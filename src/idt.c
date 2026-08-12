@@ -149,8 +149,14 @@ void idt_init(void) {
 
 // Called from ISR stubs when a CPU exception fires
 void isr_handler(int int_num) {
-    // For now, just halt on exceptions
-    (void)int_num;
+    serial_puts("[ISR] Exception ");
+    serial_putchar('0' + (int_num / 10));
+    serial_putchar('0' + (int_num % 10));
+    serial_putchar('\n');
+
+    // Halt on exceptions
+    cli();
+    while (1) { __asm__ volatile("hlt"); }
 }
 
 // Called from IRQ stubs — irq is the interrupt number (32-47)

@@ -1,11 +1,42 @@
 #include "graphics.h"
 #include "window.h"
+#include "paging.h"
 #include "gdt.h"
 #include "idt.h"
 #include "keyboard.h"
 #include "memory.h"
 #include "serial.h"
 #include "io.h"
+
+struct mboot_info {
+    uint32_t flags;
+    uint32_t mem_lower;
+    uint32_t mem_upper;
+    uint32_t boot_device;
+    uint32_t cmdline;
+    uint32_t mods_count;
+    uint32_t mods_addr;
+    uint32_t syms[4];
+    uint32_t mmap_length;
+    uint32_t mmap_addr;
+    uint32_t drives_length;
+    uint32_t drives_addr;
+    uint32_t config_table;
+    uint32_t boot_loader_name;
+    uint32_t apm_table;
+    uint32_t vbe_control_info;
+    uint32_t vbe_mode_info;
+    uint16_t vbe_mode;
+    uint16_t vbe_interface_seg;
+    uint16_t vbe_interface_off;
+    uint16_t vbe_interface_len;
+    uint64_t framebuffer_addr;
+    uint32_t framebuffer_pitch;
+    uint32_t framebuffer_width;
+    uint32_t framebuffer_height;
+    uint8_t  framebuffer_bpp;
+    uint8_t  framebuffer_type;
+} __attribute__((packed));
 
 static int mouse_down = 0;
 static int drag_win = -1;
@@ -147,7 +178,7 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "    /  /    \\ \\     \n");
         window_puts(win_id, "   /__/      \\_\\    \n");
         window_puts(win_id, "OS: okernel 0.2\n");
-        window_puts(win_id, "Resolution: 320x200\n");
+        window_puts(win_id, "Resolution: 640x480\n");
         window_puts(win_id, "Shell: okernel sh\n");
         window_puts(win_id, "Memory: ");
         // Show used/total
@@ -215,6 +246,16 @@ void kernel_main(uint32_t mboot_addr) {
     idt_init();
     memory_init(mboot_addr);
 
+    // Get framebuffer address from multiboot and set up paging
+    struct mboot_info* mboot = (struct mboot_info*)mboot_addr;
+    uint32_t fb_addr = 0;
+    if (mboot->flags & (1 << 12)) {
+        fb_addr = (uint32_t)mboot->framebuffer_addr;
+    }
+    if (fb_addr) {
+        paging_init(fb_addr);
+    }
+
     graphics_init(mboot_addr);
     window_init();
 
@@ -222,12 +263,12 @@ void kernel_main(uint32_t mboot_addr) {
     irq_register_handler(0, on_timer);
 
     // Create terminal window
-    shell_win = window_create("Terminal", 20, 20, 260, 150);
+    shell_win = window_create("Terminal", 40, 40, 380, 300);
     window_set_focus(shell_win);
     shell_prompt(shell_win);
 
     // Create system info window (neofetch-style)
-    int info_win = window_create("System Info", 100, 50, 200, 120);
+    int info_win = window_create("System Info", 260, 60, 300, 240);
     window_puts(info_win, "        ___         \n");
     window_puts(info_win, "       /   \\  okernel\n");
     window_puts(info_win, "      /     \\ v0.2  \n");
@@ -235,7 +276,7 @@ void kernel_main(uint32_t mboot_addr) {
     window_puts(info_win, "    /  /    \\ \\     \n");
     window_puts(info_win, "   /__/      \\_\\    \n");
     window_puts(info_win, "OS: okernel 0.2\n");
-    window_puts(info_win, "Res: 320x200\n");
+    window_puts(info_win, "Res: 640x480\n");
     window_puts(info_win, "Shell: okernel sh\n");
     window_puts(info_win, "Type 'help' in\n");
     window_puts(info_win, "terminal for cmds\n");
@@ -284,12 +325,14 @@ void kernel_main(uint32_t mboot_addr) {
 
         // Draw wallpaper
         for (int y = 0; y < SCREEN_H; y++) {
-            uint8_t color = 1 + (y / 25);
+            uint8_t color = 1 + (y / 60);
             if (color > 9) color = 9;
             hline(0, y, SCREEN_W, color);
         }
-        for (int y = 0; y < SCREEN_H; y += 20)
-            for (int x = 0; x < SCREEN_W; x += 20)
+
+        // Draw dots pattern
+        for (int y = 0; y < SCREEN_H; y += 30)
+            for (int x = 0; x < SCREEN_W; x += 30)
                 putpixel(x, y, 3);
 
         window_draw_all();

@@ -171,45 +171,17 @@ static uint8_t* framebuffer = 0;
 static uint32_t fb_pitch = 0;
 
 void graphics_init(uint32_t mboot_addr) {
-    (void)mboot_addr;
+    struct mboot_info* mboot = (struct mboot_info*)mboot_addr;
 
-    // Set VGA mode 13h using I/O ports (works in protected mode)
-    outb(0x3C2, 0xE3);
-    outb(0x3C4, 0x00);
-    outb(0x3C4, 0x01);
-    outb(0x3C4, 0x0F);
-    outb(0x3C4, 0x03);
-    outb(0x3C5, 0x0F);
-    outb(0x3C4, 0x00);
-    outb(0x3C5, 0x03);
-    outb(0x3CE, 0x00);
-    outb(0x3CF, 0x00);
-    outb(0x3CE, 0x01);
-    outb(0x3CF, 0x00);
-    outb(0x3CE, 0x02);
-    outb(0x3CF, 0x00);
-    outb(0x3CE, 0x03);
-    outb(0x3CF, 0x00);
-    outb(0x3CE, 0x04);
-    outb(0x3CF, 0x00);
-    outb(0x3CE, 0x05);
-    outb(0x3CF, 0x00);
-    outb(0x3CE, 0x06);
-    outb(0x3CF, 0x05);
-    outb(0x3D4, 0x03);
-    outb(0x3D5, 0x00);
-    outb(0x3D4, 0x09);
-    outb(0x3D5, 0x00);
-    outb(0x3D4, 0x14);
-    outb(0x3D5, 0x00);
-    outb(0x3D4, 0x17);
-    outb(0x3D5, 0xE3);
-    inb(0x3DA);
-    outb(0x3C0, 0x30);
-    outb(0x3C0, 0x41);
-
-    framebuffer = (uint8_t*)0xA0000;
-    fb_pitch = 320;
+    // Get framebuffer from multiboot info
+    if (mboot->flags & (1 << 12)) {
+        framebuffer = (uint8_t*)(uint32_t)mboot->framebuffer_addr;
+        fb_pitch = mboot->framebuffer_pitch;
+    } else {
+        // Fallback
+        framebuffer = (uint8_t*)0xA0000;
+        fb_pitch = SCREEN_W;
+    }
 
     for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
         backbuffer[i] = 0;

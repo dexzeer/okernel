@@ -64,8 +64,8 @@ static void mouse_irq_handler(void) {
             mouse_cycle = 0;
 
             mouse_buttons = mouse_bytes[0] & 0x07;
-            mouse_x += (int8_t)mouse_bytes[1];
-            mouse_y -= (int8_t)mouse_bytes[2]; // Y inverted
+            mouse_x += (int8_t)mouse_bytes[1] * 2;
+            mouse_y -= (int8_t)mouse_bytes[2] * 2; // Y inverted
 
             // Clamp to screen
             if (mouse_x < 0) mouse_x = 0;

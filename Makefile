@@ -23,7 +23,7 @@ COMMON_OBJ = src/gdt.o src/idt.o src/memory.o src/serial.o src/keyboard.o src/mo
 TEXT_OBJ = src/vga.o src/shell.o src/terminal.o
 
 # Desktop mode objects
-DESKTOP_OBJ = src/graphics.o src/window.o
+DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o
 
 .PHONY: all text desktop clean run debug
 

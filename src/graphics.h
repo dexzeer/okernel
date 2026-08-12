@@ -3,8 +3,8 @@
 
 #include <stdint.h>
 
-#define SCREEN_W 320
-#define SCREEN_H 200
+#define SCREEN_W 640
+#define SCREEN_H 480
 
 // Initialize graphics with multiboot info for framebuffer
 void graphics_init(uint32_t mboot_addr);
