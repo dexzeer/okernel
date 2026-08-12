@@ -14,6 +14,12 @@ static int mouse_buttons = 0;
 static int mouse_cycle = 0;
 static int8_t mouse_bytes[3];
 
+// Mouse smoothing (moving average)
+#define SMOOTH_SAMPLES 4
+static int smooth_dx[SMOOTH_SAMPLES];
+static int smooth_dy[SMOOTH_SAMPLES];
+static int smooth_idx = 0;
+
 // 8x8 mouse cursor bitmap (arrow)
 // 1 = draw, 0 = transparent
 static const uint8_t cursor_bitmap[8] = {
@@ -64,8 +70,19 @@ static void mouse_irq_handler(void) {
             mouse_cycle = 0;
 
             mouse_buttons = mouse_bytes[0] & 0x07;
-            mouse_x += (int8_t)mouse_bytes[1] * 2;
-            mouse_y -= (int8_t)mouse_bytes[2] * 2; // Y inverted
+
+            // Smooth mouse movement
+            smooth_dx[smooth_idx] = (int8_t)mouse_bytes[1];
+            smooth_dy[smooth_idx] = -(int8_t)mouse_bytes[2];
+            smooth_idx = (smooth_idx + 1) % SMOOTH_SAMPLES;
+
+            int avg_dx = 0, avg_dy = 0;
+            for (int i = 0; i < SMOOTH_SAMPLES; i++) {
+                avg_dx += smooth_dx[i];
+                avg_dy += smooth_dy[i];
+            }
+            mouse_x += avg_dx / SMOOTH_SAMPLES;
+            mouse_y += avg_dy / SMOOTH_SAMPLES;
 
             // Clamp to screen
             if (mouse_x < 0) mouse_x = 0;
