@@ -66,7 +66,8 @@ static void keyboard_irq(void) {
             case 0x50: if (callback) callback('\x10'); break; // Down Arrow
             case 0x4B: if (callback) callback('\x11'); break; // Left Arrow (scroll up too)
             case 0x4D: if (callback) callback('\x10'); break; // Right Arrow (scroll down too)
-            case 0x47: terminal_scroll_bottom(); break;       // Home = jump to bottom
+    // Home = jump to bottom (terminal mode only, handled by caller)
+    // case 0x47: terminal_scroll_bottom(); break;
         }
         return;
     }

@@ -33,7 +33,6 @@ _start:
     push ebx                ; push multiboot info pointer
     call kernel_main        ; jump to our C kernel
 
-    ; If kernel_main returns, halt
     cli
 .hang:
     hlt

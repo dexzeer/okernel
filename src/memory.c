@@ -155,3 +155,46 @@ void pmm_free_page(uint32_t addr) {
 uint32_t pmm_get_total_pages(void) { return total_pages; }
 uint32_t pmm_get_used_pages(void) { return used_pages; }
 uint32_t pmm_get_free_pages(void) { return total_pages - used_pages; }
+
+// ---- Simple kernel heap (bump allocator) ----
+static uint32_t heap_start = 0;
+static uint32_t heap_ptr = 0;
+#define HEAP_SIZE (4 * 1024 * 1024) // 4MB heap
+
+void heap_init(void) {
+    // Allocate heap from physical memory after kernel
+    extern uint32_t _kernel_end;
+    uint32_t start_page = ((uint32_t)&_kernel_end + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint32_t needed = HEAP_SIZE / PAGE_SIZE;
+
+    // Just use the first available pages for the heap
+    heap_start = start_page * PAGE_SIZE;
+    heap_ptr = heap_start;
+
+    // Mark these pages as used
+    for (uint32_t i = 0; i < needed; i++) {
+        bitmap_set(start_page + i);
+    }
+    used_pages += needed;
+}
+
+void* kmalloc(uint32_t size) {
+    if (heap_start == 0) heap_init();
+    if (size == 0) return 0;
+
+    // Align to 4 bytes
+    size = (size + 3) & ~3;
+
+    uint32_t addr = heap_ptr;
+    heap_ptr += size;
+
+    // Simple check: don't exceed heap
+    if (heap_ptr > heap_start + HEAP_SIZE) return 0;
+
+    return (void*)addr;
+}
+
+void kfree(void* ptr) {
+    // Bump allocator doesn't free — just a no-op for now
+    (void)ptr;
+}

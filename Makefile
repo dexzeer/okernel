@@ -4,7 +4,7 @@ CC = gcc
 AS = nasm
 LD = ld
 
-# Compiler flags for freestanding kernel (no standard library)
+# Compiler flags
 CFLAGS = -m32 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
          -nostartfiles -nodefaultlibs -fno-pic -fno-pie -mno-red-zone \
          -Wall -Wextra -Isrc
@@ -15,57 +15,75 @@ ASFLAGS = -f elf32
 # Linker flags
 LDFLAGS = -m elf_i386 -T linker.ld
 
-# Source files
-C_SRC = $(wildcard src/*.c)
-ASM_SRC = $(wildcard boot/*.asm)
-C_OBJ = $(C_SRC:.c=.o)
-ASM_OBJ = $(ASM_SRC:.asm=.o)
-OBJ = $(ASM_OBJ) $(C_OBJ)
+# Common objects (no kernel.c, no desktop.c)
+ASM_OBJ = boot/isr.o boot/start.o
+COMMON_OBJ = src/gdt.o src/idt.o src/memory.o src/serial.o src/keyboard.o src/mouse.o
 
-# Output
-KERNEL = okernel.bin
-ISO = okernel.iso
+# Text mode objects
+TEXT_OBJ = src/vga.o src/shell.o src/terminal.o
 
-.PHONY: all clean run iso
+# Desktop mode objects
+DESKTOP_OBJ = src/graphics.o src/window.o
 
-all: $(ISO)
+.PHONY: all text desktop clean run debug
 
-# Assemble
-%.o: %.asm
-	$(AS) $(ASFLAGS) $< -o $@
+all: text
 
-# Compile
-%.o: %.c
-	$(CC) $(CFLAGS) -c $< -o $@
+# ---- Text mode build ----
+text: okernel-text.iso
 
-# Link kernel binary
-$(KERNEL): $(OBJ)
+okernel-text.bin: $(ASM_OBJ) $(COMMON_OBJ) $(TEXT_OBJ) src/kernel.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
-# Create bootable ISO with GRUB
-iso: $(KERNEL)
+okernel-text.iso: okernel-text.bin
 	mkdir -p isodir/boot/grub
-	cp $(KERNEL) isodir/boot/okernel.bin
+	cp okernel-text.bin isodir/boot/okernel.bin
 	echo 'set timeout=0' > isodir/boot/grub/grub.cfg
 	echo 'set default=0' >> isodir/boot/grub/grub.cfg
 	echo '' >> isodir/boot/grub/grub.cfg
-	echo 'menuentry "okernel" {' >> isodir/boot/grub/grub.cfg
+	echo 'menuentry "okernel text" {' >> isodir/boot/grub/grub.cfg
 	echo '    multiboot /boot/okernel.bin' >> isodir/boot/grub/grub.cfg
 	echo '    boot' >> isodir/boot/grub/grub.cfg
 	echo '}' >> isodir/boot/grub/grub.cfg
-	grub-mkrescue -o $(ISO) isodir 2>/dev/null
+	grub-mkrescue -o $@ isodir 2>/dev/null
 
-# Build ISO as default
-$(ISO): iso
+# ---- Desktop mode build ----
+desktop: okernel-desktop.iso
 
-# Run in QEMU
-run: $(ISO)
-	qemu-system-i386 -cdrom $(ISO)
+okernel-desktop.bin: $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o
+	$(LD) $(LDFLAGS) -o $@ $^
 
-# Run with serial output for debugging
-debug: $(ISO)
-	qemu-system-i386 -cdrom $(ISO) -serial stdio -s
+okernel-desktop.iso: okernel-desktop.bin
+	mkdir -p isodir/boot/grub
+	cp okernel-desktop.bin isodir/boot/okernel.bin
+	echo 'set timeout=0' > isodir/boot/grub/grub.cfg
+	echo 'set default=0' >> isodir/boot/grub/grub.cfg
+	echo '' >> isodir/boot/grub/grub.cfg
+	echo 'menuentry "okernel desktop" {' >> isodir/boot/grub/grub.cfg
+	echo '    multiboot /boot/okernel.bin' >> isodir/boot/grub/grub.cfg
+	echo '    boot' >> isodir/boot/grub/grub.cfg
+	echo '}' >> isodir/boot/grub/grub.cfg
+	grub-mkrescue -o $@ isodir 2>/dev/null
+
+# ---- Assemble ----
+%.o: %.asm
+	$(AS) $(ASFLAGS) $< -o $@
+
+# ---- Compile ----
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# ---- Run ----
+run: text
+	qemu-system-i386 -cdrom okernel-text.iso -boot d
+
+run-desktop: desktop
+	qemu-system-i386 -cdrom okernel-desktop.iso -boot d
+
+debug: text
+	qemu-system-i386 -cdrom okernel-text.iso -boot d -serial stdio
 
 clean:
-	rm -f $(OBJ) $(KERNEL) $(ISO)
+	rm -f $(ASM_OBJ) $(COMMON_OBJ) $(TEXT_OBJ) $(DESKTOP_OBJ) src/kernel.o src/desktop.o
+	rm -f okernel-text.bin okernel-text.iso okernel-desktop.bin okernel-desktop.iso
 	rm -rf isodir
