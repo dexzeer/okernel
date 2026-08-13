@@ -39,12 +39,9 @@ static const char hex[] = "0123456789abcdef";
 
 static uint16_t io_base = 0;
 static uint8_t mac_addr[6];
-// RTL8139 RxBuf register is 16-bit — only addresses first 64KB
-// Use a fixed address at 0x8000 (safe, below kernel)
-#define RX_BUFFER_ADDR 0x8000
-static uint8_t rx_buffer[RX_BUFFER_SIZE]; // Kernel-side buffer (for reading)
+static uint8_t* rx_buffer = 0;  // Allocated from low memory
 static uint32_t rx_offset = 0;
-static uint8_t tx_buffer[TX_BUFFER_SIZE];
+static uint8_t* tx_buffer = 0;  // Allocated from low memory
 static rtl8139_rx_callback_t rx_callback = 0;
 
 static void rtl8139_irq_handler(void) {
@@ -118,23 +115,36 @@ void rtl8139_init(void) {
     for (int i = 0; i < 6; i++) mac_addr[i] = inb(io_base + IDR0 + i);
     serial_puts("[rtl8139] MAC OK\n");
 
-    // Configure — simplest possible RxConfig
-    outl(io_base + RxBuf, RX_BUFFER_ADDR);
+    // Allocate RX/TX buffers at fixed low addresses (below 1MB for DMA)
+    rx_buffer = (uint8_t*)0x20000;
+    tx_buffer = (uint8_t*)0x30000;
+
+    // Configure — use actual rx_buffer address for DMA
+    serial_puts("[rtl8139] rx_buf addr=");
+    uint32_t rba = (uint32_t)rx_buffer;
+    serial_putchar(hex[(rba >> 24) & 0xF]);
+    serial_putchar(hex[(rba >> 20) & 0xF]);
+    serial_putchar(hex[(rba >> 16) & 0xF]);
+    serial_putchar(hex[(rba >> 12) & 0xF]);
+    serial_putchar(hex[(rba >> 8) & 0xF]);
+    serial_putchar(hex[(rba >> 4) & 0xF]);
+    serial_putchar(hex[rba & 0xF]);
+    serial_putchar('\n');
+
+    outl(io_base + RxBuf, rba);
+
+    // Set buffer size (RTL8139-specific register at 0x4A)
+    outw(io_base + 0x4A, 8192 + 16);
+
+    outw(io_base + RxConfig, 0x1F); // Accept all, no WRAP
     outl(io_base + TxConfig, 0x03000000);
-
-    // Try accept-all mode (APM|AM|AB = 0x1F) with WRAP
-    outw(io_base + RxConfig, 0x9F);
-
-    // Enable RX/TX
     outb(io_base + Command, CMD_RX_ENABLE | CMD_TX_ENABLE);
 
-    // Force write RxConfig again
-    outw(io_base + RxConfig, 0x9F);
-
-    uint16_t v = inw(io_base + RxConfig);
+    // Verify with inl (QEMU's inw returns 0 for RxConfig)
+    uint32_t rv = inl(io_base + RxConfig);
     serial_puts("[rtl8139] RxConf=");
-    serial_putchar(hex[(v >> 4) & 0xF]);
-    serial_putchar(hex[v & 0xF]);
+    serial_putchar(hex[(rv >> 4) & 0xF]);
+    serial_putchar(hex[rv & 0xF]);
     serial_putchar('\n');
 
     // Register IRQ handler and enable NIC interrupts
@@ -164,53 +174,22 @@ int rtl8139_send(uint8_t* data, uint32_t len) {
 void rtl8139_poll(void) {
     if (!io_base) return;
 
-    uint16_t capr = inw(io_base + Capr);
-    uint16_t cbr = inw(io_base + Cbr);
-
-    // Debug: show CAPR and CBR values
-    static int debug_tick = 0;
-    debug_tick++;
-    if (debug_tick % 100 == 0) {
-        // Dump first 16 bytes of RX buffer
-        serial_puts("[poll] buf[0:15]=");
-        for (int i = 0; i < 16; i++) {
-            uint8_t b = ((uint8_t*)RX_BUFFER_ADDR)[i];
-            serial_putchar(hex[b >> 4]);
-            serial_putchar(hex[b & 0xF]);
-        }
-        serial_putchar('\n');
-    }
-
-    // Process any pending packets
-    while (capr != cbr) {
-        if (rx_offset >= RX_BUFFER_SIZE - 16) {
-            rx_offset = 0;
-            outw(io_base + Capr, 0);
-            capr = 0;
-            continue;
-        }
-
-        uint16_t pkt_len = *(volatile uint16_t*)(rx_buffer + rx_offset + 2);
+    // Check if there's data in the RX buffer by looking for valid headers
+    // Scan first 256 bytes (should contain at least one packet header)
+    for (int offset = 0; offset < 256; offset += 4) {
+        uint16_t pkt_len = *(volatile uint16_t*)(rx_buffer + offset + 2);
         pkt_len &= 0x3FFF;
 
-        if (pkt_len < 4 || pkt_len > 1518) {
-            // Bad packet — reset
-            rx_offset = 0;
-            outw(io_base + Capr, 0);
-            capr = 0;
-            break;
+        if (pkt_len >= 60 && pkt_len <= 1518) {
+            // Valid packet found
+            if (rx_callback) {
+                rx_callback(rx_buffer + offset + 4, pkt_len - 4);
+            }
+            rx_offset = (offset + pkt_len + 4 + 3) & ~3;
+            if (rx_offset >= RX_BUFFER_SIZE) rx_offset = 0;
+            outw(io_base + Capr, rx_offset - 16);
+            return; // Process one packet per poll
         }
-
-        if (rx_callback) {
-            rx_callback((uint8_t*)RX_BUFFER_ADDR + rx_offset + 4, pkt_len - 4);
-        }
-
-        // Advance to next packet (aligned to 4 bytes)
-        rx_offset = (rx_offset + pkt_len + 4 + 3) & ~3;
-        if (rx_offset >= RX_BUFFER_SIZE - 16) rx_offset = 0;
-
-        outw(io_base + Capr, rx_offset - 16);
-        capr = inw(io_base + Capr);
     }
 }
 
