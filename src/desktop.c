@@ -479,16 +479,7 @@ void kernel_main(uint32_t mboot_addr) {
         if (!mb) { mouse_down = 0; drag_win = -1; }
         else { mouse_down = 1; }
 
-        // Mark windows dirty when something changes
-        if (needs_redraw) {
-            for (int i = 0; i < MAX_WINDOWS; i++) {
-                struct window* w = window_get(i);
-                if (w && w->visible && !w->minimized) w->dirty = 1;
-            }
-            needs_redraw = 0;
-        }
-
-        // Only blit wallpaper when windows change (minimize/close/create/drag)
+        // Only blit wallpaper when windows change, then mark dirty
         if (needs_redraw) {
             graphics_blit_wallpaper();
             for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -499,8 +490,10 @@ void kernel_main(uint32_t mboot_addr) {
         }
 
         // Draw windows (only dirty ones)
+        mouse_hide_cursor();
         window_draw_all();
         window_draw_taskbar();
+        mouse_draw_cursor();
 
         // FPS counter
         frame_count++;
