@@ -31,6 +31,14 @@ static void build_eth_header(struct eth_header* eth, uint8_t* dst, uint8_t* src,
 }
 
 void arp_send_request(uint8_t* target_ip) {
+    serial_puts("[arp] send request to ");
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 4; i++) {
+        serial_putchar('0' + target_ip[i]);
+        if (i < 3) serial_putchar('.');
+    }
+    serial_putchar('\n');
+
     uint8_t frame[ETH_FRAME_MAX];
     uint8_t* mac = rtl8139_get_mac();
 
@@ -59,9 +67,18 @@ void arp_send_request(uint8_t* target_ip) {
 }
 
 static void handle_arp(uint8_t* data, uint32_t len) {
+    serial_puts("[arp] packet received, len=");
+    serial_putchar('0' + (len / 100));
+    serial_putchar('0' + ((len / 10) % 10));
+    serial_putchar('0' + (len % 10));
+    serial_putchar('\n');
+
     struct arp_header* arp = (struct arp_header*)(data + sizeof(struct eth_header));
 
     uint16_t opcode = ((arp->opcode >> 8) & 0xFF) | ((arp->opcode & 0xFF) << 8);
+    serial_puts("[arp] opcode=");
+    serial_putchar('0' + opcode);
+    serial_putchar('\n');
 
     if (opcode == 2) { // ARP Reply
         // Check if it's a reply for us
@@ -247,6 +264,7 @@ static void handle_ip(uint8_t* data, uint32_t len) {
 }
 
 static void handle_packet(uint8_t* data, uint32_t len) {
+    // data IS the full Ethernet frame (RTL8139 strips 4-byte header)
     if (len < sizeof(struct eth_header)) return;
 
     uint16_t eth_type = ((data[12] << 8) | data[13]);

@@ -405,10 +405,8 @@ void kernel_main(uint32_t mboot_addr) {
     window_set_text_color(term_wins[0], 15, 0); // Back to white
     shell_prompt(term_wins[0]);
 
-    // Init networking
-    serial_puts("[debug] calling rtl8139_init directly\n");
-    rtl8139_init();
-    serial_puts("[debug] rtl8139_init returned\n");
+    // Init networking (full stack: PCI + RTL8139 + ARP + IP + ICMP)
+    net_init();
 
     // Init input
     mouse_init_fb();
