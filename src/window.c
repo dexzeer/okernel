@@ -3,10 +3,14 @@
 #include "memory.h"
 #include "idt.h"
 #include "io.h"
+#include "serial.h"
 #include <stdint.h>
 
 // Backbuffer from graphics.c
 extern uint8_t* graphics_get_buffer(void);
+
+// Redraw flag from desktop.c
+extern int needs_redraw;
 
 static struct window windows[MAX_WINDOWS];
 
@@ -23,32 +27,30 @@ static int smooth_dx[SMOOTH_SAMPLES];
 static int smooth_dy[SMOOTH_SAMPLES];
 static int smooth_idx = 0;
 
-// 8x8 mouse cursor bitmap (arrow)
-// 1 = draw, 0 = transparent
-static const uint8_t cursor_bitmap[8] = {
-    0b10000000,
-    0b11000000,
-    0b11100000,
-    0b11110000,
-    0b11111000,
-    0b11101100,
-    0b10000110,
-    0b00000110,
-};
-
-static const uint8_t cursor_mask[8] = {
-    0b10000000,
-    0b11000000,
-    0b11100000,
-    0b11110000,
-    0b11111000,
-    0b11111100,
-    0b11101110,
-    0b10000111,
+// 12x16 mouse cursor bitmap (clean arrow)
+#define CURSOR_W 12
+#define CURSOR_H 16
+static const uint16_t cursor_bitmap[16] = {
+    0b110000000000,
+    0b111000000000,
+    0b111100000000,
+    0b111110000000,
+    0b111111000000,
+    0b111111100000,
+    0b111111110000,
+    0b111111111000,
+    0b111111000000,
+    0b111111100000,
+    0b110111110000,
+    0b110011111000,
+    0b110001111000,
+    0b100000111100,
+    0b000000011100,
+    0b000000001100,
 };
 
 // Save background under cursor for restoring
-static uint8_t cursor_bg[8 * 8];
+static uint8_t cursor_bg[CURSOR_W * CURSOR_H];
 static int cursor_bg_x = 0;
 static int cursor_bg_y = 0;
 static int cursor_visible = 0;
@@ -98,12 +100,12 @@ static void mouse_irq_handler(void) {
 
 // Save the background behind the cursor
 static void mouse_save_bg(void) {
-    for (int row = 0; row < 8; row++) {
-        for (int col = 0; col < 8; col++) {
+    for (int row = 0; row < CURSOR_H; row++) {
+        for (int col = 0; col < CURSOR_W; col++) {
             int sx = mouse_x + col;
             int sy = mouse_y + row;
             if (sx >= 0 && sx < SCREEN_W && sy >= 0 && sy < SCREEN_H) {
-                cursor_bg[row * 8 + col] = graphics_get_buffer()[sy * SCREEN_W + sx];
+                cursor_bg[row * CURSOR_W + col] = graphics_get_buffer()[sy * SCREEN_W + sx];
             }
         }
     }
@@ -113,12 +115,14 @@ static void mouse_save_bg(void) {
 
 // Restore background under cursor
 static void mouse_restore_bg(void) {
-    for (int row = 0; row < 8; row++) {
-        for (int col = 0; col < 8; col++) {
+    for (int row = 0; row < CURSOR_H; row++) {
+        int sy = cursor_bg_y + row;
+        if (sy < 0 || sy >= SCREEN_H) continue;
+        graphics_mark_dirty(sy);
+        for (int col = 0; col < CURSOR_W; col++) {
             int sx = cursor_bg_x + col;
-            int sy = cursor_bg_y + row;
-            if (sx >= 0 && sx < SCREEN_W && sy >= 0 && sy < SCREEN_H) {
-                putpixel(sx, sy, cursor_bg[row * 8 + col]);
+            if (sx >= 0 && sx < SCREEN_W) {
+                putpixel(sx, sy, cursor_bg[row * CURSOR_W + col]);
             }
         }
     }
@@ -128,13 +132,18 @@ void mouse_draw_cursor(void) {
     mouse_restore_bg();
     mouse_save_bg();
 
-    for (int row = 0; row < 8; row++) {
-        for (int col = 0; col < 8; col++) {
-            if (cursor_bitmap[row] & (1 << col)) {
-                putpixel(mouse_x + col, mouse_y + row, 15); // White cursor
-            } else if (cursor_mask[row] & (1 << col)) {
-                // Border pixel (black outline around white)
-                putpixel(mouse_x + col, mouse_y + row, 0);
+    // Draw cursor: white fill with black border
+    for (int row = 0; row < CURSOR_H; row++) {
+        for (int col = 0; col < CURSOR_W; col++) {
+            if (cursor_bitmap[row] & (1 << (CURSOR_W - 1 - col))) {
+                // Check if this is an edge pixel (border)
+                int is_edge = 0;
+                if (row == 0 || col == 0 ||
+                    !(cursor_bitmap[row-1] & (1 << (CURSOR_W - 1 - col))) ||
+                    !(cursor_bitmap[row] & (1 << (CURSOR_W - col)))) {
+                    is_edge = 1;
+                }
+                putpixel(mouse_x + col, mouse_y + row, is_edge ? 0 : 15);
             }
         }
     }
@@ -214,6 +223,9 @@ int window_create(const char* title, int x, int y, int w, int h) {
             windows[i].visible = 1;
             windows[i].focused = 0;
             windows[i].font_scale = 1;
+            windows[i].text_fg = 15; // White
+            windows[i].text_bg = 0;  // Black
+            windows[i].dirty = 1;    // Needs initial draw
 
             int j = 0;
             while (title[j] && j < 31) {
@@ -273,6 +285,7 @@ void window_destroy(int id) {
         windows[id].content = 0;
     }
     windows[id].visible = 0;
+    needs_redraw = 1;
 }
 
 void window_set_focus(int id) {
@@ -285,13 +298,43 @@ void window_set_close_button(int id, int has_close) {
     if (id >= 0 && id < MAX_WINDOWS) windows[id].has_close_button = has_close;
 }
 
+void window_set_minimize_button(int id, int has_min) {
+    if (id >= 0 && id < MAX_WINDOWS) windows[id].has_minimize_button = has_min;
+}
+
 int window_check_close_click(int id, int mx, int my) {
     struct window* w = &windows[id];
     if (!w->visible || !w->has_close_button) return 0;
-    // Close button: 12x12 at top-right of title bar
     int bx = w->x + w->w - WIN_BORDER - 14;
     int by = w->y + WIN_BORDER;
     return (mx >= bx && mx < bx + 12 && my >= by && my < by + 12);
+}
+
+int window_check_minimize_click(int id, int mx, int my) {
+    struct window* w = &windows[id];
+    if (!w->visible || !w->has_minimize_button) return 0;
+    // Minimize button is next to close button
+    int bx = w->x + w->w - WIN_BORDER - 28;
+    int by = w->y + WIN_BORDER;
+    return (mx >= bx && mx < bx + 12 && my >= by && my < by + 12);
+}
+
+// External flag — set by desktop.c when wallpaper needs redraw
+
+void window_minimize(int id) {
+    if (id >= 0 && id < MAX_WINDOWS) {
+        windows[id].minimized = 1;
+        windows[id].focused = 0;
+        needs_redraw = 1;
+    }
+}
+
+void window_restore(int id) {
+    if (id >= 0 && id < MAX_WINDOWS) {
+        windows[id].minimized = 0;
+        windows[id].dirty = 1;
+        needs_redraw = 1;
+    }
 }
 
 int window_get_focused(void) {
@@ -308,49 +351,83 @@ struct window* window_get(int id) {
 
 void window_draw(int id) {
     struct window* w = &windows[id];
-    if (!w->visible) return;
+    if (!w->visible || w->minimized) return;
 
-    uint8_t border_color = w->focused ? WIN_ACTIVE_BORDER : WIN_BORDER_BG;
+    // Only redraw when dirty
+    if (w->dirty) {
+        // Draw frame
+        uint8_t border_color = w->focused ? WIN_ACTIVE_BORDER : WIN_BORDER_BG;
+        rect_outline(w->x, w->y, w->w, w->h, border_color, WIN_BORDER);
+        rect_fill(w->x + WIN_BORDER, w->y + WIN_BORDER,
+                  w->w - 2 * WIN_BORDER, WIN_TITLE_H, WIN_TITLE_BG);
+        draw_string(w->x + WIN_BORDER + 4, w->y + WIN_BORDER + 2,
+                    w->title, WIN_TITLE_FG, WIN_TITLE_BG);
 
-    // Draw border
-    rect_outline(w->x, w->y, w->w, w->h, border_color, WIN_BORDER);
+        if (w->has_close_button) {
+            int bx = w->x + w->w - WIN_BORDER - 14;
+            int by = w->y + WIN_BORDER;
+            rect_fill(bx, by, 12, 12, 4);
+            draw_string(bx + 2, by + 2, "X", 15, 4);
+        }
+        if (w->has_minimize_button) {
+            int bx = w->x + w->w - WIN_BORDER - 28;
+            int by = w->y + WIN_BORDER;
+            rect_fill(bx, by, 12, 12, 6);
+            draw_string(bx + 3, by + 2, "_", 15, 6);
+        }
 
-    // Draw title bar
-    rect_fill(w->x + WIN_BORDER, w->y + WIN_BORDER,
-              w->w - 2 * WIN_BORDER, WIN_TITLE_H, WIN_TITLE_BG);
+        // Draw content background + content
+        rect_fill(w->x + WIN_BORDER, w->y + WIN_BORDER + WIN_TITLE_H,
+                  w->w - 2 * WIN_BORDER, w->h - WIN_TITLE_H - 2 * WIN_BORDER, WIN_BG);
 
-    // Draw title text
-    draw_string(w->x + WIN_BORDER + 4, w->y + WIN_BORDER + 2,
-                w->title, WIN_TITLE_FG, WIN_TITLE_BG);
+        if (w->content) {
+            int cx = w->x + WIN_BORDER;
+            int cy = w->y + WIN_BORDER + WIN_TITLE_H;
+            int scale = w->font_scale;
+            int char_w = 8 * scale;
 
-    // Draw close button if enabled
-    if (w->has_close_button) {
-        int bx = w->x + w->w - WIN_BORDER - 14;
-        int by = w->y + WIN_BORDER;
-        rect_fill(bx, by, 12, 12, 4); // Red background
-        draw_string(bx + 2, by + 2, "X", 15, 4); // White X on red
+            for (int row = 0; row < w->content_h; row++) {
+                for (int col = 0; col < w->content_w; col++) {
+                    uint16_t entry = w->content[row * w->content_w + col];
+                    char c = entry & 0xFF;
+                    uint8_t color = (entry >> 8) & 0xFF;
+                    uint8_t fg = color & 0x0F;
+                    uint8_t bg = (color >> 4) & 0x0F;
+                    draw_char_scaled(cx + col * char_w, cy + row * (8 * scale), c, fg, bg, scale);
+                }
+            }
+        }
+        w->dirty = 0;
     }
 
-    // Draw content background
-    rect_fill(w->x + WIN_BORDER, w->y + WIN_BORDER + WIN_TITLE_H,
-              w->w - 2 * WIN_BORDER, w->h - WIN_TITLE_H - 2 * WIN_BORDER, WIN_BG);
+    // Draw blinking cursor (every frame, cheap — just one rect_fill)
+    if (w->focused) {
+        extern uint32_t tick_count;
+        int cursor_on = ((tick_count / 18) % 2 == 0); // ~1 second blink
+        static int last_cursor_on = 0;
 
-    // Draw content with font scale
-    if (w->content) {
-        int cx = w->x + WIN_BORDER;
-        int cy = w->y + WIN_BORDER + WIN_TITLE_H;
-        int scale = w->font_scale;
-        int char_w = 8 * scale;
+        if (cursor_on != last_cursor_on) {
+            int cx = w->x + WIN_BORDER;
+            int cy = w->y + WIN_BORDER + WIN_TITLE_H;
+            int scale = w->font_scale;
+            int char_w = 8 * scale;
 
-        for (int row = 0; row < w->content_h; row++) {
-            for (int col = 0; col < w->content_w; col++) {
-                uint16_t entry = w->content[row * w->content_w + col];
-                char c = entry & 0xFF;
-                uint8_t color = (entry >> 8) & 0xFF;
-                uint8_t fg = color & 0x0F;
-                uint8_t bg = (color >> 4) & 0x0F;
-                draw_char_scaled(cx + col * char_w, cy + row * (8 * scale), c, fg, bg, scale);
+            if (cursor_on) {
+                rect_fill(cx + w->cursor_x * char_w, cy + w->cursor_y * (8 * scale),
+                          char_w, 8 * scale, 10);
+            } else {
+                // Redraw just the character under cursor
+                int idx = w->cursor_y * w->content_w + w->cursor_x;
+                if (w->content && idx >= 0 && idx < w->content_w * w->content_h) {
+                    uint16_t entry = w->content[idx];
+                    char c = entry & 0xFF;
+                    uint8_t color = (entry >> 8) & 0xFF;
+                    draw_char_scaled(cx + w->cursor_x * char_w,
+                                     cy + w->cursor_y * (8 * scale),
+                                     c, color & 0x0F, (color >> 4) & 0x0F, scale);
+                }
             }
+            last_cursor_on = cursor_on;
         }
     }
 }
@@ -388,6 +465,8 @@ void window_put_char(int id, char c) {
     struct window* w = &windows[id];
     if (!w->visible || !w->content) return;
 
+    uint8_t color = (w->text_bg << 4) | w->text_fg;
+
     if (c == '\n') {
         w->cursor_x = 0;
         w->cursor_y++;
@@ -396,11 +475,11 @@ void window_put_char(int id, char c) {
     } else if (c == '\b') {
         if (w->cursor_x > 0) {
             w->cursor_x--;
-            w->content[w->cursor_y * w->content_w + w->cursor_x] = 0x0F00;
+            w->content[w->cursor_y * w->content_w + w->cursor_x] = (uint16_t)color << 8 | ' ';
         }
     } else {
         if (w->cursor_x < w->content_w) {
-            w->content[w->cursor_y * w->content_w + w->cursor_x] = 0x0F00 | (uint16_t)c;
+            w->content[w->cursor_y * w->content_w + w->cursor_x] = (uint16_t)color << 8 | (uint16_t)c;
             w->cursor_x++;
         }
     }
@@ -411,6 +490,7 @@ void window_put_char(int id, char c) {
     }
 
     scroll_content(w);
+    w->dirty = 1; // Mark window for redraw
 }
 
 void window_puts(int id, const char* str) {
@@ -420,10 +500,60 @@ void window_puts(int id, const char* str) {
 void window_clear(int id) {
     struct window* w = &windows[id];
     if (!w->content) return;
+    uint8_t color = (w->text_bg << 4) | w->text_fg;
     int buf_size = w->content_w * w->content_h;
     for (int i = 0; i < buf_size; i++) {
-        w->content[i] = 0x0F00;
+        w->content[i] = (uint16_t)color << 8 | ' ';
     }
     w->cursor_x = 0;
     w->cursor_y = 0;
+    w->dirty = 1;
+}
+
+void window_set_text_color(int id, uint8_t fg, uint8_t bg) {
+    if (id >= 0 && id < MAX_WINDOWS) {
+        windows[id].text_fg = fg;
+        windows[id].text_bg = bg;
+    }
+}
+
+#define TASKBAR_H 20
+
+void window_draw_taskbar(void) {
+    int y = SCREEN_H - TASKBAR_H;
+
+    rect_fill(0, y, SCREEN_W, TASKBAR_H, 1);
+    hline(0, y, SCREEN_W, 7);
+
+    // Count visible windows
+    int count = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        if (windows[i].visible) count++;
+    }
+    if (count == 0) return;
+
+    // Dynamic button width: fill taskbar evenly
+    int total_pad = (count + 1) * 4; // 4px gap on each side
+    int btn_w = (SCREEN_W - total_pad) / count;
+    if (btn_w > 120) btn_w = 120; // Cap max width
+    if (btn_w < 30) btn_w = 30;   // Min width
+
+    int x = 4;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        struct window* w = &windows[i];
+        if (!w->visible) continue;
+
+        uint8_t btn_bg = w->focused ? 9 : 1;
+        rect_fill(x, y + 2, btn_w, TASKBAR_H - 4, btn_bg);
+
+        char label[16];
+        int li = 0;
+        int max_chars = (btn_w - 8) / 8; // Fit text in button
+        if (max_chars > 15) max_chars = 15;
+        while (w->title[li] && li < max_chars) { label[li] = w->title[li]; li++; }
+        label[li] = 0;
+        draw_string(x + 4, y + 5, label, 15, btn_bg);
+
+        x += btn_w + 4;
+    }
 }

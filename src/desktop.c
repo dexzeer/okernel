@@ -1,4 +1,5 @@
 #include "graphics.h"
+#include "wallpaper.h"
 #include "window.h"
 #include "paging.h"
 #include "gdt.h"
@@ -56,7 +57,8 @@ static int term_lens[MAX_TERMINALS];
 // System info window
 static int info_win = -1;
 
-static uint32_t tick_count = 0;
+uint32_t tick_count = 0;
+int needs_redraw = 1; // Global flag: wallpaper + windows need full redraw
 
 // FPS tracking
 static uint32_t frame_count = 0;
@@ -64,7 +66,9 @@ static uint32_t fps = 0;
 static uint32_t last_fps_tick = 0;
 
 static void shell_prompt(int win_id) {
+    window_set_text_color(win_id, 10, 0); // Green on black
     window_puts(win_id, "okernel> ");
+    window_set_text_color(win_id, 15, 0); // Back to white on black
 }
 
 static int str_eq(const char* a, const char* b) {
@@ -90,6 +94,7 @@ static void open_sysinfo(void) {
     if (info_win >= 0) return; // Already open
     info_win = window_create("System Info", 240, 60, 280, 220);
     window_set_close_button(info_win, 1);
+    window_set_minimize_button(info_win, 1);
     window_puts(info_win, "okernel v0.2\n");
     window_puts(info_win, "Desktop Edition\n\n");
     window_puts(info_win, "Resolution: 640x480\n");
@@ -111,10 +116,11 @@ static void close_sysinfo(void) {
 
 static int create_terminal(void) {
     if (term_count >= MAX_TERMINALS) return -1;
-    int x = 30 + term_count * 25;
-    int y = 30 + term_count * 20;
-    int win_id = window_create("Terminal", x, y, 380, 300);
+    int x = 80 + (term_count % 4) * 30;
+    int y = 60 + (term_count % 4) * 25;
+    int win_id = window_create("Terminal", x, y, 440, 360);
     window_set_close_button(win_id, 1);
+    window_set_minimize_button(win_id, 1);
     term_wins[term_count] = win_id;
     term_lens[term_count] = 0;
     term_bufs[term_count][0] = 0;
@@ -213,10 +219,16 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "s\n");
     }
     else if (str_eq(cmd_buf, "about")) {
-        window_puts(win_id, "okernel v0.2\n");
-        window_puts(win_id, "Desktop Edition\n");
-        window_puts(win_id, "Built from scratch\n");
-        window_puts(win_id, "in C and x86 assembly\n");
+        window_set_text_color(win_id, 11, 0); // Cyan
+        window_puts(win_id, "        _                        _ \n");
+        window_puts(win_id, "       | |                      | |\n");
+        window_puts(win_id, "   ___ | | _____ _ __ _ __   ___| |\n");
+        window_puts(win_id, "  / _ \\| |/ / _ \\ '__| '_ \\ / _ \\ |\n");
+        window_puts(win_id, " | (_) |   <  __/ |  | | | |  __/ |\n");
+        window_puts(win_id, "  \\___/|_|\\_\\___|_|  |_| |_|\\___|_|\n\n");
+        window_set_text_color(win_id, 15, 0); // White
+        window_puts(win_id, "okernel v0.2 - Desktop Edition\n");
+        window_puts(win_id, "Built from scratch in C and x86 assembly\n");
     }
     else if (str_eq(cmd_buf, "neofetch") || str_eq(cmd_buf, "sysinfo")) {
         window_puts(win_id, "okernel v0.2\n");
@@ -319,14 +331,39 @@ void kernel_main(uint32_t mboot_addr) {
 
     graphics_init(mboot_addr);
     window_init();
+
+    // Cache wallpaper for fast blitting
+    graphics_cache_wallpaper(wp_pixels, WP_W, WP_H);
+
+    // Draw initial wallpaper
+    graphics_blit_wallpaper();
+
     irq_register_handler(0, on_timer);
 
-    // Create main terminal
-    term_wins[0] = window_create("Terminal", 30, 30, 380, 300);
+    // Create main terminal — large, centered
+    term_wins[0] = window_create("Terminal", 60, 40, 440, 360);
     window_set_close_button(term_wins[0], 1);
+    window_set_minimize_button(term_wins[0], 1);
     term_count = 1;
     active_term_idx = 0;
     window_set_focus(term_wins[0]);
+
+    // Show welcome message with ASCII art (like text mode)
+    window_set_text_color(term_wins[0], 11, 0); // Cyan
+    window_puts(term_wins[0], "        _                        _ \n");
+    window_puts(term_wins[0], "       | |                      | |\n");
+    window_puts(term_wins[0], "   ___ | | _____ _ __ _ __   ___| |\n");
+    window_puts(term_wins[0], "  / _ \\| |/ / _ \\ '__| '_ \\ / _ \\ |\n");
+    window_puts(term_wins[0], " | (_) |   <  __/ |  | | | |  __/ |\n");
+    window_puts(term_wins[0], "  \\___/|_|\\_\\___|_|  |_| |_|\\___|_|\n\n");
+    window_set_text_color(term_wins[0], 15, 0); // White
+    window_puts(term_wins[0], "Welcome to okernel v0.2\n");
+    window_puts(term_wins[0], "A minimalistic operating system.\n\n");
+    window_set_text_color(term_wins[0], 8, 0); // Grey
+    window_puts(term_wins[0], "Type 'help' for commands.\n");
+    window_puts(term_wins[0], "Type 'terminal' for new window.\n");
+    window_puts(term_wins[0], "Type 'exit' to close this terminal.\n\n");
+    window_set_text_color(term_wins[0], 15, 0); // Back to white
     shell_prompt(term_wins[0]);
 
     // Init input
@@ -343,39 +380,85 @@ void kernel_main(uint32_t mboot_addr) {
 
         if (mb && !mouse_down) {
             int clicked = 0;
-            for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
-                struct window* w = window_get(i);
-                if (!w || !w->visible) continue;
 
-                // Check close button
-                if (window_check_close_click(i, mx, my)) {
-                    int tidx = find_term_idx(i);
-                    if (tidx >= 0) {
-                        destroy_terminal(tidx);
-                        if (term_count > 0) {
-                            active_term_idx = 0;
-                            window_set_focus(term_wins[0]);
-                        }
-                    } else if (i == info_win) {
-                        close_sysinfo();
-                    }
-                    clicked = 1;
-                    break;
+            // Check taskbar clicks (bottom 20px)
+            if (my >= SCREEN_H - 20) {
+                // Count visible windows to match dynamic width
+                int vis_count = 0;
+                for (int i = 0; i < MAX_WINDOWS; i++) {
+                    if (window_get(i) && window_get(i)->visible) vis_count++;
                 }
+                if (vis_count > 0) {
+                    int total_pad = (vis_count + 1) * 4;
+                    int btn_w = (SCREEN_W - total_pad) / vis_count;
+                    if (btn_w > 120) btn_w = 120;
+                    if (btn_w < 30) btn_w = 30;
 
-                // Check title bar for drag/focus
-                if (!clicked && mx >= w->x && mx < w->x + w->w &&
-                    my >= w->y && my < w->y + WIN_TITLE_H + WIN_BORDER) {
-                    drag_win = i;
-                    drag_off_x = mx - w->x;
-                    drag_off_y = my - w->y;
-
-                    int tidx = find_term_idx(i);
-                    if (tidx >= 0) {
-                        active_term_idx = tidx;
-                        window_set_focus(i);
+                    int tx = 4;
+                    for (int i = 0; i < MAX_WINDOWS; i++) {
+                        struct window* w = window_get(i);
+                        if (!w || !w->visible) continue;
+                        if (mx >= tx && mx < tx + btn_w) {
+                            window_restore(i);
+                            window_set_focus(i);
+                            int tidx = find_term_idx(i);
+                            if (tidx >= 0) active_term_idx = tidx;
+                            clicked = 1;
+                            break;
+                        }
+                        tx += btn_w + 4;
                     }
-                    break;
+                }
+            }
+
+            // Check window buttons and title bars
+            if (!clicked) {
+                for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
+                    struct window* w = window_get(i);
+                    if (!w || !w->visible || w->minimized) continue;
+
+                    if (window_check_close_click(i, mx, my)) {
+                        int tidx = find_term_idx(i);
+                        if (tidx >= 0) {
+                            destroy_terminal(tidx);
+                            if (term_count > 0) {
+                                active_term_idx = 0;
+                                window_set_focus(term_wins[0]);
+                            }
+                        } else if (i == info_win) {
+                            close_sysinfo();
+                        }
+                        clicked = 1;
+                        break;
+                    }
+
+                    if (window_check_minimize_click(i, mx, my)) {
+                        window_minimize(i);
+                        // Restore wallpaper where the window was
+                        graphics_blit_wallpaper();
+                        // Mark remaining windows dirty
+                        for (int j = 0; j < MAX_WINDOWS; j++) {
+                            struct window* w2 = window_get(j);
+                            if (w2 && w2->visible && !w2->minimized && j != i) w2->dirty = 1;
+                        }
+                        clicked = 1;
+                        break;
+                    }
+
+                    if (mx >= w->x && mx < w->x + w->w &&
+                        my >= w->y && my < w->y + WIN_TITLE_H + WIN_BORDER) {
+                        drag_win = i;
+                        drag_off_x = mx - w->x;
+                        drag_off_y = my - w->y;
+                        window_restore(i);
+                        int tidx = find_term_idx(i);
+                        if (tidx >= 0) {
+                            active_term_idx = tidx;
+                            window_set_focus(i);
+                        }
+                        clicked = 1;
+                        break;
+                    }
                 }
             }
         }
@@ -389,25 +472,35 @@ void kernel_main(uint32_t mboot_addr) {
                 if (w->y < 0) w->y = 0;
                 if (w->x + w->w > SCREEN_W) w->x = SCREEN_W - w->w;
                 if (w->y + w->h > SCREEN_H) w->y = SCREEN_H - w->h;
+                needs_redraw = 1;
             }
         }
 
         if (!mb) { mouse_down = 0; drag_win = -1; }
         else { mouse_down = 1; }
 
-        // Draw wallpaper every frame (clears old window positions)
-        for (int y = 0; y < SCREEN_H; y++) {
-            uint8_t color = 1 + (y / 60);
-            if (color > 9) color = 9;
-            hline(0, y, SCREEN_W, color);
+        // Mark windows dirty when something changes
+        if (needs_redraw) {
+            for (int i = 0; i < MAX_WINDOWS; i++) {
+                struct window* w = window_get(i);
+                if (w && w->visible && !w->minimized) w->dirty = 1;
+            }
+            needs_redraw = 0;
         }
-        for (int y = 0; y < SCREEN_H; y += 30)
-            for (int x = 0; x < SCREEN_W; x += 30)
-                putpixel(x, y, 3);
 
-        mouse_hide_cursor();
+        // Only blit wallpaper when windows change (minimize/close/create/drag)
+        if (needs_redraw) {
+            graphics_blit_wallpaper();
+            for (int i = 0; i < MAX_WINDOWS; i++) {
+                struct window* w = window_get(i);
+                if (w && w->visible && !w->minimized) w->dirty = 1;
+            }
+            needs_redraw = 0;
+        }
+
+        // Draw windows (only dirty ones)
         window_draw_all();
-        mouse_draw_cursor();
+        window_draw_taskbar();
 
         // FPS counter
         frame_count++;
@@ -416,6 +509,7 @@ void kernel_main(uint32_t mboot_addr) {
             frame_count = 0;
             last_fps_tick = tick_count;
         }
+        // FPS counter — wider box for 3-digit numbers
         char fps_buf[16] = "FPS: ";
         char num[8];
         put_uint(num, fps);
@@ -423,8 +517,8 @@ void kernel_main(uint32_t mboot_addr) {
         int ni = 0;
         while (num[ni]) fps_buf[fi++] = num[ni++];
         fps_buf[fi] = 0;
-        rect_fill(SCREEN_W - 60, 2, 58, 10, 0);
-        draw_string(SCREEN_W - 58, 3, fps_buf, 15, 0);
+        rect_fill(SCREEN_W - 70, 2, 68, 10, 0);
+        draw_string(SCREEN_W - 68, 3, fps_buf, 15, 0);
 
         graphics_flush();
     }

@@ -45,6 +45,13 @@ uint8_t* graphics_get_buffer(void);
 // Mark a row as dirty for optimized flushing
 void graphics_mark_dirty(int y);
 
+// Direct backbuffer write (for wallpaper, avoids putpixel overhead)
+void graphics_write_pixel(int x, int y, uint8_t color);
+
+// Cache a pre-rendered wallpaper for fast blitting
+void graphics_cache_wallpaper(const unsigned char* pixels, int src_w, int src_h);
+void graphics_blit_wallpaper(void);
+
 // Fill entire screen with a color
 void graphics_fill(uint8_t color);
 

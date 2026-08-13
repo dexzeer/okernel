@@ -1,4 +1,5 @@
 #include "graphics.h"
+#include "wallpaper.h"
 #include "io.h"
 #include <stdint.h>
 
@@ -173,17 +174,17 @@ struct mboot_info {
 void graphics_init(uint32_t mboot_addr) {
     struct mboot_info* mboot = (struct mboot_info*)mboot_addr;
 
-    // Get framebuffer from multiboot info
     if (mboot->flags & (1 << 12)) {
         framebuffer = (uint8_t*)(uint32_t)mboot->framebuffer_addr;
         fb_pitch = mboot->framebuffer_pitch;
     } else {
-        // Fallback
         framebuffer = (uint8_t*)0xA0000;
         fb_pitch = SCREEN_W;
     }
 
-    // Clear backbuffer and mark all rows dirty
+    // Don't load wallpaper palette — keep default VGA colors for UI
+    // Wallpaper will display with default palette colors
+
     for (int i = 0; i < SCREEN_W * SCREEN_H; i++) backbuffer[i] = 0;
     for (int i = 0; i < SCREEN_H; i++) dirty_rows[i] = 1;
 }
@@ -196,9 +197,13 @@ void putpixel(int x, int y, uint8_t color) {
 }
 
 void rect_fill(int x, int y, int w, int h, uint8_t color) {
-    if (!framebuffer) return;
     for (int j = y; j < y + h; j++) {
-        hline(x, j, w, color);
+        if (j < 0 || j >= SCREEN_H) continue;
+        dirty_rows[j] = 1;
+        uint8_t* dst = backbuffer + j * SCREEN_W;
+        int sx = x < 0 ? 0 : x;
+        int ex = x + w > SCREEN_W ? SCREEN_W : x + w;
+        for (int i = sx; i < ex; i++) dst[i] = color;
     }
 }
 
@@ -253,7 +258,7 @@ void draw_char(int x, int y, char c, uint8_t fg, uint8_t bg) {
         uint8_t bits = font8x8[idx][row];
         for (int col = 0; col < 8; col++) {
             uint8_t color = (bits & (1 << col)) ? fg : bg;
-            if (color != bg) { // Only draw non-background pixels
+            if (color != bg) {
                 putpixel(x + col, y + row, color);
             }
         }
@@ -276,7 +281,6 @@ void draw_char_scaled(int x, int y, char c, uint8_t fg, uint8_t bg, int scale) {
         uint8_t bits = font8x8[idx][row];
         for (int col = 0; col < 8; col++) {
             uint8_t color = (bits & (1 << col)) ? fg : bg;
-            // Draw each pixel as scale x scale block
             for (int sy = 0; sy < scale; sy++) {
                 for (int sx = 0; sx < scale; sx++) {
                     putpixel(x + col * scale + sx, y + row * scale + sy, color);
@@ -300,6 +304,48 @@ uint8_t* graphics_get_buffer(void) {
 
 void graphics_mark_dirty(int y) {
     if (y >= 0 && y < SCREEN_H) dirty_rows[y] = 1;
+}
+
+void graphics_write_pixel(int x, int y, uint8_t color) {
+    if (x >= 0 && x < SCREEN_W && y >= 0 && y < SCREEN_H) {
+        backbuffer[y * SCREEN_W + x] = color;
+    }
+}
+
+// Cached wallpaper (pre-rendered at screen resolution)
+static uint8_t cached_wallpaper[SCREEN_W * SCREEN_H];
+static int wallpaper_cached = 0;
+
+void graphics_cache_wallpaper(const unsigned char* pixels, int src_w, int src_h) {
+    // Copy directly if same size, otherwise stretch
+    if (src_w == SCREEN_W && src_h == SCREEN_H) {
+        for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
+            cached_wallpaper[i] = pixels[i];
+        }
+    } else {
+        for (int y = 0; y < SCREEN_H; y++) {
+            int src_y = (y * src_h) / SCREEN_H;
+            for (int x = 0; x < SCREEN_W; x++) {
+                int src_x = (x * src_w) / SCREEN_W;
+                cached_wallpaper[y * SCREEN_W + x] = pixels[src_y * src_w + src_x];
+            }
+        }
+    }
+    wallpaper_cached = 1;
+}
+
+void graphics_blit_wallpaper(void) {
+    if (!wallpaper_cached) return;
+    for (int y = 0; y < SCREEN_H; y++) {
+        uint8_t* dst = backbuffer + y * SCREEN_W;
+        uint8_t* src = cached_wallpaper + y * SCREEN_W;
+        int x = 0;
+        for (; x <= SCREEN_W - 4; x += 4) {
+            *(uint32_t*)(dst + x) = *(uint32_t*)(src + x);
+        }
+        for (; x < SCREEN_W; x++) dst[x] = src[x];
+        dirty_rows[y] = 1;
+    }
 }
 
 void graphics_fill(uint8_t color) {
