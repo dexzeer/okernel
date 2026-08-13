@@ -1,5 +1,5 @@
 #include "network.h"
-#include "rtl8139.h"
+#include "e1000.h"
 #include "../io.h"
 #include "../serial.h"
 
@@ -40,7 +40,7 @@ void arp_send_request(uint8_t* target_ip) {
     serial_putchar('\n');
 
     uint8_t frame[ETH_FRAME_MAX];
-    uint8_t* mac = rtl8139_get_mac();
+    uint8_t* mac = e1000_get_mac();
 
     // Ethernet header
     struct eth_header* eth = (struct eth_header*)frame;
@@ -63,7 +63,7 @@ void arp_send_request(uint8_t* target_ip) {
     int total = sizeof(struct eth_header) + sizeof(struct arp_header);
     while (total < ETH_FRAME_MIN) frame[total++] = 0;
 
-    rtl8139_send(frame, total);
+    e1000_send(frame, total);
 }
 
 static void handle_arp(uint8_t* data, uint32_t len) {
@@ -103,7 +103,7 @@ static void handle_arp(uint8_t* data, uint32_t len) {
             arp->target_ip[2] == our_ip[2] && arp->target_ip[3] == our_ip[3]) {
 
             uint8_t frame[ETH_FRAME_MAX];
-            uint8_t* mac = rtl8139_get_mac();
+            uint8_t* mac = e1000_get_mac();
 
             struct eth_header* eth = (struct eth_header*)frame;
             build_eth_header(eth, arp->sender_mac, mac, 0x0806);
@@ -123,7 +123,7 @@ static void handle_arp(uint8_t* data, uint32_t len) {
             int total = sizeof(struct eth_header) + sizeof(struct arp_header);
             while (total < ETH_FRAME_MIN) frame[total++] = 0;
 
-            rtl8139_send(frame, total);
+            e1000_send(frame, total);
             serial_puts("[arp] replied to request\n");
         }
     }
@@ -136,7 +136,7 @@ static uint16_t ip_checksum(struct ip_header* ip) {
 
 void icmp_send_ping(uint8_t* target_ip, uint16_t id, uint16_t seq) {
     uint8_t frame[ETH_FRAME_MAX];
-    uint8_t* mac = rtl8139_get_mac();
+    uint8_t* mac = e1000_get_mac();
 
     // Try to resolve target MAC
     uint8_t target_mac[6];
@@ -174,12 +174,12 @@ void icmp_send_ping(uint8_t* target_ip, uint16_t id, uint16_t seq) {
     icmp->checksum = net_checksum(icmp, sizeof(struct icmp_header));
 
     int total = sizeof(struct eth_header) + sizeof(struct ip_header) + sizeof(struct icmp_header);
-    rtl8139_send(frame, total);
+    e1000_send(frame, total);
 }
 
 void udp_send(uint8_t* dst_ip, uint16_t src_port, uint16_t dst_port, uint8_t* data, uint16_t len) {
     uint8_t frame[ETH_FRAME_MAX];
-    uint8_t* mac = rtl8139_get_mac();
+    uint8_t* mac = e1000_get_mac();
 
     uint8_t target_mac[6];
     if (!arp_resolve(dst_ip, target_mac)) {
@@ -215,7 +215,7 @@ void udp_send(uint8_t* dst_ip, uint16_t src_port, uint16_t dst_port, uint8_t* da
     }
 
     int total = sizeof(struct eth_header) + sizeof(struct ip_header) + sizeof(struct udp_header) + len;
-    rtl8139_send(frame, total);
+    e1000_send(frame, total);
 }
 
 static void handle_ip(uint8_t* data, uint32_t len) {
@@ -241,7 +241,7 @@ static void handle_ip(uint8_t* data, uint32_t len) {
             arp_resolve(ip->dst_ip, target_mac);
 
             uint8_t frame[ETH_FRAME_MAX];
-            uint8_t* mac = rtl8139_get_mac();
+            uint8_t* mac = e1000_get_mac();
             struct eth_header* eth = (struct eth_header*)frame;
             build_eth_header(eth, target_mac, mac, 0x0800);
 
@@ -255,7 +255,7 @@ static void handle_ip(uint8_t* data, uint32_t len) {
                 ((struct ip_header*)(frame + sizeof(struct eth_header)))->dst_ip[i] = ip->dst_ip[i];
             }
 
-            rtl8139_send(frame, total);
+            e1000_send(frame, total);
             serial_puts("[icmp] replied to ping\n");
         } else if (icmp->type == 0) { // Echo reply
             serial_puts("[icmp] got ping reply!\n");
@@ -278,9 +278,9 @@ static void handle_packet(uint8_t* data, uint32_t len) {
 
 void net_init(void) {
     serial_puts("[net] net_init start\n");
-    rtl8139_init();
+    e1000_init();
     serial_puts("[net] net_init done\n");
-    rtl8139_set_rx_callback(handle_packet);
+    e1000_set_rx_callback(handle_packet);
 
     serial_puts("[net] IP: ");
     static const char hex[] = "0123456789abcdef";

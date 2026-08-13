@@ -1,5 +1,5 @@
 #include "net/pci.h"
-#include "net/rtl8139.h"
+#include "net/e1000.h"
 #include "net/network.h"
 #include "graphics.h"
 #include "wallpaper.h"
@@ -417,7 +417,7 @@ void kernel_main(uint32_t mboot_addr) {
     // Main loop
     while (1) {
         // Poll network for incoming packets
-        rtl8139_poll();
+        e1000_poll();
 
         int mx = mouse_get_x();
         int my = mouse_get_y();
