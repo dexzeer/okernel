@@ -39,9 +39,12 @@ static const char hex[] = "0123456789abcdef";
 
 static uint16_t io_base = 0;
 static uint8_t mac_addr[6];
-static uint8_t rx_buffer[RX_BUFFER_SIZE]; // Static — avoids heap issues
+// RTL8139 RxBuf register is 16-bit — only addresses first 64KB
+// Use a fixed address at 0x8000 (safe, below kernel)
+#define RX_BUFFER_ADDR 0x8000
+static uint8_t rx_buffer[RX_BUFFER_SIZE]; // Kernel-side buffer (for reading)
 static uint32_t rx_offset = 0;
-static uint8_t tx_buffer[TX_BUFFER_SIZE]; // Single TX buffer for simplicity
+static uint8_t tx_buffer[TX_BUFFER_SIZE];
 static rtl8139_rx_callback_t rx_callback = 0;
 
 static void rtl8139_irq_handler(void) {
@@ -115,23 +118,25 @@ void rtl8139_init(void) {
     for (int i = 0; i < 6; i++) mac_addr[i] = inb(io_base + IDR0 + i);
     serial_puts("[rtl8139] MAC OK\n");
 
-    // Configure
-    serial_puts("[rtl8139] rx_buf_addr=");
-    uint32_t rxb = (uint32_t)rx_buffer;
-    serial_putchar(hex[(rxb >> 24) & 0xF]);
-    serial_putchar(hex[(rxb >> 20) & 0xF]);
-    serial_putchar(hex[(rxb >> 16) & 0xF]);
-    serial_putchar(hex[(rxb >> 12) & 0xF]);
-    serial_putchar(hex[(rxb >> 8) & 0xF]);
-    serial_putchar(hex[(rxb >> 4) & 0xF]);
-    serial_putchar(hex[rxb & 0xF]);
+    // Configure — simplest possible RxConfig
+    outl(io_base + RxBuf, RX_BUFFER_ADDR);
+    outl(io_base + TxConfig, 0x03000000);
+
+    // Try accept-all mode (APM|AM|AB = 0x1F) with WRAP
+    outw(io_base + RxConfig, 0x9F);
+
+    // Enable RX/TX
+    outb(io_base + Command, CMD_RX_ENABLE | CMD_TX_ENABLE);
+
+    // Force write RxConfig again
+    outw(io_base + RxConfig, 0x9F);
+
+    uint16_t v = inw(io_base + RxConfig);
+    serial_puts("[rtl8139] RxConf=");
+    serial_putchar(hex[(v >> 4) & 0xF]);
+    serial_putchar(hex[v & 0xF]);
     serial_putchar('\n');
 
-    outw(io_base + RxConfig, RX_CONFIG_WRAP | RX_CONFIG_APM | RX_CONFIG_AB);
-    outl(io_base + RxBuf, (uint32_t)rx_buffer);
-    serial_puts("[rtl8139] RxBuf set\n");
-    outl(io_base + TxConfig, 0x03000000);
-    outb(io_base + Command, CMD_RX_ENABLE | CMD_TX_ENABLE);
     // Register IRQ handler and enable NIC interrupts
     if (devs[idx].interrupt_line > 0) {
         irq_register_handler(devs[idx].interrupt_line, rtl8139_irq_handler);
@@ -169,7 +174,7 @@ void rtl8139_poll(void) {
         // Dump first 16 bytes of RX buffer
         serial_puts("[poll] buf[0:15]=");
         for (int i = 0; i < 16; i++) {
-            uint8_t b = rx_buffer[i];
+            uint8_t b = ((uint8_t*)RX_BUFFER_ADDR)[i];
             serial_putchar(hex[b >> 4]);
             serial_putchar(hex[b & 0xF]);
         }
@@ -197,7 +202,7 @@ void rtl8139_poll(void) {
         }
 
         if (rx_callback) {
-            rx_callback(rx_buffer + rx_offset + 4, pkt_len - 4);
+            rx_callback((uint8_t*)RX_BUFFER_ADDR + rx_offset + 4, pkt_len - 4);
         }
 
         // Advance to next packet (aligned to 4 bytes)
