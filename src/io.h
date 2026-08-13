@@ -27,4 +27,16 @@ static inline uint16_t inw(uint16_t port) {
     return result;
 }
 
+// Write a dword (32-bit) to a hardware port
+static inline void outl(uint16_t port, uint32_t data) {
+    __asm__ volatile("outl %0, %1" : : "a"(data), "Nd"(port));
+}
+
+// Read a dword (32-bit) from a hardware port
+static inline uint32_t inl(uint16_t port) {
+    uint32_t result;
+    __asm__ volatile("inl %1, %0" : "=a"(result) : "Nd"(port));
+    return result;
+}
+
 #endif

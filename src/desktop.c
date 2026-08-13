@@ -1,3 +1,6 @@
+#include "net/pci.h"
+#include "net/rtl8139.h"
+#include "net/network.h"
 #include "graphics.h"
 #include "wallpaper.h"
 #include "window.h"
@@ -180,8 +183,44 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  sysinfo   - open info window\n");
         window_puts(win_id, "  terminal  - open new terminal\n");
         window_puts(win_id, "  exit      - close this terminal\n");
+        window_puts(win_id, "  ping      - ping gateway\n");
+        window_puts(win_id, "  ip        - show IP address\n");
         window_puts(win_id, "  reboot    - reboot system\n");
         window_puts(win_id, "  shutdown  - power off\n");
+    }
+    else if (str_eq(cmd_buf, "ping")) {
+        uint8_t* gw = net_get_gateway();
+        window_puts(win_id, "Pinging gateway ");
+        char ip_buf[16];
+        int idx = 0;
+        for (int i = 0; i < 4; i++) {
+            uint8_t v = gw[i];
+            if (v >= 100) { ip_buf[idx++] = '0' + v/100; v %= 100; }
+            if (v >= 10) { ip_buf[idx++] = '0' + v/10; v %= 10; }
+            ip_buf[idx++] = '0' + v;
+            if (i < 3) ip_buf[idx++] = '.';
+        }
+        ip_buf[idx] = 0;
+        window_puts(win_id, ip_buf);
+        window_puts(win_id, "...\n");
+        icmp_send_ping(gw, 0x1234, 1);
+        arp_send_request(gw);
+    }
+    else if (str_eq(cmd_buf, "ip")) {
+        uint8_t* ip = net_get_ip();
+        window_puts(win_id, "IP: ");
+        char ip_buf[16];
+        int idx = 0;
+        for (int i = 0; i < 4; i++) {
+            uint8_t v = ip[i];
+            if (v >= 100) { ip_buf[idx++] = '0' + v/100; v %= 100; }
+            if (v >= 10) { ip_buf[idx++] = '0' + v/10; v %= 10; }
+            ip_buf[idx++] = '0' + v;
+            if (i < 3) ip_buf[idx++] = '.';
+        }
+        ip_buf[idx] = 0;
+        window_puts(win_id, ip_buf);
+        window_puts(win_id, "\n");
     }
     else if (str_eq(cmd_buf, "clear")) {
         window_clear(win_id);
@@ -366,6 +405,11 @@ void kernel_main(uint32_t mboot_addr) {
     window_set_text_color(term_wins[0], 15, 0); // Back to white
     shell_prompt(term_wins[0]);
 
+    // Init networking
+    serial_puts("[debug] calling rtl8139_init directly\n");
+    rtl8139_init();
+    serial_puts("[debug] rtl8139_init returned\n");
+
     // Init input
     mouse_init_fb();
     keyboard_init();
@@ -374,6 +418,9 @@ void kernel_main(uint32_t mboot_addr) {
 
     // Main loop
     while (1) {
+        // Poll network for incoming packets
+        rtl8139_poll();
+
         int mx = mouse_get_x();
         int my = mouse_get_y();
         int mb = mouse_get_left_button();
@@ -479,14 +526,11 @@ void kernel_main(uint32_t mboot_addr) {
         if (!mb) { mouse_down = 0; drag_win = -1; }
         else { mouse_down = 1; }
 
-        // Only blit wallpaper when windows change, then mark dirty
-        if (needs_redraw) {
-            graphics_blit_wallpaper();
-            for (int i = 0; i < MAX_WINDOWS; i++) {
-                struct window* w = window_get(i);
-                if (w && w->visible && !w->minimized) w->dirty = 1;
-            }
-            needs_redraw = 0;
+        // Blit wallpaper and mark windows dirty
+        graphics_blit_wallpaper();
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            struct window* w = window_get(i);
+            if (w && w->visible && !w->minimized) w->dirty = 1;
         }
 
         // Draw windows (only dirty ones)
