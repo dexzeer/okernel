@@ -5,6 +5,9 @@
 #include "io.h"
 #include <stdint.h>
 
+// Backbuffer from graphics.c
+extern uint8_t* graphics_get_buffer(void);
+
 static struct window windows[MAX_WINDOWS];
 
 // Mouse state
@@ -210,8 +213,8 @@ int window_create(const char* title, int x, int y, int w, int h) {
             windows[i].h = h;
             windows[i].visible = 1;
             windows[i].focused = 0;
+            windows[i].font_scale = 1;
 
-            // Copy title
             int j = 0;
             while (title[j] && j < 31) {
                 windows[i].title[j] = title[j];
@@ -219,16 +222,15 @@ int window_create(const char* title, int x, int y, int w, int h) {
             }
             windows[i].title[j] = 0;
 
-            // Calculate content area (inside borders + title)
+            // Calculate content area
             windows[i].content_w = (w - 2 * WIN_BORDER) / 8;
             windows[i].content_h = (h - WIN_TITLE_H - 2 * WIN_BORDER) / 8;
 
-            // Allocate content buffer
             int buf_size = windows[i].content_w * windows[i].content_h;
             windows[i].content = (uint16_t*)kmalloc(buf_size * sizeof(uint16_t));
             if (windows[i].content) {
                 for (int k = 0; k < buf_size; k++) {
-                    windows[i].content[k] = 0x0F00; // Space, white on black
+                    windows[i].content[k] = 0x0F00;
                 }
             }
 
@@ -238,6 +240,30 @@ int window_create(const char* title, int x, int y, int w, int h) {
         }
     }
     return -1;
+}
+
+void window_set_font_scale(int id, int scale) {
+    if (id < 0 || id >= MAX_WINDOWS) return;
+    struct window* w = &windows[id];
+    w->font_scale = scale;
+
+    // Recalculate content dimensions
+    int char_w = 8 * scale;
+    int char_h = 8 * scale;
+    w->content_w = (w->w - 2 * WIN_BORDER) / char_w;
+    w->content_h = (w->h - WIN_TITLE_H - 2 * WIN_BORDER) / char_h;
+
+    // Reallocate content buffer
+    if (w->content) kfree(w->content);
+    int buf_size = w->content_w * w->content_h;
+    w->content = (uint16_t*)kmalloc(buf_size * sizeof(uint16_t));
+    if (w->content) {
+        for (int k = 0; k < buf_size; k++) {
+            w->content[k] = 0x0F00;
+        }
+    }
+    w->cursor_x = 0;
+    w->cursor_y = 0;
 }
 
 void window_destroy(int id) {
@@ -253,6 +279,19 @@ void window_set_focus(int id) {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         windows[i].focused = (i == id);
     }
+}
+
+void window_set_close_button(int id, int has_close) {
+    if (id >= 0 && id < MAX_WINDOWS) windows[id].has_close_button = has_close;
+}
+
+int window_check_close_click(int id, int mx, int my) {
+    struct window* w = &windows[id];
+    if (!w->visible || !w->has_close_button) return 0;
+    // Close button: 12x12 at top-right of title bar
+    int bx = w->x + w->w - WIN_BORDER - 14;
+    int by = w->y + WIN_BORDER;
+    return (mx >= bx && mx < bx + 12 && my >= by && my < by + 12);
 }
 
 int window_get_focused(void) {
@@ -284,14 +323,24 @@ void window_draw(int id) {
     draw_string(w->x + WIN_BORDER + 4, w->y + WIN_BORDER + 2,
                 w->title, WIN_TITLE_FG, WIN_TITLE_BG);
 
+    // Draw close button if enabled
+    if (w->has_close_button) {
+        int bx = w->x + w->w - WIN_BORDER - 14;
+        int by = w->y + WIN_BORDER;
+        rect_fill(bx, by, 12, 12, 4); // Red background
+        draw_string(bx + 2, by + 2, "X", 15, 4); // White X on red
+    }
+
     // Draw content background
     rect_fill(w->x + WIN_BORDER, w->y + WIN_BORDER + WIN_TITLE_H,
               w->w - 2 * WIN_BORDER, w->h - WIN_TITLE_H - 2 * WIN_BORDER, WIN_BG);
 
-    // Draw content
+    // Draw content with font scale
     if (w->content) {
         int cx = w->x + WIN_BORDER;
         int cy = w->y + WIN_BORDER + WIN_TITLE_H;
+        int scale = w->font_scale;
+        int char_w = 8 * scale;
 
         for (int row = 0; row < w->content_h; row++) {
             for (int col = 0; col < w->content_w; col++) {
@@ -300,18 +349,22 @@ void window_draw(int id) {
                 uint8_t color = (entry >> 8) & 0xFF;
                 uint8_t fg = color & 0x0F;
                 uint8_t bg = (color >> 4) & 0x0F;
-                draw_char(cx + col * 8, cy + row * 8, c, fg, bg);
+                draw_char_scaled(cx + col * char_w, cy + row * (8 * scale), c, fg, bg, scale);
             }
         }
     }
 }
 
 void window_draw_all(void) {
+    int focused = -1;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (windows[i].visible) {
-            window_draw(i);
+            if (windows[i].focused) focused = i;
+            else window_draw(i);
         }
     }
+    // Draw focused window last (on top)
+    if (focused >= 0) window_draw(focused);
 }
 
 static void scroll_content(struct window* w) {

@@ -2,10 +2,13 @@
 #include "io.h"
 #include <stdint.h>
 
-// VGA framebuffer at 0xA0000
-static uint8_t* const VGA = (uint8_t*)0xA0000;
-static uint8_t backbuffer[SCREEN_W * SCREEN_H]; // Double buffer
-static uint8_t text_bg = 0; // Background color for text
+// Framebuffer and backbuffer
+static uint8_t* framebuffer = 0;
+static uint32_t fb_pitch = 0;
+static uint8_t backbuffer[SCREEN_W * SCREEN_H];
+
+// Dirty row tracking — only flush rows that changed
+static uint8_t dirty_rows[SCREEN_H];
 
 // 8x8 bitmap font (ASCII 32-127)
 // Each character is 8 bytes, each byte is a row of 8 pixels
@@ -167,9 +170,6 @@ struct mboot_info {
     uint8_t  framebuffer_type;
 } __attribute__((packed));
 
-static uint8_t* framebuffer = 0;
-static uint32_t fb_pitch = 0;
-
 void graphics_init(uint32_t mboot_addr) {
     struct mboot_info* mboot = (struct mboot_info*)mboot_addr;
 
@@ -183,22 +183,22 @@ void graphics_init(uint32_t mboot_addr) {
         fb_pitch = SCREEN_W;
     }
 
-    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
-        backbuffer[i] = 0;
-    }
+    // Clear backbuffer and mark all rows dirty
+    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) backbuffer[i] = 0;
+    for (int i = 0; i < SCREEN_H; i++) dirty_rows[i] = 1;
 }
 
 void putpixel(int x, int y, uint8_t color) {
     if (x >= 0 && x < SCREEN_W && y >= 0 && y < SCREEN_H) {
         backbuffer[y * SCREEN_W + x] = color;
+        dirty_rows[y] = 1;
     }
 }
 
 void rect_fill(int x, int y, int w, int h, uint8_t color) {
+    if (!framebuffer) return;
     for (int j = y; j < y + h; j++) {
-        for (int i = x; i < x + w; i++) {
-            putpixel(i, j, color);
-        }
+        hline(x, j, w, color);
     }
 }
 
@@ -212,9 +212,13 @@ void rect_outline(int x, int y, int w, int h, uint8_t color, int t) {
 }
 
 void hline(int x, int y, int len, uint8_t color) {
-    for (int i = 0; i < len; i++) {
-        putpixel(x + i, y, color);
-    }
+    if (y < 0 || y >= SCREEN_H) return;
+    if (x < 0) { len += x; x = 0; }
+    if (x + len > SCREEN_W) len = SCREEN_W - x;
+    if (len <= 0) return;
+    uint8_t* dst = backbuffer + y * SCREEN_W + x;
+    for (int i = 0; i < len; i++) dst[i] = color;
+    dirty_rows[y] = 1;
 }
 
 void vline(int x, int y, int len, uint8_t color) {
@@ -264,26 +268,63 @@ void draw_string(int x, int y, const char* str, uint8_t fg, uint8_t bg) {
     }
 }
 
+void draw_char_scaled(int x, int y, char c, uint8_t fg, uint8_t bg, int scale) {
+    int idx = c - 32;
+    if (idx < 0 || idx > 95) return;
+
+    for (int row = 0; row < 8; row++) {
+        uint8_t bits = font8x8[idx][row];
+        for (int col = 0; col < 8; col++) {
+            uint8_t color = (bits & (1 << col)) ? fg : bg;
+            // Draw each pixel as scale x scale block
+            for (int sy = 0; sy < scale; sy++) {
+                for (int sx = 0; sx < scale; sx++) {
+                    putpixel(x + col * scale + sx, y + row * scale + sy, color);
+                }
+            }
+        }
+    }
+}
+
+void draw_string_scaled(int x, int y, const char* str, uint8_t fg, uint8_t bg, int scale) {
+    while (*str) {
+        draw_char_scaled(x, y, *str, fg, bg, scale);
+        x += 8 * scale;
+        str++;
+    }
+}
+
 uint8_t* graphics_get_buffer(void) {
     return backbuffer;
 }
 
+void graphics_mark_dirty(int y) {
+    if (y >= 0 && y < SCREEN_H) dirty_rows[y] = 1;
+}
+
 void graphics_fill(uint8_t color) {
-    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
-        backbuffer[i] = color;
+    for (int y = 0; y < SCREEN_H; y++) {
+        uint8_t* dst = backbuffer + y * SCREEN_W;
+        for (int x = 0; x < SCREEN_W; x++) dst[x] = color;
+        dirty_rows[y] = 1;
     }
 }
 
 void graphics_flush(void) {
     if (!framebuffer) return;
-
     for (int y = 0; y < SCREEN_H; y++) {
-        for (int x = 0; x < SCREEN_W; x++) {
-            framebuffer[y * fb_pitch + x] = backbuffer[y * SCREEN_W + x];
+        if (!dirty_rows[y]) continue;
+        uint8_t* src = backbuffer + y * SCREEN_W;
+        uint8_t* dst = framebuffer + y * fb_pitch;
+        int x = 0;
+        for (; x <= SCREEN_W - 4; x += 4) {
+            *(uint32_t*)(dst + x) = *(uint32_t*)(src + x);
         }
+        for (; x < SCREEN_W; x++) dst[x] = src[x];
+        dirty_rows[y] = 0;
     }
 }
 
 void graphics_set_bg(uint8_t bg) {
-    text_bg = bg;
+    (void)bg;
 }

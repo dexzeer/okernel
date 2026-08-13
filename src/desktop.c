@@ -43,11 +43,25 @@ static int drag_win = -1;
 static int drag_off_x = 0;
 static int drag_off_y = 0;
 
-// Shell state
-static int shell_win = -1;
-static char shell_buf[256];
-static int shell_len = 0;
+// Terminal management
+#define MAX_TERMINALS 8
+static int term_wins[MAX_TERMINALS];
+static int term_count = 0;
+static int active_term_idx = 0;
+
+// Per-terminal shell state
+static char term_bufs[MAX_TERMINALS][256];
+static int term_lens[MAX_TERMINALS];
+
+// System info window
+static int info_win = -1;
+
 static uint32_t tick_count = 0;
+
+// FPS tracking
+static uint32_t frame_count = 0;
+static uint32_t fps = 0;
+static uint32_t last_fps_tick = 0;
 
 static void shell_prompt(int win_id) {
     window_puts(win_id, "okernel> ");
@@ -59,6 +73,79 @@ static int str_eq(const char* a, const char* b) {
         a++; b++;
     }
     return *a == *b;
+}
+
+// Int to string helper
+static void put_uint(char* buf, uint32_t val) {
+    if (val == 0) { buf[0] = '0'; buf[1] = 0; return; }
+    char rev[16];
+    int ri = 0;
+    while (val > 0) { rev[ri++] = '0' + (val % 10); val /= 10; }
+    int i = 0;
+    while (ri > 0) { buf[i++] = rev[--ri]; }
+    buf[i] = 0;
+}
+
+static void open_sysinfo(void) {
+    if (info_win >= 0) return; // Already open
+    info_win = window_create("System Info", 240, 60, 280, 220);
+    window_set_close_button(info_win, 1);
+    window_puts(info_win, "okernel v0.2\n");
+    window_puts(info_win, "Desktop Edition\n\n");
+    window_puts(info_win, "Resolution: 640x480\n");
+    window_puts(info_win, "Shell: okernel sh\n");
+    window_puts(info_win, "Commands: help, clear,\n");
+    window_puts(info_win, "echo, mem, uptime,\n");
+    window_puts(info_win, "about, neofetch,\n");
+    window_puts(info_win, "terminal, exit,\n");
+    window_puts(info_win, "sysinfo, reboot,\n");
+    window_puts(info_win, "shutdown\n");
+}
+
+static void close_sysinfo(void) {
+    if (info_win >= 0) {
+        window_destroy(info_win);
+        info_win = -1;
+    }
+}
+
+static int create_terminal(void) {
+    if (term_count >= MAX_TERMINALS) return -1;
+    int x = 30 + term_count * 25;
+    int y = 30 + term_count * 20;
+    int win_id = window_create("Terminal", x, y, 380, 300);
+    window_set_close_button(win_id, 1);
+    term_wins[term_count] = win_id;
+    term_lens[term_count] = 0;
+    term_bufs[term_count][0] = 0;
+    term_count++;
+    return win_id;
+}
+
+static int find_term_idx(int win_id) {
+    for (int i = 0; i < term_count; i++) {
+        if (term_wins[i] == win_id) return i;
+    }
+    return -1;
+}
+
+static void destroy_terminal(int idx) {
+    if (idx < 0 || idx >= term_count) return;
+    // Can't close the main terminal (idx 0)
+    if (idx == 0) return;
+
+    window_destroy(term_wins[idx]);
+
+    // Shift remaining terminals down
+    for (int i = idx; i < term_count - 1; i++) {
+        term_wins[i] = term_wins[i + 1];
+        term_lens[i] = term_lens[i + 1];
+        for (int j = 0; j < 256; j++) term_bufs[i][j] = term_bufs[i + 1][j];
+    }
+    term_count--;
+
+    // Fix active index
+    if (active_term_idx >= term_count) active_term_idx = term_count - 1;
 }
 
 static void shell_execute(int win_id, const char* input) {
@@ -77,15 +164,18 @@ static void shell_execute(int win_id, const char* input) {
 
     if (str_eq(cmd_buf, "help")) {
         window_puts(win_id, "Commands:\n");
-        window_puts(win_id, "  help     - show this message\n");
-        window_puts(win_id, "  clear    - clear terminal\n");
-        window_puts(win_id, "  echo     - print text\n");
-        window_puts(win_id, "  mem      - memory info\n");
-        window_puts(win_id, "  uptime   - system uptime\n");
-        window_puts(win_id, "  about    - about okernel\n");
-        window_puts(win_id, "  neofetch - system info\n");
-        window_puts(win_id, "  reboot   - reboot system\n");
-        window_puts(win_id, "  shutdown - power off\n");
+        window_puts(win_id, "  help      - show this\n");
+        window_puts(win_id, "  clear     - clear terminal\n");
+        window_puts(win_id, "  echo      - print text\n");
+        window_puts(win_id, "  mem       - memory info\n");
+        window_puts(win_id, "  uptime    - system uptime\n");
+        window_puts(win_id, "  about     - about okernel\n");
+        window_puts(win_id, "  neofetch  - system info\n");
+        window_puts(win_id, "  sysinfo   - open info window\n");
+        window_puts(win_id, "  terminal  - open new terminal\n");
+        window_puts(win_id, "  exit      - close this terminal\n");
+        window_puts(win_id, "  reboot    - reboot system\n");
+        window_puts(win_id, "  shutdown  - power off\n");
     }
     else if (str_eq(cmd_buf, "clear")) {
         window_clear(win_id);
@@ -95,74 +185,32 @@ static void shell_execute(int win_id, const char* input) {
         window_put_char(win_id, '\n');
     }
     else if (str_eq(cmd_buf, "mem")) {
-        uint32_t total = pmm_get_total_pages() * 4;
-        uint32_t used = pmm_get_used_pages() * 4;
-        uint32_t free = pmm_get_free_pages() * 4;
-
+        uint32_t total = pmm_get_total_pages() * 4 / 1024;
+        uint32_t used = pmm_get_used_pages() * 4 / 1024;
+        uint32_t free = pmm_get_free_pages() * 4 / 1024;
         char buf[16];
-        uint32_t tmp;
 
         window_puts(win_id, "Memory:\n");
-
-        // Total
-        tmp = total / 1024; int idx = 0;
-        if (tmp == 0) { buf[idx++] = '0'; }
-        else { char rev[16]; int ri = 0; while (tmp > 0) { rev[ri++] = '0' + (tmp % 10); tmp /= 10; } while (ri > 0) { buf[idx++] = rev[--ri]; } }
-        buf[idx] = 0;
-        window_puts(win_id, "  Total: ");
-        window_puts(win_id, buf);
-        window_puts(win_id, " MB\n");
-
-        // Used
-        tmp = used / 1024; idx = 0;
-        if (tmp == 0) { buf[idx++] = '0'; }
-        else { char rev[16]; int ri = 0; while (tmp > 0) { rev[ri++] = '0' + (tmp % 10); tmp /= 10; } while (ri > 0) { buf[idx++] = rev[--ri]; } }
-        buf[idx] = 0;
-        window_puts(win_id, "  Used:  ");
-        window_puts(win_id, buf);
-        window_puts(win_id, " MB\n");
-
-        // Free
-        tmp = free / 1024; idx = 0;
-        if (tmp == 0) { buf[idx++] = '0'; }
-        else { char rev[16]; int ri = 0; while (tmp > 0) { rev[ri++] = '0' + (tmp % 10); tmp /= 10; } while (ri > 0) { buf[idx++] = rev[--ri]; } }
-        buf[idx] = 0;
-        window_puts(win_id, "  Free:  ");
-        window_puts(win_id, buf);
-        window_puts(win_id, " MB\n");
+        put_uint(buf, total); window_puts(win_id, "  Total: "); window_puts(win_id, buf); window_puts(win_id, " MB\n");
+        put_uint(buf, used);  window_puts(win_id, "  Used:  "); window_puts(win_id, buf); window_puts(win_id, " MB\n");
+        put_uint(buf, free);  window_puts(win_id, "  Free:  "); window_puts(win_id, buf); window_puts(win_id, " MB\n");
     }
     else if (str_eq(cmd_buf, "uptime")) {
-        // Approximate uptime from tick count (IRQ0 fires ~18.2 Hz)
         uint32_t seconds = tick_count / 18;
-        uint32_t minutes = seconds / 60;
-        uint32_t hours = minutes / 60;
+        uint32_t h = seconds / 3600;
+        uint32_t m = (seconds % 3600) / 60;
+        uint32_t s = seconds % 60;
         char buf[16];
         int idx = 0;
 
-        // Hours
-        uint32_t h = hours;
-        if (h == 0) { buf[idx++] = '0'; }
-        else { char rev[16]; int ri = 0; while (h > 0) { rev[ri++] = '0' + (h % 10); h /= 10; } while (ri > 0) { buf[idx++] = rev[--ri]; } }
-        buf[idx++] = 'h';
-
-        // Minutes
-        uint32_t m = minutes % 60;
-        if (m < 10) buf[idx++] = '0';
-        h = m;
-        { char rev[16]; int ri = 0; while (h > 0) { rev[ri++] = '0' + (h % 10); h /= 10; } while (ri > 0) { buf[idx++] = rev[--ri]; } }
-        buf[idx++] = 'm';
-
-        // Seconds
-        uint32_t s = seconds % 60;
-        if (s < 10) buf[idx++] = '0';
-        h = s;
-        { char rev[16]; int ri = 0; while (h > 0) { rev[ri++] = '0' + (h % 10); h /= 10; } while (ri > 0) { buf[idx++] = rev[--ri]; } }
-        buf[idx++] = 's';
-        buf[idx] = 0;
-
-        window_puts(win_id, "Uptime: ");
-        window_puts(win_id, buf);
-        window_put_char(win_id, '\n');
+        put_uint(buf, h); int i = 0; while (buf[i]) window_put_char(win_id, buf[i++]);
+        window_put_char(win_id, 'h');
+        if (m < 10) window_put_char(win_id, '0');
+        put_uint(buf, m); i = 0; while (buf[i]) window_put_char(win_id, buf[i++]);
+        window_put_char(win_id, 'm');
+        if (s < 10) window_put_char(win_id, '0');
+        put_uint(buf, s); i = 0; while (buf[i]) window_put_char(win_id, buf[i++]);
+        window_puts(win_id, "s\n");
     }
     else if (str_eq(cmd_buf, "about")) {
         window_puts(win_id, "okernel v0.2\n");
@@ -170,29 +218,42 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "Built from scratch\n");
         window_puts(win_id, "in C and x86 assembly\n");
     }
-    else if (str_eq(cmd_buf, "neofetch")) {
-        window_puts(win_id, "        ___         \n");
-        window_puts(win_id, "       /   \\  okernel\n");
-        window_puts(win_id, "      /     \\ v0.2  \n");
-        window_puts(win_id, "     /  ____ \\      \n");
-        window_puts(win_id, "    /  /    \\ \\     \n");
-        window_puts(win_id, "   /__/      \\_\\    \n");
-        window_puts(win_id, "OS: okernel 0.2\n");
+    else if (str_eq(cmd_buf, "neofetch") || str_eq(cmd_buf, "sysinfo")) {
+        window_puts(win_id, "okernel v0.2\n");
         window_puts(win_id, "Resolution: 640x480\n");
         window_puts(win_id, "Shell: okernel sh\n");
         window_puts(win_id, "Memory: ");
-        // Show used/total
         uint32_t total = pmm_get_total_pages() * 4 / 1024;
         uint32_t used = pmm_get_used_pages() * 4 / 1024;
         char buf[16];
-        uint32_t tmp = used; int idx = 0;
-        if (tmp == 0) { buf[idx++] = '0'; }
-        else { char rev[16]; int ri = 0; while (tmp > 0) { rev[ri++] = '0' + (tmp % 10); tmp /= 10; } while (ri > 0) { buf[idx++] = rev[--ri]; } }
-        buf[idx++] = '/'; tmp = total;
-        { char rev[16]; int ri = 0; while (tmp > 0) { rev[ri++] = '0' + (tmp % 10); tmp /= 10; } while (ri > 0) { buf[idx++] = rev[--ri]; } }
-        buf[idx++] = 'M'; buf[idx] = 0;
-        window_puts(win_id, buf);
-        window_put_char(win_id, '\n');
+        put_uint(buf, used); window_puts(win_id, buf);
+        window_puts(win_id, "/");
+        put_uint(buf, total); window_puts(win_id, buf);
+        window_puts(win_id, "MB\n");
+        open_sysinfo();
+    }
+    else if (str_eq(cmd_buf, "terminal")) {
+        int new_win = create_terminal();
+        if (new_win >= 0) {
+            // Focus the new terminal
+            active_term_idx = term_count - 1;
+            window_set_focus(new_win);
+            shell_prompt(new_win);
+            window_puts(win_id, "Terminal opened.\n");
+        } else {
+            window_puts(win_id, "Max terminals reached.\n");
+        }
+    }
+    else if (str_eq(cmd_buf, "exit")) {
+        int idx = find_term_idx(win_id);
+        if (idx == 0) {
+            window_puts(win_id, "Cannot close main terminal.\n");
+        } else {
+            destroy_terminal(idx);
+            // Focus the main terminal
+            active_term_idx = 0;
+            window_set_focus(term_wins[0]);
+        }
     }
     else if (str_eq(cmd_buf, "reboot")) {
         window_puts(win_id, "Rebooting...\n");
@@ -207,7 +268,7 @@ static void shell_execute(int win_id, const char* input) {
         while (1) { __asm__ volatile("hlt"); }
     }
     else {
-        window_puts(win_id, "Unknown command: ");
+        window_puts(win_id, "Unknown: ");
         window_puts(win_id, cmd_buf);
         window_put_char(win_id, '\n');
     }
@@ -217,20 +278,23 @@ static void on_keypress(char c) {
     int win_id = window_get_focused();
     if (win_id < 0) return;
 
+    int tidx = find_term_idx(win_id);
+    if (tidx < 0) return; // Not a terminal window
+
     if (c == '\b') {
-        if (shell_len > 0) {
-            shell_len--;
+        if (term_lens[tidx] > 0) {
+            term_lens[tidx]--;
             window_put_char(win_id, '\b');
         }
     } else if (c == '\n') {
         window_put_char(win_id, '\n');
-        shell_buf[shell_len] = 0;
-        shell_execute(win_id, shell_buf);
-        shell_len = 0;
+        term_bufs[tidx][term_lens[tidx]] = 0;
+        shell_execute(win_id, term_bufs[tidx]);
+        term_lens[tidx] = 0;
         shell_prompt(win_id);
     } else {
-        if (shell_len < 255) {
-            shell_buf[shell_len++] = c;
+        if (term_lens[tidx] < 255) {
+            term_bufs[tidx][term_lens[tidx]++] = c;
             window_put_char(win_id, c);
         }
     }
@@ -246,40 +310,24 @@ void kernel_main(uint32_t mboot_addr) {
     idt_init();
     memory_init(mboot_addr);
 
-    // Get framebuffer address from multiboot and set up paging
     struct mboot_info* mboot = (struct mboot_info*)mboot_addr;
     uint32_t fb_addr = 0;
     if (mboot->flags & (1 << 12)) {
         fb_addr = (uint32_t)mboot->framebuffer_addr;
     }
-    if (fb_addr) {
-        paging_init(fb_addr);
-    }
+    if (fb_addr) paging_init(fb_addr);
 
     graphics_init(mboot_addr);
     window_init();
-
-    // Register timer callback for uptime
     irq_register_handler(0, on_timer);
 
-    // Create terminal window
-    shell_win = window_create("Terminal", 40, 40, 380, 300);
-    window_set_focus(shell_win);
-    shell_prompt(shell_win);
-
-    // Create system info window (neofetch-style)
-    int info_win = window_create("System Info", 260, 60, 300, 240);
-    window_puts(info_win, "        ___         \n");
-    window_puts(info_win, "       /   \\  okernel\n");
-    window_puts(info_win, "      /     \\ v0.2  \n");
-    window_puts(info_win, "     /  ____ \\      \n");
-    window_puts(info_win, "    /  /    \\ \\     \n");
-    window_puts(info_win, "   /__/      \\_\\    \n");
-    window_puts(info_win, "OS: okernel 0.2\n");
-    window_puts(info_win, "Res: 640x480\n");
-    window_puts(info_win, "Shell: okernel sh\n");
-    window_puts(info_win, "Type 'help' in\n");
-    window_puts(info_win, "terminal for cmds\n");
+    // Create main terminal
+    term_wins[0] = window_create("Terminal", 30, 30, 380, 300);
+    window_set_close_button(term_wins[0], 1);
+    term_count = 1;
+    active_term_idx = 0;
+    window_set_focus(term_wins[0]);
+    shell_prompt(term_wins[0]);
 
     // Init input
     mouse_init_fb();
@@ -294,15 +342,39 @@ void kernel_main(uint32_t mboot_addr) {
         int mb = mouse_get_left_button();
 
         if (mb && !mouse_down) {
+            int clicked = 0;
             for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
                 struct window* w = window_get(i);
                 if (!w || !w->visible) continue;
-                if (mx >= w->x && mx < w->x + w->w &&
+
+                // Check close button
+                if (window_check_close_click(i, mx, my)) {
+                    int tidx = find_term_idx(i);
+                    if (tidx >= 0) {
+                        destroy_terminal(tidx);
+                        if (term_count > 0) {
+                            active_term_idx = 0;
+                            window_set_focus(term_wins[0]);
+                        }
+                    } else if (i == info_win) {
+                        close_sysinfo();
+                    }
+                    clicked = 1;
+                    break;
+                }
+
+                // Check title bar for drag/focus
+                if (!clicked && mx >= w->x && mx < w->x + w->w &&
                     my >= w->y && my < w->y + WIN_TITLE_H + WIN_BORDER) {
                     drag_win = i;
                     drag_off_x = mx - w->x;
                     drag_off_y = my - w->y;
-                    window_set_focus(i);
+
+                    int tidx = find_term_idx(i);
+                    if (tidx >= 0) {
+                        active_term_idx = tidx;
+                        window_set_focus(i);
+                    }
                     break;
                 }
             }
@@ -323,20 +395,37 @@ void kernel_main(uint32_t mboot_addr) {
         if (!mb) { mouse_down = 0; drag_win = -1; }
         else { mouse_down = 1; }
 
-        // Draw wallpaper
+        // Draw wallpaper every frame (clears old window positions)
         for (int y = 0; y < SCREEN_H; y++) {
             uint8_t color = 1 + (y / 60);
             if (color > 9) color = 9;
             hline(0, y, SCREEN_W, color);
         }
-
-        // Draw dots pattern
         for (int y = 0; y < SCREEN_H; y += 30)
             for (int x = 0; x < SCREEN_W; x += 30)
                 putpixel(x, y, 3);
 
+        mouse_hide_cursor();
         window_draw_all();
         mouse_draw_cursor();
+
+        // FPS counter
+        frame_count++;
+        if (tick_count - last_fps_tick >= 18) {
+            fps = frame_count;
+            frame_count = 0;
+            last_fps_tick = tick_count;
+        }
+        char fps_buf[16] = "FPS: ";
+        char num[8];
+        put_uint(num, fps);
+        int fi = 5;
+        int ni = 0;
+        while (num[ni]) fps_buf[fi++] = num[ni++];
+        fps_buf[fi] = 0;
+        rect_fill(SCREEN_W - 60, 2, 58, 10, 0);
+        draw_string(SCREEN_W - 58, 3, fps_buf, 15, 0);
+
         graphics_flush();
     }
 }

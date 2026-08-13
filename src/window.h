@@ -18,11 +18,12 @@ struct window {
     int x, y, w, h;
     int visible;
     int focused;
+    int has_close_button;
     char title[32];
-    // Terminal content buffer (inside the window)
-    uint16_t* content;  // char + color pairs
+    uint16_t* content;
     int cursor_x, cursor_y;
-    int content_w, content_h; // Character dimensions
+    int content_w, content_h;
+    int font_scale;
 };
 
 void window_init(void);
@@ -35,6 +36,9 @@ void window_draw_all(void);
 void window_put_char(int id, char c);
 void window_puts(int id, const char* str);
 void window_clear(int id);
+void window_set_font_scale(int id, int scale);
+void window_set_close_button(int id, int has_close);
+int window_check_close_click(int id, int mx, int my);
 struct window* window_get(int id);
 
 // Mouse

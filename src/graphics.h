@@ -30,11 +30,20 @@ void line(int x0, int y0, int x1, int y1, uint8_t color);
 // Draw a character bitmap (8x8 font)
 void draw_char(int x, int y, char c, uint8_t fg, uint8_t bg);
 
+// Draw a character scaled by factor (1=8x8, 2=16x16, 3=24x24)
+void draw_char_scaled(int x, int y, char c, uint8_t fg, uint8_t bg, int scale);
+
 // Draw a string
 void draw_string(int x, int y, const char* str, uint8_t fg, uint8_t bg);
 
+// Draw a string scaled
+void draw_string_scaled(int x, int y, const char* str, uint8_t fg, uint8_t bg, int scale);
+
 // Get screen buffer pointer
 uint8_t* graphics_get_buffer(void);
+
+// Mark a row as dirty for optimized flushing
+void graphics_mark_dirty(int y);
 
 // Fill entire screen with a color
 void graphics_fill(uint8_t color);
