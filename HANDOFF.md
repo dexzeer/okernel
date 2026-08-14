@@ -7,7 +7,7 @@ okernel is a from-scratch operating system built in C and x86 assembly. It has t
 - **Text mode** (`make text`) — VGA text terminal with commands, scrolling, terminal multiplexing
 - **Desktop mode** (`make desktop`) — 640x480 graphical desktop with windows, mouse, and shell
 
-Current version: **v0.2** (desktop edition)
+Current version: **v0.3** (desktop edition with networking)
 
 ---
 
@@ -38,10 +38,15 @@ okernel/
 │   ├── vga.c/.h           # VGA text mode driver (text mode build only)
 │   ├── terminal.c/.h      # Terminal multiplexer (text mode build only)
 │   └── shell.c/.h         # Shell commands (text mode build only)
+│   │
+│   └── net/
+│       ├── pci.c/.h       # PCI bus enumeration
+│       ├── e1000.c/.h     # e1000 NIC driver (TX + RX working)
+│       ├── rtl8139.c/.h   # RTL8139 NIC driver (TX working, RX broken)
+│       └── network.c/.h   # ARP, IP, ICMP, UDP, TCP, DNS, HTTP
 │
 ├── linker.ld              # Linker script (kernel at 1MB, symbols for memory bounds)
 ├── Makefile               # Build system (text, desktop, clean, run targets)
-├── service.sh             # Quick launcher: qemu-system-i386 -cdrom okernel.iso -boot d
 └── okernel.txt            # ASCII art logo (user-created)
 ```
 
@@ -53,13 +58,15 @@ okernel/
 1. GRUB loads kernel via multiboot spec
 2. `start.asm`: sets up stack, pushes multiboot args, calls `kernel_main()`
 3. Desktop mode: `start.asm` requests 640x480 linear framebuffer from GRUB
-4. `kernel_main()` initializes: GDT → IDT → memory → paging → graphics → windows → mouse → keyboard → main loop
+4. `kernel_main()` initializes: GDT → IDT → memory → paging → graphics → windows → mouse → keyboard → networking → main loop
 
 ### Memory Layout
 - Kernel loaded at 1MB (0x100000)
 - BSS contains static variables (backbuffer: 307KB, window buffers, etc.)
 - Kernel heap at ~4MB (bump allocator, 4MB)
 - Page tables identity-map first 4MB + framebuffer at 0xFD000000
+- e1000 MMIO mapped via `paging_map()`
+- **NIC RX/TX buffers at 0x80000-0x9FFFF** (low memory, below 1MB, for DMA)
 
 ### Display Pipeline
 1. All drawing goes to backbuffer (307KB array)
@@ -71,6 +78,17 @@ okernel/
 - PS/2 keyboard → IRQ1 → scancode → ASCII → shell/terminal
 - PS/2 mouse → IRQ12 → 3-byte packets → smoothed coordinates → cursor
 - Mouse smoothing: 4-sample moving average
+
+### Networking Stack
+1. **PCI**: Bus enumeration, finds e1000 (8086:100E)
+2. **e1000 driver**: MMIO-based, TX + RX working. RX buffers in low memory for DMA.
+3. **ARP**: Request/reply, single-entry cache
+4. **IP**: Header construction, checksum
+5. **ICMP**: Echo request/reply (ping)
+6. **UDP**: Send/receive
+7. **DNS**: Query encoder/decoder, resolves via QEMU SLIRP (10.0.2.3)
+8. **TCP**: Minimal stack — SYN/SYN-ACK/ACK/FIN, data transfer
+9. **HTTP**: GET requests, response buffering
 
 ---
 
@@ -86,50 +104,15 @@ make clean         # Remove all build artifacts
 
 ### QEMU flags
 ```bash
-# Desktop mode (required for framebuffer display)
-qemu-system-i386 -cdrom okernel-desktop.iso -boot d -vga std
+# Desktop mode with networking (e1000)
+qemu-system-i386 -cdrom okernel-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0
 
-# Text mode (standard VGA)
-qemu-system-i386 -cdrom okernel-text.iso -boot d
+# Debug mode (serial output + networking)
+qemu-system-i386 -cdrom okernel-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0 -nographic -serial stdio
 
-# Debug mode (serial output)
-qemu-system-i386 -cdrom okernel-desktop.iso -boot d -vga std -nographic -serial stdio
+# Packet capture
+qemu-system-i386 ... -object filter-dump,id=dump0,netdev=net0,file=/tmp/net.pcap
 ```
-
----
-
-## Key Technical Details
-
-### VGA Mode 13h (Text Mode Build)
-- 320x200, 256 colors, packed pixel
-- Set via I/O port manipulation (no BIOS interrupts in protected mode)
-- Framebuffer at 0xA0000
-
-### GRUB Framebuffer (Desktop Build)
-- 640x480, 8bpp indexed color
-- Address provided by GRUB via multiboot info (typically 0xFD000000)
-- Requires page tables to access (above 4MB)
-- Identity-mapped via `paging_init()`
-
-### Interrupts
-- PIC remapped to INT 32-47 (IRQ 0-15)
-- IRQ0: timer (~18.2 Hz, used for uptime)
-- IRQ1: keyboard (scancode set 1)
-- IRQ12: mouse (3-byte PS/2 packets)
-- ISR stubs in `isr.asm` save CPU state, call C handlers
-
-### Window System
-- Up to 8 windows, each with own content buffer
-- Focused window drawn last (z-order)
-- Close button (12x12 red X) in title bar
-- Title bar drag to move windows
-- Per-window font scale (1x or 2x)
-
-### Terminal System (Text Mode)
-- 8 terminal slots, each with 80x24 content buffer
-- Scrollback: 200 lines history per terminal
-- Keyboard scrolling: Page Up/Down, Arrow keys, Home
-- Main terminal (ID 0) cannot be closed
 
 ---
 
@@ -148,6 +131,10 @@ qemu-system-i386 -cdrom okernel-desktop.iso -boot d -vga std -nographic -serial 
 | sysinfo | Open System Info window |
 | terminal | Open new terminal window |
 | exit | Close current terminal |
+| ping | Ping gateway (10.0.2.2) |
+| ip | Show IP address |
+| resolve [host] | DNS lookup |
+| browse [host] [path] | HTTP GET request |
 | reboot | Reset CPU |
 | shutdown | ACPI power off |
 
@@ -161,22 +148,33 @@ Same as above plus: `list`, `switch N`
 - **No virtual memory** — identity mapping only, no user-mode processes
 - **No filesystem** — everything in memory, no disk I/O
 - **No sound** — no audio drivers
-- **No networking** — no NIC drivers
 - **Bump allocator** — heap doesn't free (kfree is a no-op)
 - **Single CPU** — no SMP support
 - **No real mouse scroll** — PS/2 3-byte mode only (scroll via keyboard)
+- **Minimal TCP** — no retransmission, no windowing, no congestion control
+- **HTTP limited** — single GET request, no chunked encoding, no HTTPS
 
 ---
 
-## Future Ideas (v0.3+)
+## Network Stack Details
 
-- VESA/VBE for higher resolutions (1024x768+)
-- Basic filesystem (FAT12 or custom)
-- Process scheduler with context switching
-- User-mode applications
-- PCI enumeration + drivers
-- Sound (PC speaker or AC97)
-- Networking (e1000 or RTL8139)
+### e1000 Driver
+- MMIO-based, supports TX and RX
+- RX/TX buffers at fixed low memory addresses (0x80000-0x9FFFF)
+- Descriptors at 0x80000 (RX) and 0x90000 (TX)
+- IRQ handler + polling mode
+- MAC address read from RAL/RAH registers after reset
+
+### QEMU Networking
+- User-mode SLIRP networking
+- Guest IP: 10.0.2.15 (DHCP default)
+- Gateway: 10.0.2.2
+- DNS server: 10.0.2.3
+
+### Debugging
+- Serial port (COM1) output for all network events
+- Packet capture via QEMU filter-dump
+- Enable with `-nographic -serial stdio` for serial debug
 
 ---
 
@@ -191,5 +189,19 @@ Same as above plus: `list`, `switch N`
 | `src/window.c` | Window manager + mouse driver |
 | `src/paging.c` | Page tables — required for framebuffer access |
 | `src/memory.c` | Physical memory manager + heap |
+| `src/net/e1000.c` | e1000 NIC driver — TX + RX |
+| `src/net/network.c` | Full network stack — ARP, IP, ICMP, UDP, TCP, DNS, HTTP |
 | `linker.ld` | Memory layout — kernel load address, symbols |
 | `Makefile` | Build system — text vs desktop targets |
+
+---
+
+## Critical Bugs Found (and Fixed)
+
+1. **`section .note.GNU-stack` placement**: Must be LAST in .asm files
+2. **Compiler flags**: `-fno-pic -fno-pie -mno-red-zone` required for freestanding kernel
+3. **Font bit order**: 8x8 font uses LSB-first (bit 0 = leftmost pixel)
+4. **Framebuffer access**: Above 4MB, requires identity-mapped page tables
+5. **e1000 register offsets**: RDH/RDT/TDH/TDT are at 0x02810/0x02818/0x03810/0x03818 (not 0x0281/0x0282)
+6. **e1000 RX buffers**: Must be in low memory (<1MB) for DMA access
+7. **16-bit MMIO registers**: Use 16-bit writes for RDH/RDT/TDH/TDT to avoid corrupting adjacent registers

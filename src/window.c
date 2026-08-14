@@ -129,7 +129,7 @@ static void mouse_restore_bg(void) {
 }
 
 void mouse_draw_cursor(void) {
-    mouse_restore_bg();
+    // Background already restored by mouse_hide_cursor() at frame start
     mouse_save_bg();
 
     // Draw cursor: white fill with black border

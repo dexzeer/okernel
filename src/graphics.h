@@ -51,6 +51,7 @@ void graphics_write_pixel(int x, int y, uint8_t color);
 // Cache a pre-rendered wallpaper for fast blitting
 void graphics_cache_wallpaper(const unsigned char* pixels, int src_w, int src_h);
 void graphics_blit_wallpaper(void);
+void graphics_blit_wallpaper_rows(int y_start, int y_end);
 
 // Fill entire screen with a color
 void graphics_fill(uint8_t color);

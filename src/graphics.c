@@ -348,6 +348,22 @@ void graphics_blit_wallpaper(void) {
     }
 }
 
+void graphics_blit_wallpaper_rows(int y_start, int y_end) {
+    if (!wallpaper_cached) return;
+    if (y_start < 0) y_start = 0;
+    if (y_end > SCREEN_H) y_end = SCREEN_H;
+    for (int y = y_start; y < y_end; y++) {
+        uint8_t* dst = backbuffer + y * SCREEN_W;
+        uint8_t* src = cached_wallpaper + y * SCREEN_W;
+        int x = 0;
+        for (; x <= SCREEN_W - 4; x += 4) {
+            *(uint32_t*)(dst + x) = *(uint32_t*)(src + x);
+        }
+        for (; x < SCREEN_W; x++) dst[x] = src[x];
+        dirty_rows[y] = 1;
+    }
+}
+
 void graphics_fill(uint8_t color) {
     for (int y = 0; y < SCREEN_H; y++) {
         uint8_t* dst = backbuffer + y * SCREEN_W;

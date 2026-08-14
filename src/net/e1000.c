@@ -18,24 +18,25 @@
 
 // Receive registers
 #define E1000_RCTL      0x0100  // Receive Control
-#define E1000_RDBAL     0x0280  // Receive Descriptor Base Address Low
-#define E1000_RDBAH     0x0284  // Receive Descriptor Base Address High
-#define E1000_RDLEN     0x0288  // Receive Descriptor Length
-#define E1000_RDH       0x0281  // Receive Descriptor Head (16-bit, byte offset 0x280+1)
-#define E1000_RDT       0x0282  // Receive Descriptor Tail (16-bit, byte offset 0x280+2)
+#define E1000_RDBAL     0x02800 // Receive Descriptor Base Address Low
+#define E1000_RDBAH     0x02804 // Receive Descriptor Base Address High
+#define E1000_RDLEN     0x02808 // Receive Descriptor Length
+#define E1000_RDH       0x02810 // Receive Descriptor Head (16-bit)
+#define E1000_RDT       0x02818 // Receive Descriptor Tail (16-bit)
 
 // Transmit registers
 #define E1000_TCTL      0x0400  // Transmit Control
-#define E1000_TDBAL     0x0380  // Transmit Descriptor Base Address Low
-#define E1000_TDBAH     0x0384  // Transmit Descriptor Base Address High
-#define E1000_TDLEN     0x0388  // Transmit Descriptor Length
-#define E1000_TDH       0x0381  // Transmit Descriptor Head
-#define E1000_TDT       0x0382  // Transmit Descriptor Tail
+#define E1000_TDBAL     0x03800 // Transmit Descriptor Base Address Low
+#define E1000_TDBAH     0x03804 // Transmit Descriptor Base Address High
+#define E1000_TDLEN     0x03808 // Transmit Descriptor Length
+#define E1000_TDH       0x03810 // Transmit Descriptor Head (16-bit)
+#define E1000_TDT       0x03818 // Transmit Descriptor Tail (16-bit)
 
 // RCTL bits
 #define RCTL_EN         0x00000002  // Receiver Enable
 #define RCTL_BAM        0x00000004  // Broadcast Accept Mode
 #define RCTL_SECRC      0x00000008  // Strip Ethernet CRC
+#define RCTL_BSEX       0x02000000  // Buffer Size Extension
 
 // TCTL bits
 #define TCTL_EN         0x00000002  // Transmitter Enable
@@ -78,26 +79,53 @@ struct e1000_tx_desc {
 
 static volatile uint32_t* mmio = 0;
 static uint8_t mac_addr[6];
-// RX buffers at fixed low addresses (below 1MB for DMA)
-// RX buffers at fixed low memory (below 1MB for DMA)
-static uint8_t rx_buffers_mem[NUM_RX_DESCRIPTORS * RX_BUFFER_SIZE];
-static uint8_t* rx_buffers_ptrs[NUM_RX_DESCRIPTORS];
-// RX/TX descriptors at fixed low memory
-static struct e1000_rx_desc rx_descs_mem[NUM_RX_DESCRIPTORS] __attribute__((aligned(16)));
-static struct e1000_tx_desc tx_descs_mem[NUM_TX_DESCRIPTORS] __attribute__((aligned(16)));
-static uint8_t tx_buffers_mem[NUM_TX_DESCRIPTORS * 2048];
+
+// Fixed low memory addresses for DMA (below 1MB, identity-mapped)
+// These MUST be below 1MB for NIC DMA to work
+#define E1000_RX_DESCS_ADDR  0x80000  // 512KB - RX descriptors
+#define E1000_RX_BUFS_ADDR   0x80200  // 512KB + 512B - RX buffers (32 * 2048 = 64KB)
+#define E1000_TX_DESCS_ADDR  0x90000  // 576KB - TX descriptors
+#define E1000_TX_BUFS_ADDR   0x90100  // 576KB + 128B - TX buffers (8 * 2048 = 16KB)
+
+// Pointers to low memory buffers
+static struct e1000_rx_desc* rx_descs = (struct e1000_rx_desc*)E1000_RX_DESCS_ADDR;
+static uint8_t* rx_buffers = (uint8_t*)E1000_RX_BUFS_ADDR;
+static struct e1000_tx_desc* tx_descs = (struct e1000_tx_desc*)E1000_TX_DESCS_ADDR;
+static uint8_t* tx_buffers = (uint8_t*)E1000_TX_BUFS_ADDR;
+
 static uint8_t rx_cur = 0;
 static uint8_t tx_cur = 0;
 static e1000_rx_callback_t rx_callback = 0;
 
 static const char hex[] = "0123456789abcdef";
 
+static void print_hex32(uint32_t val) {
+    serial_putchar(hex[(val >> 28) & 0xF]);
+    serial_putchar(hex[(val >> 24) & 0xF]);
+    serial_putchar(hex[(val >> 20) & 0xF]);
+    serial_putchar(hex[(val >> 16) & 0xF]);
+    serial_putchar(hex[(val >> 12) & 0xF]);
+    serial_putchar(hex[(val >> 8) & 0xF]);
+    serial_putchar(hex[(val >> 4) & 0xF]);
+    serial_putchar(hex[val & 0xF]);
+}
+
 static void mmio_write(uint32_t offset, uint32_t value) {
     mmio[offset / 4] = value;
 }
 
+static void mmio_write16(uint32_t offset, uint16_t value) {
+    uint32_t addr = (uint32_t)&mmio[offset / 4];
+    *(volatile uint16_t*)addr = value;
+}
+
 static uint32_t mmio_read(uint32_t offset) {
     return mmio[offset / 4];
+}
+
+static uint16_t mmio_read16(uint32_t offset) {
+    uint32_t addr = (uint32_t)&mmio[offset / 4];
+    return *(volatile uint16_t*)addr;
 }
 
 // Read EEPROM (e1000 has onboard EEPROM for MAC)
@@ -116,10 +144,16 @@ static void e1000_irq_handler(void) {
     if (!mmio) return;
     uint32_t icr = mmio_read(E1000_ICR);
     if (icr & 0x01) {
-        serial_puts("[e1000_irq] RX!\n");
+        serial_puts("[e1000_irq] RX ICR=");
+        print_hex32(icr);
+        serial_puts(" RDH=");
+        serial_putchar(hex[mmio_read16(E1000_RDH) & 0xF]);
+        serial_puts(" desc0_st=");
+        serial_putchar(hex[rx_descs[0].status]);
+        serial_putchar('\n');
     }
     if (icr & 0x04) {
-        serial_puts("[e1000_irq] TX!\n");
+        serial_puts("[e1000_irq] TX\n");
     }
 }
 
@@ -153,14 +187,7 @@ void e1000_init(void) {
     // Get MMIO base from BAR0
     uint32_t bar0 = devs[idx].bar0;
     serial_puts("[e1000] BAR0=");
-    serial_putchar(hex[(bar0 >> 28) & 0xF]);
-    serial_putchar(hex[(bar0 >> 24) & 0xF]);
-    serial_putchar(hex[(bar0 >> 20) & 0xF]);
-    serial_putchar(hex[(bar0 >> 16) & 0xF]);
-    serial_putchar(hex[(bar0 >> 12) & 0xF]);
-    serial_putchar(hex[(bar0 >> 8) & 0xF]);
-    serial_putchar(hex[(bar0 >> 4) & 0xF]);
-    serial_putchar(hex[bar0 & 0xF]);
+    print_hex32(bar0);
     serial_putchar('\n');
 
     if (bar0 & 0x01) {
@@ -179,14 +206,7 @@ void e1000_init(void) {
     // Test MMIO access
     uint32_t ctrl = mmio_read(E1000_CTRL);
     serial_puts("[e1000] CTRL=");
-    serial_putchar(hex[(ctrl >> 28) & 0xF]);
-    serial_putchar(hex[(ctrl >> 24) & 0xF]);
-    serial_putchar(hex[(ctrl >> 20) & 0xF]);
-    serial_putchar(hex[(ctrl >> 16) & 0xF]);
-    serial_putchar(hex[(ctrl >> 12) & 0xF]);
-    serial_putchar(hex[(ctrl >> 8) & 0xF]);
-    serial_putchar(hex[(ctrl >> 4) & 0xF]);
-    serial_putchar(hex[ctrl & 0xF]);
+    print_hex32(ctrl);
     serial_putchar('\n');
 
     // Disable interrupts during init
@@ -213,44 +233,59 @@ void e1000_init(void) {
                            (mac_addr[2] << 16) | (mac_addr[3] << 24));
     mmio_write(E1000_RAH, mac_addr[4] | (mac_addr[5] << 8) | 0x80000000); // Address Valid bit
 
-    // Set up RX descriptors
-    uint32_t rx_phys = (uint32_t)rx_descs_mem;
+    // Clear RX descriptors in low memory
+    for (int i = 0; i < NUM_RX_DESCRIPTORS * sizeof(struct e1000_rx_desc); i++) {
+        ((uint8_t*)rx_descs)[i] = 0;
+    }
+
+    // Set up RX descriptors at low memory address
+    uint32_t rx_phys = E1000_RX_DESCS_ADDR;
     serial_puts("[e1000] rx_descs addr=");
-    serial_putchar(hex[(rx_phys >> 24) & 0xF]);
-    serial_putchar(hex[(rx_phys >> 20) & 0xF]);
-    serial_putchar(hex[(rx_phys >> 16) & 0xF]);
-    serial_putchar(hex[(rx_phys >> 12) & 0xF]);
-    serial_putchar(hex[(rx_phys >> 8) & 0xF]);
-    serial_putchar(hex[(rx_phys >> 4) & 0xF]);
-    serial_putchar(hex[rx_phys & 0xF]);
+    print_hex32(rx_phys);
     serial_putchar('\n');
 
     mmio_write(E1000_RDBAL, rx_phys);
     mmio_write(E1000_RDBAH, 0);
     mmio_write(E1000_RDLEN, NUM_RX_DESCRIPTORS * 16);
-    mmio_write(E1000_RDH, 0);
-    mmio_write(E1000_RDT, NUM_RX_DESCRIPTORS - 1);
+    mmio_write16(E1000_RDH, 0);
+    mmio_write16(E1000_RDT, NUM_RX_DESCRIPTORS - 1);
 
-    // Set up RX descriptor addresses using contiguous buffer
+    // Set up RX buffer addresses in low memory
     for (int i = 0; i < NUM_RX_DESCRIPTORS; i++) {
-        rx_buffers_ptrs[i] = rx_buffers_mem + (i * RX_BUFFER_SIZE);
-        rx_descs_mem[i].addr = (uint32_t)rx_buffers_ptrs[i];
-        rx_descs_mem[i].length = 0;
-        rx_descs_mem[i].status = 0;
+        uint32_t buf_addr = E1000_RX_BUFS_ADDR + (i * RX_BUFFER_SIZE);
+        rx_descs[i].addr = buf_addr;
+        rx_descs[i].length = 0;
+        rx_descs[i].status = 0;
+
+        serial_puts("[e1000] rx_buf[");
+        serial_putchar('0' + i);
+        serial_puts("] addr=");
+        print_hex32(buf_addr);
+        serial_putchar('\n');
     }
 
-    // Set up TX descriptors
-    uint32_t tx_phys = (uint32_t)tx_descs_mem;
+    // Clear TX descriptors in low memory
+    for (int i = 0; i < NUM_TX_DESCRIPTORS * sizeof(struct e1000_tx_desc); i++) {
+        ((uint8_t*)tx_descs)[i] = 0;
+    }
+
+    // Set up TX descriptors at low memory address
+    uint32_t tx_phys = E1000_TX_DESCS_ADDR;
+    serial_puts("[e1000] tx_descs addr=");
+    print_hex32(tx_phys);
+    serial_putchar('\n');
+
     mmio_write(E1000_TDBAL, tx_phys);
     mmio_write(E1000_TDBAH, 0);
     mmio_write(E1000_TDLEN, NUM_TX_DESCRIPTORS * 16);
-    mmio_write(E1000_TDH, 0);
-    mmio_write(E1000_TDT, 0);
+    mmio_write16(E1000_TDH, 0);
+    mmio_write16(E1000_TDT, 0);
 
-    // Set up TX descriptor addresses
+    // Set up TX buffer addresses in low memory
     for (int i = 0; i < NUM_TX_DESCRIPTORS; i++) {
-        tx_descs_mem[i].addr = (uint32_t)tx_buffers_mem[i];
-        tx_descs_mem[i].status = TXD_STAT_DD; // Mark as ready
+        uint32_t buf_addr = E1000_TX_BUFS_ADDR + (i * 2048);
+        tx_descs[i].addr = buf_addr;
+        tx_descs[i].status = TXD_STAT_DD; // Mark as ready
     }
 
     // Enable RX (accept broadcast + MAC filter)
@@ -259,21 +294,14 @@ void e1000_init(void) {
     // Enable TX
     mmio_write(E1000_TCTL, TCTL_EN | TCTL_PSP);
 
-    // Enable interrupts (RX)
+    // Enable interrupts (RX + RX Timer + RX Desc Minimum)
     mmio_write(E1000_ICR, 0xFFFFFFFF);
-    mmio_write(E1000_IMS, 0x01);
+    mmio_write(E1000_IMS, 0x01 | 0x40 | 0x10); // RX + RXDTYP0 + RXDMT0
 
     // Check device status
     uint32_t status = mmio_read(E1000_STATUS);
     serial_puts("[e1000] Status=");
-    serial_putchar(hex[(status >> 28) & 0xF]);
-    serial_putchar(hex[(status >> 24) & 0xF]);
-    serial_putchar(hex[(status >> 20) & 0xF]);
-    serial_putchar(hex[(status >> 16) & 0xF]);
-    serial_putchar(hex[(status >> 12) & 0xF]);
-    serial_putchar(hex[(status >> 8) & 0xF]);
-    serial_putchar(hex[(status >> 4) & 0xF]);
-    serial_putchar(hex[status & 0xF]);
+    print_hex32(status);
     serial_putchar('\n');
     if (status & 0x02) {
         serial_puts("[e1000] Link UP!\n");
@@ -295,17 +323,19 @@ void e1000_init(void) {
 int e1000_send(uint8_t* data, uint32_t len) {
     if (len > 2048) return -1;
 
+    // Copy data to TX buffer in low memory
     for (uint32_t i = 0; i < len; i++) {
-        tx_buffers_mem[tx_cur * 2048 + i] = data[i];
+        tx_buffers[tx_cur * 2048 + i] = data[i];
     }
 
-    tx_descs_mem[tx_cur].addr = (uint32_t)tx_buffers_mem[tx_cur];
-    tx_descs_mem[tx_cur].length = len;
-    tx_descs_mem[tx_cur].cmd = 0x01 | 0x08;
-    tx_descs_mem[tx_cur].status = 0;
+    // Set up TX descriptor
+    tx_descs[tx_cur].addr = E1000_TX_BUFS_ADDR + (tx_cur * 2048);
+    tx_descs[tx_cur].length = len;
+    tx_descs[tx_cur].cmd = 0x01 | 0x08; // EOP + IFCS
+    tx_descs[tx_cur].status = 0;
 
     tx_cur = (tx_cur + 1) % NUM_TX_DESCRIPTORS;
-    mmio_write(E1000_TDT, tx_cur);
+    mmio_write16(E1000_TDT, tx_cur);
 
     serial_puts("[e1000_tx] sent ");
     serial_putchar(hex[(len >> 8) & 0xF]);
@@ -315,31 +345,56 @@ int e1000_send(uint8_t* data, uint32_t len) {
     return 0;
 }
 
+static int poll_count = 0;
+static int last_debug = 0;
+
 void e1000_poll(void) {
-    // Check interrupt cause
-    uint32_t icr = mmio_read(E1000_ICR);
-    if (icr & 0x01) { // RX
-        serial_puts("[e1000] RX interrupt!\n");
+    if (!mmio) return;
+
+    poll_count++;
+
+    // Debug: print status every 500 polls
+    if (poll_count - last_debug >= 500) {
+        last_debug = poll_count;
+        uint32_t status = mmio_read(E1000_STATUS);
+        uint32_t rctl = mmio_read(E1000_RCTL);
+        uint16_t rdh = mmio_read16(E1000_RDH);
+        uint16_t rdt = mmio_read16(E1000_RDT);
+        serial_puts("[poll] St=");
+        print_hex32(status);
+        serial_puts(" RCTL=");
+        print_hex32(rctl);
+        serial_puts(" RDH=");
+        serial_putchar(hex[rdh & 0xF]);
+        serial_puts(" RDT=");
+        serial_putchar(hex[rdt & 0xF]);
+        serial_puts(" desc_st=");
+        serial_putchar(hex[rx_descs[rx_cur].status]);
+        serial_putchar('\n');
     }
 
     // Check for received packets
-    while (rx_descs_mem[rx_cur].status & RXD_STAT_DD) {
-        uint16_t len = rx_descs_mem[rx_cur].length;
+    while (rx_descs[rx_cur].status & RXD_STAT_DD) {
+        uint16_t len = rx_descs[rx_cur].length;
 
         serial_puts("[e1000_rx] pkt len=");
         serial_putchar(hex[(len >> 8) & 0xF]);
         serial_putchar(hex[(len >> 4) & 0xF]);
         serial_putchar(hex[len & 0xF]);
+        serial_puts(" cur=");
+        serial_putchar(hex[rx_cur]);
         serial_putchar('\n');
 
-        if (len > 4 && len < RX_BUFFER_SIZE && rx_callback) {
-            rx_callback(rx_buffers_ptrs[rx_cur], len - 4);
+        if (len > 0 && len < RX_BUFFER_SIZE && rx_callback) {
+            // Point to the buffer in low memory (RCTL_SECRC already strips CRC)
+            uint8_t* pkt = (uint8_t*)(E1000_RX_BUFS_ADDR + (rx_cur * RX_BUFFER_SIZE));
+            rx_callback(pkt, len);
         }
 
-        rx_descs_mem[rx_cur].status = 0;
-        rx_descs_mem[rx_cur].length = 0;
+        rx_descs[rx_cur].status = 0;
+        rx_descs[rx_cur].length = 0;
         rx_cur = (rx_cur + 1) % NUM_RX_DESCRIPTORS;
-        mmio_write(E1000_RDH, rx_cur);
+        mmio_write16(E1000_RDH, rx_cur);
     }
 }
 

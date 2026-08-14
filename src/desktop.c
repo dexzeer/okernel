@@ -124,6 +124,7 @@ static int create_terminal(void) {
     int win_id = window_create("Terminal", x, y, 440, 360);
     window_set_close_button(win_id, 1);
     window_set_minimize_button(win_id, 1);
+    needs_redraw = 1;
     term_wins[term_count] = win_id;
     term_lens[term_count] = 0;
     term_bufs[term_count][0] = 0;
@@ -185,6 +186,8 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  exit      - close this terminal\n");
         window_puts(win_id, "  ping      - ping gateway\n");
         window_puts(win_id, "  ip        - show IP address\n");
+        window_puts(win_id, "  resolve   - DNS lookup\n");
+        window_puts(win_id, "  browse    - HTTP browse\n");
         window_puts(win_id, "  reboot    - reboot system\n");
         window_puts(win_id, "  shutdown  - power off\n");
     }
@@ -204,7 +207,6 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, ip_buf);
         window_puts(win_id, "...\n");
         icmp_send_ping(gw, 0x1234, 1);
-        arp_send_request(gw);
     }
     else if (str_eq(cmd_buf, "ip")) {
         uint8_t* ip = net_get_ip();
@@ -221,6 +223,45 @@ static void shell_execute(int win_id, const char* input) {
         ip_buf[idx] = 0;
         window_puts(win_id, ip_buf);
         window_puts(win_id, "\n");
+    }
+    else if (str_eq(cmd_buf, "resolve")) {
+        if (args[0] == 0) {
+            window_puts(win_id, "Usage: resolve <hostname>\n");
+        } else {
+            window_puts(win_id, "Resolving ");
+            window_puts(win_id, args);
+            window_puts(win_id, "...\n");
+            dns_resolve(args);
+        }
+    }
+    else if (str_eq(cmd_buf, "browse")) {
+        if (args[0] == 0) {
+            window_puts(win_id, "Usage: browse <hostname> [path]\n");
+            window_puts(win_id, "Example: browse example.com /\n");
+        } else {
+            // Parse host and path from args
+            char host[128] = {0};
+            char path[128] = "/";
+            int i = 0;
+            while (args[i] && args[i] != ' ' && i < 127) {
+                host[i] = args[i];
+                i++;
+            }
+            host[i] = 0;
+            if (args[i] == ' ') {
+                i++;
+                int j = 0;
+                while (args[i] && j < 127) {
+                    path[j++] = args[i++];
+                }
+                path[j] = 0;
+            }
+            window_puts(win_id, "Browsing ");
+            window_puts(win_id, host);
+            window_puts(win_id, path);
+            window_puts(win_id, "...\n");
+            http_get(host, path);
+        }
     }
     else if (str_eq(cmd_buf, "clear")) {
         window_clear(win_id);
@@ -355,6 +396,19 @@ static void on_timer(void) {
     tick_count++;
 }
 
+// Network event callback — prints to first terminal window
+static void on_net_event(const char* msg) {
+    serial_puts("[on_net_event] called, msg=");
+    serial_puts(msg);
+    serial_puts("\n");
+    if (term_wins[0] >= 0) {
+        window_puts(term_wins[0], msg);
+        shell_prompt(term_wins[0]);
+    } else {
+        serial_puts("[on_net_event] term_wins[0] invalid!\n");
+    }
+}
+
 void kernel_main(uint32_t mboot_addr) {
     serial_init();
     gdt_init();
@@ -407,6 +461,7 @@ void kernel_main(uint32_t mboot_addr) {
 
     // Init networking (full stack: PCI + RTL8139 + ARP + IP + ICMP)
     net_init();
+    net_set_event_callback(on_net_event);
 
     // Init input
     mouse_init_fb();
@@ -418,6 +473,8 @@ void kernel_main(uint32_t mboot_addr) {
     while (1) {
         // Poll network for incoming packets
         e1000_poll();
+        net_poll();
+        http_poll();
 
         int mx = mouse_get_x();
         int my = mouse_get_y();
@@ -473,6 +530,7 @@ void kernel_main(uint32_t mboot_addr) {
                         } else if (i == info_win) {
                             close_sysinfo();
                         }
+                        needs_redraw = 1;
                         clicked = 1;
                         break;
                     }
@@ -511,24 +569,53 @@ void kernel_main(uint32_t mboot_addr) {
         if (mb && drag_win >= 0) {
             struct window* w = window_get(drag_win);
             if (w) {
+                int old_x = w->x, old_y = w->y;
                 w->x = mx - drag_off_x;
                 w->y = my - drag_off_y;
                 if (w->x < 0) w->x = 0;
                 if (w->y < 0) w->y = 0;
                 if (w->x + w->w > SCREEN_W) w->x = SCREEN_W - w->w;
                 if (w->y + w->h > SCREEN_H) w->y = SCREEN_H - w->h;
-                needs_redraw = 1;
+
+                // Only dirty the rows that overlap old OR new window position
+                int min_y = old_y < w->y ? old_y : w->y;
+                int max_y = (old_y + w->h) > (w->y + w->h) ? (old_y + w->h) : (w->y + w->h);
+                if (min_y < 0) min_y = 0;
+                if (max_y > SCREEN_H) max_y = SCREEN_H;
+
+                // Restore wallpaper for affected rows, then redraw dragged window
+                graphics_blit_wallpaper_rows(min_y, max_y);
+                w->dirty = 1;
             }
         }
 
         if (!mb) { mouse_down = 0; drag_win = -1; }
         else { mouse_down = 1; }
 
-        // Blit wallpaper and mark windows dirty
-        graphics_blit_wallpaper();
-        for (int i = 0; i < MAX_WINDOWS; i++) {
-            struct window* w = window_get(i);
-            if (w && w->visible && !w->minimized) w->dirty = 1;
+        // Blit wallpaper only when full redraw needed
+        if (needs_redraw) {
+            graphics_blit_wallpaper();
+            for (int i = 0; i < MAX_WINDOWS; i++) {
+                struct window* w = window_get(i);
+                if (w && w->visible && !w->minimized) w->dirty = 1;
+            }
+            needs_redraw = 0;
+        }
+
+        // Mark focused window dirty when cursor blinks (every ~1 second)
+        {
+            extern uint32_t tick_count;
+            static int last_cursor_tick = -1;
+            int cursor_tick = tick_count / 18;
+            if (cursor_tick != last_cursor_tick) {
+                last_cursor_tick = cursor_tick;
+                needs_redraw = 1; // Full redraw every ~1 second
+                int fi = window_get_focused();
+                if (fi >= 0) {
+                    struct window* fw = window_get(fi);
+                    if (fw) fw->dirty = 1;
+                }
+            }
         }
 
         // Draw windows (only dirty ones)

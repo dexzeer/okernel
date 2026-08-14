@@ -82,4 +82,26 @@ void net_set_ip(uint8_t ip0, uint8_t ip1, uint8_t ip2, uint8_t ip3);
 // Resolve IP to MAC (returns 1 if resolved, 0 if pending)
 int arp_resolve(uint8_t* ip, uint8_t* mac);
 
+// DNS resolution (returns 0 on success, -1 if waiting for ARP)
+int dns_resolve(const char* hostname);
+int dns_is_resolved(uint32_t* ip);
+int dns_is_pending(void);
+
+// TCP connection
+void tcp_connect(uint32_t dst_ip, uint16_t dst_port);
+void tcp_send_data(uint8_t* data, uint16_t len);
+void tcp_close(void);
+
+// Poll for pending operations (call from main loop)
+void net_poll(void);
+
+// Set callback for network events (ping replies, etc.)
+void net_set_event_callback(void (*cb)(const char* msg));
+
+// HTTP client
+void http_get(const char* host, const char* path);
+void http_poll(void);
+char* http_get_response(void);
+int http_get_response_len(void);
+
 #endif
