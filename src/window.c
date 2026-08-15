@@ -518,6 +518,17 @@ void window_set_text_color(int id, uint8_t fg, uint8_t bg) {
     }
 }
 
+void window_set_title(int id, const char* title) {
+    if (id < 0 || id >= MAX_WINDOWS) return;
+    int j = 0;
+    while (title[j] && j < 31) {
+        windows[id].title[j] = title[j];
+        j++;
+    }
+    windows[id].title[j] = 0;
+    windows[id].dirty = 1;
+}
+
 #define TASKBAR_H 20
 
 void window_draw_taskbar(void) {

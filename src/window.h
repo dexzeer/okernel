@@ -52,6 +52,7 @@ void window_restore(int id);
 void window_set_text_color(int id, uint8_t fg, uint8_t bg);
 void window_draw_taskbar(void);
 struct window* window_get(int id);
+void window_set_title(int id, const char* title);
 
 // Mouse
 void mouse_init_fb(void);

@@ -13,6 +13,7 @@
 #include "io.h"
 #include "filesystem.h"
 #include "editor.h"
+#include "browser.h"
 
 struct mboot_info {
     uint32_t flags;
@@ -292,7 +293,7 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  ping      - ping gateway\n");
         window_puts(win_id, "  ip        - show IP address\n");
         window_puts(win_id, "  resolve   - DNS lookup\n");
-        window_puts(win_id, "  browse    - HTTP (saves .txt)\n");
+        window_puts(win_id, "  browser   - open web browser\n");
         window_puts(win_id, "  edit      - open text editor\n");
         window_puts(win_id, "  ls        - list files\n");
         window_puts(win_id, "  open      - open file in editor\n");
@@ -342,54 +343,19 @@ static void shell_execute(int win_id, const char* input) {
             dns_resolve(args);
         }
     }
-    else if (str_eq(cmd_buf, "browse")) {
+    else if (str_eq(cmd_buf, "browser")) {
         if (args[0] == 0) {
-            window_puts(win_id, "Usage: browse <hostname> [path]\n");
-            window_puts(win_id, "Example: browse example.com /\n");
-            window_puts(win_id, "Saves response to <hostname>.txt\n");
+            window_puts(win_id, "Usage: browser <url>\n");
+            window_puts(win_id, "Example: browser http://example.com/\n");
         } else {
-            // Parse host and path from args
-            char host[128] = {0};
-            char path[128] = "/";
-            int i = 0;
-            while (args[i] && args[i] != ' ' && i < 127) {
-                host[i] = args[i];
-                i++;
+            int br = browser_open(args);
+            if (br >= 0) {
+                window_puts(win_id, "Opened: ");
+                window_puts(win_id, args);
+                window_put_char(win_id, '\n');
+            } else {
+                window_puts(win_id, "Cannot open browser.\n");
             }
-            host[i] = 0;
-            if (args[i] == ' ') {
-                i++;
-                int j = 0;
-                while (args[i] && j < 127) {
-                    path[j++] = args[i++];
-                }
-                path[j] = 0;
-            }
-
-            // Build filename: <hostname>.txt
-            char filename[140];
-            int fi = 0;
-            while (host[fi] && fi < 135) {
-                filename[fi] = host[fi];
-                fi++;
-            }
-            filename[fi++] = '.';
-            filename[fi++] = 't';
-            filename[fi++] = 'x';
-            filename[fi++] = 't';
-            filename[fi] = 0;
-
-            // Create file for saving response
-            fs_create(filename);
-
-            window_puts(win_id, "Browsing ");
-            window_puts(win_id, host);
-            window_puts(win_id, path);
-            window_puts(win_id, " -> saving to ");
-            window_puts(win_id, filename);
-            window_puts(win_id, "\n");
-            net_set_browse_save(filename);
-            http_get(host, path);
         }
     }
     else if (str_eq(cmd_buf, "edit")) {
@@ -561,10 +527,15 @@ static void on_keypress(char c) {
     // Check if this is an editor window
     int ed_id = editor_find_by_win(win_id);
     if (ed_id >= 0) {
-        // Handle Ctrl+S (save) — detect by checking for special char
-        // For now, just pass characters to the editor
         editor_handle_key(ed_id, c);
         editor_draw(ed_id);
+        return;
+    }
+
+    // Check if this is a browser window
+    int br_id = browser_find_by_win(win_id);
+    if (br_id >= 0) {
+        browser_handle_key(br_id, c);
         return;
     }
 
@@ -670,6 +641,7 @@ void kernel_main(uint32_t mboot_addr) {
     window_init();
     fs_init();
     editor_init();
+    browser_init();
 
     // Cache wallpaper for fast blitting
     graphics_cache_wallpaper(wp_pixels, WP_W, WP_H);
@@ -849,6 +821,24 @@ void kernel_main(uint32_t mboot_addr) {
 
         // Check for pending HTTP responses to save
         check_save_http_response();
+
+        // Check if any browser needs HTTP data processed
+        for (int bi = 0; bi < MAX_BROWSERS; bi++) {
+            struct browser* br = browser_get(bi);
+            if (!br || br->token_count > 0) continue;
+            int resp_len = http_get_response_len();
+            if (resp_len > 0 && !http_is_pending()) {
+                char* resp = http_get_response();
+                if (resp && resp_len > 0) {
+                    br->token_count = html_parse(resp, resp_len,
+                                                 br->tokens, HTML_MAX_TOKENS);
+                    html_get_title(resp, resp_len, br->title, 64);
+                    render_content(bi);
+                    window_set_title(br->win_id,
+                                     br->title[0] ? br->title : "okai");
+                }
+            }
+        }
 
         // Periodic full redraw every ~1 second (18 ticks) + on-demand when things change
         static uint32_t last_redraw_tick = 0;
