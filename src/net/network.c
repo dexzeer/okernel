@@ -70,10 +70,12 @@ struct tcp_conn {
 static struct tcp_conn tcp_conn;
 static uint8_t tcp_rx_buf[1500];
 static int tcp_rx_len = 0;
+static int tcp_rx_seg_len = 0; // length of current segment in tcp_rx_buf
 static int tcp_rx_ready = 0;
 
 // Simple HTTP client state
 static int http_pending = 0;
+static int http_done = 0; // Set when connection closes with data
 static char http_response[4096];
 static int http_response_len = 0;
 
@@ -792,9 +794,11 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
             tcp_conn.ack = seq_num + payload_len;
             tcp_send_packet(0x10, 0, 0); // ACK
 
+            // Save current segment length before overwrite
+            tcp_rx_seg_len = payload_len;
             // Copy payload to RX buffer
             for (int i = 0; i < payload_len && i < 1500; i++) {
-                tcp_rx_buf[tcp_rx_len + i] = data[data_offset + i];
+                tcp_rx_buf[i] = data[data_offset + i];
             }
             tcp_rx_len += payload_len;
 
@@ -891,15 +895,19 @@ void http_get(const char* host, const char* path) {
     serial_puts("\n");
 
     tcp_send_data(req_buf, req_len);
+    if (!http_pending) {
+        http_response_len = 0;
+        http_done = 0;
+    }
     http_pending = 1;
-    http_response_len = 0;
 }
 
 void http_poll(void) {
     if (!http_pending) return;
     if (tcp_rx_ready) {
-        // Accumulate response (append new chunk)
-        int copy_len = tcp_rx_len;
+        // Accumulate response (append current segment)
+        int copy_len = tcp_rx_seg_len;
+        if (copy_len > 1500) copy_len = 1500;
         if (http_response_len + copy_len > 4095) copy_len = 4095 - http_response_len;
         if (copy_len > 0) {
             for (int i = 0; i < copy_len; i++) {
@@ -910,6 +918,7 @@ void http_poll(void) {
         http_response[http_response_len] = 0;
         tcp_rx_ready = 0;
         tcp_rx_len = 0;
+        tcp_rx_seg_len = 0;
 
         serial_puts("[http] received ");
         serial_putchar('0' + (http_response_len / 100));
@@ -942,6 +951,7 @@ void http_poll(void) {
     }
     if (tcp_conn.state == TCP_STATE_CLOSED && http_pending) {
         http_pending = 0;
+        if (http_response_len > 0) http_done = 1;
         serial_puts("[http] connection closed\n");
     }
 }
@@ -949,6 +959,7 @@ void http_poll(void) {
 char* http_get_response(void) { return http_response; }
 int http_get_response_len(void) { return http_response_len; }
 int http_is_pending(void) { return http_pending; }
+int http_is_done(void) { return http_done; }
 
 void net_set_event_callback(void (*cb)(const char* msg)) {
     net_event_callback = cb;
@@ -1015,6 +1026,7 @@ void net_poll(void) {
         uint32_t ip;
         if (dns_is_resolved(&ip)) {
             if (tcp_conn.state == TCP_STATE_CLOSED) {
+                http_retry_pending = 0;
                 http_get(http_pending_host, http_pending_path);
             } else if (tcp_conn.state == TCP_STATE_ESTABLISHED) {
                 http_retry_pending = 0;

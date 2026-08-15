@@ -16,6 +16,7 @@ struct browser {
     int content_height; // total lines of rendered content
     struct html_token tokens[HTML_MAX_TOKENS];
     int token_count;
+    int last_resp_len;    // track HTTP response changes
     int addr_bar_focused; // 1 = typing in address bar, 0 = scrolling
     char addr_input[BROWSER_URL_LEN];
     int addr_input_len;

@@ -60,6 +60,7 @@ void render_content(int ed_id) {
     if (b->win_id < 0) return;
     struct window* w = window_get(b->win_id);
     if (!w) return;
+    if (!w->content) return;
 
     window_clear(b->win_id);
 
@@ -227,6 +228,7 @@ int browser_open(const char* url) {
     b->addr_input_len = 0;
     b->addr_input[0] = 0;
     b->title[0] = 0;
+    b->last_resp_len = 0;
     b->history_count = 0;
     b->history_pos = 0;
 

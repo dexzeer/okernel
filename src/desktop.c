@@ -825,14 +825,17 @@ void kernel_main(uint32_t mboot_addr) {
         // Check if any browser needs HTTP data processed
         for (int bi = 0; bi < MAX_BROWSERS; bi++) {
             struct browser* br = browser_get(bi);
-            if (!br || br->token_count > 0) continue;
+            if (!br) continue;
             int resp_len = http_get_response_len();
-            if (resp_len > 0) {
+            int done = http_is_done();
+            int need_parse = (br->token_count == 0 && done);
+            if (need_parse && resp_len > 0) {
                 char* resp = http_get_response();
-                if (resp && resp_len > 0) {
+                if (resp) {
                     br->token_count = html_parse(resp, resp_len,
                                                  br->tokens, HTML_MAX_TOKENS);
                     html_get_title(resp, resp_len, br->title, 64);
+                    br->last_resp_len = resp_len;
                     render_content(bi);
                     window_set_title(br->win_id,
                                      br->title[0] ? br->title : "okai");
