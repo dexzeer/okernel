@@ -77,12 +77,23 @@ okernel/
 1. All drawing goes to backbuffer (307KB array)
 2. Dirty-row tracking — only changed rows are copied to framebuffer
 3. `graphics_flush()` copies dirty rows to framebuffer at 0xFD000000
-4. Result: 60-160 FPS depending on content
+4. Clip rectangle (`graphics_set_clip`/`graphics_clip_reset`) restricts drawing during scene repair so small repairs only dirty their own rows (enforced in `putpixel`, `rect_fill`, `hline`, `graphics_write_pixel`)
+5. Result: ~900 FPS idle in QEMU, 60-160 FPS with content changes
+
+### Cursor Compositor (v0.3.1 — artifact fix)
+The cursor is a **stateless sprite** — there is NO saved background patch and no save/restore pair. This is deliberate; the previous save/restore design caused persistent artifacts (arrow ghosts, wallpaper holes in windows) because the saved patch went stale against scene changes and IRQ12 could tear it mid-read.
+
+- Main loop order (in `desktop.c`): `desktop_paint_rect(old cursor rect)` → scene draws → `mouse_paint_cursor()` → `graphics_flush()`. Nothing draws after the sprite.
+- **`desktop_paint_rect(x, y, w, h)`** — the single authoritative repair path: wallpaper → icons → windows back-to-front → taskbar. Recomposites any region from the scene model. Also used by cursor erase.
+- **`window_paint_region(id, rect)`** — repaints a window from its content model clipped to a rect (frame/title redrawn whole — over-repair is harmless; content cells are clipped)
+- **`mouse_get_position()`** — atomic position snapshot (`cli`/`sti` around the two-word read; ISR mutates it on IRQ12)
+- Blinking text cursor state is a pure function of `tick_count` (per-window `last_cursor_visible` caches the phase; no global statics)
+- Invariant: backbuffer = render(model) + one cursor sprite drawn last. If you reintroduce saved-pixel cursors or draw after `mouse_paint_cursor()`, artifacts WILL return.
 
 ### Input Pipeline
 - PS/2 keyboard → IRQ1 → scancode → ASCII → shell/terminal
 - PS/2 mouse → IRQ12 → 3-byte packets → smoothed coordinates → cursor
-- Mouse smoothing: 4-sample moving average
+- Mouse smoothing: 4-sample moving average (N sustained packets of delta d displace ≈ 8N-12 — matters when scripting tests)
 
 ### Networking Stack
 1. **PCI**: Bus enumeration, finds e1000 (8086:100E)
@@ -200,9 +211,9 @@ Same as above plus: `list`, `switch N`
 |------|---------------|
 | `boot/start.asm` | Entry point — where everything begins |
 | `boot/isr.asm` | Interrupt handlers — must match IDT setup |
-| `src/desktop.c` | Desktop main loop — shell commands, icons, editor integration |
-| `src/graphics.c` | Drawing primitives + framebuffer management |
-| `src/window.c` | Window manager + mouse driver |
+| `src/desktop.c` | Desktop main loop — shell commands, icons, editor integration, cursor compositor (`desktop_paint_rect`) |
+| `src/graphics.c` | Drawing primitives + framebuffer management + clip rectangle |
+| `src/window.c` | Window manager + mouse driver + stateless cursor sprite (`mouse_paint_cursor`, `window_paint_region`) |
 | `src/paging.c` | Page tables — required for framebuffer access |
 | `src/memory.c` | Physical memory manager + heap |
 | `src/filesystem.c` | In-memory virtual filesystem (files persist until reboot) |
@@ -225,3 +236,5 @@ Same as above plus: `list`, `switch N`
 5. **e1000 register offsets**: RDH/RDT/TDH/TDT are at 0x02810/0x02818/0x03810/0x03818 (not 0x0281/0x0282)
 6. **e1000 RX buffers**: Must be in low memory (<1MB) for DMA access
 7. **16-bit MMIO registers**: Use 16-bit writes for RDH/RDT/TDH/TDT to avoid corrupting adjacent registers
+8. **Cursor save/restore causes artifacts**: saved background patches go stale when the scene changes under them and tear when IRQ12 lands mid-save. Fixed by stateless sprite + scene repair (`desktop_paint_rect`) — see Cursor Compositor above. Do not reintroduce `cursor_bg`.
+9. **Unclipped repair painting kills FPS**: repainting a window's whole frame for a 12x16 cursor repair dirties every row the window spans (~75% of screen per frame, FPS 1030→311). Fixed with the graphics clip rectangle — any new repair path must set/reset it around its drawing.

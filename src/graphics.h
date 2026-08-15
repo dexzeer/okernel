@@ -45,12 +45,18 @@ uint8_t* graphics_get_buffer(void);
 // Mark a row as dirty for optimized flushing
 void graphics_mark_dirty(int y);
 
+// Clip rectangle — restricts all drawing to the region. Used by repair
+// painting so a small repair doesn't dirty the whole screen.
+void graphics_set_clip(int x, int y, int w, int h);
+void graphics_clip_reset(void);
+
 // Direct backbuffer write (for wallpaper, avoids putpixel overhead)
 void graphics_write_pixel(int x, int y, uint8_t color);
 
 // Cache a pre-rendered wallpaper for fast blitting
 void graphics_cache_wallpaper(const unsigned char* pixels, int src_w, int src_h);
 void graphics_blit_wallpaper(void);
+void graphics_blit_wallpaper_rect(int x, int y, int w, int h);
 
 // Fill entire screen with a color
 void graphics_fill(uint8_t color);

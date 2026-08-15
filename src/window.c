@@ -6,9 +6,6 @@
 #include "serial.h"
 #include <stdint.h>
 
-// Backbuffer from graphics.c
-extern uint8_t* graphics_get_buffer(void);
-
 // Redraw flag from desktop.c
 extern int needs_redraw;
 
@@ -28,8 +25,7 @@ static int smooth_dy[SMOOTH_SAMPLES];
 static int smooth_idx = 0;
 
 // 12x16 mouse cursor bitmap (clean arrow)
-#define CURSOR_W 12
-#define CURSOR_H 16
+// (CURSOR_W/CURSOR_H live in window.h — the compositor sizes repair rects from them)
 static const uint16_t cursor_bitmap[16] = {
     0b110000000000,
     0b111000000000,
@@ -48,12 +44,6 @@ static const uint16_t cursor_bitmap[16] = {
     0b000000011100,
     0b000000001100,
 };
-
-// Save background under cursor for restoring
-static uint8_t cursor_bg[CURSOR_W * CURSOR_H];
-static int cursor_bg_x = 0;
-static int cursor_bg_y = 0;
-static int cursor_visible = 0;
 
 static void mouse_irq_handler(void) {
     uint8_t status = inb(0x64);
@@ -98,62 +88,32 @@ static void mouse_irq_handler(void) {
     }
 }
 
-// Save the background behind the cursor
-static void mouse_save_bg(void) {
-    for (int row = 0; row < CURSOR_H; row++) {
-        for (int col = 0; col < CURSOR_W; col++) {
-            int sx = mouse_x + col;
-            int sy = mouse_y + row;
-            if (sx >= 0 && sx < SCREEN_W && sy >= 0 && sy < SCREEN_H) {
-                cursor_bg[row * CURSOR_W + col] = graphics_get_buffer()[sy * SCREEN_W + sx];
-            }
-        }
-    }
-    cursor_bg_x = mouse_x;
-    cursor_bg_y = mouse_y;
+// Atomic snapshot of cursor position — the ISR mutates mouse_x/mouse_y on
+// IRQ12, so a two-word read must not be torn by a mid-read packet.
+void mouse_get_position(int* x, int* y) {
+    uint32_t flags;
+    __asm__ volatile("pushfl; popl %0; cli" : "=r"(flags));
+    *x = mouse_x;
+    *y = mouse_y;
+    if (flags & 0x0200) __asm__ volatile("sti"); // restore IF if it was set
 }
 
-// Restore background under cursor
-static void mouse_restore_bg(void) {
-    for (int row = 0; row < CURSOR_H; row++) {
-        int sy = cursor_bg_y + row;
-        if (sy < 0 || sy >= SCREEN_H) continue;
-        graphics_mark_dirty(sy);
-        for (int col = 0; col < CURSOR_W; col++) {
-            int sx = cursor_bg_x + col;
-            if (sx >= 0 && sx < SCREEN_W) {
-                putpixel(sx, sy, cursor_bg[row * CURSOR_W + col]);
-            }
-        }
-    }
-}
-
-void mouse_draw_cursor(void) {
-    mouse_restore_bg();
-    mouse_save_bg();
-
-    // Draw cursor: white fill with black border
+// Draw the cursor sprite at explicit coordinates. Stateless by design:
+// erasing is the compositor's job (it recomposites the scene over the old
+// rect), so there is no saved background patch to go stale.
+void mouse_paint_cursor(int px, int py) {
     for (int row = 0; row < CURSOR_H; row++) {
         for (int col = 0; col < CURSOR_W; col++) {
             if (cursor_bitmap[row] & (1 << (CURSOR_W - 1 - col))) {
-                // Check if this is an edge pixel (border)
                 int is_edge = 0;
                 if (row == 0 || col == 0 ||
                     !(cursor_bitmap[row-1] & (1 << (CURSOR_W - 1 - col))) ||
                     !(cursor_bitmap[row] & (1 << (CURSOR_W - col)))) {
                     is_edge = 1;
                 }
-                putpixel(mouse_x + col, mouse_y + row, is_edge ? 0 : 15);
+                putpixel(px + col, py + row, is_edge ? 0 : 15);
             }
         }
-    }
-    cursor_visible = 1;
-}
-
-void mouse_hide_cursor(void) {
-    if (cursor_visible) {
-        mouse_restore_bg();
-        cursor_visible = 0;
     }
 }
 
@@ -350,86 +310,111 @@ struct window* window_get(int id) {
     return &windows[id];
 }
 
+// Blink state is a pure function of the tick count — no hidden static state,
+// so any repaint (dirty, blink toggle, or scene repair) renders identically.
+static int window_blink_on(void) {
+    extern uint32_t tick_count;
+    return (tick_count / 18) % 2 == 0; // ~1 second blink
+}
+
+// Repaint a window from its model. Content cells are clipped to the
+// screen-space repair rect; frame/title are cheap enough to redraw whole.
+// Idempotent: painting twice with no model change produces identical pixels.
+void window_paint_region(int id, int rx, int ry, int rw, int rh) {
+    struct window* w = &windows[id];
+    if (!w->visible || w->minimized) return;
+
+    // Frame + title bar + buttons (full redraw — over-repair is harmless)
+    uint8_t border_color = w->focused ? WIN_ACTIVE_BORDER : WIN_BORDER_BG;
+    rect_outline(w->x, w->y, w->w, w->h, border_color, WIN_BORDER);
+    rect_fill(w->x + WIN_BORDER, w->y + WIN_BORDER,
+              w->w - 2 * WIN_BORDER, WIN_TITLE_H, WIN_TITLE_BG);
+    draw_string(w->x + WIN_BORDER + 4, w->y + WIN_BORDER + 2,
+                w->title, WIN_TITLE_FG, WIN_TITLE_BG);
+
+    if (w->has_close_button) {
+        int bx = w->x + w->w - WIN_BORDER - 14;
+        int by = w->y + WIN_BORDER;
+        rect_fill(bx, by, 12, 12, 4);
+        draw_string(bx + 2, by + 2, "X", 15, 4);
+    }
+    if (w->has_minimize_button) {
+        int bx = w->x + w->w - WIN_BORDER - 28;
+        int by = w->y + WIN_BORDER;
+        rect_fill(bx, by, 12, 12, 6);
+        draw_string(bx + 3, by + 2, "_", 15, 6);
+    }
+
+    // Content area, clipped to the repair rect
+    int cx = w->x + WIN_BORDER;
+    int cy = w->y + WIN_BORDER + WIN_TITLE_H;
+    int cw = w->w - 2 * WIN_BORDER;
+    int ch = w->h - WIN_TITLE_H - 2 * WIN_BORDER;
+
+    // Intersect content rect with repair rect
+    int x0 = cx > rx ? cx : rx;
+    int y0 = cy > ry ? cy : ry;
+    int x1 = (cx + cw) < (rx + rw) ? (cx + cw) : (rx + rw);
+    int y1 = (cy + ch) < (ry + rh) ? (cy + ch) : (ry + rh);
+
+    if (x0 < x1 && y0 < y1) {
+        rect_fill(x0, y0, x1 - x0, y1 - y0, WIN_BG);
+
+        if (w->content) {
+            int scale = w->font_scale;
+            int char_w = 8 * scale;
+            int char_h = 8 * scale;
+
+            for (int row = 0; row < w->content_h; row++) {
+                int py = cy + row * char_h;
+                if (py + char_h <= y0 || py >= y1) continue;
+                for (int col = 0; col < w->content_w; col++) {
+                    int px = cx + col * char_w;
+                    if (px + char_w <= x0 || px >= x1) continue;
+                    uint16_t entry = w->content[row * w->content_w + col];
+                    char c = entry & 0xFF;
+                    uint8_t color = (entry >> 8) & 0xFF;
+                    draw_char_scaled(px, py, c, color & 0x0F, (color >> 4) & 0x0F, scale);
+                }
+            }
+        }
+    }
+
+    // Blinking text cursor — render current state if the cell intersects
+    if (w->focused && w->content) {
+        int scale = w->font_scale;
+        int char_w = 8 * scale;
+        int char_h = 8 * scale;
+        int bx = cx + w->cursor_x * char_w;
+        int by = cy + w->cursor_y * char_h;
+
+        if (bx < rx + rw && bx + char_w > rx &&
+            by < ry + rh && by + char_h > ry) {
+            if (window_blink_on()) {
+                rect_fill(bx, by, char_w, char_h, 10);
+            } else {
+                int idx = w->cursor_y * w->content_w + w->cursor_x;
+                if (idx >= 0 && idx < w->content_w * w->content_h) {
+                    uint16_t entry = w->content[idx];
+                    char c = entry & 0xFF;
+                    uint8_t color = (entry >> 8) & 0xFF;
+                    draw_char_scaled(bx, by, c, color & 0x0F, (color >> 4) & 0x0F, scale);
+                }
+            }
+        }
+    }
+}
+
 void window_draw(int id) {
     struct window* w = &windows[id];
     if (!w->visible || w->minimized) return;
 
-    // Only redraw when dirty
-    if (w->dirty) {
-        // Draw frame
-        uint8_t border_color = w->focused ? WIN_ACTIVE_BORDER : WIN_BORDER_BG;
-        rect_outline(w->x, w->y, w->w, w->h, border_color, WIN_BORDER);
-        rect_fill(w->x + WIN_BORDER, w->y + WIN_BORDER,
-                  w->w - 2 * WIN_BORDER, WIN_TITLE_H, WIN_TITLE_BG);
-        draw_string(w->x + WIN_BORDER + 4, w->y + WIN_BORDER + 2,
-                    w->title, WIN_TITLE_FG, WIN_TITLE_BG);
-
-        if (w->has_close_button) {
-            int bx = w->x + w->w - WIN_BORDER - 14;
-            int by = w->y + WIN_BORDER;
-            rect_fill(bx, by, 12, 12, 4);
-            draw_string(bx + 2, by + 2, "X", 15, 4);
-        }
-        if (w->has_minimize_button) {
-            int bx = w->x + w->w - WIN_BORDER - 28;
-            int by = w->y + WIN_BORDER;
-            rect_fill(bx, by, 12, 12, 6);
-            draw_string(bx + 3, by + 2, "_", 15, 6);
-        }
-
-        // Draw content background + content
-        rect_fill(w->x + WIN_BORDER, w->y + WIN_BORDER + WIN_TITLE_H,
-                  w->w - 2 * WIN_BORDER, w->h - WIN_TITLE_H - 2 * WIN_BORDER, WIN_BG);
-
-        if (w->content) {
-            int cx = w->x + WIN_BORDER;
-            int cy = w->y + WIN_BORDER + WIN_TITLE_H;
-            int scale = w->font_scale;
-            int char_w = 8 * scale;
-
-            for (int row = 0; row < w->content_h; row++) {
-                for (int col = 0; col < w->content_w; col++) {
-                    uint16_t entry = w->content[row * w->content_w + col];
-                    char c = entry & 0xFF;
-                    uint8_t color = (entry >> 8) & 0xFF;
-                    uint8_t fg = color & 0x0F;
-                    uint8_t bg = (color >> 4) & 0x0F;
-                    draw_char_scaled(cx + col * char_w, cy + row * (8 * scale), c, fg, bg, scale);
-                }
-            }
-        }
+    // Repaint when dirty, or when the focused window's blink cell toggles
+    int blink = window_blink_on();
+    if (w->dirty || (w->focused && blink != w->last_cursor_visible)) {
+        window_paint_region(id, 0, 0, SCREEN_W, SCREEN_H);
         w->dirty = 0;
-    }
-
-    // Draw blinking cursor (every frame, cheap — just one rect_fill)
-    if (w->focused) {
-        extern uint32_t tick_count;
-        int cursor_on = ((tick_count / 18) % 2 == 0); // ~1 second blink
-        static int last_cursor_on = 0;
-
-        if (cursor_on != last_cursor_on) {
-            int cx = w->x + WIN_BORDER;
-            int cy = w->y + WIN_BORDER + WIN_TITLE_H;
-            int scale = w->font_scale;
-            int char_w = 8 * scale;
-
-            if (cursor_on) {
-                rect_fill(cx + w->cursor_x * char_w, cy + w->cursor_y * (8 * scale),
-                          char_w, 8 * scale, 10);
-            } else {
-                // Redraw just the character under cursor
-                int idx = w->cursor_y * w->content_w + w->cursor_x;
-                if (w->content && idx >= 0 && idx < w->content_w * w->content_h) {
-                    uint16_t entry = w->content[idx];
-                    char c = entry & 0xFF;
-                    uint8_t color = (entry >> 8) & 0xFF;
-                    draw_char_scaled(cx + w->cursor_x * char_w,
-                                     cy + w->cursor_y * (8 * scale),
-                                     c, color & 0x0F, (color >> 4) & 0x0F, scale);
-                }
-            }
-            last_cursor_on = cursor_on;
-        }
+        w->last_cursor_visible = blink;
     }
 }
 
@@ -528,8 +513,6 @@ void window_set_title(int id, const char* title) {
     windows[id].title[j] = 0;
     windows[id].dirty = 1;
 }
-
-#define TASKBAR_H 20
 
 void window_draw_taskbar(void) {
     int y = SCREEN_H - TASKBAR_H;

@@ -119,7 +119,9 @@ static void draw_txt_icon(int x, int y) {
     }
 }
 
-static void draw_desktop_icons(void) {
+// Draw desktop icons, optionally limited to those intersecting a repair rect
+// (pass 0,0,SCREEN_W,SCREEN_H to draw everything)
+static void draw_desktop_icons_in(int rx, int ry, int rw, int rh) {
     int count = fs_get_count();
     for (int i = 0; i < count; i++) {
         const char* name = fs_get_name(i);
@@ -129,6 +131,12 @@ static void draw_desktop_icons(void) {
         int col = i % ICONS_PER_ROW;
         int ix = ICON_START_X + col * (ICON_SIZE + ICON_SPACING);
         int iy = ICON_START_Y + row * (ICON_SIZE + ICON_LABEL_H + ICON_SPACING);
+
+        // Icon + label footprint (label sits at iy+ICON_SIZE+2, 8px tall)
+        if (ix >= rx + rw || ix + ICON_SIZE <= rx ||
+            iy >= ry + rh || iy + ICON_SIZE + 12 <= ry) {
+            continue;
+        }
 
         draw_txt_icon(ix, iy);
 
@@ -157,6 +165,59 @@ static void draw_desktop_icons(void) {
         draw_string(ix + 4, iy + ICON_SIZE + 2, label, 15, 0);
     }
 }
+
+static void draw_desktop_icons(void) {
+    draw_desktop_icons_in(0, 0, SCREEN_W, SCREEN_H);
+}
+
+// Recomposite a screen region purely from the scene model:
+// wallpaper -> icons -> window stack (back-to-front) -> taskbar.
+// This is the single authoritative repair path — used to erase the cursor
+// sprite and any other region whose pixels must return to model truth.
+static void desktop_paint_rect(int x, int y, int w, int h) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > SCREEN_W) w = SCREEN_W - x;
+    if (y + h > SCREEN_H) h = SCREEN_H - y;
+    if (w <= 0 || h <= 0) return;
+
+    // All repair drawing is clip-limited so only the damaged rows/columns
+    // get marked dirty (keeps flush volume proportional to repair size)
+    graphics_set_clip(x, y, w, h);
+
+    graphics_blit_wallpaper_rect(x, y, w, h);
+    draw_desktop_icons_in(x, y, w, h);
+
+    // Windows back-to-front, focused last (same order as window_draw_all)
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        struct window* win = window_get(i);
+        if (!win || !win->visible || win->minimized || win->focused) continue;
+        if (win->x < x + w && win->x + win->w > x &&
+            win->y < y + h && win->y + win->h > y) {
+            window_paint_region(i, x, y, w, h);
+        }
+    }
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        struct window* win = window_get(i);
+        if (!win || !win->visible || win->minimized || !win->focused) continue;
+        if (win->x < x + w && win->x + win->w > x &&
+            win->y < y + h && win->y + win->h > y) {
+            window_paint_region(i, x, y, w, h);
+        }
+    }
+
+    if (y + h > SCREEN_H - TASKBAR_H) {
+        window_draw_taskbar();
+    }
+
+    graphics_clip_reset();
+}
+
+// Cursor compositor state: where the sprite was painted last frame.
+// The backbuffer is only ever "model + this one sprite".
+static int cursor_shown = 0;
+static int cursor_px = 0;
+static int cursor_py = 0;
 
 // Returns file index if icon clicked, -1 otherwise
 static int check_icon_click(int mx, int my) {
@@ -779,13 +840,9 @@ void kernel_main(uint32_t mboot_addr) {
 
                     if (window_check_minimize_click(i, mx, my)) {
                         window_minimize(i);
-                        // Restore wallpaper where the window was
-                        graphics_blit_wallpaper();
-                        // Mark remaining windows dirty
-                        for (int j = 0; j < MAX_WINDOWS; j++) {
-                            struct window* w2 = window_get(j);
-                            if (w2 && w2->visible && !w2->minimized && j != i) w2->dirty = 1;
-                        }
+                        // window_minimize sets needs_redraw — the periodic
+                        // full-redraw section rebuilds wallpaper and marks all
+                        // remaining windows dirty later this same frame
                         clicked = 1;
                         break;
                     }
@@ -848,6 +905,13 @@ void kernel_main(uint32_t mboot_addr) {
             }
         }
 
+        // Erase last frame's cursor sprite by recompositing that region from
+        // the scene model — no saved background patch to go stale
+        if (cursor_shown) {
+            desktop_paint_rect(cursor_px, cursor_py, CURSOR_W, CURSOR_H);
+            cursor_shown = 0;
+        }
+
         // Periodic full redraw every ~1 second (18 ticks) + on-demand when things change
         static uint32_t last_redraw_tick = 0;
         if (needs_redraw || (tick_count - last_redraw_tick >= 18)) {
@@ -862,12 +926,10 @@ void kernel_main(uint32_t mboot_addr) {
         }
 
         // Draw windows (only dirty ones — editor marks itself dirty on keystroke)
-        mouse_hide_cursor();
         window_draw_all();
         window_draw_taskbar();
-        mouse_draw_cursor();
 
-        // FPS counter
+        // FPS counter (drawn before the cursor so the sprite sits on top)
         frame_count++;
         if (tick_count - last_fps_tick >= 18) {
             fps = frame_count;
@@ -884,6 +946,12 @@ void kernel_main(uint32_t mboot_addr) {
         fps_buf[fi] = 0;
         rect_fill(SCREEN_W - 70, 2, 68, 10, 0);
         draw_string(SCREEN_W - 68, 3, fps_buf, 15, 0);
+
+        // Cursor composited last, from an atomic position snapshot — nothing
+        // draws after it, so the sprite can never be half-erased on screen
+        mouse_get_position(&cursor_px, &cursor_py);
+        mouse_paint_cursor(cursor_px, cursor_py);
+        cursor_shown = 1;
 
         graphics_flush();
     }

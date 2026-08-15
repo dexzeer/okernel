@@ -6,6 +6,11 @@
 #define MAX_WINDOWS 8
 #define WIN_TITLE_H 12
 #define WIN_BORDER 2
+#define TASKBAR_H 20
+
+// Mouse cursor sprite size (12x16 arrow)
+#define CURSOR_W 12
+#define CURSOR_H 16
 
 // Window colors — modern dark theme
 #define WIN_TITLE_BG 1    // Dark blue
@@ -39,6 +44,9 @@ void window_set_focus(int id);
 int window_get_focused(void);
 void window_draw(int id);
 void window_draw_all(void);
+// Repaint a window from its model, clipped to a screen-space rect.
+// Does not touch the dirty flag — used for scene repair (cursor erase).
+void window_paint_region(int id, int rx, int ry, int rw, int rh);
 void window_put_char(int id, char c);
 void window_puts(int id, const char* str);
 void window_clear(int id);
@@ -56,8 +64,10 @@ void window_set_title(int id, const char* title);
 
 // Mouse
 void mouse_init_fb(void);
-void mouse_draw_cursor(void);
-void mouse_hide_cursor(void);
+// Atomic snapshot of cursor position (ISR updates it on IRQ12)
+void mouse_get_position(int* x, int* y);
+// Draw cursor sprite at explicit coordinates — stateless, no save/restore
+void mouse_paint_cursor(int px, int py);
 int mouse_get_x(void);
 int mouse_get_y(void);
 int mouse_get_left_button(void);

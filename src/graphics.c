@@ -11,6 +11,11 @@ static uint8_t backbuffer[SCREEN_W * SCREEN_H];
 // Dirty row tracking — only flush rows that changed
 static uint8_t dirty_rows[SCREEN_H];
 
+// Clip rectangle — repair drawing (cursor erase) is restricted to it so a
+// small repair doesn't dirty rows/columns outside the damaged region.
+// Defaults to the full screen; set/reset around repair sequences.
+static int clip_x0 = 0, clip_y0 = 0, clip_x1 = SCREEN_W, clip_y1 = SCREEN_H;
+
 // 8x8 bitmap font (ASCII 32-127)
 // Each character is 8 bytes, each byte is a row of 8 pixels
 static const uint8_t font8x8[][8] = {
@@ -189,21 +194,41 @@ void graphics_init(uint32_t mboot_addr) {
     for (int i = 0; i < SCREEN_H; i++) dirty_rows[i] = 1;
 }
 
+void graphics_set_clip(int x, int y, int w, int h) {
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    clip_x0 = x;
+    clip_y0 = y;
+    clip_x1 = x + w > SCREEN_W ? SCREEN_W : x + w;
+    clip_y1 = y + h > SCREEN_H ? SCREEN_H : y + h;
+    if (clip_x1 < clip_x0) clip_x1 = clip_x0;
+    if (clip_y1 < clip_y0) clip_y1 = clip_y0;
+}
+
+void graphics_clip_reset(void) {
+    clip_x0 = 0; clip_y0 = 0; clip_x1 = SCREEN_W; clip_y1 = SCREEN_H;
+}
+
 void putpixel(int x, int y, uint8_t color) {
-    if (x >= 0 && x < SCREEN_W && y >= 0 && y < SCREEN_H) {
+    if (x >= clip_x0 && x < clip_x1 && y >= clip_y0 && y < clip_y1) {
         backbuffer[y * SCREEN_W + x] = color;
         dirty_rows[y] = 1;
     }
 }
 
 void rect_fill(int x, int y, int w, int h, uint8_t color) {
-    for (int j = y; j < y + h; j++) {
-        if (j < 0 || j >= SCREEN_H) continue;
+    // Intersect with clip rect, then write — rows/columns outside the clip
+    // are neither written nor marked dirty
+    int x0 = x < clip_x0 ? clip_x0 : x;
+    int y0 = y < clip_y0 ? clip_y0 : y;
+    int x1 = x + w < clip_x1 ? x + w : clip_x1;
+    int y1 = y + h < clip_y1 ? y + h : clip_y1;
+    if (x0 >= x1 || y0 >= y1) return;
+
+    for (int j = y0; j < y1; j++) {
         dirty_rows[j] = 1;
         uint8_t* dst = backbuffer + j * SCREEN_W;
-        int sx = x < 0 ? 0 : x;
-        int ex = x + w > SCREEN_W ? SCREEN_W : x + w;
-        for (int i = sx; i < ex; i++) dst[i] = color;
+        for (int i = x0; i < x1; i++) dst[i] = color;
     }
 }
 
@@ -217,9 +242,9 @@ void rect_outline(int x, int y, int w, int h, uint8_t color, int t) {
 }
 
 void hline(int x, int y, int len, uint8_t color) {
-    if (y < 0 || y >= SCREEN_H) return;
-    if (x < 0) { len += x; x = 0; }
-    if (x + len > SCREEN_W) len = SCREEN_W - x;
+    if (y < clip_y0 || y >= clip_y1) return;
+    if (x < clip_x0) { len -= clip_x0 - x; x = clip_x0; }
+    if (x + len > clip_x1) len = clip_x1 - x;
     if (len <= 0) return;
     uint8_t* dst = backbuffer + y * SCREEN_W + x;
     for (int i = 0; i < len; i++) dst[i] = color;
@@ -307,7 +332,7 @@ void graphics_mark_dirty(int y) {
 }
 
 void graphics_write_pixel(int x, int y, uint8_t color) {
-    if (x >= 0 && x < SCREEN_W && y >= 0 && y < SCREEN_H) {
+    if (x >= clip_x0 && x < clip_x1 && y >= clip_y0 && y < clip_y1) {
         backbuffer[y * SCREEN_W + x] = color;
     }
 }
@@ -345,6 +370,24 @@ void graphics_blit_wallpaper(void) {
         }
         for (; x < SCREEN_W; x++) dst[x] = src[x];
         dirty_rows[y] = 1;
+    }
+}
+
+// Blit a sub-rect of the cached wallpaper (clipped to screen). Used for
+// scene repair — restoring the base layer under a small dirty region.
+void graphics_blit_wallpaper_rect(int x, int y, int w, int h) {
+    if (!wallpaper_cached) return;
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > SCREEN_W) w = SCREEN_W - x;
+    if (y + h > SCREEN_H) h = SCREEN_H - y;
+    if (w <= 0 || h <= 0) return;
+
+    for (int yy = y; yy < y + h; yy++) {
+        uint8_t* dst = backbuffer + yy * SCREEN_W;
+        uint8_t* src = cached_wallpaper + yy * SCREEN_W;
+        for (int xx = x; xx < x + w; xx++) dst[xx] = src[xx];
+        dirty_rows[yy] = 1;
     }
 }
 
