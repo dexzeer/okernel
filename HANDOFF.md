@@ -26,6 +26,9 @@ okernel/
 │   ├── window.c/.h        # Window manager, mouse driver, PS/2 handling
 │   ├── paging.c/.h        # Identity-mapped page tables for framebuffer access
 │   │
+│   ├── filesystem.c/.h    # In-memory virtual filesystem (16 files, 4KB max)
+│   ├── editor.c/.h        # Text editor (open, edit, save files in windows)
+│   │
 │   ├── gdt.c/.h           # Global Descriptor Table setup
 │   ├── idt.c/.h           # Interrupt Descriptor Table, PIC remapping, IRQ dispatch
 │   ├── keyboard.c/.h      # PS/2 keyboard driver (scancode set 1)
@@ -134,7 +137,10 @@ qemu-system-i386 ... -object filter-dump,id=dump0,netdev=net0,file=/tmp/net.pcap
 | ping | Ping gateway (10.0.2.2) |
 | ip | Show IP address |
 | resolve [host] | DNS lookup |
-| browse [host] [path] | HTTP GET request |
+| browse [host] [path] | HTTP GET, saves response to <host>.txt |
+| edit [file] | Open text editor with file |
+| ls | List files in virtual filesystem |
+| open [file] | Open file in text editor |
 | reboot | Reset CPU |
 | shutdown | ACPI power off |
 
@@ -146,7 +152,7 @@ Same as above plus: `list`, `switch N`
 ## Known Limitations
 
 - **No virtual memory** — identity mapping only, no user-mode processes
-- **No filesystem** — everything in memory, no disk I/O
+- **In-memory filesystem only** — files lost on reboot, no disk I/O
 - **No sound** — no audio drivers
 - **Bump allocator** — heap doesn't free (kfree is a no-op)
 - **Single CPU** — no SMP support
@@ -184,11 +190,13 @@ Same as above plus: `list`, `switch N`
 |------|---------------|
 | `boot/start.asm` | Entry point — where everything begins |
 | `boot/isr.asm` | Interrupt handlers — must match IDT setup |
-| `src/desktop.c` | Desktop main loop — all user-facing logic |
+| `src/desktop.c` | Desktop main loop — shell commands, icons, editor integration |
 | `src/graphics.c` | Drawing primitives + framebuffer management |
 | `src/window.c` | Window manager + mouse driver |
 | `src/paging.c` | Page tables — required for framebuffer access |
 | `src/memory.c` | Physical memory manager + heap |
+| `src/filesystem.c` | In-memory virtual filesystem (files persist until reboot) |
+| `src/editor.c` | Text editor — open/edit/save files in windows |
 | `src/net/e1000.c` | e1000 NIC driver — TX + RX |
 | `src/net/network.c` | Full network stack — ARP, IP, ICMP, UDP, TCP, DNS, HTTP |
 | `linker.ld` | Memory layout — kernel load address, symbols |

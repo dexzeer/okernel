@@ -541,26 +541,24 @@ int dns_is_resolved(uint32_t* ip) {
 
 int dns_is_pending(void) { return dns_pending; }
 
-// TCP checksum (with pseudo-header) — compute over big-endian data correctly
+// TCP checksum (with pseudo-header) — uses big-endian reads for correctness
 static uint16_t tcp_checksum(uint8_t* src_ip, uint8_t* dst_ip, uint8_t* tcp_data, int tcp_len) {
-    // Pseudo-header (12 bytes)
+    // Pseudo-header
     uint8_t pseudo[12];
     for (int i = 0; i < 4; i++) { pseudo[i] = src_ip[i]; pseudo[i+4] = dst_ip[i]; }
     pseudo[8] = 0; pseudo[9] = 6; // Protocol: TCP
     pseudo[10] = (tcp_len >> 8) & 0xFF; pseudo[11] = tcp_len & 0xFF;
 
     uint32_t sum = 0;
-    // Sum pseudo-header as big-endian 16-bit words
-    for (int i = 0; i < 12; i += 2) sum += ((uint16_t)pseudo[i] << 8) | pseudo[i+1];
-    // Sum TCP data as big-endian 16-bit words
+    uint8_t* p = pseudo;
+    for (int i = 0; i < 12; i += 2) sum += (p[i] << 8) | p[i+1];
     for (int i = 0; i < tcp_len; i += 2) {
-        uint16_t val = (uint16_t)tcp_data[i] << 8;
+        uint16_t val = (tcp_data[i] << 8);
         if (i + 1 < tcp_len) val |= tcp_data[i + 1];
         sum += val;
     }
     while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-    // Return in HOST byte order — caller writes as big-endian
-    return ~(uint16_t)sum;
+    return ~sum;
 }
 
 void tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
@@ -653,7 +651,17 @@ void tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
 
 static void tcp_send_packet(uint8_t flags, uint8_t* data, uint16_t data_len) {
     uint8_t target_mac[6];
-    arp_resolve(tcp_conn.dst_ip, target_mac);
+
+    // Route through gateway for external IPs (same logic as tcp_connect)
+    uint8_t* arp_target = tcp_conn.dst_ip;
+    if ((tcp_conn.dst_ip[0] & 0xF0) != (our_ip[0] & 0xF0) ||
+        tcp_conn.dst_ip[1] != our_ip[1] || tcp_conn.dst_ip[2] != our_ip[2]) {
+        arp_target = net_get_gateway();
+    }
+    if (!arp_resolve(arp_target, target_mac)) {
+        arp_send_request(arp_target);
+        return;
+    }
 
     uint8_t frame[ETH_FRAME_MAX];
     uint8_t* mac = e1000_get_mac();
@@ -774,32 +782,32 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
         if (flags & 0x01) { // FIN
             tcp_conn.ack = seq_num + 1;
             tcp_send_packet(0x10, 0, 0); // ACK
+            tcp_send_packet(0x11, 0, 0); // FIN+ACK
+            tcp_conn.seq++;
             tcp_conn.state = TCP_STATE_CLOSED;
-            tcp_rx_ready = 1; // All data received
-            serial_puts("[tcp] CLOSED (server FIN), ");
-            serial_putchar('0' + (tcp_rx_len / 100));
-            serial_putchar('0' + ((tcp_rx_len / 10) % 10));
-            serial_putchar('0' + (tcp_rx_len % 10));
-            serial_puts(" bytes received\n");
+            serial_puts("[tcp] CLOSED (server FIN)\n");
             return;
         }
         if (payload_len > 0) {
             tcp_conn.ack = seq_num + payload_len;
             tcp_send_packet(0x10, 0, 0); // ACK
 
-            // Accumulate payload into RX buffer (don't reset tcp_rx_len)
-            if (tcp_rx_len + payload_len <= 4095) {
-                for (int i = 0; i < payload_len; i++) {
-                    tcp_rx_buf[tcp_rx_len + i] = data[data_offset + i];
-                }
-                tcp_rx_len += payload_len;
+            // Copy payload to RX buffer
+            for (int i = 0; i < payload_len && i < 1500; i++) {
+                tcp_rx_buf[tcp_rx_len + i] = data[data_offset + i];
             }
+            tcp_rx_len += payload_len;
 
-            serial_puts("[tcp] data: ");
-            serial_putchar('0' + (tcp_rx_len / 100));
-            serial_putchar('0' + ((tcp_rx_len / 10) % 10));
-            serial_putchar('0' + (tcp_rx_len % 10));
-            serial_puts(" bytes total\n");
+            // Check if this looks like end of HTTP response
+            // (simplistic: check for \r\n\r\n or small payload)
+            if (tcp_rx_len > 0) {
+                tcp_rx_ready = 1;
+                serial_puts("[tcp] data: ");
+                serial_putchar('0' + (tcp_rx_len / 100));
+                serial_putchar('0' + ((tcp_rx_len / 10) % 10));
+                serial_putchar('0' + (tcp_rx_len % 10));
+                serial_puts(" bytes\n");
+            }
         }
     } else if (tcp_conn.state == TCP_STATE_FIN_WAIT) {
         if (flags & 0x10) { // ACK of our FIN
@@ -834,6 +842,12 @@ void http_get(const char* host, const char* path) {
 
     // Start TCP connection if not connected
     if (tcp_conn.state == TCP_STATE_CLOSED) {
+        // Save for retry after TCP handshake completes
+        for (int i = 0; host[i] && i < 127; i++) http_pending_host[i] = host[i];
+        http_pending_host[127] = 0;
+        for (int i = 0; path[i] && i < 127; i++) http_pending_path[i] = path[i];
+        http_pending_path[127] = 0;
+        http_retry_pending = 1;
         tcp_connect(ip, 80);
         return;
     }
@@ -884,11 +898,15 @@ void http_get(const char* host, const char* path) {
 void http_poll(void) {
     if (!http_pending) return;
     if (tcp_rx_ready) {
-        // Copy response
-        for (int i = 0; i < tcp_rx_len && i < 4095; i++) {
-            http_response[i] = tcp_rx_buf[i];
+        // Accumulate response (append new chunk)
+        int copy_len = tcp_rx_len;
+        if (http_response_len + copy_len > 4095) copy_len = 4095 - http_response_len;
+        if (copy_len > 0) {
+            for (int i = 0; i < copy_len; i++) {
+                http_response[http_response_len + i] = tcp_rx_buf[i];
+            }
+            http_response_len += copy_len;
         }
-        http_response_len = tcp_rx_len;
         http_response[http_response_len] = 0;
         tcp_rx_ready = 0;
         tcp_rx_len = 0;
@@ -910,8 +928,8 @@ void http_poll(void) {
         const char* hdr2 = " bytes):\n";
         for (int i = 0; hdr2[i]; i++) net_event_msg[idx++] = hdr2[i];
         // Copy first ~180 chars of response
-        int copy_len = http_response_len < 180 ? http_response_len : 180;
-        for (int i = 0; i < copy_len && idx < 254; i++) {
+        int disp_len = http_response_len < 180 ? http_response_len : 180;
+        for (int i = 0; i < disp_len && idx < 254; i++) {
             net_event_msg[idx++] = http_response[i];
         }
         if (http_response_len > 180) {
@@ -930,6 +948,7 @@ void http_poll(void) {
 
 char* http_get_response(void) { return http_response; }
 int http_get_response_len(void) { return http_response_len; }
+int http_is_pending(void) { return http_pending; }
 
 void net_set_event_callback(void (*cb)(const char* msg)) {
     net_event_callback = cb;

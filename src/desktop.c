@@ -11,6 +11,8 @@
 #include "memory.h"
 #include "serial.h"
 #include "io.h"
+#include "filesystem.h"
+#include "editor.h"
 
 struct mboot_info {
     uint32_t flags;
@@ -68,6 +70,110 @@ static uint32_t frame_count = 0;
 static uint32_t fps = 0;
 static uint32_t last_fps_tick = 0;
 
+// Desktop icon system
+#define ICON_SIZE 32
+#define ICON_LABEL_H 8
+#define ICON_SPACING 8
+#define ICONS_PER_ROW 7
+#define ICON_START_X 10
+#define ICON_START_Y 10
+
+// 16x16 .txt file icon bitmap (1=white, 0=transparent)
+// A document with folded corner and horizontal lines
+static const uint8_t txt_icon[16][2] = {
+    {0x7F, 0xE0}, //  01111111 11100000  - top edge
+    {0x40, 0x20}, //  01000000 00100000  - left edge + fold
+    {0x40, 0x20}, //  01000000 00100000
+    {0x41, 0xE0}, //  01000001 11100000  - fold corner
+    {0x41, 0x00}, //  01000001 00000000  - fold bottom
+    {0x41, 0x00}, //  01000001 00000000
+    {0x41, 0x00}, //  01000001 00000000
+    {0x41, 0xFC}, //  01000001 11111100  - line 1
+    {0x41, 0x00}, //  01000001 00000000
+    {0x41, 0xFC}, //  01000001 11111100  - line 2
+    {0x41, 0x00}, //  01000001 00000000
+    {0x41, 0xFC}, //  01000001 11111100  - line 3
+    {0x41, 0x00}, //  01000001 00000000
+    {0x41, 0x00}, //  01000001 00000000
+    {0x7F, 0xFE}, //  01111111 11111110  - bottom edge
+    {0x00, 0x00}, //  00000000 00000000
+};
+
+static void draw_txt_icon(int x, int y) {
+    // Icon background
+    rect_fill(x, y, ICON_SIZE, ICON_SIZE, 7); // Light grey background
+    rect_outline(x, y, ICON_SIZE, ICON_SIZE, 8, 1); // Border
+
+    // Draw the icon bitmap (16x16 centered in 32x32)
+    int ox = x + 8;
+    int oy = y + 4;
+    for (int row = 0; row < 16; row++) {
+        for (int col = 0; col < 16; col++) {
+            int byte_idx = col / 8;
+            int bit_idx = 7 - (col % 8);
+            if (txt_icon[row][byte_idx] & (1 << bit_idx)) {
+                putpixel(ox + col, oy + row, 0); // Black pixels for icon
+            }
+        }
+    }
+}
+
+static void draw_desktop_icons(void) {
+    int count = fs_get_count();
+    for (int i = 0; i < count; i++) {
+        const char* name = fs_get_name(i);
+        if (!name) continue;
+
+        int row = i / ICONS_PER_ROW;
+        int col = i % ICONS_PER_ROW;
+        int ix = ICON_START_X + col * (ICON_SIZE + ICON_SPACING);
+        int iy = ICON_START_Y + row * (ICON_SIZE + ICON_LABEL_H + ICON_SPACING);
+
+        draw_txt_icon(ix, iy);
+
+        // Draw filename label centered below icon
+        int name_len = 0;
+        while (name[name_len]) name_len++;
+
+        int label_x = ix + (ICON_SIZE - name_len * 8) / 2;
+        if (label_x < ix) label_x = ix;
+
+        // Truncate name to fit (max ~5 chars for 32px icon)
+        int max_chars = ICON_SIZE / 8;
+        if (max_chars > 4) max_chars = 4;
+
+        char label[6];
+        int li = 0;
+        while (li < max_chars && name[li]) {
+            label[li] = name[li];
+            li++;
+        }
+        label[li] = 0;
+        if (name_len > max_chars) {
+            label[li - 1] = '~';
+        }
+
+        draw_string(ix + 4, iy + ICON_SIZE + 2, label, 15, 0);
+    }
+}
+
+// Returns file index if icon clicked, -1 otherwise
+static int check_icon_click(int mx, int my) {
+    int count = fs_get_count();
+    for (int i = 0; i < count; i++) {
+        int row = i / ICONS_PER_ROW;
+        int col = i % ICONS_PER_ROW;
+        int ix = ICON_START_X + col * (ICON_SIZE + ICON_SPACING);
+        int iy = ICON_START_Y + row * (ICON_SIZE + ICON_LABEL_H + ICON_SPACING);
+
+        if (mx >= ix && mx < ix + ICON_SIZE &&
+            my >= iy && my < iy + ICON_SIZE + ICON_LABEL_H) {
+            return i;
+        }
+    }
+    return -1;
+}
+
 static void shell_prompt(int win_id) {
     window_set_text_color(win_id, 10, 0); // Green on black
     window_puts(win_id, "okernel> ");
@@ -98,7 +204,7 @@ static void open_sysinfo(void) {
     info_win = window_create("System Info", 240, 60, 280, 220);
     window_set_close_button(info_win, 1);
     window_set_minimize_button(info_win, 1);
-    window_puts(info_win, "okernel v0.2\n");
+    window_puts(info_win, "okernel v0.3\n");
     window_puts(info_win, "Desktop Edition\n\n");
     window_puts(info_win, "Resolution: 640x480\n");
     window_puts(info_win, "Shell: okernel sh\n");
@@ -124,7 +230,6 @@ static int create_terminal(void) {
     int win_id = window_create("Terminal", x, y, 440, 360);
     window_set_close_button(win_id, 1);
     window_set_minimize_button(win_id, 1);
-    needs_redraw = 1;
     term_wins[term_count] = win_id;
     term_lens[term_count] = 0;
     term_bufs[term_count][0] = 0;
@@ -187,7 +292,10 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  ping      - ping gateway\n");
         window_puts(win_id, "  ip        - show IP address\n");
         window_puts(win_id, "  resolve   - DNS lookup\n");
-        window_puts(win_id, "  browse    - HTTP browse\n");
+        window_puts(win_id, "  browse    - HTTP (saves .txt)\n");
+        window_puts(win_id, "  edit      - open text editor\n");
+        window_puts(win_id, "  ls        - list files\n");
+        window_puts(win_id, "  open      - open file in editor\n");
         window_puts(win_id, "  reboot    - reboot system\n");
         window_puts(win_id, "  shutdown  - power off\n");
     }
@@ -238,6 +346,7 @@ static void shell_execute(int win_id, const char* input) {
         if (args[0] == 0) {
             window_puts(win_id, "Usage: browse <hostname> [path]\n");
             window_puts(win_id, "Example: browse example.com /\n");
+            window_puts(win_id, "Saves response to <hostname>.txt\n");
         } else {
             // Parse host and path from args
             char host[128] = {0};
@@ -256,11 +365,90 @@ static void shell_execute(int win_id, const char* input) {
                 }
                 path[j] = 0;
             }
+
+            // Build filename: <hostname>.txt
+            char filename[140];
+            int fi = 0;
+            while (host[fi] && fi < 135) {
+                filename[fi] = host[fi];
+                fi++;
+            }
+            filename[fi++] = '.';
+            filename[fi++] = 't';
+            filename[fi++] = 'x';
+            filename[fi++] = 't';
+            filename[fi] = 0;
+
+            // Create file for saving response
+            fs_create(filename);
+
             window_puts(win_id, "Browsing ");
             window_puts(win_id, host);
             window_puts(win_id, path);
-            window_puts(win_id, "...\n");
+            window_puts(win_id, " -> saving to ");
+            window_puts(win_id, filename);
+            window_puts(win_id, "\n");
+            net_set_browse_save(filename);
             http_get(host, path);
+        }
+    }
+    else if (str_eq(cmd_buf, "edit")) {
+        if (args[0] == 0) {
+            window_puts(win_id, "Usage: edit <filename>\n");
+            window_puts(win_id, "Example: edit readme.txt\n");
+        } else {
+            int ed = editor_open(args);
+            if (ed >= 0) {
+                window_puts(win_id, "Opened editor: ");
+                window_puts(win_id, args);
+                window_put_char(win_id, '\n');
+            } else {
+                window_puts(win_id, "Cannot open editor.\n");
+            }
+        }
+    }
+    else if (str_eq(cmd_buf, "ls")) {
+        int count = fs_get_count();
+        if (count == 0) {
+            window_puts(win_id, "(empty)\n");
+        } else {
+            for (int i = 0; i < count; i++) {
+                const char* name = fs_get_name(i);
+                int size = fs_get_size(name);
+                window_puts(win_id, "  ");
+                window_puts(win_id, name);
+                window_puts(win_id, "  (");
+                char buf[8];
+                int bi = 0;
+                if (size == 0) { buf[bi++] = '0'; }
+                else {
+                    char rev[8]; int ri = 0;
+                    int tmp = size;
+                    while (tmp > 0) { rev[ri++] = '0' + (tmp % 10); tmp /= 10; }
+                    while (ri > 0) buf[bi++] = rev[--ri];
+                }
+                buf[bi] = 0;
+                window_puts(win_id, buf);
+                window_puts(win_id, " bytes)\n");
+            }
+        }
+    }
+    else if (str_eq(cmd_buf, "open")) {
+        if (args[0] == 0) {
+            window_puts(win_id, "Usage: open <filename>\n");
+        } else if (!fs_exists(args)) {
+            window_puts(win_id, "File not found: ");
+            window_puts(win_id, args);
+            window_put_char(win_id, '\n');
+        } else {
+            int ed = editor_open(args);
+            if (ed >= 0) {
+                window_puts(win_id, "Opened: ");
+                window_puts(win_id, args);
+                window_put_char(win_id, '\n');
+            } else {
+                window_puts(win_id, "Cannot open editor.\n");
+            }
         }
     }
     else if (str_eq(cmd_buf, "clear")) {
@@ -307,11 +495,11 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, " | (_) |   <  __/ |  | | | |  __/ |\n");
         window_puts(win_id, "  \\___/|_|\\_\\___|_|  |_| |_|\\___|_|\n\n");
         window_set_text_color(win_id, 15, 0); // White
-        window_puts(win_id, "okernel v0.2 - Desktop Edition\n");
+        window_puts(win_id, "okernel v0.3 - Desktop Edition\n");
         window_puts(win_id, "Built from scratch in C and x86 assembly\n");
     }
     else if (str_eq(cmd_buf, "neofetch") || str_eq(cmd_buf, "sysinfo")) {
-        window_puts(win_id, "okernel v0.2\n");
+        window_puts(win_id, "okernel v0.3\n");
         window_puts(win_id, "Resolution: 640x480\n");
         window_puts(win_id, "Shell: okernel sh\n");
         window_puts(win_id, "Memory: ");
@@ -370,6 +558,16 @@ static void on_keypress(char c) {
     int win_id = window_get_focused();
     if (win_id < 0) return;
 
+    // Check if this is an editor window
+    int ed_id = editor_find_by_win(win_id);
+    if (ed_id >= 0) {
+        // Handle Ctrl+S (save) — detect by checking for special char
+        // For now, just pass characters to the editor
+        editor_handle_key(ed_id, c);
+        editor_draw(ed_id);
+        return;
+    }
+
     int tidx = find_term_idx(win_id);
     if (tidx < 0) return; // Not a terminal window
 
@@ -398,14 +596,60 @@ static void on_timer(void) {
 
 // Network event callback — prints to first terminal window
 static void on_net_event(const char* msg) {
-    serial_puts("[on_net_event] called, msg=");
-    serial_puts(msg);
-    serial_puts("\n");
     if (term_wins[0] >= 0) {
         window_puts(term_wins[0], msg);
         shell_prompt(term_wins[0]);
     } else {
         serial_puts("[on_net_event] term_wins[0] invalid!\n");
+    }
+}
+
+// Save HTTP response to the pending browse file
+static char browse_save_file[140] = {0};
+static int browse_saved_notified = 0;
+
+void net_set_browse_save(const char* filename) {
+    int i = 0;
+    while (filename[i] && i < 139) {
+        browse_save_file[i] = filename[i];
+        i++;
+    }
+    browse_save_file[i] = 0;
+    browse_saved_notified = 0;
+}
+
+static void check_save_http_response(void) {
+    if (browse_save_file[0] == 0) return;
+
+    int resp_len = http_get_response_len();
+
+    // Keep overwriting file with latest accumulated data every frame
+    if (resp_len > 0) {
+        char* resp = http_get_response();
+        if (resp) {
+            fs_write(browse_save_file, (uint8_t*)resp, resp_len);
+        }
+    }
+
+    // Once connection is closed and we have data, notify and stop
+    if (!browse_saved_notified && !http_is_pending() && resp_len > 0) {
+        browse_saved_notified = 1;
+        if (term_wins[0] >= 0) {
+            window_puts(term_wins[0], "Saved ");
+            char buf[8]; int bi = 0;
+            char rev[8]; int ri = 0;
+            int tmp = resp_len;
+            while (tmp > 0) { rev[ri++] = '0' + (tmp % 10); tmp /= 10; }
+            if (ri == 0) buf[bi++] = '0';
+            while (ri > 0) buf[bi++] = rev[--ri];
+            buf[bi] = 0;
+            window_puts(term_wins[0], buf);
+            window_puts(term_wins[0], " bytes to ");
+            window_puts(term_wins[0], browse_save_file);
+            window_puts(term_wins[0], "\n");
+            shell_prompt(term_wins[0]);
+        }
+        browse_save_file[0] = 0;
     }
 }
 
@@ -424,6 +668,8 @@ void kernel_main(uint32_t mboot_addr) {
 
     graphics_init(mboot_addr);
     window_init();
+    fs_init();
+    editor_init();
 
     // Cache wallpaper for fast blitting
     graphics_cache_wallpaper(wp_pixels, WP_W, WP_H);
@@ -450,7 +696,7 @@ void kernel_main(uint32_t mboot_addr) {
     window_puts(term_wins[0], " | (_) |   <  __/ |  | | | |  __/ |\n");
     window_puts(term_wins[0], "  \\___/|_|\\_\\___|_|  |_| |_|\\___|_|\n\n");
     window_set_text_color(term_wins[0], 15, 0); // White
-    window_puts(term_wins[0], "Welcome to okernel v0.2\n");
+    window_puts(term_wins[0], "Welcome to okernel v0.3\n");
     window_puts(term_wins[0], "A minimalistic operating system.\n\n");
     window_set_text_color(term_wins[0], 8, 0); // Grey
     window_puts(term_wins[0], "Type 'help' for commands.\n");
@@ -513,6 +759,21 @@ void kernel_main(uint32_t mboot_addr) {
                 }
             }
 
+            // Check desktop icon clicks
+            if (!clicked) {
+                int icon_idx = check_icon_click(mx, my);
+                if (icon_idx >= 0) {
+                    const char* name = fs_get_name(icon_idx);
+                    if (name) {
+                        int ed = editor_open(name);
+                        if (ed >= 0) {
+                            // Editor opened
+                        }
+                    }
+                    clicked = 1;
+                }
+            }
+
             // Check window buttons and title bars
             if (!clicked) {
                 for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
@@ -529,8 +790,12 @@ void kernel_main(uint32_t mboot_addr) {
                             }
                         } else if (i == info_win) {
                             close_sysinfo();
+                        } else {
+                            int ed_id = editor_find_by_win(i);
+                            if (ed_id >= 0) {
+                                editor_close(ed_id);
+                            }
                         }
-                        needs_redraw = 1;
                         clicked = 1;
                         break;
                     }
@@ -569,56 +834,36 @@ void kernel_main(uint32_t mboot_addr) {
         if (mb && drag_win >= 0) {
             struct window* w = window_get(drag_win);
             if (w) {
-                int old_x = w->x, old_y = w->y;
                 w->x = mx - drag_off_x;
                 w->y = my - drag_off_y;
                 if (w->x < 0) w->x = 0;
                 if (w->y < 0) w->y = 0;
                 if (w->x + w->w > SCREEN_W) w->x = SCREEN_W - w->w;
                 if (w->y + w->h > SCREEN_H) w->y = SCREEN_H - w->h;
-
-                // Only dirty the rows that overlap old OR new window position
-                int min_y = old_y < w->y ? old_y : w->y;
-                int max_y = (old_y + w->h) > (w->y + w->h) ? (old_y + w->h) : (w->y + w->h);
-                if (min_y < 0) min_y = 0;
-                if (max_y > SCREEN_H) max_y = SCREEN_H;
-
-                // Restore wallpaper for affected rows, then redraw dragged window
-                graphics_blit_wallpaper_rows(min_y, max_y);
-                w->dirty = 1;
+                needs_redraw = 1;
             }
         }
 
         if (!mb) { mouse_down = 0; drag_win = -1; }
         else { mouse_down = 1; }
 
-        // Blit wallpaper only when full redraw needed
-        if (needs_redraw) {
+        // Check for pending HTTP responses to save
+        check_save_http_response();
+
+        // Periodic full redraw every ~1 second (18 ticks) + on-demand when things change
+        static uint32_t last_redraw_tick = 0;
+        if (needs_redraw || (tick_count - last_redraw_tick >= 18)) {
             graphics_blit_wallpaper();
+            draw_desktop_icons();
             for (int i = 0; i < MAX_WINDOWS; i++) {
                 struct window* w = window_get(i);
                 if (w && w->visible && !w->minimized) w->dirty = 1;
             }
             needs_redraw = 0;
+            last_redraw_tick = tick_count;
         }
 
-        // Mark focused window dirty when cursor blinks (every ~1 second)
-        {
-            extern uint32_t tick_count;
-            static int last_cursor_tick = -1;
-            int cursor_tick = tick_count / 18;
-            if (cursor_tick != last_cursor_tick) {
-                last_cursor_tick = cursor_tick;
-                needs_redraw = 1; // Full redraw every ~1 second
-                int fi = window_get_focused();
-                if (fi >= 0) {
-                    struct window* fw = window_get(fi);
-                    if (fw) fw->dirty = 1;
-                }
-            }
-        }
-
-        // Draw windows (only dirty ones)
+        // Draw windows (only dirty ones — editor marks itself dirty on keystroke)
         mouse_hide_cursor();
         window_draw_all();
         window_draw_taskbar();

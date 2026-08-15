@@ -129,7 +129,7 @@ static void mouse_restore_bg(void) {
 }
 
 void mouse_draw_cursor(void) {
-    // Background already restored by mouse_hide_cursor() at frame start
+    mouse_restore_bg();
     mouse_save_bg();
 
     // Draw cursor: white fill with black border
@@ -226,6 +226,7 @@ int window_create(const char* title, int x, int y, int w, int h) {
             windows[i].text_fg = 15; // White
             windows[i].text_bg = 0;  // Black
             windows[i].dirty = 1;    // Needs initial draw
+            needs_redraw = 1;
 
             int j = 0;
             while (title[j] && j < 31) {

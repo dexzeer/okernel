@@ -385,10 +385,10 @@ void e1000_poll(void) {
         serial_putchar(hex[rx_cur]);
         serial_putchar('\n');
 
-        if (len > 0 && len < RX_BUFFER_SIZE && rx_callback) {
-            // Point to the buffer in low memory (RCTL_SECRC already strips CRC)
+        if (len > 4 && len < RX_BUFFER_SIZE && rx_callback) {
+            // Point to the buffer in low memory
             uint8_t* pkt = (uint8_t*)(E1000_RX_BUFS_ADDR + (rx_cur * RX_BUFFER_SIZE));
-            rx_callback(pkt, len);
+            rx_callback(pkt, len - 4);
         }
 
         rx_descs[rx_cur].status = 0;

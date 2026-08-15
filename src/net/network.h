@@ -103,5 +103,9 @@ void http_get(const char* host, const char* path);
 void http_poll(void);
 char* http_get_response(void);
 int http_get_response_len(void);
+int http_is_pending(void);
+
+// Browse file save
+void net_set_browse_save(const char* filename);
 
 #endif
