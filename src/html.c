@@ -139,7 +139,6 @@ int html_get_title(const char* html, int html_len, char* title, int max_len) {
 int html_parse(const char* html, int html_len, struct html_token* tokens, int max_tokens) {
     int count = 0;
     int pos = 0;
-    int in_head = 0;
     int in_script = 0;
     int in_style = 0;
 
@@ -165,19 +164,17 @@ int html_parse(const char* html, int html_len, struct html_token* tokens, int ma
             }
             tag_name[tn_len] = 0;
 
-            // Check for <head>, <script>, <style>
+            // Check for <script>, <style>
             if (!is_close) {
-                if (tag_match(html, tag_start + 1, "head")) in_head = 1;
                 if (tag_match(html, tag_start + 1, "script")) in_script = 1;
                 if (tag_match(html, tag_start + 1, "style")) in_style = 1;
             } else {
-                if (tag_match(html, tag_start + 2, "head")) in_head = 0;
                 if (tag_match(html, tag_start + 2, "script")) in_script = 0;
                 if (tag_match(html, tag_start + 2, "style")) in_style = 0;
             }
 
-            // Skip if inside head/script/style
-            if (in_head || in_script || in_style) {
+            // Skip if inside script/style
+            if (in_script || in_style) {
                 // Skip to end of this opening tag
                 while (pos < html_len && html[pos] != '>') pos++;
                 if (pos < html_len) pos++;
@@ -340,12 +337,11 @@ int html_parse(const char* html, int html_len, struct html_token* tokens, int ma
                 continue;
             }
 
-            // For other tags, skip to matching close
-            continue;
+            // For other tags (div, span, etc), continue to read text after them
         }
 
         // Plain text
-        if (!in_head && !in_script && !in_style) {
+        if (!in_script && !in_style) {
             char text[HTML_MAX_TEXT]; int tl = 0;
             while (pos < html_len && html[pos] != '<') {
                 // Decode HTML entities
