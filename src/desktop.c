@@ -766,6 +766,11 @@ void kernel_main(uint32_t mboot_addr) {
                             int ed_id = editor_find_by_win(i);
                             if (ed_id >= 0) {
                                 editor_close(ed_id);
+                            } else {
+                                int br_id = browser_find_by_win(i);
+                                if (br_id >= 0) {
+                                    browser_close(br_id);
+                                }
                             }
                         }
                         clicked = 1;

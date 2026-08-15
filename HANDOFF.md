@@ -28,6 +28,8 @@ okernel/
 │   │
 │   ├── filesystem.c/.h    # In-memory virtual filesystem (16 files, 4KB max)
 │   ├── editor.c/.h        # Text editor (open, edit, save files in windows)
+│   ├── browser.c/.h       # Web browser (URL bar, navigation, HTML rendering)
+│   ├── html.c/.h          # HTML parser (strips headers, tokenizes tags)
 │   │
 │   ├── gdt.c/.h           # Global Descriptor Table setup
 │   ├── idt.c/.h           # Interrupt Descriptor Table, PIC remapping, IRQ dispatch
@@ -93,6 +95,14 @@ okernel/
 8. **TCP**: Minimal stack — SYN/SYN-ACK/ACK/FIN, data transfer
 9. **HTTP**: GET requests, response buffering
 
+### Browser (okai)
+- **HTML parser** (`html.c`): Strips HTTP headers (`\r\n\r\n`), skips `<head>`, `<script>`, `<style>` blocks, tokenizes h1-h6, p, a, li, pre, br, hr, text
+- **Browser window** (`browser.c`): Address bar (g to focus, Esc to exit), toolbar, scrollable content
+- **Keyboard**: g=address bar, j/k=scroll, r=refresh, b=back
+- **Navigation**: Enter to go, back button with 4-page history
+- **Rendering**: Text content with headings, paragraphs, links (cyan), lists, preformatted blocks
+- **HTTP integration**: Parses response after connection closes (`http_done` flag), accumulates TCP segments correctly
+
 ---
 
 ## Build Commands
@@ -137,7 +147,7 @@ qemu-system-i386 ... -object filter-dump,id=dump0,netdev=net0,file=/tmp/net.pcap
 | ping | Ping gateway (10.0.2.2) |
 | ip | Show IP address |
 | resolve [host] | DNS lookup |
-| browse [host] [path] | HTTP GET, saves response to <host>.txt |
+| browser [url] | Open web browser (e.g. `browser http://example.com/`) |
 | edit [file] | Open text editor with file |
 | ls | List files in virtual filesystem |
 | open [file] | Open file in text editor |
@@ -197,6 +207,8 @@ Same as above plus: `list`, `switch N`
 | `src/memory.c` | Physical memory manager + heap |
 | `src/filesystem.c` | In-memory virtual filesystem (files persist until reboot) |
 | `src/editor.c` | Text editor — open/edit/save files in windows |
+| `src/browser.c` | Web browser — URL bar, navigation, HTML rendering |
+| `src/html.c` | HTML parser — strips HTTP headers, tokenizes tags |
 | `src/net/e1000.c` | e1000 NIC driver — TX + RX |
 | `src/net/network.c` | Full network stack — ARP, IP, ICMP, UDP, TCP, DNS, HTTP |
 | `linker.ld` | Memory layout — kernel load address, symbols |
