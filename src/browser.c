@@ -17,6 +17,7 @@ extern void net_set_browse_save(const char* filename);
 void browser_init(void) {
     for (int i = 0; i < MAX_BROWSERS; i++) {
         browsers[i].win_id = -1;
+        browsers[i].token_count = 0;
     }
     browser_count = 0;
 }

@@ -827,7 +827,7 @@ void kernel_main(uint32_t mboot_addr) {
             struct browser* br = browser_get(bi);
             if (!br || br->token_count > 0) continue;
             int resp_len = http_get_response_len();
-            if (resp_len > 0 && !http_is_pending()) {
+            if (resp_len > 0) {
                 char* resp = http_get_response();
                 if (resp && resp_len > 0) {
                     br->token_count = html_parse(resp, resp_len,
