@@ -121,9 +121,10 @@ int html_get_title(const char* html, int html_len, char* title, int max_len) {
     int pos = 0;
     while (pos < html_len - 6) {
         if (html[pos] == '<' && tag_match(html, pos + 1, "title")) {
-            pos += 7; // skip <title
+            pos += 6; // past "title"
+            // skip attributes to the tag's '>' (none for plain <title>)
             while (pos < html_len && html[pos] != '>') pos++;
-            pos++; // skip >
+            pos++; // skip '>'
             int ti = 0;
             while (pos < html_len && html[pos] != '<' && ti < max_len - 1) {
                 title[ti++] = html[pos++];
@@ -192,10 +193,13 @@ int html_parse(const char* html, int html_len, struct html_token* tokens, int ma
                 // If it was an opening tag, skip to closing tag
                 if (!is_close && (in_script || in_style)) {
                     pos = skip_to_close(html, pos, html_len, tag_name);
-                    if (tag_match(html, pos < html_len ? pos : 0, "script") ||
-                        tag_match(html, pos < html_len ? pos : 0, "style")) {
-                        // Already handled
-                    }
+                    // skip_to_close consumed </script> or </style> — the
+                    // main-loop closer branch below never sees it. Without
+                    // resetting here, every byte after the block is skipped
+                    // forever (example.com: <style> before any content =
+                    // zero tokens, blank page)
+                    in_script = 0;
+                    in_style = 0;
                 }
                 continue;
             }

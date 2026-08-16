@@ -2,22 +2,30 @@
 #define WINDOW_H
 
 #include <stdint.h>
+#include "graphics.h"
 
 #define MAX_WINDOWS 8
-#define WIN_TITLE_H 12
+// Layout constants derived from glyph size — never hardcode pixels;
+// these track FONT_SCALE automatically
+#define WIN_TITLE_H (CHAR_H + 8)
 #define WIN_BORDER 2
-#define TASKBAR_H 20
+#define TASKBAR_H (CHAR_H + 12)
+#define WIN_BTN_W (CHAR_W + 8)
+#define WIN_BTN_H (CHAR_H + 4)
+#define MIN_WIN_W 120
+#define MIN_WIN_H 80
+#define RESIZE_GRIP 16   // clickable corner zone
+#define WIN_GRIP_SIZE 12 // visible triangle legs
 
-// Mouse cursor sprite size (12x16 arrow)
 #define CURSOR_W 12
 #define CURSOR_H 16
 
-// Window colors — modern dark theme
-#define WIN_TITLE_BG 1    // Dark blue
-#define WIN_TITLE_FG 15   // White
-#define WIN_BG 0          // Black
-#define WIN_BORDER_BG 8   // Dark grey
-#define WIN_ACTIVE_BORDER 9  // Light blue border when focused
+// Window colors (VGA palette indices, converted to 32-bit RGB at draw time)
+#define WIN_TITLE_BG 1
+#define WIN_TITLE_FG 15
+#define WIN_BG 0
+#define WIN_BORDER_BG 8
+#define WIN_ACTIVE_BORDER 9
 
 struct window {
     int x, y, w, h;
@@ -26,7 +34,7 @@ struct window {
     int minimized;
     int has_close_button;
     int has_minimize_button;
-    int dirty; // Needs redraw
+    int dirty;
     int last_cursor_visible;
     char title[32];
     uint16_t* content;
@@ -44,8 +52,6 @@ void window_set_focus(int id);
 int window_get_focused(void);
 void window_draw(int id);
 void window_draw_all(void);
-// Repaint a window from its model, clipped to a screen-space rect.
-// Does not touch the dirty flag — used for scene repair (cursor erase).
 void window_paint_region(int id, int rx, int ry, int rw, int rh);
 void window_put_char(int id, char c);
 void window_puts(int id, const char* str);
@@ -57,16 +63,15 @@ int window_check_close_click(int id, int mx, int my);
 int window_check_minimize_click(int id, int mx, int my);
 void window_minimize(int id);
 void window_restore(int id);
+void window_resize(int id, int w, int h);
+int window_check_resize_grip(int id, int mx, int my);
 void window_set_text_color(int id, uint8_t fg, uint8_t bg);
 void window_draw_taskbar(void);
 struct window* window_get(int id);
 void window_set_title(int id, const char* title);
 
-// Mouse
 void mouse_init_fb(void);
-// Atomic snapshot of cursor position (ISR updates it on IRQ12)
 void mouse_get_position(int* x, int* y);
-// Draw cursor sprite at explicit coordinates — stateless, no save/restore
 void mouse_paint_cursor(int px, int py);
 int mouse_get_x(void);
 int mouse_get_y(void);

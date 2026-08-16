@@ -86,6 +86,7 @@ int editor_open(const char* filename) {
     window_set_minimize_button(win, 1);
     editors[ed].win_id = win;
     editor_count++;
+    window_set_focus(win); // take focus so typing goes into the editor
 
     // Draw status bar
     editor_draw(ed);

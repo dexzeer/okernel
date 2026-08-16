@@ -68,7 +68,7 @@ okernel/
 ### Memory Layout
 - Kernel loaded at 1MB (0x100000)
 - BSS contains static variables (backbuffer: 307KB, window buffers, etc.)
-- Kernel heap at ~4MB (bump allocator, 4MB)
+- Kernel heap right after kernel end (~1.5MB, bump allocator, 16MB — backbuffer + wallpaper cache are 3MB each at 1024x768x32bpp)
 - Page tables identity-map first 4MB + framebuffer at 0xFD000000
 - e1000 MMIO mapped via `paging_map()`
 - **NIC RX/TX buffers at 0x80000-0x9FFFF** (low memory, below 1MB, for DMA)
@@ -179,7 +179,8 @@ Same as above plus: `list`, `switch N`
 - **Single CPU** — no SMP support
 - **No real mouse scroll** — PS/2 3-byte mode only (scroll via keyboard)
 - **Minimal TCP** — no retransmission, no windowing, no congestion control
-- **HTTP limited** — single GET request, no chunked encoding, no HTTPS
+- **HTTP limited** — single GET request, no HTTPS (chunked transfer IS decoded via `http_dechunk`)
+- **TCP has no retransmission** — a lost/delayed segment stalls a transfer (some fetches hang mid-response; repro pcap in /tmp/okernel-verify/net.pcap)
 
 ---
 

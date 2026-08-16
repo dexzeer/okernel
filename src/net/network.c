@@ -68,10 +68,12 @@ struct tcp_conn {
 };
 
 static struct tcp_conn tcp_conn;
-static uint8_t tcp_rx_buf[1500];
-static int tcp_rx_len = 0;
-static int tcp_rx_seg_len = 0; // length of current segment in tcp_rx_buf
-static int tcp_rx_ready = 0;
+// HTTP response accumulation happens directly in tcp_handle_packet (IRQ
+// context). A shared one-segment buffer dropped every segment that arrived
+// before the main loop's http_poll ran — a multi-segment response started
+// mid-headers with no clean \r\n\r\n, so html_parse showed raw headers as
+// page text. Main loop only READS http_response after http_done (connection
+// closed, no further IRQ appends), so there is no concurrent writer.
 
 // Simple HTTP client state
 static int http_pending = 0;
@@ -574,8 +576,6 @@ void tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
     tcp_conn.seq = 0x1000;
     tcp_conn.ack = 0;
     tcp_conn.state = TCP_STATE_CLOSED;
-    tcp_rx_ready = 0;
-    tcp_rx_len = 0;
 
     uint8_t dst_nbo[4]; // network byte order
     dst_nbo[0] = (dst_ip >> 24) & 0xFF;
@@ -781,37 +781,62 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
             net_event_pending = 1;
         }
     } else if (tcp_conn.state == TCP_STATE_ESTABLISHED) {
+        // Payload BEFORE FIN: servers may piggyback the last data bytes on
+        // the FIN packet — checking FIN first would drop that payload
+        if (payload_len > 0 && http_pending) {
+            tcp_conn.ack = seq_num + payload_len;
+            tcp_send_packet(0x10, 0, 0); // ACK
+
+            int copy = payload_len;
+            if (copy > 1500) copy = 1500;
+            if (http_response_len + copy > 4095) copy = 4095 - http_response_len;
+            for (int i = 0; i < copy; i++) {
+                http_response[http_response_len + i] = data[data_offset + i];
+            }
+            http_response_len += copy;
+            http_response[http_response_len] = 0;
+
+            serial_puts("[http] segment, total ");
+            serial_putchar('0' + (http_response_len / 1000) % 10);
+            serial_putchar('0' + (http_response_len / 100) % 10);
+            serial_putchar('0' + (http_response_len / 10) % 10);
+            serial_putchar('0' + (http_response_len % 10));
+            serial_puts(" bytes\n");
+
+            // Terminal preview from the FIRST segment only (headers visible
+            // there by design; the browser strips them via html_parse)
+            if (http_response_len == copy) {
+                for (int i = 0; i < 255; i++) net_event_msg[i] = 0;
+                int idx = 0;
+                const char* hdr = "HTTP response (";
+                for (int i = 0; hdr[i]; i++) net_event_msg[idx++] = hdr[i];
+                net_event_msg[idx++] = '0' + (http_response_len / 100);
+                net_event_msg[idx++] = '0' + (http_response_len / 10) % 10;
+                net_event_msg[idx++] = '0' + (http_response_len % 10);
+                const char* hdr2 = " bytes):\n";
+                for (int i = 0; hdr2[i]; i++) net_event_msg[idx++] = hdr2[i];
+                int disp_len = http_response_len < 180 ? http_response_len : 180;
+                for (int i = 0; i < disp_len && idx < 254; i++) {
+                    net_event_msg[idx++] = http_response[i];
+                }
+                if (http_response_len > 180) {
+                    const char* dots = "\n...(truncated)";
+                    for (int i = 0; dots[i] && idx < 254; i++) net_event_msg[idx++] = dots[i];
+                }
+                net_event_msg[idx++] = '\n';
+                net_event_msg[idx] = 0;
+                net_event_pending = 1;
+            }
+        }
         if (flags & 0x01) { // FIN
-            tcp_conn.ack = seq_num + 1;
+            if (payload_len > 0) tcp_conn.ack = seq_num + payload_len + 1;
+            else tcp_conn.ack = seq_num + 1;
             tcp_send_packet(0x10, 0, 0); // ACK
             tcp_send_packet(0x11, 0, 0); // FIN+ACK
             tcp_conn.seq++;
             tcp_conn.state = TCP_STATE_CLOSED;
             serial_puts("[tcp] CLOSED (server FIN)\n");
             return;
-        }
-        if (payload_len > 0) {
-            tcp_conn.ack = seq_num + payload_len;
-            tcp_send_packet(0x10, 0, 0); // ACK
-
-            // Save current segment length before overwrite
-            tcp_rx_seg_len = payload_len;
-            // Copy payload to RX buffer
-            for (int i = 0; i < payload_len && i < 1500; i++) {
-                tcp_rx_buf[i] = data[data_offset + i];
-            }
-            tcp_rx_len += payload_len;
-
-            // Check if this looks like end of HTTP response
-            // (simplistic: check for \r\n\r\n or small payload)
-            if (tcp_rx_len > 0) {
-                tcp_rx_ready = 1;
-                serial_puts("[tcp] data: ");
-                serial_putchar('0' + (tcp_rx_len / 100));
-                serial_putchar('0' + ((tcp_rx_len / 10) % 10));
-                serial_putchar('0' + (tcp_rx_len % 10));
-                serial_puts(" bytes\n");
-            }
         }
     } else if (tcp_conn.state == TCP_STATE_FIN_WAIT) {
         if (flags & 0x10) { // ACK of our FIN
@@ -894,61 +919,20 @@ void http_get(const char* host, const char* path) {
     serial_puts(host);
     serial_puts("\n");
 
-    tcp_send_data(req_buf, req_len);
+    // Arm the RX accumulator BEFORE the request hits the wire — SLIRP is
+    // in-process and the response IRQ can land before this function returns
     if (!http_pending) {
         http_response_len = 0;
         http_done = 0;
     }
     http_pending = 1;
+    tcp_send_data(req_buf, req_len);
 }
 
 void http_poll(void) {
     if (!http_pending) return;
-    if (tcp_rx_ready) {
-        // Accumulate response (append current segment)
-        int copy_len = tcp_rx_seg_len;
-        if (copy_len > 1500) copy_len = 1500;
-        if (http_response_len + copy_len > 4095) copy_len = 4095 - http_response_len;
-        if (copy_len > 0) {
-            for (int i = 0; i < copy_len; i++) {
-                http_response[http_response_len + i] = tcp_rx_buf[i];
-            }
-            http_response_len += copy_len;
-        }
-        http_response[http_response_len] = 0;
-        tcp_rx_ready = 0;
-        tcp_rx_len = 0;
-        tcp_rx_seg_len = 0;
-
-        serial_puts("[http] received ");
-        serial_putchar('0' + (http_response_len / 100));
-        serial_putchar('0' + ((http_response_len / 10) % 10));
-        serial_putchar('0' + (http_response_len % 10));
-        serial_puts(" bytes\n");
-
-        // Queue first chunk for terminal display
-        for (int i = 0; i < 255; i++) net_event_msg[i] = 0;
-        int idx = 0;
-        const char* hdr = "HTTP response (";
-        for (int i = 0; hdr[i]; i++) net_event_msg[idx++] = hdr[i];
-        net_event_msg[idx++] = '0' + (http_response_len / 100);
-        net_event_msg[idx++] = '0' + ((http_response_len / 10) % 10);
-        net_event_msg[idx++] = '0' + (http_response_len % 10);
-        const char* hdr2 = " bytes):\n";
-        for (int i = 0; hdr2[i]; i++) net_event_msg[idx++] = hdr2[i];
-        // Copy first ~180 chars of response
-        int disp_len = http_response_len < 180 ? http_response_len : 180;
-        for (int i = 0; i < disp_len && idx < 254; i++) {
-            net_event_msg[idx++] = http_response[i];
-        }
-        if (http_response_len > 180) {
-            const char* dots = "\n...(truncated)";
-            for (int i = 0; dots[i] && idx < 254; i++) net_event_msg[idx++] = dots[i];
-        }
-        net_event_msg[idx++] = '\n';
-        net_event_msg[idx] = 0;
-        net_event_pending = 1;
-    }
+    // Response bytes are accumulated in tcp_handle_packet (IRQ); here we
+    // only watch for connection close to flag the response as complete
     if (tcp_conn.state == TCP_STATE_CLOSED && http_pending) {
         http_pending = 0;
         if (http_response_len > 0) http_done = 1;
@@ -957,6 +941,59 @@ void http_poll(void) {
 }
 
 char* http_get_response(void) { return http_response; }
+
+// Decode chunked transfer encoding in place. QEMU SLIRP forwards the
+// server's framing verbatim, so a "Transfer-Encoding: chunked" response
+// arrives as "N\r\n<data>\r\n0\r\n\r\n" — html_parse would render the hex
+// size lines as text. No-op (returns len) when the header isn't present.
+int http_dechunk(char* buf, int len) {
+    // locate end of headers
+    int body = -1;
+    for (int i = 0; i < len - 3; i++) {
+        if (buf[i] == '\r' && buf[i+1] == '\n' && buf[i+2] == '\r' && buf[i+3] == '\n') {
+            body = i + 4;
+            break;
+        }
+    }
+    if (body < 0) return len;
+
+    // only dechunk when the server actually said chunked
+    int chunked = 0;
+    for (int i = 0; i < body - 7; i++) {
+        if (buf[i] == 'c' && buf[i+1] == 'h' && buf[i+2] == 'u' &&
+            buf[i+3] == 'n' && buf[i+4] == 'k' && buf[i+5] == 'e' &&
+            buf[i+6] == 'd') { chunked = 1; break; }
+    }
+    if (!chunked) return len;
+
+    int rd = body, wr = body;
+    while (rd < len) {
+        // parse hex chunk size
+        int size = 0, digits = 0;
+        while (rd < len) {
+            char c = buf[rd];
+            int v = -1;
+            if (c >= '0' && c <= '9') v = c - '0';
+            else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+            else break;
+            size = size * 16 + v;
+            digits++;
+            rd++;
+        }
+        if (!digits) break;
+        while (rd < len && buf[rd] != '\n') rd++; // rest of size line
+        if (rd < len) rd++;
+        if (size == 0) break; // terminal chunk
+        for (int i = 0; i < size && rd < len; i++) buf[wr++] = buf[rd++];
+        // exactly one CRLF after each chunk (never skip more — chunk data
+        // may legitimately end with \r\n bytes)
+        if (rd < len && buf[rd] == '\r') rd++;
+        if (rd < len && buf[rd] == '\n') rd++;
+    }
+    buf[wr] = 0;
+    return wr;
+}
 int http_get_response_len(void) { return http_response_len; }
 int http_is_pending(void) { return http_pending; }
 int http_is_done(void) { return http_done; }

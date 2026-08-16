@@ -49,6 +49,9 @@ static int mouse_down = 0;
 static int drag_win = -1;
 static int drag_off_x = 0;
 static int drag_off_y = 0;
+static int resize_win = -1;
+static int resize_off_w = 0;
+static int resize_off_h = 0;
 
 // Terminal management
 #define MAX_TERMINALS 8
@@ -72,12 +75,12 @@ static uint32_t fps = 0;
 static uint32_t last_fps_tick = 0;
 
 // Desktop icon system
-#define ICON_SIZE 32
-#define ICON_LABEL_H 8
-#define ICON_SPACING 8
-#define ICONS_PER_ROW 7
-#define ICON_START_X 10
-#define ICON_START_Y 10
+#define ICON_SIZE 48
+#define ICON_LABEL_H (CHAR_H + 4) // one text row + margin
+#define ICON_SPACING 12
+#define ICONS_PER_ROW 10
+#define ICON_START_X 16
+#define ICON_START_Y 16
 
 // 16x16 .txt file icon bitmap (1=white, 0=transparent)
 // A document with folded corner and horizontal lines
@@ -101,19 +104,17 @@ static const uint8_t txt_icon[16][2] = {
 };
 
 static void draw_txt_icon(int x, int y) {
-    // Icon background
-    rect_fill(x, y, ICON_SIZE, ICON_SIZE, 7); // Light grey background
-    rect_outline(x, y, ICON_SIZE, ICON_SIZE, 8, 1); // Border
+    rect_fill(x, y, ICON_SIZE, ICON_SIZE, 0x00AAAAAA);
+    rect_outline(x, y, ICON_SIZE, ICON_SIZE, 0x00555555, 2);
 
-    // Draw the icon bitmap (16x16 centered in 32x32)
-    int ox = x + 8;
-    int oy = y + 4;
+    int ox = x + 16;
+    int oy = y + 8;
     for (int row = 0; row < 16; row++) {
         for (int col = 0; col < 16; col++) {
             int byte_idx = col / 8;
             int bit_idx = 7 - (col % 8);
             if (txt_icon[row][byte_idx] & (1 << bit_idx)) {
-                putpixel(ox + col, oy + row, 0); // Black pixels for icon
+                putpixel(ox + col, oy + row, 0x00000000);
             }
         }
     }
@@ -132,9 +133,9 @@ static void draw_desktop_icons_in(int rx, int ry, int rw, int rh) {
         int ix = ICON_START_X + col * (ICON_SIZE + ICON_SPACING);
         int iy = ICON_START_Y + row * (ICON_SIZE + ICON_LABEL_H + ICON_SPACING);
 
-        // Icon + label footprint (label sits at iy+ICON_SIZE+2, 8px tall)
+        // Icon + label footprint (label sits at iy+ICON_SIZE+4, 32px tall)
         if (ix >= rx + rw || ix + ICON_SIZE <= rx ||
-            iy >= ry + rh || iy + ICON_SIZE + 12 <= ry) {
+            iy >= ry + rh || iy + ICON_SIZE + ICON_LABEL_H <= ry) {
             continue;
         }
 
@@ -144,14 +145,14 @@ static void draw_desktop_icons_in(int rx, int ry, int rw, int rh) {
         int name_len = 0;
         while (name[name_len]) name_len++;
 
-        int label_x = ix + (ICON_SIZE - name_len * 8) / 2;
+        int label_x = ix + (ICON_SIZE - name_len * CHAR_W) / 2;
         if (label_x < ix) label_x = ix;
 
         // Truncate name to fit (max ~5 chars for 32px icon)
-        int max_chars = ICON_SIZE / 8;
-        if (max_chars > 4) max_chars = 4;
+        int max_chars = ICON_SIZE / CHAR_W;
+        if (max_chars > 6) max_chars = 6;
 
-        char label[6];
+        char label[8];
         int li = 0;
         while (li < max_chars && name[li]) {
             label[li] = name[li];
@@ -162,7 +163,7 @@ static void draw_desktop_icons_in(int rx, int ry, int rw, int rh) {
             label[li - 1] = '~';
         }
 
-        draw_string(ix + 4, iy + ICON_SIZE + 2, label, 15, 0);
+        draw_string(ix + 2, iy + ICON_SIZE + 4, label, 0x00FFFFFF, 0x00000000);
     }
 }
 
@@ -174,7 +175,9 @@ static void draw_desktop_icons(void) {
 // wallpaper -> icons -> window stack (back-to-front) -> taskbar.
 // This is the single authoritative repair path — used to erase the cursor
 // sprite and any other region whose pixels must return to model truth.
-static void desktop_paint_rect(int x, int y, int w, int h) {
+// skip_win: window id to leave out of the recomposite (-1 = none) — used
+// by the drag path when the dragged window's pixels were already blitted.
+static void desktop_paint_rect_skip(int skip_win, int x, int y, int w, int h) {
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > SCREEN_W) w = SCREEN_W - x;
@@ -191,7 +194,7 @@ static void desktop_paint_rect(int x, int y, int w, int h) {
     // Windows back-to-front, focused last (same order as window_draw_all)
     for (int i = 0; i < MAX_WINDOWS; i++) {
         struct window* win = window_get(i);
-        if (!win || !win->visible || win->minimized || win->focused) continue;
+        if (!win || !win->visible || win->minimized || win->focused || i == skip_win) continue;
         if (win->x < x + w && win->x + win->w > x &&
             win->y < y + h && win->y + win->h > y) {
             window_paint_region(i, x, y, w, h);
@@ -199,7 +202,7 @@ static void desktop_paint_rect(int x, int y, int w, int h) {
     }
     for (int i = 0; i < MAX_WINDOWS; i++) {
         struct window* win = window_get(i);
-        if (!win || !win->visible || win->minimized || !win->focused) continue;
+        if (!win || !win->visible || win->minimized || !win->focused || i == skip_win) continue;
         if (win->x < x + w && win->x + win->w > x &&
             win->y < y + h && win->y + win->h > y) {
             window_paint_region(i, x, y, w, h);
@@ -211,6 +214,10 @@ static void desktop_paint_rect(int x, int y, int w, int h) {
     }
 
     graphics_clip_reset();
+}
+
+static void desktop_paint_rect(int x, int y, int w, int h) {
+    desktop_paint_rect_skip(-1, x, y, w, h);
 }
 
 // Cursor compositor state: where the sprite was painted last frame.
@@ -263,12 +270,12 @@ static void put_uint(char* buf, uint32_t val) {
 
 static void open_sysinfo(void) {
     if (info_win >= 0) return; // Already open
-    info_win = window_create("System Info", 240, 60, 280, 220);
+    info_win = window_create("System Info", 320, 80, 380, 300);
     window_set_close_button(info_win, 1);
     window_set_minimize_button(info_win, 1);
-    window_puts(info_win, "okernel v0.3\n");
+    window_puts(info_win, "okernel v0.4\n");
     window_puts(info_win, "Desktop Edition\n\n");
-    window_puts(info_win, "Resolution: 640x480\n");
+    window_puts(info_win, "Resolution: 1024x768\n");
     window_puts(info_win, "Shell: okernel sh\n");
     window_puts(info_win, "Commands: help, clear,\n");
     window_puts(info_win, "echo, mem, uptime,\n");
@@ -287,9 +294,9 @@ static void close_sysinfo(void) {
 
 static int create_terminal(void) {
     if (term_count >= MAX_TERMINALS) return -1;
-    int x = 80 + (term_count % 4) * 30;
-    int y = 60 + (term_count % 4) * 25;
-    int win_id = window_create("Terminal", x, y, 440, 360);
+    int x = 80 + (term_count % 4) * 80;
+    int y = 60 + (term_count % 4) * 60;
+    int win_id = window_create("Terminal", x, y, 500, 400);
     window_set_close_button(win_id, 1);
     window_set_minimize_button(win_id, 1);
     term_wins[term_count] = win_id;
@@ -502,7 +509,6 @@ static void shell_execute(int win_id, const char* input) {
         uint32_t m = (seconds % 3600) / 60;
         uint32_t s = seconds % 60;
         char buf[16];
-        int idx = 0;
 
         put_uint(buf, h); int i = 0; while (buf[i]) window_put_char(win_id, buf[i++]);
         window_put_char(win_id, 'h');
@@ -522,12 +528,12 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, " | (_) |   <  __/ |  | | | |  __/ |\n");
         window_puts(win_id, "  \\___/|_|\\_\\___|_|  |_| |_|\\___|_|\n\n");
         window_set_text_color(win_id, 15, 0); // White
-        window_puts(win_id, "okernel v0.3 - Desktop Edition\n");
+        window_puts(win_id, "okernel v0.4 - Desktop Edition\n");
         window_puts(win_id, "Built from scratch in C and x86 assembly\n");
     }
     else if (str_eq(cmd_buf, "neofetch") || str_eq(cmd_buf, "sysinfo")) {
-        window_puts(win_id, "okernel v0.3\n");
-        window_puts(win_id, "Resolution: 640x480\n");
+        window_puts(win_id, "okernel v0.4\n");
+        window_puts(win_id, "Resolution: 1024x768\n");
         window_puts(win_id, "Shell: okernel sh\n");
         window_puts(win_id, "Memory: ");
         uint32_t total = pmm_get_total_pages() * 4 / 1024;
@@ -705,7 +711,7 @@ void kernel_main(uint32_t mboot_addr) {
     browser_init();
 
     // Cache wallpaper for fast blitting
-    graphics_cache_wallpaper(wp_pixels, WP_W, WP_H);
+    graphics_cache_wallpaper(wp_pixels, wp_palette, WP_W, WP_H);
 
     // Draw initial wallpaper
     graphics_blit_wallpaper();
@@ -713,29 +719,28 @@ void kernel_main(uint32_t mboot_addr) {
     irq_register_handler(0, on_timer);
 
     // Create main terminal — large, centered
-    term_wins[0] = window_create("Terminal", 60, 40, 440, 360);
+    term_wins[0] = window_create("Terminal", 120, 60, 500, 400);
     window_set_close_button(term_wins[0], 1);
     window_set_minimize_button(term_wins[0], 1);
     term_count = 1;
     active_term_idx = 0;
     window_set_focus(term_wins[0]);
 
-    // Show welcome message with ASCII art (like text mode)
-    window_set_text_color(term_wins[0], 11, 0); // Cyan
+    window_set_text_color(term_wins[0], 11, 0);
     window_puts(term_wins[0], "        _                        _ \n");
     window_puts(term_wins[0], "       | |                      | |\n");
     window_puts(term_wins[0], "   ___ | | _____ _ __ _ __   ___| |\n");
     window_puts(term_wins[0], "  / _ \\| |/ / _ \\ '__| '_ \\ / _ \\ |\n");
     window_puts(term_wins[0], " | (_) |   <  __/ |  | | | |  __/ |\n");
     window_puts(term_wins[0], "  \\___/|_|\\_\\___|_|  |_| |_|\\___|_|\n\n");
-    window_set_text_color(term_wins[0], 15, 0); // White
-    window_puts(term_wins[0], "Welcome to okernel v0.3\n");
+    window_set_text_color(term_wins[0], 15, 0);
+    window_puts(term_wins[0], "Welcome to okernel v0.4\n");
     window_puts(term_wins[0], "A minimalistic operating system.\n\n");
-    window_set_text_color(term_wins[0], 8, 0); // Grey
+    window_set_text_color(term_wins[0], 8, 0);
     window_puts(term_wins[0], "Type 'help' for commands.\n");
     window_puts(term_wins[0], "Type 'terminal' for new window.\n");
     window_puts(term_wins[0], "Type 'exit' to close this terminal.\n\n");
-    window_set_text_color(term_wins[0], 15, 0); // Back to white
+    window_set_text_color(term_wins[0], 15, 0);
     shell_prompt(term_wins[0]);
 
     // Init networking (full stack: PCI + RTL8139 + ARP + IP + ICMP)
@@ -763,19 +768,19 @@ void kernel_main(uint32_t mboot_addr) {
             int clicked = 0;
 
             // Check taskbar clicks (bottom 20px)
-            if (my >= SCREEN_H - 20) {
+            if (my >= SCREEN_H - TASKBAR_H) {
                 // Count visible windows to match dynamic width
                 int vis_count = 0;
                 for (int i = 0; i < MAX_WINDOWS; i++) {
                     if (window_get(i) && window_get(i)->visible) vis_count++;
                 }
                 if (vis_count > 0) {
-                    int total_pad = (vis_count + 1) * 4;
+                    int total_pad = (vis_count + 1) * 6;
                     int btn_w = (SCREEN_W - total_pad) / vis_count;
-                    if (btn_w > 120) btn_w = 120;
-                    if (btn_w < 30) btn_w = 30;
+                    if (btn_w > 180) btn_w = 180;
+                    if (btn_w < 60) btn_w = 60;
 
-                    int tx = 4;
+                    int tx = 6;
                     for (int i = 0; i < MAX_WINDOWS; i++) {
                         struct window* w = window_get(i);
                         if (!w || !w->visible) continue;
@@ -787,7 +792,7 @@ void kernel_main(uint32_t mboot_addr) {
                             clicked = 1;
                             break;
                         }
-                        tx += btn_w + 4;
+                        tx += btn_w + 6;
                     }
                 }
             }
@@ -847,6 +852,18 @@ void kernel_main(uint32_t mboot_addr) {
                         break;
                     }
 
+                    if (window_check_resize_grip(i, mx, my)) {
+                        resize_win = i;
+                        resize_off_w = w->w - (mx - w->x);
+                        resize_off_h = w->h - (my - w->y);
+                        window_restore(i);
+                        window_set_focus(i);
+                        int tidx = find_term_idx(i);
+                        if (tidx >= 0) active_term_idx = tidx;
+                        clicked = 1;
+                        break;
+                    }
+
                     if (mx >= w->x && mx < w->x + w->w &&
                         my >= w->y && my < w->y + WIN_TITLE_H + WIN_BORDER) {
                         drag_win = i;
@@ -865,20 +882,13 @@ void kernel_main(uint32_t mboot_addr) {
             }
         }
 
-        if (mb && drag_win >= 0) {
-            struct window* w = window_get(drag_win);
-            if (w) {
-                w->x = mx - drag_off_x;
-                w->y = my - drag_off_y;
-                if (w->x < 0) w->x = 0;
-                if (w->y < 0) w->y = 0;
-                if (w->x + w->w > SCREEN_W) w->x = SCREEN_W - w->w;
-                if (w->y + w->h > SCREEN_H) w->y = SCREEN_H - w->h;
-                needs_redraw = 1;
-            }
-        }
+        // (drag/resize repair runs after the cursor erase below — the drag
+        // blit must copy pixels that contain no cursor sprite)
 
-        if (!mb) { mouse_down = 0; drag_win = -1; }
+        if (!mb) {
+            if (drag_win >= 0 || resize_win >= 0) needs_redraw = 1; // settle on release
+            mouse_down = 0; drag_win = -1; resize_win = -1;
+        }
         else { mouse_down = 1; }
 
         // Check for pending HTTP responses to save
@@ -894,8 +904,12 @@ void kernel_main(uint32_t mboot_addr) {
             if (need_parse && resp_len > 0) {
                 char* resp = http_get_response();
                 if (resp) {
-                    br->token_count = html_parse(resp, resp_len,
-                                                 br->tokens, HTML_MAX_TOKENS);
+                    resp_len = http_dechunk(resp, resp_len);
+                    int count = html_parse(resp, resp_len,
+                                           br->tokens, HTML_MAX_TOKENS);
+                    // -1 sentinel: "parsed, nothing renderable" — keeps this
+                    // block from re-parsing every frame on empty pages
+                    br->token_count = count > 0 ? count : -1;
                     html_get_title(resp, resp_len, br->title, 64);
                     br->last_resp_len = resp_len;
                     render_content(bi);
@@ -910,6 +924,97 @@ void kernel_main(uint32_t mboot_addr) {
         if (cursor_shown) {
             desktop_paint_rect(cursor_px, cursor_py, CURSOR_W, CURSOR_H);
             cursor_shown = 0;
+        }
+
+        // ---- Window drag: blit, don't re-render ----
+        // A move doesn't change the window's own pixels, and the dragged
+        // window is focused (topmost), so copying its old rectangle to the
+        // new position is pixel-identical to re-rendering — then only the
+        // exposed L-strips need recompositing. Re-rendering every cell via
+        // the union repair pushed FPS from ~200 to ~15 during drags.
+        if (mb && drag_win >= 0) {
+            struct window* w = window_get(drag_win);
+            if (w) {
+                int nx = mx - drag_off_x;
+                int ny = my - drag_off_y;
+                if (nx < 0) nx = 0;
+                if (ny < 0) ny = 0;
+                // keep windows above the taskbar band (the taskbar is drawn
+                // over them anyway); also keeps the blit clear of taskbar rows
+                if (nx + w->w > SCREEN_W) nx = SCREEN_W - w->w;
+                if (ny + w->h > SCREEN_H - TASKBAR_H) ny = SCREEN_H - TASKBAR_H - w->h;
+                if (ny < 0) ny = 0;
+
+                if (nx != w->x || ny != w->y) {
+                    int ox = w->x, oy = w->y, ow = w->w, oh = w->h;
+                    // If any OTHER window is dirty (text arriving below us),
+                    // its repaint would overwrite the blit — take the full
+                    // recomposite path for this frame instead
+                    int other_dirty = 0;
+                    for (int i = 0; i < MAX_WINDOWS; i++) {
+                        struct window* o = window_get(i);
+                        if (o && o->visible && !o->minimized && i != drag_win && o->dirty) {
+                            other_dirty = 1;
+                            break;
+                        }
+                    }
+                    if (other_dirty) {
+                        w->x = nx; w->y = ny;
+                        needs_redraw = 1;
+                    } else {
+                        // wipe the FPS-box HUD out of the blit source so it
+                        // can't be smeared into the window interior
+                        desktop_paint_rect_skip(drag_win,
+                            SCREEN_W - (9 * CHAR_W + 8) - 12, 4,
+                            (9 * CHAR_W + 8) + 16, CHAR_H + 8);
+
+                        w->x = nx; w->y = ny;
+                        graphics_blit_rect(ox, oy, ow, oh, nx - ox, ny - oy);
+
+                        // exposed L-strips: old footprint minus new
+                        if (nx > ox)
+                            desktop_paint_rect_skip(drag_win, ox, oy, nx - ox, oh);
+                        if (nx + ow < ox + ow)
+                            desktop_paint_rect_skip(drag_win, nx + ow, oy, (ox + ow) - (nx + ow), oh);
+                        if (ny > oy)
+                            desktop_paint_rect_skip(drag_win, ox, oy, ow, ny - oy);
+                        if (ny + oh < oy + oh)
+                            desktop_paint_rect_skip(drag_win, ox, ny + oh, ow, (oy + oh) - (ny + oh));
+                    }
+                }
+            }
+        }
+
+        // ---- Live resize: band repair ----
+        // Interior cells are anchored top-left and unchanged; only the
+        // changed bands (old border/grip residue + newly exposed area)
+        // need repaint. Content buffers are slack-allocated, no realloc.
+        if (mb && resize_win >= 0) {
+            struct window* w = window_get(resize_win);
+            if (w) {
+                int ow = w->w, oh = w->h;
+                int was_redraw = needs_redraw;
+                window_resize(resize_win,
+                              (mx - w->x) + resize_off_w,
+                              (my - w->y) + resize_off_h);
+                if (!was_redraw && (w->w != ow || w->h != oh)) {
+                    int dw = w->w > ow ? w->w - ow : ow - w->w;
+                    int dh = w->h > oh ? w->h - oh : oh - w->h;
+                    // covers stale border + grip pixels left inside
+                    int band = WIN_BORDER + WIN_GRIP_SIZE + 2;
+                    if (w->w != ow) {
+                        int bx0 = w->x + (ow < w->w ? ow : w->w) - band;
+                        int hmax = oh > w->h ? oh : w->h;
+                        desktop_paint_rect(bx0, w->y, dw + band, hmax);
+                    }
+                    if (w->h != oh) {
+                        int by0 = w->y + (oh < w->h ? oh : w->h) - band;
+                        int wmax = ow > w->w ? ow : w->w;
+                        desktop_paint_rect(w->x, by0, wmax, dh + band);
+                    }
+                    needs_redraw = 0; // bands above already repaired
+                }
+            }
         }
 
         // Periodic full redraw every ~1 second (18 ticks) + on-demand when things change
@@ -936,7 +1041,7 @@ void kernel_main(uint32_t mboot_addr) {
             frame_count = 0;
             last_fps_tick = tick_count;
         }
-        // FPS counter — wider box for 3-digit numbers
+        // FPS counter — box sized from glyph metrics ("FPS: 9999" = 9 cells)
         char fps_buf[16] = "FPS: ";
         char num[8];
         put_uint(num, fps);
@@ -944,8 +1049,9 @@ void kernel_main(uint32_t mboot_addr) {
         int ni = 0;
         while (num[ni]) fps_buf[fi++] = num[ni++];
         fps_buf[fi] = 0;
-        rect_fill(SCREEN_W - 70, 2, 68, 10, 0);
-        draw_string(SCREEN_W - 68, 3, fps_buf, 15, 0);
+        int fps_w = 9 * CHAR_W + 8;
+        rect_fill(SCREEN_W - fps_w - 4, 4, fps_w, CHAR_H + 8, 0x00000000);
+        draw_string(SCREEN_W - fps_w, 8, fps_buf, 0x00FFFFFF, 0x00000000);
 
         // Cursor composited last, from an atomic position snapshot — nothing
         // draws after it, so the sprite can never be half-erased on screen

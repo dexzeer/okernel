@@ -17,11 +17,11 @@ align 4
     dd 0    ; unused
     dd 0    ; unused
     dd 0    ; unused
-    ; Video: linear graphics, 640x480, 8bpp
+    ; Video: linear graphics, 1024x768, 32bpp
     dd 0    ; mode_type = 0 (linear)
-    dd 640  ; width
-    dd 480  ; height
-    dd 8    ; bpp
+    dd 1024 ; width
+    dd 768  ; height
+    dd 32   ; bpp
 
 ; Stack — 32KB for our kernel
 section .bss

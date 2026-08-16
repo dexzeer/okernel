@@ -251,6 +251,7 @@ int browser_open(const char* url) {
     window_set_minimize_button(win, 1);
     b->win_id = win;
     browser_count++;
+    window_set_focus(win); // take focus so keyboard input (g/j/k) works immediately
 
     // Parse URL and start navigation
     char host[128], path[128];

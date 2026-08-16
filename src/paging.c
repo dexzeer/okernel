@@ -3,32 +3,49 @@
 #include <stdint.h>
 
 static uint32_t page_directory[1024] __attribute__((aligned(4096)));
-static uint32_t page_table[1024] __attribute__((aligned(4096)));
-static uint32_t extra_page_tables[4][1024] __attribute__((aligned(4096)));
-static int extra_pt_count = 0;
+// 32 tables for low memory (0–128MB), 1 for framebuffer, 1 for e1000 MMIO
+static uint32_t page_tables[34][1024] __attribute__((aligned(4096)));
+static int pt_count = 0;
+
+static void map_4mb(uint32_t base_addr) {
+    uint32_t pd_index = base_addr >> 22;
+    if (page_directory[pd_index] & 0x01) return;
+    if (pt_count >= 34) return;
+
+    uint32_t* pt = page_tables[pt_count];
+    for (int i = 0; i < 1024; i++) {
+        pt[i] = (base_addr + i * 0x1000) | 0x03;
+    }
+    page_directory[pd_index] = ((uint32_t)pt) | 0x03;
+    pt_count++;
+}
 
 void paging_init(uint32_t framebuffer_addr) {
-    // Zero everything
-    for (int i = 0; i < 1024; i++) {
-        page_directory[i] = 0;
-        page_table[i] = 0;
-    }
-    for (int t = 0; t < 4; t++)
-        for (int i = 0; i < 1024; i++)
-            extra_page_tables[t][i] = 0;
+    for (int i = 0; i < 1024; i++) page_directory[i] = 0;
 
-    // Identity map first 4MB (kernel, BSS, stack, VGA at 0xA0000, low memory buffers)
+    // Identity map first 4MB
     for (int i = 0; i < 1024; i++) {
-        page_table[i] = (i * 0x1000) | 0x03;
+        page_tables[0][i] = (i * 0x1000) | 0x03;
     }
-    page_directory[0] = ((uint32_t)page_table) | 0x03;
+    page_directory[0] = ((uint32_t)page_tables[0]) | 0x03;
+    pt_count = 1;
 
-    // Map framebuffer
+    // Identity map 4MB–128MB
+    for (uint32_t addr = 0x00400000; addr < 0x08000000; addr += 0x00400000) {
+        map_4mb(addr);
+    }
+
+    // Map framebuffer (typically 0xFD000000)
     if (framebuffer_addr) {
-        paging_map(framebuffer_addr);
+        map_4mb(framebuffer_addr & 0xFFC00000);
     }
 
-    // Load and enable
+    // Map e1000 MMIO (typically 0xFEB80000)
+    // The e1000 driver calls paging_map() after init, but we also map
+    // the high MMIO area here to be safe
+    map_4mb(0xFEB80000 & 0xFFC00000); // 0xFE000000
+
+    // Enable paging
     __asm__ volatile("mov %0, %%cr3" : : "r"(page_directory));
     uint32_t cr0;
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
@@ -37,21 +54,6 @@ void paging_init(uint32_t framebuffer_addr) {
 }
 
 void* paging_map(uint32_t phys_addr) {
-    uint32_t pd_index = phys_addr >> 22;
-    uint32_t base = phys_addr & 0xFFC00000; // Align to 4MB
-
-    // Use an extra page table
-    if (extra_pt_count >= 4) return 0;
-    uint32_t* pt = extra_page_tables[extra_pt_count];
-
-    for (int i = 0; i < 1024; i++) {
-        pt[i] = (base + i * 0x1000) | 0x03;
-    }
-    page_directory[pd_index] = ((uint32_t)pt) | 0x03;
-    extra_pt_count++;
-
-    // Flush TLB
-    __asm__ volatile("mov %0, %%cr3" : : "r"(page_directory));
-
+    map_4mb(phys_addr & 0xFFC00000);
     return (void*)phys_addr;
 }

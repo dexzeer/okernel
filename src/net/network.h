@@ -105,6 +105,7 @@ char* http_get_response(void);
 int http_get_response_len(void);
 int http_is_pending(void);
 int http_is_done(void);
+int http_dechunk(char* buf, int len);
 
 // Browse file save
 void net_set_browse_save(const char* filename);

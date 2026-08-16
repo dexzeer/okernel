@@ -70,7 +70,10 @@ okernel-desktop.iso: okernel-desktop.bin
 	$(AS) $(ASFLAGS) $< -o $@
 
 # ---- Compile ----
-%.o: %.c
+# Objects depend on all headers — FONT_SCALE/layout constants live in
+# graphics.h/window.h and stale objects with mixed metrics garble rendering
+HEADERS := $(wildcard src/*.h) $(wildcard src/net/*.h)
+%.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # ---- Run ----

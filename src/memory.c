@@ -159,7 +159,9 @@ uint32_t pmm_get_free_pages(void) { return total_pages - used_pages; }
 // ---- Simple kernel heap (bump allocator) ----
 static uint32_t heap_start = 0;
 static uint32_t heap_ptr = 0;
-#define HEAP_SIZE (4 * 1024 * 1024) // 4MB heap
+// Backbuffer + wallpaper cache are 3MB each at 1024x768x32bpp — 4MB was
+// exhausted and the wallpaper cache kmalloc silently returned NULL
+#define HEAP_SIZE (16 * 1024 * 1024) // 16MB heap
 
 void heap_init(void) {
     // Allocate heap from physical memory after kernel
@@ -180,16 +182,17 @@ void heap_init(void) {
 
 void* kmalloc(uint32_t size) {
     if (heap_start == 0) heap_init();
-    if (size == 0) return 0;
+    if (size == 0 || size > HEAP_SIZE) return 0;
 
     // Align to 4 bytes
     size = (size + 3) & ~3;
 
+    // Reject before advancing — a failed alloc must not push heap_ptr past
+    // the end and starve every later kmalloc
+    if (heap_ptr + size > heap_start + HEAP_SIZE) return 0;
+
     uint32_t addr = heap_ptr;
     heap_ptr += size;
-
-    // Simple check: don't exceed heap
-    if (heap_ptr > heap_start + HEAP_SIZE) return 0;
 
     return (void*)addr;
 }
