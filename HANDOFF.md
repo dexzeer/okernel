@@ -206,6 +206,18 @@ Same as above plus: `list`, `switch N`
 - Packet capture via QEMU filter-dump
 - Enable with `-nographic -serial stdio` for serial debug
 
+### Crypto (src/crypto/, host-tested in tests/)
+All primitives for the planned TLS 1.3 client. **Every module is host-tested against RFC vectors** (run `cd tests && gcc ... && ./test_*`):
+- `sha256.c` — FIPS 180-4, streaming + one-shot
+- `chacha20.c` — RFC 8439 stream cipher
+- `poly1305.c` — RFC 8439 MAC, 5x26-bit limbs (32-bit friendly)
+- `hmac.c` — HMAC-SHA256 (RFC 2104)
+- `hkdf.c` — HKDF-SHA256 (RFC 5869), the TLS 1.3 key schedule
+- `aead.c` — ChaCha20-Poly1305 AEAD (RFC 8439 §2.8); MAC scratch cap 20KB (TLS records fit)
+- `x25519.c` — RFC 7748 key exchange, 16x16-bit limbs, Montgomery ladder; fe_invert = binary square-and-multiply (p-2 exponent, NOT an addition chain — the hand-copied chain computed z^(2^253+3))
+
+Crypto debugging lessons (bit us during bring-up): limb packing must never route >64 bits through a uint64_t; reduction folds need their ×5/×38 factors on BOTH low and high parts with the cascade; `|` vs `+` breaks when limbs carry slack; wrap tests must check the top BIT, not the carry out; count array initializers (a 31-byte exponent array silently zero-padded its top byte).
+
 ---
 
 ## Files to Know
