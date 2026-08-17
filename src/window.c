@@ -251,22 +251,29 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
     struct window* w = &windows[id];
     if (!w->visible || w->minimized) return;
 
-    uint32_t bc = w->focused ? vga_to_rgb[WIN_ACTIVE_BORDER] : vga_to_rgb[WIN_BORDER_BG];
-    rect_outline(w->x, w->y, w->w, w->h, bc, WIN_BORDER);
-    rect_fill(w->x + WIN_BORDER, w->y + WIN_BORDER, w->w - 2 * WIN_BORDER, WIN_TITLE_H, vga_to_rgb[WIN_TITLE_BG]);
-    draw_string(w->x + WIN_BORDER + 4, w->y + WIN_BORDER + 4, w->title, vga_to_rgb[WIN_TITLE_FG], vga_to_rgb[WIN_TITLE_BG]);
-
-    if (w->has_close_button) {
-        int bx = w->x + w->w - WIN_BORDER - 4 - WIN_BTN_W, by = w->y + WIN_BORDER;
-        rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, vga_to_rgb[4]);
-        draw_string(bx + 4, by, "X", vga_to_rgb[15], vga_to_rgb[4]);
+    // ---- Title bar / border (skip if clip rect is below title) ----
+    int title_bottom = w->y + WIN_BORDER + WIN_TITLE_H;
+    if (rx < w->x + w->w && rx + rw > w->x &&
+        ry < title_bottom && ry + rh > w->y) {
+        uint32_t bc = w->focused ? vga_to_rgb[WIN_ACTIVE_BORDER] : vga_to_rgb[WIN_BORDER_BG];
+        rect_outline(w->x, w->y, w->w, w->h, bc, WIN_BORDER);
+        rect_fill(w->x + WIN_BORDER, w->y + WIN_BORDER,
+                  w->w - 2 * WIN_BORDER, WIN_TITLE_H, vga_to_rgb[WIN_TITLE_BG]);
+        draw_string(w->x + WIN_BORDER + 4, w->y + WIN_BORDER + 4,
+                    w->title, vga_to_rgb[WIN_TITLE_FG], vga_to_rgb[WIN_TITLE_BG]);
+        if (w->has_close_button) {
+            int bx = w->x + w->w - WIN_BORDER - 4 - WIN_BTN_W, by = w->y + WIN_BORDER;
+            rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, vga_to_rgb[4]);
+            draw_string(bx + 4, by, "X", vga_to_rgb[15], vga_to_rgb[4]);
+        }
+        if (w->has_minimize_button) {
+            int bx = w->x + w->w - WIN_BORDER - 8 - 2 * WIN_BTN_W, by = w->y + WIN_BORDER;
+            rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, vga_to_rgb[6]);
+            draw_string(bx + 4, by, "_", vga_to_rgb[15], vga_to_rgb[6]);
+        }
     }
-    if (w->has_minimize_button) {
-        int bx = w->x + w->w - WIN_BORDER - 8 - 2 * WIN_BTN_W, by = w->y + WIN_BORDER;
-        rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, vga_to_rgb[6]);
-        draw_string(bx + 4, by, "_", vga_to_rgb[15], vga_to_rgb[6]);
-    }
 
+    // ---- Content cells (pre-computed row/col range, no redundant bg fill) ----
     int cx = w->x + WIN_BORDER, cy = w->y + WIN_BORDER + WIN_TITLE_H;
     int cw = w->w - 2 * WIN_BORDER, ch = w->h - WIN_TITLE_H - 2 * WIN_BORDER;
     int x0 = cx > rx ? cx : rx, y0 = cy > ry ? cy : ry;
@@ -274,29 +281,46 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
     int y1 = (cy + ch) < (ry + rh) ? (cy + ch) : (ry + rh);
 
     if (x0 < x1 && y0 < y1) {
+        // Fill content background — essential: null chars (0x00) in the
+        // buffer cause draw_char_scaled to bail early, leaving gaps.
         rect_fill(x0, y0, x1 - x0, y1 - y0, vga_to_rgb[WIN_BG]);
         if (w->content) {
             int scale = w->font_scale;
             int char_w = CHAR_W * scale, char_h = CHAR_H * scale;
-            for (int row = 0; row < w->content_h; row++) {
+            // Pre-compute row/col range — skip cells outside clip rect
+            int row_start = (y0 - cy) / char_h;
+            int row_end   = (y1 - cy + char_h - 1) / char_h;
+            if (row_start < 0) row_start = 0;
+            if (row_end > w->content_h) row_end = w->content_h;
+            int col_start = (x0 - cx) / char_w;
+            int col_end   = (x1 - cx + char_w - 1) / char_w;
+            if (col_start < 0) col_start = 0;
+            if (col_end > w->content_w) col_end = w->content_w;
+            for (int row = row_start; row < row_end; row++) {
                 int py = cy + row * char_h;
-                if (py + char_h <= y0 || py >= y1) continue;
-                for (int col = 0; col < w->content_w; col++) {
+                for (int col = col_start; col < col_end; col++) {
                     int px = cx + col * char_w;
-                    if (px + char_w <= x0 || px >= x1) continue;
                     uint16_t entry = w->content[row * CONTENT_COLS_MAX + col];
                     char c = entry & 0xFF;
                     uint8_t color = (entry >> 8) & 0xFF;
-                    draw_char_scaled(px, py, c, vga_to_rgb[color & 0x0F], vga_to_rgb[(color >> 4) & 0x0F], scale);
+                    draw_char_scaled(px, py, c,
+                        vga_to_rgb[color & 0x0F],
+                        vga_to_rgb[(color >> 4) & 0x0F], scale);
                 }
             }
         }
     }
 
-    // Resize grip — filled triangle in the bottom-right corner
-    for (int i = 0; i < WIN_GRIP_SIZE; i++)
-        hline(w->x + w->w - WIN_BORDER - 1 - i, w->y + w->h - WIN_BORDER - 1 - i, i + 1, vga_to_rgb[8]);
+    // ---- Resize grip (skip if clip rect is far from bottom-right) ----
+    if (rx + rw > w->x + w->w - WIN_GRIP_SIZE - WIN_BORDER &&
+        ry + rh > w->y + w->h - WIN_GRIP_SIZE - WIN_BORDER) {
+        for (int i = 0; i < WIN_GRIP_SIZE; i++)
+            hline(w->x + w->w - WIN_BORDER - 1 - i,
+                  w->y + w->h - WIN_BORDER - 1 - i,
+                  i + 1, vga_to_rgb[8]);
+    }
 
+    // ---- Blinking cursor (skip if clip rect doesn't overlap) ----
     if (w->focused && w->content) {
         int scale = w->font_scale;
         int char_w = CHAR_W * scale, char_h = CHAR_H * scale;
@@ -309,7 +333,9 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
                 if (idx >= 0 && idx < CONTENT_CELLS_MAX) {
                     uint16_t entry = w->content[idx];
                     uint8_t color = (entry >> 8) & 0xFF;
-                    draw_char_scaled(bx, by, entry & 0xFF, vga_to_rgb[color & 0x0F], vga_to_rgb[(color >> 4) & 0x0F], scale);
+                    draw_char_scaled(bx, by, entry & 0xFF,
+                        vga_to_rgb[color & 0x0F],
+                        vga_to_rgb[(color >> 4) & 0x0F], scale);
                 }
             }
         }

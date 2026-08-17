@@ -70,33 +70,49 @@ void render_content(int ed_id) {
     int cy = 0; // cursor y in content buffer
     int skip = b->scroll_y;
 
-    // Draw toolbar
+    // Draw toolbar — title truncated so it never overflows into address bar
     window_set_text_color(b->win_id, 0, 7); // Black on grey
     window_puts(b->win_id, " ");
-    window_puts(b->win_id, b->addr_bar_focused ? "[URL]" : "[URL]");
+    window_puts(b->win_id, "[URL]");
     window_puts(b->win_id, " ");
-    window_puts(b->win_id, b->title[0] ? b->title : b->url);
-    for (int i = 0; i < view_w - 30; i++) window_put_char(b->win_id, ' ');
+    // 7 chars prefix (" [URL] "); fill rest of row with title + padding
+    {
+        const char* ttext = b->title[0] ? b->title : b->url;
+        int tlen = 0;
+        while (ttext[tlen]) tlen++;
+        int max_t = view_w - 7;          // space left after prefix
+        if (tlen > max_t) tlen = max_t;   // truncate long titles
+        for (int i = 0; i < tlen; i++) {
+            char ch = ttext[i];
+            window_put_char(b->win_id, ch >= 32 ? ch : ' ');
+        }
+        for (int i = 7 + tlen; i < view_w; i++)
+            window_put_char(b->win_id, ' ');
+    }
     window_set_text_color(b->win_id, 15, 0); // White on black
 
     // Draw address bar
     window_set_text_color(b->win_id, 15, 1); // White on blue
     window_put_char(b->win_id, '>');
+    int addr_drawn = 1; // '>' already drawn
     if (b->addr_bar_focused) {
         for (int i = 0; i < view_w - 1 && i < b->addr_input_len; i++) {
             window_put_char(b->win_id, b->addr_input[i]);
         }
+        addr_drawn += b->addr_input_len;
         // Cursor indicator
-        if (b->addr_input_len < view_w - 1) {
+        if (addr_drawn < view_w) {
             window_put_char(b->win_id, '_');
+            addr_drawn++;
         }
     } else {
         for (int i = 0; i < view_w - 1 && b->url[i]; i++) {
             window_put_char(b->win_id, b->url[i]);
         }
+        addr_drawn = 1;
+        { int i = 0; while (i < view_w - 1 && b->url[i]) { addr_drawn++; i++; } }
     }
-    for (int i = (b->addr_bar_focused ? b->addr_input_len + 1 : 0);
-         i < view_w - 1; i++) {
+    for (int i = addr_drawn; i < view_w; i++) {
         window_put_char(b->win_id, ' ');
     }
     window_set_text_color(b->win_id, 15, 0);

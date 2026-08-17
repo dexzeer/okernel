@@ -919,10 +919,27 @@ void kernel_main(uint32_t mboot_addr) {
             }
         }
 
-        // Erase last frame's cursor sprite by recompositing that region from
-        // the scene model — no saved background patch to go stale
+        // Erase last frame's cursor sprite — only if the sprite overlaps
+        // the dragged window's old footprint (avoids a full recomposite
+        // when the cursor is far away from the drag region)
         if (cursor_shown) {
-            desktop_paint_rect(cursor_px, cursor_py, CURSOR_W, CURSOR_H);
+            // During an active drag we know the old window rect; skip the
+            // erase when cursor is clearly outside it.  When not dragging
+            // (drag_win < 0) always erase unconditionally.
+            if (drag_win >= 0 && mb) {
+                struct window* dw = window_get(drag_win);
+                if (dw &&
+                    (cursor_px + CURSOR_W <= dw->x ||
+                     cursor_py + CURSOR_H <= dw->y ||
+                     cursor_px >= dw->x + dw->w ||
+                     cursor_py >= dw->y + dw->h)) {
+                    // cursor fully outside old window — skip expensive erase
+                } else {
+                    desktop_paint_rect(cursor_px, cursor_py, CURSOR_W, CURSOR_H);
+                }
+            } else {
+                desktop_paint_rect(cursor_px, cursor_py, CURSOR_W, CURSOR_H);
+            }
             cursor_shown = 0;
         }
 
@@ -962,11 +979,20 @@ void kernel_main(uint32_t mboot_addr) {
                         w->x = nx; w->y = ny;
                         needs_redraw = 1;
                     } else {
-                        // wipe the FPS-box HUD out of the blit source so it
-                        // can't be smeared into the window interior
-                        desktop_paint_rect_skip(drag_win,
-                            SCREEN_W - (9 * CHAR_W + 8) - 12, 4,
-                            (9 * CHAR_W + 8) + 16, CHAR_H + 8);
+                        // wipe the FPS-box HUD only if it overlaps the old
+                        // window footprint — most drags are far from the
+                        // top-right corner, saving a full recomposite call
+                        {
+                            int fps_rx = SCREEN_W - (9 * CHAR_W + 8) - 12;
+                            int fps_ry = 4;
+                            int fps_rw = (9 * CHAR_W + 8) + 16;
+                            int fps_rh = CHAR_H + 8;
+                            if (ox < fps_rx + fps_rw && ox + ow > fps_rx &&
+                                oy < fps_ry + fps_rh && oy + oh > fps_ry) {
+                                desktop_paint_rect_skip(drag_win,
+                                    fps_rx, fps_ry, fps_rw, fps_rh);
+                            }
+                        }
 
                         w->x = nx; w->y = ny;
                         graphics_blit_rect(ox, oy, ow, oh, nx - ox, ny - oy);

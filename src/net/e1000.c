@@ -393,8 +393,14 @@ void e1000_poll(void) {
 
         rx_descs[rx_cur].status = 0;
         rx_descs[rx_cur].length = 0;
+        // Release THIS descriptor back to hardware via the TAIL. RDT must
+        // point AT the last posted descriptor (the one just processed).
+        // Writing RDT = rx_cur+1 instead makes RDT == RDH, which reads as
+        // "no free descriptors" — hardware then drops every packet (the
+        // old code wrote RDH, leaving RDT frozen so the ring exhausted
+        // after ~15 packets; both variants stalled fetches mid-response).
+        mmio_write16(E1000_RDT, rx_cur);
         rx_cur = (rx_cur + 1) % NUM_RX_DESCRIPTORS;
-        mmio_write16(E1000_RDH, rx_cur);
     }
 }
 

@@ -5,8 +5,13 @@ AS = nasm
 LD = ld
 
 # Compiler flags
+# -O2: without it the whole kernel built at -O0 — pixel loops (blit, strip
+# repair, flush) ran 3-5x slower than needed and drags crawled.
+# -fno-strict-aliasing: the network stack type-puns packet buffers through
+# struct pointers (ip_header*, tcp on byte arrays) — UB under strict aliasing.
 CFLAGS = -m32 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
          -nostartfiles -nodefaultlibs -fno-pic -fno-pie -mno-red-zone \
+         -O2 -fno-strict-aliasing \
          -Wall -Wextra -Isrc
 
 # Assembler flags

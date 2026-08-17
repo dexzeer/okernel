@@ -5,9 +5,9 @@
 okernel is a from-scratch operating system built in C and x86 assembly. It has two modes:
 
 - **Text mode** (`make text`) — VGA text terminal with commands, scrolling, terminal multiplexing
-- **Desktop mode** (`make desktop`) — 640x480 graphical desktop with windows, mouse, and shell
+- **Desktop mode** (`make desktop`) — 1024x768x32bpp graphical desktop with windows, mouse, browser, editor, and shell
 
-Current version: **v0.3** (desktop edition with networking)
+Current version: **v0.4** (desktop edition: 1024x768x32bpp, working browser with resizable windows)
 
 ---
 
@@ -78,7 +78,8 @@ okernel/
 2. Dirty-row tracking — only changed rows are copied to framebuffer
 3. `graphics_flush()` copies dirty rows to framebuffer at 0xFD000000
 4. Clip rectangle (`graphics_set_clip`/`graphics_clip_reset`) restricts drawing during scene repair so small repairs only dirty their own rows (enforced in `putpixel`, `rect_fill`, `hline`, `graphics_write_pixel`)
-5. Result: ~900 FPS idle in QEMU, 60-160 FPS with content changes
+5. Window drag = backbuffer blit + exposed-strip repair (`graphics_blit_rect`); resize = band-only repair; content buffers are slack-allocated with fixed stride (`CONTENT_COLS_MAX`) so resize never reallocates
+6. Result (kernel built with `-O2 -fno-strict-aliasing`): ~885 FPS idle, ~726 dragging, ~784 resizing in QEMU
 
 ### Cursor Compositor (v0.3.1 — artifact fix)
 The cursor is a **stateless sprite** — there is NO saved background patch and no save/restore pair. This is deliberate; the previous save/restore design caused persistent artifacts (arrow ghosts, wallpaper holes in windows) because the saved patch went stale against scene changes and IRQ12 could tear it mid-read.
@@ -179,8 +180,8 @@ Same as above plus: `list`, `switch N`
 - **Single CPU** — no SMP support
 - **No real mouse scroll** — PS/2 3-byte mode only (scroll via keyboard)
 - **Minimal TCP** — no retransmission, no windowing, no congestion control
-- **HTTP limited** — single GET request, no HTTPS (chunked transfer IS decoded via `http_dechunk`)
-- **TCP has no retransmission** — a lost/delayed segment stalls a transfer (some fetches hang mid-response; repro pcap in /tmp/okernel-verify/net.pcap)
+- **HTTP limited** — single GET request, no HTTPS yet (chunked transfer IS decoded via `http_dechunk`)
+- **TCP minimal** — no retransmission, no windowing, no congestion control (next up: retransmit + timeout, prerequisite for TLS)
 
 ---
 
@@ -190,6 +191,7 @@ Same as above plus: `list`, `switch N`
 - MMIO-based, supports TX and RX
 - RX/TX buffers at fixed low memory addresses (0x80000-0x9FFFF)
 - Descriptors at 0x80000 (RX) and 0x90000 (TX)
+- **RX ring release: software writes `RDT = index of LAST processed descriptor`** (never index+1, never RDH — RDT==RDH reads as "ring full" and hardware silently drops every packet; writing RDH never replenishes the ring and it exhausts after ~15 packets). Both wrong variants caused stalled/blank browser fetches.
 - IRQ handler + polling mode
 - MAC address read from RAL/RAH registers after reset
 
