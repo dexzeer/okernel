@@ -104,7 +104,7 @@ The cursor is a **stateless sprite** — there is NO saved background patch and 
 5. **ICMP**: Echo request/reply (ping)
 6. **UDP**: Send/receive
 7. **DNS**: Query encoder/decoder, resolves via QEMU SLIRP (10.0.2.3)
-8. **TCP**: Minimal stack — SYN/SYN-ACK/ACK/FIN, data transfer
+8. **TCP**: Minimal stack — SYN/SYN-ACK/ACK/FIN, data transfer, retransmission with exponential backoff (220ms base, 6 attempts, then give-up + timeout message), cumulative ACK processing, RX dedup by sequence number (duplicates re-ACKed, out-of-order dropped), `netdrop N` shell command drops 1-in-N received TCP packets for testing (ARP/DNS/ICMP always pass)
 9. **HTTP**: GET requests, response buffering
 
 ### Browser (okai)
@@ -181,7 +181,7 @@ Same as above plus: `list`, `switch N`
 - **No real mouse scroll** — PS/2 3-byte mode only (scroll via keyboard)
 - **Minimal TCP** — no retransmission, no windowing, no congestion control
 - **HTTP limited** — single GET request, no HTTPS yet (chunked transfer IS decoded via `http_dechunk`)
-- **TCP minimal** — no retransmission, no windowing, no congestion control (next up: retransmit + timeout, prerequisite for TLS)
+- **TCP minimal** — single connection, no windowing/congestion control, no out-of-order buffering (gaps re-ACKed until the server fills them). Retransmission IS implemented (timer + backoff + give-up). This is the foundation for the planned TLS 1.3 client.
 
 ---
 

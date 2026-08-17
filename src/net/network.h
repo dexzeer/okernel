@@ -107,6 +107,9 @@ int http_is_pending(void);
 int http_is_done(void);
 int http_dechunk(char* buf, int len);
 
+// TCP retransmission timer — called from net_poll, exported for tests
+void tcp_poll(void);
+
 // Browse file save
 void net_set_browse_save(const char* filename);
 

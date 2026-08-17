@@ -19,4 +19,8 @@ uint8_t* e1000_get_mac(void);
 typedef void (*e1000_rx_callback_t)(uint8_t* data, uint32_t len);
 void e1000_set_rx_callback(e1000_rx_callback_t cb);
 
+// Test hook: drop every Nth received packet (0 = disable). Exercises the
+// TCP retransmission path under controlled loss.
+void net_set_drop_rate(int every_nth);
+
 #endif

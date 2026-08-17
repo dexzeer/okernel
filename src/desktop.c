@@ -343,6 +343,10 @@ static void shell_execute(int win_id, const char* input) {
     for (int i = 0; i < cmd_len; i++) cmd_buf[i] = input[i];
     cmd_buf[cmd_len] = 0;
 
+    serial_puts("[sh] exec: ");
+    serial_puts(cmd_buf);
+    serial_putchar('\n');
+
     const char* args = input + cmd_len;
     while (*args == ' ') args++;
 
@@ -360,6 +364,7 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  exit      - close this terminal\n");
         window_puts(win_id, "  ping      - ping gateway\n");
         window_puts(win_id, "  ip        - show IP address\n");
+        window_puts(win_id, "  netdrop N - drop 1-in-N TCP pkts (test)\n");
         window_puts(win_id, "  resolve   - DNS lookup\n");
         window_puts(win_id, "  browser   - open web browser\n");
         window_puts(win_id, "  edit      - open text editor\n");
@@ -400,6 +405,23 @@ static void shell_execute(int win_id, const char* input) {
         ip_buf[idx] = 0;
         window_puts(win_id, ip_buf);
         window_puts(win_id, "\n");
+    }
+    else if (str_eq(cmd_buf, "netdrop")) {
+        // Test hook: drop every Nth received TCP packet (netdrop 0 = off)
+        int n = 0;
+        for (int i = 0; args[i] >= '0' && args[i] <= '9'; i++) {
+            n = n * 10 + (args[i] - '0');
+        }
+        net_set_drop_rate(n);
+        if (n > 0) {
+            window_puts(win_id, "Dropping 1 in ");
+            char buf[8];
+            put_uint(buf, (uint32_t)n);
+            window_puts(win_id, buf);
+            window_puts(win_id, " packets.\n");
+        } else {
+            window_puts(win_id, "Packet drop disabled.\n");
+        }
     }
     else if (str_eq(cmd_buf, "resolve")) {
         if (args[0] == 0) {
@@ -907,6 +929,14 @@ void kernel_main(uint32_t mboot_addr) {
                     resp_len = http_dechunk(resp, resp_len);
                     int count = html_parse(resp, resp_len,
                                            br->tokens, HTML_MAX_TOKENS);
+                    serial_puts("[br] parse: count=");
+                    serial_putchar('0' + (count / 10) % 10);
+                    serial_putchar('0' + count % 10);
+                    serial_puts(" len=");
+                    serial_putchar('0' + (resp_len / 100) % 10);
+                    serial_putchar('0' + (resp_len / 10) % 10);
+                    serial_putchar('0' + resp_len % 10);
+                    serial_putchar('\n');
                     // -1 sentinel: "parsed, nothing renderable" — keeps this
                     // block from re-parsing every frame on empty pages
                     br->token_count = count > 0 ? count : -1;

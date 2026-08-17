@@ -348,6 +348,18 @@ int e1000_send(uint8_t* data, uint32_t len) {
 static int poll_count = 0;
 static int last_debug = 0;
 
+// Packet-loss injection for testing TCP retransmission (0 = off)
+static int net_drop_rate = 0;
+static uint32_t net_drop_ctr = 0;
+
+void net_set_drop_rate(int every_nth) {
+    net_drop_rate = every_nth > 0 ? every_nth : 0;
+    net_drop_ctr = 0;
+    serial_puts("[e1000] drop rate set to 1-in-");
+    serial_putchar('0' + (net_drop_rate % 10));
+    serial_puts("\n");
+}
+
 void e1000_poll(void) {
     if (!mmio) return;
 
@@ -385,7 +397,21 @@ void e1000_poll(void) {
         serial_putchar(hex[rx_cur]);
         serial_putchar('\n');
 
-        if (len > 4 && len < RX_BUFFER_SIZE && rx_callback) {
+        // Loss injection: every Nth TCP packet is processed but not
+        // delivered (descriptor still released below so the ring keeps
+        // flowing). Non-TCP (ARP/DNS/ICMP) always passes — dropping ARP
+        // at 100% stalls the stack below TCP, which has no retry.
+        int drop = 0;
+        if (net_drop_rate > 0 && (++net_drop_ctr % net_drop_rate) == 0) {
+            uint8_t* pkt = (uint8_t*)(E1000_RX_BUFS_ADDR + (rx_cur * RX_BUFFER_SIZE));
+            int is_tcp = (len > 34 && pkt[12] == 0x08 && pkt[13] == 0x00 &&
+                          pkt[14 + 9] == 6);
+            drop = is_tcp;
+        }
+
+        if (drop) {
+            serial_puts("[e1000] DROP (injected)\n");
+        } else if (len > 4 && len < RX_BUFFER_SIZE && rx_callback) {
             // Point to the buffer in low memory
             uint8_t* pkt = (uint8_t*)(E1000_RX_BUFS_ADDR + (rx_cur * RX_BUFFER_SIZE));
             rx_callback(pkt, len - 4);
