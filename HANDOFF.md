@@ -126,10 +126,9 @@ The cursor is a **stateless sprite** — there is NO saved background patch and 
 
 ---
 
-## TLS 1.3 client (in-progress)
+## TLS 1.3 client (Phase 4 complete, Phase 5 partial)
 
-Phases 1–3 are complete and host-tested. Phase 4 is in-progress with a known issue.
-**Nothing in `src/crypto/` is yet wired into the kernel build** (Phase 5 work).
+Phases 1–4 are complete and host-tested. Phase 5 (kernel integration) is partially done.
 
 ### Phase status
 | Phase | Files | Status |
@@ -137,56 +136,90 @@ Phases 1–3 are complete and host-tested. Phase 4 is in-progress with a known i
 | 1 record layer | `tls_record.c/.h` | **PASS** (21/21 host tests) |
 | 2 handshake codec + transcript | `tls_handshake.c/.h` | **PASS** (31/31 host tests) |
 | 3 key schedule (RFC 8446 §7.1) | `tls_keysched.c/.h` | **PASS** (13/13 host tests, RFC 8448 vector-validated) |
-| 4 full handshake driver | `tls_client.c/.h` | **WIP** — SH parses, keys derive, but AEAD decrypt of EE/Cert/CV fails |
-| 5 kernel integration | (not started) | Pending Phase 4 |
+| 4 full handshake driver | `tls_client.c/.h` | **PASS** — full handshake against example.com (Cloudflare), HTTP 200 received |
+| 5 kernel integration | `tls_net.c/.h`, `rand.c/.h` | **PARTIAL** — CPRNG + net wrapper written, Makefile NOT updated, kernel NOT built |
 | 6 QEMU verification | (not started) | Pending Phase 5 |
 
-### Phase 4 next steps (the unfinished work)
-1. **Debug remaining AEAD decrypt mismatch.** The handshake completes the SH step:
-   ```
-   [tls] got SH, cipher=0x1303 group=0x001d
-   [tls] handshake keys derived
-   ```
-   Then the server sends CCS + a 23-byte APPDATA record (7B ciphertext + 16B tag).
-   `aead_chacha20_poly1305_decrypt()` rejects this — Python's `cryptography`
-   lib rejects it too with the same `s_hs_key`/`s_hs_iv` we derived. So the key
-   derivation itself is wrong, not the AEAD layer.
-   - Verify `tls_traffic_secret(master, "c hs traffic", transcript_after_sh)`
-     against RFC 8448 example 1 (intermediate vectors all match — see Phase 3 test).
-   - The issue is most likely in how `transcript_after_sh` is reconstructed in
-     `tls_client.c` (around line ~210). The `snap` transcript hashes `ch`
-     with full handshake header (4 bytes) + body. But `ch_len` is the body
-     alone (length-prefixed) — and `tls_build_client_hello` returns total
-     bytes (header + body). Need to pass body_len only.
-   - Exact bug location: `tls_client.c:212` — `tls_transcript_update_msg(
-     &snap, TLS_HS_CLIENT_HELLO, ch, ch_len)` should use `body_len = ch_len - 4`.
-   - Same applies to SH body length. Apply the same fix there.
-2. Once AEAD works: write `Finished` (HMAC over transcript hash) and send it
-   under the handshake keys. Then send the HTTP request under app keys and
-   decrypt the response.
+### Phase 4 — FIXED (4 bugs found and corrected)
 
-### Phase 5 (kernel integration) — for the next agent
-1. **Entropy** — implement `rand.c/.h` using a ChaCha20 CPRNG seeded from RDTSC,
-   mixed with IRQ jitter and the e1000 MAC. Stir on every timer tick; never
-   output before 32 mixed samples.
-2. **AAD bytes for AEAD encrypt** — currently the kernel build path may emit
-   `aad[5]` with version `0x03 0x03` but the inner plaintext order must be
-   `real_content || content_type_byte || zeros_padded`. Verify
-   `send_aead_record` writes these in order.
-3. **Makefile** — append to `DESKTOP_OBJ`:
+Phase 4 now passes against example.com (Cloudflare). Full TLS 1.3 handshake
+completes, HTTP request sent, response received and decrypted.
+
+Host test: `tests/test_tls_client.c` connects to example.com:443 over BSD
+sockets, performs the full handshake, sends GET /, and verifies HTML response.
+
+**Bugs fixed in this session:**
+
+1. **Transcript body-length mismatch** (`tls_client.c`). `tls_build_client_hello`
+   returns TOTAL bytes (4-byte handshake header + body). `tls_transcript_update_msg`
+   expects body-only and adds the header internally. Passing the full `ch_len`
+   double-counted the header in the transcript hash.
+   - Fix: pass `ch + 4, ch_len - 4` in both the `transcript_after_sh` block and
+     the `transcript_of()` helper.
+
+2. **Certificate parser wrong format** (`tls_handshake.c`). TLS 1.3 Certificate
+   messages have a `cert_request_context<0..2^8-1>` byte before the 3-byte
+   `certificate_list` length. The old parser read bytes 0–2 as the list length,
+   but byte 0 is actually the context length (0 for server certs).
+   - Fix: skip `cert[0]` context bytes, then read list length from offset
+     `1 + ctx_len`.
+
+3. **send_aead tag not appended** (`tls_client.c`). `aead_chacha20_poly1305_encrypt`
+   writes ciphertext to `out` and tag to a separate `tag[16]` array. The old
+   `send_aead` sent `ct_len` bytes from the ciphertext buffer but never appended
+   the 16-byte tag — the last 16 bytes were stack garbage.
+   - Fix: `memcpy(ct + pt_len + 1, tag, 16)` after encryption.
+
+4. **Finished key derived from wrong secret** (`tls_client.c`). RFC 8446 §4.4.4:
+   the client Finished key is derived from the handshake traffic secret (`c_hs`),
+   NOT the application traffic secret (`c_ap`). The old code called
+   `tls_finished_key(c_ap, c_fin_key)` — the server couldn't verify our MAC.
+   - Fix: `tls_finished_key(c_hs, c_fin_key)`.
+
+5. **Separate app traffic sequence counters** (`tls_client.c`). Client and server
+   application traffic use independent sequence numbers. The old code shared
+   `app_seq` between send and receive — after sending the HTTP request (seq→1),
+   the receive tried seq=1 instead of seq=0.
+   - Fix: separate `c_ap_seq` and `s_ap_seq` starting at 0.
+
+### Phase 5 (kernel integration) — partially done
+
+**Done:**
+- `rand.c/.h` — ChaCha20 CPRNG seeded from caller, rekeys after every 64 bytes
+  of output (forward secrecy). `rand_seed()`, `rand_stir()`, `rand_bytes()`,
+  `rand_ready()`. Not yet wired into kernel init (needs RDTSC + IRQ jitter
+  seeding).
+- `tls_net.c/.h` — `https_get(host, path)` wrapper with kernel TCP send/recv
+  callbacks, 16KB TLS rx buffer, 16KB response buffer. Currently runs the
+  full handshake in a single blocking call (recv callback busy-waits with
+  `sti/nop/cli`). Works on host; needs adaptation for kernel IRQ-driven
+  model.
+
+**Not done (for the next agent):**
+1. **Makefile** — append crypto objects to `DESKTOP_OBJ`:
    ```
    src/crypto/sha256.o src/crypto/hmac.o src/crypto/hkdf.o \
    src/crypto/aead.o src/crypto/chacha20.o src/crypto/poly1305.o \
    src/crypto/x25519.o src/crypto/tls_record.o src/crypto/tls_handshake.o \
-   src/crypto/tls_keysched.o src/crypto/tls_client.o src/crypto/rand.o
+   src/crypto/tls_keysched.o src/crypto/tls_client.o src/crypto/rand.o \
+   src/net/tls_net.o
    ```
-4. **`https_get(host, path)` in `src/net/tls_net.c`** — port 443, wraps the
-   Phase 4 driver. Add a `tls_session_active` flag so `tcp_handle_packet`
-   appends into a 16KB `tls_rx_buf` instead of `http_response` when TLS is on.
-   Respond buffer for HTTPS grows to 16KB (BSS fine — heap also fine).
-5. **Browser** — `browser https://host/path` → after close,
-   `tls_decrypt_all()` fills `http_response`, then existing dechunk+parse
-   runs unchanged.
+2. **Wire `tls_append_data` into `tcp_handle_packet`** in `network.c`. When
+   `tls_is_active()` returns 1, append TCP payload to `tls_rx_buf` instead
+   of `http_response`.
+3. **Seed the CPRNG at boot** in `kernel_main()`: read RDTSC, mix with IRQ
+   jitter from timer ticks, and XOR in the e1000 MAC address. Call
+   `rand_seed()` with the first 32 bytes, then `rand_stir()` on every
+   timer tick for the first 32 ticks.
+4. **Make recv callback non-blocking** for the kernel. Replace the busy-wait
+   in `kernel_tcp_recv` with a stateful approach: the TLS handshake should
+   yield back to the main loop when waiting for data, and resume when
+   `tls_append_data` has buffered enough. This requires either making
+   `tls_client_run` cooperative (state machine) or running the handshake
+   from the main loop with a `tls_poll()` driver.
+5. **Browser HTTPS** — `browser https://host/path` → detect `https://` scheme,
+   call `https_get()` instead of `http_get()`, then existing dechunk+parse
+   runs on `tls_get_response()`.
 
 ### Phase 6 (QEMU verification)
 Boot with serial:
@@ -366,7 +399,7 @@ Crypto debugging lessons (bit us during bring-up): limb packing must never route
 - Supported_group structure: do NOT use the `<2..2^16-1>` outer length prefix
   of an early draft; the final RFC body is `{ uint16 length; NamedGroup[] }`.
 
-**Tls1.3 transcript hash on the wire (Phase 4 bug — see "Phase 4 next steps")**
+**TLS 1.3 transcript hash on the wire (Phase 4 bug — FIXED)**
 - `tls_build_client_hello` returns TOTAL bytes (4-byte handshake header + body).
 - `tls_transcript_update_msg(t, type, body, body_len)` expects `body_len` to be
   the body bytes ONLY, NOT including the handshake header. The handshake header
@@ -375,6 +408,7 @@ Crypto debugging lessons (bit us during bring-up): limb packing must never route
   the transcript hash is computed over the right total bytes but the sequence of
   bytes hashed is `type || (bodylen+4) || <body-with-extra-bytes>`, which makes
   the digest mismatch on the server side. **Always pass body-only length.**
+- Fix: pass `ch + 4, ch_len - 4` to all `tls_transcript_update_msg` calls.
 
 **Kernel** (these are old but still relevant from prior agents)
 - Heap is a bump allocator, 16MB. Nothing frees. Big static arrays go in
@@ -418,10 +452,12 @@ Crypto debugging lessons (bit us during bring-up): limb packing must never route
 | `src/html.c` | HTML parser — strips HTTP headers, tokenizes tags |
 | `src/net/e1000.c` | e1000 NIC driver — TX + RX |
 | `src/net/network.c` | Full network stack — ARP, IP, ICMP, UDP, TCP, DNS, HTTP |
-| `src/crypto/tls_client.c` | TLS 1.3 handshake driver (Phase 4 — needs AEAD decrypt fix) |
+| `src/crypto/tls_client.c` | TLS 1.3 handshake driver (Phase 4 — complete, host-tested) |
 | `src/crypto/tls_keysched.c` | RFC 8446 §7.1 — known-good, vector-validated |
 | `src/crypto/tls_handshake.c` | ClientHello builder + parsers |
 | `src/crypto/tls_record.c` | TLS record layer build/parse |
+| `src/crypto/rand.c/.h` | ChaCha20 CPRNG for TLS key generation |
+| `src/net/tls_net.c/.h` | HTTPS client wrapper (kernel integration) |
 | `src/crypto/aead.c` | ChaCha20-Poly1305 AEAD (Phase 1–3 verified, decrypt path validated in test_tls_crypto) |
 | `linker.ld` | Memory layout — kernel load address, symbols |
 | `Makefile` | Build system — text vs desktop targets |
@@ -453,7 +489,29 @@ Crypto debugging lessons (bit us during bring-up): limb packing must never route
     `buf_len == 5` (header-only), the check `buf_len - 5 < plen` reads
     `0 < plen`, rejecting every valid header. Caller reads payload
     separately. (Phase 1 bug.)
-14. **TLS 1.3 transcript hash body-length mismatch** (Phase 4 bug, in-progress):
+14. **TLS 1.3 transcript hash body-length mismatch** (Phase 4 bug — FIXED):
     `tls_build_client_hello` returns TOTAL bytes (header + body). Pass body
     length minus 4 into `tls_transcript_update_msg` — the function adds the
     4-byte handshake header itself.
+15. **TLS Certificate parser missing context_len** (Phase 4 bug — FIXED):
+    TLS 1.3 Certificate messages have `cert_request_context<0..2^8-1>` before
+    the 3-byte `certificate_list` length. The old parser read bytes 0–2 as the
+    list length, but byte 0 is actually the context length (0 for server certs).
+    Fix: skip `cert[0]` context bytes, then read list length from offset
+    `1 + ctx_len`.
+16. **send_aead missing tag append** (Phase 4 bug — FIXED):
+    `aead_chacha20_poly1305_encrypt` writes ciphertext to `out` and tag to a
+    separate `tag[16]` array. The old `send_aead` sent `ct_len` bytes from
+    the ciphertext buffer but never appended the 16-byte tag — the last 16
+    bytes were stack garbage. Fix: `memcpy(ct + pt_len + 1, tag, 16)` after
+    encryption.
+17. **Finished key derived from wrong secret** (Phase 4 bug — FIXED):
+    RFC 8446 §4.4.4: client Finished key is derived from the handshake traffic
+    secret (`c_hs`), NOT the application traffic secret (`c_ap`). The old code
+    called `tls_finished_key(c_ap, c_fin_key)` — the server couldn't verify
+    our MAC. Fix: `tls_finished_key(c_hs, c_fin_key)`.
+18. **Shared app traffic sequence counter** (Phase 4 bug — FIXED):
+    Client and server application traffic use independent sequence numbers.
+    The old code shared `app_seq` between send and receive — after sending the
+    HTTP request (seq→1), the receive tried seq=1 instead of seq=0. Fix:
+    separate `c_ap_seq` and `s_ap_seq` starting at 0.

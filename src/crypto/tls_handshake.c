@@ -330,10 +330,17 @@ int tls_parse_ee_alpn(const uint8_t* ee, uint32_t ee_len,
 // body = cert_list<0..2^24-1> where each entry = len(3) | cert_data<1..2^24-1>
 
 int tls_parse_certificate(const uint8_t* cert, uint32_t cert_len) {
-    if (cert_len < 3) return -1;
-    uint32_t list_len = ((uint32_t)cert[0] << 16) | ((uint32_t)cert[1] << 8) | cert[2];
-    if (cert_len < 3 + list_len) return -1;
-    uint32_t p = 3, eend = 3 + list_len;
+    if (cert_len < 4) return -1;
+    // TLS 1.3 Certificate (RFC 8446 s4.4.2):
+    //   cert_request_context<0..2^8-1>  (1B len + data, empty for server)
+    //   certificate_list<0..2^24-1>     (3B len + entries)
+    uint32_t ctx_len = cert[0];
+    uint32_t p = 1 + ctx_len;
+    if (p + 3 > cert_len) return -1;
+    uint32_t list_len = ((uint32_t)cert[p] << 16) | ((uint32_t)cert[p+1] << 8) | cert[p+2];
+    p += 3;
+    if (cert_len < p + list_len) return -1;
+    uint32_t eend = p + list_len;
     int saw_one = 0;
     while (p + 3 <= eend) {
         uint32_t entry_len = ((uint32_t)cert[p] << 16) |
