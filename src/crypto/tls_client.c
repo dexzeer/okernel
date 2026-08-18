@@ -30,8 +30,7 @@ static uint32_t recv_record(uint8_t* out, uint32_t cap,
     if (cap < 5) return 0;
     int n = io->recv(out, 5, 5000, io->user);
     if (n != 5) { fprintf(stderr, "[recv_record] hdr read=%d/5\n", n); return 0; }
-    fprintf(stderr, "[recv_record] hdr bytes: %02x %02x %02x %02x %02x\n",
-            out[0], out[1], out[2], out[3], out[4]);
+
     tls_record rec;
     if (tls_record_parse_header(out, 5, &rec) != 5) {
         fprintf(stderr, "[recv_record] header parse failed type=%u ver=%u\n", rec.type, rec.version);
@@ -85,6 +84,7 @@ static int send_aead(uint8_t key[32], const uint8_t iv[12], uint64_t* seq,
     aad[3] = (uint8_t)(ct_len >> 8); aad[4] = (uint8_t)(ct_len & 0xff);
     aead_chacha20_poly1305_encrypt(key, nonce, aad, 5,
                                    inner, pt_len + 1, ct, tag);
+    memcpy(ct + pt_len + 1, tag, 16);
 
     uint8_t hdr[5];
     hdr[0] = TLS_CT_APPDATA; hdr[1] = 0x03; hdr[2] = 0x03;
@@ -103,7 +103,6 @@ static int recv_aead(uint8_t key[32], const uint8_t iv[12], uint64_t* seq,
         if (total == 0) return -1;
         tls_record v;
         if (tls_record_parse_header(rec, total, &v) != 5) return -1;
-        fprintf(stderr, "[recv_aead] type=%u len=%u\n", v.type, v.payload_len);
         if (v.type == TLS_CT_CHANGE_CIPHER_SPEC) continue;
         if (v.type == TLS_CT_ALERT) return -1;
         if (v.type != TLS_CT_APPDATA) return -1;
@@ -115,21 +114,11 @@ static int recv_aead(uint8_t key[32], const uint8_t iv[12], uint64_t* seq,
         int rc = aead_chacha20_poly1305_decrypt(key, nonce, aad, 5,
                                                 v.payload, ct_len,
                                                 v.payload + ct_len, out);
-        if (rc != 0) { fprintf(stderr, "[recv_aead] decrypt fail pt_len=%u ct=", ct_len);
-            for (uint32_t i = 0; i < ct_len; i++) fprintf(stderr, "%02x", v.payload[i]);
-            fprintf(stderr, " tag=");
-            for (uint32_t i = 0; i < 16; i++) fprintf(stderr, "%02x", v.payload[ct_len + i]);
-            fprintf(stderr, "\n");
-            fprintf(stderr, "[recv_aead] key="); for (int i = 0; i < 32; i++) fprintf(stderr, "%02x", key[i]);
-            fprintf(stderr, "\n");
-            fprintf(stderr, "[recv_aead] iv=");  for (int i = 0; i < 12; i++) fprintf(stderr, "%02x", iv[i]);
-            fprintf(stderr, "\n");
-            return -1; }
+        if (rc != 0) { fprintf(stderr, "[tls] AEAD decrypt fail\n"); return -1; }
         int plen = ct_len;
         while (plen > 0 && out[plen - 1] == 0) plen--;
         if (plen == 0) return -1;
         *ct_type = out[plen - 1];
-        fprintf(stderr, "[recv_aead] pt_len=%d ct_type=%u\n", plen - 1, *ct_type);
         return plen - 1;
     }
 }
@@ -154,7 +143,8 @@ static void transcript_of(const uint8_t* ch, uint32_t ch_len,
                           uint8_t out[32]) {
     tls_transcript t;
     tls_transcript_init(&t);
-    tls_transcript_update_msg(&t, TLS_HS_CLIENT_HELLO, ch, ch_len);
+    // ch is the full ClientHello message (header + body). Pass body only.
+    tls_transcript_update_msg(&t, TLS_HS_CLIENT_HELLO, ch + 4, ch_len - 4);
     tls_transcript_update_msg(&t, TLS_HS_SERVER_HELLO, sh_body, sh_bl);
     if (ee_body)  tls_transcript_update_msg(&t, TLS_HS_ENCRYPTED_EXTENSIONS,
                                             ee_body, ee_bl);
@@ -184,8 +174,6 @@ int tls_client_run(const char* host, uint16_t port,
     if (ch_len == 0) { fprintf(stderr, "[tls] CH build failed\n"); return -1; }
     fprintf(stderr, "[tls] CH built len=%u\n", ch_len);
 
-    // Send ClientHello. (Skip CCS — Python's strict ssl rejects it; we add
-    // it back when talking to servers that need it for middlebox compat.)
     if (send_record(TLS_CT_HANDSHAKE, ch, ch_len, io) != 0) return -1;
     fprintf(stderr, "[tls] sent ClientHello\n");
 
@@ -193,32 +181,29 @@ int tls_client_run(const char* host, uint16_t port,
     uint8_t rec_buf[18432 + 32];
     uint32_t total = recv_record(rec_buf, sizeof(rec_buf), io);
     if (total == 0) { fprintf(stderr, "[tls] recv SH failed\n"); return -1; }
-    fprintf(stderr, "[tls] recv %u bytes:", total);
-    for (uint32_t i = 0; i < total && i < 64; i++) fprintf(stderr, " %02x", rec_buf[i]);
-    fprintf(stderr, "\n");
     tls_record rec_v;
     if (tls_record_parse_header(rec_buf, total, &rec_v) != 5) return -1;
     if (rec_v.type != TLS_CT_HANDSHAKE) { fprintf(stderr, "[tls] non-HS type=%u\n", rec_v.type); return -1; }
     uint8_t hs_t; uint32_t hs_bl;
     uint32_t consumed = parse_hs(rec_v.payload, rec_v.payload_len, &hs_t, &hs_bl);
-    if (consumed == 0 || hs_t != TLS_HS_SERVER_HELLO) {
-        fprintf(stderr, "[tls] parse_hs failed consumed=%u hs_t=%u\n", consumed, hs_t); return -1; }
+    if (consumed == 0 || hs_t != TLS_HS_SERVER_HELLO) return -1;
     tls_server_hello sh;
     if (tls_parse_server_hello(rec_v.payload + 4, hs_bl, &sh) != 0) {
         fprintf(stderr, "[tls] parse SH failed\n"); return -1; }
     const uint8_t* sh_body = rec_v.payload + 4;
     fprintf(stderr, "[tls] got SH, cipher=0x%04x group=0x%04x\n",
             sh.cipher_suite, sh.named_group);
-    fprintf(stderr, "[tls] SH body hex: ");
-    for (uint32_t i = 0; i < hs_bl; i++) fprintf(stderr, "%02x", sh_body[i]);
-    fprintf(stderr, "\n");
 
     // Compute transcript after SH (for handshake traffic key derivation)
+    // ch is the full ClientHello message (header + body). tls_transcript_update_msg
+    // expects body-only and adds the handshake header internally, so skip the
+    // 4-byte header (type(1) + len(3)) when feeding the transcript.
+    uint8_t ch_body_len = ch_len - 4;
     uint8_t transcript_after_sh[32];
     {
         tls_transcript snap;
         tls_transcript_init(&snap);
-        tls_transcript_update_msg(&snap, TLS_HS_CLIENT_HELLO, ch, ch_len);
+        tls_transcript_update_msg(&snap, TLS_HS_CLIENT_HELLO, ch + 4, ch_body_len);
         tls_transcript_update_msg(&snap, TLS_HS_SERVER_HELLO, sh_body, hs_bl);
         tls_transcript_final(&snap, transcript_after_sh);
     }
@@ -255,32 +240,33 @@ int tls_client_run(const char* host, uint16_t port,
         pt_len = recv_aead(s_hs_key, s_hs_iv, &s_seq,
                            pt, sizeof(pt), &ct_type, io);
         if (pt_len < 0) { fprintf(stderr, "[tls] recv_aead failed pt_len=%d\n", pt_len); return -1; }
-        if (ct_type != TLS_CT_HANDSHAKE) { fprintf(stderr, "[tls] non-HS type=%u\n", ct_type); return -1; }
-        fprintf(stderr, "[tls] decrypted AEAD record pt_len=%d\n", pt_len);
+        if (ct_type != TLS_CT_HANDSHAKE) return -1;
         uint32_t p = 0;
         while (p < (uint32_t)pt_len) {
             uint8_t t; uint32_t bl;
             uint32_t c = parse_hs(pt + p, pt_len - p, &t, &bl);
-            if (c == 0) return -1;
+            if (c == 0) { fprintf(stderr, "[tls] parse_hs fail at offset %u remaining %d\n", p, pt_len - (int)p); return -1; }
             const uint8_t* body = pt + p + 4;
             if (t == TLS_HS_ENCRYPTED_EXTENSIONS && !got_ee) {
-                if (bl > sizeof(ee_body)) return -1;
+                if (bl > sizeof(ee_body)) { fprintf(stderr, "[tls] EE too big %u\n", bl); return -1; }
                 memcpy(ee_body, body, bl); ee_bl = bl;
                 got_ee = 1;
             } else if (t == TLS_HS_CERTIFICATE && !got_cert) {
-                if (bl > sizeof(cert_body)) return -1;
+                if (bl > sizeof(cert_body)) { fprintf(stderr, "[tls] cert too big %u\n", bl); return -1; }
                 memcpy(cert_body, body, bl); cert_bl = bl;
-                if (tls_parse_certificate(cert_body, cert_bl) != 0) return -1;
+                if (tls_parse_certificate(cert_body, cert_bl) != 0) { fprintf(stderr, "[tls] cert parse failed\n"); return -1; }
                 got_cert = 1;
             } else if (t == TLS_HS_CERTIFICATE_VERIFY && !got_cv) {
-                if (bl > sizeof(cv_body)) return -1;
+                if (bl > sizeof(cv_body)) { fprintf(stderr, "[tls] CV too big %u\n", bl); return -1; }
                 memcpy(cv_body, body, bl); cv_bl = bl;
-                if (tls_parse_certificate_verify(cv_body, cv_bl) != 0) return -1;
+                if (tls_parse_certificate_verify(cv_body, cv_bl) != 0) { fprintf(stderr, "[tls] CV parse failed\n"); return -1; }
                 got_cv = 1;
             } else if (t == TLS_HS_FINISHED && !got_sfin) {
-                if (bl != 32) return -1;
+                if (bl != 32) { fprintf(stderr, "[tls] Finished bad len %u\n", bl); return -1; }
                 memcpy(fin_body, body, 32); fin_bl = 32;
                 got_sfin = 1;
+            } else {
+                fprintf(stderr, "[tls] unknown/unexpected HS type=%u\n", t);
             }
             p += c;
         }
@@ -312,13 +298,20 @@ int tls_client_run(const char* host, uint16_t port,
     uint8_t c_ap_key[32], c_ap_iv[12], s_ap_key[32], s_ap_iv[12];
     tls_record_key(c_ap, c_ap_key); tls_record_iv(c_ap, c_ap_iv);
     tls_record_key(s_ap, s_ap_key); tls_record_iv(s_ap, s_ap_iv);
-    uint8_t c_fin_key[32]; tls_finished_key(c_ap, c_fin_key);
+    // RFC 8446 s4.4.4: client Finished key derived from handshake traffic secret,
+    // NOT application traffic secret.
+    uint8_t c_fin_key[32]; tls_finished_key(c_hs, c_fin_key);
 
     // Build our Finished
     uint8_t our_fin[32];
     tls_build_finished(c_fin_key, tx_through_sfin, our_fin);
 
     // Send our Finished (encrypted under c_hs keys)
+    // CCS for middlebox compat (same record format: type=20, ver=0x0303, len=1, value=1)
+    {
+        uint8_t ccs[6] = { TLS_CT_CHANGE_CIPHER_SPEC, 0x03, 0x03, 0x00, 0x01, 0x01 };
+        if (io->send(ccs, 6, io->user) != 0) return -1;
+    }
     uint8_t fin_msg[4 + 32];
     fin_msg[0] = TLS_HS_FINISHED;
     fin_msg[1] = 0; fin_msg[2] = 0; fin_msg[3] = 32;
@@ -327,14 +320,16 @@ int tls_client_run(const char* host, uint16_t port,
                   TLS_CT_HANDSHAKE, fin_msg, 36, io) != 0) return -1;
 
     // Send HTTP request (encrypted under c_ap keys)
-    uint64_t app_seq = 0;
-    if (send_aead(c_ap_key, c_ap_iv, &app_seq,
+    // NOTE: client and server application traffic use independent sequence
+    // counters even though they share the same IV base.
+    uint64_t c_ap_seq = 0, s_ap_seq = 0;
+    if (send_aead(c_ap_key, c_ap_iv, &c_ap_seq,
                   TLS_CT_APPDATA, request, request_len, io) != 0) return -1;
 
     // Read until server closes
     uint32_t out_len = 0;
     int r;
-    while ((r = recv_aead(s_ap_key, s_ap_iv, &app_seq,
+    while ((r = recv_aead(s_ap_key, s_ap_iv, &s_ap_seq,
                           pt, sizeof(pt), &ct_type, io)) >= 0) {
         if (ct_type == TLS_CT_APPDATA) {
             if (out_len + r > out_cap) return -1;
