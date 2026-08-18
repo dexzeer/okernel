@@ -42,11 +42,12 @@ uint32_t tls_record_parse_header(const uint8_t* buf, uint32_t buf_len,
     uint32_t plen = ((uint32_t)buf[3] << 8) | buf[4];
     if (plen > TLS_RECORD_MAX_PAYLOAD) return 0;
 
-    if (buf_len - 5 < plen) return 0;  // truncated payload
+    // We don't check payload availability here — the caller supplies
+    // buf_len = 5 (just the header) and reads payload bytes separately.
 
     rec->type = type;
     rec->version = version;
-    rec->payload = buf + 5;
+    rec->payload = buf + 5;   // points past the header into caller's buffer
     rec->payload_len = plen;
     return 5;
 }

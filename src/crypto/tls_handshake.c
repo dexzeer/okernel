@@ -58,36 +58,58 @@ int tls_ext_append_supported_versions(uint8_t* buf, uint32_t cap, uint32_t* pos)
 }
 
 int tls_ext_append_supported_groups(uint8_t* buf, uint32_t cap, uint32_t* pos) {
+    // RFC 8446 §4.2.3: NamedGroupList = { uint16 length; NamedGroup groups[] }
+    static const uint16_t groups[] = {
+        0x001D, // x25519
+    };
+    uint32_t n = sizeof(groups) / sizeof(groups[0]);
     uint32_t start = *pos;
-    if (!buf_has(cap, start, 8)) return -1;
+    uint32_t list_len = 2 * n;            // bytes of group data
+    uint32_t body_len = 2 + list_len;
+    if (!buf_has(cap, start, 4 + body_len)) return -1;
     put_u16(buf + start, TLS_EXT_SUPPORTED_GROUPS);
-    put_u16(buf + start + 2, 4);     // body len
-    put_u16(buf + start + 4, 2);     // list len
-    put_u16(buf + start + 6, TLS_GROUP_X25519);
-    *pos = start + 8;
+    put_u16(buf + start + 2, body_len);
+    put_u16(buf + start + 4, list_len);
+    for (uint32_t i = 0; i < n; i++) {
+        put_u16(buf + start + 6 + 2 * i, groups[i]);
+    }
+    *pos = start + 4 + body_len;
     return 0;
 }
 
 int tls_ext_append_signature_algorithms(uint8_t* buf, uint32_t cap, uint32_t* pos) {
-    // Offer ECDSA_SECP256R1_SHA256, RSA_PSS_RSAE_SHA256, RSA_PKCS1_SHA256,
-    // ED25519 — a reasonable menu that real servers accept. We skip
-    // verification, but the server checks the list matches its key.
+    // Match openssl's exact 13 entries — Python ssl was rejecting our CH
+    // with illegal_parameter when we offered a custom list. The exact
+    // openssl set is safe.
     static const uint16_t algs[] = {
         0x0403, // ECDSA_SECP256R1_SHA256
+        0x0503, // ECDSA_SECP384R1_SHA384
+        0x0603, // ECDSA_SECP521R1_SHA512
+        0x0807, // ED25519
+        0x0808, // ED448
+        0x0809, // RSA_PSS_PSS_SHA256
+        0x080a, // RSA_PSS_PSS_SHA384
+        0x080b, // RSA_PSS_PSS_SHA512
         0x0804, // RSA_PSS_RSAE_SHA256
+        0x0805, // RSA_PSS_RSAE_SHA384
+        0x0806, // RSA_PSS_RSAE_SHA512
         0x0401, // RSA_PKCS1_SHA256
-        0x0803, // ED25519 (draft-ietf-tls-ed25519)
-        0x0503, // ECDSA_SECP384R1_SHA384 (extra)
-        0x0203, // ECDSA_SECP256R1_SHA256 legacy (extra)
+        0x0501, // RSA_PKCS1_SHA384
+        0x0601, // RSA_PKCS1_SHA512
     };
+    uint32_t n = sizeof(algs) / sizeof(algs[0]);
     uint32_t start = *pos;
-    uint32_t list_len = sizeof(algs);
+    uint32_t list_len = 2 * n;            // bytes of algorithm codes
     uint32_t body_len = 2 + list_len;
     if (!buf_has(cap, start, 4 + body_len)) return -1;
     put_u16(buf + start, TLS_EXT_SIGNATURE_ALGORITHMS);
     put_u16(buf + start + 2, body_len);
     put_u16(buf + start + 4, list_len);
-    memcpy(buf + start + 6, algs, list_len);
+    // Write algorithms in big-endian wire order. The `algs` array is in
+    // host byte order (little-endian on x86); we MUST byte-swap each entry.
+    for (uint32_t i = 0; i < n; i++) {
+        put_u16(buf + start + 6 + 2 * i, algs[i]);
+    }
     *pos = start + 4 + body_len;
     return 0;
 }
@@ -152,6 +174,19 @@ int tls_ext_append_alpn_http11(uint8_t* buf, uint32_t cap, uint32_t* pos) {
     return 0;
 }
 
+int tls_ext_append_psk_key_exchange_modes(uint8_t* buf, uint32_t cap, uint32_t* pos) {
+    // PSK key exchange modes (RFC 8446 §4.2.9): only_psk_ke (1) and
+    // psk_dhe_ke (2). We use psk_dhe_ke to support both modes.
+    uint32_t start = *pos;
+    if (!buf_has(cap, start, 6)) return -1;
+    put_u16(buf + start, TLS_EXT_PSK_KEY_EXCHANGE_MODES);
+    put_u16(buf + start + 2, 2);    // body length
+    buf[start + 4] = 1;             // list length
+    buf[start + 5] = 2;             // psk_dhe_ke
+    *pos = start + 6;
+    return 0;
+}
+
 // ---- ClientHello builder ----
 
 uint32_t tls_build_client_hello(uint8_t* out, uint32_t cap,
@@ -169,13 +204,24 @@ uint32_t tls_build_client_hello(uint8_t* out, uint32_t cap,
     // random (32)
     if (!buf_has(sizeof(body), pos, 32)) return 0;
     memcpy(body + pos, random32, 32); pos += 32;
-    // legacy_session_id (1B len + 0B data — empty)
-    if (!buf_has(sizeof(body), pos, 1)) return 0;
-    body[pos++] = 0;
-    // cipher_suites (2B len + 2B entry)
-    if (!buf_has(sizeof(body), pos, 4)) return 0;
-    put_u16(body + pos, 2); pos += 2;
-    put_u16(body + pos, TLS_CIPHER_CHACHA20_POLY1305_SHA256); pos += 2;
+    // legacy_session_id (1B len + 32B data — used by TLS 1.3 for compat
+    // with middleboxes that expect it. Empty is also OK but some servers
+    // prefer non-empty.
+    if (!buf_has(sizeof(body), pos, 1 + 32)) return 0;
+    body[pos++] = 32;
+    for (int i = 0; i < 32; i++) body[pos++] = 0;
+    // cipher_suites (2B len + entries). Offer ONLY ChaCha20-Poly1305-SHA256
+    // because we only implement SHA-256 + 32-byte key derivation. Servers
+    // that pick AES-GCM would require SHA-384 keys we don't compute.
+    static const uint16_t ciphers[] = {
+        0x1303, // TLS_CHACHA20_POLY1305_SHA256
+        0x00ff, // TLS_EMPTY_RENEGOTIATION_INFO_SCSV
+    };
+    uint32_t cs_n = sizeof(ciphers) / sizeof(ciphers[0]);
+    if (!buf_has(sizeof(body), pos, 2 + 2 * cs_n)) return 0;
+    put_u16(body + pos, 2 * cs_n); pos += 2;
+    for (uint32_t i = 0; i < cs_n; i++) put_u16(body + pos + 2 * i, ciphers[i]);
+    pos += 2 * cs_n;
     // legacy_compression_methods (1B len + 0x00)
     if (!buf_has(sizeof(body), pos, 2)) return 0;
     body[pos++] = 1;
@@ -184,12 +230,15 @@ uint32_t tls_build_client_hello(uint8_t* out, uint32_t cap,
     uint32_t ext_start = pos;
     if (!buf_has(sizeof(body), pos, 2)) return 0;
     pos += 2;
+    // Extensions: match openssl's order for max server compat. Some servers
+    // only accept this specific subset; ordering matters for a few.
     if (tls_ext_append_supported_versions(body, sizeof(body), &pos) < 0) return 0;
     if (tls_ext_append_supported_groups(body, sizeof(body), &pos) < 0) return 0;
     if (tls_ext_append_signature_algorithms(body, sizeof(body), &pos) < 0) return 0;
     if (tls_ext_append_key_share_x25519(body, sizeof(body), &pos, x25519_pub) < 0) return 0;
     if (tls_ext_append_sni(body, sizeof(body), &pos, hostname) < 0) return 0;
     if (tls_ext_append_alpn_http11(body, sizeof(body), &pos) < 0) return 0;
+    if (tls_ext_append_psk_key_exchange_modes(body, sizeof(body), &pos) < 0) return 0;
     // Patch extensions length
     put_u16(body + ext_start, pos - ext_start - 2);
 

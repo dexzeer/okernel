@@ -20,6 +20,7 @@
 #define TLS_EXT_APPLICATION_LAYER_PROTOCOL 16
 #define TLS_EXT_SUPPORTED_VERSIONS         43
 #define TLS_EXT_KEY_SHARE                  51
+#define TLS_EXT_PSK_KEY_EXCHANGE_MODES     45
 
 // Named groups.
 #define TLS_GROUP_X25519 0x001D
@@ -58,6 +59,7 @@ int tls_ext_append_key_share_x25519(uint8_t* buf, uint32_t cap, uint32_t* pos,
 int tls_ext_append_sni(uint8_t* buf, uint32_t cap, uint32_t* pos,
                       const char* hostname);
 int tls_ext_append_alpn_http11(uint8_t* buf, uint32_t cap, uint32_t* pos);
+int tls_ext_append_psk_key_exchange_modes(uint8_t* buf, uint32_t cap, uint32_t* pos);
 
 // ---- ClientHello builder ----
 // Fills `out` with a complete handshake message: type(1) || len(3) || body.

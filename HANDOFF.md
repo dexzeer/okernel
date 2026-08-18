@@ -44,15 +44,24 @@ okernel/
 │   ├── terminal.c/.h      # Terminal multiplexer (text mode build only)
 │   └── shell.c/.h         # Shell commands (text mode build only)
 │   │
-│   └── net/
-│       ├── pci.c/.h       # PCI bus enumeration
-│       ├── e1000.c/.h     # e1000 NIC driver (TX + RX working)
-│       ├── rtl8139.c/.h   # RTL8139 NIC driver (TX working, RX broken)
-│       └── network.c/.h   # ARP, IP, ICMP, UDP, TCP, DNS, HTTP
-│
-├── linker.ld              # Linker script (kernel at 1MB, symbols for memory bounds)
-├── Makefile               # Build system (text, desktop, clean, run targets)
-└── okernel.txt            # ASCII art logo (user-created)
+│   ├── net/
+│   │   ├── pci.c/.h       # PCI bus enumeration
+│   │   ├── e1000.c/.h     # e1000 NIC driver (TX + RX working)
+│   │   ├── rtl8139.c/.h   # RTL8139 NIC driver (TX working, RX broken)
+│   │   └── network.c/.h   # ARP, IP, ICMP, UDP, TCP, DNS, HTTP
+│   │
+│   └── crypto/            # TLS 1.3 client (host-tested, NOT yet in kernel build)
+│       ├── sha256.c/.h       # FIPS 180-4, streaming + one-shot
+│       ├── chacha20.c/.h     # RFC 8439 stream cipher
+│       ├── poly1305.c/.h     # RFC 8439 MAC (5×26-bit limbs)
+│       ├── hmac.c/.h         # HMAC-SHA256 (RFC 2104/4231)
+│       ├── hkdf.c/.h         # HKDF-SHA256 (RFC 5869)
+│       ├── aead.c/.h         # ChaCha20-Poly1305 AEAD (RFC 8439 §2.8)
+│       ├── x25519.c/.h       # RFC 7748 key exchange
+│       ├── tls_record.c/.h   # Phase 1: TLS record layer
+│       ├── tls_handshake.c/.h# Phase 2: handshake codec + transcript hash
+│       ├── tls_keysched.c/.h # Phase 3: key schedule (RFC 8446 §7.1)
+│       └── tls_client.c/.h   # Phase 4: full handshake driver (WIP — see below)
 ```
 
 ---
@@ -114,6 +123,81 @@ The cursor is a **stateless sprite** — there is NO saved background patch and 
 - **Navigation**: Enter to go, back button with 4-page history
 - **Rendering**: Text content with headings, paragraphs, links (cyan), lists, preformatted blocks
 - **HTTP integration**: Parses response after connection closes (`http_done` flag), accumulates TCP segments correctly
+
+---
+
+## TLS 1.3 client (in-progress)
+
+Phases 1–3 are complete and host-tested. Phase 4 is in-progress with a known issue.
+**Nothing in `src/crypto/` is yet wired into the kernel build** (Phase 5 work).
+
+### Phase status
+| Phase | Files | Status |
+|-------|-------|--------|
+| 1 record layer | `tls_record.c/.h` | **PASS** (21/21 host tests) |
+| 2 handshake codec + transcript | `tls_handshake.c/.h` | **PASS** (31/31 host tests) |
+| 3 key schedule (RFC 8446 §7.1) | `tls_keysched.c/.h` | **PASS** (13/13 host tests, RFC 8448 vector-validated) |
+| 4 full handshake driver | `tls_client.c/.h` | **WIP** — SH parses, keys derive, but AEAD decrypt of EE/Cert/CV fails |
+| 5 kernel integration | (not started) | Pending Phase 4 |
+| 6 QEMU verification | (not started) | Pending Phase 5 |
+
+### Phase 4 next steps (the unfinished work)
+1. **Debug remaining AEAD decrypt mismatch.** The handshake completes the SH step:
+   ```
+   [tls] got SH, cipher=0x1303 group=0x001d
+   [tls] handshake keys derived
+   ```
+   Then the server sends CCS + a 23-byte APPDATA record (7B ciphertext + 16B tag).
+   `aead_chacha20_poly1305_decrypt()` rejects this — Python's `cryptography`
+   lib rejects it too with the same `s_hs_key`/`s_hs_iv` we derived. So the key
+   derivation itself is wrong, not the AEAD layer.
+   - Verify `tls_traffic_secret(master, "c hs traffic", transcript_after_sh)`
+     against RFC 8448 example 1 (intermediate vectors all match — see Phase 3 test).
+   - The issue is most likely in how `transcript_after_sh` is reconstructed in
+     `tls_client.c` (around line ~210). The `snap` transcript hashes `ch`
+     with full handshake header (4 bytes) + body. But `ch_len` is the body
+     alone (length-prefixed) — and `tls_build_client_hello` returns total
+     bytes (header + body). Need to pass body_len only.
+   - Exact bug location: `tls_client.c:212` — `tls_transcript_update_msg(
+     &snap, TLS_HS_CLIENT_HELLO, ch, ch_len)` should use `body_len = ch_len - 4`.
+   - Same applies to SH body length. Apply the same fix there.
+2. Once AEAD works: write `Finished` (HMAC over transcript hash) and send it
+   under the handshake keys. Then send the HTTP request under app keys and
+   decrypt the response.
+
+### Phase 5 (kernel integration) — for the next agent
+1. **Entropy** — implement `rand.c/.h` using a ChaCha20 CPRNG seeded from RDTSC,
+   mixed with IRQ jitter and the e1000 MAC. Stir on every timer tick; never
+   output before 32 mixed samples.
+2. **AAD bytes for AEAD encrypt** — currently the kernel build path may emit
+   `aad[5]` with version `0x03 0x03` but the inner plaintext order must be
+   `real_content || content_type_byte || zeros_padded`. Verify
+   `send_aead_record` writes these in order.
+3. **Makefile** — append to `DESKTOP_OBJ`:
+   ```
+   src/crypto/sha256.o src/crypto/hmac.o src/crypto/hkdf.o \
+   src/crypto/aead.o src/crypto/chacha20.o src/crypto/poly1305.o \
+   src/crypto/x25519.o src/crypto/tls_record.o src/crypto/tls_handshake.o \
+   src/crypto/tls_keysched.o src/crypto/tls_client.o src/crypto/rand.o
+   ```
+4. **`https_get(host, path)` in `src/net/tls_net.c`** — port 443, wraps the
+   Phase 4 driver. Add a `tls_session_active` flag so `tcp_handle_packet`
+   appends into a 16KB `tls_rx_buf` instead of `http_response` when TLS is on.
+   Respond buffer for HTTPS grows to 16KB (BSS fine — heap also fine).
+5. **Browser** — `browser https://host/path` → after close,
+   `tls_decrypt_all()` fills `http_response`, then existing dechunk+parse
+   runs unchanged.
+
+### Phase 6 (QEMU verification)
+Boot with serial:
+```bash
+qemu-system-i386 -cdrom okernel-desktop.iso -boot d -vga std \
+  -device e1000,netdev=net0 -netdev user,id=net0 \
+  -display none -serial file:/tmp/ok/serial.log
+```
+Run `https example.com` from the serial monitor (see NEXT_AGENT_PROMPT for
+the recipe). Serial log must show: DNS → TCP → ClientHello → ServerHello →
+handshake done → app data → close.
 
 ---
 
@@ -181,6 +265,7 @@ Same as above plus: `list`, `switch N`
 - **No real mouse scroll** — PS/2 3-byte mode only (scroll via keyboard)
 - **Minimal TCP** — no retransmission, no windowing, no congestion control
 - **HTTP limited** — single GET request, no HTTPS yet (chunked transfer IS decoded via `http_dechunk`)
+- **TLS 1.3 limited to ChaCha20-Poly1305** — SHA-256 only; no AES-GCM, no SHA-384. Pending Phase 4 completion.
 - **TCP minimal** — single connection, no windowing/congestion control, no out-of-order buffering (gaps re-ACKed until the server fills them). Retransmission IS implemented (timer + backoff + give-up). This is the foundation for the planned TLS 1.3 client.
 
 ---
@@ -216,7 +301,103 @@ All primitives for the planned TLS 1.3 client. **Every module is host-tested aga
 - `aead.c` — ChaCha20-Poly1305 AEAD (RFC 8439 §2.8); MAC scratch cap 20KB (TLS records fit)
 - `x25519.c` — RFC 7748 key exchange, 16x16-bit limbs, Montgomery ladder; fe_invert = binary square-and-multiply (p-2 exponent, NOT an addition chain — the hand-copied chain computed z^(2^253+3))
 
-Crypto debugging lessons (bit us during bring-up): limb packing must never route >64 bits through a uint64_t; reduction folds need their ×5/×38 factors on BOTH low and high parts with the cascade; `|` vs `+` breaks when limbs carry slack; wrap tests must check the top BIT, not the carry out; count array initializers (a 31-byte exponent array silently zero-padded its top byte).
+Crypto debugging lessons (bit us during bring-up): limb packing must never route >64 bits through a uint64_t; reduction folds need their ×5/×38 factors on BOTH low and high parts of every folded digit, cascades included; `|` vs `+` breaks when limbs carry slack; wrap tests must check the top BIT, not the carry out (p-1 + 19 = exactly 2^255 → bit set, carry zero); count array initializers (a 31-byte exponent array silently zero-padded its top byte).
+
+---
+
+## TLS traps (next agent: read these!)
+
+**Crypto / TLS math (all of these happened in this repo)**
+- Limb packing: never route >64 bits through a uint64_t. Shifts ≥64 are UB.
+- Limb reduction folds: the ×5/×38 factor applies to BOTH low and high parts of
+  every folded digit; cascades included.
+- `|` vs `+`: OR silently drops carries when limbs carry slack — always carry
+  first, then pack additively.
+- Wraparound test for 2^255: check the TOP BIT, not carry-out
+  (p-1 + 19 = exactly 2^255 → bit set, carry zero).
+- Array initializers: a 31-byte literal in a 32-byte array silently zero-pads.
+  Count them or use designated initializers `[0]=.., [1...30]=..`.
+- HKDF-Expand-Label prefixes labels with `"tls13 "` — forgetting it produces
+  plausible-looking but wrong keys (no error anywhere).
+- AEAD nonce = static_iv XOR sequence counter (do not append, do not hash).
+  The64-bit counter is BIG-ENDIAN, left-padded to 12 bytes (high byte lands at
+  nonce[4], NOT nonce[11]).
+- TLS record plaintext ends with real content-type byte then zero padding. When
+  scanning back for the type, skip zeros only.
+- HKDF-Expand-Label info format is `out_len(2) || label_len(1) || "tls13 " +
+  label || context_len(1) || context` — the 1-byte length on the label is the
+  `<7..255>` opaque<…> vector encoding.
+- Transcript hash is over handshake message header + body: `type(1) || len(3)
+  || body`. NOT over the record layer's framing.
+
+**TLS record layer (Phase 1)**
+- The header parser should only check 5 bytes of header. The caller reads
+  payload separately. An earlier `buf_len - 5 < plen` check turned out to be
+  wrong — it's valid for `buf_len == 5` (header-only) with big `plen`.
+- `tls_record_parse_header` rejects unknown type bytes and unsupported versions
+  but accepts 0x0303 (TLS 1.2 legacy_version) and 0x0304 (TLS 1.3).
+
+**Handshake framing (Phase 2)**
+- `list_length` fields in extension bodies are NOT a redundant outer1-byte
+  prefix — most extensions use a2-byte length prefix describing the bytes
+  inside (inclusive of the list itself, NOT inclusive of the length bytes).
+  Don't double-count.
+- `uint16_t algs[] = { 0x0403, ... }; memcpy(buf, algs, n)` produces
+  LITTLE-ENDIAN bytes (since x86). TLS writes every uint16 as
+  BIG-ENDIAN on the wire. **Always use `put_u16()` to write integer
+  fields, never `memcpy()` a host-byte-order array.**
+- Session ID: TLS 1.3 REQUIRES empty session_id in CH for full TLS 1.3
+  compliance, but sending 32 zero bytes works too (some servers prefer it).
+
+**Python ssl compat (Phase 4)**
+- Python ssl's `UNEXPECTED_MESSAGE` alert = wrong message ORDER. TLS 1.3 strict
+  mode rejects ChangeCipherSpec BETWEEN ClientHello and ServerHello — put it
+  AFTER the CH record, not before.
+- Python ssl's `NO_SHARED_SIGNATURE_ALGORITHM` = our `signature_algorithms`
+  doesn't intersect. Match openssl's exact 13 codes (ECDSA_SECP256R1_SHA256
+  through RSA_PKCS1_SHA512).
+- Python ssl keeps CH `0x000d` sig algs in the order they appear; offer
+  enough algs to cover EC + RSA_PKCS1 + RSA_PSS (some lib combos reject
+  PSS-only).
+- Some Python ssl builds complain "bad key share" with secp256r1 included
+  alongside x25519 — start out offering ONLY x25519 to keep it consistent.
+- Python ssl's TLS 1.3 ENFORCES `legacy_compression_methods` to be exactly
+  `{ 0x00 }`. Any other value triggers illegal_parameter.
+- Supported_group structure: do NOT use the `<2..2^16-1>` outer length prefix
+  of an early draft; the final RFC body is `{ uint16 length; NamedGroup[] }`.
+
+**Tls1.3 transcript hash on the wire (Phase 4 bug — see "Phase 4 next steps")**
+- `tls_build_client_hello` returns TOTAL bytes (4-byte handshake header + body).
+- `tls_transcript_update_msg(t, type, body, body_len)` expects `body_len` to be
+  the body bytes ONLY, NOT including the handshake header. The handshake header
+  is added internally.
+- If the driver passes the full ch_len (header + body) into transcript_update_msg,
+  the transcript hash is computed over the right total bytes but the sequence of
+  bytes hashed is `type || (bodylen+4) || <body-with-extra-bytes>`, which makes
+  the digest mismatch on the server side. **Always pass body-only length.**
+
+**Kernel** (these are old but still relevant from prior agents)
+- Heap is a bump allocator, 16MB. Nothing frees. Big static arrays go in
+  BSS; check `_kernel_end` stays sane.
+- e1000 RX release: `RDT = last processed index` — never index+1 (RDT==RDH =
+  "ring full" = every packet dropped), never write RDH.
+- `tcp_handle_packet` runs in IRQ context. It must not call anything that
+  the main loop calls concurrently on the same buffer. Pattern used today:
+  IRQ appends to a buffer; main loop only reads after the connection closes.
+- `http_get` resets `http_done`/`http_response_len` at entry — a stale
+  done-flag racing the parse block caused blank pages for hours.
+- Makefile `%.o` depends on headers — never remove (stale objects with mixed
+  metrics once garbled the whole screen).
+- `section .note.GNU-stack` must be LAST in .asm files.
+- Mouse is 3-byte PS/2 only. Scripted QEMU drags undershoot ~18px due to the
+  4-sample smoothing — converge iteratively (screendump → locate → correct).
+
+**Process**
+- Serial log (`-serial file:`) is ground truth for network bugs. Grep it
+  before theorizing. `[sh] exec:` / `[br] parse:` instrumentation lines
+  already exist — extend that style.
+- Screenshot verification: crop + 3x zoom before asking a vision model;
+  count specific pixel colors.
 
 ---
 
@@ -237,6 +418,11 @@ Crypto debugging lessons (bit us during bring-up): limb packing must never route
 | `src/html.c` | HTML parser — strips HTTP headers, tokenizes tags |
 | `src/net/e1000.c` | e1000 NIC driver — TX + RX |
 | `src/net/network.c` | Full network stack — ARP, IP, ICMP, UDP, TCP, DNS, HTTP |
+| `src/crypto/tls_client.c` | TLS 1.3 handshake driver (Phase 4 — needs AEAD decrypt fix) |
+| `src/crypto/tls_keysched.c` | RFC 8446 §7.1 — known-good, vector-validated |
+| `src/crypto/tls_handshake.c` | ClientHello builder + parsers |
+| `src/crypto/tls_record.c` | TLS record layer build/parse |
+| `src/crypto/aead.c` | ChaCha20-Poly1305 AEAD (Phase 1–3 verified, decrypt path validated in test_tls_crypto) |
 | `linker.ld` | Memory layout — kernel load address, symbols |
 | `Makefile` | Build system — text vs desktop targets |
 
@@ -253,3 +439,21 @@ Crypto debugging lessons (bit us during bring-up): limb packing must never route
 7. **16-bit MMIO registers**: Use 16-bit writes for RDH/RDT/TDH/TDT to avoid corrupting adjacent registers
 8. **Cursor save/restore causes artifacts**: saved background patches go stale when the scene changes under them and tear when IRQ12 lands mid-save. Fixed by stateless sprite + scene repair (`desktop_paint_rect`) — see Cursor Compositor above. Do not reintroduce `cursor_bg`.
 9. **Unclipped repair painting kills FPS**: repainting a window's whole frame for a 12x16 cursor repair dirties every row the window spans (~75% of screen per frame, FPS 1030→311). Fixed with the graphics clip rectangle — any new repair path must set/reset it around its drawing.
+10. **uint16 array memcpy = little-endian on the wire**: TLS writes uint16
+    fields BIG-ENDIAN. Always use `put_u16()`. (Phase 4 bug — caught early
+    via Python ssl decoding CH with illegal_parameter.)
+11. **TLS extension list_length ≠ redundant outer 1-byte prefix**: Most
+    extensions use a single 2-byte length prefix; do not double-count.
+    (Phase 4 bug — supported_groups was using an obsolete draft format.)
+12. **HKDF-Expand-Label needs `"tls13 "` prefix AND a 1-byte label length**:
+    The `<7..255>` opaque<…> vector encoding puts `label_len` before the label
+    bytes. Without this, every secret deriver computes plausible-looking but
+    wrong bytes. (Phase 3 bug.)
+13. **TLS record parse_header trunc-check was wrong**: when caller passes
+    `buf_len == 5` (header-only), the check `buf_len - 5 < plen` reads
+    `0 < plen`, rejecting every valid header. Caller reads payload
+    separately. (Phase 1 bug.)
+14. **TLS 1.3 transcript hash body-length mismatch** (Phase 4 bug, in-progress):
+    `tls_build_client_hello` returns TOTAL bytes (header + body). Pass body
+    length minus 4 into `tls_transcript_update_msg` — the function adds the
+    4-byte handshake header itself.
