@@ -12,7 +12,7 @@ LD = ld
 CFLAGS = -m32 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
          -nostartfiles -nodefaultlibs -fno-pic -fno-pie -mno-red-zone \
          -O2 -fno-strict-aliasing \
-         -Wall -Wextra -Isrc
+         -Wall -Wextra -DKERNEL -Isrc
 
 # Assembler flags
 ASFLAGS = -f elf32
@@ -22,13 +22,20 @@ LDFLAGS = -m elf_i386 -T linker.ld
 
 # Common objects (no kernel.c, no desktop.c)
 ASM_OBJ = boot/isr.o boot/start.o
-COMMON_OBJ = src/gdt.o src/idt.o src/memory.o src/serial.o src/keyboard.o src/mouse.o
+COMMON_OBJ = src/gdt.o src/idt.o src/memory.o src/serial.o src/keyboard.o src/mouse.o src/string.o
 
 # Text mode objects
 TEXT_OBJ = src/vga.o src/shell.o src/terminal.o
 
 # Desktop mode objects
-DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/browser.o src/html.o
+# NOTE: -DKERNEL is set in CFLAGS below so the shared crypto/TLS source can
+# switch its stdio logging to serial_printf and its RNG to the kernel CPRNG.
+DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/browser.o src/html.o \
+             src/crypto/sha256.o src/crypto/hmac.o src/crypto/hkdf.o \
+             src/crypto/aead.o src/crypto/chacha20.o src/crypto/poly1305.o \
+             src/crypto/x25519.o src/crypto/tls_record.o src/crypto/tls_handshake.o \
+             src/crypto/tls_keysched.o src/crypto/tls_client.o src/crypto/rand.o \
+             src/net/tls_net.o
 
 .PHONY: all text desktop clean run debug
 

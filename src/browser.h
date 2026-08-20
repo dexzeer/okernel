@@ -18,6 +18,7 @@ struct browser {
     int token_count;
     int last_resp_len;    // track HTTP response changes
     int addr_bar_focused; // 1 = typing in address bar, 0 = scrolling
+    int is_https;        // 1 if URL used the https:// scheme
     char addr_input[BROWSER_URL_LEN];
     int addr_input_len;
     // History

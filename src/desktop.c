@@ -1,6 +1,7 @@
 #include "net/pci.h"
 #include "net/e1000.h"
 #include "net/network.h"
+#include "net/tls_net.h"
 #include "graphics.h"
 #include "wallpaper.h"
 #include "window.h"
@@ -14,6 +15,7 @@
 #include "filesystem.h"
 #include "editor.h"
 #include "browser.h"
+#include "crypto/rand.h"
 
 struct mboot_info {
     uint32_t flags;
@@ -650,8 +652,22 @@ static void on_keypress(char c) {
     }
 }
 
+static int rand_stir_ticks = 0;
 static void on_timer(void) {
     tick_count++;
+    // Keep mixing entropy into the CPRNG (forward secrecy) for the first ~32
+    // ticks. rand_seed() at boot already primed it to "ready"; this just
+    // continues folding fresh RDTSC + MAC jitter into the keystream.
+    if (rand_stir_ticks < 32) {
+        uint8_t sample[32];
+        uint64_t t = 0;
+        __asm__ volatile("rdtsc" : "=A"(t));
+        uint8_t* mac = e1000_get_mac();
+        for (int i = 0; i < 32; i++)
+            sample[i] = (uint8_t)((t >> ((i & 7) * 8)) ^ ((mac[i % 6] << 1) & 0xFF) ^ (rand_stir_ticks * 37 + i));
+        rand_stir(sample);
+        rand_stir_ticks++;
+    }
 }
 
 // Network event callback — prints to first terminal window
@@ -768,6 +784,28 @@ void kernel_main(uint32_t mboot_addr) {
     // Init networking (full stack: PCI + RTL8139 + ARP + IP + ICMP)
     net_init();
     net_set_event_callback(on_net_event);
+
+    // Seed the ChaCha20 CPRNG used by the TLS client for key material.
+    // Mix RDTSC + the e1000 MAC, stir 32x so the CPRNG reaches "ready"
+    // immediately (rand_ready() requires 1024 bytes of mixed entropy).
+    {
+        uint8_t* mac = e1000_get_mac();
+        uint8_t seed[32];
+        uint64_t tsc = 0;
+        __asm__ volatile("rdtsc" : "=A"(tsc));
+        for (int i = 0; i < 32; i++)
+            seed[i] = (uint8_t)(mac[i % 6] ^ ((tsc >> ((i & 7) * 8)) & 0xFF) ^ (i * 0x9E));
+        rand_seed(seed);
+        for (int s = 0; s < 32; s++) {
+            uint64_t t2 = 0;
+            __asm__ volatile("rdtsc" : "=A"(t2));
+            uint8_t sample[32];
+            for (int i = 0; i < 32; i++)
+                sample[i] = (uint8_t)((t2 >> ((i & 7) * 8)) ^ ((mac[i % 6] << 1) & 0xFF) ^ (s * 37 + i));
+            rand_stir(sample);
+        }
+        serial_printf("[rand] CPRNG seeded, ready=%d\n", rand_ready());
+    }
 
     // Init input
     mouse_init_fb();
@@ -916,10 +954,40 @@ void kernel_main(uint32_t mboot_addr) {
         // Check for pending HTTP responses to save
         check_save_http_response();
 
-        // Check if any browser needs HTTP data processed
+        // Check if any browser needs response data processed (HTTP or HTTPS)
         for (int bi = 0; bi < MAX_BROWSERS; bi++) {
             struct browser* br = browser_get(bi);
             if (!br) continue;
+
+            // HTTPS: response was buffered synchronously by https_get() into
+            // the TLS response buffer; parse it once when it's ready.
+            if (br->is_https) {
+                if (tls_is_done() && br->token_count == 0) {
+                    int resp_len = tls_get_response_len();
+                    char* resp = tls_get_response();
+                    if (resp && resp_len > 0) {
+                        resp_len = http_dechunk(resp, resp_len);
+                        int count = html_parse(resp, resp_len,
+                                               br->tokens, HTML_MAX_TOKENS);
+                        serial_puts("[br] https parse: count=");
+                        serial_putchar('0' + (count / 10) % 10);
+                        serial_putchar('0' + count % 10);
+                        serial_puts(" len=");
+                        serial_putchar('0' + (resp_len / 100) % 10);
+                        serial_putchar('0' + (resp_len / 10) % 10);
+                        serial_putchar('0' + resp_len % 10);
+                        serial_putchar('\n');
+                        br->token_count = count > 0 ? count : -1;
+                        html_get_title(resp, resp_len, br->title, 64);
+                        br->last_resp_len = resp_len;
+                        render_content(bi);
+                        window_set_title(br->win_id,
+                                         br->title[0] ? br->title : "okai");
+                    }
+                }
+                continue;
+            }
+
             int resp_len = http_get_response_len();
             int done = http_is_done();
             int need_parse = (br->token_count == 0 && done);

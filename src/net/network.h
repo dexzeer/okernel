@@ -92,6 +92,17 @@ void tcp_connect(uint32_t dst_ip, uint16_t dst_port);
 void tcp_send_data(uint8_t* data, uint16_t len);
 void tcp_close(void);
 
+// TCP connection states (shared with the TLS integration in tls_net.c)
+#define TCP_STATE_CLOSED      0
+#define TCP_STATE_SYN_SENT   1
+#define TCP_STATE_ESTABLISHED 2
+#define TCP_STATE_FIN_WAIT   3
+
+// TCP state probes for the TLS integration
+int tcp_is_established(void);
+int tcp_is_closed(void);
+int tcp_conn_state(void);
+
 // Poll for pending operations (call from main loop)
 void net_poll(void);
 

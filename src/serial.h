@@ -12,4 +12,7 @@ void serial_putchar(char c);
 // Write a string to serial port
 void serial_puts(const char* str);
 
+// Minimal printf over the serial port. Supports %s %c %d %i %u %x %X %%.
+void serial_printf(const char* fmt, ...);
+
 #endif
