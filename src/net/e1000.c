@@ -98,6 +98,8 @@ static uint8_t tx_cur = 0;
 static e1000_rx_callback_t rx_callback = 0;
 
 static const char hex[] = "0123456789abcdef";
+static int rx_dumped = 0; // one-shot raw RX dump
+static int rx_dump_count = 0;
 
 static void print_hex32(uint32_t val) {
     serial_putchar(hex[(val >> 28) & 0xF]);
@@ -414,6 +416,33 @@ void e1000_poll(void) {
         } else if (len > 4 && len < RX_BUFFER_SIZE && rx_callback) {
             // Point to the buffer in low memory
             uint8_t* pkt = (uint8_t*)(E1000_RX_BUFS_ADDR + (rx_cur * RX_BUFFER_SIZE));
+            if (rx_dump_count < 9 && pkt[12] == 0x08 && pkt[13] == 0x00) {
+                rx_dump_count++;
+                uint8_t* dsc = (uint8_t*)&rx_descs[rx_cur];
+                serial_puts("[e1000] DESC bytes: ");
+                for (int d = 0; d < 16; d++) {
+                    serial_putchar(hex[(dsc[d] >> 4) & 0xF]);
+                    serial_putchar(hex[dsc[d] & 0xF]);
+                }
+                serial_putchar('\n');
+                serial_puts("[e1000] DESC len=");
+                serial_putchar(hex[(rx_descs[rx_cur].length >> 12) & 0xF]);
+                serial_putchar(hex[(rx_descs[rx_cur].length >> 8) & 0xF]);
+                serial_putchar(hex[(rx_descs[rx_cur].length >> 4) & 0xF]);
+                serial_putchar(hex[rx_descs[rx_cur].length & 0xF]);
+                serial_puts(" status=");
+                serial_putchar(hex[rx_descs[rx_cur].status]);
+                serial_puts(" rx_cur=");
+                serial_putchar(hex[rx_cur]);
+                serial_putchar('\n');
+                serial_puts("[e1000] FRAME: ");
+                for (int d = 0; d < 70; d++) {
+                    serial_putchar(hex[(pkt[d] >> 4) & 0xF]);
+                    serial_putchar(hex[pkt[d] & 0xF]);
+                    if (d % 32 == 31) serial_putchar(' ');
+                }
+                serial_putchar('\n');
+            }
             rx_callback(pkt, len - 4);
         }
 

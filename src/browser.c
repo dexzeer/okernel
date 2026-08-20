@@ -3,6 +3,7 @@
 #include "graphics.h"
 #include "memory.h"
 #include "net/network.h"
+#include "net/tls_net.h"
 #include "filesystem.h"
 #include "serial.h"
 #include <stdint.h>
@@ -26,10 +27,13 @@ static void parse_url(const char* url, char* host, char* path) {
     host[0] = 0;
     path[0] = 0;
     int i = 0;
-    // Skip http://
+    // Skip http:// (7) or https:// (8)
     if (url[0] == 'h' && url[1] == 't' && url[2] == 't' && url[3] == 'p' &&
         url[4] == ':' && url[5] == '/' && url[6] == '/') {
         i = 7;
+    } else if (url[0] == 'h' && url[1] == 't' && url[2] == 't' && url[3] == 'p' &&
+               url[4] == 's' && url[5] == ':' && url[6] == '/' && url[7] == '/') {
+        i = 8;
     }
     // Extract host
     int hi = 0;
@@ -245,6 +249,7 @@ int browser_open(const char* url) {
     b->addr_input[0] = 0;
     b->title[0] = 0;
     b->last_resp_len = 0;
+    b->is_https = 0;
     b->history_count = 0;
     b->history_pos = 0;
 
@@ -273,8 +278,13 @@ int browser_open(const char* url) {
     char host[128], path[128];
     parse_url(url, host, path);
 
-    // Start HTTP request
-    http_get(host, path);
+    // Detect scheme: https:// uses TLS, otherwise plain HTTP
+    b->is_https = (url[0] == 'h' && url[1] == 't' && url[2] == 't' &&
+                   url[3] == 'p' && url[4] == 's' && url[5] == ':');
+
+    // Start request
+    if (b->is_https) https_get(host, path);
+    else http_get(host, path);
 
     // Render initial state
     render_content(id);
@@ -320,7 +330,10 @@ void browser_navigate(int id, const char* url) {
 
     char host[128], path[128];
     parse_url(url, host, path);
-    http_get(host, path);
+    b->is_https = (url[0] == 'h' && url[1] == 't' && url[2] == 't' &&
+                   url[3] == 'p' && url[4] == 's' && url[5] == ':');
+    if (b->is_https) https_get(host, path);
+    else http_get(host, path);
 
     render_content(id);
 }
@@ -398,7 +411,11 @@ void browser_handle_key(int id, char c) {
                 b->title[0] = 0;
                 char host[128], path[128];
                 parse_url(b->url, host, path);
-                http_get(host, path);
+                b->is_https = (b->url[0] == 'h' && b->url[1] == 't' &&
+                               b->url[2] == 't' && b->url[3] == 'p' &&
+                               b->url[4] == 's' && b->url[5] == ':');
+                if (b->is_https) https_get(host, path);
+                else http_get(host, path);
                 render_content(id);
             }
         }

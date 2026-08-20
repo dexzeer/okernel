@@ -2,11 +2,19 @@
 #include "e1000.h"
 #include "../io.h"
 #include "../serial.h"
+#include "tls_net.h"
 
 static uint8_t our_ip[4] = {10, 0, 2, 15};    // QEMU user-mode default
 static uint8_t gateway_ip[4] = {10, 0, 2, 2};  // QEMU user-mode gateway
 static uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static const char hex[] = "0123456789abcdef";
+
+static void print_hex32(uint32_t val) {
+    for (int s = 28; s >= 0; s -= 4)
+        serial_putchar(hex[(val >> s) & 0xF]);
+}
+
+static int tls_dumped = 0; // one-shot dump of first TLS segment bytes
 
 // ARP cache (4 entries)
 #define ARP_CACHE_SIZE 4
@@ -51,11 +59,7 @@ static void net_event_post(const char* msg) {
     net_event_pending = 1;
 }
 
-// TCP state
-#define TCP_STATE_CLOSED   0
-#define TCP_STATE_SYN_SENT 1
-#define TCP_STATE_ESTABLISHED 2
-#define TCP_STATE_FIN_WAIT 3
+// TCP state constants live in network.h (shared with tls_net.c).
 
 struct tcp_conn {
     uint8_t dst_ip[4]; // stored in network byte order
@@ -821,6 +825,25 @@ void tcp_close(void) {
     }
 }
 
+// --- TCP state probes (used by the TLS integration to drive a blocking
+//     handshake from a single call context, e.g. the keyboard ISR) ---
+
+int tcp_is_established(void) {
+    return tcp_conn.state == TCP_STATE_ESTABLISHED;
+}
+
+int tcp_conn_state(void) {
+    return tcp_conn.state;
+}
+
+// True once the peer has closed (FIN seen, possibly our FIN already ACKed).
+// Used by the TLS recv callback to return EOF promptly instead of spinning
+// on the 5s record timeout.
+int tcp_is_closed(void) {
+    return tcp_conn.state == TCP_STATE_CLOSED ||
+           tcp_conn.state == TCP_STATE_FIN_WAIT;
+}
+
 // Retransmission timer — call from the main loop. Fires when a flight
 // (SYN, data, or FIN) goes unacked past the RTO; backs off exponentially
 // and gives up after TCP_MAX_RTX attempts.
@@ -898,6 +921,15 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
     serial_puts(" flags=");
     serial_putchar(hex[(flags >> 4) & 0xF]);
     serial_putchar(hex[flags & 0xF]);
+    serial_puts(" seq=");
+    print_hex32(seq_num);
+    serial_puts(" ack=");
+    print_hex32(ack_num);
+    serial_puts(" our_ack=");
+    print_hex32(tcp_conn.ack);
+    serial_puts(" plen=");
+    serial_putchar(hex[(payload_len >> 8) & 0xF]);
+    serial_putchar(hex[payload_len & 0xF]);
     serial_puts(" state=");
     serial_putchar('0' + tcp_conn.state);
     serial_putchar('\n');
@@ -949,49 +981,76 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
 
         // Payload BEFORE FIN: servers may piggyback the last data bytes on
         // the FIN packet — checking FIN first would drop that payload
-        if (payload_len > 0 && http_pending) {
-            tcp_conn.ack = seq_num + payload_len;
-            tcp_send_packet(0x10, 0, 0); // ACK
-
-            int copy = payload_len;
-            if (copy > 1500) copy = 1500;
-            if (http_response_len + copy > 4095) copy = 4095 - http_response_len;
-            for (int i = 0; i < copy; i++) {
-                http_response[http_response_len + i] = data[data_offset + i];
-            }
-            http_response_len += copy;
-            http_response[http_response_len] = 0;
-
-            serial_puts("[http] segment, total ");
-            serial_putchar('0' + (http_response_len / 1000) % 10);
-            serial_putchar('0' + (http_response_len / 100) % 10);
-            serial_putchar('0' + (http_response_len / 10) % 10);
-            serial_putchar('0' + (http_response_len % 10));
-            serial_puts(" bytes\n");
-
-            // Terminal preview from the FIRST segment only (headers visible
-            // there by design; the browser strips them via html_parse)
-            if (http_response_len == copy) {
-                for (int i = 0; i < 255; i++) net_event_msg[i] = 0;
-                int idx = 0;
-                const char* hdr = "HTTP response (";
-                for (int i = 0; hdr[i]; i++) net_event_msg[idx++] = hdr[i];
-                net_event_msg[idx++] = '0' + (http_response_len / 100);
-                net_event_msg[idx++] = '0' + (http_response_len / 10) % 10;
-                net_event_msg[idx++] = '0' + (http_response_len % 10);
-                const char* hdr2 = " bytes):\n";
-                for (int i = 0; hdr2[i]; i++) net_event_msg[idx++] = hdr2[i];
-                int disp_len = http_response_len < 180 ? http_response_len : 180;
-                for (int i = 0; i < disp_len && idx < 254; i++) {
-                    net_event_msg[idx++] = http_response[i];
+        if (payload_len > 0) {
+            if (tls_is_active()) {
+                // TLS session in progress: feed raw TCP payload into the TLS
+                // receive buffer. tls_client_run polls this buffer from its
+                // recv callback; the main loop never reads it concurrently
+                // with the IRQ, so there is no writer race.
+                tcp_conn.ack = seq_num + payload_len;
+                tcp_send_packet(0x10, 0, 0); // ACK
+                int copy = payload_len < 1500 ? payload_len : 1500;
+                tls_append_data(data + data_offset, copy);
+                if (!tls_dumped) {
+                    tls_dumped = 1;
+                    serial_puts("[tls] RX bytes: ");
+                    for (int d = 0; d < copy && d < 32; d++) {
+                        serial_putchar(hex[(data[data_offset + d] >> 4) & 0xF]);
+                        serial_putchar(hex[data[data_offset + d] & 0xF]);
+                        serial_putchar(' ');
+                    }
+                    serial_putchar('\n');
                 }
-                if (http_response_len > 180) {
-                    const char* dots = "\n...(truncated)";
-                    for (int i = 0; dots[i] && idx < 254; i++) net_event_msg[idx++] = dots[i];
+                serial_puts("[tls] segment, fed ");
+                serial_putchar('0' + (copy / 1000) % 10);
+                serial_putchar('0' + (copy / 100) % 10);
+                serial_putchar('0' + (copy / 10) % 10);
+                serial_putchar('0' + (copy % 10));
+                serial_puts(" bytes to TLS rx\n");
+            } else if (http_pending) {
+                tcp_conn.ack = seq_num + payload_len;
+                tcp_send_packet(0x10, 0, 0); // ACK
+
+                int copy = payload_len;
+                if (copy > 1500) copy = 1500;
+                if (http_response_len + copy > 4095) copy = 4095 - http_response_len;
+                for (int i = 0; i < copy; i++) {
+                    http_response[http_response_len + i] = data[data_offset + i];
                 }
-                net_event_msg[idx++] = '\n';
-                net_event_msg[idx] = 0;
-                net_event_pending = 1;
+                http_response_len += copy;
+                http_response[http_response_len] = 0;
+
+                serial_puts("[http] segment, total ");
+                serial_putchar('0' + (http_response_len / 1000) % 10);
+                serial_putchar('0' + (http_response_len / 100) % 10);
+                serial_putchar('0' + (http_response_len / 10) % 10);
+                serial_putchar('0' + (http_response_len % 10));
+                serial_puts(" bytes\n");
+
+                // Terminal preview from the FIRST segment only (headers visible
+                // there by design; the browser strips them via html_parse)
+                if (http_response_len == copy) {
+                    for (int i = 0; i < 255; i++) net_event_msg[i] = 0;
+                    int idx = 0;
+                    const char* hdr = "HTTP response (";
+                    for (int i = 0; hdr[i]; i++) net_event_msg[idx++] = hdr[i];
+                    net_event_msg[idx++] = '0' + (http_response_len / 100);
+                    net_event_msg[idx++] = '0' + (http_response_len / 10) % 10;
+                    net_event_msg[idx++] = '0' + (http_response_len % 10);
+                    const char* hdr2 = " bytes):\n";
+                    for (int i = 0; hdr2[i]; i++) net_event_msg[idx++] = hdr2[i];
+                    int disp_len = http_response_len < 180 ? http_response_len : 180;
+                    for (int i = 0; i < disp_len && idx < 254; i++) {
+                        net_event_msg[idx++] = http_response[i];
+                    }
+                    if (http_response_len > 180) {
+                        const char* dots = "\n...(truncated)";
+                        for (int i = 0; dots[i] && idx < 254; i++) net_event_msg[idx++] = dots[i];
+                    }
+                    net_event_msg[idx++] = '\n';
+                    net_event_msg[idx] = 0;
+                    net_event_pending = 1;
+                }
             }
         }
         if (flags & 0x01) { // FIN
@@ -1004,6 +1063,7 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
             tcp_rtx_arm();
             tcp_conn.seq++;
             tcp_conn.state = TCP_STATE_FIN_WAIT;
+            if (tls_is_active()) tls_connection_closed();
             serial_puts("[tcp] FIN_WAIT (server FIN)\n");
             return;
         }
@@ -1340,8 +1400,18 @@ static void handle_ip(uint8_t* data, uint32_t len) {
             udp_callback(data, len, src_port, dst_port);
         }
     } else if (protocol == 6) { // TCP
-        uint8_t* tcp_data = data + sizeof(struct eth_header) + sizeof(struct ip_header);
-        uint32_t tcp_len = len - sizeof(struct eth_header) - sizeof(struct ip_header);
+        // Derive the TCP segment length from the IP total length, NOT the
+        // (padded) Ethernet frame length. Ethernet pads short frames up to the
+        // 64-byte minimum, so a frame-length calculation would silently include
+        // zero padding as payload — feeding garbage (or, worse, advancing
+        // RCV.NXT by the padding count) to the application.
+        struct ip_header* iph = (struct ip_header*)(data + sizeof(struct eth_header));
+        uint16_t ip_total = ((iph->total_length >> 8) & 0xFF) |
+                            ((iph->total_length & 0xFF) << 8);
+        uint8_t ip_hlen = (iph->version_ihl & 0x0F) * 4;
+        if (ip_total < (uint16_t)ip_hlen + 20) return; // malformed
+        uint8_t* tcp_data = (uint8_t*)iph + ip_hlen;
+        uint32_t tcp_len = ip_total - ip_hlen;
         tcp_handle_packet(tcp_data, tcp_len);
     }
 }

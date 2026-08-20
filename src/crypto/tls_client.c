@@ -6,9 +6,16 @@
 #include "aead.h"
 #include "hmac.h"
 #include <string.h>
-#include <stdio.h>
+#include "tls_dbg.h"
 
-// ----- entropy (host fallback) -----
+#ifdef KERNEL
+#include "rand.h"
+#endif
+
+// ----- entropy -----
+// Host builds use a tiny xorshift; the kernel uses the seeded ChaCha20 CPRNG
+// (rand.c), which is fed RDTSC + IRQ jitter + NIC MAC at boot.
+#ifndef KERNEL
 static uint64_t host_rng_state = 0x123456789abcdef0ull;
 static void host_rng(uint8_t* out, uint32_t n) {
     for (uint32_t i = 0; i < n; i++) {
@@ -17,6 +24,18 @@ static void host_rng(uint8_t* out, uint32_t n) {
         host_rng_state = x;
         out[i] = (uint8_t)(x & 0xff);
     }
+}
+#endif
+
+static void tls_fill_random(uint8_t* out, uint32_t n) {
+#ifdef KERNEL
+    if (rand_bytes(out, n) != 1) {
+        // CPRNG not yet ready (shouldn't happen post-boot) — degenerate fill
+        for (uint32_t i = 0; i < n; i++) out[i] = (uint8_t)(i * 0x6D + 0x13);
+    }
+#else
+    host_rng(out, n);
+#endif
 }
 
 int shared_is_zero(const uint8_t s[32]) {
@@ -29,17 +48,17 @@ static uint32_t recv_record(uint8_t* out, uint32_t cap,
                             const struct tls_client_io* io) {
     if (cap < 5) return 0;
     int n = io->recv(out, 5, 5000, io->user);
-    if (n != 5) { fprintf(stderr, "[recv_record] hdr read=%d/5\n", n); return 0; }
+    if (n != 5) { tls_dbg( "[recv_record] hdr read=%d/5\n", n); return 0; }
 
     tls_record rec;
     if (tls_record_parse_header(out, 5, &rec) != 5) {
-        fprintf(stderr, "[recv_record] header parse failed type=%u ver=%u\n", rec.type, rec.version);
+        tls_dbg( "[recv_record] header parse failed type=%u ver=%u\n", rec.type, rec.version);
         return 0;
     }
     if (cap < 5 + rec.payload_len) return 0;
     if (rec.payload_len > 0) {
         int r = io->recv(out + 5, rec.payload_len, 5000, io->user);
-        if (r != (int)rec.payload_len) { fprintf(stderr, "[recv_record] payload read=%d/%u\n", r, rec.payload_len); return 0; }
+        if (r != (int)rec.payload_len) { tls_dbg( "[recv_record] payload read=%d/%u\n", r, rec.payload_len); return 0; }
     }
     return 5 + rec.payload_len;
 }
@@ -114,7 +133,7 @@ static int recv_aead(uint8_t key[32], const uint8_t iv[12], uint64_t* seq,
         int rc = aead_chacha20_poly1305_decrypt(key, nonce, aad, 5,
                                                 v.payload, ct_len,
                                                 v.payload + ct_len, out);
-        if (rc != 0) { fprintf(stderr, "[tls] AEAD decrypt fail\n"); return -1; }
+        if (rc != 0) { tls_dbg( "[tls] AEAD decrypt fail\n"); return -1; }
         int plen = ct_len;
         while (plen > 0 && out[plen - 1] == 0) plen--;
         if (plen == 0) return -1;
@@ -162,36 +181,36 @@ int tls_client_run(const char* host, uint16_t port,
                    uint8_t* out, uint32_t out_cap,
                    const struct tls_client_io* io) {
     (void)port;
-    fprintf(stderr, "[tls] start, host=%s\n", host);
+    tls_dbg( "[tls] start, host=%s\n", host);
 
-    uint8_t priv[32]; host_rng(priv, 32);
+    uint8_t priv[32]; tls_fill_random(priv, 32);
     priv[0] &= 248; priv[31] &= 127; priv[31] |= 64;
     uint8_t pub[32]; x25519_public_key(pub, priv);
-    uint8_t random[32]; memset(random, 0x42, 32);  // deterministic for debug
+    uint8_t random[32]; tls_fill_random(random, 32);
 
     uint8_t ch[1024];
     uint32_t ch_len = tls_build_client_hello(ch, sizeof(ch), random, pub, host);
-    if (ch_len == 0) { fprintf(stderr, "[tls] CH build failed\n"); return -1; }
-    fprintf(stderr, "[tls] CH built len=%u\n", ch_len);
+    if (ch_len == 0) { tls_dbg( "[tls] CH build failed\n"); return -1; }
+    tls_dbg( "[tls] CH built len=%u\n", ch_len);
 
     if (send_record(TLS_CT_HANDSHAKE, ch, ch_len, io) != 0) return -1;
-    fprintf(stderr, "[tls] sent ClientHello\n");
+    tls_dbg( "[tls] sent ClientHello\n");
 
     // Receive ServerHello
     uint8_t rec_buf[18432 + 32];
     uint32_t total = recv_record(rec_buf, sizeof(rec_buf), io);
-    if (total == 0) { fprintf(stderr, "[tls] recv SH failed\n"); return -1; }
+    if (total == 0) { tls_dbg( "[tls] recv SH failed\n"); return -1; }
     tls_record rec_v;
     if (tls_record_parse_header(rec_buf, total, &rec_v) != 5) return -1;
-    if (rec_v.type != TLS_CT_HANDSHAKE) { fprintf(stderr, "[tls] non-HS type=%u\n", rec_v.type); return -1; }
+    if (rec_v.type != TLS_CT_HANDSHAKE) { tls_dbg( "[tls] non-HS type=%u\n", rec_v.type); return -1; }
     uint8_t hs_t; uint32_t hs_bl;
     uint32_t consumed = parse_hs(rec_v.payload, rec_v.payload_len, &hs_t, &hs_bl);
     if (consumed == 0 || hs_t != TLS_HS_SERVER_HELLO) return -1;
     tls_server_hello sh;
     if (tls_parse_server_hello(rec_v.payload + 4, hs_bl, &sh) != 0) {
-        fprintf(stderr, "[tls] parse SH failed\n"); return -1; }
+        tls_dbg( "[tls] parse SH failed\n"); return -1; }
     const uint8_t* sh_body = rec_v.payload + 4;
-    fprintf(stderr, "[tls] got SH, cipher=0x%04x group=0x%04x\n",
+    tls_dbg( "[tls] got SH, cipher=0x%04x group=0x%04x\n",
             sh.cipher_suite, sh.named_group);
 
     // Compute transcript after SH (for handshake traffic key derivation)
@@ -211,7 +230,7 @@ int tls_client_run(const char* host, uint16_t port,
     // Derive handshake keys
     uint8_t shared[32];
     x25519_shared_secret(shared, priv, sh.key_share);
-    if (shared_is_zero(shared)) { fprintf(stderr, "[tls] zero shared\n"); return -1; }
+    if (shared_is_zero(shared)) { tls_dbg( "[tls] zero shared\n"); return -1; }
     uint8_t early_secret[32];
     tls_early_secret(NULL, 0, early_secret);
     uint8_t derived[32], hs_secret[32];
@@ -219,7 +238,7 @@ int tls_client_run(const char* host, uint16_t port,
     tls_handshake_secret(derived, shared, hs_secret);
     uint8_t c_hs[32], s_hs[32];
     tls_traffic_secret(hs_secret, "c hs traffic", transcript_after_sh, c_hs);
-    fprintf(stderr, "[tls] handshake keys derived\n");
+    tls_dbg( "[tls] handshake keys derived\n");
     tls_traffic_secret(hs_secret, "s hs traffic", transcript_after_sh, s_hs);
     uint8_t c_hs_key[32], c_hs_iv[12], s_hs_key[32], s_hs_iv[12];
     tls_record_key(c_hs, c_hs_key); tls_record_iv(c_hs, c_hs_iv);
@@ -239,34 +258,34 @@ int tls_client_run(const char* host, uint16_t port,
     while (!got_sfin) {
         pt_len = recv_aead(s_hs_key, s_hs_iv, &s_seq,
                            pt, sizeof(pt), &ct_type, io);
-        if (pt_len < 0) { fprintf(stderr, "[tls] recv_aead failed pt_len=%d\n", pt_len); return -1; }
+        if (pt_len < 0) { tls_dbg( "[tls] recv_aead failed pt_len=%d\n", pt_len); return -1; }
         if (ct_type != TLS_CT_HANDSHAKE) return -1;
         uint32_t p = 0;
         while (p < (uint32_t)pt_len) {
             uint8_t t; uint32_t bl;
             uint32_t c = parse_hs(pt + p, pt_len - p, &t, &bl);
-            if (c == 0) { fprintf(stderr, "[tls] parse_hs fail at offset %u remaining %d\n", p, pt_len - (int)p); return -1; }
+            if (c == 0) { tls_dbg( "[tls] parse_hs fail at offset %u remaining %d\n", p, pt_len - (int)p); return -1; }
             const uint8_t* body = pt + p + 4;
             if (t == TLS_HS_ENCRYPTED_EXTENSIONS && !got_ee) {
-                if (bl > sizeof(ee_body)) { fprintf(stderr, "[tls] EE too big %u\n", bl); return -1; }
+                if (bl > sizeof(ee_body)) { tls_dbg( "[tls] EE too big %u\n", bl); return -1; }
                 memcpy(ee_body, body, bl); ee_bl = bl;
                 got_ee = 1;
             } else if (t == TLS_HS_CERTIFICATE && !got_cert) {
-                if (bl > sizeof(cert_body)) { fprintf(stderr, "[tls] cert too big %u\n", bl); return -1; }
+                if (bl > sizeof(cert_body)) { tls_dbg( "[tls] cert too big %u\n", bl); return -1; }
                 memcpy(cert_body, body, bl); cert_bl = bl;
-                if (tls_parse_certificate(cert_body, cert_bl) != 0) { fprintf(stderr, "[tls] cert parse failed\n"); return -1; }
+                if (tls_parse_certificate(cert_body, cert_bl) != 0) { tls_dbg( "[tls] cert parse failed\n"); return -1; }
                 got_cert = 1;
             } else if (t == TLS_HS_CERTIFICATE_VERIFY && !got_cv) {
-                if (bl > sizeof(cv_body)) { fprintf(stderr, "[tls] CV too big %u\n", bl); return -1; }
+                if (bl > sizeof(cv_body)) { tls_dbg( "[tls] CV too big %u\n", bl); return -1; }
                 memcpy(cv_body, body, bl); cv_bl = bl;
-                if (tls_parse_certificate_verify(cv_body, cv_bl) != 0) { fprintf(stderr, "[tls] CV parse failed\n"); return -1; }
+                if (tls_parse_certificate_verify(cv_body, cv_bl) != 0) { tls_dbg( "[tls] CV parse failed\n"); return -1; }
                 got_cv = 1;
             } else if (t == TLS_HS_FINISHED && !got_sfin) {
-                if (bl != 32) { fprintf(stderr, "[tls] Finished bad len %u\n", bl); return -1; }
+                if (bl != 32) { tls_dbg( "[tls] Finished bad len %u\n", bl); return -1; }
                 memcpy(fin_body, body, 32); fin_bl = 32;
                 got_sfin = 1;
             } else {
-                fprintf(stderr, "[tls] unknown/unexpected HS type=%u\n", t);
+                tls_dbg( "[tls] unknown/unexpected HS type=%u\n", t);
             }
             p += c;
         }

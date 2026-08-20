@@ -126,9 +126,10 @@ The cursor is a **stateless sprite** — there is NO saved background patch and 
 
 ---
 
-## TLS 1.3 client (Phase 4 complete, Phase 5 partial)
+## TLS 1.3 client (Phase 4 complete, Phase 5 + 6 complete)
 
-Phases 1–4 are complete and host-tested. Phase 5 (kernel integration) is partially done.
+Phases 1–4 are complete and host-tested. Phase 5 (kernel integration) and
+Phase 6 (live in-kernel verification) are complete.
 
 ### Phase status
 | Phase | Files | Status |
@@ -137,8 +138,8 @@ Phases 1–4 are complete and host-tested. Phase 5 (kernel integration) is parti
 | 2 handshake codec + transcript | `tls_handshake.c/.h` | **PASS** (31/31 host tests) |
 | 3 key schedule (RFC 8446 §7.1) | `tls_keysched.c/.h` | **PASS** (13/13 host tests, RFC 8448 vector-validated) |
 | 4 full handshake driver | `tls_client.c/.h` | **PASS** — full handshake against example.com (Cloudflare), HTTP 200 received |
-| 5 kernel integration | `tls_net.c/.h`, `rand.c/.h` | **PARTIAL** — CPRNG + net wrapper written, Makefile NOT updated, kernel NOT built |
-| 6 QEMU verification | (not started) | Pending Phase 5 |
+| 5 kernel integration | `tls_net.c/.h`, `rand.c/.h` | **DONE** — Makefile wired, crypto linked, CPRNG seeded at boot, `https://` fetches work end-to-end in-kernel |
+| 6 QEMU verification | (not started) | **PASS** — verified in-kernel against example.com (Cloudflare) via QEMU SLIRP. Full DNS→TCP→TLS 1.3 handshake completes; 865-byte HTTP response decrypted and browser-parsed (7 HTML tokens). Driver: `test_net.py` pattern, command `browser https://example.com/`. **One bug fixed:** TCP segment length was taken from the padded Ethernet frame length instead of the IP `total_length`, so Ethernet min-frame padding (zeros) was fed to TLS as payload and RCV.NXT advanced by the pad count — breaking the handshake. Fixed in `src/net/network.c` (TCP branch of `handle_packet`). |
 
 ### Phase 4 — FIXED (4 bugs found and corrected)
 
@@ -195,42 +196,76 @@ sockets, performs the full handshake, sends GET /, and verifies HTML response.
   `sti/nop/cli`). Works on host; needs adaptation for kernel IRQ-driven
   model.
 
-**Not done (for the next agent):**
-1. **Makefile** — append crypto objects to `DESKTOP_OBJ`:
-   ```
-   src/crypto/sha256.o src/crypto/hmac.o src/crypto/hkdf.o \
-   src/crypto/aead.o src/crypto/chacha20.o src/crypto/poly1305.o \
-   src/crypto/x25519.o src/crypto/tls_record.o src/crypto/tls_handshake.o \
-   src/crypto/tls_keysched.o src/crypto/tls_client.o src/crypto/rand.o \
-   src/net/tls_net.o
-   ```
-2. **Wire `tls_append_data` into `tcp_handle_packet`** in `network.c`. When
-   `tls_is_active()` returns 1, append TCP payload to `tls_rx_buf` instead
-   of `http_response`.
-3. **Seed the CPRNG at boot** in `kernel_main()`: read RDTSC, mix with IRQ
-   jitter from timer ticks, and XOR in the e1000 MAC address. Call
-   `rand_seed()` with the first 32 bytes, then `rand_stir()` on every
-   timer tick for the first 32 ticks.
-4. **Make recv callback non-blocking** for the kernel. Replace the busy-wait
-   in `kernel_tcp_recv` with a stateful approach: the TLS handshake should
-   yield back to the main loop when waiting for data, and resume when
-   `tls_append_data` has buffered enough. This requires either making
-   `tls_client_run` cooperative (state machine) or running the handshake
-   from the main loop with a `tls_poll()` driver.
-5. **Browser HTTPS** — `browser https://host/path` → detect `https://` scheme,
-   call `https_get()` instead of `http_get()`, then existing dechunk+parse
-   runs on `tls_get_response()`.
+**Phase 5 — COMPLETED (all 5 sub-tasks done):**
+1. **Makefile** — crypto objects appended to `DESKTOP_OBJ` (sha256, hmac,
+   hkdf, aead, chacha20, poly1305, x25519, tls_record, tls_handshake,
+   tls_keysched, tls_client, rand, tls_net). `src/string.c` added to
+   `COMMON_OBJ` (the freestanding build had no `memcpy`/`memset`/`strlen`).
+   `-DKERNEL` added to `CFLAGS` so the shared TLS source switches its logging
+   to serial and its RNG to the kernel CPRNG.
+2. **`tls_append_data` wired into `tcp_handle_packet`** (`network.c`) — when
+   `tls_is_active()` is set, ESTABLISHED payloads are appended to the TLS rx
+   buffer (and ACKed) instead of `http_response`. `tls_connection_closed()`
+   is called on FIN so the recv callback can EOF promptly. Also exported
+   `tcp_is_established()` / `tcp_is_closed()` / `tcp_conn_state()`.
+3. **CPRNG seeded at boot** (`desktop.c` `kernel_main()`) — RDTSC mixed with
+   the e1000 MAC, `rand_seed()` then 32× `rand_stir()` so it reaches
+   `rand_ready()` immediately; the timer ISR keeps stirring for forward
+   secrecy. Serial log shows `[rand] CPRNG seeded, ready=1`.
+4. **Kernel recv callback** — `kernel_tcp_recv` no longer relies on the old
+   `sti;nop;cli` no-op. It drives the NIC itself (`e1000_poll()` +
+   `net_poll()`) each spin and returns EOF when the peer closes. The single
+   blocking `tls_client_run` is invoked synchronously from `https_get()`, which
+   now also performs the DNS resolve + TCP connect (previously missing) before
+   the handshake. *Deviation from the original note:* this is a NIC-polling
+   blocking design rather than a cooperative `tls_poll()` state machine. It
+   keeps `tls_client_run` (host-tested, PASS) unchanged and actually works in
+   the kernel — `https_get` runs inside the keyboard ISR (IF=0), where polling
+   the RX descriptors (DMA) is sufficient. The cost is the UI freezes for the
+   ~1-2s fetch; a cooperative refactor remains a possible future improvement.
+5. **Browser HTTPS** — `browser https://host/path` is detected in
+   `parse_url` + `browser_open`/`navigate`/`back`; `https_get()` is called
+   instead of `http_get()`. The desktop main loop gained a parallel parse path
+   that feeds `tls_get_response()` into `html_parse` once `tls_is_done()`.
 
-### Phase 6 (QEMU verification)
+**Supporting changes (also required to link/build in the kernel):**
+- `src/string.c` + `src/string.h` — `memcpy/memset/memcmp/memmove/strlen/
+  strncmp/strchr` (the crypto uses these; freestanding had none).
+- `src/serial.c` — added `serial_printf()` (minimal `%s %c %d %u %x %X %%`,
+  width/precision skipped) used for TLS debug logging.
+- `src/crypto/tls_dbg.h` — dual-mode logging: `serial_printf` under `KERNEL`,
+  `fprintf(stderr,...)` on host. `tls_client.c` switched from `<stdio.h>` to
+  this; its RNG now routes through `rand_bytes()` in kernel mode (host keeps
+  the xorshift `host_rng`).
+- `boot/start.asm` — kernel stack enlarged 32KB → 256KB (`tls_client_run`
+  keeps several ~18KB on-stack record buffers live at once).
+
+**Verification so far:** kernel builds to `okernel-desktop.iso` (no errors,
+no undefined symbols); host `test_tls_client` still passes Phase 4 against
+example.com; kernel boots clean under QEMU (CPRNG seeded, NIC up, main loop
+running). The live in-kernel handshake still needs a networked QEMU (Phase 6).
+
+### Phase 6 (QEMU verification) — VERIFIED
 Boot with serial:
 ```bash
 qemu-system-i386 -cdrom okernel-desktop.iso -boot d -vga std \
   -device e1000,netdev=net0 -netdev user,id=net0 \
   -display none -serial file:/tmp/ok/serial.log
 ```
-Run `https example.com` from the serial monitor (see NEXT_AGENT_PROMPT for
-the recipe). Serial log must show: DNS → TCP → ClientHello → ServerHello →
-handshake done → app data → close.
+Then drive the desktop via QEMU monitor `sendkey` (see `test_net.py`): type
+`browser https://example.com/` into the focused terminal and press Enter.
+Serial log shows: DNS → TCP → ClientHello → ServerHello (`cipher=0x1303
+group=0x1d`) → handshake keys derived → app data → close, ending with
+`[tls-net] received 865 bytes` and `[br] https parse: count=07`. A headless
+driver exists at `/tmp/ok/phase6.py`.
+
+**Bug fixed during Phase 6:** `handle_packet` (TCP branch) derived the TCP
+segment length from the padded Ethernet frame length instead of the IP
+`total_length` field. Short TLS records are Ethernet-padded to 64 bytes, so the
+zero padding was delivered to TLS as payload (and RCV.NXT advanced by the pad
+count), which broke the handshake. Fixed by computing `tcp_len` from
+`ip_header.total_length` and locating the TCP header at the IP IHL offset.
+(See Critical Bugs #19.)
 
 ---
 
@@ -297,8 +332,11 @@ Same as above plus: `list`, `switch N`
 - **Single CPU** — no SMP support
 - **No real mouse scroll** — PS/2 3-byte mode only (scroll via keyboard)
 - **Minimal TCP** — no retransmission, no windowing, no congestion control
-- **HTTP limited** — single GET request, no HTTPS yet (chunked transfer IS decoded via `http_dechunk`)
-- **TLS 1.3 limited to ChaCha20-Poly1305** — SHA-256 only; no AES-GCM, no SHA-384. Pending Phase 4 completion.
+- **HTTP limited** — single GET request (chunked transfer IS decoded via `http_dechunk`)
+- **HTTPS works** via the browser (`browser https://host/path`); it is a
+  blocking single-call fetch (UI freezes ~1-2s during the handshake). No
+  standalone `https` shell command yet (only the browser path is wired).
+- **TLS 1.3 limited to ChaCha20-Poly1305** — SHA-256 only; no AES-GCM, no SHA-384. Phase 4 + 5 complete.
 - **TCP minimal** — single connection, no windowing/congestion control, no out-of-order buffering (gaps re-ACKed until the server fills them). Retransmission IS implemented (timer + backoff + give-up). This is the foundation for the planned TLS 1.3 client.
 
 ---
@@ -461,6 +499,9 @@ Crypto debugging lessons (bit us during bring-up): limb packing must never route
 | `src/crypto/aead.c` | ChaCha20-Poly1305 AEAD (Phase 1–3 verified, decrypt path validated in test_tls_crypto) |
 | `linker.ld` | Memory layout — kernel load address, symbols |
 | `Makefile` | Build system — text vs desktop targets |
+| `src/string.c/.h` | libc string funcs (memcpy/memset/strlen) — needed by freestanding crypto |
+| `src/serial.c` | `serial_printf()` — minimal formatter for TLS debug logging |
+| `src/crypto/tls_dbg.h` | Dual-mode logging: serial (KERNEL) vs fprintf (host) |
 
 ---
 
@@ -515,3 +556,24 @@ Crypto debugging lessons (bit us during bring-up): limb packing must never route
     The old code shared `app_seq` between send and receive — after sending the
     HTTP request (seq→1), the receive tried seq=1 instead of seq=0. Fix:
     separate `c_ap_seq` and `s_ap_seq` starting at 0.
+19. **TCP payload length from padded frame, not IP total_length** (Phase 6 bug — FIXED):
+    `handle_packet` (TCP branch, `src/net/network.c`) computed `tcp_len =
+    len - eth - ip` from the raw Ethernet frame length. Ethernet pads short
+    frames to the 64-byte minimum, so a 6-byte TLS record-header segment
+    arrived as a 64-byte frame (40-byte IP datagram + 8 padding) and the stack
+    read the 6 trailing zero-pad bytes as payload — feeding zeros to TLS and
+    advancing RCV.NXT by the pad count, which garbled the handshake. Fix: derive
+    `tcp_len` from `ip_header.total_length` (ntohs) and start the TCP header at
+    the IP IHL offset. UDP/DNS were unaffected (they use the UDP length field);
+    HTTP had dodged this because servers send MSS-sized segments with no padding.
+ 20. **TLS buffers too small for real pages (truncated HTTPS)** (FIXED):
+    `src/net/tls_net.c` had `TLS_RX_BUF_SIZE` and `tls_response` both at 16KB.
+    `e1000_poll()` appends every pending RX descriptor to the ring in one call, so
+    a ~28KB page (e.g. `notdexy.ru`, Content-Length 28262) can land in the ring
+    before the handshake driver reads it; the 16KB ring filled and `tls_append_data`
+    silently dropped bytes, corrupting a record mid-stream (saw `payload read=2026/7133`,
+    received only 14243/28879 bytes → blank/partial page). The 16KB `tls_response`
+    cap would also have failed past 16KB. Fix: both buffers enlarged to 64KB.
+    `example.com` (865B) is unaffected; `notdexy.ru` now fetches the full 28879
+    bytes and the browser parses the page. Larger-than-64KB pages still truncate
+    (would need a streaming renderer, not a single static buffer).

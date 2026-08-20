@@ -25,6 +25,9 @@ int tls_poll(void);
 // Check if a TLS session is active.
 int tls_is_active(void);
 
+// Check if the last https_get() completed with a buffered response.
+int tls_is_done(void);
+
 // Get the TLS response (same interface as http_get_response).
 char* tls_get_response(void);
 int tls_get_response_len(void);
