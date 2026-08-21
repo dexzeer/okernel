@@ -60,3 +60,10 @@ char* strchr(const char* s, int c) {
     }
     return 0;
 }
+
+char* strncpy(char* dst, const char* src, unsigned int n) {
+    unsigned int i = 0;
+    for (; i < n && src[i]; i++) dst[i] = src[i];
+    for (; i < n; i++) dst[i] = 0;
+    return dst;
+}

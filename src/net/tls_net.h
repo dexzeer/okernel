@@ -14,9 +14,14 @@
 //   3. tls_poll() drives the TLS handshake from the main loop
 //   4. When the response is ready, http_get_response() returns it
 
-// Start an HTTPS GET request. Resolves DNS, connects TCP:443,
-// performs TLS 1.3 handshake, sends GET, and buffers the response.
+// Start an HTTPS GET request. Queues the fetch (DNS + TCP:443 + TLS 1.3
+// handshake + download); it runs asynchronously, driven by https_get_poll()
+// from the main loop, so the desktop never freezes during the load.
 void https_get(const char* host, const char* path);
+
+// Advance the in-flight HTTPS fetch by one step (DNS / TCP / TLS). Call once
+// per main-loop iteration. When the response is ready, tls_is_done() returns 1.
+void https_get_poll(void);
 
 // Drive the TLS handshake forward. Call from main loop.
 // Returns 0 if still in progress, 1 if response is ready, -1 on error.

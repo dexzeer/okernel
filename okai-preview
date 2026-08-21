@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# okai-preview — see how okai renders a page, WITHOUT booting the kernel.
+#
+#   ./okai-preview https://example.com/     -> ~/okvm/preview_example.png
+#   ./okai-preview page.html                -> ~/okvm/preview_page.png
+#   ./okai-preview https://site/ out.png 54 # custom output / width in cols
+#
+# Uses the host build of the real okai sources (tests/okai_preview.c):
+# identical tokenizer, CSS engine, and layout to the kernel — only the
+# browser chrome (toolbar/tabs) is absent. Reruns instantly (~50ms), so it's
+# the fast loop for layout/CSS/text changes; QEMU stays for chrome/input work.
+set -e
+cd "$(dirname "$0")"
+
+mkdir -p ~/okvm
+make -C tests -f Makefile.preview okai_preview >/dev/null
+
+src="$1"
+name=$(echo "$src" | sed 's|.*://||; s|/.*||; s|[^A-Za-z0-9._-]|_|g')
+name=${name:-$(basename "${src%%.*}" )}
+out="${2:-$HOME/okvm/preview_${name}.png}"
+cols="${3:-54}"
+
+tmp=$(mktemp /tmp/okai_preview_XXXXXX.html)
+trap 'rm -f "$tmp"' EXIT
+if [[ "$src" == http://* || "$src" == https://* ]]; then
+    curl -sL "$src" -o "$tmp"
+else
+    cp "$src" "$tmp"
+fi
+
+tests/okai_preview "$tmp" "$out" "$cols"
+echo "open: $out"

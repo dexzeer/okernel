@@ -14,7 +14,7 @@
 #include "io.h"
 #include "filesystem.h"
 #include "editor.h"
-#include "browser.h"
+#include "okai.h"
 #include "crypto/rand.h"
 
 struct mboot_info {
@@ -193,21 +193,21 @@ static void desktop_paint_rect_skip(int skip_win, int x, int y, int w, int h) {
     graphics_blit_wallpaper_rect(x, y, w, h);
     draw_desktop_icons_in(x, y, w, h);
 
-    // Windows back-to-front, focused last (same order as window_draw_all)
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        struct window* win = window_get(i);
-        if (!win || !win->visible || win->minimized || win->focused || i == skip_win) continue;
-        if (win->x < x + w && win->x + win->w > x &&
-            win->y < y + h && win->y + win->h > y) {
-            window_paint_region(i, x, y, w, h);
-        }
-    }
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        struct window* win = window_get(i);
-        if (!win || !win->visible || win->minimized || !win->focused || i == skip_win) continue;
-        if (win->x < x + w && win->x + win->w > x &&
-            win->y < y + h && win->y + win->h > y) {
-            window_paint_region(i, x, y, w, h);
+    // Windows back-to-front, focused last (same order as window_draw_all).
+    // A okai's pixel chrome is painted right after ITS window, in this same
+    // z-order — a global after-all-windows chrome pass let a lower browser's
+    // chrome paint over a higher overlapping window (text leaking through).
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < MAX_WINDOWS; i++) {
+            struct window* win = window_get(i);
+            if (!win || !win->visible || win->minimized ||
+                (pass == 0) == win->focused || i == skip_win) continue;
+            if (win->x < x + w && win->x + win->w > x &&
+                win->y < y + h && win->y + win->h > y) {
+                window_paint_region(i, x, y, w, h);
+                int ob = okai_find_by_win(i);
+                if (ob >= 0) okai_paint_overlays(ob);
+            }
         }
     }
 
@@ -272,12 +272,12 @@ static void put_uint(char* buf, uint32_t val) {
 
 static void open_sysinfo(void) {
     if (info_win >= 0) return; // Already open
-    info_win = window_create("System Info", 320, 80, 380, 300);
+    info_win = window_create("System Info", 600, 80, 700, 500);
     window_set_close_button(info_win, 1);
     window_set_minimize_button(info_win, 1);
     window_puts(info_win, "okernel v0.4\n");
     window_puts(info_win, "Desktop Edition\n\n");
-    window_puts(info_win, "Resolution: 1024x768\n");
+    window_puts(info_win, "Resolution: 1920x1080\n");
     window_puts(info_win, "Shell: okernel sh\n");
     window_puts(info_win, "Commands: help, clear,\n");
     window_puts(info_win, "echo, mem, uptime,\n");
@@ -298,7 +298,7 @@ static int create_terminal(void) {
     if (term_count >= MAX_TERMINALS) return -1;
     int x = 80 + (term_count % 4) * 80;
     int y = 60 + (term_count % 4) * 60;
-    int win_id = window_create("Terminal", x, y, 500, 400);
+    int win_id = window_create("Terminal", x, y, 900, 650);
     window_set_close_button(win_id, 1);
     window_set_minimize_button(win_id, 1);
     term_wins[term_count] = win_id;
@@ -368,7 +368,7 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  ip        - show IP address\n");
         window_puts(win_id, "  netdrop N - drop 1-in-N TCP pkts (test)\n");
         window_puts(win_id, "  resolve   - DNS lookup\n");
-        window_puts(win_id, "  browser   - open web browser\n");
+        window_puts(win_id, "  okai   - open web okai\n");
         window_puts(win_id, "  edit      - open text editor\n");
         window_puts(win_id, "  ls        - list files\n");
         window_puts(win_id, "  open      - open file in editor\n");
@@ -435,18 +435,24 @@ static void shell_execute(int win_id, const char* input) {
             dns_resolve(args);
         }
     }
-    else if (str_eq(cmd_buf, "browser")) {
-        if (args[0] == 0) {
-            window_puts(win_id, "Usage: browser <url>\n");
-            window_puts(win_id, "Example: browser http://example.com/\n");
+    else if (str_eq(cmd_buf, "okai")) {
+        // One browser window: reuse it and open the URL as a new tab; with no
+        // argument, open the internal homepage.
+        const char* target = args[0] ? args : OKAI_HOME_URL;
+        if (okai_window_count() > 0) {
+            okai_new_tab(0, target);
+            window_set_focus(okai_get(0)->win_id);
+            window_puts(win_id, "New tab: ");
+            window_puts(win_id, target);
+            window_put_char(win_id, '\n');
         } else {
-            int br = browser_open(args);
-            if (br >= 0) {
+            int ok = okai_open(target);
+            if (ok >= 0) {
                 window_puts(win_id, "Opened: ");
-                window_puts(win_id, args);
+                window_puts(win_id, target);
                 window_put_char(win_id, '\n');
             } else {
-                window_puts(win_id, "Cannot open browser.\n");
+                window_puts(win_id, "Cannot open okai.\n");
             }
         }
     }
@@ -557,7 +563,7 @@ static void shell_execute(int win_id, const char* input) {
     }
     else if (str_eq(cmd_buf, "neofetch") || str_eq(cmd_buf, "sysinfo")) {
         window_puts(win_id, "okernel v0.4\n");
-        window_puts(win_id, "Resolution: 1024x768\n");
+        window_puts(win_id, "Resolution: 1920x1080 (2x scale)\n");
         window_puts(win_id, "Shell: okernel sh\n");
         window_puts(win_id, "Memory: ");
         uint32_t total = pmm_get_total_pages() * 4 / 1024;
@@ -623,10 +629,10 @@ static void on_keypress(char c) {
         return;
     }
 
-    // Check if this is a browser window
-    int br_id = browser_find_by_win(win_id);
+    // Check if this is a okai window
+    int br_id = okai_find_by_win(win_id);
     if (br_id >= 0) {
-        browser_handle_key(br_id, c);
+        okai_handle_key(br_id, c);
         return;
     }
 
@@ -680,22 +686,22 @@ static void on_net_event(const char* msg) {
     }
 }
 
-// Save HTTP response to the pending browse file
-static char browse_save_file[140] = {0};
-static int browse_saved_notified = 0;
+// Save HTTP response to the pending okse file
+static char okse_save_file[140] = {0};
+static int okse_saved_notified = 0;
 
-void net_set_browse_save(const char* filename) {
+void net_set_okse_save(const char* filename) {
     int i = 0;
     while (filename[i] && i < 139) {
-        browse_save_file[i] = filename[i];
+        okse_save_file[i] = filename[i];
         i++;
     }
-    browse_save_file[i] = 0;
-    browse_saved_notified = 0;
+    okse_save_file[i] = 0;
+    okse_saved_notified = 0;
 }
 
 static void check_save_http_response(void) {
-    if (browse_save_file[0] == 0) return;
+    if (okse_save_file[0] == 0) return;
 
     int resp_len = http_get_response_len();
 
@@ -703,13 +709,13 @@ static void check_save_http_response(void) {
     if (resp_len > 0) {
         char* resp = http_get_response();
         if (resp) {
-            fs_write(browse_save_file, (uint8_t*)resp, resp_len);
+            fs_write(okse_save_file, (uint8_t*)resp, resp_len);
         }
     }
 
     // Once connection is closed and we have data, notify and stop
-    if (!browse_saved_notified && !http_is_pending() && resp_len > 0) {
-        browse_saved_notified = 1;
+    if (!okse_saved_notified && !http_is_pending() && resp_len > 0) {
+        okse_saved_notified = 1;
         if (term_wins[0] >= 0) {
             window_puts(term_wins[0], "Saved ");
             char buf[8]; int bi = 0;
@@ -721,11 +727,11 @@ static void check_save_http_response(void) {
             buf[bi] = 0;
             window_puts(term_wins[0], buf);
             window_puts(term_wins[0], " bytes to ");
-            window_puts(term_wins[0], browse_save_file);
+            window_puts(term_wins[0], okse_save_file);
             window_puts(term_wins[0], "\n");
             shell_prompt(term_wins[0]);
         }
-        browse_save_file[0] = 0;
+        okse_save_file[0] = 0;
     }
 }
 
@@ -746,7 +752,7 @@ void kernel_main(uint32_t mboot_addr) {
     window_init();
     fs_init();
     editor_init();
-    browser_init();
+    okai_init();
 
     // Cache wallpaper for fast blitting
     graphics_cache_wallpaper(wp_pixels, wp_palette, WP_W, WP_H);
@@ -757,7 +763,7 @@ void kernel_main(uint32_t mboot_addr) {
     irq_register_handler(0, on_timer);
 
     // Create main terminal — large, centered
-    term_wins[0] = window_create("Terminal", 120, 60, 500, 400);
+    term_wins[0] = window_create("Terminal", 40, 30, 900, 650);
     window_set_close_button(term_wins[0], 1);
     window_set_minimize_button(term_wins[0], 1);
     term_count = 1;
@@ -819,10 +825,23 @@ void kernel_main(uint32_t mboot_addr) {
         e1000_poll();
         net_poll();
         http_poll();
+        https_get_poll(); // advance any in-flight async HTTPS fetch
 
         int mx = mouse_get_x();
         int my = mouse_get_y();
         int mb = mouse_get_left_button();
+
+        // Mouse wheel → scroll the okai window under the cursor, or the
+        // terminal's scrollback (same wheel model as the browser).
+        int wheel = mouse_get_scroll();
+        if (wheel != 0) {
+            int wid = window_from_point(mx, my);
+            if (wid >= 0) {
+                int br_id = okai_find_by_win(wid);
+                if (br_id >= 0) okai_handle_mouse_scroll(br_id, wheel);
+                else if (find_term_idx(wid) >= 0) window_scroll_view(wid, wheel);
+            }
+        }
 
         if (mb && !mouse_down) {
             int clicked = 0;
@@ -893,9 +912,9 @@ void kernel_main(uint32_t mboot_addr) {
                             if (ed_id >= 0) {
                                 editor_close(ed_id);
                             } else {
-                                int br_id = browser_find_by_win(i);
+                                int br_id = okai_find_by_win(i);
                                 if (br_id >= 0) {
-                                    browser_close(br_id);
+                                    okai_close(br_id);
                                 }
                             }
                         }
@@ -924,16 +943,102 @@ void kernel_main(uint32_t mboot_addr) {
                         break;
                     }
 
+                    // Click anywhere inside the window selects/focuses it (the
+                    // whole window, not just the title bar) and routes keyboard
+                    // input to it. A terminal also becomes the active terminal.
                     if (mx >= w->x && mx < w->x + w->w &&
-                        my >= w->y && my < w->y + WIN_TITLE_H + WIN_BORDER) {
-                        drag_win = i;
-                        drag_off_x = mx - w->x;
-                        drag_off_y = my - w->y;
-                        window_restore(i);
+                        my >= w->y && my < w->y + w->h) {
                         int tidx = find_term_idx(i);
-                        if (tidx >= 0) {
-                            active_term_idx = tidx;
-                            window_set_focus(i);
+                        if (tidx >= 0) active_term_idx = tidx;
+                        window_restore(i);
+                        window_set_focus(i);
+
+                        // Tab strip: switch tabs / close via ×, then toolbar
+                        // nav buttons — both before the drag/link branches that
+                        // would otherwise claim the top chrome band.
+                        {
+                            int br_id = okai_find_by_win(i);
+                            if (br_id >= 0) {
+                                int on_close = 0;
+                                int ti = okai_tab_hit(br_id, mx, my, &on_close);
+                                if (ti >= 0) {
+                                    if (on_close) okai_close_tab(br_id, ti);
+                                    else okai_switch_tab(br_id, ti);
+                                    clicked = 1;
+                                    break;
+                                }
+                                int nav = okai_check_nav_click(br_id, mx, my);
+                                if (nav != NAV_NONE) {
+                                    serial_printf("[okai] nav action=%d (mx=%d my=%d)\n", nav, mx, my);
+                                    if (nav == NAV_BACK) okai_nav_back(br_id);
+                                    else if (nav == NAV_FWD) okai_nav_fwd(br_id);
+                                    else if (nav == NAV_RELOAD) okai_nav_reload(br_id);
+                                    else if (nav == NAV_HOME) okai_nav_home(br_id);
+                                    else if (nav == NAV_NEWTAB) okai_new_tab(br_id, OKAI_HOME_URL);
+                                    clicked = 1;
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Grid top mirrors window_paint_region: a no_titlebar
+                        // window's content grid starts right below the border
+                        // (the old +WIN_TITLE_H offset put every click ~1.25
+                        // rows below the link it was aimed at — links never
+                        // hit).
+                        int grid_top = w->y + WIN_BORDER +
+                                       (w->no_titlebar ? 0 : WIN_TITLE_H);
+                        // Top chrome band: drag the window by it — except the
+                        // address bar, which click-focuses for typing (like
+                        // pressing 'g'). Anything else must NOT clear the URL
+                        // display; stray chrome clicks used to wipe it.
+                        if (my < w->y + WIN_TITLE_H + WIN_BORDER) {
+                            int br_id2 = okai_find_by_win(i);
+                            if (br_id2 >= 0 && okai_addr_bar_hit(br_id2, mx, my)) {
+                                struct okai* ok = okai_get(br_id2);
+                                if (ok && !ok->addr_bar_focused) {
+                                    ok->addr_bar_focused = 1;
+                                    ok->addr_input_len = 0;
+                                    ok->addr_input[0] = 0;
+                                    okai_render_content(br_id2);
+                                }
+                            } else {
+                                drag_win = i;
+                                drag_off_x = mx - w->x;
+                                drag_off_y = my - w->y;
+                            }
+                        }
+                        // Okai content → hit-test clickable links.
+                        else if (mx >= w->x + WIN_BORDER && mx < w->x + w->w - WIN_BORDER &&
+                                 my >= grid_top &&
+                                 my < w->y + w->h - WIN_BORDER) {
+                            int br_id = okai_find_by_win(i);
+                            if (br_id >= 0) {
+                                struct okai* ok = okai_get(br_id);
+                                struct okai_tab* T = ok ? okai_tab_of(ok) : 0;
+                                if (ok && T->link_count > 0) {
+                                    int ox = w->x + WIN_BORDER;
+                                    int cw = CHAR_W * w->font_scale;
+                                    int chh = CHAR_H * w->font_scale;
+                                    int col = (mx - ox) / cw;
+                                    int row = (my - grid_top) / chh;
+                                    serial_printf("[okai] click row=%d col=%d (mx=%d my=%d) links=%d\n",
+                                                  row, col, mx, my, T->link_count);
+                                    for (int li = 0; li < T->link_count; li++) {
+                                        if (T->links[li].row == row &&
+                                            col >= T->links[li].col0 &&
+                                            col <= T->links[li].col1) {
+                                            serial_printf("[okai] LINK HIT li=%d -> %s\n",
+                                                          li, T->links[li].href);
+                                            // Links navigate the CURRENT tab
+                                            // in place — one browser window,
+                                            // tabs instead of window sprawl.
+                                            okai_navigate(br_id, T->links[li].href);
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         clicked = 1;
                         break;
@@ -954,65 +1059,107 @@ void kernel_main(uint32_t mboot_addr) {
         // Check for pending HTTP responses to save
         check_save_http_response();
 
-        // Check if any browser needs response data processed (HTTP or HTTPS)
-        for (int bi = 0; bi < MAX_BROWSERS; bi++) {
-            struct browser* br = browser_get(bi);
-            if (!br) continue;
-
-            // HTTPS: response was buffered synchronously by https_get() into
-            // the TLS response buffer; parse it once when it's ready.
-            if (br->is_https) {
-                if (tls_is_done() && br->token_count == 0) {
+        // Drive okai fetches. The network stack services a SINGLE global TCP
+        // connection + response buffer, so only one fetch may be in flight at a
+        // time. It is attributed to okai_fetch_owner; windows with token_count==0
+        // are pending and are started in turn (lowest id first). Serializing this
+        // way stops concurrent/mixed-protocol windows from corrupting the shared
+        // TLS/TCP state (which froze the desktop) or mis-routing each other's
+        // response bytes into the wrong buffer (which left windows blank).
+        if (okai_fetch_owner >= 0) {
+            int bi = okai_fetch_owner;
+            struct okai* ok = okai_get(bi);
+            struct okai_tab* T = ok ? okai_tab_of(ok) : 0;
+            if (!ok) {
+                okai_fetch_owner = -1;
+            } else if (T->is_https) {
+                if (tls_is_done()) {
                     int resp_len = tls_get_response_len();
                     char* resp = tls_get_response();
                     if (resp && resp_len > 0) {
-                        resp_len = http_dechunk(resp, resp_len);
-                        int count = html_parse(resp, resp_len,
-                                               br->tokens, HTML_MAX_TOKENS);
-                        serial_puts("[br] https parse: count=");
-                        serial_putchar('0' + (count / 10) % 10);
-                        serial_putchar('0' + count % 10);
-                        serial_puts(" len=");
-                        serial_putchar('0' + (resp_len / 100) % 10);
-                        serial_putchar('0' + (resp_len / 10) % 10);
-                        serial_putchar('0' + resp_len % 10);
-                        serial_putchar('\n');
-                        br->token_count = count > 0 ? count : -1;
-                        html_get_title(resp, resp_len, br->title, 64);
-                        br->last_resp_len = resp_len;
-                        render_content(bi);
-                        window_set_title(br->win_id,
-                                         br->title[0] ? br->title : "okai");
+                        if (okai_check_redirect(bi, resp, resp_len)) {
+                            // 3xx followed; owner stays bi, new fetch issued
+                        } else {
+                            resp_len = http_dechunk(resp, resp_len);
+                            int css_len = html_extract_css(resp, resp_len,
+                                                           T->css_text, OKAI_CSS_TEXT);
+                            T->css_n = css_parse(T->css_text, css_len,
+                                                  T->css_rules, CSS_MAX_RULES);
+                            serial_printf("[br] css rules=%d\n", T->css_n);
+                            serial_puts("[br] css text (first 200): ");
+                            for (int ci = 0; ci < 200 && T->css_text[ci]; ci++)
+                                serial_putchar(T->css_text[ci]);
+                            serial_putchar('\n');
+                            int count = html_parse(resp, resp_len,
+                                                  T->tokens, OKAI_TAB_TOKENS);
+                            serial_printf("[br] https parse: count=%d len=%d\n",
+                                          count, resp_len);
+                            T->token_count = count > 0 ? count : -1;
+                            html_get_title(resp, resp_len, T->title, 64);
+                            T->last_resp_len = resp_len;
+                            okai_render_content(bi);
+                            window_set_title(ok->win_id,
+                                             T->title[0] ? T->title : "okai");
+                            okai_fetch_owner = -1;
+                        }
                     }
+                } else if (!tls_is_active() && !tls_is_done()) {
+                    // Fetch gave up (TLS timeout / unreachable) — don't retry
+                    // forever and don't block later windows from loading.
+                    okai_fetch_owner = -1;
+                    T->token_count = -1;
+                    T->last_resp_len = 0;
+                    okai_render_content(bi); // show "Unable to load" page
                 }
-                continue;
+            } else {
+                int resp_len = http_get_response_len();
+                int done = http_is_done();
+                if (done && resp_len > 0) {
+                    char* resp = http_get_response();
+                    if (resp && okai_check_redirect(bi, resp, resp_len)) {
+                        // 3xx followed; owner stays bi
+                    } else if (resp) {
+                        resp_len = http_dechunk(resp, resp_len);
+                        int css_len = html_extract_css(resp, resp_len,
+                                                       T->css_text, OKAI_CSS_TEXT);
+                        T->css_n = css_parse(T->css_text, css_len,
+                                              T->css_rules, CSS_MAX_RULES);
+                        serial_printf("[br] css rules=%d\n", T->css_n);
+                        serial_puts("[br] css text (first 200): ");
+                        for (int ci = 0; ci < 200 && T->css_text[ci]; ci++)
+                            serial_putchar(T->css_text[ci]);
+                        serial_putchar('\n');
+                        int count = html_parse(resp, resp_len,
+                                               T->tokens, OKAI_TAB_TOKENS);
+                        serial_printf("[br] parse: count=%d len=%d\n",
+                                      count, resp_len);
+                        // -1 sentinel: "parsed, nothing renderable" — keeps this
+                        // block from re-parsing every frame on empty pages
+                        T->token_count = count > 0 ? count : -1;
+                        html_get_title(resp, resp_len, T->title, 64);
+                        T->last_resp_len = resp_len;
+                        okai_render_content(bi);
+                        window_set_title(ok->win_id,
+                                         T->title[0] ? T->title : "okai");
+                        okai_fetch_owner = -1;
+                    }
+                } else if (!http_is_pending() && !http_is_retry_pending() && !http_is_done()) {
+                    // Fetch gave up (connection closed with no data / unreachable)
+                    okai_fetch_owner = -1;
+                    T->token_count = -1;
+                    T->last_resp_len = 0;
+                    okai_render_content(bi); // show "Unable to load" page
+                }
             }
-
-            int resp_len = http_get_response_len();
-            int done = http_is_done();
-            int need_parse = (br->token_count == 0 && done);
-            if (need_parse && resp_len > 0) {
-                char* resp = http_get_response();
-                if (resp) {
-                    resp_len = http_dechunk(resp, resp_len);
-                    int count = html_parse(resp, resp_len,
-                                           br->tokens, HTML_MAX_TOKENS);
-                    serial_puts("[br] parse: count=");
-                    serial_putchar('0' + (count / 10) % 10);
-                    serial_putchar('0' + count % 10);
-                    serial_puts(" len=");
-                    serial_putchar('0' + (resp_len / 100) % 10);
-                    serial_putchar('0' + (resp_len / 10) % 10);
-                    serial_putchar('0' + resp_len % 10);
-                    serial_putchar('\n');
-                    // -1 sentinel: "parsed, nothing renderable" — keeps this
-                    // block from re-parsing every frame on empty pages
-                    br->token_count = count > 0 ? count : -1;
-                    html_get_title(resp, resp_len, br->title, 64);
-                    br->last_resp_len = resp_len;
-                    render_content(bi);
-                    window_set_title(br->win_id,
-                                     br->title[0] ? br->title : "okai");
+        } else {
+            // No fetch in flight: start the lowest-index window still needing one.
+            for (int bi = 0; bi < MAX_OKAIS; bi++) {
+                struct okai* ok = okai_get(bi);
+                struct okai_tab* T = ok ? okai_tab_of(ok) : 0;
+                if (ok && T->token_count == 0) {
+                    if (okai_start_fetch(bi) == 0)
+                        okai_fetch_owner = bi; // only claim ownership if a fetch fired
+                    break;
                 }
             }
         }
@@ -1155,27 +1302,50 @@ void kernel_main(uint32_t mboot_addr) {
         }
 
         // Draw windows (only dirty ones — editor marks itself dirty on keystroke)
-        window_draw_all();
+        // Windows back-to-front with each okai's chrome painted with its own
+        // window (z-order correct — see desktop_paint_rect_skip).
+        {
+            int focused = -1;
+            for (int i = 0; i < MAX_WINDOWS; i++) {
+                struct window* win = window_get(i);
+                if (win && win->visible && !win->minimized) {
+                    if (win->focused) focused = i;
+                    else {
+                        window_draw(i);
+                        int ob = okai_find_by_win(i);
+                        if (ob >= 0) okai_paint_overlays(ob);
+                    }
+                }
+            }
+            if (focused >= 0) {
+                window_draw(focused);
+                int ob = okai_find_by_win(focused);
+                if (ob >= 0) okai_paint_overlays(ob);
+            }
+        }
         window_draw_taskbar();
 
         // FPS counter (drawn before the cursor so the sprite sits on top)
+        static int g_show_fps = 0; // debug HUD; keep 0 to leave the desktop clean
         frame_count++;
         if (tick_count - last_fps_tick >= 18) {
             fps = frame_count;
             frame_count = 0;
             last_fps_tick = tick_count;
         }
-        // FPS counter — box sized from glyph metrics ("FPS: 9999" = 9 cells)
-        char fps_buf[16] = "FPS: ";
-        char num[8];
-        put_uint(num, fps);
-        int fi = 5;
-        int ni = 0;
-        while (num[ni]) fps_buf[fi++] = num[ni++];
-        fps_buf[fi] = 0;
-        int fps_w = 9 * CHAR_W + 8;
-        rect_fill(SCREEN_W - fps_w - 4, 4, fps_w, CHAR_H + 8, 0x00000000);
-        draw_string(SCREEN_W - fps_w, 8, fps_buf, 0x00FFFFFF, 0x00000000);
+        if (g_show_fps) {
+            // FPS counter — box sized from glyph metrics ("FPS: 9999" = 9 cells)
+            char fps_buf[16] = "FPS: ";
+            char num[8];
+            put_uint(num, fps);
+            int fi = 5;
+            int ni = 0;
+            while (num[ni]) fps_buf[fi++] = num[ni++];
+            fps_buf[fi] = 0;
+            int fps_w = 9 * CHAR_W + 8;
+            rect_fill(SCREEN_W - fps_w - 4, 4, fps_w, CHAR_H + 8, 0x00000000);
+            draw_string(SCREEN_W - fps_w, 8, fps_buf, 0x00FFFFFF, 0x00000000);
+        }
 
         // Cursor composited last, from an atomic position snapshot — nothing
         // draws after it, so the sprite can never be half-erased on screen

@@ -17,10 +17,10 @@ align 4
     dd 0    ; unused
     dd 0    ; unused
     dd 0    ; unused
-    ; Video: linear graphics, 1024x768, 32bpp
+    ; Video: linear graphics, 1920x1080, 32bpp
     dd 0    ; mode_type = 0 (linear)
-    dd 1024 ; width
-    dd 768  ; height
+    dd 1920 ; width
+    dd 1080 ; height
     dd 32   ; bpp
 
 ; Stack — 256KB. tls_client_run keeps several ~18KB on-stack record buffers

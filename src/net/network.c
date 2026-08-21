@@ -32,6 +32,10 @@ static uint16_t dns_tx_id = 0x1234;
 static uint32_t dns_resolved_ip = 0;
 static int dns_resolved = 0;
 static int dns_pending = 0;
+// The host the cached dns_resolved_ip belongs to. DNS has no per-host cache,
+// so we must only reuse the cached IP when the requested host matches — otherwise
+// a second navigation would connect to the first host's IP and hang.
+static char dns_resolved_host[128] = {0};
 
 // Pending operation state (for retry after ARP resolves)
 static int ping_pending = 0;
@@ -41,10 +45,32 @@ static uint16_t ping_seq = 0;
 
 static char dns_pending_host[128] = {0};
 static int dns_retry_pending = 0;
+// Host of the last DNS query actually TRANSMITTED (set where the query goes
+// on the wire, after ARP). On a definitive DNS failure (RCODE error or a
+// response with no A record), this tells us whose pending request to abort.
+static char dns_query_host[128] = {0};
 
 static char http_pending_host[128] = {0};
 static char http_pending_path[128] = {0};
 static int http_retry_pending = 0;
+static uint16_t http_pending_port = 80; // port for the parked request
+// Connection attempts for the current (in-flight) request. Bounded so an
+// unreachable host gives up instead of letting net_poll re-fire http_get forever
+// (which would wedge the single-owner fetch model in okai.c).
+static int http_conn_attempts = 0;
+#define HTTP_MAX_CONN_ATTEMPTS 4
+
+// Copy a host/path string, always NUL-terminating at the ACTUAL length.
+// The old pattern (copy loop + dst[127]=0) left the previous, longer value's
+// tail in place when the new value was shorter: fetching example.com then
+// iana.org left "iana.orgcom" in dns_resolved_host, so dns_host_matches()
+// failed forever and the okai fetch stalled in HP_DNS until timeout
+// (the "clicked link opens a black window" bug).
+static void net_copy_str(char* dst, const char* src) {
+    int i = 0;
+    while (src[i] && i < 127) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
 
 // Network event callback (for terminal output)
 static void (*net_event_callback)(const char* msg) = 0;
@@ -81,6 +107,15 @@ struct tcp_conn {
 
 static struct tcp_conn tcp_conn;
 
+// Ephemeral source port for outbound TCP connections. Incremented on every
+// connect so consecutive fetches don't share a 4-tuple — QEMU's SLIRP NAT
+// keeps the previous connection's mapping (TIME_WAIT) around and would
+// otherwise route/drop the second connection's SYN and its response. Observed
+// symptom: the first HTTPS fetch worked, the second hung forever at the TCP
+// handshake (SYN retransmits, no SYNACK). A fresh source port gives SLIRP a
+// clean mapping so the second fetch completes on the first attempt.
+static uint16_t tcp_ephemeral_port = 43210;
+
 // Unacked outbound data for retransmission. Our sends are a GET request
 // (<= ~512 bytes) or bare FIN, so 4KB is ample for this stack.
 #define TCP_RTX_BUF_SIZE 4096
@@ -108,7 +143,9 @@ static void tcp_rtx_arm(void) {
 // Simple HTTP client state
 static int http_pending = 0;
 static int http_done = 0; // Set when connection closes with data
-static char http_response[4096];
+// Real pages run large (google.com serves ~85KB of HTML); a 64KB buffer
+// truncated mid-script, and the parser then produced only the header links.
+static char http_response[131072];
 static int http_response_len = 0;
 
 static uint16_t net_checksum(void* data, int len) {
@@ -396,6 +433,49 @@ static int dns_decode_name(uint8_t* packet, int offset, char* out, int max_len) 
     return original_offset;
 }
 
+// Case-insensitive hostname comparison (hostnames are case-insensitive).
+static int dns_host_matches(const char* a, const char* b);
+
+// A DNS query for `dns_query_host` has definitively failed (RCODE error or a
+// response carrying no A record). If an HTTP fetch was parked waiting on this
+// host (http_retry_pending), abort it now — otherwise the okai HTTP give-up
+// condition (!http_is_retry_pending()) can never fire and the fetch owner
+// wedges forever, leaving every later okai window black.
+static void dns_fail_pending_http(void) {
+    if (http_retry_pending && dns_host_matches(dns_query_host, http_pending_host)) {
+        http_retry_pending = 0;
+        serial_puts("[dns] failed for pending HTTP host, aborting request\n");
+    }
+}
+
+// Parse a strict dotted-quad ("10.0.2.2") into the DNS-cache layout
+// (first octet in the high byte). Returns 1 on success.
+static int net_parse_ip(const char* s, uint32_t* out) {
+    uint32_t ip = 0;
+    for (int oct = 0; oct < 4; oct++) {
+        int val = 0, digits = 0;
+        while (*s >= '0' && *s <= '9' && digits < 3) { val = val * 10 + (*s - '0'); s++; digits++; }
+        if (!digits || val > 255) return 0;
+        ip = (ip << 8) | (uint32_t)val;
+        if (oct < 3) {
+            if (*s != '.') return 0;
+            s++;
+        }
+    }
+    if (*s) return 0; // trailing junk — it's a hostname, not an IP
+    *out = ip;
+    return 1;
+}
+
+// Seed the DNS cache with a literal address — numeric-IP URLs skip DNS.
+void dns_seed(const char* host, uint32_t ip) {
+    net_copy_str(dns_resolved_host, host);
+    dns_resolved_ip = ip;
+    dns_resolved = 1;
+    dns_pending = 0;
+    serial_puts("[dns] numeric host, seeded\n");
+}
+
 static void handle_dns_response(uint8_t* data, uint16_t len) {
     if (len < 12) return;
 
@@ -410,6 +490,7 @@ static void handle_dns_response(uint8_t* data, uint16_t len) {
         serial_putchar('0' + (flags & 0xF));
         serial_putchar('\n');
         dns_pending = 0;
+        dns_fail_pending_http();
         return;
     }
 
@@ -473,25 +554,28 @@ static void handle_dns_response(uint8_t* data, uint16_t len) {
         }
         offset += rdlength;
     }
+    // Response parsed but carried no usable A record — definitive failure.
     dns_pending = 0;
+    dns_fail_pending_http();
 }
 
 int dns_resolve(const char* hostname) {
     dns_resolved = 0;
     dns_pending = 1;
     dns_tx_id++;
+    net_copy_str(dns_resolved_host, hostname);
 
     uint8_t dns_server_ip[4] = {10, 0, 2, 3}; // QEMU SLIRP DNS
 
     uint8_t target_mac[6];
     if (!arp_resolve(dns_server_ip, target_mac)) {
         arp_send_request(dns_server_ip);
-        for (int i = 0; hostname[i] && i < 127; i++) dns_pending_host[i] = hostname[i];
-        dns_pending_host[127] = 0;
+        net_copy_str(dns_pending_host, hostname);
         dns_retry_pending = 1;
         return -1; // Waiting for ARP
     }
     dns_retry_pending = 0;
+    net_copy_str(dns_query_host, hostname);
 
     uint8_t frame[ETH_FRAME_MAX];
     uint8_t* mac = e1000_get_mac();
@@ -565,8 +649,21 @@ int dns_resolve(const char* hostname) {
     return 0;
 }
 
-int dns_is_resolved(uint32_t* ip) {
-    if (dns_resolved) {
+// Case-insensitive hostname comparison (hostnames are case-insensitive).
+static int dns_host_matches(const char* a, const char* b) {
+    int i = 0;
+    while (a[i] && b[i]) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return 0;
+        i++;
+    }
+    return a[i] == b[i];
+}
+
+int dns_is_resolved(uint32_t* ip, const char* host) {
+    if (dns_resolved && dns_host_matches(dns_resolved_host, host)) {
         *ip = dns_resolved_ip;
         return 1;
     }
@@ -601,7 +698,9 @@ void tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
     tcp_conn.dst_ip[1] = (dst_ip >> 16) & 0xFF;
     tcp_conn.dst_ip[2] = (dst_ip >> 8) & 0xFF;
     tcp_conn.dst_ip[3] = dst_ip & 0xFF;
-    tcp_conn.src_port = 43210;
+    tcp_conn.src_port = tcp_ephemeral_port;
+    if (tcp_ephemeral_port >= 0xFFFE) tcp_ephemeral_port = 44000;
+    else tcp_ephemeral_port++;
     tcp_conn.dst_port = dst_port;
     tcp_conn.seq = 0x1000;
     tcp_conn.ack = 0;
@@ -1013,40 +1112,31 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
 
                 int copy = payload_len;
                 if (copy > 1500) copy = 1500;
-                if (http_response_len + copy > 4095) copy = 4095 - http_response_len;
+                if (http_response_len + copy > (int)sizeof(http_response) - 1)
+                    copy = (int)sizeof(http_response) - 1 - http_response_len;
                 for (int i = 0; i < copy; i++) {
                     http_response[http_response_len + i] = data[data_offset + i];
                 }
                 http_response_len += copy;
                 http_response[http_response_len] = 0;
 
-                serial_puts("[http] segment, total ");
-                serial_putchar('0' + (http_response_len / 1000) % 10);
-                serial_putchar('0' + (http_response_len / 100) % 10);
-                serial_putchar('0' + (http_response_len / 10) % 10);
-                serial_putchar('0' + (http_response_len % 10));
-                serial_puts(" bytes\n");
+                serial_printf("[http] segment, total %u bytes\n",
+                              (unsigned)http_response_len);
 
-                // Terminal preview from the FIRST segment only (headers visible
-                // there by design; the browser strips them via html_parse)
+                // Terminal preview from the FIRST segment only. Show just the
+                // status line — the old 180-byte raw-header dump flooded the
+                // terminal on every fetch (full headers stay in the serial
+                // log, where debugging belongs).
                 if (http_response_len == copy) {
                     for (int i = 0; i < 255; i++) net_event_msg[i] = 0;
                     int idx = 0;
-                    const char* hdr = "HTTP response (";
-                    for (int i = 0; hdr[i]; i++) net_event_msg[idx++] = hdr[i];
-                    net_event_msg[idx++] = '0' + (http_response_len / 100);
-                    net_event_msg[idx++] = '0' + (http_response_len / 10) % 10;
-                    net_event_msg[idx++] = '0' + (http_response_len % 10);
-                    const char* hdr2 = " bytes):\n";
-                    for (int i = 0; hdr2[i]; i++) net_event_msg[idx++] = hdr2[i];
-                    int disp_len = http_response_len < 180 ? http_response_len : 180;
-                    for (int i = 0; i < disp_len && idx < 254; i++) {
-                        net_event_msg[idx++] = http_response[i];
+                    for (int i = 0; i < copy && idx < 60; i++) {
+                        char ch = http_response[i];
+                        if (ch == '\r' || ch == '\n') break;
+                        net_event_msg[idx++] = ch;
                     }
-                    if (http_response_len > 180) {
-                        const char* dots = "\n...(truncated)";
-                        for (int i = 0; dots[i] && idx < 254; i++) net_event_msg[idx++] = dots[i];
-                    }
+                    const char* tail = " — receiving...";
+                    for (int i = 0; tail[i] && idx < 254; i++) net_event_msg[idx++] = tail[i];
                     net_event_msg[idx++] = '\n';
                     net_event_msg[idx] = 0;
                     net_event_pending = 1;
@@ -1081,49 +1171,73 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
 }
 
 void http_get(const char* host, const char* path) {
+    http_get_port(host, path, 80);
+}
+
+// Port-aware GET (numeric-IP URLs and non-80 ports). port 0 means 80.
+void http_get_port(const char* host, const char* path, uint16_t port) {
+    uint16_t use_port = port ? port : 80;
+    http_pending_port = use_port;
+
     // Every request starts a fresh response lifecycle. Without this, a
-    // second fetch (e.g. browser refresh) raced the parse block with the
+    // second fetch (e.g. okai refresh) raced the parse block with the
     // PREVIOUS response's stale http_done=1 + buffer: an immediate bogus
     // parse ran, double-dechunked the buffer to garbage, and the sentinel
     // then blocked the real response from ever rendering.
     http_response_len = 0;
     http_done = 0;
 
+    // Numeric host ("10.0.2.2")? Seed the cache and skip DNS entirely.
+    uint32_t nip;
+    if (net_parse_ip(host, &nip)) dns_seed(host, nip);
+
     // Resolve hostname first
     uint32_t ip;
-    if (dns_is_resolved(&ip)) {
-        // Already resolved, connect directly
+    if (dns_is_resolved(&ip, host)) {
+        // Already resolved for this host, connect directly
     } else if (dns_is_pending()) {
         // Save for retry after DNS completes
-        for (int i = 0; host[i] && i < 127; i++) http_pending_host[i] = host[i];
-        http_pending_host[127] = 0;
-        for (int i = 0; path[i] && i < 127; i++) http_pending_path[i] = path[i];
-        http_pending_path[127] = 0;
+        net_copy_str(http_pending_host, host);
+        net_copy_str(http_pending_path, path);
         http_retry_pending = 1;
         return;
     } else {
         dns_resolve(host);
-        for (int i = 0; host[i] && i < 127; i++) http_pending_host[i] = host[i];
-        http_pending_host[127] = 0;
-        for (int i = 0; path[i] && i < 127; i++) http_pending_path[i] = path[i];
-        http_pending_path[127] = 0;
+        net_copy_str(http_pending_host, host);
+        net_copy_str(http_pending_path, path);
         http_retry_pending = 1;
         return;
     }
 
-    // Start TCP connection if not connected
-    if (tcp_conn.state == TCP_STATE_CLOSED) {
-        // Save for retry after TCP handshake completes
-        for (int i = 0; host[i] && i < 127; i++) http_pending_host[i] = host[i];
-        http_pending_host[127] = 0;
-        for (int i = 0; path[i] && i < 127; i++) http_pending_path[i] = path[i];
-        http_pending_path[127] = 0;
+    // The stack services one global connection, so a new request must open a
+    // fresh one unless the current session is a live, reusable ESTABLISHED
+    // (keep-alive) connection. Every other state (CLOSED, FIN_WAIT, CLOSE_WAIT,
+    // TIME_WAIT, LAST_ACK) means the previous fetch ended — reconnect.
+    if (tcp_conn.state == TCP_STATE_ESTABLISHED) {
+        // Keep-alive: reuse the live connection, fall through to send the GET.
+    } else if (tcp_conn.state == TCP_STATE_SYN_SENT) {
+        // Handshake already in progress for this request; the retry path
+        // re-fires http_get() once it reaches ESTABLISHED.
+        net_copy_str(http_pending_host, host);
+        net_copy_str(http_pending_path, path);
         http_retry_pending = 1;
-        tcp_connect(ip, 80);
-        return;
-    }
-    if (tcp_conn.state == TCP_STATE_SYN_SENT) {
         serial_puts("[http] waiting for TCP handshake...\n");
+        return;
+    } else {
+        // Previous connection ended (or is mid-close) — open a fresh one.
+        http_conn_attempts++;
+        if (http_conn_attempts > HTTP_MAX_CONN_ATTEMPTS) {
+            // Unreachable after several SYN attempts: abandon this request so
+            // the okai owner model can move on to the next pending window.
+            http_retry_pending = 0;
+            http_done = 0;
+            serial_puts("[http] giving up: host unreachable\n");
+            return;
+        }
+        net_copy_str(http_pending_host, host);
+        net_copy_str(http_pending_path, path);
+        http_retry_pending = 1;
+        tcp_connect(ip, use_port);
         return;
     }
 
@@ -1151,6 +1265,9 @@ void http_get(const char* host, const char* path) {
     for (int i = 0; host[i]; i++) req_buf[req_len++] = host[i];
     req_buf[req_len++] = '\r';
     req_buf[req_len++] = '\n';
+
+    const char* hdr_ua = "User-Agent: okernel/0.4\r\nAccept: */*\r\n";
+    for (int i = 0; hdr_ua[i]; i++) req_buf[req_len++] = hdr_ua[i];
 
     const char* hdr_end = "Connection: close\r\n\r\n";
     for (int i = 0; hdr_end[i]; i++) req_buf[req_len++] = hdr_end[i];
@@ -1245,6 +1362,10 @@ int http_dechunk(char* buf, int len) {
 int http_get_response_len(void) { return http_response_len; }
 int http_is_pending(void) { return http_pending; }
 int http_is_done(void) { return http_done; }
+int http_is_retry_pending(void) { return http_retry_pending; }
+// Reset the connection-attempt counter for a brand-new request (called by the
+// okai fetch driver before http_get; NOT by net_poll's retry re-fire).
+void http_reset_conn_attempts(void) { http_conn_attempts = 0; }
 
 void net_set_event_callback(void (*cb)(const char* msg)) {
     net_event_callback = cb;
@@ -1312,13 +1433,13 @@ void net_poll(void) {
     // Retry HTTP after DNS resolves
     if (http_retry_pending) {
         uint32_t ip;
-        if (dns_is_resolved(&ip)) {
+        if (dns_is_resolved(&ip, http_pending_host)) {
             if (tcp_conn.state == TCP_STATE_CLOSED) {
                 http_retry_pending = 0;
-                http_get(http_pending_host, http_pending_path);
+                http_get_port(http_pending_host, http_pending_path, http_pending_port);
             } else if (tcp_conn.state == TCP_STATE_ESTABLISHED) {
                 http_retry_pending = 0;
-                http_get(http_pending_host, http_pending_path);
+                http_get_port(http_pending_host, http_pending_path, http_pending_port);
             }
         }
     }

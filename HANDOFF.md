@@ -5,9 +5,9 @@
 okernel is a from-scratch operating system built in C and x86 assembly. It has two modes:
 
 - **Text mode** (`make text`) — VGA text terminal with commands, scrolling, terminal multiplexing
-- **Desktop mode** (`make desktop`) — 1024x768x32bpp graphical desktop with windows, mouse, browser, editor, and shell
+- **Desktop mode** (`make desktop`) — 1024x768x32bpp graphical desktop with windows, mouse, okai, editor, and shell
 
-Current version: **v0.4** (desktop edition: 1024x768x32bpp, working browser with resizable windows)
+Current version: **v0.4** (desktop edition: 1024x768x32bpp, working okai with resizable windows)
 
 ---
 
@@ -28,7 +28,7 @@ okernel/
 │   │
 │   ├── filesystem.c/.h    # In-memory virtual filesystem (16 files, 4KB max)
 │   ├── editor.c/.h        # Text editor (open, edit, save files in windows)
-│   ├── browser.c/.h       # Web browser (URL bar, navigation, HTML rendering)
+│   ├── okai.c/.h       # Web okai (URL bar, navigation, HTML rendering)
 │   ├── html.c/.h          # HTML parser (strips headers, tokenizes tags)
 │   │
 │   ├── gdt.c/.h           # Global Descriptor Table setup
@@ -116,13 +116,73 @@ The cursor is a **stateless sprite** — there is NO saved background patch and 
 8. **TCP**: Minimal stack — SYN/SYN-ACK/ACK/FIN, data transfer, retransmission with exponential backoff (220ms base, 6 attempts, then give-up + timeout message), cumulative ACK processing, RX dedup by sequence number (duplicates re-ACKed, out-of-order dropped), `netdrop N` shell command drops 1-in-N received TCP packets for testing (ARP/DNS/ICMP always pass)
 9. **HTTP**: GET requests, response buffering
 
-### Browser (okai)
+### Okai (okai)
 - **HTML parser** (`html.c`): Strips HTTP headers (`\r\n\r\n`), skips `<head>`, `<script>`, `<style>` blocks, tokenizes h1-h6, p, a, li, pre, br, hr, text
-- **Browser window** (`browser.c`): Address bar (g to focus, Esc to exit), toolbar, scrollable content
+- **Okai window** (`okai.c`): Address bar (g to focus, Esc to exit), toolbar, scrollable content
+- **Scrolling** (`okai.c`): LINE-based via a virtual document — `okai_render_content` lays the WHOLE page out once into a static offscreen grid (`doc_chars`/`doc_attrs`, 1024 lines × 128 cols, shared scratch — only live during render), clamps `scroll_y` to `[0, doc_lines - view_h]`, then blits the visible slice into the window buffer with `window_write_cell`. `content_height` is the true full-page height measured by this layout pass. Do NOT go back to rendering straight into the window with a token-granular `skip`: that re-measured content_height from the scrolled render (bound shrank ~2 lines per 1 line scrolled → j/k stalled) and skipped 2-3 lines per step. `HTML_END_PARA` (`</p>/</div>/</li>` closes) terminates the current line in the layout pass — without it blocks jam together and pages are too short to scroll. Links are recorded in doc rows, then converted to BUFFER rows (`doc_row - scroll_y + 2`; the +2 is toolbar/address bar) after the clamp; off-screen links are invalidated (-1) so they never match clicks.
 - **Keyboard**: g=address bar, j/k=scroll, r=refresh, b=back
 - **Navigation**: Enter to go, back button with 4-page history
-- **Rendering**: Text content with headings, paragraphs, links (cyan), lists, preformatted blocks
+- **Rendering**: CSS-styled text — headings, paragraphs, links, lists, preformatted blocks. A from-scratch CSS engine (`src/css.c`) applies `color`/`background`/`text-align`/`display:none`/`margin` from inline `style=` and `<style>` blocks.
+- **Body inheritance**: `<body>`-level styles (`text-align`, `color`, …) are folded into every element via `css_merge_base` so `body{text-align:center}` actually centers content (the flat tokenizer has no DOM hierarchy). The body's `background-color` is the **page background** (painted across the whole content area via `window_set_content_bg`), NOT per-character — and a readable default text color is chosen (black on light pages, white on dark) so text never drowns in white. `render_content` sets the page bg *before* `window_clear` so blank cells carry it.
+- **Clickable links**: each `<a href>` is rendered on its own line in blue, recorded as a (row,col,href) region in `struct okai.links[]`, and a desktop mouse-click in that region calls `okai_navigate`. Relative hrefs (`/path`, `//host`, `page.html`) are resolved against the current URL scheme+host by `resolve_href`.
 - **HTTP integration**: Parses response after connection closes (`http_done` flag), accumulates TCP segments correctly
+
+---
+
+## Browser visual polish & toolbar navigation (2026-08 sessions)
+
+Goal: make **okai** look and behave like a real browser (visual polish first,
+then behavior), verified by screenshotting in QEMU and analyzing with the
+`opencode-go/mimo-v2.5` vision model (the base model has no image vision — route
+the PNG path into a vision subagent, do NOT eyeball pixels yourself).
+
+**Project path (this session):** all builds ran from
+`/media/notdexy/Новый том/projects/okernel` (the non-ASCII path) and worked.
+MEMORY.md's claim that the project "moved" to an ASCII path is STALE — verify
+with `ls` before trusting either path; they may be the same bind-mount.
+
+### What shipped
+- **Phase 0–1 — Firefox-ish blue pixel chrome** (`gradient_fill` primitive +
+  `theme.h` palette + `okai_draw_chrome`): tab strip, toolbar, primitive bitmap
+  nav-icon buttons (back/forward/reload/home), HTTPS lock, rounded active tab,
+  boxed `+` new-tab button, top-right `×` close. Drawn as **pixels** over the
+  window's top reserved rows (the window interior is a fixed character-cell grid;
+  chrome can't be restyled text — it must be a pixel overlay). `no_titlebar` window
+  mode added so the Win95 title bar is suppressed and the browser owns its top.
+- **Phase 3 — page CSS**: `OKAI_TEXT_PAD` page margins (content inset, both
+  gutters blank), bracketless **BLUE** links (hitbox = text span), H1 extra
+  spacing, HR/gutter fixes.
+- **Heading SIZE (the #1 visual gap) — DONE, vision-verified:** the window
+  interior is a uniform `CHAR_W×CHAR_H` cell grid, so headings can't be bigger
+  there. Fix = **pixel-overlay per heading line**: `doc_draw_heading()` places
+  each heading char every 2 grid columns and flags the line via `doc_line_kind[]`;
+  the blit blanks those grid cells (writes spaces) and
+  `okai_draw_heading_pixels()` (called from `okai_draw_chrome_all`, after
+  `window_draw_all`) paints the heading text at `scale = 2*font_scale` → exactly
+  2× the body glyph (32×64 px), matching page fg/bg. `window.c`'s `vga_to_rgb[16]`
+  was made non-static + `extern`-ed in `window.h` so heading colors match the body
+  exactly. Links are unaffected (headings aren't links). Vision confirmed ~2×,
+  no ghosting/clipping, reasonable spacing. **All of H1–H6 currently render at
+  2×** (no hierarchy yet — see Next Steps).
+- **Toolbar nav buttons are now CLICKABLE** (were visual-only): `okai_check_nav_click()`
+  (geometry mirrors `okai_draw_chrome` exactly — same `cx0/by/btn/gap`) routed in
+  `desktop.c`'s mouse handler *before* the title-drag / link branches; actions
+  `okai_nav_back/fwd/reload/home` call into the existing history/navigate logic.
+  `okai.h` gained the `NAV_*` constants + the four nav function decls.
+- **FPS HUD hidden** (`static int g_show_fps = 0` in `desktop.c`).
+- Test: `tests/headless/test_nav.py` (uses `OkVM`, mouse gain ≈4.2 → divide
+  deltas by 4.2 to converge without overshoot). Verification confirmed the
+  hit-test geometry is correct (a click at x≈99 logged `nav action=2` = FWD,
+  exactly matching the FWD rect `[74,100]`). The full 4-button sweep PASS was
+  being finalized at handoff — **run it to confirm all four light up**.
+
+### Known remaining visual gaps
+- Desktop/terminal/editor/sysinfo windows STILL use the Win95 blue title bar
+  (Phase 4 only unified the **browser** window). The OS looks like Win95 next to
+  a modern browser.
+- Nav icons are primitive geometric shapes (no real back-arrow / reload-circle).
+- Font is monospace bitmap (inherent from-scratch constraint — no Unicode/TTF).
+- Headings are all 2× (no H1>H2>H3 hierarchy).
 
 ---
 
@@ -139,7 +199,7 @@ Phase 6 (live in-kernel verification) are complete.
 | 3 key schedule (RFC 8446 §7.1) | `tls_keysched.c/.h` | **PASS** (13/13 host tests, RFC 8448 vector-validated) |
 | 4 full handshake driver | `tls_client.c/.h` | **PASS** — full handshake against example.com (Cloudflare), HTTP 200 received |
 | 5 kernel integration | `tls_net.c/.h`, `rand.c/.h` | **DONE** — Makefile wired, crypto linked, CPRNG seeded at boot, `https://` fetches work end-to-end in-kernel |
-| 6 QEMU verification | (not started) | **PASS** — verified in-kernel against example.com (Cloudflare) via QEMU SLIRP. Full DNS→TCP→TLS 1.3 handshake completes; 865-byte HTTP response decrypted and browser-parsed (7 HTML tokens). Driver: `test_net.py` pattern, command `browser https://example.com/`. **One bug fixed:** TCP segment length was taken from the padded Ethernet frame length instead of the IP `total_length`, so Ethernet min-frame padding (zeros) was fed to TLS as payload and RCV.NXT advanced by the pad count — breaking the handshake. Fixed in `src/net/network.c` (TCP branch of `handle_packet`). |
+| 6 QEMU verification | (not started) | **PASS** — verified in-kernel against example.com (Cloudflare) via QEMU SLIRP. Full DNS→TCP→TLS 1.3 handshake completes; 865-byte HTTP response decrypted and okai-parsed (7 HTML tokens). Driver: `test_net.py` pattern, command `okai https://example.com/`. **One bug fixed:** TCP segment length was taken from the padded Ethernet frame length instead of the IP `total_length`, so Ethernet min-frame padding (zeros) was fed to TLS as payload and RCV.NXT advanced by the pad count — breaking the handshake. Fixed in `src/net/network.c` (TCP branch of `handle_packet`). |
 
 ### Phase 4 — FIXED (4 bugs found and corrected)
 
@@ -223,8 +283,8 @@ sockets, performs the full handshake, sends GET /, and verifies HTML response.
    the kernel — `https_get` runs inside the keyboard ISR (IF=0), where polling
    the RX descriptors (DMA) is sufficient. The cost is the UI freezes for the
    ~1-2s fetch; a cooperative refactor remains a possible future improvement.
-5. **Browser HTTPS** — `browser https://host/path` is detected in
-   `parse_url` + `browser_open`/`navigate`/`back`; `https_get()` is called
+5. **Okai HTTPS** — `okai https://host/path` is detected in
+   `parse_url` + `okai_open`/`navigate`/`back`; `https_get()` is called
    instead of `http_get()`. The desktop main loop gained a parallel parse path
    that feeds `tls_get_response()` into `html_parse` once `tls_is_done()`.
 
@@ -253,7 +313,7 @@ qemu-system-i386 -cdrom okernel-desktop.iso -boot d -vga std \
   -display none -serial file:/tmp/ok/serial.log
 ```
 Then drive the desktop via QEMU monitor `sendkey` (see `test_net.py`): type
-`browser https://example.com/` into the focused terminal and press Enter.
+`okai https://example.com/` into the focused terminal and press Enter.
 Serial log shows: DNS → TCP → ClientHello → ServerHello (`cipher=0x1303
 group=0x1d`) → handshake keys derived → app data → close, ending with
 `[tls-net] received 865 bytes` and `[br] https parse: count=07`. A headless
@@ -266,6 +326,48 @@ zero padding was delivered to TLS as payload (and RCV.NXT advanced by the pad
 count), which broke the handshake. Fixed by computing `tcp_len` from
 `ip_header.total_length` and locating the TCP header at the IP IHL offset.
 (See Critical Bugs #19.)
+
+---
+
+## CSS engine (from scratch) — v0.5
+
+A from-scratch CSS implementation — no tinyjs, no external CSS library, preserving
+the project's from-scratch identity.
+
+**Files:** `src/css.c/.h` (engine), `src/html.c` (attribute capture + `<style>`
+extraction), `src/okai.c` (computed-style application). `src/css.o` added to
+`DESKTOP_OBJ`; `strncpy` added to `src/string.c` (freestanding libc lacked it).
+
+**Capabilities:**
+- Parses `<style>` blocks (`html_extract_css`) and inline `style=` attributes.
+- Selectors: `tag`, `.class`, `#id`, and compounds `tag.class` / `tag#id`.
+  (No descendant combinators, no attribute selectors.)
+- Cascade by specificity (`id·100 + class·10 + tag`) then source order; inline
+  `style=` overrides everything.
+- Properties: `color`, `background`/`background-color`, `font-size` (px),
+  `font-weight:bold`, `text-align`, `margin`/`-top`/`-bottom` (shorthand →
+  top+bottom), `display` (block/inline/none).
+- Colors: `#rgb`/`#rrggbb` + a small named set, quantized to the 16-color VGA
+  text palette (`window_set_text_color` fg/bg 0-15).
+- `html_token` now carries `tag`/`cls`/`id`/`style`; `okai.c` calls
+  `css_compute()` per token and applies fg/bg, `display:none` (skip), margins
+  (blank lines), `text-align` (center/right padding). Links keep cyan unless CSS
+  overrides the color.
+
+**Verification:**
+- Host unit test `tests/test_css.c` — 24 assertions, all PASS (parser, cascade,
+  inline override, color quantization, `<style>` extraction).
+- QEMU smoke (`/tmp/ok/css_smoke.py`): `example.com`'s inline `<style>`
+  (`body{background:#eee;...}a:link,a:visited{color:#348...}`) extracted, 5 rules
+  parsed, page rendered, no crash. `notdexy.ru` uses external stylesheets → 0
+  inline rules (expected; external CSS is deferred).
+
+**Deferred (future work):** external `<link rel=stylesheet>` (2nd TLS GET to the
+host); descendant combinators `a b` (needs a parent/ancestor tree; the token
+model is flat); full box model (padding/border/width affecting flow);
+`font-size`/`font-weight` visual effects (fixed-cell text grid today);
+pseudo-classes beyond tag-degradation (`:hover`, `:nth-child`; `a:link`/`:visited`
+currently collapse to tag `a`).
 
 ---
 
@@ -311,7 +413,7 @@ qemu-system-i386 ... -object filter-dump,id=dump0,netdev=net0,file=/tmp/net.pcap
 | ping | Ping gateway (10.0.2.2) |
 | ip | Show IP address |
 | resolve [host] | DNS lookup |
-| browser [url] | Open web browser (e.g. `browser http://example.com/`) |
+| okai [url] | Open web okai (e.g. `okai http://example.com/`) |
 | edit [file] | Open text editor with file |
 | ls | List files in virtual filesystem |
 | open [file] | Open file in text editor |
@@ -333,10 +435,11 @@ Same as above plus: `list`, `switch N`
 - **No real mouse scroll** — PS/2 3-byte mode only (scroll via keyboard)
 - **Minimal TCP** — no retransmission, no windowing, no congestion control
 - **HTTP limited** — single GET request (chunked transfer IS decoded via `http_dechunk`)
-- **HTTPS works** via the browser (`browser https://host/path`); it is a
+- **HTTPS works** via the okai (`okai https://host/path`); it is a
   blocking single-call fetch (UI freezes ~1-2s during the handshake). No
-  standalone `https` shell command yet (only the browser path is wired).
+  standalone `https` shell command yet (only the okai path is wired).
 - **TLS 1.3 limited to ChaCha20-Poly1305** — SHA-256 only; no AES-GCM, no SHA-384. Phase 4 + 5 complete.
+- **CSS is from-scratch and scoped** — selectors limited to `tag`/`.class`/`#id` (+ compounds); no descendant combinators, external stylesheets, box model, or most pseudo-classes. Colors quantized to the 16-color text palette, so gradients/alpha/`rgb()` etc. are unsupported.
 - **TCP minimal** — single connection, no windowing/congestion control, no out-of-order buffering (gaps re-ACKed until the server fills them). Retransmission IS implemented (timer + backoff + give-up). This is the foundation for the planned TLS 1.3 client.
 
 ---
@@ -347,7 +450,7 @@ Same as above plus: `list`, `switch N`
 - MMIO-based, supports TX and RX
 - RX/TX buffers at fixed low memory addresses (0x80000-0x9FFFF)
 - Descriptors at 0x80000 (RX) and 0x90000 (TX)
-- **RX ring release: software writes `RDT = index of LAST processed descriptor`** (never index+1, never RDH — RDT==RDH reads as "ring full" and hardware silently drops every packet; writing RDH never replenishes the ring and it exhausts after ~15 packets). Both wrong variants caused stalled/blank browser fetches.
+- **RX ring release: software writes `RDT = index of LAST processed descriptor`** (never index+1, never RDH — RDT==RDH reads as "ring full" and hardware silently drops every packet; writing RDH never replenishes the ring and it exhausts after ~15 packets). Both wrong variants caused stalled/blank okai fetches.
 - IRQ handler + polling mode
 - MAC address read from RAL/RAH registers after reset
 
@@ -486,7 +589,7 @@ Crypto debugging lessons (bit us during bring-up): limb packing must never route
 | `src/memory.c` | Physical memory manager + heap |
 | `src/filesystem.c` | In-memory virtual filesystem (files persist until reboot) |
 | `src/editor.c` | Text editor — open/edit/save files in windows |
-| `src/browser.c` | Web browser — URL bar, navigation, HTML rendering |
+| `src/okai.c` | Web okai — URL bar, navigation, HTML rendering |
 | `src/html.c` | HTML parser — strips HTTP headers, tokenizes tags |
 | `src/net/e1000.c` | e1000 NIC driver — TX + RX |
 | `src/net/network.c` | Full network stack — ARP, IP, ICMP, UDP, TCP, DNS, HTTP |
@@ -575,5 +678,381 @@ Crypto debugging lessons (bit us during bring-up): limb packing must never route
     received only 14243/28879 bytes → blank/partial page). The 16KB `tls_response`
     cap would also have failed past 16KB. Fix: both buffers enlarged to 64KB.
     `example.com` (865B) is unaffected; `notdexy.ru` now fetches the full 28879
-    bytes and the browser parses the page. Larger-than-64KB pages still truncate
+    bytes and the okai parses the page. Larger-than-64KB pages still truncate
     (would need a streaming renderer, not a single static buffer).
+ 21. **Stale-tail host buffer → 2nd okai fetch stalls in HP_DNS** (FIXED — the
+    "clicked link opens a black window" bug): every host/path copy used
+    `for(...) dst[i]=src[i]; dst[127]=0;` — no NUL at the ACTUAL length. After
+    fetching `example.com`, `dns_resolved_host` still held `...com`, so fetching
+    `iana.org` left `iana.orgcom`; `dns_host_matches()` then failed forever, the
+    TLS fetch stalled in HP_DNS until the 66s timeout, and the new okai window
+    rendered pure black (WIN_BG). Fix: `net_copy_str()` (always NUL at actual
+    length) at all copy sites in `network.c` (`dns_resolved_host`,
+    `dns_pending_host`, `http_pending_host`, `http_pending_path`).
+ 22. **DNS definitive failure wedged the fetch owner forever** (FIXED): an
+    NXDOMAIN (rcode 3) or a response with no A record cleared `dns_pending` but
+    left `http_retry_pending=1` forever — the okai HTTP give-up condition
+    (`!http_is_retry_pending()`) could never fire, so `okai_fetch_owner` wedged
+    and EVERY later okai window stayed black. Fix: `dns_fail_pending_http()`
+    aborts the parked HTTP request on definitive DNS failure (tracked via
+    `dns_query_host`); `https_get_poll` HP_DNS aborts when `!dns_is_pending()`
+    and DNS didn't resolve; `okai_start_fetch` refuses empty-host URLs outright
+    (returns -1; desktop claims fetch ownership only when a fetch really fired).
+    Failed fetches now render a readable "Unable to load page" error instead of
+    a black screen, and the owner is always released.
+ 23. **google.com garbled mess** (FIXED, three parts): (a) HTTP response buffer
+    was 64KB; google serves ~85KB chunked, truncating mid-script so the parser
+    emitted only ~21 tokens (header links) — buffer now 128KB (~45 tokens,
+    footer links included). (b) `CSS_MAX_RULES` was 48; google's ~200 obfuscated
+    `.gb_*` widget rules filled the table before `body{background:#fff;...}`
+    was ever reached, so the page rendered default-black — cap now 256 (~730KB
+    more BSS; kernel_end ~6.3MB, still inside the 4MB-128MB identity map; the
+    heap auto-follows `_kernel_end`, so no overlap). (c) HTML entities were
+    never actually decoded anywhere: the plain-text path matched named entities
+    with `tag_match()`, whose terminator check requires space/`>`/`/` — an
+    entity's `;` never matched. New shared `html_decode_entities()` (numeric +
+    18 named entities; non-ASCII codepoints → `?`) applied to h1-h6/li/pre/
+    title/`<a>` text AND href; okai render paths also clamp high bytes → `?`
+    (the 8x16 font is ASCII-only, so Cyrillic renders as `?` placeholders —
+    readable, not entity soup). `&amp;` in hrefs now decodes before navigation.
+ 24. **Serial log formatters overflowed silently** (FIXED): `css rules` printed
+    2 digits (256 → "I6"), `[http] segment, total` printed 4 digits (86KB
+    wrapped to "6729" — actively misleading during debugging); both replaced
+    with `serial_printf`. The full `css text` serial dump (50KB+ on real pages)
+    is trimmed to a 200-char preview. New serial instrumentation: `[okai] link[i]
+    row= col0= col1= href=`, `[okai] click row= col= (mx= my=) links=`,
+    `[okai] LINK HIT li= -> href` — exact ground truth for headless link tests.
+ 25. **IntelliMouse ID read drained the byte it was waiting for** (FIXED — the
+    "nav test clicks stop registering" bug): after the 200/100/80 magic +
+    `0xF2`, `mouse_init_fb` drained the output buffer (consuming ACK and often
+    the ID) and then read a not-yet-arrived byte. QEMU's mouse had already
+    switched to 4-byte packets while `mouse_has_wheel` stayed 0 → PS/2 stream
+    desync shortly into the session: movement died, only lucky button-byte
+    resyncs logged. Fix: wait for ACK, then wait for ID (bounded spins).
+    Detection now logs `[mse] wheel detect id=0x03 4-byte mode ON`.
+
+---
+
+## Session 2026-08-21 — nav test PASS + OS-wide theming + heading hierarchy
+
+**All four prioritized visual-polish items from the previous handoff are DONE
+and vision-verified** (`opencode-go/mimo-v2.5` subagent read the PNGs; overall
+verdict PASS).
+
+### 1. Nav test — `tests/headless/test_nav.py` PASSES (4/4 buttons)
+Two root causes fixed to get there:
+
+- **Kernel bug — IntelliMouse handshake read the device ID backwards**
+  (`window.c` `mouse_init_fb`). After sending the 200/100/80 sample-rate magic
+  + `0xF2` (get ID), the old code DRAINED the output buffer (eating the ACK
+  and often the ID byte) and then read a byte that hadn't arrived. QEMU's
+  mouse had already switched to 4-byte packets while `mouse_has_wheel`
+  stayed 0 → permanent PS/2 stream desync a few packets into the session:
+  movement died mid-test (4 clicks registered out of ~176 issued). Fixed by
+  WAITING for the ACK, then WAITING for the ID (bounded spin loops); the
+  detect log `[mse] wheel detect id=0x03 4-byte mode ON` now confirms correct
+  detection, and a probe (`burst`+click rounds) shows packets flowing and
+  every click registering. NOTE: AGENTS.md's "don't add a 4th byte read"
+  warning was about doing the handshake WRONG — with a correct handshake the
+  4-byte wheel mode works in QEMU (scroll is wired via `mouse_get_scroll`).
+- **Test bug — settle feedback was blind outside browser content.**
+  `settle_to` only got position feedback from `[okai] click row=...` lines,
+  which the kernel logs ONLY for clicks inside okai content. One overshoot
+  past the window edge → no feedback → stale-position corrections pinned the
+  cursor at the screen edge forever (x=0, marching down). The test now
+  converges on the new `[mse] btn=1 x= y=` lines (logged for EVERY button
+  press anywhere). Measured mid-flight mouse gain ≈ 4.8 px/burst-unit
+  (quiescent probe said 4.4; old assumption 4.2 undershot).
+
+**New kernel instrumentation (keep):** `[mse] btn=<0-7> x= y= pkts=` on every
+button transition, `[mse] wheel detect ...` at boot — exact ground truth for
+any headless mouse work; desync shows up as the packet counter stalling.
+
+**Host gotcha that bit this session:** `/tmp` on this machine is aggressively
+cleaned — it wiped `/tmp/ok/*` (logs AND scripts) MID-RUN, killing a test.
+`okvm.py` `OUTDIR` is now `~/okvm` (durable). `shot_chrome.py` writes
+`~/okvm/chrome.png`. Keep test artifacts out of `/tmp`.
+
+### 2. Phase 4 theming — DONE (title bars, buttons, borders, taskbar)
+The Win95 chrome is gone; the whole OS now speaks the browser's Firefox-blue
+language (`theme.h`):
+- **Title bars** (`window_paint_region` in `window.c`): focused = the browser
+  toolbar gradient (CHROME_TOOL_TOP→BOT), unfocused = desaturated gray-blue;
+  1px TITLE_DIVIDER under the bar; title text via new
+  `draw_string_fg()` (graphics.c — fg-only glyphs, no glyph-cell background
+  patch on gradients).
+- **Buttons**: muted-red rounded close with a 2px pixel-drawn ×, slate
+  rounded minimize with a white dash (`round_fill()` helper draws rounded
+  rects by skipping corner pixels so the gradient shows through). Hit rects
+  unchanged (geometry preserved).
+- **Borders**: focused BORDER_ACTIVE (navy) / inactive BORDER_INACTIVE
+  (gray) RGB colors; old VGA-index WIN_TITLE_BG/FG, WIN_ACTIVE_BORDER,
+  WIN_BORDER_BG defines removed from window.h.
+- **Taskbar** (`window_draw_taskbar`): navy gradient + divider, rounded
+  buttons — active = CHROME_TAB_ACTIVE with dark text, inactive =
+  TASK_BTN_INACT with white text. Desktop.c's taskbar click hit-testing
+  unchanged.
+
+### 3. Nav icons — DONE
+`okai_icon_back/fwd` are now proper arrows (3px shaft + 2px-thick chevron
+head) instead of solid triangles; reload ring is 2px thick with a 2px
+arrowhead; home is an outlined house with a filled door. Vision-verified:
+all four "clearly recognizable", correct directions, no clipping.
+
+### 4. Heading hierarchy — DONE
+H1 = 3× body (3 grid cols per glyph, 2 spacer rows), H2 = 2× (unchanged),
+H3–H6 = body size via `doc_draw_block_text` (plain grid text, keeps CSS
+color). `doc_line_kind[]` codes: 0=normal, 1=2×, 2=3×; the pixel overlay
+(`okai_draw_heading_pixels`) derives rows/scale from the kind
+(`glyph_rows = kind+1`, `hscale = (kind+1)*font_scale`). Vision-verified:
+"Example Domain" ≈ 2.5–3× body height, clean, no overlap.
+CAREFUL: the overlay scans every column (not every hc-th) because centered
+headings start at an arbitrary pad offset.
+
+### 5. UX fixes from a user-pasted screenshot (post-vision session)
+The user pasted a live screenshot showing two annoyances; both fixed and
+verified by `tests/headless/test_addrbar.py` (PASS):
+
+- **Terminal fetch-log flood** (`network.c`): every HTTP fetch echoed a
+  180-byte raw response-header dump ("HTTP/1.1 200 OK / Date: / Server: …")
+  into the terminal — repeated fetches buried the shell. Now the terminal
+  event carries ONLY the status line + " — receiving..." (full headers stay
+  in the serial log where debugging belongs).
+- **URL bar wiped by stray chrome clicks** (`desktop.c` + new
+  `okai_addr_bar_hit()` in `okai.c`): ANY click in the top band used to
+  focus + clear the address bar, so a click that missed a nav button
+  blanked the URL display (and stray keystrokes like 'g' landed in it).
+  Now only a click ON the address bar rect focuses it (same state as 'g',
+  non-destructive if already focused); other top-band clicks just drag the
+  window. Hit geometry mirrors `okai_draw_chrome`.
+
+**Image-analysis lesson learned:** for "what does this pixel look like"
+questions, combine the vision tool with PIXEL FORENSICS — load the PNG with
+PIL and compare against the theme's exact RGB constants (e.g.
+CHROME_TOOL_TOP 0x6E92C8, TAB_ACTIVE 0xEAF1FB). The vision tool alone
+misread tiny 26px-tall title bars as "flat Win95 with 3 buttons" on a
+1649×711 capture of the NEW build; the pixel scan proved the gradient and
+theme colors were present. Vision = layout/legibility questions; pixels +
+serial = ground truth for colors and geometry.
+
+### 6. Browser chrome overhaul (user-reported: "nothing is fixed")
+The user's follow-up screenshot flagged four REAL pre-existing chrome bugs
+(none touched by items 2–4 above — those were the OS title bar/taskbar):
+tab labels half-cut, oversized URL text, terminal overlapping the browser,
+bare icon glyphs. All fixed, verified by pixel checks + vision + both
+regressions (test_addrbar PASS, test_nav PASS 4/4):
+
+- **Root cause of both text bugs:** chrome text used the 16×32 body font
+  inside 18–22px bands; the toolbar gradient painted after covered the
+  glyph bottoms. New `draw_char_1x`/`draw_string_1x` (graphics.c — 8×16 px,
+  no FONT_SCALE doubling) is the chrome font. Chrome bands grew:
+  CHROME_TAB_H 18→22, CHROME_TOOL_H 30→36 (58 total ≤ 96 reserved by
+  CHROME_ROWS=3, so no content-grid change). Tab label, "+", and URL are 1×
+  and CLAMPED to their bar/tab width (no overflow onto neighbors).
+- **Nav buttons are proper chips now:** `round_rect_fill` (public in
+  graphics.c; window.c's static helper removed) draws a rounded NAVBTN_BG
+  chip + NAVBTN_HI top highlight behind each icon; btn 26→30. Geometry
+  mirrored in okai_draw_chrome, okai_check_nav_click, okai_addr_bar_hit —
+  keep all three in sync.
+- **No more terminal/browser overlap:** the okai window opens at
+  (1010, 60, 880, 650), right of the default terminal (80,60,900×650).
+- **Test updates:** test_nav TARGETS = 1035/1073/1111/1149 (y band 87..117),
+  CONTENT_Y=300; test_addrbar scans y 60..130. NOTE: okvm.py's
+  `click_link` content-origin constants (ox,oy=32,62) are STALE for the new
+  browser position — update before using test_link_click.py again.
+
+### 7. Terminal mouse-wheel scrollback (like the browser)
+Terminals now scroll with the wheel, using the same routing model as the
+okai (`desktop.c` main loop: `mouse_get_scroll()` → window under cursor →
+browser `okai_handle_mouse_scroll` else terminal `window_scroll_view`).
+
+- **Design** (`window.c`): a per-window scrollback RING (`sb_ring`, 256
+  lines × CONTENT_COLS_MAX, ~490KB BSS for 8 windows) archives every line
+  pushed off the content grid by `scroll_content`. The wheel moves a VIEW
+  offset (`struct window.scroll_off`) — the live grid is never rewritten;
+  `window_paint_region` serves the top `scroll_off` rows from the ring and
+  shifts live rows down by `scroll_off`. 3 lines per detent, clamped to
+  [0, archived]. Blinking cursor is HIDDEN while scrolled back.
+- **Auto-follow:** any grid scroll resets `scroll_off = 0` (new output
+  snaps to the tail). `window_clear` wipes the ring (the `clear` command
+  clears history too); create/destroy/resize reset the state.
+- **Wheel sign (CORRECTED after user report):** the real input path
+  (QEMU GUI frontend → PS/2) sends Z NEGATIVE for wheel-up; the ISR
+  accumulates it raw (`mouse_scroll += z`) and consumers keep the
+  "positive = down/toward the tail" convention (browser + terminal
+  consistently). **HMP `mouse_move dz` is sign-flipped vs the GUI path:**
+  scripts must inject dz=+1 for wheel-UP and dz=-1 for wheel-DOWN.
+  (An earlier calibration against HMP only had this backwards.)
+- **Verified in QEMU** (`[scr] win= off= hist=` serial ground truth +
+  pixel diffs): wheel-up off→17 (clamped at hist=17), view changes;
+  wheel-down returns to the exact bottom (pixel diff 0); output after
+  scrolling back auto-follows (probe wheel-down emits no new [scr]).
+  QEMU 8.2.2 HMP: `mouse_move dx dy [dz]` — dz works.
+
+### 8. okai text-engine upgrade: Cyrillic, structure, tables (v0.6-grade)
+Goal: "make okai actually good." This round attacked text quality:
+
+- **Cyrillic + symbol glyphs** (`graphics.c`): `font8x16_ext[0x80][16]`
+  generated from the CyrSlav-Terminus16 PSF console font (bitmap data).
+  Byte slots: 0x80-0xBF = U+0410..U+044F (А-я), 0xC0+ = Ё ё — – « » • № …
+  ° € © ® ™ ─ │. All glyph renderers (draw_char / _scaled / _1x /
+  draw_string_fg) go through one `glyph_rows()` helper that handles slots.
+  PSF extraction gotcha: kbd PSF1 unicode tables are UCS-2 **little-endian**
+  with 0xFFFF separators; keep-first-mapping-per-glyph loses secondary cps —
+  parse the FULL table.
+- **Charset decoding** (`html.c`): `html_decode_entities` now = charset pass
+  THEN entity pass (order matters: entities produce slot bytes that must not
+  be re-decoded). UTF-8 (2-3 byte) and windows-1251 (sniffed via
+  `charset=...1251` in the first 2KB — matches Content-Type and meta) both
+  collapse to slots via `html_map_cp`. Numeric entities are decimal AND hex
+  (`&#x27;` — Next.js emits hex!). **map_cp maps control bytes to SPACE** —
+  the first version mapped them to '?', putting a stray `?` before every
+  block (inter-tag whitespace is real text here).
+- **Structure rendering**: `<ul>` li → "• " prefix; `<ol>` li → "N. " (state
+  tracked in the tokenizer, prefix inserted AFTER decode); `<hr>` → full
+ -width ── rule; `<blockquote>` → separation break; `<img>` → "[image: alt]"
+  text token; `<td>/<th>` → HTML_TABLE_CELL tokens, cells flow on one line
+  joined by │ and `</tr>` breaks the row (END_PARA). `</ul>/</ol>/</tr>`
+  close blocks.
+- **Numeric-IP + port URLs**: `http://10.0.2.2:8000/x` works —
+  `parse_url` captures `:port`, `http_get_port()` threads it through the
+  retry machinery (`http_pending_port`), and `net_parse_ip` + `dns_seed`
+  skip DNS for literal addresses. THIS ENABLES HOST-SERVED TEST PAGES:
+  `python3 -m http.server 8000` in a dir, then okai
+  `http://10.0.2.2:8000/page.html` — deterministic page fixtures for
+  rendering tests (see /tmp/www/test.html pattern; re-create as needed).
+- **Host test**: `tests/test_text_decode.c` (20 assertions — UTF-8, CP1251,
+  decimal+hex entities, markers, img, tables, hr/blockquote) —
+  `cd tests && gcc -DKERNEL=0 -I../src -include string.h test_text_decode.c
+  ../src/html.c -o t && ./t`. Slot arithmetic for expectations:
+  slot = 0x80 + (cp - 0x410) for Cyrillic.
+- **Verified**: host test PASS; QEMU end-to-end on a served Russian page —
+  H1/H2/H3 hierarchy in Cyrillic, «»—… in paragraphs, • and 1./2. lists, ──
+  rule, `Имя │ Значение` table, blockquote with DECODED entities,
+  [image: логотип]; vision-confirmed readable; example.com regression OK.
+- **Deferred**: async HTTPS (UI still freezes ~1-2s per fetch), external
+  CSS, inline images, KOI8-R (rare), CJK (no glyphs — falls to '?').
+
+### 9. Host preview: see okai's rendering WITHOUT booting the kernel
+`./okai-preview <url-or-file> [out.png] [cols]` renders any page through the
+REAL okai sources on the host in ~50ms: tokenizer + charset/entities, CSS
+engine, and document layout are compiled directly from src (html.c, css.c,
+okai.c) with `-DHOST_PREVIEW` accessors (end of okai.c: doc grid exposure)
+plus kernel-service stubs in `tests/okai_preview.c`. Output is a PNG painted
+with the real font (tests/font_data.h, regenerated from graphics.c by
+`make -C tests -f Makefile.preview font_data.h`). Identical output to the
+kernel minus pixel chrome — THE fast loop for text/CSS/layout work; use
+QEMU only for chrome/input/fetch behavior. Build:
+`make -C tests -f Makefile.preview okai_preview`.
+NOTE: token counts from the preview match the kernel exactly (43/7/92 on
+the fixtures) — good quick-fidelity check.
+
+### 10. Mouse-interaction fixes: link clicks, new tab, real Home
+All three user-reported, all fixed, gated by `tests/headless/test_links.py`
+(PASS: LINK / NEWTAB / HOME):
+
+- **Link clicks were dead**: the desktop click branch computed the content
+  row from `y + WIN_BORDER + WIN_TITLE_H` unconditionally — but a
+  `no_titlebar` okai's grid starts at `y + WIN_BORDER` (mirrors
+  `window_paint_region`'s `title_off`). Every click mapped ~1.25 rows below
+  its target, so links never matched. Fixed with `grid_top` (the
+  no_titlebar-aware offset). NOTE the serial `[okai] link[i] row=` lines log
+  DOC rows; the hit-test uses BUFFER rows (= doc + CHROME_ROWS). okvm.py's
+  `click_link` was updated to the current geometry (window 1010,60; +3 rows).
+- **'+' new tab works**: `okai_check_nav_click` returns NAV_NEWTAB (5) for
+  the tab-strip '+' rect (mirrors the draw, padded 4px); desktop.c routes it
+  to `okai_open(OKAI_HOME_URL)`. Successive okai windows now CASCADE
+  (`1010 - 30*id, 60 + 45*id`) instead of stacking exactly.
+- **Home is a real home**: `okai_nav_home` was `goto_history(0)` — i.e. "go
+  back to the first site this session" (the user-visible "home = back"
+  bug). Now `okai_navigate(id, OKAI_HOME_URL)` ("http://example.com/" —
+  change OKAI_HOME_URL in okai.h), which pushes history like a real browser.
+
+### 11. Tabs, internal homepage, one window, z-order leak fix
+The browser became a real tabbed browser (user request). All gated by
+`tests/headless/test_links.py` (PASS: HOMEPAGE / LINK IN-PLACE / NEWTAB /
+TAB SWITCH / CHROME-BOUNDS) + test_addrbar PASS + test_nav PASS 4/4.
+
+- **Architecture**: `struct okai_tab` (url, title, history, scroll,
+  tokens[OKAI_TAB_TOKENS=384], css, links) — one okai WINDOW holds
+  `tabs[OKAI_MAX_TABS=4]` + `active_tab`; MAX_OKAIS is now 2. Tab switch
+  re-renders the cached page (NO refetch); `+`/`okai <url>` open new tabs
+  in the SAME window; the `okai` shell command with no argument opens the
+  homepage. Link clicks navigate the current tab in place (no window
+  sprawl). Per-tab close × on the active tab; closing the last tab closes
+  the window (okai_close compacts the okais[] array — the one-window shell
+  path must never see a dead slot).
+- **`okai:home`**: OKAI_HOME_HTML is parsed through the normal pipeline
+  (html_parse + CSS engine) — headings/styles/links work, zero network.
+  `okai_navigate`/`okai_start_fetch` short-circuit it via `okai_is_home`.
+  The page: dark navy, centered logo, quick links (example.com, notdexy.ru,
+  wikipedia, info.cern.ch). Vision-verified.
+- **Z-order leak fixed**: okai chrome used to be painted AFTER all windows
+  (`okai_draw_chrome_all`), so a lower browser's chrome painted over a
+  higher overlapping window. Chrome + heading overlays now paint right
+  after THEIR window in both paint paths (main loop and
+  `desktop_paint_rect_skip`), via `okai_paint_overlays(id)`. Chrome-bounds
+  pixel probe: no chrome colors outside the chrome band.
+- **Bug found on the way — wrapped links recorded broken regions**: a link
+  that wrapped mid-text recorded a 1-char click region at the wrap point
+  (clicked the wrong thing / dead zones). Fixed: whole-link fit check
+  before drawing (fresh line if it doesn't fit, like doc_flow_word).
+- **Test-harness lessons** (okvm mouse): the 4-sample smoothing ring keeps
+  moving the cursor for several packets after bursts — flush with 5×
+  `mouse_move 0 0` before clicking, and verify clicks BY EFFECT (serial
+  line appears) with plain retries — move() re-aims from the kernel's
+  reported press position, so retries are closed-loop.
+
+
+
+
+
+
+
+
+### Remaining known gaps (unchanged from before)
+- `+` new-tab button / tab clicks / lock icon still visual-only (was
+  explicitly optional; untouched).
+- All headings use page-level fg/bg in the scaled overlay (CSS heading
+  colors apply to H3+ only) — pre-existing behavior.
+- Scaled-full-desktop screenshots flatten the gradients visually; verify
+  theming on CROPPED+ZOOMED captures.
+
+---
+
+## Next steps (handoff to next agent)
+
+**Do NOT `git commit` unless the user explicitly asks** (prior sessions kept
+the tree uncommitted on `kernel`).
+
+1. **Interactive chrome (the last browser-polish item).** The `+` new-tab
+   button, tab strip clicks, and the lock icon are visual-only. Wire `+` →
+   open a new blank okai tab/window, tab clicks → focus switch, lock →
+   HTTPS state indicator. Geometry lives in `okai_draw_chrome`
+   (`src/okai.c`); click routing follows the `okai_check_nav_click` +
+   desktop.c pattern that just passed its test.
+
+2. **CSS engine deferred items** (see the CSS section above): external
+   `<link rel=stylesheet>` fetching (2nd TLS GET), descendant combinators,
+   full box model, pseudo-classes.
+
+3. **Cooperative TLS fetch.** `https_get` still blocks the UI ~1-2s inside
+   the fetch owner; a `tls_poll()` state machine would un-freeze the desktop
+   (original Phase 5 deviation note).
+
+4. **Anything mouse-related:** use the `[mse] btn=1 x= y= pkts=` serial
+   ground truth (see session notes above) and `~/okvm` for artifacts. Run
+   `python3 tests/headless/test_nav.py` after touching window.c/mouse code —
+   it's the regression gate for input + nav routing (currently PASS 4/4).
+   QEMU gotcha: bound runs with `timeout`; check `pgrep -c '[q]emu-system-i386'`
+   before/after; `pkill -f qemu-system-i386` kills its own shell — bracket trick.
+
+
+
+### Hard constraints to respect
+- **From-scratch mandate:** no external libs (no TTF/font engines, no GUI
+  frameworks). Bitmap font only.
+- **No JS** this round (CSS only).
+- **Vision verification is mandatory** for any "does it look right?" question —
+  the base model cannot see images.
+- Project path is the non-ASCII cyrillic path this session; confirm with `ls`.
