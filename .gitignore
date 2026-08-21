@@ -13,3 +13,9 @@ isodir/
 .mimocode/
 desktop.png
 terminal.png
+# Host test binaries / caches
+okai-preview-binary
+tests/okai_preview
+tests/test_css
+tests/test_html_google
+__pycache__/

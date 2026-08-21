@@ -3,14 +3,15 @@
 #include <stdint.h>
 
 static uint32_t page_directory[1024] __attribute__((aligned(4096)));
-// 32 tables for low memory (0–128MB), 1 for framebuffer, 1 for e1000 MMIO
-static uint32_t page_tables[34][1024] __attribute__((aligned(4096)));
+// 32 tables for low memory (0–128MB), up to 3 for framebuffer (1080p LFB is
+// ~8.3MB), 1 for e1000 MMIO
+static uint32_t page_tables[40][1024] __attribute__((aligned(4096)));
 static int pt_count = 0;
 
 static void map_4mb(uint32_t base_addr) {
     uint32_t pd_index = base_addr >> 22;
     if (page_directory[pd_index] & 0x01) return;
-    if (pt_count >= 34) return;
+    if (pt_count >= 40) return;
 
     uint32_t* pt = page_tables[pt_count];
     for (int i = 0; i < 1024; i++) {
@@ -35,9 +36,12 @@ void paging_init(uint32_t framebuffer_addr) {
         map_4mb(addr);
     }
 
-    // Map framebuffer (typically 0xFD000000)
+    // Map framebuffer (typically 0xFD000000). A 1920x1080x32bpp LFB is
+    // ~8.3MB, so map three consecutive 4MB windows to cover it regardless of
+    // alignment (two windows would be 8MB, one short).
     if (framebuffer_addr) {
-        map_4mb(framebuffer_addr & 0xFFC00000);
+        uint32_t fb_base = framebuffer_addr & 0xFFC00000;
+        for (int i = 0; i < 3; i++) map_4mb(fb_base + i * 0x00400000);
     }
 
     // Map e1000 MMIO (typically 0xFEB80000)

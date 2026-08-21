@@ -159,9 +159,10 @@ uint32_t pmm_get_free_pages(void) { return total_pages - used_pages; }
 // ---- Simple kernel heap (bump allocator) ----
 static uint32_t heap_start = 0;
 static uint32_t heap_ptr = 0;
-// Backbuffer + wallpaper cache are 3MB each at 1024x768x32bpp — 4MB was
-// exhausted and the wallpaper cache kmalloc silently returned NULL
-#define HEAP_SIZE (16 * 1024 * 1024) // 16MB heap
+// Backbuffer + wallpaper cache are 8.3MB each at 1920x1080x32bpp, plus
+// window/content buffers — 16MB was exhausted and the wallpaper cache
+// kmalloc silently returned NULL
+#define HEAP_SIZE (48 * 1024 * 1024) // 48MB heap
 
 void heap_init(void) {
     // Allocate heap from physical memory after kernel

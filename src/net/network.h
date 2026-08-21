@@ -84,7 +84,9 @@ int arp_resolve(uint8_t* ip, uint8_t* mac);
 
 // DNS resolution (returns 0 on success, -1 if waiting for ARP)
 int dns_resolve(const char* hostname);
-int dns_is_resolved(uint32_t* ip);
+int dns_is_resolved(uint32_t* ip, const char* host);
+// Seed the DNS cache with a literal address (numeric-IP URLs skip DNS).
+void dns_seed(const char* host, uint32_t ip);
 int dns_is_pending(void);
 
 // TCP connection
@@ -111,11 +113,15 @@ void net_set_event_callback(void (*cb)(const char* msg));
 
 // HTTP client
 void http_get(const char* host, const char* path);
+// Port-aware GET (0 = 80). Handles numeric-IP hosts without DNS.
+void http_get_port(const char* host, const char* path, uint16_t port);
 void http_poll(void);
 char* http_get_response(void);
 int http_get_response_len(void);
 int http_is_pending(void);
 int http_is_done(void);
+int http_is_retry_pending(void);
+void http_reset_conn_attempts(void);
 int http_dechunk(char* buf, int len);
 
 // TCP retransmission timer — called from net_poll, exported for tests

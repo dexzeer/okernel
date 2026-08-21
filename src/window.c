@@ -1,14 +1,17 @@
 #include "window.h"
 #include "graphics.h"
+#include "theme.h"
 #include "memory.h"
 #include "idt.h"
 #include "io.h"
+#include "serial.h"
 #include <stdint.h>
 
 extern int needs_redraw;
 
-// VGA palette lookup for content rendering
-static const uint32_t vga_to_rgb[16] = {
+// VGA palette lookup for content rendering (non-static: okai reads it too so
+// headings drawn as raw pixels match the body text's color exactly)
+const uint32_t vga_to_rgb[16] = {
     0x00000000, 0x000000AA, 0x0000AA00, 0x0000AAAA,
     0x00AA0000, 0x00AA00AA, 0x00AA5500, 0x00AAAAAA,
     0x00555555, 0x005555FF, 0x0055FF55, 0x0055FFFF,
@@ -26,10 +29,21 @@ static struct window windows[MAX_WINDOWS];
 #define CONTENT_ROWS_MAX ((SCREEN_H - WIN_TITLE_H - 2 * WIN_BORDER) / CHAR_H)
 #define CONTENT_CELLS_MAX (CONTENT_COLS_MAX * CONTENT_ROWS_MAX)
 
+// Per-window scrollback: lines pushed off the top of the content grid when it
+// scrolls, replayable with the mouse wheel. The wheel shifts a VIEW offset —
+// the live grid is never rewritten, so scrolling is non-destructive and new
+// output simply snaps back to the bottom (auto-follow).
+#define SB_ROWS 256
+static uint16_t sb_ring[MAX_WINDOWS][SB_ROWS][CONTENT_COLS_MAX];
+static int sb_count[MAX_WINDOWS]; // valid lines in the ring (<= SB_ROWS)
+static int sb_next[MAX_WINDOWS];  // next write index (ring)
+
 // Mouse state
 static int mouse_x = 160, mouse_y = 100;
 static int mouse_buttons = 0, mouse_cycle = 0;
-static int8_t mouse_bytes[3];
+static int8_t mouse_bytes[4];
+static int mouse_has_wheel = 0;  // 1 once Intellimouse 4-byte mode is on
+static int mouse_scroll = 0;     // accumulated wheel delta, consumed per frame
 #define SMOOTH_SAMPLES 4
 static int smooth_dx[SMOOTH_SAMPLES], smooth_dy[SMOOTH_SAMPLES], smooth_idx = 0;
 
@@ -40,6 +54,33 @@ static const uint16_t cursor_bitmap[16] = {
     0b110001111000, 0b100000111100, 0b000000011100, 0b000000001100,
 };
 
+// Apply one movement packet (bytes 0..2) to the cursor position.
+static uint32_t mse_pkt_count = 0;
+static uint8_t mse_prev_buttons = 0;
+static void mouse_process_packet(void) {
+    mouse_buttons = mouse_bytes[0] & 0x07;
+    smooth_dx[smooth_idx] = (int8_t)mouse_bytes[1];
+    smooth_dy[smooth_idx] = -(int8_t)mouse_bytes[2];
+    smooth_idx = (smooth_idx + 1) % SMOOTH_SAMPLES;
+    int avg_dx = 0, avg_dy = 0;
+    for (int i = 0; i < SMOOTH_SAMPLES; i++) { avg_dx += smooth_dx[i]; avg_dy += smooth_dy[i]; }
+    mouse_x += avg_dx / SMOOTH_SAMPLES;
+    mouse_y += avg_dy / SMOOTH_SAMPLES;
+    if (mouse_x < 0) mouse_x = 0;
+    if (mouse_x >= SCREEN_W) mouse_x = SCREEN_W - 1;
+    if (mouse_y < 0) mouse_y = 0;
+    if (mouse_y >= SCREEN_H) mouse_y = SCREEN_H - 1;
+    mse_pkt_count++;
+    // Ground truth for headless mouse tests: log button transitions with the
+    // current position and cumulative packet count (desync shows up as the
+    // count stalling or positions not following bursts).
+    if (mouse_buttons != mse_prev_buttons) {
+        serial_printf("[mse] btn=%d x=%d y=%d pkts=%u\n",
+                      mouse_buttons, mouse_x, mouse_y, mse_pkt_count);
+        mse_prev_buttons = mouse_buttons;
+    }
+}
+
 static void mouse_irq_handler(void) {
     uint8_t status = inb(0x64);
     if (!(status & 0x01)) return;
@@ -48,19 +89,18 @@ static void mouse_irq_handler(void) {
         case 0: mouse_bytes[0] = data; if (data & 0x08) mouse_cycle++; break;
         case 1: mouse_bytes[1] = data; mouse_cycle++; break;
         case 2:
-            mouse_bytes[2] = data; mouse_cycle = 0;
-            mouse_buttons = mouse_bytes[0] & 0x07;
-            smooth_dx[smooth_idx] = (int8_t)mouse_bytes[1];
-            smooth_dy[smooth_idx] = -(int8_t)mouse_bytes[2];
-            smooth_idx = (smooth_idx + 1) % SMOOTH_SAMPLES;
-            int avg_dx = 0, avg_dy = 0;
-            for (int i = 0; i < SMOOTH_SAMPLES; i++) { avg_dx += smooth_dx[i]; avg_dy += smooth_dy[i]; }
-            mouse_x += avg_dx / SMOOTH_SAMPLES;
-            mouse_y += avg_dy / SMOOTH_SAMPLES;
-            if (mouse_x < 0) mouse_x = 0;
-            if (mouse_x >= SCREEN_W) mouse_x = SCREEN_W - 1;
-            if (mouse_y < 0) mouse_y = 0;
-            if (mouse_y >= SCREEN_H) mouse_y = SCREEN_H - 1;
+            mouse_bytes[2] = data;
+            if (mouse_has_wheel) mouse_cycle++;          // expect 4th (wheel) byte
+            else { mouse_cycle = 0; mouse_process_packet(); }
+            break;
+        case 3:
+            mouse_bytes[3] = data; mouse_cycle = 0;
+            // PS/2 Z byte: NEGATIVE = wheel up on the real input path (QEMU
+            // GUI frontends; note HMP `mouse_move dz` has the opposite sign —
+            // scripts inject dz=+1 for wheel-up). Consumers (okai scroll,
+            // terminal scrollback) keep "positive = down/toward the tail".
+            mouse_scroll += (int8_t)mouse_bytes[3];
+            mouse_process_packet();
             break;
     }
 }
@@ -87,6 +127,14 @@ int mouse_get_x(void) { return mouse_x; }
 int mouse_get_y(void) { return mouse_y; }
 int mouse_get_left_button(void) { return mouse_buttons & 0x01; }
 
+// Return the accumulated wheel delta since the last call, then reset it.
+// Positive = wheel up (toward the user), negative = wheel down.
+int mouse_get_scroll(void) {
+    int s = mouse_scroll;
+    mouse_scroll = 0;
+    return s;
+}
+
 void mouse_init_fb(void) {
     mouse_x = SCREEN_W / 2; mouse_y = SCREEN_H / 2;
     mouse_buttons = 0; mouse_cycle = 0;
@@ -101,13 +149,75 @@ void mouse_init_fb(void) {
     while (inb(0x64) & 0x02); outb(0x64, 0xD4);
     while (inb(0x64) & 0x02); outb(0x60, 0xF4);
     while (inb(0x64) & 0x01) inb(0x60);
+
+    // Try to enable Intellimouse wheel mode (4-byte packets). Send the standard
+    // sample-rate magic sequence, then read the device ID; a wheel-capable
+    // mouse answers 0x03 (or 0x04). If it doesn't, we stay in 3-byte mode and
+    // simply never receive wheel bytes.
+    {
+        uint8_t id = 0;
+        uint8_t rates[] = { 0xC8, 0x64, 0x50 }; // 200, 100, 80
+        for (int i = 0; i < 3; i++) {
+            while (inb(0x64) & 0x02); outb(0x64, 0xD4);
+            while (inb(0x64) & 0x02); outb(0x60, 0xF3); // set sample rate
+            while (inb(0x64) & 0x01) inb(0x60);          // ack
+            while (inb(0x64) & 0x02); outb(0x64, 0xD4);
+            while (inb(0x64) & 0x02); outb(0x60, rates[i]);
+            while (inb(0x64) & 0x01) inb(0x60);          // ack
+        }
+        while (inb(0x64) & 0x02); outb(0x64, 0xD4);
+        while (inb(0x64) & 0x02); outb(0x60, 0xF2);     // get device ID
+        // The device answers ACK (0xFA) then the ID byte. WAIT for each byte —
+        // draining the output buffer first would eat the ID and leave a garbage
+        // read, misdetecting wheel mode while the device already switched to
+        // 4-byte packets (permanent stream desync: movement dies).
+        for (int spin = 0; spin < 100000 && !(inb(0x64) & 0x01); spin++);
+        (void)inb(0x60);                                 // ack
+        for (int spin = 0; spin < 100000 && !(inb(0x64) & 0x01); spin++);
+        id = inb(0x60);
+        if (id == 0x03 || id == 0x04) mouse_has_wheel = 1;
+        serial_puts("[mse] wheel detect id=0x");
+        serial_putchar("0123456789ABCDEF"[id >> 4]);
+        serial_putchar("0123456789ABCDEF"[id & 0xF]);
+        serial_puts(mouse_has_wheel ? " 4-byte mode ON\n" : " 3-byte mode\n");
+    }
+
+    // Re-enable data reporting (sample-rate commands may have paused it).
+    while (inb(0x64) & 0x02); outb(0x64, 0xD4);
+    while (inb(0x64) & 0x02); outb(0x60, 0xF4);
+    while (inb(0x64) & 0x01) inb(0x60);
+
     irq_register_handler(12, mouse_irq_handler);
 }
 
 // ---- Window Manager ----
 
 void window_init(void) {
-    for (int i = 0; i < MAX_WINDOWS; i++) { windows[i].visible = 0; windows[i].focused = 0; windows[i].content = 0; }
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        windows[i].visible = 0; windows[i].focused = 0; windows[i].content = 0;
+        sb_count[i] = 0; sb_next[i] = 0; windows[i].scroll_off = 0;
+    }
+}
+
+// Recompute the content grid from the window's size, font scale, and title-bar
+// mode, and re-blank the (slack-sized) content buffer.
+static void window_apply_metrics(struct window* w) {
+    int title = w->no_titlebar ? 0 : WIN_TITLE_H;
+    int scale = w->font_scale;
+    int cw = (w->w - 2 * WIN_BORDER) / (CHAR_W * scale);
+    int ch = (w->h - title - 2 * WIN_BORDER) / (CHAR_H * scale);
+    if (cw > CONTENT_COLS_MAX) cw = CONTENT_COLS_MAX;
+    if (ch > CONTENT_ROWS_MAX) ch = CONTENT_ROWS_MAX;
+    w->content_w = cw;
+    w->content_h = ch;
+    if (w->content) {
+        uint8_t color = (uint8_t)((w->content_bg << 4) | w->text_fg);
+        uint16_t blank = (uint16_t)((uint16_t)color << 8) | ' ';
+        for (int k = 0; k < CONTENT_CELLS_MAX; k++) w->content[k] = blank;
+    }
+    w->cursor_x = 0; w->cursor_y = 0;
+    w->scroll_off = 0; // resize reflows the grid — re-anchor at the live tail
+    w->dirty = 1; needs_redraw = 1;
 }
 
 int window_create(const char* title, int x, int y, int w, int h) {
@@ -115,20 +225,16 @@ int window_create(const char* title, int x, int y, int w, int h) {
         if (!windows[i].visible) {
             windows[i].x = x; windows[i].y = y; windows[i].w = w; windows[i].h = h;
             windows[i].visible = 1; windows[i].focused = 0; windows[i].font_scale = 1;
+            windows[i].no_titlebar = 0;
             windows[i].text_fg = 15; windows[i].text_bg = 0;
+            windows[i].content_bg = WIN_BG;
             windows[i].dirty = 1; needs_redraw = 1;
+            sb_count[i] = 0; sb_next[i] = 0; windows[i].scroll_off = 0;
             int j = 0;
             while (title[j] && j < 31) { windows[i].title[j] = title[j]; j++; }
             windows[i].title[j] = 0;
-            int cw = (w - 2 * WIN_BORDER) / CHAR_W;
-            int ch = (h - WIN_TITLE_H - 2 * WIN_BORDER) / CHAR_H;
-            if (cw > CONTENT_COLS_MAX) cw = CONTENT_COLS_MAX;
-            if (ch > CONTENT_ROWS_MAX) ch = CONTENT_ROWS_MAX;
-            windows[i].content_w = cw;
-            windows[i].content_h = ch;
             windows[i].content = (uint16_t*)kmalloc(CONTENT_CELLS_MAX * sizeof(uint16_t));
-            if (windows[i].content) for (int k = 0; k < CONTENT_CELLS_MAX; k++) windows[i].content[k] = 0x0F00;
-            windows[i].cursor_x = 0; windows[i].cursor_y = 0;
+            window_apply_metrics(&windows[i]); // sets content_w/h and blanks the buffer
             return i;
         }
     }
@@ -139,22 +245,14 @@ void window_set_font_scale(int id, int scale) {
     if (id < 0 || id >= MAX_WINDOWS) return;
     struct window* w = &windows[id];
     w->font_scale = scale;
-    int cw = CHAR_W * scale, ch = CHAR_H * scale;
-    int ncw = (w->w - 2 * WIN_BORDER) / cw;
-    int nch = (w->h - WIN_TITLE_H - 2 * WIN_BORDER) / ch;
-    if (ncw > CONTENT_COLS_MAX) ncw = CONTENT_COLS_MAX;
-    if (nch > CONTENT_ROWS_MAX) nch = CONTENT_ROWS_MAX;
-    w->content_w = ncw;
-    w->content_h = nch;
-    if (w->content) for (int k = 0; k < CONTENT_CELLS_MAX; k++) w->content[k] = 0x0F00;
-    w->cursor_x = 0; w->cursor_y = 0;
-    w->dirty = 1; needs_redraw = 1;
+    window_apply_metrics(w);
 }
 
 void window_destroy(int id) {
     if (id < 0 || id >= MAX_WINDOWS) return;
     if (windows[id].content) { kfree(windows[id].content); windows[id].content = 0; }
     windows[id].visible = 0; needs_redraw = 1;
+    sb_count[id] = 0; sb_next[id] = 0; windows[id].scroll_off = 0;
 }
 
 void window_set_focus(int id) {
@@ -169,9 +267,22 @@ void window_set_minimize_button(int id, int has_min) {
     if (id >= 0 && id < MAX_WINDOWS) windows[id].has_minimize_button = has_min;
 }
 
+void window_set_no_titlebar(int id, int flag) {
+    if (id < 0 || id >= MAX_WINDOWS) return;
+    struct window* w = &windows[id];
+    if (w->no_titlebar == flag) return;
+    w->no_titlebar = flag;
+    window_apply_metrics(w);
+}
+
 int window_check_close_click(int id, int mx, int my) {
     struct window* w = &windows[id];
     if (!w->visible || !w->has_close_button) return 0;
+    if (w->no_titlebar) {
+        int s = WIN_CTRL_BTN;
+        int bx = w->x + w->w - WIN_BORDER - 4 - s, by = w->y + WIN_BORDER;
+        return (mx >= bx && mx < bx + s && my >= by && my < by + s);
+    }
     int bx = w->x + w->w - WIN_BORDER - 4 - WIN_BTN_W, by = w->y + WIN_BORDER;
     return (mx >= bx && mx < bx + WIN_BTN_W && my >= by && my < by + WIN_BTN_H);
 }
@@ -179,6 +290,7 @@ int window_check_close_click(int id, int mx, int my) {
 int window_check_minimize_click(int id, int mx, int my) {
     struct window* w = &windows[id];
     if (!w->visible || !w->has_minimize_button) return 0;
+    if (w->no_titlebar) return 0; // no minimize control in title-bar-less mode
     int bx = w->x + w->w - WIN_BORDER - 8 - 2 * WIN_BTN_W, by = w->y + WIN_BORDER;
     return (mx >= bx && mx < bx + WIN_BTN_W && my >= by && my < by + WIN_BTN_H);
 }
@@ -201,15 +313,16 @@ void window_resize(int id, int new_w, int new_h) {
     if (new_h > SCREEN_H - w->y) new_h = SCREEN_H - w->y;
     if (new_w == w->w && new_h == w->h) return;
 
-    int ncw = (new_w - 2 * WIN_BORDER) / CHAR_W;
-    int nch = (new_h - WIN_TITLE_H - 2 * WIN_BORDER) / CHAR_H;
+    int title = w->no_titlebar ? 0 : WIN_TITLE_H;
+    int ncw = (new_w - 2 * WIN_BORDER) / (CHAR_W * w->font_scale);
+    int nch = (new_h - title - 2 * WIN_BORDER) / (CHAR_H * w->font_scale);
     if (ncw > CONTENT_COLS_MAX) ncw = CONTENT_COLS_MAX;
     if (nch > CONTENT_ROWS_MAX) nch = CONTENT_ROWS_MAX;
 
     // The buffer is slack-sized with fixed stride, so a resize is just a
     // dimension change: blank the cells newly exposed by growth. The area
     // abandoned by shrinking is simply never read.
-    uint8_t color = (w->text_bg << 4) | w->text_fg;
+    uint8_t color = (w->content_bg << 4) | w->text_fg;
     uint16_t blank = (uint16_t)color << 8 | ' ';
     for (int r = 0; r < nch; r++) {
         int from = (r < w->content_h) ? w->content_w : 0;
@@ -242,6 +355,24 @@ struct window* window_get(int id) {
     return &windows[id];
 }
 
+// Topmost visible, non-minimized window containing screen point (x, y), or -1.
+int window_from_point(int x, int y) {
+    for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
+        struct window* w = &windows[i];
+        if (!w->visible || w->minimized) continue;
+        if (x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h)
+            return i;
+    }
+    return -1;
+}
+
+// Current text cursor position in the content buffer (row/col, not pixels).
+void window_get_cursor(int id, int* out_x, int* out_y) {
+    if (id < 0 || id >= MAX_WINDOWS) { if (out_x) *out_x = 0; if (out_y) *out_y = 0; return; }
+    if (out_x) *out_x = windows[id].cursor_x;
+    if (out_y) *out_y = windows[id].cursor_y;
+}
+
 static int window_blink_on(void) {
     extern uint32_t tick_count;
     return (tick_count / 18) % 2 == 0;
@@ -251,30 +382,48 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
     struct window* w = &windows[id];
     if (!w->visible || w->minimized) return;
 
-    // ---- Title bar / border (skip if clip rect is below title) ----
-    int title_bottom = w->y + WIN_BORDER + WIN_TITLE_H;
-    if (rx < w->x + w->w && rx + rw > w->x &&
-        ry < title_bottom && ry + rh > w->y) {
-        uint32_t bc = w->focused ? vga_to_rgb[WIN_ACTIVE_BORDER] : vga_to_rgb[WIN_BORDER_BG];
+    // ---- Border + (optional) title bar ----
+    int title_off = w->no_titlebar ? 0 : WIN_TITLE_H;
+    int title_bottom = w->y + WIN_BORDER + title_off;
+    // Border frame — drawn whenever the clip rect overlaps the window at all.
+    if (rx < w->x + w->w && rx + rw > w->x && ry < w->y + w->h && ry + rh > w->y) {
+        uint32_t bc = w->focused ? BORDER_ACTIVE : BORDER_INACTIVE;
         rect_outline(w->x, w->y, w->w, w->h, bc, WIN_BORDER);
-        rect_fill(w->x + WIN_BORDER, w->y + WIN_BORDER,
-                  w->w - 2 * WIN_BORDER, WIN_TITLE_H, vga_to_rgb[WIN_TITLE_BG]);
-        draw_string(w->x + WIN_BORDER + 4, w->y + WIN_BORDER + 4,
-                    w->title, vga_to_rgb[WIN_TITLE_FG], vga_to_rgb[WIN_TITLE_BG]);
+    }
+    // Title bar (skipped for title-bar-less windows; the client draws its own top).
+    // Same blue gradient family as the browser toolbar (theme.h) so the OS
+    // chrome and the browser chrome read as one system.
+    if (!w->no_titlebar &&
+        rx < w->x + w->w && rx + rw > w->x && ry < title_bottom && ry + rh > w->y) {
+        int tx = w->x + WIN_BORDER, ty = w->y + WIN_BORDER;
+        int tw = w->w - 2 * WIN_BORDER;
+        if (w->focused)
+            gradient_fill(tx, ty, tw, WIN_TITLE_H, CHROME_TOOL_TOP, CHROME_TOOL_BOT, 1);
+        else
+            gradient_fill(tx, ty, tw, WIN_TITLE_H, TITLE_GRAD_U_TOP, TITLE_GRAD_U_BOT, 1);
+        hline(tx, ty + WIN_TITLE_H - 1, tw, TITLE_DIVIDER);
+        draw_string_fg(tx + 4, ty + 4, w->title,
+                       w->focused ? TITLE_TEXT_F : TITLE_TEXT_U);
         if (w->has_close_button) {
             int bx = w->x + w->w - WIN_BORDER - 4 - WIN_BTN_W, by = w->y + WIN_BORDER;
-            rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, vga_to_rgb[4]);
-            draw_string(bx + 4, by, "X", vga_to_rgb[15], vga_to_rgb[4]);
+            round_rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, TBTN_CLOSE_BG, 4);
+            int cx = bx + WIN_BTN_W / 2, cy = by + WIN_BTN_H / 2, d = 5;
+            line(cx - d, cy - d, cx + d, cy + d, TBTN_FG);
+            line(cx - d + 1, cy - d, cx + d + 1, cy + d, TBTN_FG);
+            line(cx + d, cy - d, cx - d, cy + d, TBTN_FG);
+            line(cx + d + 1, cy - d, cx - d + 1, cy + d, TBTN_FG);
         }
         if (w->has_minimize_button) {
             int bx = w->x + w->w - WIN_BORDER - 8 - 2 * WIN_BTN_W, by = w->y + WIN_BORDER;
-            rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, vga_to_rgb[6]);
-            draw_string(bx + 4, by, "_", vga_to_rgb[15], vga_to_rgb[6]);
+            round_rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, TBTN_NEUTRAL_BG, 4);
+            int cy = by + WIN_BTN_H / 2 + 4, d = 5;
+            hline(bx + WIN_BTN_W / 2 - d, cy, 2 * d + 1, TBTN_FG);
+            hline(bx + WIN_BTN_W / 2 - d, cy + 1, 2 * d + 1, TBTN_FG);
         }
     }
 
     // ---- Content cells (pre-computed row/col range, no redundant bg fill) ----
-    int cx = w->x + WIN_BORDER, cy = w->y + WIN_BORDER + WIN_TITLE_H;
+    int cx = w->x + WIN_BORDER, cy = w->y + WIN_BORDER + title_off;
     int cw = w->w - 2 * WIN_BORDER, ch = w->h - WIN_TITLE_H - 2 * WIN_BORDER;
     int x0 = cx > rx ? cx : rx, y0 = cy > ry ? cy : ry;
     int x1 = (cx + cw) < (rx + rw) ? (cx + cw) : (rx + rw);
@@ -283,8 +432,9 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
     if (x0 < x1 && y0 < y1) {
         // Fill content background — essential: null chars (0x00) in the
         // buffer cause draw_char_scaled to bail early, leaving gaps.
-        rect_fill(x0, y0, x1 - x0, y1 - y0, vga_to_rgb[WIN_BG]);
+        rect_fill(x0, y0, x1 - x0, y1 - y0, vga_to_rgb[w->content_bg]);
         if (w->content) {
+            int wid = (int)(w - windows);
             int scale = w->font_scale;
             int char_w = CHAR_W * scale, char_h = CHAR_H * scale;
             // Pre-compute row/col range — skip cells outside clip rect
@@ -298,9 +448,22 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
             if (col_end > w->content_w) col_end = w->content_w;
             for (int row = row_start; row < row_end; row++) {
                 int py = cy + row * char_h;
+                // Scrolled-back view: the top scroll_off rows come from the
+                // history ring; live rows shift down by scroll_off. The live
+                // grid itself is never rewritten.
+                const uint16_t* src;
+                if (w->scroll_off > 0 && row < w->scroll_off) {
+                    int h = sb_count[wid] - w->scroll_off + row; // history line
+                    int idx = ((sb_next[wid] - sb_count[wid] + h) % SB_ROWS
+                               + SB_ROWS) % SB_ROWS;
+                    src = sb_ring[wid][idx];
+                } else {
+                    int lrow = row - w->scroll_off;
+                    src = w->content + lrow * CONTENT_COLS_MAX;
+                }
                 for (int col = col_start; col < col_end; col++) {
                     int px = cx + col * char_w;
-                    uint16_t entry = w->content[row * CONTENT_COLS_MAX + col];
+                    uint16_t entry = src[col];
                     char c = entry & 0xFF;
                     uint8_t color = (entry >> 8) & 0xFF;
                     draw_char_scaled(px, py, c,
@@ -320,8 +483,9 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
                   i + 1, vga_to_rgb[8]);
     }
 
-    // ---- Blinking cursor (skip if clip rect doesn't overlap) ----
-    if (w->focused && w->content) {
+    // ---- Blinking cursor (skip if clip rect doesn't overlap; hidden while
+    // scrolled back — it belongs to the live tail, not the history view) ----
+    if (w->focused && w->content && !w->scroll_off) {
         int scale = w->font_scale;
         int char_w = CHAR_W * scale, char_h = CHAR_H * scale;
         int bx = cx + w->cursor_x * char_w, by = cy + w->cursor_y * char_h;
@@ -362,12 +526,39 @@ void window_draw_all(void) {
 
 static void scroll_content(struct window* w) {
     if (w->cursor_y >= w->content_h) {
+        // The top line leaves the grid — archive it into the scrollback ring.
+        int id = (int)(w - windows);
+        if (id >= 0 && id < MAX_WINDOWS) {
+            for (int col = 0; col < w->content_w; col++)
+                sb_ring[id][sb_next[id]][col] = w->content[col];
+            sb_next[id] = (sb_next[id] + 1) % SB_ROWS;
+            if (sb_count[id] < SB_ROWS) sb_count[id]++;
+            w->scroll_off = 0; // new output → follow the tail again
+        }
         for (int row = 0; row < w->content_h - 1; row++)
             for (int col = 0; col < w->content_w; col++)
                 w->content[row * CONTENT_COLS_MAX + col] = w->content[(row + 1) * CONTENT_COLS_MAX + col];
         for (int col = 0; col < w->content_w; col++)
-            w->content[(w->content_h - 1) * CONTENT_COLS_MAX + col] = 0x0F00;
+            w->content[(w->content_h - 1) * CONTENT_COLS_MAX + col] =
+                (uint16_t)((w->content_bg << 4) | w->text_fg) << 8 | ' ';
         w->cursor_y = w->content_h - 1;
+    }
+}
+
+// Mouse-wheel scroll: `notches` follows the okai convention (positive = wheel
+// down = toward the live tail; negative = back through history). 3 lines per
+// detent, clamped to [0, archived lines].
+void window_scroll_view(int id, int notches) {
+    if (id < 0 || id >= MAX_WINDOWS || notches == 0) return;
+    struct window* w = &windows[id];
+    if (!w->visible) return;
+    int off = w->scroll_off - notches * 3;
+    if (off > sb_count[id]) off = sb_count[id];
+    if (off < 0) off = 0;
+    if (off != w->scroll_off) {
+        w->scroll_off = off;
+        w->dirty = 1; needs_redraw = 1;
+        serial_printf("[scr] win=%d off=%d hist=%d\n", id, off, sb_count[id]);
     }
 }
 
@@ -386,18 +577,57 @@ void window_put_char(int id, char c) {
 
 void window_puts(int id, const char* str) { while (*str) window_put_char(id, *str++); }
 
+void window_write_cell(int id, int row, int col, char c, uint8_t fg, uint8_t bg) {
+    struct window* w = &windows[id];
+    if (!w->visible || !w->content) return;
+    if (row < 0 || row >= w->content_h || col < 0 || col >= w->content_w) return;
+    uint16_t color = (uint16_t)((bg << 4) | fg);
+    w->content[row * CONTENT_COLS_MAX + col] = (uint16_t)(color << 8) | (uint8_t)c;
+    w->dirty = 1;
+}
+
+void window_set_cursor(int id, int row, int col) {
+    if (id < 0 || id >= MAX_WINDOWS) return;
+    struct window* w = &windows[id];
+    if (row < 0) row = 0;
+    if (row >= w->content_h) row = w->content_h - 1;
+    if (col < 0) col = 0;
+    if (col >= w->content_w) col = w->content_w - 1;
+    w->cursor_x = col;
+    w->cursor_y = row;
+}
+
 void window_clear(int id) {
+    if (id < 0 || id >= MAX_WINDOWS) return;
     struct window* w = &windows[id];
     if (!w->content) return;
-    uint8_t color = (w->text_bg << 4) | w->text_fg;
+    uint8_t color = (w->content_bg << 4) | w->text_fg;
     for (int r = 0; r < w->content_h; r++)
         for (int c = 0; c < w->content_w; c++)
             w->content[r * CONTENT_COLS_MAX + c] = (uint16_t)color << 8 | ' ';
     w->cursor_x = 0; w->cursor_y = 0; w->dirty = 1;
+    sb_count[id] = 0; sb_next[id] = 0; w->scroll_off = 0; // wipe history too
 }
 
 void window_set_text_color(int id, uint8_t fg, uint8_t bg) {
     if (id >= 0 && id < MAX_WINDOWS) { windows[id].text_fg = fg; windows[id].text_bg = bg; }
+}
+
+void window_set_content_bg(int id, uint8_t bg) {
+    if (id >= 0 && id < MAX_WINDOWS) {
+        struct window* w = &windows[id];
+        if (w->content_bg != bg) { w->content_bg = bg; w->dirty = 1; needs_redraw = 1; }
+    }
+}
+
+// True if a VGA palette index reads as a light (high-luminance) color, used to
+// pick a readable default text color when a page sets a background.
+int window_color_is_light(uint8_t idx) {
+    if (idx > 15) return 0;
+    uint32_t c = vga_to_rgb[idx];
+    int r = (int)((c >> 16) & 0xFF), g = (int)((c >> 8) & 0xFF), b = (int)(c & 0xFF);
+    int lum = (r * 77 + g * 150 + b * 29) / 256; // perceptual-ish 0..255
+    return lum > 128;
 }
 
 void window_set_title(int id, const char* title) {
@@ -408,8 +638,8 @@ void window_set_title(int id, const char* title) {
 
 void window_draw_taskbar(void) {
     int y = SCREEN_H - TASKBAR_H;
-    rect_fill(0, y, SCREEN_W, TASKBAR_H, vga_to_rgb[1]);
-    hline(0, y, SCREEN_W, vga_to_rgb[7]);
+    gradient_fill(0, y, SCREEN_W, TASKBAR_H, TASKBAR_TOP, TASKBAR_BOT, 1);
+    hline(0, y, SCREEN_W, TITLE_DIVIDER);
 
     int count = 0;
     for (int i = 0; i < MAX_WINDOWS; i++) if (windows[i].visible) count++;
@@ -424,14 +654,15 @@ void window_draw_taskbar(void) {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         struct window* w = &windows[i];
         if (!w->visible) continue;
-        uint32_t btn_bg = w->focused ? vga_to_rgb[9] : vga_to_rgb[1];
-        rect_fill(x, y + 3, btn_w, TASKBAR_H - 6, btn_bg);
+        int focused = w->focused && !w->minimized;
+        uint32_t btn_bg = focused ? CHROME_TAB_ACTIVE : TASK_BTN_INACT;
+        round_rect_fill(x, y + 3, btn_w, TASKBAR_H - 6, btn_bg, 4);
         char label[20]; int li = 0;
         int max_chars = (btn_w - 8) / CHAR_W;
         if (max_chars > 18) max_chars = 18;
         while (w->title[li] && li < max_chars) { label[li] = w->title[li]; li++; }
         label[li] = 0;
-        draw_string(x + 4, y + 5, label, vga_to_rgb[15], btn_bg);
+        draw_string_fg(x + 4, y + 5, label, focused ? CHROME_TAB_TEXT : TITLE_TEXT_F);
         x += btn_w + 6;
     }
 }

@@ -30,7 +30,7 @@ TEXT_OBJ = src/vga.o src/shell.o src/terminal.o
 # Desktop mode objects
 # NOTE: -DKERNEL is set in CFLAGS below so the shared crypto/TLS source can
 # switch its stdio logging to serial_printf and its RNG to the kernel CPRNG.
-DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/browser.o src/html.o \
+DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/html.o src/css.o \
              src/crypto/sha256.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/chacha20.o src/crypto/poly1305.o \
              src/crypto/x25519.o src/crypto/tls_record.o src/crypto/tls_handshake.o \
@@ -72,6 +72,7 @@ okernel-desktop.iso: okernel-desktop.bin
 	echo 'set default=0' >> isodir/boot/grub/grub.cfg
 	echo '' >> isodir/boot/grub/grub.cfg
 	echo 'menuentry "okernel desktop" {' >> isodir/boot/grub/grub.cfg
+	echo '    set gfxpayload=1920x1080x32' >> isodir/boot/grub/grub.cfg
 	echo '    multiboot /boot/okernel.bin' >> isodir/boot/grub/grub.cfg
 	echo '    boot' >> isodir/boot/grub/grub.cfg
 	echo '}' >> isodir/boot/grub/grub.cfg
@@ -93,7 +94,7 @@ run: text
 	qemu-system-i386 -cdrom okernel-text.iso -boot d
 
 run-desktop: desktop
-	qemu-system-i386 -cdrom okernel-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0
+	qemu-system-i386 -cdrom okernel-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0 -fullscreen
 
 debug: text
 	qemu-system-i386 -cdrom okernel-text.iso -boot d -serial stdio

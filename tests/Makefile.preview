@@ -1,0 +1,16 @@
+# Host build of the okai page preview — no QEMU needed.
+# The preview compiles the REAL kernel sources (html.c/css.c/okai.c) with
+# -DHOST_PREVIEW accessors plus stubs; output is a PNG of the laid-out page.
+CC      = gcc
+CFLAGS  = -DKERNEL=0 -DHOST_PREVIEW -I../src -include string.h -O2
+
+okai_preview: okai_preview.c ../src/okai.c ../src/html.c ../src/css.c font_data.h
+	$(CC) $(CFLAGS) okai_preview.c ../src/okai.c ../src/html.c ../src/css.c -lz -o $@
+
+# regenerate font_data.h from the kernel font tables (run after font changes)
+font_data.h: ../src/graphics.c gen_font.py
+	python3 gen_font.py
+
+clean:
+	rm -f okai_preview font_data.h
+.PHONY: clean

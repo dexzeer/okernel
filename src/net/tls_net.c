@@ -1,15 +1,17 @@
 // TLS 1.3 network integration for the kernel.
-// Provides https_get() which resolves DNS, opens a TCP:443 connection, runs the
-// full TLS 1.3 handshake, sends the HTTP request, and buffers the decrypted
-// response — all from a single blocking call.
+// Provides https_get() which queues an HTTPS GET (DNS resolution, TCP:443
+// connect, full TLS 1.3 handshake, HTTP GET, and response buffering) and runs
+// it ASYNCHRONOUSLY: https_get_poll() is called once per main loop and advances
+// the fetch by one step. This keeps the desktop responsive (mouse/keyboard/
+// other windows) while a page loads, instead of blocking the whole kernel for
+// the duration of the handshake + download.
 //
-// The kernel has no select()/poll() syscall and the TLS client (tls_client.c)
-// is a single blocking driver. So this module makes the recv callback *itself*
-// pump the NIC: each time the handshake waits for bytes it calls e1000_poll()
-// + net_poll(), which process incoming packets into the TLS receive buffer via
-// tcp_handle_packet -> tls_append_data(). This is the kernel equivalent of a
-// blocking select() loop, and it runs fine from the keyboard ISR context
-// (interrupts are off there, but RX is DMA so polling the descriptors works).
+// The TLS client driver (tls_client.c) is a resumable state machine. Its recv
+// callback (kernel_tcp_recv) is NON-blocking: it returns available bytes, -1 on
+// peer close, or 0 when no data has arrived yet. The driver then yields to the
+// main loop; the next iteration re-attempts. Incoming packets are appended to
+// tls_rx_buf by tcp_handle_packet -> tls_append_data() as the main loop polls
+// the NIC (e1000_poll / net_poll).
 #include "tls_net.h"
 #include "../crypto/tls_client.h"
 #include "network.h"
@@ -20,11 +22,6 @@
 #include <string.h>
 
 // TLS receive buffer — TCP data from tcp_handle_packet goes here.
-// Must be large enough to hold an entire in-flight burst: e1000_poll() drains
-// every available RX descriptor in one call, so a ~28KB page can land in the
-// ring before the handshake driver reads it. Too small and tls_append_data
-// silently drops bytes, truncating the TLS stream mid-record (seen with
-// notdexy.ru: 16KB dropped ~14KB and corrupted a 7133-byte record).
 #define TLS_RX_BUF_SIZE 65536
 static uint8_t  tls_rx_buf[TLS_RX_BUF_SIZE];
 static uint32_t tls_rx_head;     // next write position
@@ -32,23 +29,45 @@ static uint32_t tls_rx_tail;     // next read position
 static uint32_t tls_rx_len;      // bytes available
 
 // TLS response buffer — decrypted HTTP response goes here.
-// Must exceed the largest page we want to render (notdexy.ru is ~29KB). The
-// handshake driver caps out_len at this size and fails past it, so a too-small
-// buffer yields a blank page rather than a truncated one.
-static char     tls_response[65536];
+static char     tls_response[262144];
 static uint32_t tls_response_len;
 
-// TLS state
-static int tls_active;           // 1 while a TLS session is in progress
-static int tls_phase;            // handshake phase for the state machine
+// Async fetch state machine.
+enum { HP_IDLE = 0, HP_DNS, HP_TCP, HP_TLS };
+static int tls_active;           // 1 while a fetch is in progress
+static int tls_phase;            // HP_* current phase
+static char tls_host_buf[128];   // copied (caller's host buffer may be transient)
 static const char* tls_host;
 static char tls_path[128];
 static char tls_req_buf[512];
+static uint32_t tls_req_len;
 
-static int tls_done = 0;         // 1 once https_get has a finished response
-static int tls_peer_closed = 0;  // set by tcp_handle_packet when FIN arrives
+static int tls_done = 0;         // 1 once the response is buffered
+static int tls_peer_closed = 0;  // set by tcp_handle_packet on FIN
+// TCP connection attempts for the current fetch. Bounded so an unreachable host
+// gives up instead of re-tcp_connect() forever (which would wedge the okai
+// single-owner fetch model).
+static int tls_conn_attempts = 0;
+#define TLS_MAX_CONN_ATTEMPTS 4
 
-// ---- Buffer management ----
+static uint32_t tls_resolved_ip = 0;
+
+// Fetch start tick, for a defensive timeout so a connection that can never
+// complete (e.g. unreachable host) stops the async machine instead of spinning
+// forever and leaving the okai on a blank page.
+extern uint32_t tick_count;
+static uint32_t tls_start_tick = 0;
+#define TLS_FETCH_TIMEOUT_TICKS 1200 // ~66s at 18 ticks/s; generous on purpose
+
+// Resumable TLS client state, advanced one step per https_get_poll() call.
+static int kernel_tcp_send(const uint8_t* buf, uint32_t len, void* user);
+static int kernel_tcp_recv(uint8_t* buf, uint32_t cap, uint32_t timeout_ms, void* user);
+static struct tls_state tls_s;
+static struct tls_client_io tls_io = {
+    .send = kernel_tcp_send,
+    .recv = kernel_tcp_recv,
+    .user = NULL,
+};
 
 static void tls_rx_reset(void) {
     tls_rx_head = 0;
@@ -64,65 +83,22 @@ void tls_append_data(const uint8_t* data, uint32_t len) {
     }
 }
 
-// Yield the vCPU so QEMU's SLIRP (which shares the QEMU process) can run and
-// DMA inbound packets into the RX ring we're polling. A tight CPU-spin here
-// would starve SLIRP under TCG (no KVM): the guest hogs the process and the
-// SYN/ACK + TLS records never get delivered, so the fetch hangs. Halting with
-// interrupts enabled lets the timer/NIC IRQs wake us (~55ms windows at 18Hz),
-// which is enough to keep the network pump fed. The keyboard IRQ is masked for
-// the duration so a stray keystroke can't re-enter on_keypress mid-fetch, and
-// the original interrupt flag is preserved either way.
-static void net_yield(void) {
-    uint32_t flags;
-    __asm__ volatile("pushf; popl %0" : "=r"(flags));
-    uint8_t kmask = inb(0x21);
-    outb(0x21, kmask | 0x02); // block IRQ1 (keyboard)
-    if (flags & 0x200) {
-        __asm__ volatile("hlt"); // IF already on; stay enabled
-    } else {
-        __asm__ volatile("sti; hlt; cli"); // re-establish IF=0 afterwards
-    }
-    outb(0x21, kmask); // restore keyboard mask
-}
-
-// Brief yield between NIC polls in the blocking loop (see net_yield).
-static void tls_spin(void) {
-    net_yield();
-}
-
-// ---- TCP send callback for tls_client_io ----
-
 static int kernel_tcp_send(const uint8_t* buf, uint32_t len, void* user) {
     (void)user;
-    // tcp_send_data handles segmentation internally (requires ESTABLISHED).
     tcp_send_data((uint8_t*)buf, (uint16_t)len);
     return 0;
 }
 
-// ---- TCP recv callback for tls_client_io ----
-// Polls the NIC (which fills tls_rx_buf via tcp_handle_packet -> tls_append_data)
-// and returns buffered bytes, or -1 on peer close / timeout.
-
+// NON-blocking recv: returns buffered bytes, -1 on peer close, or 0 when no
+// data has arrived yet (caller yields to the main loop). The main loop polls
+// the NIC every frame, so data shows up within a frame or two.
 static int kernel_tcp_recv(uint8_t* buf, uint32_t cap, uint32_t timeout_ms, void* user) {
     (void)user;
-    uint32_t waited = 0;
-    uint32_t step = 40; // approximate ms per spin
-
-    while (tls_rx_len == 0) {
-        // Peer closed the connection and nothing is buffered -> EOF.
+    (void)timeout_ms;
+    if (tls_rx_len == 0) {
         if (tls_peer_closed || tcp_is_closed()) return -1;
-
-        // Process any arrived packets. In the kernel there is no background
-        // packet pump (the main loop is not running while we block), so we
-        // must drive the NIC ourselves.
-        e1000_poll();
-        net_poll();
-        tls_spin();
-
-        waited += step;
-        if (timeout_ms && waited >= timeout_ms) return -1;
+        return 0; // would block
     }
-
     uint32_t to_read = tls_rx_len < cap ? tls_rx_len : cap;
     for (uint32_t i = 0; i < to_read; i++) {
         buf[i] = tls_rx_buf[tls_rx_tail];
@@ -132,23 +108,26 @@ static int kernel_tcp_recv(uint8_t* buf, uint32_t cap, uint32_t timeout_ms, void
     return (int)to_read;
 }
 
-// ---- Public API ----
-
 void https_get(const char* host, const char* path) {
     tls_rx_reset();
     tls_response_len = 0;
+    tls_response[0] = 0;
     tls_active = 1;
-    tls_phase = 0;
-    tls_peer_closed = 0;
+    tls_phase = HP_DNS;
     tls_done = 0;
-    tls_host = host;
+    tls_peer_closed = 0;
+    tls_resolved_ip = 0;
+    tls_conn_attempts = 0;
+    tls_start_tick = tick_count;
 
-    // Copy path
     int i;
+    for (i = 0; host[i] && i < 127; i++) tls_host_buf[i] = host[i];
+    tls_host_buf[i] = 0;
+    tls_host = tls_host_buf;
+
     for (i = 0; path[i] && i < 127; i++) tls_path[i] = path[i];
     tls_path[i] = 0;
 
-    // Build HTTP request
     int rlen = 0;
     const char* req = "GET ";
     while (*req) tls_req_buf[rlen++] = *req++;
@@ -157,74 +136,111 @@ void https_get(const char* host, const char* path) {
     req = "HTTP/1.1\r\nHost: ";
     while (*req) tls_req_buf[rlen++] = *req++;
     for (i = 0; tls_host[i]; i++) tls_req_buf[rlen++] = tls_host[i];
-    req = "\r\nConnection: close\r\n\r\n";
+    req = "\r\nUser-Agent: okernel/0.4\r\nAccept: */*\r\nConnection: close\r\n\r\n";
     while (*req) tls_req_buf[rlen++] = *req++;
+    tls_req_len = rlen;
 
-    serial_puts("[tls-net] starting HTTPS to ");
+    dns_resolve(host);
+    serial_puts("[tls-net] queued HTTPS ");
     serial_puts(host);
+    serial_puts(tls_path);
     serial_puts("\n");
+}
 
-    // 1) DNS resolution (busy-wait, pumping the NIC)
-    uint32_t ip = 0;
-    if (!dns_is_resolved(&ip)) {
-        dns_resolve(host);
-        uint32_t t = 0;
-        while (!dns_is_resolved(&ip) && t < 30000) {
-            e1000_poll(); net_poll(); tls_spin(); t += 50;
-        }
-    }
-    if (!dns_is_resolved(&ip)) {
-        serial_puts("[tls-net] DNS FAILED\n");
-        tls_active = 0;
-        return;
-    }
-    serial_puts("[tls-net] resolved, opening TCP:443\n");
+// Advance the in-flight HTTPS fetch by one step. Called once per main-loop
+// iteration. Yields between phases so the desktop stays interactive.
+void https_get_poll(void) {
+    if (!tls_active) return;
 
-    // 2) TCP connect — call tcp_connect() only while CLOSED (it resets the
-    //    connection state, so re-calling every iteration would re-send SYN).
-    {
-        uint32_t t = 0;
-        while (!tcp_is_established() && t < 30000) {
-            if (tcp_conn_state() == TCP_STATE_CLOSED) tcp_connect(ip, 443);
-            e1000_poll(); net_poll(); tls_spin(); t += 50;
-        }
-    }
-    if (!tcp_is_established()) {
-        serial_puts("[tls-net] TCP connect FAILED\n");
-        tls_active = 0;
-        return;
-    }
-    serial_puts("[tls-net] TCP established, handshake...\n");
-
-    // 3) TLS handshake + GET + read. The recv callback pumps the NIC.
-    struct tls_client_io io = {
-        .send = kernel_tcp_send,
-        .recv = kernel_tcp_recv,
-        .user = NULL,
-    };
-
-    int n = tls_client_run(host, 443,
-                           (const uint8_t*)tls_req_buf, rlen,
-                           (uint8_t*)tls_response, sizeof(tls_response) - 1,
-                           &io);
-
-    if (n < 0) {
-        serial_puts("[tls-net] handshake FAILED\n");
+    // Defensive timeout: a fetch that can't complete (unreachable host, dropped
+    // SYN) must stop the machine rather than hang the okai on a blank page.
+    if (tls_phase != HP_IDLE && (uint32_t)(tick_count - tls_start_tick) > TLS_FETCH_TIMEOUT_TICKS) {
+        serial_puts("[tls-net] fetch timed out\n");
         tls_response_len = 0;
         tls_response[0] = 0;
-    } else {
-        tls_response_len = (uint32_t)n;
-        tls_response[n] = 0;
-        serial_printf("[tls-net] received %u bytes\n", (unsigned)n);
+        tls_done = 0;
+        tls_active = 0;
+        tls_phase = HP_IDLE;
+        return;
     }
 
-    tls_done = (n > 0);
-    tls_active = 0;
+    if (tls_phase == HP_DNS) {
+        if (dns_is_resolved(&tls_resolved_ip, tls_host)) {
+            serial_puts("[tls-net] DNS resolved, opening TCP:443\n");
+            tls_phase = HP_TCP;
+        } else if (!dns_is_pending()) {
+            // The query was answered but carried no A record (bad/empty host,
+            // NXDOMAIN). Abort now instead of stalling until the 66s timeout —
+            // the okai owner model must be released for the next window.
+            serial_puts("[tls-net] DNS failed (no A record), aborting fetch\n");
+            tls_response_len = 0;
+            tls_response[0] = 0;
+            tls_done = 0;
+            tls_active = 0;
+            tls_phase = HP_IDLE;
+        }
+        return;
+    }
+
+    if (tls_phase == HP_TCP) {
+        if (tcp_is_established()) {
+            // Connection is up: run the TLS handshake exactly once.
+            tls_state_init(&tls_s, tls_host, 443,
+                           (const uint8_t*)tls_req_buf, tls_req_len,
+                           (uint8_t*)tls_response, sizeof(tls_response) - 1);
+            tls_phase = HP_TLS;
+            serial_puts("[tls-net] TCP established, handshake...\n");
+            return;
+        }
+        // Open a FRESH connection only when the global socket is not already
+        // mid-handshake. tcp_connect() re-randomizes the ephemeral source port
+        // on every call, so re-invoking it each poll while SYN_SENT sends a SYN
+        // from a new port every frame; the server's SYN-ACK (destined for the
+        // previous port) is then dropped and the handshake can never complete —
+        // the 2nd fetch just retransmits forever and the window stays black.
+        // A SYN_SENT connection is owned by tcp_poll()'s retransmit timer: send
+        // the SYN once here, then let that timer ride until ESTABLISHED.
+        if (tcp_conn_state() != TCP_STATE_SYN_SENT) {
+            tls_conn_attempts++;
+            if (tls_conn_attempts > TLS_MAX_CONN_ATTEMPTS) {
+                // Unreachable after several SYN attempts: abandon so the okai
+                // owner model can move on to the next pending window.
+                tls_response_len = 0;
+                tls_response[0] = 0;
+                tls_done = 0;
+                tls_active = 0;
+                tls_phase = HP_IDLE;
+                serial_puts("[tls-net] giving up: host unreachable\n");
+                return;
+            }
+            tcp_connect(tls_resolved_ip, 443);
+        }
+        return;
+    }
+
+    if (tls_phase == HP_TLS) {
+        int r = tls_state_step(&tls_s, &tls_io);
+        if (r == TLS_STEP_DONE) {
+            tls_response_len = tls_s.out_len;
+            tls_response[tls_s.out_len] = 0;
+            tls_done = 1;
+            tls_active = 0;
+            tls_phase = HP_IDLE;
+            serial_printf("[tls-net] received %u bytes\n", (unsigned)tls_s.out_len);
+        } else if (r == TLS_STEP_ERR) {
+            tls_response_len = 0;
+            tls_response[0] = 0;
+            tls_done = 0;
+            tls_active = 0;
+            tls_phase = HP_IDLE;
+            serial_puts("[tls-net] handshake/download FAILED\n");
+        }
+        return;
+    }
 }
 
 int tls_poll(void) {
-    // The handshake is driven synchronously inside https_get(); there is no
-    // asynchronous state machine to advance from the main loop.
+    https_get_poll();
     return tls_done ? 1 : 0;
 }
 
@@ -245,6 +261,5 @@ int tls_is_done(void) {
 }
 
 void tls_connection_closed(void) {
-    // Peer sent FIN. The recv callback watches this to return EOF promptly.
     tls_peer_closed = 1;
 }
