@@ -6,12 +6,32 @@
 #define SCREEN_W 1920
 #define SCREEN_H 1080
 
-// Font: 8x16 source, FONT_SCALE 2 = 16x32 rendered characters
-#define FONT_W 8
-#define FONT_H 16
-#define FONT_SCALE 2
+// Main font: Terminus 16x32 (tools/bdf2font.py from terminus-font ter-u32n.bdf),
+// rendered 1:1 (FONT_SCALE 1) so glyphs are crisp, not upscaled/pixelated.
+// Width exceeds 8 here (2 bytes per row); FONT_BPR = bytes per glyph row.
+// Swap sizes by regenerating src/font_data.c and updating FONT_W/FONT_H here.
+#define FONT_W 16
+#define FONT_H 32
+#define FONT_SCALE 1
+#define FONT_BPR ((FONT_W + 7) / 8)
 #define CHAR_W (FONT_W * FONT_SCALE)
 #define CHAR_H (FONT_H * FONT_SCALE)
+
+// Font bitmap data lives in src/font_data.c (generated). Keep the second
+// dimension in sync with FONT_H * FONT_BPR when you change the font size.
+extern const uint8_t font8x16[95][FONT_H * FONT_BPR];
+
+// Extended font (Cyrillic + symbols, slots >= 0x80 from the HTML decoder)
+// keeps its own size so it can stay 8x16 while the main font is upgraded.
+#define FONT_EXT_W 8
+#define FONT_EXT_H 16
+#define FONT_EXT_BPR ((FONT_EXT_W + 7) / 8)
+
+// Content text (terminal + webpage body) renders at 3/4 of the base glyph
+// size: 12x24 px instead of 16x32 — ~25% smaller so more text fits. OS and
+// browser chrome keep the full 16x32 via draw_char / draw_string_fg.
+#define CONTENT_GW (FONT_W * FONT_SCALE * 3 / 4)
+#define CONTENT_GH (FONT_H * FONT_SCALE * 3 / 4)
 
 // Initialize graphics with multiboot info for framebuffer
 void graphics_init(uint32_t mboot_addr);
@@ -39,6 +59,10 @@ void line(int x0, int y0, int x1, int y1, uint32_t color);
 
 // Draw a character (8x16 font, scaled 2x = 16x16 pixels)
 void draw_char(int x, int y, char c, uint32_t fg, uint32_t bg);
+
+// Draw a character into an exact tw x th box (nearest-neighbor); used by
+// content text at CONTENT_GW x CONTENT_GH (12x24).
+void draw_char_sized(int x, int y, char c, uint32_t fg, uint32_t bg, int tw, int th);
 
 // Draw a character with extra scaling
 void draw_char_scaled(int x, int y, char c, uint32_t fg, uint32_t bg, int scale);

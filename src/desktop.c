@@ -15,6 +15,7 @@
 #include "filesystem.h"
 #include "editor.h"
 #include "okai.h"
+#include "theme.h"
 #include "crypto/rand.h"
 
 struct mboot_info {
@@ -222,11 +223,20 @@ static void desktop_paint_rect(int x, int y, int w, int h) {
     desktop_paint_rect_skip(-1, x, y, w, h);
 }
 
+// Public wrapper so other modules (e.g. window.c on close/minimize) can repair
+// a screen region now that the backbuffer is persistent and we no longer do a
+// full repaint every frame.
+void desktop_paint_rect_pub(int x, int y, int w, int h) {
+    desktop_paint_rect_skip(-1, x, y, w, h);
+}
+
 // Cursor compositor state: where the sprite was painted last frame.
 // The backbuffer is only ever "model + this one sprite".
 static int cursor_shown = 0;
 static int cursor_px = 0;
 static int cursor_py = 0;
+static int g_last_mouse_x = -1;
+static int g_last_mouse_y = -1;
 
 // Returns file index if icon clicked, -1 otherwise
 static int check_icon_click(int mx, int my) {
@@ -275,7 +285,7 @@ static void open_sysinfo(void) {
     info_win = window_create("System Info", 600, 80, 700, 500);
     window_set_close_button(info_win, 1);
     window_set_minimize_button(info_win, 1);
-    window_puts(info_win, "okernel v0.4\n");
+    window_puts(info_win, "okernel v0.7\n");
     window_puts(info_win, "Desktop Edition\n\n");
     window_puts(info_win, "Resolution: 1920x1080\n");
     window_puts(info_win, "Shell: okernel sh\n");
@@ -534,7 +544,7 @@ static void shell_execute(int win_id, const char* input) {
         put_uint(buf, free);  window_puts(win_id, "  Free:  "); window_puts(win_id, buf); window_puts(win_id, " MB\n");
     }
     else if (str_eq(cmd_buf, "uptime")) {
-        uint32_t seconds = tick_count / 18;
+        uint32_t seconds = tick_count / 100;
         uint32_t h = seconds / 3600;
         uint32_t m = (seconds % 3600) / 60;
         uint32_t s = seconds % 60;
@@ -558,11 +568,11 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, " | (_) |   <  __/ |  | | | |  __/ |\n");
         window_puts(win_id, "  \\___/|_|\\_\\___|_|  |_| |_|\\___|_|\n\n");
         window_set_text_color(win_id, 15, 0); // White
-        window_puts(win_id, "okernel v0.4 - Desktop Edition\n");
+        window_puts(win_id, "okernel v0.7 - Desktop Edition\n");
         window_puts(win_id, "Built from scratch in C and x86 assembly\n");
     }
     else if (str_eq(cmd_buf, "neofetch") || str_eq(cmd_buf, "sysinfo")) {
-        window_puts(win_id, "okernel v0.4\n");
+        window_puts(win_id, "okernel v0.7\n");
         window_puts(win_id, "Resolution: 1920x1080 (2x scale)\n");
         window_puts(win_id, "Shell: okernel sh\n");
         window_puts(win_id, "Memory: ");
@@ -762,6 +772,13 @@ void kernel_main(uint32_t mboot_addr) {
 
     irq_register_handler(0, on_timer);
 
+    // Raise the PIT from the BIOS-default 18.2 Hz to 100 Hz. Vsync-less
+    // software rendering needs a fine-grained tick to cap the redraw rate
+    // without busy-looping the whole screen hundreds of times per second.
+    outb(0x43, 0x36);            // channel 0, mode 3, 16-bit binary
+    outb(0x40, 0x9C);            // divisor lo  (1193182 / 100 = 11932 = 0x2E9C)
+    outb(0x40, 0x2E);            // divisor hi
+
     // Create main terminal — large, centered
     term_wins[0] = window_create("Terminal", 40, 30, 900, 650);
     window_set_close_button(term_wins[0], 1);
@@ -778,7 +795,7 @@ void kernel_main(uint32_t mboot_addr) {
     window_puts(term_wins[0], " | (_) |   <  __/ |  | | | |  __/ |\n");
     window_puts(term_wins[0], "  \\___/|_|\\_\\___|_|  |_| |_|\\___|_|\n\n");
     window_set_text_color(term_wins[0], 15, 0);
-    window_puts(term_wins[0], "Welcome to okernel v0.4\n");
+    window_puts(term_wins[0], "Welcome to okernel v0.7\n");
     window_puts(term_wins[0], "A minimalistic operating system.\n\n");
     window_set_text_color(term_wins[0], 8, 0);
     window_puts(term_wins[0], "Type 'help' for commands.\n");
@@ -959,6 +976,16 @@ void kernel_main(uint32_t mboot_addr) {
                         {
                             int br_id = okai_find_by_win(i);
                             if (br_id >= 0) {
+                                struct okai* ok = okai_get(br_id);
+                                // Lock icon toggles a security popup; any other
+                                // click inside the window dismisses it first.
+                                if (okai_lock_hit(br_id, mx, my)) {
+                                    ok->show_security = !ok->show_security;
+                                    needs_redraw = 1;
+                                    clicked = 1;
+                                    break;
+                                }
+                                if (ok->show_security) { ok->show_security = 0; needs_redraw = 1; }
                                 int on_close = 0;
                                 int ti = okai_tab_hit(br_id, mx, my, &on_close);
                                 if (ti >= 0) {
@@ -991,8 +1018,14 @@ void kernel_main(uint32_t mboot_addr) {
                         // Top chrome band: drag the window by it — except the
                         // address bar, which click-focuses for typing (like
                         // pressing 'g'). Anything else must NOT clear the URL
-                        // display; stray chrome clicks used to wipe it.
-                        if (my < w->y + WIN_TITLE_H + WIN_BORDER) {
+                        // display or fall through to content/link hit-testing;
+                        // stray chrome clicks used to wipe it or trigger link
+                        // navigation. For a no-titlebar browser the chrome is the
+                        // whole tab strip + toolbar; for a titled window it is
+                        // just the title bar (above grid_top).
+                        if (w->no_titlebar
+                                ? (my <= grid_top + CHROME_TAB_H + CHROME_TOOL_H)
+                                : (my < grid_top)) {
                             int br_id2 = okai_find_by_win(i);
                             if (br_id2 >= 0 && okai_addr_bar_hit(br_id2, mx, my)) {
                                 struct okai* ok = okai_get(br_id2);
@@ -1018,8 +1051,8 @@ void kernel_main(uint32_t mboot_addr) {
                                 struct okai_tab* T = ok ? okai_tab_of(ok) : 0;
                                 if (ok && T->link_count > 0) {
                                     int ox = w->x + WIN_BORDER;
-                                    int cw = CHAR_W * w->font_scale;
-                                    int chh = CHAR_H * w->font_scale;
+                                    int cw = CONTENT_GW * w->font_scale;
+                                    int chh = CONTENT_GH * w->font_scale;
                                     int col = (mx - ox) / cw;
                                     int row = (my - grid_top) / chh;
                                     serial_printf("[okai] click row=%d col=%d (mx=%d my=%d) links=%d\n",
@@ -1104,12 +1137,19 @@ void kernel_main(uint32_t mboot_addr) {
                         }
                     }
                 } else if (!tls_is_active() && !tls_is_done()) {
-                    // Fetch gave up (TLS timeout / unreachable) — don't retry
-                    // forever and don't block later windows from loading.
-                    okai_fetch_owner = -1;
-                    T->token_count = -1;
-                    T->last_resp_len = 0;
-                    okai_render_content(bi); // show "Unable to load" page
+                    // Fetch gave up (TLS timeout / unreachable / no A record).
+                    // If we haven't already, retry once over plain HTTP — some
+                    // hosts don't serve HTTPS. Ownership stays with this window;
+                    // the next loop iteration takes the HTTP branch (is_https is
+                    // now 0) so this branch won't re-fire.
+                    if (okai_fallback_http(bi) == 0) {
+                        serial_printf("[okai] http fallback in flight for %s\n", T->url);
+                    } else {
+                        okai_fetch_owner = -1;
+                        T->token_count = -1;
+                        T->last_resp_len = 0;
+                        okai_render_content(bi); // show "Unable to load" page
+                    }
                 }
             } else {
                 int resp_len = http_get_response_len();
@@ -1288,18 +1328,35 @@ void kernel_main(uint32_t mboot_addr) {
             }
         }
 
-        // Periodic full redraw every ~1 second (18 ticks) + on-demand when things change
+        // Keep the desktop live while the mouse moves: the cursor sprite is
+        // repainted every iteration, but window content only refreshes on a
+        // real redraw. Without this, moving the mouse leaves the desktop
+        // frozen at the 1-second idle throttle.
+        int cmx, cmy;
+        int cursor_moved = 0;
+        mouse_get_position(&cmx, &cmy);
+        cursor_moved = (cmx != g_last_mouse_x || cmy != g_last_mouse_y);
+
+        // Full redraw on demand (events / mouse movement), capped to at most
+        // one per timer tick (100 Hz after the PIT bump), plus a 1-second idle
+        // throttle so animations (cursor blink, clock) still advance.
         static uint32_t last_redraw_tick = 0;
-        if (needs_redraw || (tick_count - last_redraw_tick >= 18)) {
-            graphics_blit_wallpaper();
+        int composed = (needs_redraw || (tick_count - last_redraw_tick >= 100));
+        if (composed) {
+            // The wallpaper and desktop icons already live in the persistent
+            // backbuffer (blitted once at init, repaired per-region on window
+            // close/move). We no longer repaint the whole screen every frame,
+            // and windows only repaint when they flagged themselves dirty
+            // (keystroke, scroll, network data, cursor blink) — see window_draw.
             draw_desktop_icons();
-            for (int i = 0; i < MAX_WINDOWS; i++) {
-                struct window* w = window_get(i);
-                if (w && w->visible && !w->minimized) w->dirty = 1;
-            }
             needs_redraw = 0;
             last_redraw_tick = tick_count;
         }
+
+        // Keep an animating okai tab re-rendering. window_draw clears w->dirty
+        // after each render, so re-mark the window dirty here every iteration
+        // while a tab open/close animation is in flight (okai_anim_win >= 0).
+        if (okai_anim_win >= 0) window_set_dirty(okai_anim_win);
 
         // Draw windows (only dirty ones — editor marks itself dirty on keystroke)
         // Windows back-to-front with each okai's chrome painted with its own
@@ -1326,9 +1383,8 @@ void kernel_main(uint32_t mboot_addr) {
         window_draw_taskbar();
 
         // FPS counter (drawn before the cursor so the sprite sits on top)
-        static int g_show_fps = 0; // debug HUD; keep 0 to leave the desktop clean
-        frame_count++;
-        if (tick_count - last_fps_tick >= 18) {
+        static int g_show_fps = 1; // debug HUD; set 0 to leave the desktop clean
+        if (tick_count - last_fps_tick >= 100) {
             fps = frame_count;
             frame_count = 0;
             last_fps_tick = tick_count;
@@ -1347,11 +1403,22 @@ void kernel_main(uint32_t mboot_addr) {
             draw_string(SCREEN_W - fps_w, 8, fps_buf, 0x00FFFFFF, 0x00000000);
         }
 
-        // Cursor composited last, from an atomic position snapshot — nothing
-        // draws after it, so the sprite can never be half-erased on screen
+        // Cursor composited last. With the backbuffer now persistent, we erase
+        // the old sprite (restoring the underlying scene via desktop_paint_rect)
+        // and draw the new one only when it actually moved — or after a composite
+        // that may have overwritten its pixels. A static cursor costs zero work.
         mouse_get_position(&cursor_px, &cursor_py);
+        if (cursor_shown && cursor_moved)
+            desktop_paint_rect(g_last_mouse_x, g_last_mouse_y, CURSOR_W, CURSOR_H);
         mouse_paint_cursor(cursor_px, cursor_py);
+        if (cursor_moved) {
+            g_last_mouse_x = cmx;
+            g_last_mouse_y = cmy;
+        }
         cursor_shown = 1;
+        // Honest FPS: count actually-presented frames (a composite or a cursor
+        // movement), not main-loop spins.
+        if (composed || cursor_moved) frame_count++;
 
         graphics_flush();
     }

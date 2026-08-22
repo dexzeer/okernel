@@ -8,6 +8,9 @@
 // pixels and needs this so heading colors match the body text exactly)
 extern const uint32_t vga_to_rgb[16];
 
+// Default content background (VGA index 0) as exact RGB.
+#define WIN_BG_RGB 0x00000000
+
 #define MAX_WINDOWS 8
 // Layout constants derived from glyph size — never hardcode pixels;
 // these track FONT_SCALE automatically
@@ -42,13 +45,22 @@ struct window {
     int last_cursor_visible;
     char title[32];
     uint16_t* content;
+    // Exact-color planes parallel to `content` (one 0xRRGGBB value per cell).
+    // RGB is the paint-time source of truth; the VGA attr byte in `content`
+    // is kept in sync for legacy callers. History rows in the scrollback ring
+    // are VGA-indexed (terminals only — okai never scrolls the window grid).
+    uint32_t* cell_fg;
+    uint32_t* cell_bg;
     int cursor_x, cursor_y;
     int content_w, content_h;
     int font_scale;
     uint8_t text_fg;
     uint8_t text_bg;
-    uint8_t content_bg;  // page background color (set by okai from <body>)
+    uint32_t text_fg_rgb, text_bg_rgb;   // exact colors behind text_fg/text_bg
+    uint8_t content_bg;  // page background color index (set by okai from <body>)
+    uint32_t content_bg_rgb;             // page background as 0xRRGGBB
     int scroll_off;      // scrollback view offset (0 = live tail; see window.c)
+    int hide_cursor;     // no blinking text cursor (browser windows)
 };
 
 void window_init(void);
@@ -58,17 +70,21 @@ void window_set_focus(int id);
 int window_get_focused(void);
 void window_draw(int id);
 void window_draw_all(void);
+void window_set_dirty(int id); // mark a window for re-render (used by animating chrome)
 void window_paint_region(int id, int rx, int ry, int rw, int rh);
 void window_put_char(int id, char c);
 void window_puts(int id, const char* str);
 // Write one content cell directly (no cursor movement) — used by the okai
 // to blit a scrolled slice of its virtual document into the buffer.
 void window_write_cell(int id, int row, int col, char c, uint8_t fg, uint8_t bg);
+// Same, with exact 0xRRGGBB colors (true-color blit path).
+void window_write_cell_rgb(int id, int row, int col, char c, uint32_t fg, uint32_t bg);
 void window_clear(int id);
 void window_set_font_scale(int id, int scale);
 void window_set_close_button(int id, int has_close);
 void window_set_minimize_button(int id, int has_min);
 void window_set_no_titlebar(int id, int flag);
+void window_set_hide_cursor(int id, int flag);
 int window_check_close_click(int id, int mx, int my);
 int window_check_minimize_click(int id, int mx, int my);
 void window_minimize(int id);
@@ -76,10 +92,13 @@ void window_restore(int id);
 void window_resize(int id, int w, int h);
 int window_check_resize_grip(int id, int mx, int my);
 void window_set_text_color(int id, uint8_t fg, uint8_t bg);
+void window_set_text_color_rgb(int id, uint32_t fg, uint32_t bg);
 void window_scroll_view(int id, int notches); // wheel scrollback (terminals; positive = down/tail)
 void window_set_cursor(int id, int row, int col);
 void window_set_content_bg(int id, uint8_t bg);
+void window_set_content_bg_rgb(int id, uint32_t bg);
 int window_color_is_light(uint8_t idx);
+int window_rgb_is_light(uint32_t c);
 void window_draw_taskbar(void);
 struct window* window_get(int id);
 void window_get_cursor(int id, int* out_x, int* out_y);

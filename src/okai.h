@@ -37,6 +37,7 @@ struct okai_tab {
     int token_count;
     int last_resp_len;    // track HTTP response changes
     int is_https;         // 1 if URL used the https:// scheme
+    int https_fell_back;  // 1 once we've already retried a failed HTTPS fetch over HTTP
     // CSS: parsed from <style> blocks of this page
     struct css_rule css_rules[CSS_MAX_RULES];
     int css_n;
@@ -49,6 +50,9 @@ struct okai_tab {
     int history_count;
     int history_pos;
     int redirect_count;    // HTTP 3xx hops followed on this page (anti-loop)
+    // Animation: current rendered tab width (px) and close-in-progress flag.
+    int anim_w;            // eased toward the target width for open/close animation
+    int closing;           // 1 while the tab is shrinking before removal
 };
 
 struct okai {
@@ -59,6 +63,7 @@ struct okai {
     int addr_bar_focused; // 1 = typing in address bar, 0 = scrolling
     char addr_input[OKAI_URL_LEN];
     int addr_input_len;
+    int show_security;   // HTTPS lock popup open (toggled by clicking the lock icon)
 };
 
 void okai_init(void);
@@ -80,6 +85,10 @@ int  okai_tab_hit(int id, int mx, int my, int* on_close);
 // desktop response loop under the single-connection owner model (okai_fetch_owner).
 // Returns 0 if a fetch was started, -1 if the URL was refused (empty host).
 int okai_start_fetch(int id);
+// Re-issue the current tab's fetch over plain HTTP after an HTTPS failure
+// (one-time fallback so http-only hosts still load). Returns okai_start_fetch()'s
+// result, or -1 if already fallen back this navigation.
+int okai_fallback_http(int id);
 void okai_navigate(int id, const char* url);
 void okai_handle_key(int id, char c);
 void okai_handle_mouse_scroll(int id, int dy);
@@ -92,6 +101,11 @@ struct okai* okai_get(int id);
 // The desktop response loop sets/clears this; declared here so desktop.c can
 // read it without reaching into okai.c internals.
 extern int okai_fetch_owner;
+// Window id whose tab open/close animation is currently running, or -1.
+// okai_draw sets this; the desktop main loop re-marks that window dirty each
+// iteration so the animation keeps advancing (window_draw clears w->dirty after
+// every render, so a per-render dirty flag alone can't self-sustain it).
+extern int okai_anim_win;
 // Inspect an HTTP response for a 3xx + Location header; if found, resolve the
 // target against the current URL and re-issue the request (http<->https aware).
 // Returns 1 if a redirect was followed (caller should skip parsing this frame).
@@ -108,6 +122,7 @@ int okai_check_redirect(int id, const char* resp, int len);
 #define NAV_NEWTAB 5  // the '+' box in the tab strip
 
 int  okai_check_nav_click(int id, int mx, int my);
+int  okai_lock_hit(int id, int mx, int my); // click hit-test for the address-bar lock icon
 int  okai_addr_bar_hit(int id, int mx, int my); // click-to-focus the address bar
 void okai_nav_back(int id);
 void okai_nav_fwd(int id);

@@ -45,12 +45,28 @@ struct css_rule {
 
 struct css_style {
     int   has_fg;  uint8_t fg;
+    // Exact resolved color (0xRRGGBB). Set whenever has_fg/has_bg is set;
+    // the 8-bit field above is the nearest VGA palette index kept for
+    // legacy callers and host-test expectations.
+    int   has_fg_rgb; uint32_t fg_rgb;
     int   has_bg;  uint8_t bg;
+    int   has_bg_rgb; uint32_t bg_rgb;
     int   has_size;    int font_size;   // px
     int   has_bold;    int bold;        // 0/1
     int   has_align;   int align;       // CSS_ALIGN_*
     int   has_mt;      int margin_top;  // px
     int   has_mb;      int margin_bottom;
+    int   has_ml;      int margin_left;  // px
+    int   has_mr;      int margin_right; // px
+    int   has_pt;      int padding_top;  // px
+    int   has_pr;      int padding_right;
+    int   has_pb;      int padding_bottom;
+    int   has_pl;      int padding_left;
+    int   has_bw;      int border_width; // px (all sides, v1)
+    int   has_bc;      uint32_t border_color; // 0xRRGGBB
+    int   has_bs;      int border_style; // 0=none 1=solid (v1)
+    int   has_w;       int width;        // px content-width hint
+    int   has_h;       int height;       // px
     int   has_display; int display;     // CSS_DISPLAY_*
 };
 

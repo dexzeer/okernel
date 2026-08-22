@@ -31,6 +31,7 @@ TEXT_OBJ = src/vga.o src/shell.o src/terminal.o
 # NOTE: -DKERNEL is set in CFLAGS below so the shared crypto/TLS source can
 # switch its stdio logging to serial_printf and its RNG to the kernel CPRNG.
 DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/html.o src/css.o \
+              src/font_data.o \
              src/crypto/sha256.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/chacha20.o src/crypto/poly1305.o \
              src/crypto/x25519.o src/crypto/tls_record.o src/crypto/tls_handshake.o \

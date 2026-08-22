@@ -272,7 +272,17 @@ static int extract_attr(const char* html, int pos, int len,
                         }
                         value[vi] = 0;
                         return 1;
-                    }
+                    } else if (at < len) {
+                        // Unquoted value: class=box, id=x, style=...
+                        int vi = 0;
+                        while (at < len && html[at] != ' ' && html[at] != '>'
+                               && html[at] != '/' && html[at] != '\n'
+                               && vi < max_val - 1) {
+                            value[vi++] = html[at++];
+                        }
+                        value[vi] = 0;
+                        return 1;
+}
                 }
                 return 0;
             }
@@ -589,6 +599,22 @@ int html_parse(const char* html, int html_len, struct html_token* tokens, int ma
                     }
                     add_token(tokens, &count, max_tokens, HTML_LIST_ITEM, text, "");
                 }
+                continue;
+            }
+            // <p> / <div> become block tokens (so they receive box-model
+            // styling). Their direct text is captured like <li>/<h1> do; nested
+            // inline elements (<a>, <span>) remain separate tokens after it
+            // (v1 limitation — no nesting inside a bordered block).
+            if (tag_match(html, tag_start + 1, "p") ||
+                tag_match(html, tag_start + 1, "div")) {
+                int ttype = (html[tag_start + 1] == 'p') ? HTML_PARA : HTML_DIV;
+                char text[HTML_MAX_TEXT]; int tl = 0;
+                while (pos < html_len && html[pos] != '<') {
+                    add_char_to_text(text, &tl, HTML_MAX_TEXT, html[pos++]);
+                }
+                text[tl] = 0;
+                html_decode_entities(text);
+                if (tl > 0) add_token(tokens, &count, max_tokens, ttype, text, "");
                 continue;
             }
             if (tag_match(html, tag_start + 1, "pre")) {
