@@ -2,7 +2,7 @@
 
 ## What this is
 
-From-scratch OS in C + x86 assembly. Two build targets: text mode (VGA 320x200) and desktop mode (640x480 GRUB framebuffer). Runs in QEMU. No standard library, no Linux, no BIOS calls in protected mode.
+From-scratch OS in C + x86 assembly. Two build targets: text mode (VGA text) and desktop mode (1920x1080 GRUB framebuffer). Runs in QEMU. No standard library, no Linux, no BIOS calls in protected mode.
 
 ## Build
 

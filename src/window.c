@@ -8,6 +8,7 @@
 #include <stdint.h>
 
 extern int needs_redraw;
+extern void desktop_paint_rect_pub(int x, int y, int w, int h);
 
 // VGA palette lookup for content rendering (non-static: okai reads it too so
 // headings drawn as raw pixels match the body text's color exactly)
@@ -25,8 +26,8 @@ static struct window windows[MAX_WINDOWS];
 // kfree is a no-op on the bump heap, and per-frame reallocs during a
 // resize drag would burn it down fast. ALL content indexing must use
 // CONTENT_COLS_MAX as the row stride, never content_w.
-#define CONTENT_COLS_MAX ((SCREEN_W - 2 * WIN_BORDER) / CHAR_W)
-#define CONTENT_ROWS_MAX ((SCREEN_H - WIN_TITLE_H - 2 * WIN_BORDER) / CHAR_H)
+#define CONTENT_COLS_MAX ((SCREEN_W - 2 * WIN_BORDER) / CONTENT_GW)
+#define CONTENT_ROWS_MAX ((SCREEN_H - WIN_TITLE_H - 2 * WIN_BORDER) / CONTENT_GH)
 #define CONTENT_CELLS_MAX (CONTENT_COLS_MAX * CONTENT_ROWS_MAX)
 
 // Per-window scrollback: lines pushed off the top of the content grid when it
@@ -201,19 +202,24 @@ void window_init(void) {
 
 // Recompute the content grid from the window's size, font scale, and title-bar
 // mode, and re-blank the (slack-sized) content buffer.
+static void cell_blank(struct window* w, int idx) {
+    uint8_t color = (uint8_t)((w->content_bg << 4) | w->text_fg);
+    w->content[idx] = (uint16_t)((uint16_t)color << 8) | ' ';
+    w->cell_fg[idx] = w->text_fg_rgb;
+    w->cell_bg[idx] = w->text_bg_rgb;
+}
+
 static void window_apply_metrics(struct window* w) {
     int title = w->no_titlebar ? 0 : WIN_TITLE_H;
     int scale = w->font_scale;
-    int cw = (w->w - 2 * WIN_BORDER) / (CHAR_W * scale);
-    int ch = (w->h - title - 2 * WIN_BORDER) / (CHAR_H * scale);
+    int cw = (w->w - 2 * WIN_BORDER) / (CONTENT_GW * scale);
+    int ch = (w->h - title - 2 * WIN_BORDER) / (CONTENT_GH * scale);
     if (cw > CONTENT_COLS_MAX) cw = CONTENT_COLS_MAX;
     if (ch > CONTENT_ROWS_MAX) ch = CONTENT_ROWS_MAX;
     w->content_w = cw;
     w->content_h = ch;
     if (w->content) {
-        uint8_t color = (uint8_t)((w->content_bg << 4) | w->text_fg);
-        uint16_t blank = (uint16_t)((uint16_t)color << 8) | ' ';
-        for (int k = 0; k < CONTENT_CELLS_MAX; k++) w->content[k] = blank;
+        for (int k = 0; k < CONTENT_CELLS_MAX; k++) cell_blank(w, k);
     }
     w->cursor_x = 0; w->cursor_y = 0;
     w->scroll_off = 0; // resize reflows the grid — re-anchor at the live tail
@@ -227,13 +233,17 @@ int window_create(const char* title, int x, int y, int w, int h) {
             windows[i].visible = 1; windows[i].focused = 0; windows[i].font_scale = 1;
             windows[i].no_titlebar = 0;
             windows[i].text_fg = 15; windows[i].text_bg = 0;
+            windows[i].text_fg_rgb = vga_to_rgb[15]; windows[i].text_bg_rgb = vga_to_rgb[0];
             windows[i].content_bg = WIN_BG;
+            windows[i].content_bg_rgb = WIN_BG_RGB;
             windows[i].dirty = 1; needs_redraw = 1;
             sb_count[i] = 0; sb_next[i] = 0; windows[i].scroll_off = 0;
             int j = 0;
             while (title[j] && j < 31) { windows[i].title[j] = title[j]; j++; }
             windows[i].title[j] = 0;
             windows[i].content = (uint16_t*)kmalloc(CONTENT_CELLS_MAX * sizeof(uint16_t));
+            windows[i].cell_fg = (uint32_t*)kmalloc(CONTENT_CELLS_MAX * sizeof(uint32_t));
+            windows[i].cell_bg = (uint32_t*)kmalloc(CONTENT_CELLS_MAX * sizeof(uint32_t));
             window_apply_metrics(&windows[i]); // sets content_w/h and blanks the buffer
             return i;
         }
@@ -251,7 +261,12 @@ void window_set_font_scale(int id, int scale) {
 void window_destroy(int id) {
     if (id < 0 || id >= MAX_WINDOWS) return;
     if (windows[id].content) { kfree(windows[id].content); windows[id].content = 0; }
-    windows[id].visible = 0; needs_redraw = 1;
+    if (windows[id].cell_fg) { kfree(windows[id].cell_fg); windows[id].cell_fg = 0; }
+    if (windows[id].cell_bg) { kfree(windows[id].cell_bg); windows[id].cell_bg = 0; }
+    windows[id].visible = 0;
+    // Backbuffer is persistent now: repair the freed region (wallpaper + icons +
+    // any window behind) instead of relying on a full per-frame repaint.
+    desktop_paint_rect_pub(windows[id].x, windows[id].y, windows[id].w, windows[id].h);
     sb_count[id] = 0; sb_next[id] = 0; windows[id].scroll_off = 0;
 }
 
@@ -275,6 +290,12 @@ void window_set_no_titlebar(int id, int flag) {
     window_apply_metrics(w);
 }
 
+void window_set_hide_cursor(int id, int flag) {
+    if (id < 0 || id >= MAX_WINDOWS) return;
+    windows[id].hide_cursor = flag;
+    windows[id].dirty = 1;
+}
+
 int window_check_close_click(int id, int mx, int my) {
     struct window* w = &windows[id];
     if (!w->visible || !w->has_close_button) return 0;
@@ -296,7 +317,10 @@ int window_check_minimize_click(int id, int mx, int my) {
 }
 
 void window_minimize(int id) {
-    if (id >= 0 && id < MAX_WINDOWS) { windows[id].minimized = 1; windows[id].focused = 0; needs_redraw = 1; }
+    if (id >= 0 && id < MAX_WINDOWS) {
+        windows[id].minimized = 1; windows[id].focused = 0;
+        desktop_paint_rect_pub(windows[id].x, windows[id].y, windows[id].w, windows[id].h);
+    }
 }
 
 void window_restore(int id) {
@@ -314,8 +338,8 @@ void window_resize(int id, int new_w, int new_h) {
     if (new_w == w->w && new_h == w->h) return;
 
     int title = w->no_titlebar ? 0 : WIN_TITLE_H;
-    int ncw = (new_w - 2 * WIN_BORDER) / (CHAR_W * w->font_scale);
-    int nch = (new_h - title - 2 * WIN_BORDER) / (CHAR_H * w->font_scale);
+    int ncw = (new_w - 2 * WIN_BORDER) / (CONTENT_GW * w->font_scale);
+    int nch = (new_h - title - 2 * WIN_BORDER) / (CONTENT_GH * w->font_scale);
     if (ncw > CONTENT_COLS_MAX) ncw = CONTENT_COLS_MAX;
     if (nch > CONTENT_ROWS_MAX) nch = CONTENT_ROWS_MAX;
 
@@ -375,7 +399,7 @@ void window_get_cursor(int id, int* out_x, int* out_y) {
 
 static int window_blink_on(void) {
     extern uint32_t tick_count;
-    return (tick_count / 18) % 2 == 0;
+    return (tick_count / 100) % 2 == 0;
 }
 
 void window_paint_region(int id, int rx, int ry, int rw, int rh) {
@@ -424,7 +448,7 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
 
     // ---- Content cells (pre-computed row/col range, no redundant bg fill) ----
     int cx = w->x + WIN_BORDER, cy = w->y + WIN_BORDER + title_off;
-    int cw = w->w - 2 * WIN_BORDER, ch = w->h - WIN_TITLE_H - 2 * WIN_BORDER;
+    int cw = w->w - 2 * WIN_BORDER, ch = w->h - title_off - 2 * WIN_BORDER;
     int x0 = cx > rx ? cx : rx, y0 = cy > ry ? cy : ry;
     int x1 = (cx + cw) < (rx + rw) ? (cx + cw) : (rx + rw);
     int y1 = (cy + ch) < (ry + rh) ? (cy + ch) : (ry + rh);
@@ -432,11 +456,11 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
     if (x0 < x1 && y0 < y1) {
         // Fill content background — essential: null chars (0x00) in the
         // buffer cause draw_char_scaled to bail early, leaving gaps.
-        rect_fill(x0, y0, x1 - x0, y1 - y0, vga_to_rgb[w->content_bg]);
+        rect_fill(x0, y0, x1 - x0, y1 - y0, w->content_bg_rgb);
         if (w->content) {
             int wid = (int)(w - windows);
             int scale = w->font_scale;
-            int char_w = CHAR_W * scale, char_h = CHAR_H * scale;
+            int char_w = CONTENT_GW * scale, char_h = CONTENT_GH * scale;
             // Pre-compute row/col range — skip cells outside clip rect
             int row_start = (y0 - cy) / char_h;
             int row_end   = (y1 - cy + char_h - 1) / char_h;
@@ -449,9 +473,10 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
             for (int row = row_start; row < row_end; row++) {
                 int py = cy + row * char_h;
                 // Scrolled-back view: the top scroll_off rows come from the
-                // history ring; live rows shift down by scroll_off. The live
-                // grid itself is never rewritten.
+                // history ring (VGA-indexed — terminals only); live rows read
+                // the exact-color RGB planes.
                 const uint16_t* src;
+                const uint32_t *sfg = 0, *sbg = 0; // RGB planes (live rows)
                 if (w->scroll_off > 0 && row < w->scroll_off) {
                     int h = sb_count[wid] - w->scroll_off + row; // history line
                     int idx = ((sb_next[wid] - sb_count[wid] + h) % SB_ROWS
@@ -460,15 +485,21 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
                 } else {
                     int lrow = row - w->scroll_off;
                     src = w->content + lrow * CONTENT_COLS_MAX;
+                    sfg = w->cell_fg + lrow * CONTENT_COLS_MAX;
+                    sbg = w->cell_bg + lrow * CONTENT_COLS_MAX;
                 }
                 for (int col = col_start; col < col_end; col++) {
                     int px = cx + col * char_w;
                     uint16_t entry = src[col];
                     char c = entry & 0xFF;
-                    uint8_t color = (entry >> 8) & 0xFF;
-                    draw_char_scaled(px, py, c,
-                        vga_to_rgb[color & 0x0F],
-                        vga_to_rgb[(color >> 4) & 0x0F], scale);
+                    uint32_t fg, bg;
+                    if (sfg) { fg = sfg[col]; bg = sbg[col]; }
+                    else {
+                        uint8_t color = (entry >> 8) & 0xFF;
+                        fg = vga_to_rgb[color & 0x0F];
+                        bg = vga_to_rgb[(color >> 4) & 0x0F];
+                    }
+                    draw_char_sized(px, py, c, fg, bg, char_w, char_h);
                 }
             }
         }
@@ -485,9 +516,9 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
 
     // ---- Blinking cursor (skip if clip rect doesn't overlap; hidden while
     // scrolled back — it belongs to the live tail, not the history view) ----
-    if (w->focused && w->content && !w->scroll_off) {
+    if (w->focused && w->content && !w->scroll_off && !w->hide_cursor) {
         int scale = w->font_scale;
-        int char_w = CHAR_W * scale, char_h = CHAR_H * scale;
+        int char_w = CONTENT_GW * scale, char_h = CONTENT_GH * scale;
         int bx = cx + w->cursor_x * char_w, by = cy + w->cursor_y * char_h;
         if (bx < rx + rw && bx + char_w > rx && by < ry + rh && by + char_h > ry) {
             if (window_blink_on()) {
@@ -495,11 +526,8 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
             } else {
                 int idx = w->cursor_y * CONTENT_COLS_MAX + w->cursor_x;
                 if (idx >= 0 && idx < CONTENT_CELLS_MAX) {
-                    uint16_t entry = w->content[idx];
-                    uint8_t color = (entry >> 8) & 0xFF;
-                    draw_char_scaled(bx, by, entry & 0xFF,
-                        vga_to_rgb[color & 0x0F],
-                        vga_to_rgb[(color >> 4) & 0x0F], scale);
+                    draw_char_sized(bx, by, w->content[idx] & 0xFF,
+                        w->cell_fg[idx], w->cell_bg[idx], char_w, char_h);
                 }
             }
         }
@@ -510,7 +538,7 @@ void window_draw(int id) {
     struct window* w = &windows[id];
     if (!w->visible || w->minimized) return;
     int blink = window_blink_on();
-    if (w->dirty || (w->focused && blink != w->last_cursor_visible)) {
+    if (w->dirty || (w->focused && !w->hide_cursor && blink != w->last_cursor_visible)) {
         window_paint_region(id, 0, 0, SCREEN_W, SCREEN_H);
         w->dirty = 0; w->last_cursor_visible = blink;
     }
@@ -524,6 +552,10 @@ void window_draw_all(void) {
     if (focused >= 0) window_draw(focused);
 }
 
+void window_set_dirty(int id) {
+    if (id >= 0 && id < MAX_WINDOWS) windows[id].dirty = 1;
+}
+
 static void scroll_content(struct window* w) {
     if (w->cursor_y >= w->content_h) {
         // The top line leaves the grid — archive it into the scrollback ring.
@@ -535,12 +567,16 @@ static void scroll_content(struct window* w) {
             if (sb_count[id] < SB_ROWS) sb_count[id]++;
             w->scroll_off = 0; // new output → follow the tail again
         }
-        for (int row = 0; row < w->content_h - 1; row++)
-            for (int col = 0; col < w->content_w; col++)
-                w->content[row * CONTENT_COLS_MAX + col] = w->content[(row + 1) * CONTENT_COLS_MAX + col];
-        for (int col = 0; col < w->content_w; col++)
-            w->content[(w->content_h - 1) * CONTENT_COLS_MAX + col] =
-                (uint16_t)((w->content_bg << 4) | w->text_fg) << 8 | ' ';
+        for (int row = 0; row < w->content_h - 1; row++) {
+            for (int col = 0; col < w->content_w; col++) {
+                int dst = row * CONTENT_COLS_MAX + col, src = (row + 1) * CONTENT_COLS_MAX + col;
+                w->content[dst] = w->content[src];
+                w->cell_fg[dst] = w->cell_fg[src];
+                w->cell_bg[dst] = w->cell_bg[src];
+            }
+        }
+        int last = (w->content_h - 1) * CONTENT_COLS_MAX;
+        for (int col = 0; col < w->content_w; col++) cell_blank(w, last + col);
         w->cursor_y = w->content_h - 1;
     }
 }
@@ -566,10 +602,19 @@ void window_put_char(int id, char c) {
     struct window* w = &windows[id];
     if (!w->visible || !w->content) return;
     uint8_t color = (w->text_bg << 4) | w->text_fg;
+    uint32_t idx = (uint32_t)w->cursor_y * CONTENT_COLS_MAX + w->cursor_x;
     if (c == '\n') { w->cursor_x = 0; w->cursor_y++; }
     else if (c == '\r') { w->cursor_x = 0; }
-    else if (c == '\b') { if (w->cursor_x > 0) { w->cursor_x--; w->content[w->cursor_y * CONTENT_COLS_MAX + w->cursor_x] = (uint16_t)color << 8 | ' '; } }
-    else { if (w->cursor_x < w->content_w) { w->content[w->cursor_y * CONTENT_COLS_MAX + w->cursor_x] = (uint16_t)color << 8 | (uint16_t)c; w->cursor_x++; } }
+    else if (c == '\b') {
+        if (w->cursor_x > 0) { w->cursor_x--; cell_blank(w, --idx); }
+    } else {
+        if (w->cursor_x < w->content_w) {
+            w->content[idx] = (uint16_t)((uint16_t)color << 8) | (uint16_t)(uint8_t)c;
+            w->cell_fg[idx] = w->text_fg_rgb;
+            w->cell_bg[idx] = w->text_bg_rgb;
+            w->cursor_x++;
+        }
+    }
     if (w->cursor_x >= w->content_w) { w->cursor_x = 0; w->cursor_y++; }
     scroll_content(w);
     w->dirty = 1;
@@ -577,12 +622,41 @@ void window_put_char(int id, char c) {
 
 void window_puts(int id, const char* str) { while (*str) window_put_char(id, *str++); }
 
+// Keep the legacy VGA attr byte roughly in sync when writing exact RGB
+// directly: nearest palette entry by Euclidean distance (paint never reads it).
+static uint8_t rgb_to_vga(uint32_t rgb) {
+    int r = (int)((rgb >> 16) & 0xFF), g = (int)((rgb >> 8) & 0xFF), b = (int)(rgb & 0xFF);
+    int best = 0, best_d = 0x7FFFFFFF;
+    for (int i = 0; i < 16; i++) {
+        uint32_t c = vga_to_rgb[i];
+        int dr = r - (int)((c >> 16) & 0xFF), dg = g - (int)((c >> 8) & 0xFF), db = b - (int)(c & 0xFF);
+        int d = dr*dr + dg*dg + db*db;
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    return (uint8_t)best;
+}
+
 void window_write_cell(int id, int row, int col, char c, uint8_t fg, uint8_t bg) {
     struct window* w = &windows[id];
     if (!w->visible || !w->content) return;
     if (row < 0 || row >= w->content_h || col < 0 || col >= w->content_w) return;
+    uint32_t idx = (uint32_t)row * CONTENT_COLS_MAX + col;
     uint16_t color = (uint16_t)((bg << 4) | fg);
-    w->content[row * CONTENT_COLS_MAX + col] = (uint16_t)(color << 8) | (uint8_t)c;
+    w->content[idx] = (uint16_t)((uint16_t)color << 8) | (uint8_t)c;
+    w->cell_fg[idx] = vga_to_rgb[fg & 0x0F];
+    w->cell_bg[idx] = vga_to_rgb[(bg >> 4) & 0x0F];
+    w->dirty = 1;
+}
+
+void window_write_cell_rgb(int id, int row, int col, char c, uint32_t fg, uint32_t bg) {
+    struct window* w = &windows[id];
+    if (!w->visible || !w->content) return;
+    if (row < 0 || row >= w->content_h || col < 0 || col >= w->content_w) return;
+    uint32_t idx = (uint32_t)row * CONTENT_COLS_MAX + col;
+    uint8_t fgi = rgb_to_vga(fg), bgi = rgb_to_vga(bg);
+    w->content[idx] = (uint16_t)((uint16_t)(((bgi << 4) | fgi) << 8)) | (uint8_t)(uint8_t)c;
+    w->cell_fg[idx] = fg;
+    w->cell_bg[idx] = bg;
     w->dirty = 1;
 }
 
@@ -601,33 +675,66 @@ void window_clear(int id) {
     if (id < 0 || id >= MAX_WINDOWS) return;
     struct window* w = &windows[id];
     if (!w->content) return;
-    uint8_t color = (w->content_bg << 4) | w->text_fg;
     for (int r = 0; r < w->content_h; r++)
         for (int c = 0; c < w->content_w; c++)
-            w->content[r * CONTENT_COLS_MAX + c] = (uint16_t)color << 8 | ' ';
+            cell_blank(w, r * CONTENT_COLS_MAX + c);
     w->cursor_x = 0; w->cursor_y = 0; w->dirty = 1;
     sb_count[id] = 0; sb_next[id] = 0; w->scroll_off = 0; // wipe history too
 }
 
 void window_set_text_color(int id, uint8_t fg, uint8_t bg) {
-    if (id >= 0 && id < MAX_WINDOWS) { windows[id].text_fg = fg; windows[id].text_bg = bg; }
+    if (id < 0 || id >= MAX_WINDOWS) return;
+    struct window* w = &windows[id];
+    w->text_fg = fg & 0x0F;
+    w->text_bg = bg & 0x0F;
+    w->text_fg_rgb = vga_to_rgb[fg & 0x0F];
+    w->text_bg_rgb = vga_to_rgb[bg & 0x0F];
+}
+
+void window_set_text_color_rgb(int id, uint32_t fg, uint32_t bg) {
+    if (id < 0 || id >= MAX_WINDOWS) return;
+    struct window* w = &windows[id];
+    w->text_fg_rgb = fg;
+    w->text_bg_rgb = bg;
+    w->text_fg = rgb_to_vga(fg);
+    w->text_bg = rgb_to_vga(bg);
 }
 
 void window_set_content_bg(int id, uint8_t bg) {
     if (id >= 0 && id < MAX_WINDOWS) {
         struct window* w = &windows[id];
-        if (w->content_bg != bg) { w->content_bg = bg; w->dirty = 1; needs_redraw = 1; }
+        if (w->content_bg != bg || w->content_bg_rgb != vga_to_rgb[bg]) {
+            w->content_bg = bg;
+            w->content_bg_rgb = vga_to_rgb[bg];
+            w->dirty = 1; needs_redraw = 1;
+        }
     }
 }
 
-// True if a VGA palette index reads as a light (high-luminance) color, used to
-// pick a readable default text color when a page sets a background.
-int window_color_is_light(uint8_t idx) {
-    if (idx > 15) return 0;
-    uint32_t c = vga_to_rgb[idx];
+void window_set_content_bg_rgb(int id, uint32_t bg) {
+    if (id >= 0 && id < MAX_WINDOWS) {
+        struct window* w = &windows[id];
+        if (w->content_bg_rgb != bg) {
+            w->content_bg_rgb = bg;
+            w->content_bg = rgb_to_vga(bg);
+            w->text_bg = rgb_to_vga(bg);
+            w->text_bg_rgb = bg;
+            w->dirty = 1; needs_redraw = 1;
+        }
+    }
+}
+
+// True if an RGB color reads as light (high luminance), used to pick a
+// readable default text color when a page sets a background.
+int window_rgb_is_light(uint32_t c) {
     int r = (int)((c >> 16) & 0xFF), g = (int)((c >> 8) & 0xFF), b = (int)(c & 0xFF);
     int lum = (r * 77 + g * 150 + b * 29) / 256; // perceptual-ish 0..255
     return lum > 128;
+}
+
+int window_color_is_light(uint8_t idx) {
+    if (idx > 15) return 0;
+    return window_rgb_is_light(vga_to_rgb[idx]);
 }
 
 void window_set_title(int id, const char* title) {

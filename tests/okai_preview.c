@@ -30,10 +30,20 @@ struct window* window_get(int id) { (void)id; return &fake_win; }
 void window_write_cell(int id, int row, int col, char c, uint8_t fg, uint8_t bg) {
     (void)id; (void)row; (void)col; (void)c; (void)fg; (void)bg;
 }
+void window_write_cell_rgb(int id, int row, int col, char c, uint32_t fg, uint32_t bg) {
+    (void)id; (void)row; (void)col; (void)c; (void)fg; (void)bg;
+}
 void window_set_content_bg(int id, uint8_t bg) { (void)id; fake_win.content_bg = bg; }
+void window_set_content_bg_rgb(int id, uint32_t bg) { (void)id; fake_win.content_bg = 0; }
+void window_set_text_color_rgb(int id, uint32_t fg, uint32_t bg) { (void)id; (void)fg; (void)bg; }
+void window_set_hide_cursor(int id, int flag) { (void)id; (void)flag; }
 void window_set_title(int id, const char* t) { (void)id; (void)t; }
 int  window_color_is_light(uint8_t idx) {
     return idx == 0 || idx == 7 || idx == 8 || idx == 15;
+}
+int  window_rgb_is_light(uint32_t c) {
+    int r = (int)((c >> 16) & 0xFF), g = (int)((c >> 8) & 0xFF), b = (int)(c & 0xFF);
+    return (r * 77 + g * 150 + b * 29) / 256 > 128;
 }
 void* kmalloc(unsigned long n) { return malloc(n); }
 void  kfree(void* p) { free(p); }
@@ -88,11 +98,12 @@ int needs_redraw = 0; // window.c owns this; okai.c externs it
 
 // provided by okai.c under HOST_PREVIEW
 const char*    preview_doc_chars(void);
-const uint8_t* preview_doc_attrs(void);
+const uint32_t* preview_doc_fg_rgb(void);
+const uint32_t* preview_doc_bg_rgb(void);
 const uint8_t* preview_doc_kinds(void);
 int            preview_doc_dims(int* left, int* width);
 int            preview_doc_cols(void);
-void           preview_page_colors(int* fg, int* bg);
+void           preview_page_colors(uint32_t* fg, uint32_t* bg);
 struct okai*   okai_get_for_preview(void);
 void           okai_render_content_for_preview(void);
 
@@ -183,16 +194,17 @@ int main(int argc, char** argv) {
     int left, width;
     int doc_lines = preview_doc_dims(&left, &width);
     const char* chars = preview_doc_chars();
-    const uint8_t* attrs = preview_doc_attrs();
+    const uint32_t* fgs = preview_doc_fg_rgb();
+    const uint32_t* bgs = preview_doc_bg_rgb();
     const uint8_t* kinds = preview_doc_kinds();
     int stride = preview_doc_cols();
-    int pfg, pbg;
+    uint32_t pfg, pbg;
     preview_page_colors(&pfg, &pbg);
 
     int rows = doc_lines < 60 ? doc_lines : 60;
     int W = cols * 16, H = rows * 32;
     uint8_t* rgb = calloc((size_t)W * H * 3, 1);
-    uint32_t bgc = vga_rgb[pbg & 0xF];
+    uint32_t bgc = pbg;
     for (int i = 0; i < W * H; i++) {
         rgb[i * 3] = bgc >> 16; rgb[i * 3 + 1] = bgc >> 8; rgb[i * 3 + 2] = bgc;
     }
@@ -202,8 +214,7 @@ int main(int argc, char** argv) {
             if (ch == ' ' || (unsigned char)ch < 33) continue;
             const uint8_t* g = glyph(ch);
             if (!g) continue;
-            uint8_t attr = attrs[r * stride + c];
-            uint32_t fg = vga_rgb[attr & 0xF];
+            uint32_t fg = fgs[r * stride + c];
             int kind = kinds[r];
             int scale = kind == 2 ? 3 : kind == 1 ? 2 : 1; // heading sizes
             for (int gy = 0; gy < 16; gy++) {

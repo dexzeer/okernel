@@ -65,28 +65,11 @@ static uint8_t css_quantize(uint8_t r, uint8_t g, uint8_t b) {
     return (uint8_t)best;
 }
 
-// Named colors -> palette index (subset of common names).
-static int css_named(const char* v) {
-    if (css_ieq(v,"black"))   return 0;
-    if (css_ieq(v,"blue"))    return 1;
-    if (css_ieq(v,"green"))   return 2;
-    if (css_ieq(v,"cyan")||css_ieq(v,"aqua")) return 3;
-    if (css_ieq(v,"red"))     return 4;
-    if (css_ieq(v,"magenta")||css_ieq(v,"purple")) return 5;
-    if (css_ieq(v,"brown"))   return 6;
-    if (css_ieq(v,"gray")||css_ieq(v,"grey")||css_ieq(v,"lightgray")||css_ieq(v,"lightgrey")) return 7;
-    if (css_ieq(v,"darkgray")||css_ieq(v,"darkgrey")) return 8;
-    if (css_ieq(v,"lightblue")) return 9;
-    if (css_ieq(v,"lightgreen")) return 10;
-    if (css_ieq(v,"lightcyan")) return 11;
-    if (css_ieq(v,"lightred")||css_ieq(v,"crimson")) return 12;
-    if (css_ieq(v,"pink")||css_ieq(v,"lightmagenta")) return 13;
-    if (css_ieq(v,"yellow"))  return 14;
-    if (css_ieq(v,"white"))   return 15;
-    return -1;
-}
+// Named colors are handled by the NAMED table next to css_parse_color_rgb.
 
-// Parse a color value; returns palette index 0-15 or -1.
+// Parse a color value; returns palette index 0-15 or -1, and (if rgb_out is
+// non-NULL) the exact 0xRRGGBB color. Named colors use the web-standard RGB
+// values, not the VGA approximations.
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -96,28 +79,57 @@ static int hexval(char c) {
 static int is_hex(char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
-static int css_parse_color(const char* v) {
+
+struct named_color { const char* name; uint8_t idx; uint32_t rgb; };
+static const struct named_color NAMED[] = {
+    {"black",        0,  0x000000}, {"blue",         1,  0x0000FF},
+    {"green",        2,  0x008000}, {"cyan",         3,  0x00FFFF},
+    {"aqua",         3,  0x00FFFF}, {"red",          4,  0xFF0000},
+    {"magenta",      5,  0xFF00FF}, {"purple",       5,  0x800080},
+    {"brown",        6,  0xA52A2A}, {"gray",         7,  0x808080},
+    {"grey",         7,  0x808080}, {"lightgray",    7,  0xD3D3D3},
+    {"lightgrey",    7,  0xD3D3D3}, {"darkgray",     8,  0xA9A9A9},
+    {"darkgrey",     8,  0xA9A9A9}, {"lightblue",    9,  0xADD8E6},
+    {"lightgreen",  10,  0x90EE90}, {"lightcyan",   11,  0xE0FFFF},
+    {"lightred",    12,  0xFF5555}, {"crimson",     12,  0xDC143C},
+    {"pink",        13,  0xFFC0CB}, {"lightmagenta",13,  0xFF77FF},
+    {"yellow",      14,  0xFFFF00}, {"white",       15,  0xFFFFFF},
+};
+
+static int css_parse_color_rgb(const char* v, uint32_t* rgb_out) {
     if (v[0] == '#') {
         const char* h = v + 1;
         int n = 0;
         while (is_hex(h[n])) n++;
         if (n == 3) {
-            int r = hexval(h[0]), g = hexval(h[1]), b = hexval(h[2]);
-            return css_quantize((uint8_t)(r*17),(uint8_t)(g*17),(uint8_t)(b*17));
+            int r = hexval(h[0]) * 17, g = hexval(h[1]) * 17, b = hexval(h[2]) * 17;
+            if (rgb_out) *rgb_out = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+            return css_quantize((uint8_t)r,(uint8_t)g,(uint8_t)b);
         } else if (n == 6) {
             int r = hexval(h[0])*16 + hexval(h[1]);
             int g = hexval(h[2])*16 + hexval(h[3]);
             int b = hexval(h[4])*16 + hexval(h[5]);
+            if (rgb_out) *rgb_out = ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
             return css_quantize((uint8_t)r, (uint8_t)g, (uint8_t)b);
         }
         return -1;
     }
-    return css_named(v);
+    for (int k = 0; k < (int)(sizeof(NAMED)/sizeof(NAMED[0])); k++) {
+        if (css_ieq(v, NAMED[k].name)) {
+            if (rgb_out) *rgb_out = NAMED[k].rgb;
+            return NAMED[k].idx;
+        }
+    }
+    return -1;
+}
+static int css_parse_color(const char* v) {
+    return css_parse_color_rgb(v, 0);
 }
 
 // ---- declaration application (with cascade specificity) ------------------
 
-enum { P_COLOR=0, P_BG, P_SIZE, P_WEIGHT, P_ALIGN, P_MT, P_MB, P_DISPLAY, P_N };
+enum { P_COLOR=0, P_BG, P_SIZE, P_WEIGHT, P_ALIGN, P_MT, P_MB, P_DISPLAY,
+        P_ML, P_MR, P_PT, P_PR, P_PB, P_PL, P_BW, P_BC, P_BS, P_W, P_H, P_N };
 
 static int css_prop_index(const char* p) {
     if (css_ieq(p,"color")) return P_COLOR;
@@ -125,9 +137,22 @@ static int css_prop_index(const char* p) {
     if (css_ieq(p,"font-size")) return P_SIZE;
     if (css_ieq(p,"font-weight")) return P_WEIGHT;
     if (css_ieq(p,"text-align")) return P_ALIGN;
-    if (css_ieq(p,"margin")) return P_MT;          // shorthand -> top & bottom
+    if (css_ieq(p,"margin")) return P_MT;          // shorthand -> all four sides
     if (css_ieq(p,"margin-top")) return P_MT;
     if (css_ieq(p,"margin-bottom")) return P_MB;
+    if (css_ieq(p,"margin-left")) return P_ML;
+    if (css_ieq(p,"margin-right")) return P_MR;
+    if (css_ieq(p,"padding")) return P_PT;         // shorthand -> all four sides
+    if (css_ieq(p,"padding-top")) return P_PT;
+    if (css_ieq(p,"padding-bottom")) return P_PB;
+    if (css_ieq(p,"padding-left")) return P_PL;
+    if (css_ieq(p,"padding-right")) return P_PR;
+    if (css_ieq(p,"border")) return P_BW;          // shorthand -> width+style+color
+    if (css_ieq(p,"border-width")) return P_BW;
+    if (css_ieq(p,"border-color")) return P_BC;
+    if (css_ieq(p,"border-style")) return P_BS;
+    if (css_ieq(p,"width")) return P_W;
+    if (css_ieq(p,"height")) return P_H;
     if (css_ieq(p,"display")) return P_DISPLAY;
     return -1;
 }
@@ -136,6 +161,32 @@ static int css_px(const char* v) {
     int n = 0;
     while (*v >= '0' && *v <= '9') n = n*10 + (*v++ - '0');
     return n; // px (em/% ignored for v1; treated as px count)
+}
+
+// Parse up to `max` whitespace/comma-separated integers from a shorthand value
+// (e.g. "10px 20px" -> {10,20}). Returns the count parsed.
+static int css_px_list(const char* v, int* out, int max) {
+    int n = 0;
+    while (*v && n < max) {
+        while (*v == ' ' || *v == '\t' || *v == ',') v++;
+        if (!(*v >= '0' && *v <= '9')) break;
+        int x = 0;
+        while (*v >= '0' && *v <= '9') x = x*10 + (*v++ - '0');
+        out[n++] = x;
+    }
+    return n;
+}
+
+// Local substring search (freestanding kernel has no strstr).
+static const char* css_strstr(const char* hay, const char* needle) {
+    if (!hay || !needle || !*needle) return hay;
+    int nl = 0; while (needle[nl]) nl++;
+    for (int i = 0; hay[i]; i++) {
+        int j = 0;
+        while (needle[j] && hay[i+j] == needle[j]) j++;
+        if (j == nl) return hay + i;
+    }
+    return 0;
 }
 
 // Apply one declaration if its specificity wins. `win` tracks per-prop winner.
@@ -148,13 +199,17 @@ static void css_apply(struct css_style* out, const char* prop, const char* val,
 
     switch (idx) {
     case P_COLOR: {
-        int c = css_parse_color(val);
-        if (c >= 0) { out->has_fg = 1; out->fg = (uint8_t)c; }
+        uint32_t rgb;
+        int c = css_parse_color_rgb(val, &rgb);
+        if (c >= 0) { out->has_fg = 1; out->fg = (uint8_t)c;
+                      out->has_fg_rgb = 1; out->fg_rgb = rgb; }
         break;
     }
     case P_BG: {
-        int c = css_parse_color(val);
-        if (c >= 0) { out->has_bg = 1; out->bg = (uint8_t)c; }
+        uint32_t rgb;
+        int c = css_parse_color_rgb(val, &rgb);
+        if (c >= 0) { out->has_bg = 1; out->bg = (uint8_t)c;
+                      out->has_bg_rgb = 1; out->bg_rgb = rgb; }
         break;
     }
     case P_SIZE:
@@ -170,13 +225,52 @@ static void css_apply(struct css_style* out, const char* prop, const char* val,
         else if (css_ieq(val,"right")) out->align = CSS_ALIGN_RIGHT;
         else out->align = CSS_ALIGN_LEFT;
         break;
-    case P_MT:
-        out->has_mt = 1; out->margin_top = css_px(val);
-        if (idx == P_MT && !out->has_mb) { out->has_mb = 1; out->margin_bottom = css_px(val); }
+    case P_MT: { // `margin` shorthand or `margin-top`
+        int v[4]; int n = css_px_list(val, v, 4);
+        if (!n) break;
+        if (n == 1) { v[1] = v[2] = v[3] = v[0]; }
+        else if (n == 2) { v[2] = v[0]; v[3] = v[1]; }
+        else if (n == 3) { v[3] = v[1]; }
+        out->has_mt = 1; out->margin_top    = v[0];
+        out->has_mr = 1; out->margin_right  = v[1];
+        out->has_mb = 1; out->margin_bottom = v[2];
+        out->has_ml = 1; out->margin_left   = v[3];
         break;
-    case P_MB:
-        out->has_mb = 1; out->margin_bottom = css_px(val);
+    }
+    case P_MB: out->has_mb = 1; out->margin_bottom = css_px(val); break;
+    case P_ML: out->has_ml = 1; out->margin_left   = css_px(val); break;
+    case P_MR: out->has_mr = 1; out->margin_right  = css_px(val); break;
+    case P_PT: { // `padding` shorthand or `padding-top`
+        int v[4]; int n = css_px_list(val, v, 4);
+        if (!n) break;
+        if (n == 1) { v[1] = v[2] = v[3] = v[0]; }
+        else if (n == 2) { v[2] = v[0]; v[3] = v[1]; }
+        else if (n == 3) { v[3] = v[1]; }
+        out->has_pt = 1; out->padding_top    = v[0];
+        out->has_pr = 1; out->padding_right  = v[1];
+        out->has_pb = 1; out->padding_bottom = v[2];
+        out->has_pl = 1; out->padding_left   = v[3];
         break;
+    }
+    case P_PB: out->has_pb = 1; out->padding_bottom = css_px(val); break;
+    case P_PL: out->has_pl = 1; out->padding_left   = css_px(val); break;
+    case P_PR: out->has_pr = 1; out->padding_right  = css_px(val); break;
+    case P_BW: { // `border` shorthand or `border-width`
+        int w = css_px(val);
+        if (w > 0) { out->has_bw = 1; out->border_width = w; }
+        if (css_strstr(val, "solid") || css_strstr(val, "dotted") || css_strstr(val, "dashed")) {
+            out->has_bs = 1; out->border_style = 1;
+        }
+        const char* h = css_strstr(val, "#");
+        if (h) { uint32_t bc; if (css_parse_color_rgb(h, &bc) >= 0) {
+                     out->has_bc = 1; out->border_color = bc; } }
+        break;
+    }
+    case P_BC: { uint32_t bc; if (css_parse_color_rgb(val, &bc) >= 0) {
+                     out->has_bc = 1; out->border_color = bc; } break; }
+    case P_BS: out->has_bs = 1; out->border_style = css_ieq(val, "none") ? 0 : 1; break;
+    case P_W:  out->has_w  = 1; out->width  = css_px(val); break;
+    case P_H:  out->has_h  = 1; out->height = css_px(val); break;
     case P_DISPLAY:
         out->has_display = 1;
         if (css_ieq(val,"none")) out->display = CSS_DISPLAY_NONE;
@@ -386,10 +480,23 @@ void css_compute(const struct css_rule* rules, int n,
 void css_merge_base(struct css_style* out, const struct css_style* base) {
     if (!out->has_fg        && base->has_fg)        { out->has_fg = 1;        out->fg = base->fg; }
     if (!out->has_bg        && base->has_bg)        { out->has_bg = 1;        out->bg = base->bg; }
+    if (!out->has_fg_rgb    && base->has_fg_rgb)    { out->has_fg_rgb = 1;    out->fg_rgb = base->fg_rgb; }
+    if (!out->has_bg_rgb    && base->has_bg_rgb)    { out->has_bg_rgb = 1;    out->bg_rgb = base->bg_rgb; }
     if (!out->has_size      && base->has_size)      { out->has_size = 1;      out->font_size = base->font_size; }
     if (!out->has_bold      && base->has_bold)      { out->has_bold = 1;      out->bold = base->bold; }
     if (!out->has_align     && base->has_align)     { out->has_align = 1;     out->align = base->align; }
     if (!out->has_mt        && base->has_mt)        { out->has_mt = 1;        out->margin_top = base->margin_top; }
     if (!out->has_mb        && base->has_mb)        { out->has_mb = 1;        out->margin_bottom = base->margin_bottom; }
+    if (!out->has_ml        && base->has_ml)        { out->has_ml = 1;        out->margin_left = base->margin_left; }
+    if (!out->has_mr        && base->has_mr)        { out->has_mr = 1;        out->margin_right = base->margin_right; }
+    if (!out->has_pt        && base->has_pt)        { out->has_pt = 1;        out->padding_top = base->padding_top; }
+    if (!out->has_pb        && base->has_pb)        { out->has_pb = 1;        out->padding_bottom = base->padding_bottom; }
+    if (!out->has_pl        && base->has_pl)        { out->has_pl = 1;        out->padding_left = base->padding_left; }
+    if (!out->has_pr        && base->has_pr)        { out->has_pr = 1;        out->padding_right = base->padding_right; }
+    if (!out->has_bw        && base->has_bw)        { out->has_bw = 1;        out->border_width = base->border_width; }
+    if (!out->has_bc        && base->has_bc)        { out->has_bc = 1;        out->border_color = base->border_color; }
+    if (!out->has_bs        && base->has_bs)        { out->has_bs = 1;        out->border_style = base->border_style; }
+    if (!out->has_w         && base->has_w)         { out->has_w = 1;         out->width = base->width; }
+    if (!out->has_h         && base->has_h)         { out->has_h = 1;         out->height = base->height; }
     if (!out->has_display   && base->has_display)   { out->has_display = 1;   out->display = base->display; }
 }
