@@ -194,22 +194,27 @@ static void desktop_paint_rect_skip(int skip_win, int x, int y, int w, int h) {
     graphics_blit_wallpaper_rect(x, y, w, h);
     draw_desktop_icons_in(x, y, w, h);
 
-    // Windows back-to-front, focused last (same order as window_draw_all).
-    // A okai's pixel chrome is painted right after ITS window, in this same
-    // z-order — a global after-all-windows chrome pass let a lower browser's
-    // chrome paint over a higher overlapping window (text leaking through).
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < MAX_WINDOWS; i++) {
-            struct window* win = window_get(i);
-            if (!win || !win->visible || win->minimized ||
-                (pass == 0) == win->focused || i == skip_win) continue;
-            if (win->x < x + w && win->x + win->w > x &&
-                win->y < y + h && win->y + win->h > y) {
-                window_paint_region(i, x, y, w, h);
-                int ob = okai_find_by_win(i);
-                if (ob >= 0) okai_paint_overlays(ob);
-            }
-        }
+    // Windows back-to-front by z (highest z = topmost, painted last so it
+    // covers any lower-z okai chrome/heading that would otherwise bleed
+    // through). Same order as the main draw loop in window_draw_all.
+    int vis[MAX_WINDOWS], nv = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        struct window* win = window_get(i);
+        if (!win || !win->visible || win->minimized || i == skip_win) continue;
+        if (win->x < x + w && win->x + win->w > x &&
+            win->y < y + h && win->y + win->h > y)
+            vis[nv++] = i;
+    }
+    for (int a = 1; a < nv; a++) {
+        int id = vis[a], zb = window_get(id)->z, b = a - 1;
+        while (b >= 0 && window_get(vis[b])->z > zb) { vis[b + 1] = vis[b]; b--; }
+        vis[b + 1] = id;
+    }
+    for (int a = 0; a < nv; a++) {
+        int id = vis[a];
+        window_paint_region(id, x, y, w, h);
+        int ob = okai_find_by_win(id);
+        if (ob >= 0) okai_paint_overlays(ob);
     }
 
     if (y + h > SCREEN_H - TASKBAR_H) {
@@ -1353,31 +1358,68 @@ void kernel_main(uint32_t mboot_addr) {
             last_redraw_tick = tick_count;
         }
 
-        // Keep an animating okai tab re-rendering. window_draw clears w->dirty
-        // after each render, so re-mark the window dirty here every iteration
-        // while a tab open/close animation is in flight (okai_anim_win >= 0).
-        if (okai_anim_win >= 0) window_set_dirty(okai_anim_win);
-
-        // Draw windows (only dirty ones — editor marks itself dirty on keystroke)
-        // Windows back-to-front with each okai's chrome painted with its own
-        // window (z-order correct — see desktop_paint_rect_skip).
+        // Draw windows back-to-front by z-stack. Each okai window's chrome and
+        // heading overlay are painted right after the window itself, clipped to
+        // the part of the window NOT covered by a higher-z window — so the
+        // overlay never bleeds over a covering window, and that covering window
+        // does NOT need a forced full repaint every frame (which tanked FPS when
+        // a window sat over okai).
         {
-            int focused = -1;
+            int vis[MAX_WINDOWS], nv = 0;
             for (int i = 0; i < MAX_WINDOWS; i++) {
-                struct window* win = window_get(i);
-                if (win && win->visible && !win->minimized) {
-                    if (win->focused) focused = i;
-                    else {
-                        window_draw(i);
-                        int ob = okai_find_by_win(i);
-                        if (ob >= 0) okai_paint_overlays(ob);
-                    }
-                }
+                struct window* w = window_get(i);
+                if (w && w->visible && !w->minimized) vis[nv++] = i;
             }
-            if (focused >= 0) {
-                window_draw(focused);
-                int ob = okai_find_by_win(focused);
-                if (ob >= 0) okai_paint_overlays(ob);
+            // insertion sort by z ascending (back to front)
+            for (int a = 1; a < nv; a++) {
+                int id = vis[a], z = window_get(id)->z, b = a - 1;
+                while (b >= 0 && window_get(vis[b])->z > z) { vis[b + 1] = vis[b]; b--; }
+                vis[b + 1] = id;
+            }
+            for (int a = 0; a < nv; a++) {
+                int id = vis[a];
+                struct window* w = window_get(id);
+                window_draw(id);
+                int ob = okai_find_by_win(id);
+                if (ob >= 0) {
+                    // Clip okai's overlay to the part of its window NOT covered
+                    // by a higher-z window, so the overlay never paints over a
+                    // covering window (which would otherwise need a forced full
+                    // repaint every frame and tank FPS when a window sits over
+                    // okai). The covering window is drawn later (higher z) and
+                    // already occludes okai's content; okai's overlay only shows
+                    // in the uncovered region.
+                    int rects[64][4], nr = 1;
+                    rects[0][0] = w->x; rects[0][1] = w->y;
+                    rects[0][2] = w->w; rects[0][3] = w->h;
+                    for (int c = a + 1; c < nv; c++) {
+                        struct window* hw = window_get(vis[c]);
+                        int hx0 = hw->x, hy0 = hw->y,
+                            hx1 = hw->x + hw->w, hy1 = hw->y + hw->h;
+                        int nr2 = 0, r2[64][4];
+                        for (int i = 0; i < nr; i++) {
+                            int rx = rects[i][0], ry = rects[i][1],
+                                rw = rects[i][2], rh = rects[i][3];
+                            int rx1 = rx + rw, ry1 = ry + rh;
+                            if (hx0 >= rx1 || hx1 <= rx || hy0 >= ry1 || hy1 <= ry) {
+                                r2[nr2][0]=rx; r2[nr2][1]=ry; r2[nr2][2]=rw; r2[nr2][3]=rh; nr2++;
+                                continue;
+                            }
+                            if (rx < hx0) { r2[nr2][0]=rx; r2[nr2][1]=ry; r2[nr2][2]=hx0-rx; r2[nr2][3]=rh; nr2++; }
+                            if (rx1 > hx1) { r2[nr2][0]=hx1; r2[nr2][1]=ry; r2[nr2][2]=rx1-hx1; r2[nr2][3]=rh; nr2++; }
+                            int lx = rx > hx0 ? rx : hx0, rxr = rx1 < hx1 ? rx1 : hx1;
+                            if (ry < hy0) { r2[nr2][0]=lx; r2[nr2][1]=ry; r2[nr2][2]=rxr-lx; r2[nr2][3]=hy0-ry; nr2++; }
+                            if (ry1 > hy1) { r2[nr2][0]=lx; r2[nr2][1]=hy1; r2[nr2][2]=rxr-lx; r2[nr2][3]=ry1-hy1; nr2++; }
+                        }
+                        if (nr2 > 64) nr2 = 64;
+                        nr = nr2;
+                        for (int i = 0; i < nr; i++) {
+                            rects[i][0]=r2[i][0]; rects[i][1]=r2[i][1];
+                            rects[i][2]=r2[i][2]; rects[i][3]=r2[i][3];
+                        }
+                    }
+                    okai_paint_overlays_rects(ob, rects, nr);
+                }
             }
         }
         window_draw_taskbar();

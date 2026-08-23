@@ -10,14 +10,17 @@
 #include <stdint.h>
 #include <string.h>
 
-// Set by okai_paint_overlays while a tab open/close animation runs; the desktop
-// main loop reads it to keep the window re-rendering until the animation settles.
-int okai_anim_win = -1;
+// Wall-clock baseline for the tab open/close animation. okai_anim_step eases
+// each tab's width toward its target once per 10ms tick (the PIT runs at 100Hz),
+// so the animation duration is tied to real time, not the main-loop spin rate.
+extern uint32_t tick_count;
+static uint32_t okai_last_tick = 0;
 
 // Tab chrome sizing / animation constants
-#define OKAI_XBOX      16   // close-× square outline box, px
-#define OKAI_NB        32   // new-tab "+" button box, px (matches the 32px glyph)
-#define OKAI_ANIM_STEP 24   // px/frame tab-width easing for open/close animation
+#define OKAI_XBOX       16   // close-× square outline box, px
+#define OKAI_NB         32   // new-tab "+" button box, px (matches the 32px glyph)
+#define OKAI_ANIM_FACTOR 18  // % of remaining width eased per 10ms tick (exponential
+                             // ease-out; ~150ms to fully open/close a tab)
 
 static struct okai okais[MAX_OKAIS];
 static int okai_count = 0;
@@ -99,6 +102,7 @@ int okai_new_tab(int id, const char* url) {
     okai_tab_reset(&b->tabs[tab]);
     b->tabs[tab].anim_w = 0;   // open animation: grow from zero width
     b->tabs[tab].closing = 0;
+    okai_last_tick = tick_count; // start the ease-out cleanly from width 0
     okai_navigate(id, url);
     return tab;
 }
@@ -1292,48 +1296,61 @@ static void okai_poly_ring(int cx, int cy, int r, int start, int count, uint32_t
     }
 }
 
-// Navigation icons, 26px box, drawn with 2px-thick strokes so they stay legible
-// on the toolbar gradient.
+// Navigation icons drawn as bold, filled glyphs so they read clearly on the
+// toolbar gradient (white on the dark nav chips).
+static void okai_fill_tri(int x0, int y0, int x1, int y1, int x2, int y2, uint32_t c) {
+    int miny = y0; if (y1 < miny) miny = y1; if (y2 < miny) miny = y2;
+    int maxy = y0; if (y1 > maxy) maxy = y1; if (y2 > maxy) maxy = y2;
+    for (int y = miny; y <= maxy; y++) {
+        int xs[4]; int n = 0;
+        int ex[3] = {x0, x1, x2}; int ey[3] = {y0, y1, y2};
+        for (int i = 0; i < 3; i++) {
+            int j = (i + 1) % 3;
+            int ya = ey[i], yb = ey[j], xa = ex[i], xb = ex[j];
+            if ((y >= ya && y < yb) || (y >= yb && y < ya)) {
+                int xx = xa + (y - ya) * (xb - xa) / (yb - ya);
+                if (n < 4) xs[n++] = xx;
+            }
+        }
+        if (n >= 2) {
+            int a = xs[0], b = xs[1];
+            if (a > b) { int t = a; a = b; b = t; }
+            hline(a, y, b - a + 1, c);
+        }
+    }
+}
+
 static void okai_icon_back(int x, int y, int s, uint32_t fg) {
-    int cy = y + s / 2, tip = x + 5, tail = x + s - 5;
-    rect_fill(tip + 2, cy - 1, tail - tip - 2, 3, fg);       // shaft
-    line(tip, cy, tip + 6, cy - 6, fg);                      // head, 2px thick
-    line(tip + 1, cy, tip + 7, cy - 6, fg);
-    line(tip, cy, tip + 6, cy + 6, fg);
-    line(tip + 1, cy, tip + 7, cy + 6, fg);
+    int cy = y + s / 2;
+    okai_fill_tri(x + 5, cy, x + 19, y + 5, x + 19, y + s - 5, fg); // left-pointing head
+    rect_fill(x + 19, cy - 3, 6, 6, fg);                            // stem
 }
 
 static void okai_icon_fwd(int x, int y, int s, uint32_t fg) {
-    int cy = y + s / 2, tip = x + s - 5, tail = x + 5;
-    rect_fill(tail, cy - 1, tip - tail - 2, 3, fg);          // shaft
-    line(tip, cy, tip - 6, cy - 6, fg);
-    line(tip - 1, cy, tip - 7, cy - 6, fg);
-    line(tip, cy, tip - 6, cy + 6, fg);
-    line(tip - 1, cy, tip - 7, cy + 6, fg);
+    int cy = y + s / 2;
+    okai_fill_tri(x + s - 5, cy, x + s - 19, y + 5, x + s - 19, y + s - 5, fg); // right-pointing head
+    rect_fill(x + s - 25, cy - 3, 6, 6, fg);                            // stem
 }
 
 static void okai_icon_reload(int x, int y, int s, uint32_t fg) {
     int cx = x + s / 2, cy = y + s / 2, r = s / 2 - 3;
-    okai_poly_ring(cx, cy, r, 1, 9, fg);          // open ring (gap at top)
-    okai_poly_ring(cx, cy, r - 1, 1, 9, fg);      // 2px-thick ring
-    // arrowhead at the ring's open end (top, around index 10)
+    okai_poly_ring(cx, cy, r,     1, 9, fg);   // open ring (gap at top)
+    okai_poly_ring(cx, cy, r - 1, 1, 9, fg);   // 2px-thick ring
+    okai_poly_ring(cx, cy, r - 2, 1, 9, fg);   // 3px-thick ring
+    // bold arrowhead at the ring's open end (top, index 10)
     int hx = cx + OKAI_CIRC_X[10] * r / 8, hy = cy + OKAI_CIRC_Y[10] * r / 8;
-    line(hx - 3, hy + 2, hx, hy - 2, fg);
-    line(hx + 3, hy + 2, hx, hy - 2, fg);
-    line(hx - 3, hy + 3, hx, hy - 1, fg);
-    line(hx + 3, hy + 3, hx, hy - 1, fg);
+    okai_fill_tri(hx - 4, hy + 5, hx + 4, hy + 5, hx, hy - 4, fg);
 }
 
 static void okai_icon_home(int x, int y, int s, uint32_t fg) {
     int mid = x + s / 2;
     int half = (s - 8) / 2;
-    for (int i = 0; i <= half; i++) { line(mid - i, y + 4 + i, mid + i, y + 4 + i, fg); } // roof
-    int half_w = half + 1;                       // roof base half-width
+    okai_fill_tri(mid, y + 4, x + 4, y + 5 + half, x + s - 4, y + 5 + half, fg); // roof
     int body_y = y + 5 + half;
-    int body_h = (y + s - 5) - body_y + 1;
+    int body_h = (y + s - 4) - body_y;
     if (body_h < 4) return;
-    rect_outline(mid - half_w, body_y, 2 * half_w + 1, body_h, fg, 1);   // walls
-    if (body_h >= 8) rect_fill(mid - 1, body_y + body_h - 5, 3, 5, fg);  // door
+    rect_outline(mid - half, body_y, 2 * half + 1, body_h, fg, 1);   // walls
+    if (body_h >= 7) rect_fill(mid - 1, body_y + body_h - 5, 3, 5, fg); // door
 }
 
 static void okai_icon_lock(int x, int y, int s, uint32_t fg) {
@@ -1362,8 +1379,11 @@ int okai_lock_hit(int id, int mx, int my) {
 }
 
 // Advance tab open/close animations. Eases every live tab's rendered width
-// (anim_w) toward its target; removes any tab whose close animation finished.
-// Returns 1 while something is still animating (caller keeps the window dirty).
+// (anim_w) toward its target with a frame-rate-independent exponential ease-out
+// (tied to the 100Hz tick clock), then removes any tab whose close finished.
+// Returns 1 while still animating. The chrome is repainted every frame by
+// okai_paint_overlays and flushed by graphics_flush(), so no full window
+// re-render is needed here.
 static int okai_anim_step(int id) {
     struct okai* b = &okais[id];
     if (b->win_id < 0) return 0;
@@ -1373,7 +1393,31 @@ static int okai_anim_step(int id) {
     int cwp = w->w - 2 * WIN_BORDER;
     int tw = (cwp - 40) / n; if (tw > 300) tw = 300; if (tw < 60) tw = 60;
 
-    // Remove tabs whose close animation has finished (width reached zero).
+    // Real-time delta since the last step, in ticks (10ms each at 100Hz).
+    int dt = (int)(tick_count - okai_last_tick);
+    okai_last_tick = tick_count;
+    if (dt < 0) dt = 0;
+    if (dt > 10) dt = 10;   // clamp after a long stall / hidden window
+
+    // Ease each tab's width toward its target (exponential ease-out).
+    int animating = 0;
+    for (int ti = 0; ti < b->tab_count; ti++) {
+        int target = b->tabs[ti].closing ? 0 : tw;
+        int cur = b->tabs[ti].anim_w;
+        if (cur != target && dt > 0) {
+            for (int k = 0; k < dt; k++) {
+                int delta = target - cur;
+                int step = (delta * OKAI_ANIM_FACTOR + 50) / 100;
+                if (step == 0) step = (delta > 0 ? 1 : -1);
+                cur += step;
+                if ((delta > 0 && cur >= target) || (delta < 0 && cur <= target)) { cur = target; break; }
+            }
+        }
+        if (cur != target) animating = 1;
+        b->tabs[ti].anim_w = cur;
+    }
+
+    // Remove tabs whose close animation finished (width hit zero).
     for (int i = 0; i < b->tab_count; ) {
         if (b->tabs[i].closing && b->tabs[i].anim_w <= 0) {
             for (int j = i; j < b->tab_count - 1; j++) b->tabs[j] = b->tabs[j + 1];
@@ -1385,15 +1429,6 @@ static int okai_anim_step(int id) {
         }
     }
     if (b->tab_count == 0) { okai_close(id); return 0; } // last tab closed -> close window
-
-    int animating = 0;
-    for (int ti = 0; ti < b->tab_count; ti++) {
-        int target = b->tabs[ti].closing ? 0 : tw;
-        int cur = b->tabs[ti].anim_w;
-        if (cur < target) { cur += OKAI_ANIM_STEP; if (cur > target) cur = target; animating = 1; }
-        else if (cur > target) { cur -= OKAI_ANIM_STEP; if (cur < target) cur = target; animating = 1; }
-        b->tabs[ti].anim_w = cur;
-    }
     return animating;
 }
 
@@ -1550,18 +1585,29 @@ static void okai_draw_heading_pixels(int id); // defined just below
 // The security popup card (okai_draw_chrome) must sit ON TOP of page content,
 // so the heading pixels are painted first and the chrome/card last.
 void okai_paint_overlays(int id) {
-    // Advance tab open/close animation. This *is* the live render path
-    // (desktop.c calls it every iteration for each visible okai window), so
-    // stepping here is what grows anim_w from 0 to target. Keep the okai window
-    // re-marked dirty while animating so desktop.c re-renders it next iteration.
-    if (okai_anim_step(id)) {
-        struct okai* b = &okais[id];
-        okai_anim_win = (b->win_id >= 0) ? b->win_id : -1;
-    } else {
-        okai_anim_win = -1;
-    }
+    // This *is* the live render path (desktop.c calls it every main-loop
+    // iteration for each visible okai window). Stepping the animation here
+    // grows/shrinks each tab's anim_w; the chrome drawn below is flushed every
+    // frame by graphics_flush(), so no full window re-render is needed during
+    // the animation (the page body only re-renders when its content changes).
+    okai_anim_step(id);
     okai_draw_heading_pixels(id);
     okai_draw_chrome(id);
+}
+
+// Draw okai's chrome/heading overlay clipped to the given sub-rects (okai's
+// window minus any higher-z overlapping windows). This keeps the overlay from
+// painting over a covering window, so that window does NOT need to be force-
+// repainted every frame — which was tanking FPS when a window sat over okai.
+// rects[i] = {x, y, w, h} in screen coords; nr may be 0 (fully covered).
+void okai_paint_overlays_rects(int id, int rects[][4], int nr) {
+    okai_anim_step(id);
+    for (int i = 0; i < nr; i++) {
+        graphics_set_clip(rects[i][0], rects[i][1], rects[i][2], rects[i][3]);
+        okai_draw_heading_pixels(id);
+        okai_draw_chrome(id);
+    }
+    graphics_clip_reset();
 }
 
 void okai_draw_chrome_all(void) {

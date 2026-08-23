@@ -37,6 +37,9 @@ struct window {
     int visible;
     int focused;
     int minimized;
+    int z;              // stacking order; higher = drawn on top. Raised on focus /
+                       // interaction so the window you click is always topmost
+                       // (and its pixels correctly occlude lower windows).
     int has_close_button;
     int has_minimize_button;
     int no_titlebar;   // when set, the window has no title bar; the client draws
@@ -67,6 +70,7 @@ void window_init(void);
 int window_create(const char* title, int x, int y, int w, int h);
 void window_destroy(int id);
 void window_set_focus(int id);
+void window_raise(int id);   // bump a window to the top of the z-stack
 int window_get_focused(void);
 void window_draw(int id);
 void window_draw_all(void);

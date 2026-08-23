@@ -101,11 +101,6 @@ struct okai* okai_get(int id);
 // The desktop response loop sets/clears this; declared here so desktop.c can
 // read it without reaching into okai.c internals.
 extern int okai_fetch_owner;
-// Window id whose tab open/close animation is currently running, or -1.
-// okai_draw sets this; the desktop main loop re-marks that window dirty each
-// iteration so the animation keeps advancing (window_draw clears w->dirty after
-// every render, so a per-render dirty flag alone can't self-sustain it).
-extern int okai_anim_win;
 // Inspect an HTTP response for a 3xx + Location header; if found, resolve the
 // target against the current URL and re-issue the request (http<->https aware).
 // Returns 1 if a redirect was followed (caller should skip parsing this frame).
@@ -132,5 +127,9 @@ void okai_nav_home(int id);
 // after the window itself in z-order (okai_draw_chrome_all drew them after
 // ALL windows, so a lower okai's chrome painted over a higher window).
 void okai_paint_overlays(int id);
+// Clip the overlay to the given sub-rects (okai window minus higher-z windows)
+// so it never paints over a covering window — avoids forcing that window to
+// repaint every frame (FPS regression when a window sits over okai).
+void okai_paint_overlays_rects(int id, int rects[][4], int nr);
 
 #endif

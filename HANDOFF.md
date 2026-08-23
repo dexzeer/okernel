@@ -158,8 +158,9 @@ with `ls` before trusting either path; they may be the same bind-mount.
   there. Fix = **pixel-overlay per heading line**: `doc_draw_heading()` places
   each heading char every 2 grid columns and flags the line via `doc_line_kind[]`;
   the blit blanks those grid cells (writes spaces) and
-  `okai_draw_heading_pixels()` (called from `okai_draw_chrome_all`, after
-  `window_draw_all`) paints the heading text at `scale = 2*font_scale` → exactly
+  `okai_draw_heading_pixels()` (now called from `okai_paint_overlays`, after
+  `window_draw` in the main loop / `desktop_paint_rect_skip`) paints the heading
+  text at `scale = 2*font_scale` → exactly
   2× the body glyph (32×64 px), matching page fg/bg. `window.c`'s `vga_to_rgb[16]`
   was made non-static + `extern`-ed in `window.h` so heading colors match the body
   exactly. Links are unaffected (headings aren't links). Vision confirmed ~2×,
@@ -169,7 +170,9 @@ with `ls` before trusting either path; they may be the same bind-mount.
   `desktop.c`'s mouse handler *before* the title-drag / link branches; actions
   `okai_nav_back/fwd/reload/home` call into the existing history/navigate logic.
   `okai.h` gained the `NAV_*` constants + the four nav function decls.
-- **FPS HUD hidden** (`static int g_show_fps = 0` in `desktop.c`).
+- **FPS HUD** (`static int g_show_fps` in `desktop.c` — set to 0 to leave the
+  desktop clean; was toggled on (1) to debug the terminal-over-okai FPS
+  regression).
 - Test: `tests/headless/test_nav.py` (uses `OkVM`, mouse gain ≈4.2 → divide
   deltas by 4.2 to converge without overshoot). Verification confirmed the
   hit-test geometry is correct (a click at x≈99 logged `nav action=2` = FWD,
@@ -743,6 +746,16 @@ Crypto debugging lessons (bit us during bring-up): limb packing must never route
 
 ---
 
+ 26. **Forced full-window repaint under a covering window tanked FPS** (FIXED,
+     2026-08-24): an earlier terminal-occlusion fix forced `w->dirty = 1` on
+     any window overlapping a lower-z okai EVERY main-loop iteration, so a
+     terminal sitting over okai repainted its full 900×650 content on every
+     mouse-move (≈585k px/frame) — dropping 60 → 13 FPS. Fix: clip okai's
+     overlay to the uncovered region (`okai_paint_overlays_rects`) so it never
+     paints over the covering window, and removed the forced `w->dirty = 1`.
+     The covering window now only repaints when it actually changes (drag /
+     focus). (See the z-order/bleed fix, Session 2026-08-24.)
+
 ## Session 2026-08-21 — nav test PASS + OS-wide theming + heading hierarchy
 
 **All four prioritized visual-polish items from the previous handoff are DONE
@@ -803,11 +816,15 @@ language (`theme.h`):
   TASK_BTN_INACT with white text. Desktop.c's taskbar click hit-testing
   unchanged.
 
-### 3. Nav icons — DONE
-`okai_icon_back/fwd` are now proper arrows (3px shaft + 2px-thick chevron
-head) instead of solid triangles; reload ring is 2px thick with a 2px
-arrowhead; home is an outlined house with a filled door. Vision-verified:
-all four "clearly recognizable", correct directions, no clipping.
+### 3. Nav icons — DONE (redesigned 2026-08-24)
+`okai_icon_back/fwd` are now **bold filled triangles** drawn via a new
+`okai_fill_tri()` scanline fill (replacing the earlier thin chevrons); reload
+is a 3px ring + bold arrowhead; home is a filled roof + door. All four sit in
+30px rounded chips (`NAVBTN_BG` + `NAVBTN_HI`, `round_rect_fill`).
+**From-scratch — NO external icon library.** Vision-verified: all four clearly
+recognizable, correct directions, no clipping. Icon geometry is triplicated in
+`okai_draw_chrome` / `okai_check_nav_click` / `okai_addr_bar_hit` (keep in
+sync).
 
 ### 4. Heading hierarchy — DONE
 H1 = 3× body (3 grid cols per glyph, 2 spacer rows), H2 = 2× (unchanged),
@@ -856,16 +873,21 @@ regressions (test_addrbar PASS, test_nav PASS 4/4):
   inside 18–22px bands; the toolbar gradient painted after covered the
   glyph bottoms. New `draw_char_1x`/`draw_string_1x` (graphics.c — 8×16 px,
   no FONT_SCALE doubling) is the chrome font. Chrome bands grew:
-  CHROME_TAB_H 18→22, CHROME_TOOL_H 30→36 (58 total ≤ 96 reserved by
-  CHROME_ROWS=3, so no content-grid change). Tab label, "+", and URL are 1×
+  CHROME_TAB_H 22→38, CHROME_TOOL_H 36→58 (96 total = CHROME_ROWS×FONT_H = 3×32,
+  so page content starts exactly at the chrome bottom — the earlier 82px chrome
+  left a 14px gap under the nav bar, fixed 2026-08-24). Tab label, "+", and
+  URL are 1×
   and CLAMPED to their bar/tab width (no overflow onto neighbors).
 - **Nav buttons are proper chips now:** `round_rect_fill` (public in
   graphics.c; window.c's static helper removed) draws a rounded NAVBTN_BG
   chip + NAVBTN_HI top highlight behind each icon; btn 26→30. Geometry
   mirrored in okai_draw_chrome, okai_check_nav_click, okai_addr_bar_hit —
   keep all three in sync.
-- **No more terminal/browser overlap:** the okai window opens at
-  (1010, 60, 880, 650), right of the default terminal (80,60,900×650).
+- **Default window layout:** the okai window opens at
+  (1010, 60, 880, 650), right of the default terminal (40,30,900×650). True
+  drag-overlap (terminal dragged over okai) is now handled by the z-order +
+  clipped-overlay fix (Session 2026-08-24) — this positional offset is just
+  the default, non-overlapping spawn.
 - **Test updates:** test_nav TARGETS = 1035/1073/1111/1149 (y band 87..117),
   CONTENT_Y=300; test_addrbar scans y 60..130. NOTE: okvm.py's
   `click_link` content-origin constants (ox,oy=32,62) are STALE for the new
@@ -997,12 +1019,29 @@ TAB SWITCH / CHROME-BOUNDS) + test_addrbar PASS + test_nav PASS 4/4.
   `okai_navigate`/`okai_start_fetch` short-circuit it via `okai_is_home`.
   The page: dark navy, centered logo, quick links (example.com, notdexy.ru,
   wikipedia, info.cern.ch). Vision-verified.
-- **Z-order leak fixed**: okai chrome used to be painted AFTER all windows
-  (`okai_draw_chrome_all`), so a lower browser's chrome painted over a
-  higher overlapping window. Chrome + heading overlays now paint right
-  after THEIR window in both paint paths (main loop and
-  `desktop_paint_rect_skip`), via `okai_paint_overlays(id)`. Chrome-bounds
-  pixel probe: no chrome colors outside the chrome band.
+- **Terminal/okai overlap (bleed) fully fixed — z-order + clipped overlay
+  (2026-08-24).** okai's chrome/heading overlay is painted at absolute coords
+  every frame, so a higher window that was NOT itself repainting would still
+  show okai's nav-bar / big heading bleeding through. Fix has three layers:
+  1. **Real z-stack** (`window.h`/`window.c`): `struct window` gained `int z`;
+     `window_raise(id)` bumps a window to the top of the stack (monotonic
+     `g_z_top`), called from `window_set_focus` so the window you click/drag is
+     always topmost. `window_from_point` returns the highest-z window. Both
+     desktop draw paths (`window_draw_all` main loop + `desktop_paint_rect_skip`)
+     sort visible windows by z ascending and draw back-to-front.
+  2. **Overlay clipped to the uncovered region** (`okai_paint_overlays_rects(id,
+     rects, nr)` in `okai.c`): the overlay is clipped to the okai window rect
+     MINUS every higher-z overlapping window (rectangle subtraction into ≤64
+     sub-rects), so it can never paint over a covering window.
+  3. **No forced repaint**: the covering window is NOT marked dirty every
+     frame (that caused a 60→13 FPS regression — see Critical Bug #26). Because
+     the overlay is clipped, the covering window only repaints when it actually
+     changes.
+  Verify: put a window over okai and the nav bar / big heading stay under it;
+  moving the mouse over that overlap is back to ~60 FPS.
+- **Skipped-overlay variant rejected**: an earlier attempt skipped the WHOLE
+  okai overlay when a higher-z window overlapped — that hid okai's own chrome
+  in the partially-uncovered region. Clipping (layer 2) is correct.
 - **Bug found on the way — wrapped links recorded broken regions**: a link
   that wrapped mid-text recorded a 1-char click region at the wrap point
   (clicked the wrong thing / dead zones). Fixed: whole-link fit check
@@ -1031,6 +1070,66 @@ TAB SWITCH / CHROME-BOUNDS) + test_addrbar PASS + test_nav PASS 4/4.
 
 ---
 
+## Session 2026-08-24 — nav-bar gap, arrow redesign, terminal occlusion, FPS fix
+
+Four user-reported UI issues from a live session, all gated by
+`tests/headless/test_tab_x.py` (PASS) + okai-screenshot PIL/pixel verification.
+(Headless QEMU **cannot** reliably drag a *titled* window — the PS/2 cursor has
+no position-feedback loop for landing in a ~28px title bar — so the
+terminal-over-okai drag case is verified by build + logic, not a live drag;
+confirm in the GUI.)
+
+### 1. Nav bar cut off the page (14px gap) — FIXED
+`theme.h`: `CHROME_TOOL_H` 36→58 so `CHROME_TAB_H(38) + CHROME_TOOL_H(58) =
+96 = CHROME_ROWS×FONT_H = 3×32`. The chrome band was previously 82px but page
+content starts at row 3 (96px down), leaving a 14px strip of page content
+rendering *under* the nav bar. Now the toolbar fills exactly to y=158 and
+content starts there — no gap, no overlap. **Invariant:** keep the two chrome
+bands summing to `CHROME_ROWS×FONT_H`; never shrink one without the other, and
+never below `FONT_H` (32).
+
+### 2. Animation — accepted (no change)
+The tick-based ease-out animation (Next-steps item 5) was confirmed "perfect"
+by the user; no action taken.
+
+### 3. Broken arrow buttons — FIXED (redesigned)
+`okai.c`: `okai_icon_back/fwd/reload/home` rewritten as **bold filled glyphs**
+via a new `okai_fill_tri()` scanline fill — left/right filled triangles, a 3px
+reload ring + bold arrowhead, a filled roof + door for home. Replaces the
+broken thin strokes. **From-scratch — no external icon library.** The 30px chip
+geometry is unchanged so the triplicated hit-test / `okai_check_nav_click` /
+`okai_addr_bar_hit` stays in sync. PIL confirms white glyph pixels in all four
+nav-button boxes.
+
+### 4. Terminal doesn't fully overlap okai — FIXED (z-order + clipped overlay)
+Root cause: okai's chrome/heading overlay is painted at absolute coords every
+frame; a higher window that wasn't itself repainting would still show okai's
+nav bar / big heading bleeding through. Three-layer fix:
+- **Real z-stack** (`window.h`/`window.c`): `struct window` gained `int z`;
+  `window_raise(id)` bumps a window to the top (monotonic `g_z_top`), called
+  from `window_set_focus` so the window you click/drag is always topmost;
+  `window_from_point` returns the highest-z window. Both desktop draw paths
+  (`window_draw_all` main loop + `desktop_paint_rect_skip`) sort visible
+  windows by z ascending and draw back-to-front.
+- **Overlay clipped to the uncovered region** (`okai_paint_overlays_rects(id,
+  rects, nr)` in `okai.c`): the overlay is clipped to the okai window rect
+  MINUS every higher-z overlapping window (rectangle subtraction into ≤64
+  sub-rects), so it can never paint over a covering window.
+- **Skipped-overlay variant rejected**: an earlier attempt skipped the whole
+  okai overlay when a higher-z window overlapped — that hid okai's own chrome
+  in the partially-uncovered region. Clipping (above) is correct.
+
+### 5. FPS regression (60→13) when mouse moves over terminal-over-okai — FIXED
+The first #4 attempt forced `w->dirty = 1` on any window overlapping a lower-z
+okai **every frame**, so a terminal sitting over okai repainted its full
+900×650 content on every mouse-move (~585k px/frame) — dropping 60→13 FPS.
+**FIX:** clip okai's overlay (above) so it never paints over the covering
+window, and **remove the forced `w->dirty = 1`**. The covering window now
+repaints only when it actually changes (drag / focus). Moving the mouse over
+the overlap is back to ~60 FPS. See Critical Bug #26.
+
+---
+
 ## Next steps (handoff to next agent)
 
 **Do NOT `git commit` unless the user explicitly asks** (prior sessions kept
@@ -1056,30 +1155,31 @@ the tree uncommitted on `kernel`).
    QEMU gotcha: bound runs with `timeout`; check `pgrep -c '[q]emu-system-i386'`
    before/after; `pkill -f qemu-system-i386` kills its own shell — bracket trick.
 
- 5. **Optimize + speed up the tab open/close animation** (currently functional
-    but frame-rate-dependent and over-paints — see `okai_anim_step` in
-    `src/okai.c` and the `okai_anim_win` re-mark in `desktop.c`). Next steps:
-    - **Time-based easing (frame-rate independence):** `okai_anim_step` advances
-      each tab's `anim_w` by a fixed `OKAI_ANIM_STEP` (24px) *per frame*, so the
-      open/close duration tracks the main-loop tick rate (100Hz in-kernel after
-      the PIT change; ~690Hz spin under headless QEMU) — on fast hardware it can
-      finish in 1–2 frames (effectively instant). Pass a tick/`dt` delta and step
-      by `OKAI_ANIM_SPEED * dt_ms`, or use exponential smoothing
-      `cur += (target - cur) * (1 - exp(-k*dt))` for a consistent ~150–200ms settle.
-    - **Stop re-rendering the whole window during animation (the real speed-up):**
-      `desktop.c`'s `if (okai_anim_win >= 0) window_set_dirty(okai_anim_win);`
-      dirties the *entire* okai window, so `window_draw` re-blits the page body
-      every frame even though only the tab strip width changes. Add a chrome-only
-      dirty region (top `CHROME_TAB_H + CHROME_TOOL_H` rows) — e.g.
-      `window_set_dirty_region(win, y0, y1)` — so the page content is not
-      repainted/re-blitted each frame. Cuts per-frame work and removes page flicker.
-    - **Ease-out curve for polish:** exponential smoothing (above) yields a
-      natural fast-start / gentle-settle feel; the current linear step looks flat.
-    - **Tune duration:** target ~150ms open + close; verify with a temporary
-      serial `[anim] open N frames` / `[anim] close N frames` counter (a debug
-      like this already existed and was removed), then drop the debug.
-    - **Optional:** double-buffer the chrome band if horizontal tear/flicker
-      appears as tab widths change rapidly.
+ 5. **Optimize + speed up the tab open/close animation** — **DONE (2026-08-23).**
+    `okai_anim_step` (`src/okai.c`) reworked:
+    - **Time-based easing (frame-rate independent):** stepping is now driven by the
+      100Hz `tick_count` delta (`dt = tick_count - okai_last_tick`, clamped to
+      [0,10]). Each consumed tick advances `anim_w` by an integer ease-out step
+      `step = (delta * OKAI_ANIM_FACTOR + 50) / 100` (1px floor when the result
+      rounds to 0; snaps to target on overshoot). `OKAI_ANIM_STEP` is gone;
+      `OKAI_ANIM_FACTOR 18` is the per-10ms-tick ease-out factor (~150ms settle,
+      shape falls out naturally — big steps far, tiny near). A freshly opened tab
+      resets `okai_last_tick` in `okai_new_tab` so it starts cleanly at width 0.
+    - **Chrome-only dirty — the real speed-up (whole-window re-mark removed):**
+      `okai_anim_win` (global + `okai.h` extern + the `desktop.c` re-mark
+      `if (okai_anim_win >= 0) window_set_dirty(okai_anim_win);`) is DELETED.
+      Investigation confirmed `graphics_flush()` runs every main-loop iteration and
+      blits only dirty rows; `okai_paint_overlays` repaints the chrome each frame,
+      marking only the chrome rows dirty, so the tab animation repaints chrome
+      WITHOUT re-rendering the page body. No `window_set_dirty_region` API needed.
+    - **Ease-out curve:** integer exponential ease-out (above) gives the
+      fast-start / gentle-settle feel; the old linear per-frame step is gone.
+    - **Duration tuning:** target ~150ms; verified ~160ms open via a temporary
+      `[anim] settle N ms` serial counter, then the debug was removed.
+    - **Optional chrome double-buffer:** not needed — per-row flush shows no
+      tear/flicker as tab widths change.
+    - `tests/headless/test_tab_x.py` PASSES; PIL confirms the × box reaches
+      full-width x[1298,1314] (anim_w=300) with the re-mark removed.
 
 
 
