@@ -21,14 +21,15 @@
 
 // Chrome layout in pixels. Tab strip + toolbar must fit within
 // CHROME_ROWS * CHAR_H reserved content-buffer rows (3 * 32 = 96px).
-// Tab strip 22 + toolbar 36 = 58 <= 96. Bands are tall enough for 1x text
+// Tab strip 38 + toolbar 58 = 96px EXACTLY, so the page content begins right
+// at the toolbar bottom (no blank gap and no overlap with the chrome band).
 // Chrome rows must be tall enough for the 32px body-font glyphs (FONT_H).
 // The tab strip and toolbar each reserve room for one 32px line plus padding
 // so labels like "okai:home" and tab titles show in full instead of being
 // clipped to their upper half. CHROME_ROWS reserves that many 32px content
 // buffer rows (CHROME_TAB_H + CHROME_TOOL_H <= CHROME_ROWS * FONT_H).
 #define CHROME_TAB_H   38
-#define CHROME_TOOL_H  44
+#define CHROME_TOOL_H  58
 #define CHROME_ROWS    3
 
 // Nav toolbar buttons: rounded dark chips on the toolbar gradient

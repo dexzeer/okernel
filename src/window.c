@@ -231,6 +231,7 @@ int window_create(const char* title, int x, int y, int w, int h) {
         if (!windows[i].visible) {
             windows[i].x = x; windows[i].y = y; windows[i].w = w; windows[i].h = h;
             windows[i].visible = 1; windows[i].focused = 0; windows[i].font_scale = 1;
+            windows[i].z = i;
             windows[i].no_titlebar = 0;
             windows[i].text_fg = 15; windows[i].text_bg = 0;
             windows[i].text_fg_rgb = vga_to_rgb[15]; windows[i].text_bg_rgb = vga_to_rgb[0];
@@ -270,8 +271,17 @@ void window_destroy(int id) {
     sb_count[id] = 0; sb_next[id] = 0; windows[id].scroll_off = 0;
 }
 
+static int g_z_top = 0;   // monotonically increasing top of the z-stack
+
+void window_raise(int id) {
+    if (id < 0 || id >= MAX_WINDOWS) return;
+    if (!windows[id].visible) return;
+    windows[id].z = ++g_z_top;
+}
+
 void window_set_focus(int id) {
     for (int i = 0; i < MAX_WINDOWS; i++) windows[i].focused = (i == id);
+    window_raise(id);   // focused window is always topmost
 }
 
 void window_set_close_button(int id, int has_close) {
@@ -380,14 +390,17 @@ struct window* window_get(int id) {
 }
 
 // Topmost visible, non-minimized window containing screen point (x, y), or -1.
+// "Topmost" = highest z (the window that would be drawn last / on top).
 int window_from_point(int x, int y) {
-    for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
+    int best = -1, bestz = -1;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
         struct window* w = &windows[i];
         if (!w->visible || w->minimized) continue;
-        if (x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h)
-            return i;
+        if (x >= w->x && x < w->x + w->w && y >= w->y && y < w->y + w->h) {
+            if (w->z > bestz) { bestz = w->z; best = i; }
+        }
     }
-    return -1;
+    return best;
 }
 
 // Current text cursor position in the content buffer (row/col, not pixels).
