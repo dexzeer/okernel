@@ -340,6 +340,8 @@ void isr_handler(int int_num) {
             __asm__ volatile("mov %%cr2, %0" : "=r"(cr2));
             // Faulting pid (input-bug bisect): weak process_current (COMMON
             // text build has no process.o); pid = pcb[0] per process.h ABI.
+            // Plus CS (pushed[11]) and saved-EBX (pushed[4]): CS tells ring
+            // (0x08 = kernel fault vs 0x1B = user fault).
             uint32_t fpid = 0xFFFFFFFF;
             {
                 extern void *process_current(void) __attribute__((weak));
@@ -348,9 +350,10 @@ void isr_handler(int int_num) {
                     if (pcb) fpid = pcb[0];
                 }
             }
-            serial_printf(" err=%x cr2=%x eip=%x esp=%x pid=%d\n",
+            serial_printf(" err=%x cr2=%x eip=%x esp=%x pid=%d cs=%x ebx=%x\n",
                           pushed_edi[9], cr2, pushed_edi[10],
-                          pushed_edi[13], fpid);
+                          pushed_edi[13], fpid, pushed_edi[11] & 0xFFFF,
+                          pushed_edi[4]);
         } else {
             serial_putchar('\n');
         }
