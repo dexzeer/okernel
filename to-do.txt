@@ -1,0 +1,47 @@
+The Big Missing Foundations
+
+    [x] User Mode (Ring 3) — DONE 2026-09-07/08
+        IRET entry at 0x08048000, INT 0x80 gate (DPL=3), TSS+ESP0, per-process PDs.
+        `usermode` smoke test + `run /bin/*` ELF spawn through the entry drain.
+
+    [x] Virtual Memory + Per-Process Address Spaces — DONE 2026-09-07/08
+        High-half kernel (linker-high.ld), private user-low PDs, paging_map_user_pd,
+        pointer validation, mmap/munmap/sbrk per process. (No COW/demand-paging yet.)
+
+    [~] Processes & Scheduling — MOSTLY DONE 2026-09-08, preemption live
+        Process table, PCB (esp0/term_win/entered_ring3/park), round-robin preemptive
+        tick + safe-point yield, fork (page copy, child EAX=0), zombies/wait/kill.
+        OPEN: ring-3 sh input bug (garbage line + fork-child #PF) — see HANDOFF 2026-09-08.
+
+    [x] System Call Interface — DONE 2026-09-08
+        INT 0x80 ABI 0-17: print/exit/write/read/open/close/fork/exec/sbrk/pipe/dup/
+        wait/kill/mmap/munmap. Return via saved-EAX slot; trap-safe yield (slice-only).
+        TODO: sys_ioctl, seek, non-blocking flags.
+
+    [x] ELF Loader — DONE 2026-09-08
+        src/elf.c: ET_EXEC/i386 validation + PT_LOAD single-walk loader.
+        sched_spawn_elf (fresh spawn, argc/argv/envp on user stack) + sys_proc_exec
+        (in-place, TLB flush after user-low wipe — bisected 2026-09-08).
+
+    [x] Real Filesystem + Disk Driver — first slice DONE 2026-09-08
+        ATA polling-PIO LBA28 + OKPFS1 (SB + 16-entry table + runs, 32KB/file),
+        mount-or-format + hydrate, write-through VFS hooks, editor Ctrl+S/Ctrl+X,
+        `disk`/`save`/`locktest` shell cmds. Userland ELFs seeded at boot
+        (src/userland_seed.c); disk copy wins.
+
+    [x] IPC & Synchronization — first slice DONE 2026-09-08
+        Pipes (4KB rings), signals (TERM/CHLD/USR1), spinlock + nesting mutex.
+        TODO: shared memory (same phys in two PDs), futexes, named pipes.
+
+    [ ] Multi-core (SMP)
+        Still single-CPU. APIC, per-CPU, balancing — huge leap, not urgent.
+
+    [x] Better TCP/IP — first slice DONE 2026-09-08
+        32KB advertised window, peer-window gate + persist probes, Tahoe fast
+        retransmit (pure-ACK-only discipline), Jacobson/Karels RTO, 8-slot reorder
+        buffer (per-connection reset). Still no Reno/CUBIC, still single-connection.
+
+    [~] Userland cutover (init + shell-from-disk) — IN PROGRESS, see
+        ~/.commandcode/plans/userland-cutover.md Phases 0-4 DONE; Phase 5-6 partial:
+        init spawns, /bin/sh prompts, but shell input delivers garbage + #PF
+        (HANDOFF 2026-09-08 evening). `usermode` retires only after sh works.

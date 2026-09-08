@@ -110,6 +110,25 @@ void editor_handle_key(int ed_id, char c) {
     if (ed_id < 0 || ed_id >= MAX_EDITORS) return;
     struct editor* ed = &editors[ed_id];
 
+    // Ctrl+S (0x13) = save to VFS (write-through to disk via pfs hook).
+    // Ctrl+X (0x18) = save + close. The status bar advertises both; until
+    // now neither was wired (edits died with the window).
+    if (c == '\x13' || c == '\x18') {
+        fs_write(ed->filename, (uint8_t*)ed->text, ed->text_len);
+        ed->modified = 0;
+        ed->dirty = 1;
+        serial_puts("[editor] saved: ");
+        serial_puts(ed->filename);
+        serial_putchar('\n');
+        if (c == '\x18') {
+            if (ed->win_id >= 0) {
+                window_destroy(ed->win_id);
+                ed->win_id = -1;
+            }
+        }
+        return;
+    }
+
     if (c == '\b') {
         // Backspace
         if (ed->cursor_pos > 0) {

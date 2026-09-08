@@ -80,8 +80,9 @@ struct e1000_tx_desc {
 static volatile uint32_t* mmio = 0;
 static uint8_t mac_addr[6];
 
-// Fixed low memory addresses for DMA (below 1MB, identity-mapped)
-// These MUST be below 1MB for NIC DMA to work
+// Fixed low memory addresses for DMA (below 1MB, supervisor identity window)
+// The CPU reaches them via paging_map_low (virt == phys here); the NIC is
+// programmed with the same PHYS values for RDBAL/TDBAL + descriptor addrs.
 #define E1000_RX_DESCS_ADDR  0x80000  // 512KB - RX descriptors
 #define E1000_RX_BUFS_ADDR   0x80200  // 512KB + 512B - RX buffers (32 * 2048 = 64KB)
 #define E1000_TX_DESCS_ADDR  0x90000  // 576KB - TX descriptors

@@ -45,6 +45,7 @@ static const char scancode_shift[128] = {
 
 static keyboard_callback_t callback = 0;
 static int shift_pressed = 0;
+static int ctrl_pressed = 0; // 1 = Ctrl held (0x1D)
 static int extended = 0; // 1 = received 0xE0 prefix
 
 static void keyboard_irq(void) {
@@ -78,6 +79,15 @@ static void keyboard_irq(void) {
         if (released == 0x2A || released == 0x36) {
             shift_pressed = 0;
         }
+        if (released == 0x1D) {
+            ctrl_pressed = 0;
+        }
+        return;
+    }
+
+    // Ctrl press (0x1D) — tracked, not typed.
+    if (scancode == 0x1D) {
+        ctrl_pressed = 1;
         return;
     }
 
@@ -105,6 +115,15 @@ static void keyboard_irq(void) {
         c = scancode_ascii[scancode];
     }
 
+    // Ctrl+letter → control code (Ctrl+S = 0x13, Ctrl+X = 0x18, ...).
+    // The editor's status bar advertises Ctrl+S/Ctrl+X; the terminal passes
+    // control codes through to the focused window's handler.
+    if (ctrl_pressed && c >= 'a' && c <= 'z') {
+        c = (char)(c - 'a' + 1);
+    } else if (ctrl_pressed && c >= 'A' && c <= 'Z') {
+        c = (char)(c - 'A' + 1);
+    }
+
     if (c && callback) {
         callback(c);
     }
@@ -113,6 +132,7 @@ static void keyboard_irq(void) {
 void keyboard_init(void) {
     callback = 0;
     shift_pressed = 0;
+    ctrl_pressed = 0;
     extended = 0;
     irq_register_handler(1, keyboard_irq);
 }

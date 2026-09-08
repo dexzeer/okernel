@@ -1,4 +1,5 @@
 #include "memory.h"
+#include "memlayout.h"
 #include "serial.h"
 #include <stdint.h>
 
@@ -36,26 +37,33 @@ static int bitmap_test(uint32_t page) {
     return bitmap[page / 8] & (1 << (page % 8));
 }
 
-void memory_init(uint32_t mboot_addr) {
-    struct multiboot_info* mboot = (struct multiboot_info*)mboot_addr;
+void memory_init(uint32_t mboot_phys) {
+    // mboot_phys is PHYS (GRUB structs live low). Plain phys derefs through
+    // the boot PD's 0-4M LOW identity window. (An earlier pushed-args mixup
+    // in start.asm once delivered the magic number in this slot — diagnosed
+    // via serial mboot print + GDB; the push order is fixed, this stays.)
+    uint32_t mp = mboot_phys;
+    serial_printf("[mem] mboot phys=%x\n", mp);
+    uint32_t mboot_flags = *(volatile uint32_t*)(mp + 0);
+    uint32_t mboot_upper = *(volatile uint32_t*)(mp + 8);
 
     // Clear bitmap (all pages marked as used by default)
     for (int i = 0; i < BITMAP_SIZE; i++) {
         bitmap[i] = 0xFF;
     }
 
-    if (!(mboot->flags & MULTIBOOT_FLAG_MEM)) {
+    serial_printf("[mem] mboot phys=%x flags=%x\n", mboot_phys, mboot_flags);
+
+    uint32_t mem_upper_kb = mboot_upper;
+    if (!(mboot_flags & MULTIBOOT_FLAG_MEM)) {
         serial_puts("[mem] no memory info from multiboot\n");
         // Assume 1MB-16MB if no info
-        mboot->mem_lower = 640;   // KB below 1MB
-        mboot->mem_upper = 15 * 1024; // KB above 1MB
+        mem_upper_kb = 15 * 1024; // KB above 1MB
     }
 
     // Total memory = lower (< 1MB) + upper (> 1MB)
     // We only manage upper memory (> 1MB) for simplicity
-    uint32_t mem_upper_kb = mboot->mem_upper;
     uint32_t mem_upper_bytes = mem_upper_kb * 1024;
-    uint32_t mem_upper_start = 1024 * 1024; // 1MB
 
     total_pages = mem_upper_bytes / PAGE_SIZE;
 
@@ -78,11 +86,13 @@ void memory_init(uint32_t mboot_addr) {
         bitmap_set(i);
     }
 
-    // Mark pages used by kernel (from 1MB to end of kernel)
+    // Mark pages used by kernel (from 1MB to end of kernel).
+    // _kernel_* are HIGH linked: convert to phys before page math, or the
+    // 0xC01xxxxx vaddr overflows the 32K-entry bitmap (786K pages).
     extern uint32_t _kernel_start;
     extern uint32_t _kernel_end;
-    uint32_t kernel_start = (uint32_t)&_kernel_start;
-    uint32_t kernel_end = (uint32_t)&_kernel_end;
+    uint32_t kernel_start = V2P((uint32_t)&_kernel_start);
+    uint32_t kernel_end = V2P((uint32_t)&_kernel_end);
 
     // Align to page boundaries
     kernel_start = kernel_start & ~(PAGE_SIZE - 1);
@@ -165,13 +175,15 @@ static uint32_t heap_ptr = 0;
 #define HEAP_SIZE (48 * 1024 * 1024) // 48MB heap
 
 void heap_init(void) {
-    // Allocate heap from physical memory after kernel
+    // Heap lives in HIGH virtual (CPU uses virt); the bitmap tracks PHYS
+    // pages, so convert with V2P before marking. _kernel_end is high-linked.
     extern uint32_t _kernel_end;
-    uint32_t start_page = ((uint32_t)&_kernel_end + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint32_t kend_phys = V2P((uint32_t)&_kernel_end);
+    uint32_t start_page = (kend_phys + PAGE_SIZE - 1) / PAGE_SIZE;
     uint32_t needed = HEAP_SIZE / PAGE_SIZE;
 
-    // Just use the first available pages for the heap
-    heap_start = start_page * PAGE_SIZE;
+    // Heap virtual base = page-aligned high _kernel_end
+    heap_start = (start_page * PAGE_SIZE) + KERNEL_VBASE;
     heap_ptr = heap_start;
 
     // Mark these pages as used
