@@ -12,8 +12,15 @@ uint32_t syscall_take_ret(void);
 
 // Trapped ring-3 resume state (idt.c stashes pre-dispatch; fork consumes).
 void syscall_stash_trap(uint32_t eip, uint32_t esp);
+void syscall_stash_trap_full(uint32_t eip, uint32_t esp, uint32_t ebx,
+                             uint32_t edi, uint32_t esi, uint32_t ebp,
+                             int have_regs);
 uint32_t syscall_trap_eip(void);
 uint32_t syscall_trap_esp(void);
+uint32_t syscall_trap_ebx(void);
+uint32_t syscall_trap_edi(void);
+uint32_t syscall_trap_esi(void);
+uint32_t syscall_trap_ebp(void);
 
 // Desktop-only services behind hooks (installed by desktop.c at boot):
 // validate(user-virt range) + write-to-focused-terminal. Text mode leaves

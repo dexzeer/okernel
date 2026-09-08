@@ -1784,3 +1784,27 @@ are one small GET so cwnd would buy nothing; the wins are latency + honesty):
 - e1000_poll #PF (err=0 cr2=0x8001c esp=garbage) is a SECOND, kernel-side crash
   (stale ESP0/trap-stack or half-switched CR3 at IRQ time) — after the child
   mess, not instead of it. Audit ESP0 across park paths next.
+
+### Update 2026-09-09 ~01:00 +0500 — MECHANISM FOUND (fork children resume with garbage callee-saved regs)
+- The EAX!=0 theory is DEAD. Reaching sh's exec path REQUIRES EAX==0 at `test
+  %eax,%eax` (else `jne` diverts to the wait path, never exec) — and the child DID
+  reach exec. So EAX was 0; the garbage is ESI: `mov %esi,%ebx` loaded
+  0x8049109 into the exec EBX. ESI is derived from EBP (`lea -0x226(%ebp),%esi`
+  each loop iteration), so the child's EBP is garbage.
+- WHY: fork children enter via a FRESH IRET (`enter_user_mode`) which loads ONLY
+  EIP/CS/EFLAGS/ESP/SS (+EAX via the fork flag). EBX/ECX/EDX/ESI/EDI/EBP arrive as
+  whatever `enter_user_mode` left — i.e. GARBAGE. The child resumes mid-function
+  (`mov %eax,%ebx` after the fork `int $0x80`) with a garbage frame. dbgchild/
+  dbg2/forktest children survive because they never touch EBP-relative state
+  after fork (call/pop msg = position-independent, ESP-relative touches only);
+  sh/forkexec children die the moment they read `line[]` (EBP-0x226).
+- FIX (next): user-space resume stub. At fork, push (EBX,EDI,ESI,EBP of the
+  trapping parent — idt.c has them in pushed[0..7]) + resume-EIP onto the child's
+  stack via the high alias, point the child at a 5-byte stub
+  (`pop ebx; pop edi; pop esi; pop ebp; ret` = `5b 5f 5e 5d c3`) placed at the
+  stack page base, keep the EAX=0 flag (stub preserves EAX). Child lands at
+  resume-EIP with parent's frame intact + ESP = trapped ESP. Needs: idt.c stash
+  of EBP/ESI/EDI/EBX (extend per-slot trap stash), PD-walk helper to find the
+  child's stack page phys, sanity (tesp offset >= 64 else abort child).
+- SECOND CRASH unchanged: e1000_poll #PF err=0 cr2=0x8001c esp=garbage — stale
+  ESP0 or half-switched CR3 at IRQ time. Audit AFTER the stub lands.

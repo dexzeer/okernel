@@ -233,7 +233,13 @@ void isr_handler(int int_num) {
         }
         // Stash the trapped user resume state for fork (child resumes after
         // the fork call, not at image entry). CPU EIP/ESP are pushed[10/13]
-        // per the layout above. Direct call (same linkage as the handler).
+        // per the layout above; callee-saved EBX/EDI/ESI/EBP ride pushed
+        // [4]/[0]/[1]/[2] (pusha order EDI ESI EBP ESP EBX EDX ECX EAX).
+        // The fork stub (sys_proc.c) needs them: fork children enter via a
+        // FRESH IRET (only EIP/CS/EFLAGS/ESP/SS+EAX restored), so mid-function
+        // resumes would otherwise inherit garbage frames (bisected 2026-09-08:
+        // sh children died touching EBP-relative line[]). Direct call (same
+        // linkage as the handler).
         // ALSO reconcile BEFORE stash: a tick may have stolen ring 3 for
         // pid 0 (main loop), so current/CR3/ESP0 are the kernel's — but the
         // CPU-pushed EIP/ESP are still the USER's (the trap itself switched
@@ -246,8 +252,12 @@ void isr_handler(int int_num) {
             if (syscall_reconcile_ring3) syscall_reconcile_ring3();
         }
         {
-            extern void syscall_stash_trap(uint32_t eip, uint32_t esp);
-            syscall_stash_trap(pushed[10], pushed[13]);
+            extern void syscall_stash_trap_full(uint32_t eip, uint32_t esp,
+                                               uint32_t ebx, uint32_t edi,
+                                               uint32_t esi, uint32_t ebp,
+                                               int have_regs);
+            syscall_stash_trap_full(pushed[10], pushed[13], pushed[4],
+                                    pushed[0], pushed[1], pushed[2], 1);
         }
         syscall_handler(eax_val, ebx_val, ecx_val, edx_val);
         // Exec redirect: SYS_EXEC success replaced user-low in place. The

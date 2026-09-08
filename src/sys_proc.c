@@ -481,6 +481,10 @@ int sys_proc_fork(void) {
     {
         extern uint32_t syscall_trap_eip(void);
         extern uint32_t syscall_trap_esp(void);
+        extern uint32_t syscall_trap_ebx(void);
+        extern uint32_t syscall_trap_edi(void);
+        extern uint32_t syscall_trap_esi(void);
+        extern uint32_t syscall_trap_ebp(void);
         uint32_t teip = syscall_trap_eip();
         uint32_t tesp = syscall_trap_esp();
         // Sanity: trapped EIP must be user-low text, ESP the user stack.
@@ -493,10 +497,62 @@ int sys_proc_fork(void) {
             process_destroy((uint32_t)child_pid);
             return -1;
         }
-        child->user_eip = teip;
-        child->user_esp = tesp;
-        serial_printf("[fork] child=%d resume eip=%x esp=%x\n",
-                      child_pid, teip, tesp);
+        // FORK STUB (2026-09-08): fresh-IRET children inherit garbage
+        // callee-saved regs (EBX/EDI/ESI/EBP) — mid-function resumes (sh's
+        // fork inside _start) die touching EBP-relative state. Push the
+        // parent's trapped (EBX,EDI,ESI,EBP) + resume-EIP onto the child's
+        // stack copy (via the HIGH alias; child PD not running) and enter
+        // the child at a 5-byte stub (pop ebx; pop edi; pop esi; pop ebp;
+        // ret = 5b 5f 5e 5d c3) laid at the stack page base. Frame order
+        // (low→high): [EBX][EDI][ESI][EBP][resume-EIP] at the entry ESP;
+        // pops run low→high and ret lands at resume-EIP with ESP exactly on
+        // the trapped ESP. EAX=0 via the fork flag (stub preserves EAX).
+        // Needs 21 free bytes below the trapped ESP; require tesp offset
+        // >= 32 (page-relative) else abort the child (loud, not silent).
+        {
+            uint32_t tebx = syscall_trap_ebx();
+            uint32_t tedi = syscall_trap_edi();
+            uint32_t tesi = syscall_trap_esi();
+            uint32_t tebp = syscall_trap_ebp();
+            uint32_t page_off = tesp & 0xFFF;
+            if (page_off < 32) {
+                serial_printf("[fork] stub: no room esp=%x — abort child\n",
+                              tesp);
+                process_destroy((uint32_t)child_pid);
+                return -1;
+            }
+            // Locate the child's stack page phys (walk ITS PD: PD 0-767 PD
+            // 767 covers 0xBFC00000-0xBFFFFFFF; stack page = last PTE).
+            uint32_t *cpd = (uint32_t*)P2V_U32(child->page_dir);
+            uint32_t pde = cpd[tesp >> 22];
+            uint32_t *cpt = (uint32_t*)P2V_U32(pde & 0xFFFFF000);
+            uint32_t sph = cpt[(tesp >> 12) & 0x3FF] & 0xFFFFF000;
+            uint8_t *spage = (uint8_t*)P2V_U32(sph);
+            // Stub bytes at page base (5B; .text-adjacent low page is mapped
+            // user — reuse the stack page base, never executed otherwise).
+            spage[0] = 0x5b; spage[1] = 0x5f; spage[2] = 0x5e;
+            spage[3] = 0x5d; spage[4] = 0xc3;
+            uint32_t stub_virt = (tesp & 0xFFFFF000);
+            // Frame (low→high): [EBX][EDI][ESI][EBP][resume-EIP], 20 bytes
+            // below trapped ESP (pop order is low→high: EBX must sit at the
+            // entry ESP; the final ret pops resume-EIP and lands ESP exactly
+            // on the trapped ESP). Write LE by bytes (no unaligned u32 store).
+            uint32_t vals[5];
+            vals[0] = tebx; vals[1] = tedi;
+            vals[2] = tesi; vals[3] = tebp; vals[4] = teip;
+            uint32_t woff = page_off - 20;
+            for (uint32_t wi = 0; wi < 5; wi++) {
+                uint32_t v = vals[wi];
+                spage[woff + wi * 4] = v & 0xFF;
+                spage[woff + wi * 4 + 1] = (v >> 8) & 0xFF;
+                spage[woff + wi * 4 + 2] = (v >> 16) & 0xFF;
+                spage[woff + wi * 4 + 3] = (v >> 24) & 0xFF;
+            }
+            child->user_eip = stub_virt;
+            child->user_esp = (tesp & 0xFFFFF000) + woff;
+            serial_printf("[fork] child=%d stub=%x resume eip=%x esp=%x (frame ebp=%x esi=%x)\n",
+                          child_pid, stub_virt, teip, tesp, tebp, tesi);
+        }
     }
     child->heap_break = parent->heap_break;
     child->mmap_next = parent->mmap_next;
