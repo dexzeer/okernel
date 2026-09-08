@@ -277,6 +277,18 @@ uint32_t process_next(void) {
 void process_switch(uint32_t pid) {
     struct process *next = process_get(pid);
     if (!next) return;
+    // BLOCKED processes must never be switched INTO via the lightweight
+    // path (bisected 2026-09-09: kbd-wake IRET into pid 1's stale park
+    // resume faulted #PF err=4 at the resume EIP with pid=0 live — the
+    // parked thread has no live kernel frame; its resume runs through the
+    // entry drain (prepare + enter_user_mode), never a CR3-only handoff.
+    // The drain's wake path sets READY before entering; the tick never
+    // picks BLOCKED (process_next skips them). Refuse loudly (serial) so a
+    // future caller faults visibly here instead of mysteriously at resume.
+    if (next->state == PROC_BLOCKED) {
+        serial_printf("[sw] refuse BLOCKED pid=%d\n", pid);
+        return;
+    }
     if (next->state != PROC_READY && next->state != PROC_RUNNING) return;
 
     struct process *prev = process_current();
