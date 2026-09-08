@@ -191,7 +191,19 @@ void process_destroy(uint32_t pid) {
             // Free page directory pages: USER LOW ONLY (PD 0-767). PD
             // 768-1023 are shared kernel-high tables — freeing them would
             // unmap the kernel for every other process. page_dir is PHYS.
-            if (processes[i].page_dir) {
+            // USE-AFTER-FREE GUARD (bisected 2026-09-09: post-hello #PF — the
+            // timer tick snapshots next_esp/next_cr3 with IF SET, then a
+            // ring-3 wait() reaps the target (PMM-frees its PD pages) BEFORE
+            // the tick's cli+context_switch loads the freed PD. PMM instantly
+            // recycles the pages (pmm_alloc hands them to the next fork) so
+            // the switch loads HALF-REUSED tables → #PF err=0 cr2=0. Fix:
+            // NEVER free user pages here (leak ~8-40KB/exit; 16 slots max,
+            // PMM has MBs — the hobby-OS trade). The PD/PT memory stays
+            // mapped-but-orphaned; a racing tick loads STALE-BUT-VALID tables
+            // (worst case: switches into a dead address space for one slice,
+            // then the zombie-target guard refuses it next tick). Poison + park
+            // drop below still run (slot hygiene unchanged).
+            if (0 && processes[i].page_dir) {
                 uint32_t *pd = (uint32_t *)P2V_U32(processes[i].page_dir);
                 for (int j = 0; j < PD_KERNEL_BASE; j++) {
                     if (pd[j] & 0x01) {
