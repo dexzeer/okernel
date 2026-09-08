@@ -1361,6 +1361,23 @@ void kernel_main(uint32_t mboot_phys) {
                 break; // queue + slot both empty
             }
             is_fork_child = (pid >= 0) ? sched_fork_take_child((uint32_t)pid) : 0;
+            // EXITED-SKIP (2026-09-09: post-hello #PF err=0 cr2=0 eip=0 — a
+            // wait-parked parent was re-entered, reaped its zombie, and
+            // EXITED... then a STALE queued entry for the same pid (staged
+            // before the exit, e.g. fork-child entry + park-resume entry
+            // both queued) dequeued into prepare+IRET with user_eip/esp from
+            // a FREED address space (destroy poisoned esp/esp0/page_dir to 0
+            // → CR3=kernel-PD-fallback... actually page_dir=0 → kernel PD,
+            // eip/esp=stale user values → #PF at CR2==EIP==0 class). Never
+            // enter a pid whose slot is UNUSED or whose state is
+            // ZOMBIE/EXITED (reaped or awaiting reap — wait() owns it now).
+            if (pid >= 0) {
+                struct process *chk = process_get((uint32_t)pid);
+                if (!chk || chk->state == PROC_ZOMBIE || chk->state == PROC_EXITED) {
+                    serial_printf("[drain] skip dead pid=%d\n", pid);
+                    continue;
+                }
+            }
             // WAKE ORDER: a BLOCKED parker with a staged resume whose wake
             // condition holds is re-entered through THIS drain (not its own
             // iret — its trap frame was discarded by the park trampoline).
