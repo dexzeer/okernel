@@ -1679,9 +1679,14 @@ void kernel_main(uint32_t mboot_phys) {
                     __asm__ volatile("cli" ::: "memory");
                 }
                 drain_stash_pid(rp->pid);
+                // READY BEFORE prepare (process_switch refuses BLOCKED —
+                // the parked thread has no live frame; its resume is an
+                // entry-drain IRET, never a CR3 handoff. Mark READY first so
+                // the handoff is legal; the IRET below is the real resume).
+                rp->state = PROC_READY;
+                rp->ticks_left = SCHED_SLICE_TICKS;
                 sched_prepare((uint32_t)rp->pid);
                 rp->entered_ring3 = 1;
-                rp->state = PROC_READY;
                 rp->ticks_left = SCHED_SLICE_TICKS;
                 enter_user_mode_park_ret(rret);
                 __asm__ volatile(
