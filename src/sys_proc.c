@@ -42,6 +42,24 @@ static spinlock_t kbd_lock = SPINLOCK_INIT;
 
 void sys_proc_kbd_offer(const char *line, uint32_t len) {
     if (!line || len == 0) return;
+    // STALE-BACKLOG GUARD (2026-09-08: sh's first read ate the `run /bin/sh`
+    // kernel-shell line offered BEFORE sh existed — then every fresh command
+    // lagged one line behind, execing the PREVIOUS line forever. The queue is
+    // a shell-input queue, not a log: drop stale lines when NO reader is
+    // parked... simpler + correct: DROP when no userland process exists yet
+    // (offered before the first spawn — kernel-shell bootstrap lines). A
+    // live reader drains promptly; a dead one means the line is stale.)
+    {
+        int live = 0;
+        for (int s = 0; s < 16; s++) {
+            struct process *pcb = process_get_by_slot(s);
+            if (!pcb) continue;
+            if (pcb->pid == 0) continue; // pid 0 = kernel, not a reader
+            live = 1;
+            break;
+        }
+        if (!live) return; // kernel-shell bootstrap line — nobody can read it
+    }
     if (len >= KBD_LINE_LEN) len = KBD_LINE_LEN - 1;
     uint32_t ef = spin_lock_irq(&kbd_lock);
     if (kbd_count < KBD_QUEUE_LEN) {

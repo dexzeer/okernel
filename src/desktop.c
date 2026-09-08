@@ -1006,7 +1006,34 @@ static void on_keypress(char c) {
         // Offer the completed line to any ring-3 reader on fd 0 (keyboard
         // line queue — sys_read(0) drains; non-blocking, drops when full).
         sys_proc_kbd_offer(term_bufs[tidx], term_lens[tidx]);
-        shell_execute(win_id, term_bufs[tidx]);
+        // FOREGROUND GATE (2026-09-08: sh read the STALE `run /bin/sh` line
+        // because the kernel shell consumes every line even while a userland
+        // foreground process owns the terminal — fresh keystrokes then race
+        // the kernel shell vs the ring-3 reader, and the kernel usually wins
+        // (offers+executes as a kernel command, e.g. `Unknown:`). While a
+        // foreground `run` child (or init's shell — any non-zombie userland
+        // process with term_win == this window) is live, the line belongs
+        // to IT: offer only, never kernel-execute.
+        {
+            extern struct process *process_get_by_slot(int slot);
+            int fg_live = 0;
+            if (run_wait_pid >= 0) {
+                extern struct process *process_get(uint32_t pid);
+                struct process *w = process_get((uint32_t)run_wait_pid);
+                if (w && w->term_win == win_id) fg_live = 1;
+            }
+            if (!fg_live) {
+                for (int s = 0; s < 16; s++) {
+                    struct process *p = process_get_by_slot(s);
+                    if (!p) continue;
+                    if (p->pid == 0) continue;
+                    if (p->term_win != win_id) continue;
+                    fg_live = 1;
+                    break;
+                }
+            }
+            if (!fg_live) shell_execute(win_id, term_bufs[tidx]);
+        }
         term_lens[tidx] = 0;
         shell_prompt(win_id);
     } else {
@@ -1494,6 +1521,15 @@ void kernel_main(uint32_t mboot_phys) {
                     pp->ticks_left = SCHED_SLICE_TICKS;
                     sched_park_stage((uint32_t)pid, peip, pesp, pret);
                     syscall_can_exit = 1;
+                    // PARK-HOME INVARIANT (2026-09-08: e1000_poll #PF err=0
+                    // cr2=0x8001c esp=garbage after park cycles — the park
+                    // trampoline resumes the drain with the PARKED process's
+                    // PD still live + ITS ESP0 armed. Any IRQ before the next
+                    // prepare (timer → sched_tick → e1000_poll → DMA decode)
+                    // runs on the wrong address space/stack. Restore kernel
+                    // PD + idle ESP0 here (same as the exit path below); the
+                    // parker's resume re-prepares at re-entry.)
+                    sched_unprepare();
                     {
                         extern volatile int switch_busy;
                         switch_busy = 0;
