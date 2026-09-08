@@ -61,6 +61,15 @@ IRQ 13, 45
 IRQ 14, 46
 IRQ 15, 47
 
+; ISR 0x80 (ring-3 syscall gate): same frame as exceptions (err=0 +
+; int_num=0x80) so isr_handler's pushed[0..14] layout holds; DPL=3 gate
+; installed in idt.c (0xEE) lets ring 3 call it via int $0x80.
+global isr80
+isr80:
+    push dword 0              ; dummy error code
+    push dword 0x80           ; interrupt number
+    jmp isr_common_stub
+
 ; Common ISR stub — saves registers, calls C handler, restores
 extern isr_handler
 isr_common_stub:
