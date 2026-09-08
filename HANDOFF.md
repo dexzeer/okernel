@@ -1837,3 +1837,22 @@ are one small GET so cwnd would buy nothing; the wins are latency + honesty):
   CR3 across the park trampoline (whose PD is live when the park jmp runs?).
 - Bisect traces stay (`[exec-ebx]`, `[exec-arg]`, `[kbd]`, `[fork]`, #PF pid)
   until sh runs hello end-to-end.
+
+### Update 2026-09-09 ~02:00 — SHELL END-TO-END (hello runs, prompt returns); post-run #PF still open
+- MILESTONE: `/bin/sh` reads a typed line, forks, execs `/bin/hello`, hello
+  prints (`hello from userland` + pid), exits 0, `Back from user mode`, no wedge.
+  Chain that got here: fork stub (callee-saved regs) + exec argv rebuild +
+  per-slot trap/park/retval + stale-drop + foreground gate + park-home +
+  offer-wake (IRQ arms, main loop enters) + READY-before-prepare + exited-skip.
+- STILL OPEN (post-run #PF): `err=0 cr2=0 eip=0 esp=0 pid=4` right after the hello
+  exit announce. Shape: the wait-parked sh reaps pid 5 (destroy), retries wait
+  (no children → -1), prints... then SOMETHING enters pid 4 with EIP=ESP=0.
+  Suspects: (a) sh's park resume staged EIP/ESP=0 (drain consumed the wrong pid's
+  park state — self-slot vs pid getters — AUDIT every remaining
+  `syscall_park_eip/esp()` self-slot call on drain paths); (b) sh's user_esp got
+  clobbered to 0 (exec? no — sh never execs; park_stage with peip/pesp=0 from a
+  zeroed slot). NEXT: `[park]` trace already proves stage values — add the same
+  for WAKE entries (`[wake] pid eip esp`), find the zero.
+- Docs: checkpoints current through 0a14115 (exited-skip). Plan NEXT-1/2 (input
+  bug + hello end-to-end) DONE in practice except the post-run crash; NEXT-3
+  (kernel shell skip) DONE via the foreground gate; NEXT-4 (builtins) not started.
