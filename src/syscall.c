@@ -142,7 +142,21 @@ uint32_t syscall_take_ret(void) {
 // for dead slots are simply never read.
 static uint32_t trap_user_eip[16];
 static uint32_t trap_user_esp[16];
+// Fork-frame callee-saved regs (captured from the pusha frame at fork-trap
+// time; 2026-09-08: fork children enter via a FRESH IRET which loads only
+// EIP/CS/EFLAGS/ESP/SS+EAX — EBX/EDI/ESI/EBP arrive as garbage, so children
+// that touch EBP-relative state (sh's line[]) die. The fix (fork stub in
+// sys_proc.c) pops these off the child's stack right after entry).
+static uint32_t trap_user_ebx[16];
+static uint32_t trap_user_edi[16];
+static uint32_t trap_user_esi[16];
+static uint32_t trap_user_ebp[16];
 void syscall_stash_trap(uint32_t eip, uint32_t esp) {
+    syscall_stash_trap_full(eip, esp, 0, 0, 0, 0, 0);
+}
+void syscall_stash_trap_full(uint32_t eip, uint32_t esp, uint32_t ebx,
+                             uint32_t edi, uint32_t esi, uint32_t ebp,
+                             int have_regs) {
     extern void *process_current(void) __attribute__((weak));
     unsigned slot = 0;
     if (process_current) {
@@ -159,9 +173,19 @@ void syscall_stash_trap(uint32_t eip, uint32_t esp) {
     }
     trap_user_eip[slot] = eip;
     trap_user_esp[slot] = esp;
+    if (have_regs) {
+        trap_user_ebx[slot] = ebx;
+        trap_user_edi[slot] = edi;
+        trap_user_esi[slot] = esi;
+        trap_user_ebp[slot] = ebp;
+    }
 }
 uint32_t syscall_trap_eip(void) { return trap_user_eip[trap_slot_self()]; }
 uint32_t syscall_trap_esp(void) { return trap_user_esp[trap_slot_self()]; }
+uint32_t syscall_trap_ebx(void) { return trap_user_ebx[trap_slot_self()]; }
+uint32_t syscall_trap_edi(void) { return trap_user_edi[trap_slot_self()]; }
+uint32_t syscall_trap_esi(void) { return trap_user_esi[trap_slot_self()]; }
+uint32_t syscall_trap_ebp(void) { return trap_user_ebp[trap_slot_self()]; }
 
 // Serial chatter policy: per-syscall SUCCESS lines are OFF by default —
 // init/sh/forktest wait/yield/read-poll rings emit millions of lines and
