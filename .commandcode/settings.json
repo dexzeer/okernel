@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(which qemu-system-i386 gcc nasm ld grub-mkrescue python3 2>&1; gcc --version | head -1; qemu-system-i386 --version | head -1)",
+      "Shell(make desktop 2>&1 | tail -20; ls -lh okernel-desktop.iso okernel-desktop.bin 2>&1; python3 -c \"import sys; sys.path.insert(0,'tests/headless'); import okvm; print('okvm ok')\")",
+      "Shell(python3 - <<'EOF' import sys, time sys.path.insert(0, 'tests/headless') from okvm import OkVM vm = OkVM(\"usermode\") time.sleep(14) vm.type_string(\"usermode\\n\") ok_gp = vm.wait_for(\"GP fault\", timeout=25) time.sleep(2) log = vm.serial() vm.kill() i = log.find(\"usermode\") print(\"GP_WAIT:\", ok_gp) print(log[max(0,i-500):i+3000] if i>=0 else log[-3000:]) EOF)",
+      "Shell(objdump:*)",
+      "Shell(nm:*)",
+      "Shell(grep:*)",
+      "Shell(make desktop 2>&1 | grep -E \"error|warning.*idt|okernel\" | head; ls -lh okernel-desktop.iso python3 - <<'EOF' import sys, time sys.path.insert(0, 'tests/headless') from okvm import OkVM vm = OkVM(\"usermode2\") time.sleep(14) vm.type_string(\"usermode\\n\") vm.wait_for(\"GP fault\", timeout=25) time.sleep(2) log = vm.serial() vm.kill() i = log.find(\"[usermode]\") print(log[max(0,i-200):i+1500] if i>=0 else log[-2000:]) EOF)",
+      "Shell(make desktop 2>&1 | grep -iE \"error|warning\" | grep -v RWX | head; echo BUILD_DONE python3 - <<'EOF' import sys, time sys.path.insert(0, 'tests/headless') from okvm import OkVM vm = OkVM(\"usermode3\") time.sleep(14) vm.type_string(\"usermode\\n\") vm.wait_for(\"GP fault\", timeout=25) time.sleep(2) log = vm.serial() vm.kill() i = log.find(\"[usermode]\") print(log[max(0,i-200):i+1500] if i>=0 else log[-2000:]) EOF)",
+      "Shell(make desktop 2>&1 | grep -iE \"error|warning\" | grep -v RWX | head; echo BUILD_DONE python3 - <<'EOF' import sys, time sys.path.insert(0, 'tests/headless') from okvm import OkVM vm = OkVM(\"usermode4\") time.sleep(14) vm.type_string(\"usermode\\n\") vm.wait_for(\"GP fault\", timeout=25) time.sleep(2) log = vm.serial() vm.kill() i = log.find(\"[usermode]\") print(log[max(0,i-200):i+1500] if i>=0 else log[-2000:]) EOF)",
+      "Shell(make desktop 2>&1 | grep -iE \"error|warning\" | grep -v RWX | head; echo BUILD_DONE python3 - <<'EOF' import sys, time sys.path.insert(0, 'tests/headless') from okvm import OkVM vm = OkVM(\"usermode5\") time.sleep(14) vm.type_string(\"usermode\\n\") vm.wait_for(\"GP fault\", timeout=25) time.sleep(2) log = vm.serial() vm.kill() i = log.find(\"[usermode]\") print(log[max(0,i-200):i+1500] if i>=0 else log[-2000:]) EOF)",
+      "Shell(make:*)",
+      "Shell(python3 - <<'EOF' import sys, time sys.path.insert(0, 'tests/headless') from okvm import OkVM vm = OkVM(\"usermode6\") time.sleep(14) vm.type_string(\"usermode\\n\") got_user = vm.wait_for(\"[user]\", timeout=25) got_gp = \"GP fault\" in vm.serial() time.sleep(3) log = vm.serial() vm.kill() i = log.find(\"[usermode]\") print(\"USER:\", got_user, \"GP:\", got_gp) print(log[max(0,i-200):i+2000] if i>=0 else log[-2500:]) EOF)",
+      "Shell(sed:*)",
+      "Shell(make desktop 2>&1 | grep -iE \"error|warning\" | grep -v RWX | head; echo DONE python3 - <<'EOF' import sys, time sys.path.insert(0, 'tests/headless') from okvm import OkVM vm = OkVM(\"usermode7\") time.sleep(14) vm.type_string(\"usermode\\n\") vm.wait_for(\"[user]\", timeout=25) time.sleep(3) log = vm.serial() vm.kill() i = log.find(\"[usermode]\") print(log[max(0,i-200):i+2000] if i>=0 else log[-2500:]) EOF)",
+      "Shell(make desktop 2>&1 | grep -iE \"error|warning\" | grep -v RWX | head; echo DONE python3 - <<'EOF' import sys, time sys.path.insert(0, 'tests/headless') from okvm import OkVM vm = OkVM(\"usermode8\") time.sleep(14) vm.type_string(\"usermode\\n\") vm.wait_for(\"exit syscall\", timeout=25) time.sleep(4) log = vm.serial() vm.kill() i = log.find(\"[usermode]\") tail = log[i:i+2500] if i>=0 else log[-2500:] print(tail) hello = \"[user] Hello from user mode!\" in log gp = \"GP fault\" in log[i:] if i>=0 else \"GP fault\" in log exc = \"[ISR] Exception\" in log[i:] if i>=0 else False print(\"HELLO:\", hello, \"GP_AFTER:\", gp, \"EXC_AFTER:\", exc) EOF)",
+      "Shell(git:*)",
+      "Shell(ls:*)",
+      "Shell(python3 - <<'EOF' import sys, time sys.path.insert(0, 'tests/headless') from okvm import OkVM vm = OkVM(\"usermode9\") time.sleep(14) vm.type_string(\"usermode\\n\") vm.wait_for(\"exit syscall\", timeout=25) time.sleep(3) log = vm.serial() vm.kill() i = log.find(\"[usermode]\") tail = log[i:i+1500] if i>=0 else log[-2000:] print(tail) print(\"HELLO:\", \"[user] Hello from user mode!\" in log, \"GP:\", \"GP fault\" in (log[i:] if i>=0 else log)) EOF echo ===HOST_TESTS===; ls tests/test_*.c 2>/dev/null)",
+      "Shell(gcc:*)",
+      "Shell(/tmp/t_css:*)",
+      "Shell(/tmp/t_dec:*)",
+      "Shell(/tmp/t_sub:*)",
+      "Shell(/tmp/t_css | tail -2; gcc test_text_decode.c ../src/html.c -I../src -o /tmp/t_dec 2>/dev/null; /tmp/t_dec | tail -2; gcc test_subres.c ../src/html.c -I../src -o /tmp/t_sub 2>/dev/null; /tmp/t_sub | tail -2)",
+      "Shell(git stash list | head -2; git status --short tests/ src/html.c src/html.h src/css.c 2>/dev/null | head; echo ===; git log --oneline -2 -- tests/test_text_decode.c; gcc -DKERNEL=0 test_text_decode.c ../src/html.c -I../src -o /tmp/t_dec0 2>/dev/null; /tmp/t_dec0 | tail -2)",
+      "Shell(gcc test_subres.c ../src/html.c ../src/css.c -I../src -o /tmp/t_sub 2>/dev/null; /tmp/t_sub | tail -4)",
+      "Shell(python3 tests/headless/test_addrbar.py 2 >& 1)",
+      "Shell(python3 tests/headless/test_nav.py 2 >& 1)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}

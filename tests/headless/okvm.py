@@ -35,7 +35,7 @@ BOOT_WAIT = 14          # seconds; kernel boots in ~8s, 14 is safe
 
 
 class OkVM:
-    def __init__(self, tag="vm", extra_net=True):
+    def __init__(self, tag="vm", extra_net=True, disk=None):
         os.makedirs(OUTDIR, exist_ok=True)
         self.LOG  = os.path.join(OUTDIR, f"{tag}_serial.log")
         self.SOCK = os.path.join(OUTDIR, f"{tag}_mon.sock")
@@ -50,6 +50,8 @@ class OkVM:
                "-monitor", f"unix:{self.SOCK},server,nowait", "-no-reboot"]
         if extra_net:  # e1000 + SLIRP user networking (10.0.2.x)
             cmd += ["-device", "e1000,netdev=net0", "-netdev", "user,id=net0"]
+        if disk:  # raw ATA disk image for the persistent-FS layer
+            cmd += ["-hda", disk]
         self.q = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL, cwd=PROJECT)
         # Wait for the monitor socket to appear

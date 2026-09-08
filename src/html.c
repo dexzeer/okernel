@@ -1,4 +1,5 @@
 #include "html.h"
+#include "okai.h"
 #include "serial.h"
 #include <string.h>
 
@@ -248,8 +249,10 @@ static int extract_attr(const char* html, int pos, int len,
     while (attr_name[alen]) alen++;
 
     while (pos < len) {
-        // Look for attribute name
-        if (html[pos] == attr_name[0]) {
+        // Look for attribute name (case-insensitive)
+        char c0 = html[pos];
+        if (c0 >= 'A' && c0 <= 'Z') c0 += 32;
+        if (c0 == attr_name[0]) {
             int match = 1;
             for (int i = 1; i < alen; i++) {
                 if (pos + i >= len) { match = 0; break; }
@@ -313,6 +316,100 @@ int html_get_title(const char* html, int html_len, char* title, int max_len) {
     return 0;
 }
 
+// Parse a <form>/<input>/<button> control at tag_start ('<'). Emits the token
+// (stamped with the current form context) and returns the position just past
+// the control (past '>' for <input>/<form>, past '</button>' for <button>).
+// Shared by the main parse loop AND the <td>/<a> inner loops so controls are
+// never swallowed as "nested markup" (google's search box lives in a <td>).
+static int emit_control(const char* html, int tag_start, int html_len,
+                        struct html_token* tokens, int* count, int max_tokens,
+                        int* cur_form_idx, char* cur_form_action, char* cur_form_method) {
+    char tag[32]; int tl = 0; int p = tag_start + 1;
+    while (p < html_len && html[p] != ' ' && html[p] != '>' && html[p] != '/' && tl < 31)
+        tag[tl++] = html[p++];
+    tag[tl] = 0;
+
+    // Bound attribute extraction to this tag (extract_attr scans forward and
+    // would otherwise grab the NEXT tag's attributes — e.g. an <input> with no
+    // type would inherit a later type="submit").
+    int tag_end = tag_start;
+    while (tag_end < html_len && html[tag_end] != '>') tag_end++;
+
+    if (strncmp(tag, "form", 4) == 0) {
+        if (*cur_form_idx < 31) (*cur_form_idx)++;
+        extract_attr(html, tag_start + 1, tag_end, "action", cur_form_action, 64);
+        char fm[8] = {0};
+        extract_attr(html, tag_start + 1, tag_end, "method", fm, 8);
+        strncpy(cur_form_method, (fm[0] == 'p' || fm[0] == 'P') ? "POST" : "GET", 7);
+        cur_form_method[7] = 0;
+        int before = *count;
+        add_token(tokens, count, max_tokens, HTML_FORM, "", cur_form_action);
+        if (*count > before) {
+            struct html_token* tk = &tokens[*count - 1];
+            tk->form_idx = *cur_form_idx;
+            strncpy(tk->method, cur_form_method, 7);
+        }
+        while (p < html_len && html[p] != '>') p++;
+        if (p < html_len) p++;
+        return p;
+    }
+    if (strncmp(tag, "input", 5) == 0) {
+        char itype[16] = {0}; extract_attr(html, tag_start + 1, tag_end, "type", itype, 16);
+        char iname[40] = {0}; extract_attr(html, tag_start + 1, tag_end, "name", iname, 40);
+        char ival[160] = {0}; extract_attr(html, tag_start + 1, tag_end, "value", ival, 160);
+        char iplh[40] = {0}; extract_attr(html, tag_start + 1, tag_end, "placeholder", iplh, 40);
+        html_decode_entities(ival);
+        html_decode_entities(iplh);
+        int is_submit = (itype[0] == 's' || itype[0] == 'S') &&
+                        (itype[1] == 'u' || itype[1] == 'U');
+        int ttype = is_submit ? HTML_BUTTON : HTML_INPUT;
+        int before = *count;
+        add_token(tokens, count, max_tokens, ttype, ival, "");
+        if (*count > before) {
+            struct html_token* tk = &tokens[*count - 1];
+            strncpy(tk->name, iname, 39); tk->name[39] = 0;
+            strncpy(tk->value, ival, 159); tk->value[159] = 0;
+            strncpy(tk->placeholder, iplh, 39); tk->placeholder[39] = 0;
+            strncpy(tk->input_type, itype, 15); tk->input_type[15] = 0;
+            strncpy(tk->method, cur_form_method, 7);
+            strncpy(tk->href, cur_form_action, 63); tk->href[63] = 0;
+            tk->form_idx = *cur_form_idx;
+        }
+        while (p < html_len && html[p] != '>') p++;
+        if (p < html_len) p++;
+        return p;
+    }
+    if (strncmp(tag, "button", 6) == 0) {
+        while (p < html_len && html[p] != '>') p++; // past opening <button ...>
+        if (p < html_len) p++;
+        int pe = p;
+        while (pe < html_len && !(html[pe] == '<' && pe + 1 < html_len &&
+                html[pe+1] == '/' && (html[pe+2] == 'b' || html[pe+2] == 'B')))
+            pe++;
+        char label[HTML_MAX_TEXT]; int ll = 0; int scan = p;
+        while (scan < pe && ll < HTML_MAX_TEXT - 1) {
+            if (html[scan] == '<') { while (scan < pe && html[scan] != '>') scan++; if (scan < pe) scan++; }
+            else label[ll++] = html[scan++];
+        }
+        label[ll] = 0; html_decode_entities(label);
+        char btype[16] = {0}; extract_attr(html, tag_start + 1, tag_end, "type", btype, 16);
+        int before = *count;
+        add_token(tokens, count, max_tokens, HTML_BUTTON, label, "");
+        if (*count > before) {
+            struct html_token* tk = &tokens[*count - 1];
+            strncpy(tk->method, cur_form_method, 7);
+            strncpy(tk->href, cur_form_action, 63); tk->href[63] = 0;
+            tk->form_idx = *cur_form_idx;
+            strncpy(tk->input_type, (btype[0] == 'b') ? "button" : "submit", 15);
+        }
+        return pe;
+    }
+    // Unknown control tag — skip past '>'
+    while (p < html_len && html[p] != '>') p++;
+    if (p < html_len) p++;
+    return p;
+}
+
 int html_parse(const char* html, int html_len, struct html_token* tokens, int max_tokens) {
     int count = 0;
     int pos = 0;
@@ -323,6 +420,12 @@ int html_parse(const char* html, int html_len, struct html_token* tokens, int ma
     // number (li gets "N. ").
     int list_ordered = 0;
     int list_num = 0;
+
+    // Form context: each <input>/<button> is stamped with the enclosing
+    // <form>'s action + method + index so a submit can build the query URL.
+    int cur_form_idx = -1;
+    char cur_form_action[64] = {0};
+    char cur_form_method[8] = "GET";
 
     // Sniff the charset before anything else: look for "charset=..." in the
     // headers / early markup (covers both Content-Type and <meta charset>).
@@ -487,6 +590,16 @@ int html_parse(const char* html, int html_len, struct html_token* tokens, int ma
                 }
                 continue;
             }
+
+            // ---- Forms / inputs / buttons (okai search & submit) ----
+            if (tag_match(html, tag_start + 1, "form") ||
+                tag_match(html, tag_start + 1, "input") ||
+                tag_match(html, tag_start + 1, "button")) {
+                pos = emit_control(html, tag_start, html_len, tokens, &count, max_tokens,
+                                   &cur_form_idx, cur_form_action, cur_form_method);
+                continue;
+            }
+
             // <td>/<th>: one cell until its closing tag; consecutive cells
             // join on a row (okai render), </tr> breaks the line.
             if (tag_match(html, tag_start + 1, "td") ||
@@ -495,7 +608,30 @@ int html_parse(const char* html, int html_len, struct html_token* tokens, int ma
                                           tag_name[0] == 't' && tag_name[1] == 'd' ? "td" : "th");
                 char text[HTML_MAX_TEXT]; int tl = 0;
                 while (pos < close && tl < HTML_MAX_TEXT - 1) {
-                    if (html[pos] == '<') { // strip nested markup inside the cell
+                    if (html[pos] == '<') {
+                        // Skip ENTIRE <script>/<style> blocks inside the cell —
+                        // the head/script/style skip in the main loop never sees
+                        // them because this inner loop owns the cell scan; without
+                        // this, the script source leaks as visible cell text.
+                        char nx = (pos + 1 < close) ? html[pos + 1] : 0;
+                        if (nx == 's' || nx == 'S') {
+                            const char* tn = tag_match(html, pos + 1, "script") ? "script"
+                                         : tag_match(html, pos + 1, "style")  ? "style" : 0;
+                            if (tn) {
+                                int np = skip_to_close(html, pos + 1, close, tn);
+                                if (np > pos + 1) { pos = np; continue; }
+                                break; // unterminated block inside cell — stop
+                            }
+                        }
+                        // Parse <form>/<input>/<button> controls inside the cell
+                        // (otherwise the search box etc. would be swallowed).
+                        if (tag_match(html, pos + 1, "form") ||
+                            tag_match(html, pos + 1, "input") ||
+                            tag_match(html, pos + 1, "button")) {
+                            pos = emit_control(html, pos, html_len, tokens, &count, max_tokens,
+                                               &cur_form_idx, cur_form_action, cur_form_method);
+                            continue;
+                        }
                         while (pos < close && html[pos] != '>') pos++;
                         if (pos < close) pos++;
                         if (tl && text[tl-1] != ' ') text[tl++] = ' ';
@@ -661,6 +797,17 @@ int html_parse(const char* html, int html_len, struct html_token* tokens, int ma
                                 break;
                             }
                         }
+                        // Skip ENTIRE <script>/<style> blocks nested in the link
+                        // (otherwise their source leaks as link text).
+                        char nx = (pos + 1 < html_len) ? html[pos + 1] : 0;
+                        if (nx == 's' || nx == 'S') {
+                            const char* tn = tag_match(html, pos + 1, "script") ? "script"
+                                         : tag_match(html, pos + 1, "style")  ? "style" : 0;
+                            if (tn) {
+                                int np = skip_to_close(html, pos + 1, html_len, tn);
+                                if (np > pos + 1) { pos = np; continue; }
+                            }
+                        }
                         // Skip nested tags
                         pos++;
                         while (pos < html_len && html[pos] != '>') pos++;
@@ -729,4 +876,73 @@ int html_extract_css(const char* html, int html_len, char* out, int cap) {
         pos++;
     }
     return total;
+}
+
+// Extract href from <link rel="stylesheet" href="..."> tags.
+// Each URL is null-terminated; buffer is double-null-terminated.
+int html_extract_link_css(const char* html, int html_len, char* out, int cap) {
+    int count = 0;
+    int pos = 0;
+    int out_pos = 0;
+    out[0] = 0;
+    while (pos < html_len - 5) {
+        if (html[pos] == '<' && tag_match(html, pos + 1, "link")) {
+            // Find end of the <link ...> tag
+            int tag_end = pos;
+            while (tag_end < html_len && html[tag_end] != '>') tag_end++;
+            if (tag_end >= html_len) break;
+            // Check for rel="stylesheet"
+            char rel[32] = {0};
+            extract_attr(html, pos + 1, tag_end, "rel", rel, 32);
+            int is_stylesheet = 0;
+            if (rel[0]) {
+                // case-insensitive compare
+                if ((rel[0]=='s'||rel[0]=='S') && (rel[1]=='t'||rel[1]=='T') &&
+                    (rel[2]=='y'||rel[2]=='Y')) is_stylesheet = 1;
+            }
+            if (is_stylesheet && count < OKAI_MAX_SUBRES - 1) {
+                char href[OKAI_URL_LEN] = {0};
+                extract_attr(html, pos + 1, tag_end, "href", href, OKAI_URL_LEN);
+                if (href[0] && out_pos + (int)strlen(href) + 2 < cap) {
+                    int hlen = 0;
+                    while (href[hlen]) { out[out_pos++] = href[hlen]; hlen++; }
+                    out[out_pos++] = 0; // null-terminate this URL
+                    count++;
+                }
+            }
+            pos = tag_end + 1;
+            continue;
+        }
+        pos++;
+    }
+    out[out_pos] = 0; // double-null-terminate
+    return count;
+}
+
+// Extract src from <script src="..."> tags.
+int html_extract_script_src(const char* html, int html_len, char* out, int cap) {
+    int count = 0;
+    int pos = 0;
+    int out_pos = 0;
+    out[0] = 0;
+    while (pos < html_len - 7) {
+        if (html[pos] == '<' && tag_match(html, pos + 1, "script")) {
+            int tag_end = pos;
+            while (tag_end < html_len && html[tag_end] != '>') tag_end++;
+            if (tag_end >= html_len) break;
+            char src[OKAI_URL_LEN] = {0};
+            extract_attr(html, pos + 1, tag_end, "src", src, OKAI_URL_LEN);
+            if (src[0] && count < OKAI_MAX_SUBRES - 1) {
+                int slen = 0;
+                while (src[slen]) { out[out_pos++] = src[slen]; slen++; }
+                out[out_pos++] = 0; // null-terminate
+                count++;
+            }
+            pos = tag_end + 1;
+            continue;
+        }
+        pos++;
+    }
+    out[out_pos] = 0; // double-null-terminate
+    return count;
 }

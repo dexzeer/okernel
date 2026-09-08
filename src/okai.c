@@ -7,6 +7,7 @@
 #include "net/tls_net.h"
 #include "filesystem.h"
 #include "serial.h"
+#include "js/js_dom.h"
 #include <stdint.h>
 #include <string.h>
 
@@ -73,9 +74,16 @@ static void okai_tab_reset(struct okai_tab* T) {
     T->css_n = 0;
     T->css_text[0] = 0;
     T->link_count = 0;
+    T->field_count = 0;
+    T->focused_input = -1;
     T->history_count = 0;
     T->history_pos = 0;
     T->redirect_count = 0;
+    T->sub_res_phase = 0;
+    T->sub_res_idx = 0;
+    T->sub_res_count = 0;
+    memset(T->sub_res_type, 0, OKAI_MAX_SUBRES);
+    memset(T->sub_res_urls, 0, sizeof(T->sub_res_urls));
 }
 
 // Switching re-renders the tab's cached page — no refetch.
@@ -457,6 +465,7 @@ void okai_render_content(int ed_id) {
     if (!w->content) return;
 
     T->link_count = 0;
+    T->field_count = 0;
 
     int view_w = w->content_w;
     int view_h = w->content_h - CHROME_ROWS; // Reserve top rows for pixel chrome
@@ -677,6 +686,71 @@ void okai_render_content(int ed_id) {
             doc_putc(' ');
             break;
 
+        case HTML_FORM:
+            // Container — no direct visual; its inputs/buttons render below.
+            break;
+
+        case HTML_INPUT: {
+            if (t->input_type[0] == 'h') break; // hidden inputs aren't drawn
+            const char* shown = t->value[0] ? t->value : t->placeholder;
+            int focused = (T->focused_input == i);
+            int boxw = 30, maxtext = boxw - 2;
+            int lrow = doc_cy, lcol0 = doc_cx;
+            int fi = (T->field_count < OKAI_MAX_LINKS) ? T->field_count++ : -1;
+            doc_fg = 0x222222;
+            doc_putc('[');
+            int sl = 0; while (shown[sl]) sl++;
+            int n = sl < maxtext ? sl : maxtext;
+            for (int k = 0; k < n; k++) doc_putc(doc_sanitize(shown[k]));
+            int filled = n;
+            while (filled < maxtext) { doc_putc(' '); filled++; }
+            if (focused) doc_putc('_'); // text caret
+            doc_putc(']');
+            if (fi >= 0) {
+                T->fields[fi].row = lrow;
+                T->fields[fi].col0 = lcol0;
+                T->fields[fi].col1 = doc_cx - 1;
+                if (T->fields[fi].col1 < lcol0) T->fields[fi].col1 = lcol0;
+                T->fields[fi].token_index = i;
+                T->fields[fi].is_button = 0;
+            }
+            doc_fg = fg; doc_bg = bg;
+            break;
+        }
+
+        case HTML_BUTTON: {
+            // Label: prefer <button> text or input value; substitute a readable
+            // default when empty or non-Latin (Cyrillic decodes to '?' in the
+            // 8x16 font, so google's "Поиск в Google" falls back to "Search").
+            const char* raw = t->text[0] ? t->text : t->value;
+            int has_latin = 0;
+            for (int k = 0; raw[k]; k++)
+                if ((raw[k] >= 'a' && raw[k] <= 'z') ||
+                    (raw[k] >= 'A' && raw[k] <= 'Z')) { has_latin = 1; break; }
+            const char* label = (raw[0] && has_latin) ? raw
+                              : (t->input_type[0] == 'b' ? "Button" : "Search");
+            int boxw = 20, maxtext = boxw - 2;
+            int lrow = doc_cy, lcol0 = doc_cx;
+            int fi = (T->field_count < OKAI_MAX_LINKS) ? T->field_count++ : -1;
+            doc_fg = 0x1133AA; // button label (dark blue)
+            doc_putc('[');
+            int ll = 0; while (label[ll]) ll++;
+            int n = ll < maxtext ? ll : maxtext;
+            for (int k = 0; k < n; k++) doc_putc(doc_sanitize(label[k]));
+            int filled = n; while (filled < maxtext) { doc_putc(' '); filled++; }
+            doc_putc(']');
+            if (fi >= 0) {
+                T->fields[fi].row = lrow;
+                T->fields[fi].col0 = lcol0;
+                T->fields[fi].col1 = doc_cx - 1;
+                if (T->fields[fi].col1 < lcol0) T->fields[fi].col1 = lcol0;
+                T->fields[fi].token_index = i;
+                T->fields[fi].is_button = 1;
+            }
+            doc_fg = fg; doc_bg = bg;
+            break;
+        }
+
         case HTML_TEXT:
             doc_flow_text(t->text);
             break;
@@ -757,7 +831,194 @@ void okai_render_content(int ed_id) {
         T->links[li].row = buf_row;
     }
 
+    // Form-control regions are recorded in document rows too; convert like links.
+    for (int li = 0; li < T->field_count; li++) {
+        int buf_row = T->fields[li].row - T->scroll_y + CHROME_ROWS;
+        if (buf_row < CHROME_ROWS || buf_row >= w->content_h) buf_row = -1;
+        T->fields[li].row = buf_row;
+        serial_printf("[okai] field[%d] row=%d col0=%d col1=%d btn=%d tok=%d\n",
+                      li, T->fields[li].row, T->fields[li].col0,
+                      T->fields[li].col1, T->fields[li].is_button,
+                      T->fields[li].token_index);
+    }
+
     w->dirty = 1;
+}
+
+// ---- Sub-resource fetch queue (<link rel=stylesheet>, <script src>) ----------
+
+// Extract external CSS and JS URLs from the raw HTML and queue them for
+// sequential fetching. Called after the main page is parsed and rendered.
+void okai_queue_sub_resources(int id, const char* html, int html_len) {
+    struct okai* b = &okais[id];
+    struct okai_tab* T = okai_tab_of(b);
+    T->sub_res_count = 0;
+    T->sub_res_idx = 0;
+    T->sub_res_phase = 0;
+    if (!html || html_len <= 0) return;
+
+    // Extract <link rel="stylesheet" href="..."> URLs
+    char css_urls[OKAI_SUBRES_BUF];
+    int n_css = html_extract_link_css(html, html_len, css_urls, OKAI_SUBRES_BUF);
+
+    // Extract <script src="..."> URLs
+    char js_urls[OKAI_SUBRES_BUF];
+    int n_js = html_extract_script_src(html, html_len, js_urls, OKAI_SUBRES_BUF);
+
+    if (n_css == 0 && n_js == 0) return;
+
+    // Resolve all URLs against the current page URL and queue them
+    int idx = 0;
+    const char* p = css_urls;
+    for (int i = 0; i < n_css && idx < OKAI_MAX_SUBRES; i++) {
+        char abs_url[OKAI_URL_LEN];
+        okai_resolve_href(b, p, abs_url, OKAI_URL_LEN);
+        if (abs_url[0]) {
+            int k = 0;
+            while (abs_url[k] && k < OKAI_URL_LEN - 1) {
+                T->sub_res_urls[idx][k] = abs_url[k]; k++;
+            }
+            T->sub_res_urls[idx][k] = 0;
+            T->sub_res_type[idx] = 'c'; // CSS
+            idx++;
+        }
+        while (*p) p++; p++; // skip to next null-terminated URL
+    }
+
+    p = js_urls;
+    for (int i = 0; i < n_js && idx < OKAI_MAX_SUBRES; i++) {
+        char abs_url[OKAI_URL_LEN];
+        okai_resolve_href(b, p, abs_url, OKAI_URL_LEN);
+        if (abs_url[0]) {
+            int k = 0;
+            while (abs_url[k] && k < OKAI_URL_LEN - 1) {
+                T->sub_res_urls[idx][k] = abs_url[k]; k++;
+            }
+            T->sub_res_urls[idx][k] = 0;
+            T->sub_res_type[idx] = 'j'; // JS
+            idx++;
+        }
+        while (*p) p++; p++;
+    }
+
+    T->sub_res_count = idx;
+    if (idx > 0) {
+        T->sub_res_phase = 1; // start fetching CSS links first
+        T->sub_res_idx = 0;
+        serial_printf("[okai] sub-res: %d resources queued (%d css, %d js)\n",
+                      idx, n_css, n_js);
+    }
+}
+
+// Start fetching the next sub-resource in the queue. Returns 0 if a fetch
+// was started, 1 if all done, -1 on error.
+int okai_start_sub_res_fetch(int id) {
+    struct okai* b = &okais[id];
+    struct okai_tab* T = okai_tab_of(b);
+
+    // Find the next resource to fetch
+    while (T->sub_res_idx < T->sub_res_count) {
+        int i = T->sub_res_idx;
+        char type = T->sub_res_type[i];
+        char* url = T->sub_res_urls[i];
+
+        // Skip CSS during JS phase
+        if (T->sub_res_phase == 2 && type == 'c') { T->sub_res_idx++; continue; }
+        // Skip JS during CSS phase
+        if (T->sub_res_phase == 1 && type == 'j') { T->sub_res_idx++; continue; }
+
+        if (!url[0]) { T->sub_res_idx++; continue; }
+
+        // Parse the URL and start the fetch
+        char host[128], path[128];
+        int url_port = 0;
+        parse_url(url, host, path, &url_port);
+        if (!host[0]) { T->sub_res_idx++; continue; }
+
+        int is_https = (url[0]=='h' && url[1]=='t' && url[2]=='t' && url[3]=='p' &&
+                        url[4]=='s' && url[5]==':');
+        serial_printf("[okai] sub-res fetch: %s %s\n", type == 'c' ? "CSS" : "JS", url);
+        if (is_https) https_get(host, path);
+        else { http_reset_conn_attempts(); http_get_port(host, path, (uint16_t)url_port); }
+        return 0;
+    }
+
+    // All resources in current phase done; advance to next phase
+    if (T->sub_res_phase == 1) {
+        T->sub_res_phase = 2; // switch to JS phase
+        T->sub_res_idx = 0;
+        return okai_start_sub_res_fetch(id); // recurse to start JS fetches
+    }
+
+    // All phases done
+    T->sub_res_phase = 0;
+    return 1;
+}
+
+// Called by desktop.c when a sub-resource fetch completes. Processes the
+// response and advances to the next resource. Returns 1 if all done.
+int okai_sub_res_done(int id, const char* resp, int resp_len) {
+    struct okai* b = &okais[id];
+    struct okai_tab* T = okai_tab_of(b);
+    if (T->sub_res_phase == 0 || T->sub_res_idx >= T->sub_res_count) return 1;
+
+    int i = T->sub_res_idx;
+    char type = T->sub_res_type[i];
+
+    if (type == 'c' && resp && resp_len > 0) {
+        // Dechunk and strip HTTP headers
+        int total = http_dechunk(resp, resp_len);
+        // Find the body (after \r\n\r\n)
+        char* body = resp;
+        int body_len = total;
+        for (int k = 0; k < total - 3; k++) {
+            if (resp[k] == '\r' && resp[k+1] == '\n' && resp[k+2] == '\r' && resp[k+3] == '\n') {
+                body = resp + k + 4;
+                body_len = total - k - 4;
+                break;
+            }
+        }
+        // External CSS is raw CSS text (not wrapped in <style> tags).
+        // Parse it directly and append rules.
+        int prev_css_len = strlen(T->css_text);
+        int copy_len = body_len;
+        if (prev_css_len + copy_len + 1 < OKAI_CSS_TEXT) {
+            memcpy(T->css_text + prev_css_len, body, copy_len);
+            T->css_text[prev_css_len + copy_len] = 0;
+        }
+        T->css_n = css_parse(T->css_text, strlen(T->css_text),
+                              T->css_rules, CSS_MAX_RULES);
+        serial_printf("[okai] sub-res CSS: %d bytes, %d rules (total %d)\n",
+                      body_len, copy_len, T->css_n);
+    } else if (type == 'j' && resp && resp_len > 0) {
+        // Dechunk and strip HTTP headers
+        int total = http_dechunk(resp, resp_len);
+        char* body = resp;
+        int body_len = total;
+        for (int k = 0; k < total - 3; k++) {
+            if (resp[k] == '\r' && resp[k+1] == '\n' && resp[k+2] == '\r' && resp[k+3] == '\n') {
+                body = resp + k + 4;
+                body_len = total - k - 4;
+                break;
+            }
+        }
+        if (body_len > 0) {
+            char* js_code = (char*)kmalloc(body_len + 1);
+            if (js_code) {
+                memcpy(js_code, body, body_len);
+                js_code[body_len] = 0;
+                js_run(js_code);
+                kfree(js_code);
+            }
+        }
+        serial_printf("[okai] sub-res JS: executed %d bytes\n", body_len);
+    }
+
+    T->sub_res_idx++;
+    // Re-render with updated CSS after each external stylesheet
+    if (type == 'c') okai_render_content(id);
+
+    return 0; // not done yet
 }
 
 // Begin the network fetch for window `id` using its current URL. Called by the
@@ -1186,6 +1447,81 @@ static void okai_scroll_clamp(struct okai* b, struct window* w) {
     if (T->scroll_y < 0) T->scroll_y = 0;
 }
 
+// Submit a form: gather all <input> values of the submitting control's form
+// (form_idx), URL-encode them as a GET query, and navigate to
+// <form action>?<query>. Used by Enter-in-field and button clicks.
+void okai_submit_form(int id, int input_idx) {
+    struct okai* b = &okais[id];
+    struct okai_tab* T = okai_tab_of(b);
+    if (b->win_id < 0 || input_idx < 0 || input_idx >= T->token_count) return;
+    struct html_token* sub = &T->tokens[input_idx];
+    int form_idx = sub->form_idx;
+    if (sub->type == HTML_BUTTON && sub->input_type[0] == 'b') {
+        return; // <button type="button"> never submits
+    }
+    char query[1024]; int ql = 0; query[0] = 0;
+    static const char hex[] = "0123456789ABCDEF";
+    for (int k = 0; k < T->token_count; k++) {
+        struct html_token* tk = &T->tokens[k];
+        if (tk->type != HTML_INPUT || tk->form_idx != form_idx) continue;
+        if (tk->name[0] == 0) continue; // unnamed control: skip
+        if (ql > 0 && ql < 1023) query[ql++] = '&';
+        int ni = 0; while (tk->name[ni] && ql < 1023) query[ql++] = tk->name[ni++];
+        if (ql < 1023) query[ql++] = '=';
+        for (int vi = 0; tk->value[vi] && ql < 1023; vi++) {
+            unsigned char ch = (unsigned char)tk->value[vi];
+            if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ||
+                ch == '.' || ch == '~') {
+                query[ql++] = ch;
+            } else if (ch == ' ') {
+                query[ql++] = '+';
+            } else {
+                query[ql++] = '%';
+                query[ql++] = hex[ch >> 4];
+                query[ql++] = hex[ch & 0xF];
+            }
+        }
+    }
+    query[ql] = 0;
+    char action[OKAI_URL_LEN]; action[0] = 0;
+    okai_resolve_href(b, sub->href, action, OKAI_URL_LEN);
+    char url[OKAI_URL_LEN]; int ul = 0;
+    int ai = 0; while (action[ai] && ul < OKAI_URL_LEN - 1) url[ul++] = action[ai++];
+    if (ql > 0 && ul < OKAI_URL_LEN - 1) url[ul++] = '?';
+    int qi = 0; while (query[qi] && ul < OKAI_URL_LEN - 1) url[ul++] = query[qi++];
+    url[ul] = 0;
+    T->focused_input = -1;
+    serial_printf("[okai] submit form_idx=%d -> %s\n", form_idx, url);
+    okai_navigate(id, url);
+}
+
+// Content hit-test for form controls (inputs/buttons). Returns 1 and performs
+// the action (focus a field / submit a button) if a control was clicked, else 0.
+// `row`/`col` are buffer-space coords already transformed by the caller
+// (desktop.c uses the same transform for links, so fields line up exactly).
+int okai_check_content_click(int id, int row, int col) {
+    struct okai* b = &okais[id];
+    struct okai_tab* T = okai_tab_of(b);
+    if (b->win_id < 0) return 0;
+    if (row < CHROME_ROWS) return 0; // chrome, not content
+    for (int li = 0; li < T->field_count; li++) {
+        struct okai_field* f = &T->fields[li];
+        if (f->row < 0) continue;
+        if (row == f->row && col >= f->col0 && col <= f->col1) {
+            if (f->is_button) {
+                okai_submit_form(id, f->token_index);
+            } else {
+                T->focused_input = f->token_index;
+                okai_render_content(id);
+                serial_printf("[okai] focus input token=%d\n", f->token_index);
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void okai_handle_key(int id, char c) {
     struct okai* b = &okais[id];
     struct okai_tab* T = okai_tab_of(b);
@@ -1219,6 +1555,26 @@ void okai_handle_key(int id, char c) {
             b->addr_input[b->addr_input_len] = 0;
         }
         okai_render_content(id);
+    } else if (T->focused_input >= 0 && T->focused_input < T->token_count &&
+               T->tokens[T->focused_input].type == HTML_INPUT) {
+        // Form field input mode: keys edit the focused <input> instead of
+        // scrolling; Enter submits the form, Esc blurs.
+        struct html_token* f = &T->tokens[T->focused_input];
+        if (c == '\n') {
+            okai_submit_form(id, T->focused_input);
+        } else if (c == '\b') {
+            int vl = 0; while (f->value[vl]) vl++;
+            if (vl > 0) f->value[--vl] = 0;
+            okai_render_content(id);
+        } else if (c == 27) { // Escape blurs the field
+            T->focused_input = -1;
+            okai_render_content(id);
+        } else if (c >= 32 && c < 127) {
+            int vl = 0; while (f->value[vl]) vl++;
+            if (vl < 159) { f->value[vl++] = c; f->value[vl] = 0; }
+            okai_render_content(id);
+        }
+        // other keys ignored while typing in a field
     } else {
         // Content scroll mode
         if (c == 'g' || c == 'G') {

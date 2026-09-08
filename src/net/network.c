@@ -87,6 +87,18 @@ static void net_event_post(const char* msg) {
 
 // TCP state constants live in network.h (shared with tls_net.c).
 
+// --- Reorder buffer: hold out-of-order gap segments until the hole fills.
+// 8 slots x 1500B (12KB — covers a typical burst of reordered segments).
+// All IRQ-context (tcp_handle_packet runs in IRQ): single-threaded vs the
+// main loop's readers (buffers are only drained here, never concurrently).
+// Declared up here (not at tcp_handle_packet) because tcp_connect resets it.
+#define TCP_REORDER_SLOTS 8
+#define TCP_REORDER_SEG 1500
+static uint8_t tcp_reorder_data[TCP_REORDER_SLOTS][TCP_REORDER_SEG];
+static uint32_t tcp_reorder_seq[TCP_REORDER_SLOTS];
+static uint16_t tcp_reorder_len[TCP_REORDER_SLOTS];
+static uint8_t tcp_reorder_used[TCP_REORDER_SLOTS];
+
 struct tcp_conn {
     uint8_t dst_ip[4]; // stored in network byte order
     uint16_t src_port;
@@ -103,6 +115,28 @@ struct tcp_conn {
     uint8_t  rtx_tries;      // retransmit attempts since last progress
     uint16_t rtx_timeout;    // current RTO in ticks (doubles per retry)
     uint32_t rtx_last_tick;  // tick when the flight was (re)sent
+    // Receive window (what WE advertise): fixed 32KB. Our buffers are huge
+    // (1MB http_response, 64KB TLS ring), so we never need to shrink it —
+    // but advertising a real window (not a stub) lets fast servers stream
+    // without silly-window stalls. Sent on every segment (tcp_send_raw).
+    // Peer window (what THEY advertise): cached from incoming segments,
+    // caps our sends (never send past SND.UNA + peer_win). 0 = persist
+    // (send 1-byte probes on rtx timer instead of stalling forever).
+    uint32_t peer_win;       // last advertised peer window (bytes)
+    // Fast retransmit: count DUP acks (same ack_num, no progress). At 3,
+    // resend the head of the flight immediately (no RTO wait) — classic
+    // Tahoe fast-retransmit (no fast-recovery/cwnd inflation: congestion
+    // window stays 1 MSS-equivalent since we only ever have one small
+    // flight; the gain is latency, not throughput).
+    uint32_t dup_acks;       // consecutive duplicate ACKs
+    uint32_t last_ack_num;   // ack number of the last processed ACK
+    // RTT estimation (Jacobson/Karels, tick granularity): SRTT/RTTVAR drive
+    // the RTO instead of the fixed 220ms. Ticks are ~10ms (100Hz PIT), so
+    // alpha=1/8 beta=1/4 via shifts. RTO clamped [2 ticks, 60 ticks].
+    uint32_t srtt;           // smoothed RTT (ticks << 3)
+    uint32_t rttvar;         // variance (ticks << 2)
+    uint32_t rtt_seq;        // seq being timed (0 = none in flight)
+    uint32_t rtt_tick;       // tick when rtt_seq was first sent
 };
 
 static struct tcp_conn tcp_conn;
@@ -145,8 +179,14 @@ static int http_pending = 0;
 static int http_done = 0; // Set when connection closes with data
 // Real pages run large (google.com serves ~85KB of HTML); a 64KB buffer
 // truncated mid-script, and the parser then produced only the header links.
-static char http_response[131072];
-static int http_response_len = 0;
+// Plain-HTTP response accumulator. Raised from 128 KiB to 1 MiB so larger
+// pages (multi-hundred-KiB bodies, e.g. real homepages) are captured whole
+// instead of being truncated mid-stream. Raising this array is the only change
+// needed: the clamp in tcp_handle_packet keys off sizeof(http_response), and
+// html_parse / dechunk read http_response_len, not a fixed size.
+static char http_response[1048576];
+static int  http_response_len = 0;
+static int  http_response_overflow = 0; // set once when a response exceeds the buffer
 
 static uint16_t net_checksum(void* data, int len) {
     uint16_t* buf = (uint16_t*)data;
@@ -712,6 +752,18 @@ void tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
     tcp_conn.rtx_has_fin = 0;
     tcp_conn.rtx_tries = 0;
     tcp_conn.rtx_timeout = TCP_RTO_TICKS;
+    // Estimator + window state reset per connection (stale SRTT from a LAN
+    // peer would mis-time a WAN peer and vice versa).
+    tcp_conn.peer_win = 65535; // assume open until the first segment says so
+    tcp_conn.dup_acks = 0;
+    tcp_conn.last_ack_num = 0;
+    tcp_conn.srtt = 0;
+    tcp_conn.rttvar = 0;
+    tcp_conn.rtt_seq = 0;
+    tcp_conn.rtt_tick = 0;
+    // Reorder buffer is per-connection: a stale gap from the previous
+    // connection would deliver garbage into the new stream on seq overlap.
+    for (int ri = 0; ri < TCP_REORDER_SLOTS; ri++) tcp_reorder_used[ri] = 0;
 
     uint8_t dst_nbo[4]; // network byte order
     dst_nbo[0] = (dst_ip >> 24) & 0xFF;
@@ -769,7 +821,7 @@ void tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
     tcp[8] = 0; tcp[9] = 0; tcp[10] = 0; tcp[11] = 0; // ACK number
     tcp[12] = 0x50; // Data offset: 5 words
     tcp[13] = 0x02; // Flags: SYN
-    tcp[14] = 0x00; tcp[15] = 0x3C; // Window: 60
+    tcp[14] = 0x80; tcp[15] = 0x00; // Window: 32768 (see tcp_send_raw)
     tcp[16] = 0; tcp[17] = 0; // Checksum (set below)
     tcp[18] = 0; tcp[19] = 0; // Urgent pointer
 
@@ -839,7 +891,10 @@ static void tcp_send_raw(uint32_t seq_num, uint32_t ack_num, uint8_t flags,
     tcp[11] = ack_num & 0xFF;
     tcp[12] = 0x50;
     tcp[13] = flags;
-    tcp[14] = 0x00; tcp[15] = 0x3C;
+    // Advertise a real receive window (32KB — our buffers dwarf it) instead
+    // of the old 60-byte stub (0x3C). The stub throttled fast servers to
+    // ~60 bytes per round trip (silly-window behavior on THEIR side).
+    tcp[14] = 0x80; tcp[15] = 0x00;
     tcp[16] = 0; tcp[17] = 0;
     tcp[18] = 0; tcp[19] = 0;
 
@@ -861,9 +916,46 @@ static void tcp_send_packet(uint8_t flags, uint8_t* data, uint16_t data_len) {
 }
 
 // Cumulative ACK processing: drop acked bytes from the retransmit buffer,
-// advance snd_una, reset backoff on progress.
-static void tcp_process_ack(uint32_t ack_num) {
-    if (!seq_lt(tcp_conn.snd_una, ack_num)) return; // old / duplicate ack
+// advance snd_una, reset backoff on progress. Also feeds the RTT estimator,
+// the duplicate-ACK counter (fast retransmit), and the peer-window cache.
+static void tcp_process_ack(uint32_t ack_num, uint16_t seg_plen) {
+    // DUP-ACK DISCIPLINE (RFC 5681 §2: a duplicate ACK acknowledges NO new
+    // data AND carries no payload). Fast retransmit counts ONLY pure-ACK
+    // repeats (plen == 0, ack_num <= SND.UNA). A segment carrying THEIR data
+    // (plen > 0) advances the receive stream even when the ack field repeats
+    // (their data ACKs are usually piggybacked, not per-segment) — counting
+    // those fired bogus fast retransmits mid-download (bisected 2026-09-08:
+    // 3 "fast rtx" during a healthy example.com fetch, each resending the
+    // GET and stalling the server into SYN-timeout on the NEXT connection).
+    if (seg_plen == 0 && !seq_lt(tcp_conn.snd_una, ack_num)) {
+        // Duplicate ACK (no progress): count toward fast retransmit. Only
+        // count pure ACKs (the retransmit path resends on #3 — see below).
+        // Cap the counter so a long stall doesn't overflow it.
+        if (ack_num == tcp_conn.last_ack_num && tcp_conn.dup_acks < 100)
+            tcp_conn.dup_acks++;
+        else if (ack_num != tcp_conn.last_ack_num) {
+            tcp_conn.last_ack_num = ack_num;
+            tcp_conn.dup_acks = 1;
+        }
+        if (tcp_conn.dup_acks == 3) {
+            // Fast retransmit: resend the head of the flight NOW (Tahoe —
+            // no cwnd inflation, just skip the RTO wait). Serial-gated so
+            // headless logs show exactly when it fires.
+            serial_puts("[tcp] fast rtx (3 dup ACKs)\n");
+            tcp_conn.rtx_tries++; // counts toward give-up like an RTO retry
+            tcp_rtx_arm();
+            if (tcp_conn.rtx_has_syn) {
+                tcp_send_raw(tcp_conn.snd_una, 0, 0x02, 0, 0);
+            } else {
+                uint8_t flags = 0x10;
+                if (tcp_conn.rtx_len > 0) flags |= 0x08;
+                else if (tcp_conn.rtx_has_fin) flags |= 0x01;
+                tcp_send_raw(tcp_conn.snd_una, tcp_conn.ack, flags,
+                             tcp_rtx_buf, tcp_conn.rtx_len);
+            }
+        }
+        return; // old / duplicate ack
+    }
 
     uint32_t flight = (tcp_conn.rtx_has_syn ? 1u : 0u) +
                       tcp_conn.rtx_len +
@@ -889,15 +981,60 @@ static void tcp_process_ack(uint32_t ack_num) {
         tcp_conn.snd_una++;
     }
 
-    // Progress: reset backoff, restart timer if anything remains in flight
+    // Progress: fresh ACK number resets the dup counter; RTT sample if the
+    // ack covers the timed seq (Karn: skip samples from retransmitted flights
+    // — rtx_tries > 0 means this ACK may ack a resend, so don't sample).
+    tcp_conn.dup_acks = 0;
+    tcp_conn.last_ack_num = ack_num;
+    if (tcp_conn.rtx_tries == 0 && tcp_conn.rtt_seq != 0 &&
+        !seq_lt(ack_num, tcp_conn.rtt_seq)) {
+        uint32_t rtt = tick_count - tcp_conn.rtt_tick; // ~10ms ticks
+        if (tcp_conn.srtt == 0) {
+            // First sample: SRTT = R, RTTVAR = R/2.
+            tcp_conn.srtt = rtt << 3;
+            tcp_conn.rttvar = rtt << 1;
+        } else {
+            // Jacobson/Karels: SRTT += (R-SRTT)/8; RTTVAR += (|R-SRTT|-RTTVAR)/4.
+            uint32_t sr = tcp_conn.srtt >> 3;
+            uint32_t diff = rtt > sr ? rtt - sr : sr - rtt;
+            tcp_conn.srtt += (rtt << 3 > tcp_conn.srtt) ?
+                             ((rtt << 3) - tcp_conn.srtt) >> 3 :
+                             0 - (tcp_conn.srtt - (rtt << 3) >> 3);
+            uint32_t rv = tcp_conn.rttvar >> 2;
+            if (diff > rv) tcp_conn.rttvar += (diff - rv);
+            else tcp_conn.rttvar -= (rv - diff);
+        }
+        // RTO = SRTT + 4*RTTVAR, clamped [2, 60] ticks (20ms..600ms).
+        uint32_t rto = (tcp_conn.srtt >> 3) + tcp_conn.rttvar;
+        if (rto < 2) rto = 2;
+        if (rto > 60) rto = 60;
+        tcp_conn.rtx_timeout = (uint16_t)rto;
+        tcp_conn.rtt_seq = 0;
+    }
+    // Fresh progress always clears the retry count (backoff restarts).
     tcp_conn.rtx_tries = 0;
-    tcp_conn.rtx_timeout = TCP_RTO_TICKS;
     if (tcp_conn.rtx_len > 0 || tcp_conn.rtx_has_syn || tcp_conn.rtx_has_fin)
         tcp_rtx_arm();
 }
 
 void tcp_send_data(uint8_t* data, uint16_t len) {
     if (tcp_conn.state != TCP_STATE_ESTABLISHED) return;
+    // Peer-window gate: never send past SND.UNA + peer_win. Our flights are
+    // one small GET (<=512B) and the peer window is KBs, so this never fires
+    // in practice — but a zero-window peer must NOT get a full send (it
+    // would drop it); tcp_poll covers persistence (see below).
+    if (tcp_conn.peer_win == 0) {
+        // Zero window: buffer (if room) and let the persist timer probe.
+        if (tcp_conn.rtx_len + len > TCP_RTX_BUF_SIZE) {
+            serial_puts("[tcp] rtx buffer overflow, resetting\n");
+            tcp_conn.rtx_len = 0;
+        }
+        for (int i = 0; i < len; i++)
+            tcp_rtx_buf[tcp_conn.rtx_len + i] = data[i];
+        tcp_conn.rtx_len += len;
+        tcp_rtx_arm();
+        return;
+    }
     // Buffer for retransmission (a second GET would mean a protocol bug —
     // log and drop old unacked data rather than corrupt the stream)
     if (tcp_conn.rtx_len + len > TCP_RTX_BUF_SIZE) {
@@ -910,6 +1047,12 @@ void tcp_send_data(uint8_t* data, uint16_t len) {
 
     tcp_send_packet(0x18, data, len); // PSH+ACK
     tcp_conn.seq += len;
+    // Start an RTT sample on this flight (Karn: only when nothing unacked —
+    // otherwise the ACK is ambiguous).
+    if (tcp_conn.rtx_tries == 0 && tcp_conn.rtt_seq == 0) {
+        tcp_conn.rtt_seq = tcp_conn.seq;
+        tcp_conn.rtt_tick = tick_count;
+    }
     if (tcp_conn.rtx_tries == 0) tcp_rtx_arm();
 }
 
@@ -943,9 +1086,12 @@ int tcp_is_closed(void) {
            tcp_conn.state == TCP_STATE_FIN_WAIT;
 }
 
-// Retransmission timer — call from the main loop. Fires when a flight
-// (SYN, data, or FIN) goes unacked past the RTO; backs off exponentially
-// and gives up after TCP_MAX_RTX attempts.
+// Retransmission + persist timer — call from the main loop. Fires when a
+// flight (SYN, data, or FIN) goes unacked past the RTO; backs off
+// exponentially and gives up after TCP_MAX_RTX attempts. Doubles as the
+// zero-window persist timer: with peer_win == 0 and data buffered, sends a
+// 1-byte probe (RFC 793 §3.7) instead of the full flight so a window update
+// (not a drop) comes back.
 void tcp_poll(void) {
     if (tcp_conn.state == TCP_STATE_CLOSED &&
         !(tcp_conn.rtx_len || tcp_conn.rtx_has_syn || tcp_conn.rtx_has_fin))
@@ -956,6 +1102,18 @@ void tcp_poll(void) {
                       (tcp_conn.rtx_has_fin ? 1u : 0u);
     if (flight == 0) return;
     if ((uint32_t)(tick_count - tcp_conn.rtx_last_tick) < tcp_conn.rtx_timeout) return;
+
+    // Zero-window persist: probe with 1 byte (never the full flight — the
+    // peer advertised zero and would drop it). Does NOT count toward give-up
+    // (a shut window is not packet loss) and does NOT double the RTO.
+    if (tcp_conn.peer_win == 0 && tcp_conn.rtx_len > 0 &&
+        !tcp_conn.rtx_has_syn && tcp_conn.state == TCP_STATE_ESTABLISHED) {
+        serial_puts("[tcp] persist probe (peer win 0)\n");
+        tcp_send_raw(tcp_conn.snd_una, tcp_conn.ack, 0x10,
+                     tcp_rtx_buf, 1);
+        tcp_rtx_arm();
+        return;
+    }
 
     if (tcp_conn.rtx_tries >= TCP_MAX_RTX) {
         serial_puts("[tcp] retransmit give-up, closing connection\n");
@@ -999,6 +1157,13 @@ void tcp_poll(void) {
     }
 }
 
+// --- Reorder helpers (definitions live just above tcp_handle_packet).
+// Store a gap segment (seq > RCV.NXT). Returns 1 stored, 0 dropped.
+static int tcp_reorder_store(uint32_t seq, const uint8_t *payload, uint16_t plen);
+// Deliver one in-order payload + drain abutting buffered segments.
+static void tcp_deliver_in_order(uint32_t seq, const uint8_t *payload,
+                                 uint16_t plen, int is_tls);
+
 void tcp_handle_packet(uint8_t* data, uint32_t len) {
     if (len < 20) return;
     uint16_t src_port = ((data[0] << 8) | data[1]);
@@ -1010,6 +1175,9 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
     uint8_t flags = data[13];
     uint8_t data_offset = (data[12] >> 4) * 4;
     uint16_t payload_len = len - data_offset;
+    // Cache the peer's advertised window on EVERY segment (window updates
+    // ride on pure ACKs too, not just data). Zero is meaningful (persist).
+    tcp_conn.peer_win = ((uint32_t)data[14] << 8) | data[15];
 
     serial_puts("[tcp] pkt src=");
     serial_putchar(hex[(src_port >> 8) & 0xF]);
@@ -1045,7 +1213,7 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
     if (tcp_conn.state == TCP_STATE_CLOSED) {
         // Late ACK (e.g. for our FIN after the server closed first) —
         // still clears the retransmit flight
-        if (flags & 0x10) tcp_process_ack(ack_num);
+        if (flags & 0x10) tcp_process_ack(ack_num, payload_len);
         return;
     }
 
@@ -1054,7 +1222,7 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
             tcp_conn.ack = seq_num + 1;
             tcp_conn.seq = ack_num; // Sync our seq
             tcp_conn.state = TCP_STATE_ESTABLISHED;
-            tcp_process_ack(ack_num); // clears in-flight SYN
+            tcp_process_ack(ack_num, payload_len); // clears in-flight SYN
             tcp_send_packet(0x10, 0, 0); // ACK
             serial_puts("[tcp] ESTABLISHED\n");
             for (int i = 0; i < 255; i++) net_event_msg[i] = 0;
@@ -1065,82 +1233,50 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
             net_event_pending = 1;
         }
     } else if (tcp_conn.state == TCP_STATE_ESTABLISHED) {
-        // Cumulative ACK for our in-flight data/FIN (usually piggybacked)
-        if (flags & 0x10) tcp_process_ack(ack_num);
+        // Cumulative ACK for our in-flight data/FIN (usually piggybacked).
+        // Thread the segment length so pure-ACK repeats (fast-retransmit
+        // candidates) are distinguished from data-carrying segments.
+        if (flags & 0x10) tcp_process_ack(ack_num, payload_len);
 
-        // In-order delivery check. Duplicates (seq < RCV.NXT) arrive when
-        // OUR ack of their data was lost; gaps (seq > RCV.NXT) mean an
-        // earlier segment went missing. Either way: re-ACK what we have
-        // and drop the payload (no out-of-order buffering in this stack).
+        // In-order fast path; duplicates + gaps go to the reorder buffer.
+        // Duplicates (seq < RCV.NXT) arrive when OUR ack of their data was
+        // lost — re-ACK only. Gaps (seq > RCV.NXT) mean an earlier segment
+        // went missing — STASH the payload in the reorder buffer (up to 8
+        // segments / 12KB) instead of dropping it; tcp_reorder_drain()
+        // delivers it in order once the hole fills. Beyond capacity: drop +
+        // re-ACK (classic behavior, sender retransmits).
         if (payload_len > 0 && seq_num != tcp_conn.ack) {
-            serial_puts("[tcp] dup/out-of-order seq, re-ACKing\n");
-            tcp_send_packet(0x10, 0, 0);
-            payload_len = 0; // don't double-append below
+            if (seq_lt(seq_num, tcp_conn.ack)) {
+                serial_puts("[tcp] dup seq, re-ACKing\n");
+                tcp_send_packet(0x10, 0, 0);
+                payload_len = 0; // don't double-append below
+            } else if (!tcp_reorder_store(seq_num, data + data_offset,
+                                           payload_len)) {
+                serial_puts("[tcp] reorder full, dropping gap segment\n");
+                tcp_send_packet(0x10, 0, 0);
+                payload_len = 0;
+            } else {
+                // Stored for later: ACK the hole edge (fast-retransmit hint
+                // for the sender) but don't advance RCV.NXT yet.
+                serial_puts("[tcp] gap buffered, re-ACKing\n");
+                tcp_send_packet(0x10, 0, 0);
+                payload_len = 0;
+            }
         }
 
         // Payload BEFORE FIN: servers may piggyback the last data bytes on
-        // the FIN packet — checking FIN first would drop that payload
+        // the FIN packet — checking FIN first would drop that payload.
+        // Both branches go through tcp_deliver_in_order() so a filled hole
+        // immediately drains any buffered gap segments sitting behind it.
         if (payload_len > 0) {
             if (tls_is_active()) {
                 // TLS session in progress: feed raw TCP payload into the TLS
                 // receive buffer. tls_client_run polls this buffer from its
                 // recv callback; the main loop never reads it concurrently
                 // with the IRQ, so there is no writer race.
-                tcp_conn.ack = seq_num + payload_len;
-                tcp_send_packet(0x10, 0, 0); // ACK
-                int copy = payload_len < 1500 ? payload_len : 1500;
-                tls_append_data(data + data_offset, copy);
-                if (!tls_dumped) {
-                    tls_dumped = 1;
-                    serial_puts("[tls] RX bytes: ");
-                    for (int d = 0; d < copy && d < 32; d++) {
-                        serial_putchar(hex[(data[data_offset + d] >> 4) & 0xF]);
-                        serial_putchar(hex[data[data_offset + d] & 0xF]);
-                        serial_putchar(' ');
-                    }
-                    serial_putchar('\n');
-                }
-                serial_puts("[tls] segment, fed ");
-                serial_putchar('0' + (copy / 1000) % 10);
-                serial_putchar('0' + (copy / 100) % 10);
-                serial_putchar('0' + (copy / 10) % 10);
-                serial_putchar('0' + (copy % 10));
-                serial_puts(" bytes to TLS rx\n");
+                tcp_deliver_in_order(seq_num, data + data_offset, payload_len, 1);
             } else if (http_pending) {
-                tcp_conn.ack = seq_num + payload_len;
-                tcp_send_packet(0x10, 0, 0); // ACK
-
-                int copy = payload_len;
-                if (copy > 1500) copy = 1500;
-                if (http_response_len + copy > (int)sizeof(http_response) - 1)
-                    copy = (int)sizeof(http_response) - 1 - http_response_len;
-                for (int i = 0; i < copy; i++) {
-                    http_response[http_response_len + i] = data[data_offset + i];
-                }
-                http_response_len += copy;
-                http_response[http_response_len] = 0;
-
-                serial_printf("[http] segment, total %u bytes\n",
-                              (unsigned)http_response_len);
-
-                // Terminal preview from the FIRST segment only. Show just the
-                // status line — the old 180-byte raw-header dump flooded the
-                // terminal on every fetch (full headers stay in the serial
-                // log, where debugging belongs).
-                if (http_response_len == copy) {
-                    for (int i = 0; i < 255; i++) net_event_msg[i] = 0;
-                    int idx = 0;
-                    for (int i = 0; i < copy && idx < 60; i++) {
-                        char ch = http_response[i];
-                        if (ch == '\r' || ch == '\n') break;
-                        net_event_msg[idx++] = ch;
-                    }
-                    const char* tail = " — receiving...";
-                    for (int i = 0; tail[i] && idx < 254; i++) net_event_msg[idx++] = tail[i];
-                    net_event_msg[idx++] = '\n';
-                    net_event_msg[idx] = 0;
-                    net_event_pending = 1;
-                }
+                tcp_deliver_in_order(seq_num, data + data_offset, payload_len, 0);
             }
         }
         if (flags & 0x01) { // FIN
@@ -1159,7 +1295,7 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
         }
     } else if (tcp_conn.state == TCP_STATE_FIN_WAIT) {
         if (flags & 0x10) { // ACK of our FIN
-            tcp_process_ack(ack_num); // clears rtx_has_fin
+            tcp_process_ack(ack_num, payload_len); // clears rtx_has_fin
             tcp_conn.state = TCP_STATE_CLOSED;
             serial_puts("[tcp] CLOSED (FIN ACKed)\n");
         }
@@ -1167,6 +1303,110 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
         if (flags & 0x01) {
             tcp_send_packet(0x10, 0, 0);
         }
+    }
+}
+
+// --- Reorder helper definitions (prototypes above tcp_handle_packet). ---
+static int tcp_reorder_store(uint32_t seq, const uint8_t *payload, uint16_t plen) {
+    if (!payload || plen == 0 || plen > TCP_REORDER_SEG) return 0;
+    for (int i = 0; i < TCP_REORDER_SLOTS; i++) {
+        if (tcp_reorder_used[i] && tcp_reorder_seq[i] == seq) return 0;
+    }
+    for (int i = 0; i < TCP_REORDER_SLOTS; i++) {
+        if (!tcp_reorder_used[i]) {
+            for (int b = 0; b < plen; b++)
+                tcp_reorder_data[i][b] = payload[b];
+            tcp_reorder_seq[i] = seq;
+            tcp_reorder_len[i] = plen;
+            tcp_reorder_used[i] = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void tcp_sink_payload(const uint8_t *payload, uint16_t plen, int is_tls) {
+    if (is_tls) {
+        int copy = plen < 1500 ? plen : 1500;
+        tls_append_data((uint8_t*)payload, copy);
+        if (!tls_dumped) {
+            tls_dumped = 1;
+            serial_puts("[tls] RX bytes: ");
+            for (int d = 0; d < copy && d < 32; d++) {
+                serial_putchar(hex[(payload[d] >> 4) & 0xF]);
+                serial_putchar(hex[payload[d] & 0xF]);
+                serial_putchar(' ');
+            }
+            serial_putchar('\n');
+        }
+        serial_puts("[tls] segment, fed ");
+        serial_putchar('0' + (copy / 1000) % 10);
+        serial_putchar('0' + (copy / 100) % 10);
+        serial_putchar('0' + (copy / 10) % 10);
+        serial_putchar('0' + (copy % 10));
+        serial_puts(" bytes to TLS rx\n");
+        return;
+    }
+    int copy = plen;
+    if (copy > 1500) copy = 1500;
+    if (http_response_len + copy > (int)sizeof(http_response) - 1) {
+        copy = (int)sizeof(http_response) - 1 - http_response_len;
+        if (!http_response_overflow) {
+            http_response_overflow = 1;
+            serial_puts("[http] WARNING: response exceeded buffer, truncating\n");
+        }
+    }
+    for (int i = 0; i < copy; i++) {
+        http_response[http_response_len + i] = (char)payload[i];
+    }
+    http_response_len += copy;
+    http_response[http_response_len] = 0;
+
+    serial_printf("[http] segment, total %u bytes\n",
+                  (unsigned)http_response_len);
+
+    // Terminal preview from the FIRST segment only. Show just the
+    // status line — the old 180-byte raw-header dump flooded the
+    // terminal on every fetch (full headers stay in the serial
+    // log, where debugging belongs).
+    if (http_response_len == copy) {
+        for (int i = 0; i < 255; i++) net_event_msg[i] = 0;
+        int idx = 0;
+        for (int i = 0; i < copy && idx < 60; i++) {
+            char ch = http_response[i];
+            if (ch == '\r' || ch == '\n') break;
+            net_event_msg[idx++] = ch;
+        }
+        const char* tail = " — receiving...";
+        for (int i = 0; tail[i] && idx < 254; i++) net_event_msg[idx++] = tail[i];
+        net_event_msg[idx++] = '\n';
+        net_event_msg[idx] = 0;
+        net_event_pending = 1;
+    }
+}
+
+static void tcp_deliver_in_order(uint32_t seq, const uint8_t *payload,
+                                 uint16_t plen, int is_tls) {
+    // Caller guarantees seq == RCV.NXT for the head segment.
+    tcp_conn.ack = seq + plen;
+    tcp_send_packet(0x10, 0, 0); // ACK
+    tcp_sink_payload(payload, plen, is_tls);
+    // Drain loop: find the buffered segment starting exactly at RCV.NXT.
+    for (;;) {
+        int found = -1;
+        for (int i = 0; i < TCP_REORDER_SLOTS; i++) {
+            if (tcp_reorder_used[i] && tcp_reorder_seq[i] == tcp_conn.ack) {
+                found = i;
+                break;
+            }
+        }
+        if (found < 0) break;
+        uint16_t flen = tcp_reorder_len[found];
+        tcp_conn.ack += flen;
+        tcp_send_packet(0x10, 0, 0); // ACK (cumulative — covers the gap)
+        tcp_sink_payload(tcp_reorder_data[found], flen, is_tls);
+        tcp_reorder_used[found] = 0;
+        serial_puts("[tcp] reorder drain: delivered buffered segment\n");
     }
 }
 
@@ -1185,6 +1425,7 @@ void http_get_port(const char* host, const char* path, uint16_t port) {
     // parse ran, double-dechunked the buffer to garbage, and the sentinel
     // then blocked the real response from ever rendering.
     http_response_len = 0;
+    http_response_overflow = 0;
     http_done = 0;
 
     // Numeric host ("10.0.2.2")? Seed the cache and skip DNS entirely.
@@ -1282,6 +1523,7 @@ void http_get_port(const char* host, const char* path, uint16_t port) {
     // in-process and the response IRQ can land before this function returns
     if (!http_pending) {
         http_response_len = 0;
+        http_response_overflow = 0;
         http_done = 0;
     }
     http_pending = 1;
@@ -1316,16 +1558,23 @@ int http_dechunk(char* buf, int len) {
     }
     if (body < 0) return len;
 
-    // only dechunk when the server actually said chunked
+    // only dechunk when the server actually said chunked (detect BEFORE
+    // shifting the body, since the headers get moved away below)
     int chunked = 0;
     for (int i = 0; i < body - 7; i++) {
         if (buf[i] == 'c' && buf[i+1] == 'h' && buf[i+2] == 'u' &&
             buf[i+3] == 'n' && buf[i+4] == 'k' && buf[i+5] == 'e' &&
             buf[i+6] == 'd') { chunked = 1; break; }
     }
+
+    // Shift the body to the start of the buffer so callers (html_parse etc.)
+    // receive a body-only buffer at buf[0]. Headers are discarded.
+    int out = len - body;
+    memmove(buf, buf + body, out);
+    len = out;
     if (!chunked) return len;
 
-    int rd = body, wr = body;
+    int rd = 0, wr = 0;
     int first_chunk = 1;
     while (rd < len) {
         // parse hex chunk size
@@ -1343,7 +1592,7 @@ int http_dechunk(char* buf, int len) {
         }
         // Idempotence: if the FIRST size line isn't hex, this buffer was
         // already dechunked (or isn't chunked despite the header) —
-        // returning `body` here would truncate it to headers-only
+        // returning `len` here leaves the un-shifted body intact.
         if (!digits && first_chunk) return len;
         if (!digits) break;
         first_chunk = 0;

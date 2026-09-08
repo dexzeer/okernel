@@ -1,6 +1,17 @@
 #include "filesystem.h"
 #include "serial.h"
 
+// Write-through hook into the persistent layer (pfs.c). Set by pfs_init via
+// fs_install_persist; NULL = diskless, VFS-only. Indirect (not a direct
+// call) so filesystem.o stays dependency-free.
+static int (*persist_sync_fn)(const char *name) = 0;
+static int (*persist_delete_fn)(const char *name) = 0;
+void fs_install_persist(int (*sync_fn)(const char *),
+                        int (*delete_fn)(const char *)) {
+    persist_sync_fn = sync_fn;
+    persist_delete_fn = delete_fn;
+}
+
 static struct fs_file files[FS_MAX_FILES];
 static int file_count = 0;
 
@@ -59,6 +70,7 @@ int fs_write(const char* name, const uint8_t* data, int len) {
     if (len > FS_MAX_SIZE) len = FS_MAX_SIZE;
     for (int i = 0; i < len; i++) files[idx].data[i] = data[i];
     files[idx].size = len;
+    if (persist_sync_fn) persist_sync_fn(files[idx].name);
     return len;
 }
 
@@ -75,6 +87,7 @@ int fs_append(const char* name, const uint8_t* data, int len) {
         files[idx].data[files[idx].size + i] = data[i];
     }
     files[idx].size += len;
+    if (persist_sync_fn) persist_sync_fn(files[idx].name);
     return len;
 }
 
@@ -94,10 +107,13 @@ int fs_exists(const char* name) {
 int fs_delete(const char* name) {
     int idx = find_file(name);
     if (idx < 0) return 0;
+    char gone[FS_MAX_NAME];
+    for (int i = 0; i < FS_MAX_NAME; i++) gone[i] = files[idx].name[i];
     files[idx].used = 0;
     files[idx].size = 0;
     files[idx].name[0] = 0;
     file_count--;
+    if (persist_delete_fn) persist_delete_fn(gone);
     return 1;
 }
 

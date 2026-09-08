@@ -21,16 +21,24 @@
 #include "../idt.h"
 #include <string.h>
 
-// TLS receive buffer — TCP data from tcp_handle_packet goes here.
-#define TLS_RX_BUF_SIZE 65536
+// TLS receive buffer — TCP data from tcp_handle_packet goes here. Must be large
+// enough to hold the whole encrypted response: google's homepage is ~85KB
+// ciphertext, which overflowed the old 64KB ring and truncated the body
+// mid-<script> (html_parse then saw in_script stuck and emitted 0 tokens).
+// It is now 1 MiB to match the decrypted response buffer.
+#define TLS_RX_BUF_SIZE 1048576
 static uint8_t  tls_rx_buf[TLS_RX_BUF_SIZE];
 static uint32_t tls_rx_head;     // next write position
 static uint32_t tls_rx_tail;     // next read position
 static uint32_t tls_rx_len;      // bytes available
 
-// TLS response buffer — decrypted HTTP response goes here.
-static char     tls_response[262144];
+// TLS response buffer — decrypted HTTP response goes here. Raised from 256 KiB
+// to 1 MiB so larger HTTPS pages (e.g. real homepages, which are often 200-400
+// KiB uncompressed) are captured whole. tls_state_init() is handed
+// sizeof(tls_response)-1 as the cap, so this is the only change needed.
+static char     tls_response[1048576];
 static uint32_t tls_response_len;
+static int      tls_response_overflow = 0; // set once when a response exceeds the buffer
 
 // Async fetch state machine.
 enum { HP_IDLE = 0, HP_DNS, HP_TCP, HP_TLS };
@@ -111,6 +119,7 @@ static int kernel_tcp_recv(uint8_t* buf, uint32_t cap, uint32_t timeout_ms, void
 void https_get(const char* host, const char* path) {
     tls_rx_reset();
     tls_response_len = 0;
+    tls_response_overflow = 0;
     tls_response[0] = 0;
     tls_active = 1;
     tls_phase = HP_DNS;
@@ -223,6 +232,10 @@ void https_get_poll(void) {
         if (r == TLS_STEP_DONE) {
             tls_response_len = tls_s.out_len;
             tls_response[tls_s.out_len] = 0;
+            if ((unsigned)tls_s.out_len >= sizeof(tls_response) - 1 && !tls_response_overflow) {
+                tls_response_overflow = 1;
+                serial_puts("[tls-net] WARNING: response exceeded buffer, truncating\n");
+            }
             tls_done = 1;
             tls_active = 0;
             tls_phase = HP_IDLE;

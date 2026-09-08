@@ -4,6 +4,15 @@
 *.iso
 isodir/
 
+# Userland link outputs + generated bindata (rebuild via make -C userland && make -C userland gen)
+/userland/hello
+/userland/forktest
+/userland/pipetest
+/userland/exectest
+/userland/sh
+/userland/init
+/userland/gen_*.h
+
 # Editor
 *.swp
 *~

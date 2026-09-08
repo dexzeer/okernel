@@ -13,6 +13,8 @@
 #define OKAI_CSS_TEXT 16384
 #define OKAI_MAX_LINKS 64
 #define OKAI_MAX_REDIRECTS 8
+#define OKAI_MAX_SUBRES 8      // max external <link>/<script> per page
+#define OKAI_SUBRES_BUF 4096   // buffer for extracted URLs (double-null-terminated)
 
 // Where the Home button, the '+' new tab, and `okai` with no argument go.
 // okai:home is an INTERNAL page rendered from OKAI_HOME_HTML (no network).
@@ -24,6 +26,17 @@ struct okai_link {
     int col0;           // first column (inclusive)
     int col1;           // last column (inclusive)
     char href[OKAI_URL_LEN]; // resolved, absolute URL
+};
+
+// A focusable form control (input/button) region, recorded during render for
+// mouse hit-testing. token_index indexes T->tokens[]; is_button distinguishes
+// submit targets from text fields (click focuses a field, activates a button).
+struct okai_field {
+    int row;            // content buffer row
+    int col0;           // first column (inclusive)
+    int col1;           // last column (inclusive)
+    int token_index;    // index into T->tokens[]
+    int is_button;      // 1 = submit button, 0 = text input
 };
 
 // One page: everything that a tab switch must preserve so switching back
@@ -45,11 +58,21 @@ struct okai_tab {
     // Clickable links recorded during render, for mouse hit-testing
     struct okai_link links[OKAI_MAX_LINKS];
     int link_count;
+    // Form controls (inputs/buttons) recorded during render, for mouse focus/submit
+    struct okai_field fields[OKAI_MAX_LINKS];
+    int field_count;
+    int focused_input;  // token index of the focused <input>, or -1
     // History
     char history[OKAI_MAX_HISTORY][OKAI_URL_LEN];
     int history_count;
     int history_pos;
     int redirect_count;    // HTTP 3xx hops followed on this page (anti-loop)
+    // External resource fetch queue (<link rel=stylesheet>, <script src>)
+    int sub_res_phase;     // 0=idle, 1=fetching CSS links, 2=fetching JS scripts
+    int sub_res_idx;       // index into sub_res_urls for the current fetch
+    int sub_res_count;     // number of URLs in sub_res_urls
+    char sub_res_type[OKAI_MAX_SUBRES]; // 'c'=CSS link, 'j'=JS script
+    char sub_res_urls[OKAI_MAX_SUBRES][OKAI_URL_LEN]; // resolved absolute URLs
     // Animation: current rendered tab width (px) and close-in-progress flag.
     int anim_w;            // eased toward the target width for open/close animation
     int closing;           // 1 while the tab is shrinking before removal
@@ -119,6 +142,13 @@ int okai_check_redirect(int id, const char* resp, int len);
 int  okai_check_nav_click(int id, int mx, int my);
 int  okai_lock_hit(int id, int mx, int my); // click hit-test for the address-bar lock icon
 int  okai_addr_bar_hit(int id, int mx, int my); // click-to-focus the address bar
+// Content hit-test for form controls (inputs/buttons), given buffer-row/col
+// already transformed by the caller (one coordinate space with links). Returns
+// 1 and performs the action (focus the input / submit the form), else 0.
+int  okai_check_content_click(int id, int row, int col);
+// Build the form's GET query from its inputs and navigate (used on Enter / button
+// click). `input_idx` is the submitting field's token index (input or button).
+void okai_submit_form(int id, int input_idx);
 void okai_nav_back(int id);
 void okai_nav_fwd(int id);
 void okai_nav_reload(int id);
@@ -131,5 +161,12 @@ void okai_paint_overlays(int id);
 // so it never paints over a covering window — avoids forcing that window to
 // repaint every frame (FPS regression when a window sits over okai).
 void okai_paint_overlays_rects(int id, int rects[][4], int nr);
+
+// Sub-resource fetch queue (<link rel=stylesheet>, <script src>).
+// After the main page is parsed, external CSS/JS are queued and fetched
+// sequentially through the single TCP connection.
+void okai_queue_sub_resources(int id, const char* html, int html_len);
+int  okai_start_sub_res_fetch(int id);
+int  okai_sub_res_done(int id, const char* resp, int resp_len);
 
 #endif

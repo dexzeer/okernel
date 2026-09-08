@@ -17,7 +17,8 @@ Current version: **v0.7** (desktop edition: 1920x1080x32bpp, working okai with t
 okernel/
 ├── boot/
 │   ├── start.asm          # Kernel entry point, multiboot header, stack
-│   └── isr.asm            # Interrupt service routines (ISRs/IRQs), GDT flush
+│   ├── isr.asm            # Interrupt service routines (ISRs/IRQs), GDT flush, INT 0x80 stub, enter_user_mode
+│   └── user_test.asm     # Ring 3 test program (runs in user mode, calls INT 0x80)
 ├── src/
 │   ├── kernel.c           # Text mode kernel entry (terminal-only build)
 │   ├── desktop.c          # Desktop mode kernel entry (graphical build)
@@ -31,10 +32,12 @@ okernel/
 │   ├── okai.c/.h       # Web okai (URL bar, navigation, HTML rendering)
 │   ├── html.c/.h          # HTML parser (strips headers, tokenizes tags)
 │   │
-│   ├── gdt.c/.h           # Global Descriptor Table setup
-│   ├── idt.c/.h           # Interrupt Descriptor Table, PIC remapping, IRQ dispatch
+│   ├── gdt.c/.h           # Global Descriptor Table + TSS (user segments, ring 3 support)
+│   ├── idt.c/.h           # Interrupt Descriptor Table, PIC remapping, IRQ dispatch, INT 0x80 syscall gate
 │   ├── keyboard.c/.h      # PS/2 keyboard driver (scancode set 1)
-│   ├── mouse.c/.h         # PS/2 mouse driver (3-byte packets, no scroll)
+│   ├── mouse.c/.h         # PS/2 mouse driver (IntelliMouse 4-byte wheel mode)
+│   ├── process.c/.h       # Process table, per-process page directories, context switching skeleton
+│   ├── syscall.c/.h       # INT 0x80 syscall handler (sys_print, sys_exit)
 │   │
 │   ├── memory.c/.h        # Physical memory manager (bitmap) + kernel heap (bump)
 │   ├── serial.c/.h        # Serial port output (COM1, for debugging)
@@ -49,6 +52,20 @@ okernel/
 │   │   ├── e1000.c/.h     # e1000 NIC driver (TX + RX working)
 │   │   ├── rtl8139.c/.h   # RTL8139 NIC driver (TX working, RX broken)
 │   │   └── network.c/.h   # ARP, IP, ICMP, UDP, TCP, DNS, HTTP
+│   │
+│   │
+│   ├── js/                # JS engine — "tinyjs ok edition(tm)" (C port of tiny-js, substantially rewritten)
+│   │   ├── js_os.h/.c     # Host/kernel shim (kmalloc/kfree, printf, strtod/dtoa; JS_KERNEL flips to freestanding)
+│   │   ├── js.h           # Public types: js_var (universal value), js_lex, js_tiny (interp state), tokens, value flags
+│   │   ├── js_var.c       # CScriptVar (C port) — refcount GC, string/number/object children
+│   │   ├── js_lex.c       # CScriptLex (C port) — tokenizer, owned char* tkStr
+│   │   ├── js_parse.c     # CTinyJS (C port) — recursive-descent parser + tree-walking interpreter
+│   │   ├── js_funcs.c     # Built-in functions (parseInt, parseFloat, etc.)
+│   │   ├── js_math.c      # Math.* built-ins
+│   │   ├── js_dom.c/.h    # Kernel glue: js_init(), js_run(), js_dom_run_page() + DOM bridge
+│   │   │                    #   getElementById, querySelector, querySelectorAll, createElement,
+│   │   │                    #   setText, setStyle, setAttribute, getAttribute, appendChild, body
+│   │   └── tests/*.js     # 38 test scripts from upstream tiny-js (all PASS)
 │   │
 │   └── crypto/            # TLS 1.3 client (host-tested AND integrated into the kernel build — Phase 5/6 complete)
 │       ├── sha256.c/.h       # FIPS 180-4, streaming + one-shot
@@ -373,13 +390,103 @@ extraction), `src/okai.c` (computed-style application). `src/css.o` added to
   parsed, page rendered, no crash. `notdexy.ru` uses external stylesheets → 0
   inline rules (expected; external CSS is deferred).
 
-**Deferred (future work):** external `<link rel=stylesheet>` (2nd TLS GET to the
-host); descendant combinators `a b` (needs a parent/ancestor tree; the token
-model is flat); per-side border width/color, border-radius, box-shadow, `height`
-`/min-height` (box model v1 covers only uniform border width + style + color,
-margin/padding/border/width); `font-size`/`font-weight` visual effects
-(fixed-cell text grid today); pseudo-classes beyond tag-degradation (`:hover`,
-`:nth-child`; `a:link`/`:visited` currently collapse to tag `a`).
+**Deferred (future work):** descendant combinators `a b` (needs a parent/ancestor
+tree; the token model is flat); per-side border width/color, border-radius,
+box-shadow, `height`/`min-height`; `font-size`/`font-weight` visual effects
+(fixed-cell text grid today); pseudo-classes beyond tag-degradation.
+
+---
+
+## External CSS/JS Fetching (COMPLETE)
+
+External `<link rel="stylesheet">` and `<script src="...">` are now fetched
+and applied sequentially through the single TCP connection.
+
+### How it works
+1. After the main page is fetched and rendered, `okai_queue_sub_resources()`
+   scans the raw HTML for `<link rel="stylesheet" href="...">` and
+   `<script src="...">` tags, resolves relative URLs, and queues them.
+2. CSS links are fetched first (phase 1), then JS scripts (phase 2).
+3. Each fetch reuses the single TCP connection (DNS -> TCP -> HTTP).
+4. After each CSS is fetched, rules are appended to `T->css_rules` and the
+   page is re-rendered. After each JS is fetched, it is executed via `js_run()`.
+5. Serial output: `[okai] sub-res: N resources queued`, `[okai] sub-res fetch: CSS/JS url`,
+   `[okai] sub-res CSS: X bytes, Y rules`.
+
+### Files involved
+- `src/html.c`: `html_extract_link_css()`, `html_extract_script_src()` — URL extraction
+- `src/okai.c`: `okai_queue_sub_resources()`, `okai_start_sub_res_fetch()`, `okai_sub_res_done()`
+- `src/desktop.c`: Sub-resource fetch handling in main loop
+
+### Verified
+- External CSS from DuckDuckGo Lite: 39 rules parsed from `duckduckgo.com/dist/lr.*.css`
+- External CSS from local server: background color, text color applied correctly
+- DDG Lite search works end-to-end: navigate, search input clickable, results displayed
+- Google: 51 tokens, 256 CSS rules, JS-dependent features (search box) unavailable
+
+---
+
+
+## JS Engine — tinyjs ok edition(tm) (Phase 1–3 complete)
+
+From-scratch C port of the tiny-js engine (gfwilliams/tiny-js, MIT license).
+MIT attribution in every ported file header + "tinyjs-derived, substantially
+rewritten" note.
+
+**Phase 1:** standalone engine core + serial `print()` test harness — DONE.
+**Phase 2:** values, scope, GC, built-in functions — DONE (38/38 tests PASS).
+**Phase 3:** DOM bridge to okai — DONE (tested via QEMU, setText/setStyle verified).
+
+### How it works
+- `desktop.c` calls `js_dom_run_page(resp, resp_len)` after `html_parse`. This
+  extracts `<script>…</script>` tags (case-insensitive, skips `<script src>`) and
+  feeds each block to `js_run()`.
+- Before running JS, `js_set_current_tab(bi, ok->active_tab)` and `js_set_page_url(T->url)`
+  set the context so DOM mutations target the correct tab.
+- `js_init()` creates the global engine (`g_js_engine`), registers built-in
+  functions and DOM natives (see DOM Bridge below).
+
+### DOM Bridge (Phase 3 — COMPLETE)
+The JS engine can now interact with the browser's token-based DOM:
+
+- **`document.getElementById(id)`** — returns a memoized element object with
+  native methods attached (setText, setStyle, setAttribute, getAttribute,
+  appendChild, addEventListener).
+- **`document.querySelector(sel)`** — supports `#id`, `.class`, `tag` selectors.
+  Returns first match.
+- **`document.querySelectorAll(sel)`** — returns array of matching elements.
+- **`document.createElement(tag)`** — creates a new element with generated id.
+- **`document.body`** — returns the body element.
+- **`el.setText(text)`** — updates the token's text field and triggers re-render.
+- **`el.setStyle(prop, value)`** — updates the token's inline style and triggers
+  re-render. Appends to existing style string.
+- **`el.setAttribute(name, value)`** — updates class/id/style/href on the token.
+- **`el.getAttribute(name)`** — reads from the token.
+- **`el.innerHTML = "..."`** — strips HTML tags, updates token text.
+
+After any DOM mutation, `js_dom_request_rerender()` is called. The main loop
+checks `js_dom_is_rerender_needed()` and re-renders all okai windows.
+
+**Key bug fixed:** `T->token_count` was set AFTER `js_dom_run_page()` ran,
+causing DOM lookups to find 0 tokens. Moved assignment before JS execution.
+
+**Known limitation:** Heading overlay uses body-level fg color (not per-token CSS),
+so `el.setStyle("color", ...)` on `<h1>` won't change the heading pixel color.
+
+### Port mechanics (C++ → freestanding C)
+- `throw` → `setjmp`/`longjmp` via `js_tiny.jb` (freestanding i386 asm in
+  `js_os.c` — save/restore ebx,esi,edi,ebp,eip,esp)
+- `std::vector<scopes>` → manual dynamic array stack
+- `std::string` → owned `char*` (growable `tkStr` in lexer)
+- Refcount GC preserved from original
+- `addNative("function foo(a,b)", cb, ud)` is the DOM-bridge hook
+
+### Kernel build integration
+- `Makefile` `DESKTOP_OBJ` lists `js_os.o`, `js_var.o`, `js_lex.o`, `js_parse.o`,
+  `js_funcs.o`, `js_math.o`, `js_dom.o`
+- Compiled by `src/js/%.o` rule with `-DJS_KERNEL`
+- Host test: compile with `-m32 -DJS_KERNEL` + stub `memory.h`/`serial.h` +
+  `kglue.c` → 38/38 PASS
 
 ---
 
@@ -437,23 +544,118 @@ Same as above plus: `list`, `switch N`
 
 ---
 
+## User Mode (Ring 3) — WORKING (2026-09-07)
+
+Ring-3 entry works end to end: `usermode` IRETs to ring 3, `user_mode_test`
+runs, `int 0x80` syscalls dispatch, and control returns. Serial proof:
+
+```
+[usermode] code=115b80 stack=1ca0f4c
+[user] Hello from user mode!
+[user] exit syscall — returning to kernel
+```
+
+No GP fault, no exception. `test_addrbar` + `test_nav` (4/4) still PASS.
+
+### What's built
+- **GDT**: 6 entries — null, kernel code (0x08), kernel data (0x10),
+  user code (0x18, DPL=3), user data (0x20, DPL=3), TSS (0x28)
+- **TSS**: Task State Segment with SS0=0x10 (kernel data), ESP0 set via
+  `tss_set_kernel_stack()` to a real 4KB kernel stack (static in
+  `desktop.c`). Loaded via `ltr` at boot.
+- **INT 0x80 gate**: DPL=3 (0xEE) so ring 3 can call it. Dispatches to
+  `syscall_handler()` in `syscall.c`.
+- **Syscall handler**: `sys_print` (serial output), `sys_exit` (stub).
+- **`paging_map_user()`**: Maps pages with User bit (0x07) for ring 3 access —
+  on BOTH the PT entry and the PD entry, plus `invlpg`.
+- **`enter_user_mode()`**: Loads DS/ES/FS/GS=0x23, builds IRET frame
+  (EIP, CS=0x1B, EFLAGS=0x3202, ESP, SS=0x23), does IRET.
+- **`user_test.asm`**: Ring 3 test program — sets DS/ES/FS/GS=0x23, calls
+  int 0x80 (print + exit). Message symbol is `msg_user_hello` so the
+  `usermode` command can map its `.rodata` page user-accessible.
+- **`usermode` shell command**: Real ESP0 stack, user stack page mapped
+  user, code pages + msg page mapped user, then `enter_user_mode()`.
+- **`ps` shell command**: Lists processes with PID and state.
+- **Process table**: 16 slots, PID tracking, state machine, page directory creation.
+
+### The GP fault (FIXED 2026-09-07 — 4 stacked bugs + 1 bad diagnostic)
+The old serial line `error_code=0xd (LDT index 0)` was NEVER the real error
+code — the GP handler dereferenced the pushed int_num slot (13 = 0xd) instead
+of the CPU error code 44 bytes above the pushed-EDI base (32 pusha + 4 ds +
+4 int_num + 4 ret addr). Fixed the decode; the true code was 0x18
+(CS selector, RPL=0). Underneath it were four real bugs, all fixed:
+
+1. **IRET frame selectors lacked RPL=3** (`boot/isr.asm`): CS=0x18/SS=0x20 →
+   CS=0x1B/SS=0x23. The CPU checks requested privilege in the frame's own
+   selectors; bare 0x18 faulted as GP(selector=0x18).
+2. **`user_test.asm` used bare 0x20** for DS/ES/FS/GS → 0x23 (same RPL rule;
+   `enter_user_mode` also preloads 0x23 before IRET).
+3. **`paging_map_user()` left the PD entry supervisor** (`src/paging.c`): the
+   CPU checks every level, so a supervisor PD entry faults ring 3 even with a
+   user PT entry. Now ORs U/S into pre-existing PD entries + `invlpg`.
+4. **ESP0 pointed at BSS, user stack unmapped** (`src/desktop.c`): ESP0 is now
+   a real 4KB stack; the kmalloc'd user-stack page and the `.rodata` msg page
+   are mapped user-accessible.
+5. **Syscall register decode was shifted by 2 slots** (`src/idt.c`): the old
+   `frame+8` base pointed at the int_num slot, so eax read the EDX slot
+   ("unknown syscall 1137536" = leaked user EIP). Base is now frame+16
+   (saved-ebp/ret/int_num/ds skipped), pusha order EDI..EAX.
+
+### Still TODO (Priority 1 remainder)
+- `sys_exit` is a stub (returns; user code hangs in `.hang`). No return path
+  to the shell prompt yet — `usermode` does not regain control after IRET.
+- No per-process page directories wired into the `usermode` path yet
+  (`process_create`/`process_switch` exist but unused here); everything still
+  shares the kernel page directory with user-bit flips.
+- No timer-driven scheduler (IRQ0 switch) — Priority 3.
+- GDB-stub recipe retained for the next ring-3 bug (never needed this time —
+  serial + objdump sufficed).
+
+### Files involved
+- `src/gdt.c/.h`: GDT + TSS setup, user segment descriptors
+- `boot/isr.asm`: `enter_user_mode()`, INT 0x80 stub, `user_mode_test`
+- `src/idt.c`: INT 0x80 gate (DPL=3), GP fault error code logging
+- `src/syscall.c/.h`: Syscall handler
+- `src/process.c/.h`: Process table, page directory creation
+- `src/paging.c/.h`: `paging_map_user()` for ring-3 page access
+- `src/user_test.asm`: Ring 3 test program
+
+---
+
 ## Known Limitations
 
-- **No virtual memory** — identity mapping only, no user-mode processes
+- **Virtual memory** — HIGH-HALF DONE (2026-09-07): desktop kernel links at
+  0xC0100000 (phys 1MB, `linker-high.ld`), low trampoline entry (`_start`,
+  VMA==LMA, e_entry=0x100030), boot PD maps 0-4M low+high, `paging_init`
+  builds full low identity 0-128M + high alias PD 768-799 + FB/MMIO
+  supervisor. `V2P`/`P2V_U32` in `src/memlayout.h`. Process table shares
+  PD 768-1023, user-low private (copy-high-only). Full low identity is
+  transitional (supervisor); clearing low PD 1-767 per process is Priority 3.
+- **User mode (Ring 3)** — WORKING (2026-09-07, re-verified on high-half):
+  IRET entry at user-low 0x08048000 (position-independent `user_test` copy),
+  INT 0x80 syscalls, serial-verified (`[user] Hello from user mode!`).
+  `sys_exit` still a stub (no return to shell), no scheduler.
 - **In-memory filesystem only** — files lost on reboot, no disk I/O
 - **No sound** — no audio drivers
 - **Bump allocator** — heap doesn't free (kfree is a no-op)
 - **Single CPU** — no SMP support
-- **No real mouse scroll** — PS/2 3-byte mode only (scroll via keyboard)
-- **Minimal TCP** — no retransmission, no windowing, no congestion control
+- **Mouse scroll** — IntelliMouse 4-byte wheel mode IS supported via PS/2 negotiation.
+  `mouse_has_wheel` flag, 4th byte read as wheel delta. HMP `mouse_move dz` is
+  sign-flipped vs GUI path.
+- **Minimal TCP** — single connection, no windowing/congestion control, no out-of-order
+  buffering (gaps re-ACKed until the server fills them). Retransmission IS implemented
+  (timer + backoff + give-up).
 - **HTTP limited** — single GET request (chunked transfer IS decoded via `http_dechunk`)
 - **HTTPS works** via the okai (`okai https://host/path`) and is fetched
-  ASYNCHRONOUSLY — `https_get_poll()` advances one step per main-loop pass, so
-  the UI stays responsive during the handshake (no freeze). No standalone
-  `https` shell command yet (only the okai path is wired).
-- **TLS 1.3 limited to ChaCha20-Poly1305** — SHA-256 only; no AES-GCM, no SHA-384. Phase 4 + 5 complete.
-- **CSS is from-scratch and scoped** — selectors limited to `tag`/`.class`/`#id` (+ compounds); no descendant combinators, external stylesheets, or most pseudo-classes. A box model (margin/padding/border/width/height) IS implemented at doc-build time. Colors are full 24-bit RGB (`#rgb`/`#rrggbb`/named), but gradients/alpha/`rgb()`/hsl() functions are unsupported.
-- **TCP minimal** — single connection, no windowing/congestion control, no out-of-order buffering (gaps re-ACKed until the server fills them). Retransmission IS implemented (timer + backoff + give-up). This is the foundation for the planned TLS 1.3 client.
+  ASYNCHRONOUSLY. External CSS/JS from `<link>` and `<script src>` tags are
+  fetched sequentially through the same TCP connection after the main page loads.
+- **TLS 1.3 limited to ChaCha20-Poly1305** — SHA-256 only; no AES-GCM, no SHA-384.
+- **CSS** — from-scratch engine with box model, 24-bit RGB colors, `tag`/`.class`/`#id`
+  selectors. External `<link rel="stylesheet">` stylesheets ARE now fetched and applied.
+  Descendant combinators, pseudo-classes, gradients/alpha unsupported.
+- **JS engine** — tinyjs subset (vars, functions, loops, basic objects). DOM bridge
+  with getElementById, querySelector, setText, setStyle. Cannot execute complex
+  frameworks (React, etc.) — Google search box requires JS we can't run.
 
 ---
 
@@ -618,6 +820,9 @@ Crypto debugging lessons (bit us during bring-up): limb packing must never route
 | `src/string.c/.h` | libc string funcs (memcpy/memset/strlen) — needed by freestanding crypto |
 | `src/serial.c` | `serial_printf()` — minimal formatter for TLS debug logging |
 | `src/crypto/tls_dbg.h` | Dual-mode logging: serial (KERNEL) vs fprintf (host) |
+| `tests/headless/okvm.py` | Headless QEMU driver library (boot, type, click, screenshot, serial) |
+| `tests/headless/TESTING.md` | Complete headless testing playbook |
+| `src/js/*.c` | JS engine — tinyjs ok edition (parser, interpreter, DOM glue) |
 
 ---
 
@@ -921,7 +1126,7 @@ browser `okai_handle_mouse_scroll` else terminal `window_scroll_view`).
   scrolling back auto-follows (probe wheel-down emits no new [scr]).
   QEMU 8.2.2 HMP: `mouse_move dx dy [dz]` — dz works.
 
-### 8. okai text-engine upgrade: Cyrillic, structure, tables (v0.7-grade)
+### 8. okai text-engine upgrade: Cyrillic, structure, tables (v0.7-grade, COMPLETE)
 Goal: "make okai actually good." This round attacked text quality:
 
 - **Cyrillic + symbol glyphs** (`graphics.c`): `font8x16_ext[0x80][16]`
@@ -1130,63 +1335,419 @@ the overlap is back to ~60 FPS. See Critical Bug #26.
 
 ---
 
-## Next steps (handoff to next agent)
+## okvm — Headless QEMU Test Harness
 
-**Do NOT `git commit` unless the user explicitly asks** (prior sessions kept
-the tree uncommitted on `kernel`).
+**okvm** is the Python library (`tests/headless/okvm.py`) for driving okernel
+headlessly in QEMU. It provides keystroke injection, screendump analysis,
+empirical mouse movement (bursts that defeat the kernel's 4-sample PS/2
+smoothing), clicks, and closed-loop click-convergence driven by the kernel's
+own serial instrumentation.
 
-1. **Interactive chrome — DONE.** The `+` new-tab button, tab strip clicks, and
-   the HTTPS lock icon are all interactive (open tab / switch tab / toggle the
-   security popup). Geometry lives in `okai_draw_chrome` (`src/okai.c`); click
-   routing follows the `okai_check_nav_click` + desktop.c pattern.
+**Output directory:** `~/okvm` (durable — `/tmp` gets wiped on this host).
 
-2. **CSS engine deferred items** (see the CSS section above): external
-   `<link rel=stylesheet>` fetching (2nd TLS GET), descendant combinators,
-   pseudo-classes. (Full box model is implemented.)
+### Quick start
 
-3. **Cooperative TLS fetch.** DONE — `https_get_poll()` already drives the fetch
-   one step per main-loop pass with a non-blocking recv callback, so the desktop
-   stays responsive during HTTPS fetches (no freeze).
+```python
+import sys, time
+sys.path.insert(0, 'tests/headless')
+from okvm import OkVM
 
-4. **Anything mouse-related:** use the `[mse] btn=1 x= y= pkts=` serial
-   ground truth (see session notes above) and `~/okvm` for artifacts. Run
-   `python3 tests/headless/test_nav.py` after touching window.c/mouse code —
-   it's the regression gate for input + nav routing (currently PASS 4/4).
-   QEMU gotcha: bound runs with `timeout`; check `pgrep -c '[q]emu-system-i386'`
-   before/after; `pkill -f qemu-system-i386` kills its own shell — bracket trick.
+vm = OkVM("mytest")             # boots headless QEMU with e1000 networking
+time.sleep(14)                  # wait for kernel boot (~8s, 14 is safe)
+vm.type_string("okai https://example.com/\n")
+ok = vm.wait_for("https parse: count=", timeout=70)
+w, h, px = vm.dump()           # screenshot → ~/okvm/mytest.ppm
+# ... pixel checks / serial greps ...
+vm.kill()
+print("PASS" if ok else "FAIL")
+```
 
- 5. **Optimize + speed up the tab open/close animation** — **DONE (2026-08-23).**
-    `okai_anim_step` (`src/okai.c`) reworked:
-    - **Time-based easing (frame-rate independent):** stepping is now driven by the
-      100Hz `tick_count` delta (`dt = tick_count - okai_last_tick`, clamped to
-      [0,10]). Each consumed tick advances `anim_w` by an integer ease-out step
-      `step = (delta * OKAI_ANIM_FACTOR + 50) / 100` (1px floor when the result
-      rounds to 0; snaps to target on overshoot). `OKAI_ANIM_STEP` is gone;
-      `OKAI_ANIM_FACTOR 18` is the per-10ms-tick ease-out factor (~150ms settle,
-      shape falls out naturally — big steps far, tiny near). A freshly opened tab
-      resets `okai_last_tick` in `okai_new_tab` so it starts cleanly at width 0.
-    - **Chrome-only dirty — the real speed-up (whole-window re-mark removed):**
-      `okai_anim_win` (global + `okai.h` extern + the `desktop.c` re-mark
-      `if (okai_anim_win >= 0) window_set_dirty(okai_anim_win);`) is DELETED.
-      Investigation confirmed `graphics_flush()` runs every main-loop iteration and
-      blits only dirty rows; `okai_paint_overlays` repaints the chrome each frame,
-      marking only the chrome rows dirty, so the tab animation repaints chrome
-      WITHOUT re-rendering the page body. No `window_set_dirty_region` API needed.
-    - **Ease-out curve:** integer exponential ease-out (above) gives the
-      fast-start / gentle-settle feel; the old linear per-frame step is gone.
-    - **Duration tuning:** target ~150ms; verified ~160ms open via a temporary
-      `[anim] settle N ms` serial counter, then the debug was removed.
-    - **Optional chrome double-buffer:** not needed — per-row flush shows no
-      tear/flicker as tab widths change.
-    - `tests/headless/test_tab_x.py` PASSES; PIL confirms the × box reaches
-      full-width x[1298,1314] (anim_w=300) with the re-mark removed.
+### Core API
+
+| Method | What it does |
+|--------|-------------|
+| `OkVM(tag, extra_net=True)` | Boots QEMU headless with serial log (`~/okvm/<tag>_serial.log`), monitor socket, e1000 NIC |
+| `vm.type_string(s)` | Types a string via `sendkey` (supports `/`, `.`, `:`, `-`, `\n`, uppercase) |
+| `vm.serial()` | Returns full serial log (ground truth for everything) |
+| `vm.wait_for(pattern, timeout=70)` | Polls serial until `pattern` appears (or timeout/crash) |
+| `vm.dump(path)` | `screendump` → PPM file; returns `(w, h, pixel_bytes)` |
+| `vm.burst(dx, dy, n=5)` | Sends `n` relative mouse moves so the smoothing ring fills; net ≈ 3.75× delta |
+| `vm.click()` | Left click (mouse_button 1, then 0) |
+| `vm.click_link(row, col0, col1)` | Closed-loop link click: click, read kernel `[okai] click row=.. col=..` feedback, correct with burst, repeat |
+| `vm.click_lines()` | Parses `[okai] click row=R col=C (mx=X my=Y)` — exact ground truth coords |
+| `vm.link_regions()` | Parses `[okai] link[i] row=.. col0=.. col1=.. href=..` — rendered link regions |
+| `vm.kill()` | SIGTERM the QEMU process |
+
+### Key ground rules (from TESTING.md)
+
+1. **Serial log is ground truth.** Never guess system state from pixels alone.
+   The kernel prints every network event to COM1.
+2. **Burst for mouse movement.** QEMU HMP `mouse_move` is RELATIVE; the kernel's
+   4-sample smoothing dilutes single moves by ~4×. Use `burst(dx, dy)` (5× repeated
+   moves) to fill the ring. Convergence: burst, wait, read serial feedback, correct.
+3. **`click_link` is closed-loop.** It reads the kernel's own `[okai] click row=
+   col=` line after each click, computes the error, bursts to correct, and repeats.
+   This is the single most reliable way to click anything in okai.
+4. **Boot wait is 14s.** The kernel boots in ~8s; 14 is a safe margin.
+5. **Output in `~/okvm`.** Logs, PPMs, and PNGs go here — `/tmp` is unreliable.
+
+### Mouse automation recipe (PS/2 relative + smoothing)
+
+```
+1. Reset to corner:  vm.burst(-300, -300) × 12  (unknown start position)
+2. Walk to target:   vm.burst(small_dx, small_dy)  — coarse bursts overshoot
+3. Converge:         click → read (mx,my) from serial → burst correction (±12, /~4.5)
+4. Verify:           check for [okai] LINK HIT in serial
+```
+
+The kernel's 4-sample smoothing ring amplifies sustained bursts by ~4.3× net.
+Un-capped convergence bursts overshoot the window and escape permanently.
+
+### Existing test scripts
+
+All in `tests/headless/`:
+
+| Script | What it tests |
+|--------|--------------|
+| `test_link_click.py` | Link click → new window → fetch → render |
+| `test_errors.py` | Empty-host refusal, NXDOMAIN abort, error page, owner release |
+| `test_google.py` | Redirect + 85KB chunked + white bg + ≥40 tokens (needs internet) |
+| `test_google_search.py` | Google search form input + submit |
+| `test_nav.py` | 4-button nav bar sweep (back/fwd/reload/home) |
+| `test_addrbar.py` | Address bar focus + URL bar behavior |
+| `test_tab_x.py` | Tab open/close animation + `+` button + tab switch |
+| `test_links.py` | Link click, new tab, home, tab switch, chrome bounds |
+| `test_font_render.py` | Font rendering verification |
+| `test_css_box.py` | CSS box model rendering |
+| `test_stale_doc.py` | Stale document regression |
+| `test_lock.py` | HTTPS lock icon verification |
+| `test_https_default.py` | HTTPS-by-default behavior |
+| `shot_chrome.py` | Browser chrome screenshot |
+| `shot_desktop.py` | Full desktop screenshot |
+| `diag_h.py` | Heading diagnostic |
+| `diag_nav.py` | Nav diagnostic |
+
+### Vision verification
+
+For "does it look right?" questions, screenshot → convert PPM→PNG → dispatch
+to the `opencode-go/mimo-v2.5` vision model (subagent). The base model cannot
+see images. Give the model context (window geometry, expected content, known
+cursor sprite 12×16 white arrow). Ask for facts, not conclusions.
+
+### Host preview (no QEMU)
+
+`./okai-preview <url-or-file> [out.png] [cols]` renders any page through the
+real okai sources on the host in ~50ms. Useful for fast text/CSS/layout iteration
+without booting the kernel. Build: `make -C tests -f Makefile.preview okai_preview`.
 
 
 
 ### Hard constraints to respect
 - **From-scratch mandate:** no external libs (no TTF/font engines, no GUI
-  frameworks). Bitmap font only.
-- **No JS** this round (CSS only).
+  frameworks). Bitmap font only. JS engine is self-authored (tinyjs ok edition).
+- **JS engine in scope:** tiny-js MIT reference architecture ported to freestanding
+  C (≥50% rewrite). MIT attribution kept in every header. Working on DOM bridge.
 - **Vision verification is mandatory** for any "does it look right?" question —
   the base model cannot see images.
 - Project path is the non-ASCII cyrillic path this session; confirm with `ls`.
+
+## Next Steps for Agent
+
+### Priority 1: User-mode return path — DONE (2026-09-08)
+Ring-3 entry AND return both work. `sys_exit` resumes the main loop through
+`user_exit_trampoline` (full caller-frame restore: EBP/ESI/EDI/ESP + segments,
+register calling convention eip->EAX/esp->EDX so the ESP save is exact);
+the shell prints "Back from user mode." and stays interactive. Verified
+visually via okvm screenshot (usermode → Back from user mode → help → full
+command list, no freeze, no `[ISR] Exception`).
+Root-cause chain (bisected with hlt + serial): cdecl passes the saved-ESP arg
+on the STACK (not EAX); the trap-stack C frame must be jumped-past (never
+called/returned); the landing pad must be branch- and spill-free (-O2 reuses
+caller spills across the call). Old screenshots/socks cleaned from
+`~/okvm/` + `/tmp` captures removed before verification.
+
+### Priority 3: Scheduler + syscall ABI + isolation — SLICE DONE (2026-09-08)
+Shipped (all in-tree, both ISOs build, regressions PASS):
+- `src/sched.c/.h` (new, desktop-only): `sched_tick()` slice ACCOUNTING from
+  the timer IRQ (never switches CR3/ESP0 itself — no asm context-switch stub
+  exists, so preempting a live kernel thread mid-frame would strand it);
+  `sched_yield()` safe-point handoff; `sched_spawn_user()` (private PD +
+  user-low code/stack mapping + image copy through the high alias);
+  `sched_prepare()` / `sched_unprepare()` / `sched_reap()`.
+- `src/process.c/.h`: PCB gains `esp0_top` + `ticks_left`; pid 0 owns a real
+  4K `idle_stack` set as ESP0 at init (any early ring transition lands valid);
+  `process_switch` documented as handoff-point-only (CR3 + ESP0, no mid-frame
+  preemption).
+- `src/syscall.c` (COMMON, desktop services via hooks): extended ABI 2-5 —
+  `SYS_WRITE` (fd 1 → focused terminal + serial mirror), `SYS_GETPID`,
+  `SYS_YIELD`, `SYS_MMAP_USER` (page-aligned, user-low only); `SYS_PRINT`
+  validates the ring-3 pointer page-by-page AND mirrors to the focused
+  terminal (2026-09-08 fix: ring-3 output was serial-only, so the window
+  showed Entering/Starting/Back with no program output — looked like nothing
+  ran); hooks keep the text build linking (process/paging/window are
+  desktop-only; text syscalls fail safe).
+- `src/paging.c/.h`: `paging_map_user_pd()` (build a space without switching;
+  no TLB flush — CR3 switch flushes), `paging_user_range_valid()` (present +
+  U/S at both levels, wraparound + kernel-half rejected).
+- `src/desktop.c`: `on_timer` calls `sched_tick()` first (no-op with no user
+  process — zero behavior change for existing flows); `usermode` spawns a REAL
+  process (private PD via `sched_spawn_user`, pid-tracked pending flag);
+  main loop prepares (CR3+ESP0) before IRET, unprepares + reaps after the
+  trampoline resumes (user PD never leaks into kernel work; no stale user
+  bits in the shared kernel PD anymore). `ps` shows the live process.
+- Traps fixed 2026-09-08: spawn rejected the legacy stack top
+  (0xBFFFF000+4096 = 0xC0000000 = KERNEL_VBASE exactly — `>=` guard treated
+  an exclusive-end TOP as an address; now `>`); same for the alignment check
+  (top itself is not mapped — only base = top-4096 must align).
+- Still TODO (needs asm stub + entry rewire): true timer preemption of kernel
+  threads; `sys_fork`/`sys_exec`/ELF loader.
+- Verified: `usermode` → pid 1 spawn → switch → ring-3 Hello (serial AND
+  window) → switch home → reap → Back from user mode, no exceptions;
+  `test_nav` 4/4 PASS; `test_addrbar` PASS; `test_css` ALL PASS;
+  `test_subres` 0 failures.
+
+### Priority 4: System Call Interface — DONE (2026-09-08)
+INT 0x80 ABI is now 0-17 (`src/syscall.c` dispatch + `src/sys_proc.c` backend,
+desktop hooks; text build links via NULL hooks, fails safe):
+- 0 print / 1 exit (legacy pair, now with terminal mirror + return values)
+- 2 write (fd 1 terminal fast path + fd-table files/pipes, returns bytes)
+- 3 getpid / 4 yield (trap-safe: slice reset only, never switches CR3/ESP0
+  under the stub frame) / 5 mmap_user (page-aligned, user-low)
+- 6 read (fd 0 = keyboard line queue via `sys_proc_kbd_offer`, else fd table)
+- 7 open / 8 close over the VFS (flags 0=ro 1=wo+truncate 2=rw+create)
+- 9 fork (full user-low page copy, shared ofd refcounts, parent gets pid)
+- 10 exec (ELF from VFS — see Priority 5)
+- 11 sbrk (per-process heap 0x08000000→0x40000000, zeroed pages)
+- 12 pipe (4KB ring, refcounted ends) / 13 dup (lowest free fd)
+- 14 wait (non-blocking zombie reap, -1 = any child) / 15 kill + signals
+  (TERM/CHLD/USR1 bitmask, default actions at safe points)
+- 16 mmap (fresh zero page, auto-pick scans down from 0xB0000000) /
+  17 munmap (free + full TLB flush)
+- Return values ride the saved-EAX slot (`syscall_set_ret` /
+  `syscall_take_ret` in `idt.c` — popa reloads EAX before iret).
+- FD table per PCB (`fds[16]`, 0=kbd 1/2=term, 3+ files/pipes; `struct
+  open_file` refcounted across dup/fork); `process_fd_get/alloc/free`.
+- Ring-3 test program exercises 0,3,2,4,11,16 live every `usermode` run.
+- Still TODO: sys_ioctl, groeiende fd features (non-blocking flags, seek).
+
+### Priority 2: Virtual Memory — High-Half Kernel — DONE (2026-09-07)
+Desktop kernel links high (`linker-high.ld`, VMA 0xC0100000 / LMA phys 1MB);
+text build keeps `linker.ld`. Boot: LOW trampoline `_start` (VMA==LMA,
+e_entry=0x100030, scratch ESP 0x7FF00) fills boot PD (0-4M low PD 0 + high
+PD 768), loads private boot GDT (GRUB's 0x08 is invalid — GP sel=0x8 trap),
+enables PG, ljumps to `_start_high` (high .text), calls
+`kernel_main(mboot_phys)`. Order: memory → mboot field copy (offsets
+flags@0/fb@88/pitch@96) → `paging_init` (low 0-128M + high alias 768-799 +
+FB/MMIO supervisor, unconditional — boot PD covers only 0-4M) →
+`process_init` → graphics (identity FB, NOT `paging_map` window) → rest.
+Verified: both ISOs build; ISO boots to 1920x1080 (`[gfx] fb=fd000000
+pitch=7680 w=1920 h=1080`); `usermode` ring-3 OK at 0x08048000;
+`test_addrbar` PASS; `test_nav` 4/4 PASS; `test_css` ALL PASS; `test_subres`
+0 failures (`test_text_decode` 5 pre-existing Cyrillic FAILs, untouched).
+
+Files: `linker-high.ld` (new), `src/memlayout.h` (new: `V2P`/`P2V_U32`),
+`boot/start.asm` (trampoline + boot GDT + `_start_high`), `src/paging.c/.h`
+(high map + `paging_map` MMIO window + `paging_map_user` PMM-PT),
+`src/memory.c` (V2P kernel range, heap-virt), `src/process.c` (copy-high-only,
+destroy-low-only, switch+ESP0, boot-PD fallback), `src/desktop.c`
+(uncond paging, mboot offsets, PI user copy), `src/user_test.asm`
+(position-independent, call/pop msg), `src/graphics.c` (identity FB +
+`[gfx]` diag), `src/net/e1000.c` (DMA comment), `Makefile` (dual-link,
+start.o-first order, `rm -rf isodir`).
+
+REMAINING TRAPS (do not regress): GRUB entry needs LOW e_entry (high
+triple-faults, SeaBIOS text); boot GDT required (GRUB 0x08 invalid);
+`paging_init` before `process_init` (.bss beyond 4M); FB via identity, not
+MMIO window (black 640x480); `paging_map_user` needs explicit 2nd PMM page
++ FULL 4K source-page copy (59B copy left msg tail unmapped);
+multiboot fb@88/pitch@96 (44/52 misread VBE as fb=0x90).
+
+### Priority 3 (old): Context Switching + Round-Robin Scheduler — SUPERSEDED
+Replaced by "Priority 3: Scheduler + syscall ABI + isolation — SLICE DONE"
+above (2026-09-08): slice accounting + safe-point handoffs + spawn/prepare/
+reap + extended syscall ABI + per-PD user mapping + pointer validation.
+True timer preemption of kernel threads still needs the asm stub.
+
+### Priority 4 (old): Expand System Call Interface — SUPERSEDED
+Replaced by "Priority 4: Expand System Call Interface (remainder)" above.
+
+### Priority 5: ELF Loader — DONE (2026-09-08)
+`src/elf.c/.h`: ET_EXEC/i386 validation (magic, class, machine, PH bounds,
+user-low-only segments, no wraparound, filesz<=memsz), single-walk loader
+(map-once + zero-via-high-alias + copy per page slice, overlapping segments
+share pages, 32-page cap). `sys_proc_exec` wipes user-low (frees old pages,
+keeps kernel-high shared), maps a fresh stack, loads segments, sets
+user_eip/entry + user_esp/top. Shell: `exec <file>` runs ELF from VFS (test:
+build a static i386 ET_EXEC with the host cross gcc, `edit`-import or
+pre-seed via VFS, then exec).
+Trap: the loader takes `elf_map_fn` (bound to the TARGET PD) — never
+`paging_map_user` (that maps the RUNNING space).
+
+### Lower Priority
+- IPC: pipes + signals + spinlocks/mutexes DONE (see Priority 4 / sys_proc);
+  remaining: shared memory (map same phys into two PDs), futexes, named pipes.
+- SMP: still single-CPU (APIC, per-CPU, balancing — huge leap, not urgent).
+- Better TCP/IP — DONE first slice (2026-09-08, see below).
+- Real filesystem + disk — DONE first slice (2026-09-08, see below).
+
+### Persistent filesystem + ATA disk — DONE first slice (2026-09-08)
+- `src/ata.c/.h`: polling-PIO LBA28 primary-master driver (IDENTIFY probe,
+  0xFF floating-bus + BSY-stuck = absent, ATAPI abort = no ATA disk; all
+  fail safe → VFS-only). 512B sectors, ~1s-bounded status waits.
+- `src/pfs.c/.h`: from-scratch OKPFS1 layout (NOT FAT/ext — mandate + no
+  clock for timestamps): sector 0 superblock (magic/version/nfiles/476B
+  bitmap), sectors 1-16 file table (16 entries: name[32]/size/start/flags),
+  sector 17+ data (contiguous runs, 64 sectors = 32KB max/file).
+  Write-through on every VFS mutation (`fs_install_persist` hook in
+  `filesystem.c` — write/append/delete sync; `filesystem.o` stays
+  dependency-free); mount-or-format at boot (`pfs_init` after `fs_init`);
+  hydrate all entries into VFS; `pfs_status` serial table dump.
+- Editor Ctrl+S (0x13) / Ctrl+X (0x18) now WIRED (status bar always
+  advertised them — edits died with the window before): save → VFS →
+  write-through → disk. Keyboard driver tracks Ctrl (0x1D make/break) and
+  maps Ctrl+letter → control codes; terminal ignores control codes.
+- Shell: `disk` (presence + mount + serial table), `save <file>` (manual
+  sync override), `locktest` (spinlock/mutex selftest → serial PASS/FAIL).
+- Verified: diskless boot = VFS-only (no wedge); 20MB `-hda` boot formats +
+  mounts (`[ata] disk present: 40960 sectors`, `[pfs] mounted: 0 files
+  hydrated`); editor save → `[editor] saved`; REBOOT → `[pfs] mounted: 1
+  files hydrated` + `files=1 'p1' size=23 start=17` (persistence PROOF).
+- `tests/headless/okvm.py`: `OkVM(tag, disk=path)` appends `-hda` (for PFS
+  tests; default runs stay diskless).
+- Traps: `fs_delete` copies the name BEFORE clearing (hook needs it);
+  `pfs_sync_file` frees the old run BEFORE first-fit alloc (else the file
+  can never grow in place); hydrate uses a static 32KB buffer (stack is
+  4KB — a 32KB stack buffer would smash it).
+
+### Better TCP/IP — DONE first slice (2026-09-08)
+`src/net/network.c` (single-connection stack, still no Reno/CUBIC — flights
+are one small GET so cwnd would buy nothing; the wins are latency + honesty):
+- Advertised window 60B stub → 32KB (`tcp_send_raw` + SYN). The stub throttled
+  fast servers to ~60B per RTT (their silly-window avoidance).
+- Peer-window tracking (cached per segment, zero is meaningful) + send gate
+  (`tcp_send_data` buffers instead of sending into a shut window) + persist
+  timer (1-byte probes on RTO, not counted toward give-up — RFC 793 §3.7).
+- Fast retransmit (Tahoe, no cwnd inflation): 3 pure-ACK dups → resend head
+  NOW. Discipline fix: ONLY pure ACKs count (plen==0 threaded through
+  `tcp_process_ack`) — data-carrying segments with a repeated ack field were
+  miscounted, firing 3 bogus fast-rtx mid-download and stalling the NEXT
+  connection into SYN-timeout (bisected via `test_errors` recovery FAIL).
+- Jacobson/Karels RTO (SRTT/RTTVAR, Karn's rule, clamp 20-600ms) replacing
+  the fixed 220ms; per-connection reset (stale LAN SRTT mis-times WAN).
+- Reorder buffer (8×1500B): gap segments are STORED (not dropped) and
+  drained cumulatively when the hole fills (`tcp_deliver_in_order` +
+  `tcp_sink_payload` shared by TLS + HTTP paths); drained ACKs are cumulative.
+  Reset per connection (stale gaps would poison the next stream).
+- Verified: clean fetch (0 fast-rtx, 0 give-up), 1-in-20 `netdrop` loss fetch
+  PASS (RTO-driven, no wedge), `test_nav` 4/4, `test_errors` 5/6 (recovery
+  after refusal FIXED by the dup-ACK discipline; recovery after NXDOMAIN
+  still FAILs — late-SYNACK + slow-TLS-handshake exceeding the 70s test
+  window on a loaded host, NOT a wedge: handshake completes, parses lag;
+  was already FAIL on the base commit).
+
+### What NOT to Break
+- The external CSS/JS fetching pipeline works end-to-end (DDG search verified)
+- The JS DOM bridge works (getElementById, setText, setStyle)
+- The browser renders Google (51 tokens, 256 CSS rules)
+- All host tests pass (test_css, test_subres)
+- Kernel builds clean with no errors
+
+
+---
+
+## Session 2026-09-08 (evening) — userland cutover: init + exec-from-VFS live, ring-3 sh boots, input path buggy
+
+**Status: Phases 0–4 of `~/.commandcode/plans/userland-cutover.md` DONE and QEMU-verified; Phase 5–6 partial (init spawns, sh runs + prompts, but shell input delivers garbage + fork-child #PF).**
+
+### What works (serial proof, `~/okvm/ulcut*.log`)
+- `run /bin/hello` → `[user] hello from userland`, exit code 0, Back from user mode, shell live.
+- `run /bin/forktest`, `run /bin/pipetest` → fork/pipe serial proof, no wedge.
+- First `run` lazily spawns `/sbin/init` (pid 1) from VFS-seeded ELF (`src/userland_seed.c` + `userland/gen_*.h`): `[spawn_elf] pid=1 '/sbin/init'`, `init: I am pid 1`, forks + execs `/bin/sh`, sh prints `user sh ready` + `u> ` prompt.
+- Preemptive scheduler live (`sched_tick` → `process_switch_to` on slice expiry); park/wake for wait/yield/read-empty; zombies + reaping; CLOEXEC-lite; `term_win` stdio binding.
+
+### Bugs fixed this session
+1. **Exec #PF exc 14 at new entry** — `sys_proc_exec` wiped user-low PDEs/PTEs in memory but never flushed the TLB, so the iret into the new image faulted on stale translations. Fix: CR3 reload after the wipe in `src/sys_proc.c` (same address space, ring 0 — safe).
+2. **fd-0 reads bypassed the keyboard queue** — `sys_proc_read_fd` returned -1 for `PROC_FD_KBD`, so `sys_read(0)` (fd-table path) never drained `kbd_lines`. Fix: route `PROC_FD_KBD` to `sys_proc_kbd_read()` in `src/sys_proc.c`.
+3. **#PF handler printed nothing useful** — `src/idt.c` else-branch now logs `err/cr2/eip/esp` for exc 14 (layout: err=pushed[9], EIP=pushed[10], ESP=pushed[13]; same as GP handler).
+
+### OPEN BUG (next step): ring-3 shell input delivers garbage + fork-child #PF
+- sh boots and prompts, but its first `sys_read(0)` returns corrupted data: `[exec] not found: <garbage bytes>` with NO typing after sh start (reproduced `~/okvm/ulcut4/ulcut5`).
+- Then `[ISR] Exception 14 err=6 cr2=fffffedb eip=804912c esp=bffffdb4` — eip is in sh's `/bin/`-prefix build loop (`mov %dl,-0x126(%ebp,%eax,1)`), fault addr `0xfffffedb` = garbage EBP-relative destination. So either the fork child's stack/EBP is corrupt at resume, or `line[]` contents are garbage and the loop walks off.
+- Suspects (in order): (a) stale queue line (`run /bin/sh` offered before sh existed — but that's ASCII, not garbage — so more likely (b) fork-child resume ESP/EIP stash vs actual parent trap state, or (c) park-resume EIP/ESP clobbering the child's stack page.
+- Needed instrumentation: log offered-line bytes in `sys_proc_kbd_offer`, log read-return bytes in `sys_proc_kbd_read`, log faulting pid in the #PF handler (weak `process_current`, pid=pcb[0]).
+
+### Docs/process reminders (user directive, standing)
+- Keep `to-do.txt` crossed out as items land; update the cutover plan file (`~/.commandcode/plans/userland-cutover.md`) phase checkboxes on the go; HANDOFF gets a session entry each session.
+- `usermode` command NOT yet retired (still the known-good ring-3 smoke test until sh input works). Delete it + `user_test.asm` staging only after Phase 6 proves out.
+- Kernel shell still consumes every completed line (offers to queue AND executes as a kernel command). Once sh runs foreground, kernel `shell_execute` must skip lines while a userland foreground process owns the terminal — else double-execution (`/bin/hello` exists → kernel would `run` it too).
+
+### Update 2026-09-08 late — input-bug bisect (STILL OPEN, narrowed hard)
+- Proven: dbgchild (fork+print, no read/exec) WORKS end to end — parent prints,
+  child prints `I AM THE CHILD`, no fault. So fork, child EAX=0, page copy, and
+  the entry drain are all correct.
+- Proven: the sh fault is SPONTANEOUS — `run /bin/sh`, type nothing after, and
+  within ~seconds: stale `run /bin/sh` line (offered at kernel-shell time, BEFORE
+  sh existed) is read by sh pid 2, fork child 3 execs GARBAGE, #PF
+  `err=6 cr2=fffffedb eip=804913a esp=bffffdb4 pid=3` (child's `/bin/`-prefix loop
+  walking a garbage EBP — fault addr is EBP-relative, so the child STACK or its
+  page copy is corrupt... OR the parent's `line[]` was already garbage before fork).
+- kbd traces added (`[kbd] offer` hex in `sys_proc_kbd_offer`, `[kbd] read` pid+n+hex
+  in `sys_proc_kbd_read`, pid in the #PF handler via weak `process_current`): offer
+  bytes = clean ASCII `run /bin/sh`; read bytes = SAME clean ASCII. So the queue is
+  innocent — corruption happens between sh's `sys_read` return and the child's exec
+  (child stack page? fork copy of that page? park-resume clobber?).
+- Deferral-guard attempt (hold `switch_busy` across drain dequeue→IRET so the tick
+  can't capture the drain's half-built frame) did NOT fix it — and dbgchild working
+  suggests the race theory was wrong: if the tick stole drain frames, dbgchild's
+  child would fault too. Next suspects: (a) sh's 256B `line[]` + 270B `p[]` + argv
+  setup overflowing the single 4KB user stack page (stack page vs heap/args layout
+  in `sched_spawn_elf`/`sys_proc_exec`); (b) fork copying a page mid-write; (c) the
+  `sys_read` kernel→user copy (`sys_proc_kbd_read` buf through the alias) writing
+  to the wrong page.
+- Shots not yet fired: per-page dump of child's stack page at fork (parent vs child
+  phys), `line[]` address print from sh, stack-top audit (stack page base vs ESP at
+  read time — is `line[256]` within the mapped page?).
+- Repo-path note: the live repo is `/home/notdexy/projects/okernel`
+  (`/media/notdexy/...` is the same file — same dev/inode — but shell cwd defaults
+  to the HOME path; always build/test from ONE path or `make` no-ops against stale
+  trees).
+
+### Update 2026-09-08 night — ROOT CAUSE FOUND (child EBX garbage) + second crash (e1000_poll #PF) + docs
+- ROOT CAUSE (child exec garbage): `[exec-ebx] ebx=8049109 pid=5` — the failing
+  child's EBX points at its own fork-resume EIP (the `mov %eax,%ebx` right after
+  its fork `int $0x80`), NOT at the `line` buffer. The child is executing the
+  PARENT's post-fork path (`mov %eax,%ebx; test; jns/jne...`) instead of the
+  `child==0` branch: fork-returned EAX != 0 in the child. So the fork-child
+  EAX=0 mechanism fails for sh/forkexec children (but works for dbgchild/dbg2 —
+  difference TBD: those fork earlier/first-trap vs after read-park cycles?).
+  The `p[270]` build + #PF were downstream of this (child ran parent code with
+  parent stack values). Sh `child==0` now execs `line` directly (no child-side
+  stack build) — still fails the same way (proves it: EBX never held `line`).
+- Why EAX!=0: `enter_user_mode` zeroes EAX iff `user_fork_child` is set
+  (`enter_user_mode_fork_child` before enter). Suspects: (a) the flag was consumed
+  by a DIFFERENT entry first (stale `user_fork_child=1` from an earlier fork +
+  drain ordering: parent entry consumed the child's flag — single global, same
+  staleness class as retval/trap-stash/park-state, all now per-slot EXCEPT this
+  flag); (b) `sched_fork_take_child` consumed-but-not-entered ordering with park
+  resumes. NEXT: make `user_fork_child` per-slot (or pid-tagged) the same way.
+- Per-slot conversions landed (all verified building, none yet fixing the child):
+  trap stash (EIP/ESP), park arm/consume/resume, syscall retval. Park-drop hygiene
+  on fork + destroy also landed (`sched_park_drop`). Exec now builds a clean
+  argc=1/argv[0]=path stack (was: empty stack top → garbage argc; forkexec
+  hello-after-exec now prints). Exec path guards (`bad path byte/len`) bound the
+  damage; `[exec-ebx]` + `[exec-arg]` + `[kbd]` + #PF-pid traces stay until fixed.
+- SECOND CRASH (new, kernel-side): `[ISR] Exception 14 err=0 cr2=8001c
+  eip=c010cd46 esp=2e6010 pid=4` inside `e1000_poll` (`testb $0x1,0x8000c(%edx)`
+  with EDX=0 — descriptor-decode read from phys 0x80000+ → #PF read non-present;
+  esp=0x2e5010 is NOT a kernel stack — trap landed on a garbage ESP0). Means: a
+  trap/IRQ ran with a stale TSS.ESP0 (freed/reused trap-stack page) OR on a
+  half-switched CR3. Appears after sh's child exitsсков... precisely after the
+  `exec failed` + init respawn sequence. NEXT: audit ESP0 across
+  prepare/unprepare/reap/destroy (esp0_top=0 poison + `tss_set` fallback?) and
+  CR3 across the park-trampoline path (park runs on WHOSE PD?).
+- Probes added: `/bin/forkexec` (fork→exec hello — isolates read/parse),
+  `/bin/dbg2` (child ESP + 512B stack touch — PROVED child stack mapping is
+  fine: `child stack OK`), `/bin/dbg3` (child read-after-fork — PROVED queue +
+  copy path clean: child got the line). All seeded via userland_seed.c.
+- Docs: to-do.txt crossed (done/x, in-progress/~, open bug noted); plan file
+  phases marked DONE/PARTIAL + NEXT list; this HANDOFF entry.

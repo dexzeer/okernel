@@ -6,7 +6,9 @@
 #include "wallpaper.h"
 #include "window.h"
 #include "paging.h"
+#include "memlayout.h"
 #include "gdt.h"
+#include "syscall.h"
 #include "idt.h"
 #include "keyboard.h"
 #include "memory.h"
@@ -15,8 +17,16 @@
 #include "filesystem.h"
 #include "editor.h"
 #include "okai.h"
+#include "js/js_dom.h"
 #include "theme.h"
 #include "crypto/rand.h"
+#include "process.h"
+#include "sched.h"
+#include "sys_proc.h"
+#include "spinlock.h"
+#include "pfs.h"
+#include "ata.h"
+#include "userland_seed.h"
 
 struct mboot_info {
     uint32_t flags;
@@ -260,10 +270,17 @@ static int check_icon_click(int mx, int my) {
     return -1;
 }
 
-static void shell_prompt(int win_id) {
-    window_set_text_color(win_id, 10, 0); // Green on black
-    window_puts(win_id, "okernel> ");
-    window_set_text_color(win_id, 15, 0); // Back to white on black
+static void shell_prompt(int win_id);
+// Foreground-run waiter: armed by `run` (shell IRQ context, never blocks),
+// consumed by the main-loop drain after the matching pid exits. The shell
+// runs as pid 0 with no PCB-parent link to spawned children, so the waiter
+// records pid+window explicitly; the drain matches zombie→waiter and prints
+// the exit status into the owning window.
+static int run_wait_pid = -1;
+static int run_wait_win = -1;
+void run_wait_arm(int pid, int win) {
+    run_wait_pid = pid;
+    run_wait_win = win;
 }
 
 static int str_eq(const char* a, const char* b) {
@@ -273,6 +290,179 @@ static int str_eq(const char* a, const char* b) {
     }
     return *a == *b;
 }
+
+// Resolve a shell word to a VFS binary path: exact name first, /bin/<name>.
+// Writes into `out` (64B) and returns out, or 0 when neither exists.
+static const char *binpath_of(const char *name) {
+    static char bins[2][64];
+    static int flip = 0;
+    char *out = bins[flip]; flip ^= 1;
+    uint32_t bi = 0;
+    if (name[0] == '/') {
+        while (name[bi] && bi < 63) { out[bi] = name[bi]; bi++; }
+        out[bi] = 0;
+        return fs_exists(out) ? out : 0;
+    }
+    const char *prefix = "/bin/";
+    bi = 0;
+    while (prefix[bi]) { out[bi] = prefix[bi]; bi++; }
+    uint32_t ni = 0;
+    while (name[ni] && bi < 63) { out[bi] = name[ni]; bi++; ni++; }
+    out[bi] = 0;
+    return fs_exists(out) ? out : 0;
+}
+
+// Shared `run` implementation (used by the `run` builtin AND the Unknown:
+// filesystem fallback below). Parses `rest` (program + args + optional `&`),
+// spawns via sched_spawn_elf, stages the entry drain, arms foreground wait.
+// Runs in keyboard-IRQ context — never iret here, only stage.
+static void shell_execute_run(int win_id, const char *rest) {
+    char argbuf[256];
+    uint32_t alen = 0;
+    while (rest[alen] && alen < 255) { argbuf[alen] = rest[alen]; alen++; }
+    argbuf[alen] = 0;
+    // Tokenize (in place, max 16 argv entries incl. program name).
+    char *rargv[17];
+    uint32_t rargc = 0;
+    uint32_t i = 0;
+    int background = 0;
+    while (i < alen && rargc < 16) {
+        while (i < alen && argbuf[i] == ' ') i++;
+        if (i >= alen) break;
+        uint32_t s = i;
+        while (i < alen && argbuf[i] != ' ') i++;
+        int is_last = (i >= alen);
+        // `&` as the final token means background (not an argument).
+        uint32_t tlen = i - s;
+        if (is_last && tlen == 1 && argbuf[s] == '&') {
+            background = 1;
+            break;
+        }
+        argbuf[i] = 0; // NUL-terminate (i<alen here, or trailing NUL)
+        rargv[rargc++] = &argbuf[s];
+        if (i < alen) i++;
+    }
+    rargv[rargc] = 0;
+    if (rargc == 0) {
+        window_puts(win_id, "Usage: run <path> [args...] [&]\n");
+        return;
+    }
+    // Resolve the path: exact VFS name first, then /bin/<name>.
+    const char *resolved = binpath_of(rargv[0]);
+    if (!resolved) {
+        window_puts(win_id, "run: cannot load ");
+        window_puts(win_id, rargv[0]);
+        window_put_char(win_id, '\n');
+        return;
+    }
+    // PID 1 (lazy, first-run): the boot-time spawn raced init's fork/exec
+    // children against the entry drain (see kernel_main note). Spawn init
+    // here instead — the drain is live (we're past boot) and the run path
+    // is proven. One-shot (init_armed); fail-soft when /sbin/init missing.
+    // ORDER: the requested program's entry is queued below AFTER this block
+    // runs — so enqueue init FIRST here would jump the queue. Instead this
+    // block only ARMS (spawns the PCB); the init ENTRY is enqueued after the
+    // program entry below. (Spawn-then-enqueue split keeps FIFO correct.)
+    // RE-ENTRANCY GUARD: shell_execute_run runs in keyboard-IRQ context
+    // while the main loop may ALSO be inside the entry drain (a tick stole
+    // ring 3 mid-program and a keystroke landed). init_armed is set BEFORE
+    // the spawn (not after) so a nested run can't double-spawn init; and
+    // the program-entry enqueue below is skipped when the queue is full
+    // (spawn is destroyed instead of wedging the drain — see below).
+    int init_pid = -1;
+    {
+        static int init_armed = 0;
+        if (!init_armed) {
+            init_armed = 1;
+            char *init_argv[] = { "/sbin/init", 0 };
+            init_pid = sched_spawn_elf("/sbin/init", init_argv, 0, win_id);
+            if (init_pid >= 0) {
+                struct process *ip = process_get((uint32_t)init_pid);
+                serial_printf("[boot] init pid=%d spawned from /sbin/init\n",
+                              init_pid);
+                if (ip) ip->term_win = win_id;
+            } else {
+                serial_puts("[boot] no /sbin/init — kernel shell only\n");
+            }
+        }
+    }
+    char path[64];
+    {
+        uint32_t pi = 0;
+        while (resolved[pi] && pi < 63) { path[pi] = resolved[pi]; pi++; }
+        path[pi] = 0;
+    }
+    if (entry_pending_any()) {
+        window_puts(win_id, "run: another program is starting\n");
+        return;
+    }
+    int pid = sched_spawn_elf(path, rargv, 0, win_id);
+    if (pid < 0) {
+        window_puts(win_id, "run: cannot load ");
+        window_puts(win_id, path);
+        window_put_char(win_id, '\n');
+        return;
+    }
+    struct process *rp = process_get((uint32_t)pid);
+    serial_printf("[run] pid=%d '%s' argc=%d bg=%d\n",
+                  pid, path, rargc, background);
+    window_puts(win_id, "Starting ");
+    window_puts(win_id, path);
+    window_put_char(win_id, '\n');
+    syscall_can_exit = 1;
+    // Enqueue the program entry; if the queue is FULL (a fork child or an
+    // earlier spawn still staged — possible when a tick stole ring 3 and a
+    // keystroke landed mid-drain), destroy the fresh spawn and fail LOUD
+    // instead of silently dropping the entry (which wedges the waiter: the
+    // drain announces Back/exit for a pid that never runs).
+    if (rp) {
+        if (entry_enqueue(pid, rp->user_eip, rp->user_esp, win_id)) {
+            serial_printf("[run] pid=%d entry queue full — dropped\n", pid);
+            window_puts(win_id, "run: system busy, try again\n");
+            sched_reap((uint32_t)pid);
+            if (init_pid >= 0) {
+                struct process *ip = process_get((uint32_t)init_pid);
+                if (ip) sched_reap((uint32_t)init_pid);
+            }
+            syscall_can_exit = 0;
+            return;
+        }
+    } else {
+        entry_enqueue(pid, 0x08048000, 0xBFFFF000 + 4096, win_id);
+    }
+    // Init entry goes second (FIFO after the program that triggered first-run).
+    if (init_pid >= 0) {
+        struct process *ip = process_get((uint32_t)init_pid);
+        if (ip && entry_enqueue(init_pid, ip->user_eip, ip->user_esp, win_id)) {
+            // Queue filled between the two enqueues (absurd — 4 slots):
+            // reap init, keep the program (fail-soft, no wedge).
+            serial_puts("[run] init entry dropped (queue full)\n");
+            sched_reap((uint32_t)init_pid);
+        }
+    }
+    if (!background) {
+        // Foreground: the main loop waits (blocking) and prints the exit
+        // status (run_wait_arm — armed here, consumed in the drain loop;
+        // the shell IRQ thread itself never blocks or irets).
+        extern void run_wait_arm(int pid, int win);
+        run_wait_arm(pid, win_id);
+    } else {
+        serial_printf("[run] pid=%d background\n", pid);
+        window_puts(win_id, "[bg] pid ");
+        {
+            char pb[12]; int pbi = 0, tv = pid;
+            char rv[12]; int ri = 0;
+            if (tv == 0) pb[pbi++] = '0';
+            while (tv > 0 && pbi < 11) { rv[ri++] = '0' + (tv % 10); tv /= 10; }
+            while (ri > 0) pb[pbi++] = rv[--ri];
+            pb[pbi] = 0;
+            window_puts(win_id, pb);
+        }
+        window_put_char(win_id, '\n');
+    }
+}
+
+static void shell_execute(int win_id, const char* input);
 
 // Int to string helper
 static void put_uint(char* buf, uint32_t val) {
@@ -321,6 +511,12 @@ static int create_terminal(void) {
     term_bufs[term_count][0] = 0;
     term_count++;
     return win_id;
+}
+
+static void shell_prompt(int win_id) {
+    window_set_text_color(win_id, 10, 0); // Green on black
+    window_puts(win_id, "okernel> ");
+    window_set_text_color(win_id, 15, 0); // Back to white on black
 }
 
 static int find_term_idx(int win_id) {
@@ -387,6 +583,12 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  edit      - open text editor\n");
         window_puts(win_id, "  ls        - list files\n");
         window_puts(win_id, "  open      - open file in editor\n");
+        window_puts(win_id, "  disk      - disk + persistent FS status\n");
+        window_puts(win_id, "  save      - force one file to disk\n");
+        window_puts(win_id, "  locktest  - spinlock/mutex selftest\n");
+        window_puts(win_id, "  ps        - list processes\n");
+        window_puts(win_id, "  usermode  - ring-3 test (use run /bin/hello)\n");
+        window_puts(win_id, "  run       - run ELF program (/bin/*) [&]\n");
         window_puts(win_id, "  reboot    - reboot system\n");
         window_puts(win_id, "  shutdown  - power off\n");
     }
@@ -530,6 +732,39 @@ static void shell_execute(int win_id, const char* input) {
             }
         }
     }
+    else if (str_eq(cmd_buf, "disk")) {
+        // Disk + persistent-FS diagnostics: presence, mount, table.
+        serial_puts("[sh] disk status\n");
+        if (!ata_present()) {
+            window_puts(win_id, "disk: no ATA disk (VFS only)\n");
+        } else {
+            window_puts(win_id, "disk: ATA present, ");
+            window_puts(win_id, pfs_mounted() ? "PFS mounted\n" : "PFS NOT mounted\n");
+        }
+        pfs_status(); // serial table dump (names/sizes/sectors)
+        window_puts(win_id, "(see serial for PFS table)\n");
+    }
+    else if (str_eq(cmd_buf, "save")) {
+        // save <file>: force one VFS file through to disk now (normally
+        // write-through is automatic — this is the manual override + proof).
+        if (args[0] == 0) {
+            window_puts(win_id, "Usage: save <filename>\n");
+        } else if (!fs_exists(args)) {
+            window_puts(win_id, "File not found: ");
+            window_puts(win_id, args);
+            window_put_char(win_id, '\n');
+        } else if (!ata_present()) {
+            window_puts(win_id, "save: no disk (VFS only)\n");
+        } else {
+            int rc = pfs_sync_file(args);
+            window_puts(win_id, rc == 0 ? "saved to disk\n" : "save FAILED\n");
+        }
+    }
+    else if (str_eq(cmd_buf, "locktest")) {
+        // Exercise spinlock/mutex primitives (no SMP needed) — serial PASS/FAIL.
+        sys_proc_lock_selftest();
+        window_puts(win_id, "lock selftest ran (see serial)\n");
+    }
     else if (str_eq(cmd_buf, "clear")) {
         window_clear(win_id);
     }
@@ -619,6 +854,92 @@ static void shell_execute(int win_id, const char* input) {
         outb(0x64, 0xFE);
         while (1) { __asm__ volatile("hlt"); }
     }
+    else if (str_eq(cmd_buf, "ps")) {
+        window_puts(win_id, "PID  STATE\n");
+        // use process_get_by_slot
+        for (int i = 0; i < 16; i++) {
+            struct process *p = process_get_by_slot(i);
+            if (p && p->state != 0) {
+                char buf[32];
+                int n = 0;
+                uint32_t tmp = p->pid;
+                if (tmp == 0) buf[n++] = '0';
+                else {
+                    char rev[8]; int ri = 0;
+                    while (tmp > 0) { rev[ri++] = '0' + (tmp % 10); tmp /= 10; }
+                    while (ri > 0) buf[n++] = rev[--ri];
+                }
+                while (n < 4) buf[n++] = ' ';
+                buf[n] = 0;
+                window_puts(win_id, buf);
+                const char *st = (p->state==2) ? "RUNNING" :
+                                 (p->state==1) ? "READY" :
+                                 (p->state==3) ? "BLOCKED" :
+                                 (p->state==5) ? "ZOMBIE" : "EXITED";
+                window_puts(win_id, st);
+                window_put_char(win_id, '\n');
+            }
+        }
+    }
+    else if (str_eq(cmd_buf, "usermode")) {
+        // DEFERRED RING-3 ENTRY: never iret from inside the keyboard IRQ
+        // (the shell runs buried in its trap frame — parking there wedges the
+        // desktop: serial alive, screen/keyboard dead). Spawn a real process
+        // (private address space via sched_spawn_user), then ARM a main-loop
+        // pending flag carrying the PID; the main loop (plain ring-0 thread)
+        // prepares the space (CR3+ESP0) and performs the IRET next iteration.
+        // Ring 3 then runs on its own user stack; sys_exit resumes the main
+        // loop via user_exit_trampoline (full caller frame restore), which
+        // reaps the process and announces completion below.
+        extern volatile uint32_t user_entry_eip;
+        extern volatile uint32_t user_entry_esp;
+        extern volatile int user_entry_pending;
+        extern volatile int user_entry_pid;
+        if (syscall_can_exit || user_entry_pending) {
+            window_puts(win_id, "User mode already running.\n");
+        } else {
+        // user_test is position-independent (call/pop msg), so the image runs
+        // at 0x08048000 with the entry offset preserved. The spawn copies the
+        // FULL 4K source page (not just the 59B test): the msg tail (ebx+0x14)
+        // must land in the user page too.
+        extern void user_mode_test(void);
+        extern uint8_t* user_test_page_base(void);
+        extern uint32_t user_test_page_off(void);
+        extern uint32_t user_test_len(void);
+        uint32_t u_stack_top = 0xBFFFF000 + 4096;
+        uint32_t u_code = 0x08048000;
+        uint32_t test_len = user_test_len();
+        if (!test_len) test_len = 4096;
+        int pid = sched_spawn_user(user_test_page_base(), test_len,
+                                   u_code, u_stack_top);
+        if (pid < 0) {
+            window_puts(win_id, "usermode: out of memory\n");
+        } else {
+            struct process *up = process_get((uint32_t)pid);
+            serial_printf("[usermode] pid=%d code=%x stack=%x\n",
+                          pid, u_code, u_stack_top);
+            window_puts(win_id, "Entering user mode (ring 3)...\n");
+            syscall_can_exit = 1;
+            // Entry is u_code FLAT (spawn copied the image slice to page
+            // base — entry offset consumed at copy time, not at entry).
+            user_entry_eip = u_code;
+            user_entry_esp = u_stack_top;
+            user_entry_pid = pid;
+            if (up) { up->user_eip = user_entry_eip; up->user_esp = u_stack_top; }
+            user_entry_pending = 1;
+            window_puts(win_id, "User program starting.\n");
+        }
+        }
+    }
+    else if (str_eq(cmd_buf, "run")) {
+        // run <path> [args...] [&]: spawn an ELF program from the VFS and
+        // enter it through the main-loop drain (same path as usermode, but
+        // ELF-aware via sched_spawn_elf with argc/argv on the user stack).
+        // Foreground (default): the main loop waits and prints status.
+        // Background (`&` last): enqueue and return to the prompt at once.
+        // Runs in keyboard-IRQ context — never iret here, only stage.
+        shell_execute_run(win_id, args);
+    }
     else if (str_eq(cmd_buf, "shutdown")) {
         window_puts(win_id, "Shutting down...\n");
         outw(0x604, 0x2000);
@@ -626,9 +947,24 @@ static void shell_execute(int win_id, const char* input) {
         while (1) { __asm__ volatile("hlt"); }
     }
     else {
-        window_puts(win_id, "Unknown: ");
-        window_puts(win_id, cmd_buf);
-        window_put_char(win_id, '\n');
+        // Filesystem fallback (userland cutover): `run` resolution for
+        // anything not a builtin — exact VFS name, then /bin/<cmd>. Pipes
+        // and redirection are NOT interpreted here (print a hint instead of
+        // silently misbehaving). Keeps `usermode` working until Phase 5
+        // retires it in favor of `run /bin/hello`.
+        const char *arrow = 0;
+        for (const char *p = input; *p; p++) {
+            if (*p == '|' || *p == '>') { arrow = p; break; }
+        }
+        if (arrow) {
+            window_puts(win_id, "pipes/redirection are not supported yet\n");
+        } else if (fs_exists(cmd_buf) || fs_exists(binpath_of(cmd_buf))) {
+            shell_execute_run(win_id, input);
+        } else {
+            window_puts(win_id, "Unknown: ");
+            window_puts(win_id, cmd_buf);
+            window_put_char(win_id, '\n');
+        }
     }
 }
 
@@ -654,6 +990,11 @@ static void on_keypress(char c) {
     int tidx = find_term_idx(win_id);
     if (tidx < 0) return; // Not a terminal window
 
+    // Control codes (Ctrl+letter from the keyboard driver) are not terminal
+    // input — ignore them here (the editor handles its own Ctrl+S/Ctrl+X;
+    // the terminal has no control semantics yet).
+    if ((unsigned char)c < 32 && c != '\b' && c != '\n' && c != '\t') return;
+
     if (c == '\b') {
         if (term_lens[tidx] > 0) {
             term_lens[tidx]--;
@@ -662,6 +1003,9 @@ static void on_keypress(char c) {
     } else if (c == '\n') {
         window_put_char(win_id, '\n');
         term_bufs[tidx][term_lens[tidx]] = 0;
+        // Offer the completed line to any ring-3 reader on fd 0 (keyboard
+        // line queue — sys_read(0) drains; non-blocking, drops when full).
+        sys_proc_kbd_offer(term_bufs[tidx], term_lens[tidx]);
         shell_execute(win_id, term_bufs[tidx]);
         term_lens[tidx] = 0;
         shell_prompt(win_id);
@@ -676,6 +1020,10 @@ static void on_keypress(char c) {
 static int rand_stir_ticks = 0;
 static void on_timer(void) {
     tick_count++;
+    // Scheduler tick FIRST (cheap, runs at IRQ): count down the running
+    // user process's slice and round-robin on expiry. No-op when only the
+    // kernel idle process exists — zero behavior change for existing flows.
+    sched_tick();
     // Keep mixing entropy into the CPRNG (forward secrecy) for the first ~32
     // ticks. rand_seed() at boot already primed it to "ready"; this just
     // continues folding fresh RDTSC + MAC jitter into the keystream.
@@ -750,22 +1098,107 @@ static void check_save_http_response(void) {
     }
 }
 
-void kernel_main(uint32_t mboot_addr) {
+// Desktop-only syscall helpers (need paging.o + window.o + process.o):
+// fd-1 terminal output for SYS_WRITE, page-granular user mapping for
+// SYS_MMAP_USER. Installed via syscall_install at boot (see kernel_main).
+// fd routing: SYS_WRITE fd 1/2 resolve through the CALLING process's fd
+// table (PROC_FD_TERM → owning window, real ofd → sys_proc_write_fd), so
+// later redirection/close/dup2 change where output goes instead of always
+// hitting the focused window.
+static int sys_write_to_terminal(const char *buf, uint32_t len) {
+    // Legacy hook: terminal output with no fd context (sys_print mirror).
+    // Routes to the focused window (best effort when no process owns it).
+    if (!buf) return -1;
+    int fw = window_get_focused();
+    if (fw < 0) return -1;
+    for (uint32_t i = 0; i < len; i++) window_put_char(fw, buf[i]);
+    return 0;
+}
+// Owning-window write: used by the fd-aware SYS_WRITE path (fd 1/2 bound to
+// the spawning window). Falls back to focused when the owner is gone.
+static int sys_write_to_window(int win_id, const char *buf, uint32_t len) {
+    if (!buf) return -1;
+    if (win_id < 0 || !window_get(win_id)) win_id = window_get_focused();
+    if (win_id < 0) return -1;
+    for (uint32_t i = 0; i < len; i++) window_put_char(win_id, buf[i]);
+    return (int)len;
+}
+void desktop_mmap_user(uint32_t virt, uint32_t phys) {
+    paging_map_user(virt, phys);
+}
+static int desktop_current_pid(void) {
+    struct process *cur = process_current();
+    return cur ? (int)cur->pid : 0;
+}
+static void desktop_sched_yield(void) {
+    sched_yield();
+}
+
+void kernel_main(uint32_t mboot_phys) {
+    // mboot_phys is PHYS (GRUB via trampoline). GRUB structs live low, so
+    // read through the boot PD's 0-4M LOW identity window (valid pre- and
+    // post-paging_init: the full map keeps the low half). Use plain phys
+    // derefs here (mboot_phys + off); P2V forms are for high-kernel math.
     serial_init();
     gdt_init();
     idt_init();
-    memory_init(mboot_addr);
+    memory_init(mboot_phys);
 
-    struct mboot_info* mboot = (struct mboot_info*)mboot_addr;
+    // mboot_info.framebuffer_addr is the uint64 at offset 88 (NOT 44: count
+    // the packed struct above — 4+4+4*9+2*4 = 88). A wrong offset reads
+    // vbe_mode_info/garbage as fb (0x90 class) and paging maps nothing.
+    uint32_t mboot_flags = *(volatile uint32_t*)(mboot_phys + 0);
+    uint64_t mboot_fb = *(volatile uint64_t*)(mboot_phys + 88);
     uint32_t fb_addr = 0;
-    if (mboot->flags & (1 << 12)) {
-        fb_addr = (uint32_t)mboot->framebuffer_addr;
+    if (mboot_flags & (1 << 12)) {
+        fb_addr = (uint32_t)mboot_fb;
     }
-    if (fb_addr) paging_init(fb_addr);
+    serial_printf("[boot] mboot phys=%x flags=%x fb=%x\n",
+                  mboot_phys, mboot_flags, fb_addr);
+    // paging_init BEFORE process_init: the boot PD maps only 0-4M, but .bss
+    // statics (page_directory at phys ~0x2C00000, processes, bitmap tail)
+    // live at phys 1M-14M. process_init's first .bss touch faults without
+    // the full map (CR2=0xC0xxxxxx class, e=0002). FB addr 0 = still map.
+    paging_init(fb_addr);
+    process_init();
 
-    graphics_init(mboot_addr);
+    // Syscall ABI hooks (syscall.c is COMMON so text links too; the
+    // implementations need paging.o + window.o + process.o = desktop-only).
+    // Installed once here: validation + terminal/keyboard + fd/process/VM.
+    syscall_install(paging_user_range_valid, sys_write_to_terminal);
+    syscall_install_winwrite(sys_write_to_window);
+    syscall_install_proc(desktop_current_pid, desktop_sched_yield);
+    syscall_install_mmap(desktop_mmap_user);
+    syscall_install_full(sys_proc_munmap, sys_proc_kbd_read,
+                          sys_proc_open, sys_proc_close,
+                          sys_proc_write_fd, sys_proc_read_fd,
+                          sys_proc_fork, sys_proc_exec,
+                          sys_proc_sbrk, sys_proc_pipe,
+                          sys_proc_dup, sys_proc_wait,
+                          sys_proc_kill, sys_proc_mmap_anon);
+    // Ring-3 test image source for sched_spawn_user (page base + entry off).
+    {
+        extern void user_mode_test(void);
+        extern void user_mode_test_end(void);
+        uint32_t taddr = (uint32_t)user_mode_test;
+        uint32_t tend = (uint32_t)user_mode_test_end;
+        syscall_install_usertest((const uint8_t*)(taddr & 0xFFFFF000),
+                                 taddr & 0xFFF);
+        syscall_install_usertest_len(tend > taddr ? tend - taddr : 0);
+    }
+    graphics_init(mboot_phys);
     window_init();
     fs_init();
+    pfs_init(); // ATA disk + mount-or-format (diskless = VFS-only, safe)
+    userland_seed(); // /bin/* + /sbin/init from embedded ELFs (skips present)
+    // PID 1 is spawned LAZILY (first terminal creation) instead of here:
+    // sched_spawn_elf needs the PFS/VFS settled AND the entry drain must be
+    // reachable (main loop running). Spawning here (pre-loop) wedges the
+    // drain ordering vs init's fork/exec children (bisected 2026-09-08:
+    // boot-spawned init forked sh but the exec never dispatched — the boot
+    // entry raced the first terminal's drain). kernel_shell_ready() below
+    // fires once the first terminal exists; the shell path stays fully
+    // working until then (fail-soft: no userland, no wedge).
     editor_init();
     okai_init();
 
@@ -809,6 +1242,14 @@ void kernel_main(uint32_t mboot_addr) {
     window_set_text_color(term_wins[0], 15, 0);
     shell_prompt(term_wins[0]);
 
+    // PID 1 is spawned on FIRST `run` (lazy): the boot-time spawn raced
+    // init's fork/exec children against the entry drain (bisected 2026-09-08:
+    // boot-spawned init forked sh but exec never dispatched AND the run path
+    // wedged while init's wait-storm owned ring 3). Deferring to first use
+    // keeps boot deterministic; the shell path stays fully working until
+    // then (fail-soft: no userland, no wedge). See shell_execute_run().
+    // (No code here — the arm lives in shell_execute_run, first call.)
+
     // Init networking (full stack: PCI + RTL8139 + ARP + IP + ICMP)
     net_init();
     net_set_event_callback(on_net_event);
@@ -839,15 +1280,319 @@ void kernel_main(uint32_t mboot_addr) {
     mouse_init_fb();
     keyboard_init();
     keyboard_set_callback(on_keypress);
+    // Capture the main-loop thread's live ESP/EBP into pid 0 BEFORE sti:
+    // the preemption stub saves/restores p->esp per thread, and process_init
+    // ran one frame up (its ESP capture is stale by a frame). This is the
+    // exact thread the timer will preempt — seed it precisely. Also arm
+    // pid 0's slice (first tick decrements instead of expiring at boot).
+    {
+        extern void process_capture_idle_esp(void);
+        process_capture_idle_esp();
+    }
+    process_idle_arm();
     sti();
 
     // Main loop
     while (1) {
+        // Ring-3 entry drain: the shell (and fork) stage pid+eip+esp+window
+        // into the entry run queue; here is plain ring-0 thread context, so
+        // prepare (CR3+ESP0) + IRET below is safe. sys_exit resumes right
+        // after the call (trampoline restores the caller frame:
+        // EBP/ESI/EDI/ESP + segments): drain signals, unprepare, reap (or
+        // leave zombies for wait()), announce, re-enable, loop on.
+        // Legacy single slot (usermode path) is drained first, then queued
+        // fork/spawn entries in order.
+        for (;;) {
+            uint32_t eip = 0, esp = 0;
+            int pid = -1, win_id = -1, is_fork_child = 0;
+            if (user_entry_pending) {
+                eip = user_entry_eip; esp = user_entry_esp;
+                pid = user_entry_pid;
+                user_entry_pending = 0;
+                user_entry_pid = -1;
+            } else if (!entry_dequeue(&pid, &eip, &esp, &win_id)) {
+                // queued entry (fork child or run-spawn)
+            } else {
+                break; // queue + slot both empty
+            }
+            is_fork_child = (pid >= 0) ? sched_fork_take_child((uint32_t)pid) : 0;
+            // WAKE ORDER: a BLOCKED parker with a staged resume whose wake
+            // condition holds is re-entered through THIS drain (not its own
+            // iret — its trap frame was discarded by the park trampoline).
+            // Conditions: wait-park → a matching child is ZOMBIE now;
+            // yield/read-park → any queued entry or READY sibling exists, or
+            // (read) the kbd queue is non-empty. Otherwise skip (stay
+            // BLOCKED until the tick WAKE pass or SIG_CHLD wakes us).
+            // Pre-entry fork children (never entered) always run: their
+            // queued entry IS their first frame.
+            uint32_t park_ret = 0;
+            int is_park_resume = 0;
+            if (pid >= 0 && !is_fork_child) {
+                struct process *dp = process_get((uint32_t)pid);
+                if (dp && dp->state == PROC_BLOCKED && dp->entered_ring3) {
+                    extern int sched_park_resume(uint32_t, uint32_t*, uint32_t*);
+                    extern int sched_park_take(uint32_t, uint32_t*);
+                    uint32_t peip = 0, pesp = 0;
+                    if (sched_park_resume((uint32_t)pid, &peip, &pesp)) {
+                        // Staged resume exists: check its wake condition.
+                        // Wait-park (ret == -2): wake iff a matching child
+                        // is a zombie NOW (reaped by the drain below after
+                        // re-entry... actually reaped HERE would be simpler,
+                        // but the retry path expects -2-then-reap; instead
+                        // wake only on zombie and let the retry reap).
+                        uint32_t pret = 0;
+                        sched_park_take((uint32_t)pid, &pret);
+                        // Peek only (take consumed the flag — re-stage).
+                        extern void sched_park_stage(uint32_t, uint32_t, uint32_t, uint32_t);
+                        sched_park_stage((uint32_t)pid, peip, pesp, pret);
+                        int wake = 0;
+                        if (pret == (uint32_t)-2) {
+                            // wait-park: wake iff matching zombie exists
+                            struct process *me = process_get((uint32_t)pid);
+                            if (me) {
+                                for (int s = 0; s < MAX_PROCESSES; s++) {
+                                    struct process *c = process_get_by_slot(s);
+                                    if (!c) continue;
+                                    if (c->parent_pid != me->pid) continue;
+                                    if (c->state == PROC_ZOMBIE || c->state == PROC_EXITED) { wake = 1; break; }
+                                }
+                            }
+                        } else {
+                            // yield/read-park: wake iff work exists
+                            extern int entry_pending_any(void);
+                            wake = entry_pending_any() ? 1 : 0;
+                            if (!wake) {
+                                for (int s = 0; s < MAX_PROCESSES; s++) {
+                                    struct process *c = process_get_by_slot(s);
+                                    if (!c || c->pid == 0) continue;
+                                    if (c->state == PROC_READY && c->entered_ring3) { wake = 1; break; }
+                                }
+                            }
+                        }
+                        if (wake) {
+                            // Consume the staged resume for real this time.
+                            sched_park_take((uint32_t)pid, &park_ret);
+                            eip = peip; esp = pesp;
+                            is_park_resume = 1;
+                            dp->state = PROC_READY;
+                            dp->ticks_left = SCHED_SLICE_TICKS;
+                        } else {
+                            continue; // stay parked
+                        }
+                    } else {
+                        continue; // BLOCKED with no resume (legacy) — skip
+                    }
+                }
+            }
+            // Fork children resume via the entry drain (no live frame yet):
+            // DEFERRAL GUARD (bisected 2026-09-08: exec garbage + child #PF —
+            // a tick between drain-dequeue and IRET captures the DRAIN's
+            // half-built register frame as the child's "thread", then the
+            // drain IRETs anyway: two entries, one pid, garbage resume).
+            // entered=0/unseed did NOT fix it (tick still raced the window).
+            // Correct fix: CLOSE the window — hold the switch busy-guard
+            // across the whole dequeue→IRET sequence so the tick CANNOT
+            // switch mid-drain (it returns immediately, retries next tick —
+            // by then the child has entered and owns a real frame). The IRET
+            // itself runs with IF clear on this path (IRQ gates), and the
+            // drain re-enables after resume; the guard is released on every
+            // exit path below (park-continue, post-exit) — grep switch_busy.
+            {
+                extern volatile int switch_busy;
+                switch_busy = 1;
+                __asm__ volatile("cli" ::: "memory");
+            }
+            if (is_fork_child) {
+                struct process *fc = process_get((uint32_t)pid);
+                if (fc) fc->entered_ring3 = 1;
+            }
+            serial_puts("[usermode] entering ring 3 from main loop\n");
+            // Stash the drain pid BEFORE the IRET (locals go stale across
+            // enter/exit — re-captured after resume for the reap check).
+            if (pid >= 0) drain_stash_pid(pid);
+            // Activate the process's private address space + trap stack BEFORE
+            // the IRET: ring-3 fetches and INT 0x80 traps must land in ITS
+            // space, not the kernel PD. (Previously mapped into the shared
+            // kernel PD — leaked user bits there permanently.)
+            if (pid >= 0) sched_prepare((uint32_t)pid);
+            // Mark entered BEFORE the IRET (preemption then treats this as
+            // a live thread with a real saved frame — which it is after the
+            // first tick saves it; the seed frame covers the gap before).
+            if (pid >= 0) {
+                struct process *ent = process_get((uint32_t)pid);
+                if (ent) ent->entered_ring3 = 1;
+            }
+            // Fork child: EAX forced 0 by the enter path (see isr.asm), so
+            // ring-3 observes fork() == 0. Park resume: staged EAX likewise.
+            // Plain calls BEFORE the enter asm (flags live in .bss — safe
+            // against the asm's EAX clobber). Never both (a pid is either a
+            // fresh child or a resumed parker, not both — fork wins).
+            // FORK-TRACE (input-bug bisect 2026-09-08): prove the flag path.
+            if (is_fork_child) {
+                serial_printf("[fork-enter] pid=%d eip=%x esp=%x EAX=0\n",
+                              pid, eip, esp);
+            }
+            if (is_fork_child) enter_user_mode_fork_child();
+            else if (is_park_resume) enter_user_mode_park_ret(park_ret);
+            // Register calling convention: eip->EAX, esp->EDX (enter takes NO
+            // stack args, so ESP points AT the return address and the save is
+            // exact). Clobbers: eax,ebx,ecx,edx + memory. EBX is consumed as
+            // the user_eip carrier and NOT restored — list it clobbered.
+            __asm__ volatile(
+                "push %%ebx; push %%esi;"
+                "mov %0, %%eax; mov %1, %%edx;"
+                "call enter_user_mode"
+                : : "r"(eip), "r"(esp) : "eax", "ebx", "ecx", "edx", "memory");
+            // RESUMED VIA TRAMPOLINE (not a normal return): sys_exit jumped
+            // here with the caller frame restored (EBP/ESI/EDI/ESP/segments).
+            // EBX is stale (entry clobbered it) — never trust it below.
+            // NOTE: NO sti here. The trampoline ran cli, and the preemptive
+            // scheduler needs IF managed by the switch paths, not blanket
+            // set: an sti here opens a preemption window INSIDE the exit
+            // sequence (unprepare/reap touch CR3 + free pages — a tick there
+            // switches onto freed stacks/PDs → #PF at CR2==EIP in
+            // context_switch, bisected 2026-09-08). IRQs stay off until the
+            // exit sequence completes; the next loop iteration's hlt (idle)
+            // or the next switch_to's sti re-enables.
+            // Re-capture the drain pid (locals lived in registers/stack slots
+            // across the IRET — the trampoline restored EBP/ESI/EDI/ESP but
+            // EBX/EAX/ECX/EDX are STALE (entry clobbered EBX, idt hijack
+            // clobbered EAX). The reap probe proved it: pid read 0 post-resume
+            // (should be 1) → reap skipped → zombie never freed → next tick
+            // switched to the dead slot (bisected 2026-09-08: [reapchk] pid=0
+            // post-Back, then [sw] 0->1 into the zombie).
+            // Parked return: the drain IRETed into ring 3, but the process
+            // PARKED (wait-no-zombie / yield / read-empty) instead of
+            // exiting — the park trampoline resumed the main loop right here
+            // (same resume path as sys_exit: caller frame restored, pid
+            // re-captured from the stash). Distinguish exit from park via
+            // PCB state: ZOMBIE/EXITED = real exit (reap path below); anything
+            // else = parked (reap NOTHING, announce NOTHING — the thread is
+            // live and will be re-entered by the drain once woken).
+            pid = -1;
+            {
+                extern int drain_last_pid(void);
+                pid = drain_last_pid();
+            }
+            // Parked? (process alive, not a zombie) → stage its resume
+            // (BLOCKED + trapped EIP/ESP/retval already saved by the arm),
+            // re-arm the exit latch, sti, and continue the drain loop so
+            // queued siblings run THIS iteration. The parker is re-entered
+            // later via enter_user_mode(park_eip/esp) with the staged EAX
+            // (park_ret_pending flag, fork-child-style).
+            {
+                struct process *pp = (pid >= 0) ? process_get((uint32_t)pid) : 0;
+                if (pp && pp->state != PROC_ZOMBIE && pp->state != PROC_EXITED) {
+                    extern uint32_t syscall_park_eip(void);
+                    extern uint32_t syscall_park_esp(void);
+                    extern uint32_t syscall_take_park_ret(void);
+                    extern void sched_park_stage(uint32_t pid, uint32_t eip, uint32_t esp, uint32_t ret);
+                    uint32_t peip = syscall_park_eip();
+                    uint32_t pesp = syscall_park_esp();
+                    uint32_t pret = syscall_take_park_ret();
+                    pp->state = PROC_BLOCKED;
+                    pp->ticks_left = SCHED_SLICE_TICKS;
+                    sched_park_stage((uint32_t)pid, peip, pesp, pret);
+                    syscall_can_exit = 1;
+                    {
+                        extern volatile int switch_busy;
+                        switch_busy = 0;
+                    }
+                    __asm__ volatile("sti" ::: "memory");
+                    continue;
+                }
+            }
+            syscall_can_exit = 0;
+            // Safe-point signal drain (default actions: TERM→zombie+notify).
+            sys_proc_drain_signals();
+            // Back on the kernel PD + idle trap stack: the process's private
+            // space was live during ring 3. Restore both BEFORE touching any
+            // kernel state (window buffers, serial-adjacent heap) — the user
+            // PD shares the high map, but its low half is private and its TLB
+            // entries are stale for kernel work.
+            sched_unprepare();
+            // Reap policy: the legacy usermode path (parent_pid == 0, no
+            // waiter) reaps immediately; `run` foreground leaves the zombie
+            // for the waiter below (which prints status); fork children stay
+            // for ring-3 wait(). Exited-without-zombie (legacy stub) reaps.
+            int run_done_code = -1;
+            {
+                struct process *done = (pid >= 0) ? process_get((uint32_t)pid) : 0;
+                if (done && done->state == PROC_ZOMBIE) {
+                    if (pid == run_wait_pid) {
+                        // Foreground run child: capture status, reap now,
+                        // disarm waiter (announced below with the code).
+                        run_done_code = done->exit_code;
+                        sched_reap((uint32_t)pid);
+                        // keep run_wait_win for the announcement below
+                        run_wait_pid = -1;
+                    } else if (done->parent_pid == 0) {
+                        if (pid >= 0) sched_reap((uint32_t)pid);
+                    }
+                } else if (pid >= 0) {
+                    // Exited without zombie (legacy stub path) — reap now.
+                    struct process *d2 = process_get((uint32_t)pid);
+                    if (d2) sched_reap((uint32_t)pid);
+                }
+            }
+            {
+                int fw = window_get_focused();
+                if (fw >= 0) {
+                    window_puts(fw, "Back from user mode.\n");
+                    shell_prompt(fw);
+                }
+            }
+            serial_puts("Back from user mode.\n");
+            // Foreground-run status line (into the OWNING window, not
+            // focused — the user may have clicked elsewhere mid-run).
+            if (run_done_code >= 0) {
+                int ow = run_wait_win;
+                if (ow < 0 || !window_get(ow)) ow = window_get_focused();
+                if (ow >= 0) {
+                    window_puts(ow, "[run] exit code ");
+                    {
+                        char cb[12]; int cbi = 0, tv = run_done_code;
+                        char rv[12]; int ri = 0;
+                        if (tv == 0) cb[cbi++] = '0';
+                        while (tv > 0 && cbi < 11) { rv[ri++] = '0' + (tv % 10); tv /= 10; }
+                        while (ri > 0) cb[cbi++] = rv[--ri];
+                        cb[cbi] = 0;
+                        window_puts(ow, cb);
+                    }
+                    window_put_char(ow, '\n');
+                    shell_prompt(ow);
+                }
+                serial_printf("[run] exit code %d\n", run_done_code);
+                run_wait_win = -1;
+            }
+            // Exit sequence done (CR3 home, slot reaped-or-zombied): IRQs
+            // back on for the poll/draw tail of this iteration. Also release
+            // the drain deferral guard (held since dequeue — see above) so
+            // the tick can switch again (the entered child now owns a real
+            // frame; races are over). Release ONLY when the drain queue is
+            // empty: with entries still staged (fork child behind a finished
+            // parent, init behind run) the next for-iteration dequeues
+            // straight into another IRET — keep the guard across it (it
+            // re-arms at the top of the loop anyway; releasing here would
+            // open the race window between iterations).
+            {
+                extern volatile int switch_busy;
+                extern int entry_pending_any(void);
+                if (!entry_pending_any()) switch_busy = 0;
+            }
+            __asm__ volatile("sti" ::: "memory");
+        }
         // Poll network for incoming packets
         e1000_poll();
         net_poll();
         http_poll();
         https_get_poll(); // advance any in-flight async HTTPS fetch
+
+        // Legacy completion poll: the trampoline path above already announces
+        // inline AND latches user_exited (hijack calls note_exited) — so by
+        // the time we get here the latch is ALWAYS set after a trampoline
+        // exit. Drain it silently (no second announcement).
+        user_mode_poll_finished();
 
         int mx = mouse_get_x();
         int my = mouse_get_y();
@@ -1110,6 +1855,44 @@ void kernel_main(uint32_t mboot_addr) {
             struct okai_tab* T = ok ? okai_tab_of(ok) : 0;
             if (!ok) {
                 okai_fetch_owner = -1;
+        } else if (T->sub_res_phase > 0) {
+            // Sub-resource fetch in progress
+            if (T->is_https) {
+                if (tls_is_done()) {
+                    int resp_len = tls_get_response_len();
+                    char* resp = tls_get_response();
+                    if (resp && resp_len > 0) {
+                        okai_sub_res_done(bi, resp, resp_len);
+                    }
+                    if (okai_start_sub_res_fetch(bi) != 0) {
+                        okai_render_content(bi);
+                        okai_fetch_owner = -1;
+                    }
+                } else if (!tls_is_active() && !tls_is_done()) {
+                    T->sub_res_idx++;
+                    if (okai_start_sub_res_fetch(bi) != 0) {
+                        okai_render_content(bi);
+                        okai_fetch_owner = -1;
+                    }
+                }
+            } else {
+                int resp_len = http_get_response_len();
+                int done = http_is_done();
+                if (done && resp_len > 0) {
+                    char* resp = http_get_response();
+                    if (resp) okai_sub_res_done(bi, resp, resp_len);
+                    if (okai_start_sub_res_fetch(bi) != 0) {
+                        okai_render_content(bi);
+                        okai_fetch_owner = -1;
+                    }
+                } else if (!http_is_pending() && !http_is_retry_pending() && !http_is_done()) {
+                    T->sub_res_idx++;
+                    if (okai_start_sub_res_fetch(bi) != 0) {
+                        okai_render_content(bi);
+                        okai_fetch_owner = -1;
+                    }
+                }
+            }
             } else if (T->is_https) {
                 if (tls_is_done()) {
                     int resp_len = tls_get_response_len();
@@ -1206,6 +1989,14 @@ void kernel_main(uint32_t mboot_addr) {
                         okai_fetch_owner = bi; // only claim ownership if a fetch fired
                     break;
                 }
+            }
+        }
+
+        // Check if JS DOM mutations require a re-render
+        if (js_dom_is_rerender_needed()) {
+            for (int bi = 0; bi < MAX_OKAIS; bi++) {
+                struct okai* ok = okai_get(bi);
+                if (ok) okai_render_content(bi);
             }
         }
 

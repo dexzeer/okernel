@@ -27,15 +27,25 @@
 #define HTML_BLOCK     17  // <hr> or blockquote
 #define HTML_END_PARA  18  // closing </p>, </div>, etc
 #define HTML_TABLE_CELL 19 // <td>/<th> text; cells join on a row, </tr> breaks
+#define HTML_FORM       20 // <form action method>
+#define HTML_INPUT      21 // <input name value placeholder type>
+#define HTML_BUTTON     22 // <button> / <input type=submit>
 
 struct html_token {
     uint8_t type;
     char text[HTML_MAX_TEXT];
-    char href[64];  // For links
+    char href[64];  // For links; reused for <form action> and stamped onto inputs
     char tag[16];   // element tag (lowercased), for CSS matching
     char cls[32];   // space-separated class list (lowercased)
     char id[32];    // element id (lowercased)
     char style[128]; // inline style="" attribute text
+    // Form support (okai search/submit). Unused for non-form tokens.
+    char name[40];        // <input name> / <form id>
+    char value[160];      // <input value> — also the live-editable text buffer
+    char placeholder[40]; // <input placeholder>
+    char method[8];       // <form method> "GET"/"POST" (stamped onto inputs)
+    char input_type[16];  // <input type> (text/submit/hidden/checkbox/...) — render gate
+    int  form_idx;        // index of the enclosing <form> (stamped at parse time)
 };
 
 int html_parse(const char* html, int html_len, struct html_token* tokens, int max_tokens);
@@ -49,5 +59,15 @@ void html_decode_entities(char* s);
 // Concatenate the text of every <style>...</style> block into `out` (for CSS).
 // Returns total bytes written (capped at cap-1).
 int html_extract_css(const char* html, int html_len, char* out, int cap);
+
+// Extract href values from <link rel="stylesheet"> tags into a string buffer.
+// Each URL is null-terminated; the buffer is double-null-terminated.
+// Returns number of URLs extracted.
+int html_extract_link_css(const char* html, int html_len, char* out, int cap);
+
+// Extract src values from <script src="..."> tags into a string buffer.
+// Each URL is null-terminated; the buffer is double-null-terminated.
+// Returns number of URLs extracted.
+int html_extract_script_src(const char* html, int html_len, char* out, int cap);
 
 #endif

@@ -1,5 +1,7 @@
 #include "graphics.h"
 #include "memory.h"
+#include "memlayout.h"
+#include "paging.h"
 #include "serial.h"
 #include "io.h"
 #include <stdint.h>
@@ -225,14 +227,36 @@ struct mboot_info {
     uint8_t  framebuffer_type;
 } __attribute__((packed));
 
-void graphics_init(uint32_t mboot_addr) {
-    struct mboot_info* mboot = (struct mboot_info*)mboot_addr;
+void graphics_init(uint32_t mboot_phys) {
+    // mboot_phys is PHYS (GRUB structs live low). Plain phys derefs through
+    // the 0-4M LOW identity window (see kernel_main). Offsets from struct
+    // mboot_info above: flags@0, pitch@96, addr@88.
+    uint32_t flags = *(volatile uint32_t*)(mboot_phys + 0);
 
-    if (mboot->flags & (1 << 12)) {
-        framebuffer = (uint8_t*)(uint32_t)mboot->framebuffer_addr;
-        fb_pitch = mboot->framebuffer_pitch;
+    // VIDEO DIAG (2026-09-07): log the full multiboot framebuffer block so
+    // the next agent can see what GRUB actually set (addr/pitch/w/h/bpp).
+    {
+        uint64_t dfb = *(volatile uint64_t*)(mboot_phys + 88);
+        uint32_t dpitch = *(volatile uint32_t*)(mboot_phys + 96);
+        uint32_t dw = *(volatile uint32_t*)(mboot_phys + 100);
+        uint32_t dh = *(volatile uint32_t*)(mboot_phys + 104);
+        uint8_t dbpp = *(volatile uint8_t*)(mboot_phys + 108);
+        serial_printf("[gfx] mboot fb=%x pitch=%d w=%d h=%d bpp=%d flags=%x\n",
+                      (uint32_t)dfb, dpitch, dw, dh, dbpp, flags);
+    }
+
+    if (flags & (1 << 12)) {
+        uint64_t fb = *(volatile uint64_t*)(mboot_phys + 88);
+        // FB is identity-mapped by paging_init (PD phys>>22, supervisor):
+        // use the PHYS address directly, NOT paging_map's MMIO window
+        // (that double-maps 0xFD000000 -> 0xC8000000+ and the flush wrote to
+        // the wrong window = black 640x480 screendump despite 1080p mode).
+        framebuffer = (uint8_t*)(uint32_t)fb;
+        fb_pitch = *(volatile uint32_t*)(mboot_phys + 96);
+        serial_printf("[gfx] using identity FB %x pitch=%d\n",
+                      (uint32_t)fb, fb_pitch);
     } else {
-        framebuffer = (uint8_t*)0xA0000;
+        framebuffer = (uint8_t*)paging_map_low(0xA0000);
         fb_pitch = SCREEN_W * 4;
     }
 

@@ -17,12 +17,15 @@ CFLAGS = -m32 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
 # Assembler flags
 ASFLAGS = -f elf32
 
-# Linker flags
+# Linker flags (text = low link; desktop = high-half link at 0xC0100000)
 LDFLAGS = -m elf_i386 -T linker.ld
+LDFLAGS_HIGH = -m elf_i386 -T linker-high.ld
 
-# Common objects (no kernel.c, no desktop.c)
-ASM_OBJ = boot/isr.o boot/start.o
-COMMON_OBJ = src/gdt.o src/idt.o src/memory.o src/serial.o src/keyboard.o src/mouse.o src/string.o
+# Common objects (no kernel.c, no desktop.c). ORDER: start.o FIRST — its
+# .text must land at 0xC0100030 (right after .multiboot) so _start's LOW
+# alias (phys 0x100030+0x30) is where GRUB jumps. isr.o second.
+ASM_OBJ = boot/start.o boot/isr.o
+COMMON_OBJ = src/gdt.o src/idt.o src/memory.o src/serial.o src/keyboard.o src/mouse.o src/string.o src/syscall.o
 
 # Text mode objects
 TEXT_OBJ = src/vga.o src/shell.o src/terminal.o
@@ -30,8 +33,15 @@ TEXT_OBJ = src/vga.o src/shell.o src/terminal.o
 # Desktop mode objects
 # NOTE: -DKERNEL is set in CFLAGS below so the shared crypto/TLS source can
 # switch its stdio logging to serial_printf and its RNG to the kernel CPRNG.
-DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/html.o src/css.o \
+# NOTE: src/userland_seed.o embeds userland/gen_*.h bindata — it must rebuild
+# whenever any gen header changes (the %.o rule only tracks HEADERS, and a
+# stale seed silently ships last week's ELFs — bisected 2026-09-08 when a
+# fresh forktest never reached the ISO).
+USERLAND_GEN = $(wildcard userland/gen_*.h)
+src/userland_seed.o: $(USERLAND_GEN)
+DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/html.o src/css.o src/user_test.o \
               src/font_data.o \
+              src/js/js_os.o src/js/js_var.o src/js/js_lex.o src/js/js_parse.o src/js/js_funcs.o src/js/js_math.o src/js/js_dom.o \
              src/crypto/sha256.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/chacha20.o src/crypto/poly1305.o \
              src/crypto/x25519.o src/crypto/tls_record.o src/crypto/tls_handshake.o \
@@ -63,10 +73,11 @@ okernel-text.iso: okernel-text.bin
 # ---- Desktop mode build ----
 desktop: okernel-desktop.iso
 
-okernel-desktop.bin: $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o
-	$(LD) $(LDFLAGS) -o $@ $^
+okernel-desktop.bin: $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o linker-high.ld
+	$(LD) $(LDFLAGS_HIGH) -o $@ $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o
 
 okernel-desktop.iso: okernel-desktop.bin
+	rm -rf isodir
 	mkdir -p isodir/boot/grub
 	cp okernel-desktop.bin isodir/boot/okernel.bin
 	echo 'set timeout=0' > isodir/boot/grub/grub.cfg
@@ -89,6 +100,10 @@ okernel-desktop.iso: okernel-desktop.bin
 HEADERS := $(wildcard src/*.h) $(wildcard src/net/*.h)
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
+
+# JS engine files need the freestanding shim (kmalloc/serial_printf + no libc)
+src/js/%.o: src/js/%.c $(HEADERS)
+	$(CC) $(CFLAGS) -DJS_KERNEL -c $< -o $@
 
 # ---- Run ----
 run: text
