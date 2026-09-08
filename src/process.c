@@ -459,6 +459,19 @@ void process_switch_to(uint32_t pid) {
         // Same zombie rule as process_switch (see above): only demote a
         // RUNNING outgoing thread. A ZOMBIE/EXITED/BLOCKED prev keeps its
         // state (exit_current races the tick — the tick must not resurrect).
+        // ZOMBIE-TARGET GUARD (bisected 2026-09-09: post-hello #PF err=0
+        // cr2=eip=esp=0 — the tick's prologue snapshots next_esp BEFORE the
+        // drain reaps the target (IF SET on kernel threads); the re-resolve
+        // checks UNUSED but a ZOMBIE slot is NOT unused (reap deferred to
+        // waiters) — without this the switch loads poisoned esp=0 and resumes
+        // into nothing. Refuse ZOMBIE/EXITED/esp==0 targets (waiter reaps;
+        // tick retries next slice).
+        if (nx->state == PROC_ZOMBIE || nx->state == PROC_EXITED ||
+            nx->esp == 0) {
+            switch_busy = 0;
+            __asm__ volatile("sti" ::: "memory");
+            return;
+        }
         if (pv->state == PROC_RUNNING)
             pv->state = PROC_READY;
         nx->state = PROC_RUNNING;
