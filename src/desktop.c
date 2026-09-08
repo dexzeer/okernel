@@ -1442,6 +1442,10 @@ void kernel_main(uint32_t mboot_phys) {
                         if (wake) {
                             // Consume the staged resume for real this time.
                             sched_park_take((uint32_t)pid, &park_ret);
+                            // WAKE-TRACE (bisect 2026-09-09: post-hello #PF
+                            // eip=esp=0 — find who enters zeros).
+                            serial_printf("[wake] pid=%d eip=%x esp=%x ret=%d\n",
+                                          pid, peip, pesp, (int)park_ret);
                             eip = peip; esp = pesp;
                             is_park_resume = 1;
                             dp->state = PROC_READY;
@@ -1504,6 +1508,11 @@ void kernel_main(uint32_t mboot_phys) {
             }
             if (is_fork_child) enter_user_mode_fork_child();
             else if (is_park_resume) enter_user_mode_park_ret(park_ret);
+            // ENTER-TRACE (bisect 2026-09-09: post-hello #PF eip=esp=0 —
+            // prove every IRET's target; the crash enters pid 4 with zeros
+            // and NO [wake]/[fork-enter]/[kbd-wake] line precedes it).
+            serial_printf("[enter] pid=%d eip=%x esp=%x fork=%d park=%d\n",
+                          pid, eip, esp, is_fork_child, is_park_resume);
             // Register calling convention: eip->EAX, esp->EDX (enter takes NO
             // stack args, so ESP points AT the return address and the save is
             // exact). Clobbers: eax,ebx,ecx,edx + memory. EBX is consumed as
@@ -1706,6 +1715,8 @@ void kernel_main(uint32_t mboot_phys) {
                 rp->entered_ring3 = 1;
                 rp->ticks_left = SCHED_SLICE_TICKS;
                 enter_user_mode_park_ret(rret);
+                serial_printf("[enter] pid=%d eip=%x esp=%x fork=0 park=1 (kbd-wake)\n",
+                              rp->pid, reip, resp);
                 __asm__ volatile(
                     "push %%ebx; push %%esi;"
                     "mov %0, %%eax; mov %1, %%edx;"
