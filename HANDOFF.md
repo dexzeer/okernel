@@ -1856,3 +1856,25 @@ are one small GET so cwnd would buy nothing; the wins are latency + honesty):
 - Docs: checkpoints current through 0a14115 (exited-skip). Plan NEXT-1/2 (input
   bug + hello end-to-end) DONE in practice except the post-run crash; NEXT-3
   (kernel shell skip) DONE via the foreground gate; NEXT-4 (builtins) not started.
+
+### Update 2026-09-09 ~02:30 — post-run #PF narrowed: timer switch into reaped waiter slot
+- All `[enter]` targets are clean (no zero-addr IRET anywhere — 8 enters, all
+  valid). The crash is the TIMER path: `process_switch_to` snapshots
+  next_esp/eip BEFORE its cli, then the drain reaps/reuses the slot between
+  snapshot and `context_switch` — re-resolve checks UNUSED but ring-3 wait()
+  reaps to UNUSED... covered. What it does NOT cover: RING-3 wait reaping the
+  CURRENTLY-ENTERED thread's sibling while the tick has it snapshotted, then
+  `process_create` REUSING the slot for a fresh spawn (state READY, esp set,
+  eip=0/unseeded — passes every guard) while `next_cr3` still holds the OLD
+  (freed) PD phys. The switch loads a freed PD → #PF err=0 (read, non-present)
+  with garbage ESP. cr2=0/eip=esp=0 in the log is the poisoned PCB (destroy
+  zeroes esp/esp0/page_dir), i.e. the tick switched into a slot
+  MID-reuse (freed but not yet re-initialized, or re-initialized with a PD
+  whose pages were reclaimed).
+- NEXT (concrete): (1) add a per-switch serial-free generation guard —
+  simplest: `process_destroy` bumps a `generation` on the slot; `switch_to`
+  snapshots it + re-checks under cli, aborts on mismatch; (2) stop freeing PD
+  pages on destroy when a tick may hold them: defer frees to a reap queue
+  drained by the main loop with the tick held (switch_busy) — or simply never
+  free PD pages (leak 8KB/exit; fine for a hobby shell — 16 slots max, PMM has
+  MBs); (3) re-test sh+hello, then move to builtins (NEXT-4).
