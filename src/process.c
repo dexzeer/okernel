@@ -295,10 +295,11 @@ void process_switch(uint32_t pid) {
     // parked thread has no live kernel frame; its resume runs through the
     // entry drain (prepare + enter_user_mode), never a CR3-only handoff.
     // The drain's wake path sets READY before entering; the tick never
-    // picks BLOCKED (process_next skips them). Refuse loudly (serial) so a
-    // future caller faults visibly here instead of mysteriously at resume.
+    // picks BLOCKED (process_next skips them). SILENT refuse (no serial:
+    // process_switch runs in the drain's cli-held window and on tick-adjacent
+    // paths — serial_printf there re-enters the formatter; the refusal is
+    // observable via the missing switch, not a line).
     if (next->state == PROC_BLOCKED) {
-        serial_printf("[sw] refuse BLOCKED pid=%d\n", pid);
         return;
     }
     if (next->state != PROC_READY && next->state != PROC_RUNNING) return;
@@ -496,21 +497,10 @@ void process_switch_to(uint32_t pid) {
         // Woken thread lands here (same code path both directions):
         // clear the guard + re-enable. current_slot was set pre-switch and
         // is already correct for the woken thread. No serial (prints twice
-        // per switch — once per direction).
-        // RESUME-TRACE (bisect 2026-09-09: post-hello #PF cs=8 eip=0 — prove
-        // every kernel-thread resume lands with a sane EIP. Prints the
-        // return address (top of stack) + current pid/slot. Gated by a flag
-        // so normal runs stay quiet... actually ALWAYS (switches are ~10/s;
-        // the serial can take it; remove after the bisect).
-        {
-            uint32_t retaddr = 0;
-            __asm__ volatile("mov (%%esp), %0" : "=r"(retaddr));
-            extern struct process *process_current(void);
-            struct process *rc = process_current();
-            serial_printf("[sw-resume] pid=%d ret=%x esp=%x\n",
-                          rc ? (int)rc->pid : -99, retaddr,
-                          (uint32_t)&retaddr);
-        }
+        // per switch — once per direction; WORSE: serial_printf's deep
+        // va_list frames + static formatter state corrupt the switch frame
+        // itself — bisected 2026-09-09: a resume-trace here moved the crash
+        // INTO switch_to's prologue. NEVER serial inside switch paths).
         switch_busy = 0;
         __asm__ volatile("sti" ::: "memory");
     }
