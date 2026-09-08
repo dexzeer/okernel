@@ -1751,3 +1751,36 @@ are one small GET so cwnd would buy nothing; the wins are latency + honesty):
   copy path clean: child got the line). All seeded via userland_seed.c.
 - Docs: to-do.txt crossed (done/x, in-progress/~, open bug noted); plan file
   phases marked DONE/PARTIAL + NEXT list; this HANDOFF entry.
+
+### Update 2026-09-09 ~01:00 — isr.asm RESTORED + checkpointed; input bug STILL OPEN (EAX!=0 proven at IRET)
+- ACCIDENT + RECOVERY: a `git checkout boot/isr.asm` (meant to drop a comment-only
+  edit) reverted the file to the 138-line HEAD version — wiping the entire ring-3
+  block (enter_user_mode, fork/park flags, context_switch, both trampolines, .bss
+  frame) that was never committed (all untracked/uncommitted session work). Rebuilt
+  it line-for-line from the `boot/isr.o` disassembly (`objdump -d`, object survived
+  from the 23:32 build) + one fix: the checked-in file never defined `isr80` (the
+  INT 0x80 stub idt.c references — pre-existing link gap, previously papered by the
+  stale .o). Added the 0x80 stub (err=0 + int_num=0x80 → isr_common_stub) + moved
+  `.note.GNU-stack` LAST (was mid-file — code after it lands non-executable).
+  Verified: `nasm` clean, globals T (not N), ISO links + boots, ring-3 alive.
+- SAFETY (standing): `git commit` early and often on this project — the session
+  proved a one-line checkout can nuke a day of asm work. Two checkpoints now exist:
+  a09cb63 (cutover WIP) + d1a5548 (isr restore). NEVER `git checkout -- <file>`
+  with uncommitted work; use `git diff` + targeted edits instead.
+- INPUT BUG, HARD PROOF (forkexec log): `[fork-enter] pid=5 ... EAX=0` logged (drain
+  DID flag the child) yet the child's first exec trap shows
+  `ebx=8049109` (= its own resume EIP bytes `89 c3...` = `mov %eax,%ebx`) — i.e.
+  EAX!=0 at the child's fork-resume instruction DESPITE the flag. So the flag is
+  consumed between `enter_user_mode_fork_child()` and the child's IRET — OR the
+  IRET lands with a stale EAX path... `enter_user_mode` reads `user_fork_child`
+  (single global) at IRET-build time; a park-resume entry for ANOTHER pid between
+  flag-set and IRET would NOT consume it (separate flag)... but TWO fork children
+  queued WILL (first IRET consumes, second finds clear). Current case has ONE
+  child — so suspect: the tick's `process_switch_to` context_switch SAVE/RESTORE
+  of... no, IRET EAX is built fresh per entry. STILL OPEN. Next: pid-tag the flag
+  (`user_fork_child_pid`, enter takes pid... register convention has no room —
+  use a per-slot array + drain-passed slot, or re-set the flag INSIDE the
+  cli-held region just before `call enter_user_mode`).
+- e1000_poll #PF (err=0 cr2=0x8001c esp=garbage) is a SECOND, kernel-side crash
+  (stale ESP0/trap-stack or half-switched CR3 at IRQ time) — after the child
+  mess, not instead of it. Audit ESP0 across park paths next.
