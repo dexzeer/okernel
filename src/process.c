@@ -497,6 +497,20 @@ void process_switch_to(uint32_t pid) {
         // clear the guard + re-enable. current_slot was set pre-switch and
         // is already correct for the woken thread. No serial (prints twice
         // per switch — once per direction).
+        // RESUME-TRACE (bisect 2026-09-09: post-hello #PF cs=8 eip=0 — prove
+        // every kernel-thread resume lands with a sane EIP. Prints the
+        // return address (top of stack) + current pid/slot. Gated by a flag
+        // so normal runs stay quiet... actually ALWAYS (switches are ~10/s;
+        // the serial can take it; remove after the bisect).
+        {
+            uint32_t retaddr = 0;
+            __asm__ volatile("mov (%%esp), %0" : "=r"(retaddr));
+            extern struct process *process_current(void);
+            struct process *rc = process_current();
+            serial_printf("[sw-resume] pid=%d ret=%x esp=%x\n",
+                          rc ? (int)rc->pid : -99, retaddr,
+                          (uint32_t)&retaddr);
+        }
         switch_busy = 0;
         __asm__ volatile("sti" ::: "memory");
     }
