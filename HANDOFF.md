@@ -1808,3 +1808,32 @@ are one small GET so cwnd would buy nothing; the wins are latency + honesty):
   child's stack page phys, sanity (tesp offset >= 64 else abort child).
 - SECOND CRASH unchanged: e1000_poll #PF err=0 cr2=0x8001c esp=garbage — stale
   ESP0 or half-switched CR3 at IRQ time. Audit AFTER the stub lands.
+
+### Update 2026-09-09 ~01:30 — FORK STUB FIXED (children live); sh reaches exec; stale-queue + e1000 #PF remain
+- FORK STUB (sys_proc.c): fork children now enter through a 5-byte stub
+  (`pop ebx/edi/esi/ebp; ret`, page base) with frame [EBX][EDI][ESI][EBP]
+  [resume-EIP] below the trapped ESP — two bugs fixed along the way: frame was
+  laid backwards ([resume][regs] — pops read garbage, ret to garbage, #UD), and
+  entry ESP pointed past the frame (+20 — first pop read resume-EIP as EBX, ret
+  to EBX = #UD). dbgchild/dbg2/dbg3 still PASS; sh's child now reaches exec with
+  VALID ESI/EBP (`ebx=bffffec4` = the real `line` buffer, correct bytes
+  `run /bin/sh`... but stale — see below).
+- EXEC-ARG MISMATCH (still open, narrowed): sh typed `/bin/hello` but the child
+  exec'd the STALE `run /bin/sh` line (offered at kernel-shell time, read by sh
+  pid 2 as its first read). So sh's read consumed the stale backlog instead of
+  the fresh keystrokes — the keystrokes arrived while sh was parked/execing and
+  either (a) went to the kernel shell (which offers+executes them as kernel
+  commands — the `Unknown:`/double-execution path), or (b) sat in the queue
+  behind... precisely: sh read n=11 stale → fork → child exec stale → fail;
+  fresh `/bin/hello` line offered LATER (kernel shell consumed it — check serial
+  for `[sh] exec:` after). FIX (next): kernel shell MUST NOT consume lines while
+  a userland foreground process owns the terminal (plan NEXT-3 — now the blocker,
+  not step 3). Gate: `on_keypress` offers to the queue ALWAYS but calls
+  `shell_execute` only when no `run_wait_pid`/foreground userland process is live
+  on that window.
+- SECOND CRASH (kernel-side, unchanged): e1000_poll #PF err=0 cr2=0x8001c with
+  esp=garbage (0x3ff6809 — not a kernel stack). Stale ESP0 or half-switched CR3
+  at IRQ time; happens after init respawns sh. Audit ESP0 across park paths +
+  CR3 across the park trampoline (whose PD is live when the park jmp runs?).
+- Bisect traces stay (`[exec-ebx]`, `[exec-arg]`, `[kbd]`, `[fork]`, #PF pid)
+  until sh runs hello end-to-end.
