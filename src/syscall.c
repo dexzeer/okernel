@@ -272,6 +272,36 @@ void syscall_stash_park_ret(uint32_t v) {
     // idt.c re-stages for the drain (same trap, same thread — self slot).
     park_ret[trap_slot_self()] = v;
 }
+// Drain-side getters: the drain runs as pid 0 (main loop), NOT as the
+// parker — so self-slot is WRONG here (bisected 2026-09-09: the drain read
+// slot 0's empty park state instead of the parker's, staged EIP=ESP=0, and
+// parked readers slept forever — sh never saw offers). Take an explicit pid
+// and resolve its slot by scan (slots never move; UNUSED → slot 0 empty).
+static unsigned trap_slot_of_pid(uint32_t pid) {
+    extern void *process_get(uint32_t pid) __attribute__((weak));
+    extern void *process_get_by_slot(int slot) __attribute__((weak));
+    if (process_get && process_get_by_slot) {
+        void *pcb = process_get(pid);
+        if (pcb) {
+            for (unsigned s = 0; s < 16; s++) {
+                if (process_get_by_slot((int)s) == pcb) return s;
+            }
+        }
+    }
+    return 0;
+}
+uint32_t syscall_park_eip_for(uint32_t pid) {
+    return park_eip[trap_slot_of_pid(pid)];
+}
+uint32_t syscall_park_esp_for(uint32_t pid) {
+    return park_esp[trap_slot_of_pid(pid)];
+}
+uint32_t syscall_take_park_ret_for(uint32_t pid) {
+    unsigned s = trap_slot_of_pid(pid);
+    uint32_t v = park_ret[s];
+    park_ret[s] = 0;
+    return v;
+}
 uint32_t syscall_park_eip(void) { return park_eip[trap_slot_self()]; }
 uint32_t syscall_park_esp(void) { return park_esp[trap_slot_self()]; }
 
