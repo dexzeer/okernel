@@ -99,10 +99,15 @@ int syscall_take_exec_redirect(void);
 // Park: blocking syscalls arm (retval + trapped EIP/ESP); idt.c consumes
 // after dispatch and jmps to user_park_trampoline (trap discarded, main
 // loop resumes). Drain re-enters the parker with park_ret in EAX.
+// Per-slot like the trap stash. Drain-side getters take an explicit pid
+// (the drain runs as pid 0 — self-slot would read the wrong slot).
 void syscall_arm_park(uint32_t retval);
 int syscall_take_park(void);
 uint32_t syscall_take_park_ret(void);
 void syscall_stash_park_ret(uint32_t v);
 uint32_t syscall_park_eip(void);
 uint32_t syscall_park_esp(void);
+uint32_t syscall_park_eip_for(uint32_t pid);
+uint32_t syscall_park_esp_for(uint32_t pid);
+uint32_t syscall_take_park_ret_for(uint32_t pid);
 #endif

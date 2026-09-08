@@ -282,6 +282,10 @@ void run_wait_arm(int pid, int win) {
     run_wait_pid = pid;
     run_wait_win = win;
 }
+// Offer-wake flag: set by on_keypress (keyboard IRQ context — must NEVER
+// IRET there) after staging a kbd offer; consumed by the main loop (plain
+// thread context) which wake-enters the oldest BLOCKED entered reader.
+static volatile int kbd_wake_armed = 0;
 
 static int str_eq(const char* a, const char* b) {
     while (*a && *b) {
@@ -1006,6 +1010,20 @@ static void on_keypress(char c) {
         // Offer the completed line to any ring-3 reader on fd 0 (keyboard
         // line queue — sys_read(0) drains; non-blocking, drops when full).
         sys_proc_kbd_offer(term_bufs[tidx], term_lens[tidx]);
+        // OFFER-WAKE, DEFERRED (2026-09-09: waking the reader INLINE (IRET
+        // from inside the keyboard IRQ) faulted — #PF err=4 at the resume EIP
+        // with pid=0 live: the IRQ trap frame (keyboard IRQ entered via
+        // irq_common_stub on the CURRENT trap stack) is buried under our IRET
+        // — enter's caller-frame save + iret discards it, and the IRQ never
+        // returns (EOI already sent? no — we never reach irq_handler's EOI...
+        // actually EOI ran (irq_handler prologue); the fault is CR3/ESP0: we
+        // prepared the reader's space but IRETed from IRQ context whose stack
+        // is the interrupted thread's — trampoline resumes the IRQ stub frame
+        // as if it were the drain caller → garbage). Correct shape: ARM a
+        // flag; the MAIN LOOP (plain thread context, next iteration) performs
+        // the wake-enter. One flag word (kbd_wake_armed): set here, consumed
+        // + cleared by the loop before its poll/draw tail.
+        kbd_wake_armed = 1;
         // FOREGROUND GATE (2026-09-08: sh read the STALE `run /bin/sh` line
         // because the kernel shell consumes every line even while a userland
         // foreground process owns the terminal — fresh keystrokes then race
@@ -1518,13 +1536,21 @@ void kernel_main(uint32_t mboot_phys) {
             {
                 struct process *pp = (pid >= 0) ? process_get((uint32_t)pid) : 0;
                 if (pp && pp->state != PROC_ZOMBIE && pp->state != PROC_EXITED) {
-                    extern uint32_t syscall_park_eip(void);
-                    extern uint32_t syscall_park_esp(void);
-                    extern uint32_t syscall_take_park_ret(void);
+                    // Drain-side pid getters (NOT self-slot: the drain runs
+                    // as pid 0; self-slot reads slot 0's empty park state —
+                    // bisected 2026-09-09: parked readers staged EIP=ESP=0
+                    // and slept forever).
+                    extern uint32_t syscall_park_eip_for(uint32_t pid);
+                    extern uint32_t syscall_park_esp_for(uint32_t pid);
+                    extern uint32_t syscall_take_park_ret_for(uint32_t pid);
                     extern void sched_park_stage(uint32_t pid, uint32_t eip, uint32_t esp, uint32_t ret);
-                    uint32_t peip = syscall_park_eip();
-                    uint32_t pesp = syscall_park_esp();
-                    uint32_t pret = syscall_take_park_ret();
+                    uint32_t peip = syscall_park_eip_for((uint32_t)pid);
+                    uint32_t pesp = syscall_park_esp_for((uint32_t)pid);
+                    uint32_t pret = syscall_take_park_ret_for((uint32_t)pid);
+                    // PARK-TRACE (bisect 2026-09-09): prove the drain stages
+                    // the parker's real resume (not slot-0 zeros).
+                    serial_printf("[park] pid=%d eip=%x esp=%x ret=%d\n",
+                                  pid, peip, pesp, (int)pret);
                     pp->state = PROC_BLOCKED;
                     pp->ticks_left = SCHED_SLICE_TICKS;
                     sched_park_stage((uint32_t)pid, peip, pesp, pret);
@@ -1625,6 +1651,69 @@ void kernel_main(uint32_t mboot_phys) {
                 if (!entry_pending_any()) switch_busy = 0;
             }
             __asm__ volatile("sti" ::: "memory");
+        }
+        // OFFER-WAKE CONSUME (see on_keypress: IRQ context must never IRET).
+        // Plain thread context here: wake-enter the oldest BLOCKED entered
+        // reader with a staged resume so it consumes the just-offered line.
+        // Runs BEFORE the poll/draw tail (the reader may exit/park again —
+        // its tail is the drain's abbreviated resume path, same as the IRQ
+        // attempt but on a valid caller frame).
+        if (kbd_wake_armed) {
+            kbd_wake_armed = 0;
+            extern int sched_park_resume(uint32_t, uint32_t*, uint32_t*);
+            extern int sched_park_take(uint32_t, uint32_t*);
+            extern void enter_user_mode_park_ret(uint32_t v);
+            for (int s = 0; s < 16; s++) {
+                struct process *rp = process_get_by_slot(s);
+                if (!rp || rp->pid == 0) continue;
+                if (rp->state != PROC_BLOCKED) continue;
+                if (!rp->entered_ring3) continue;
+                uint32_t reip = 0, resp = 0, rret = 0;
+                if (!sched_park_resume((uint32_t)rp->pid, &reip, &resp)) continue;
+                sched_park_take((uint32_t)rp->pid, &rret);
+                serial_printf("[kbd-wake] pid=%d eip=%x esp=%x\n",
+                              rp->pid, reip, resp);
+                {
+                    extern volatile int switch_busy;
+                    switch_busy = 1;
+                    __asm__ volatile("cli" ::: "memory");
+                }
+                drain_stash_pid(rp->pid);
+                sched_prepare((uint32_t)rp->pid);
+                rp->entered_ring3 = 1;
+                rp->state = PROC_READY;
+                rp->ticks_left = SCHED_SLICE_TICKS;
+                enter_user_mode_park_ret(rret);
+                __asm__ volatile(
+                    "push %%ebx; push %%esi;"
+                    "mov %0, %%eax; mov %1, %%edx;"
+                    "call enter_user_mode"
+                    : : "r"(reip), "r"(resp)
+                    : "eax", "ebx", "ecx", "edx", "memory");
+                // Resumed via trampoline (park or exit — same resume shape
+                // as the drain: caller frame restored, pid from the stash).
+                {
+                    extern int drain_last_pid(void);
+                    int wpid = drain_last_pid();
+                    struct process *wpp = (wpid >= 0) ? process_get((uint32_t)wpid) : 0;
+                    if (wpp && wpp->state != PROC_ZOMBIE && wpp->state != PROC_EXITED) {
+                        uint32_t wpeip = syscall_park_eip_for((uint32_t)wpid);
+                        uint32_t wpesp = syscall_park_esp_for((uint32_t)wpid);
+                        uint32_t wpret = syscall_take_park_ret_for((uint32_t)wpid);
+                        wpp->state = PROC_BLOCKED;
+                        wpp->ticks_left = SCHED_SLICE_TICKS;
+                        sched_park_stage((uint32_t)wpid, wpeip, wpesp, wpret);
+                    }
+                    sched_unprepare();
+                    {
+                        extern volatile int switch_busy;
+                        extern int entry_pending_any(void);
+                        if (!entry_pending_any()) switch_busy = 0;
+                    }
+                    __asm__ volatile("sti" ::: "memory");
+                }
+                break; // one wake per offer
+            }
         }
         // Poll network for incoming packets
         e1000_poll();
