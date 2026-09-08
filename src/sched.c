@@ -25,14 +25,18 @@ void sched_tick(void) {
     if (!cur) return;
     // WAKE PASS (runs even when current isn't RUNNING — e.g. a parked
     // waiter owns ring 3 while pid 0 is READY): if the entry queue holds an
-    // un-entered spawn OR a READY+entered sibling exists, wake ONE
-    // yield-parker (BLOCKED + ticks_left == 1) to READY so its next trap
-    // iret resumes it. Wait-parkers (ticks_left == SCHED_SLICE_TICKS) only
-    // wake on SIG_CHLD (see exit_current) — never here. Trap-safe: PCB
-    // state only, no switches (the switch happens on slice expiry below,
-    // or the drain runs the sibling on the next loop iteration).
+    // un-entered spawn OR a READY+entered sibling exists OR the kbd queue
+    // holds an unread line (a parked reader's wake condition — the line it
+    // waits for is already there; 2026-09-09: sh slept through offers),
+    // wake ONE yield/read-parker (BLOCKED + ticks_left == 1) to READY so its
+    // next trap iret resumes it. Wait-parkers (ticks_left ==
+    // SCHED_SLICE_TICKS) only wake on SIG_CHLD (see exit_current) — never
+    // here. Trap-safe: PCB state only, no switches (the switch happens on
+    // slice expiry below, or the drain runs the sibling on the next loop
+    // iteration).
     {
         extern int entry_pending_any(void);
+        extern int sys_proc_kbd_pending(void);
         int sibling_ready = 0;
         for (int s = 0; s < MAX_PROCESSES; s++) {
             struct process *c = process_get_by_slot(s);
@@ -43,7 +47,7 @@ void sched_tick(void) {
                 break;
             }
         }
-        if (entry_pending_any() || sibling_ready) {
+        if (entry_pending_any() || sibling_ready || sys_proc_kbd_pending()) {
             for (int s = 0; s < MAX_PROCESSES; s++) {
                 struct process *c = process_get_by_slot(s);
                 if (!c) continue;

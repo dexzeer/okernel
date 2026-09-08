@@ -511,6 +511,19 @@ void syscall_handler(uint32_t eax, uint32_t ebx, uint32_t ecx, uint32_t edx) {
             // and the drain re-enters us with EAX=0. Without this the
             // waiter spins in ring 3 while run N+1 sits queued (bisected
             // 2026-09-08: run N wedged under init's wait/yield storm).
+            // READ-PATH SHORT-CIRCUIT (2026-09-09: sh's read-park slept
+            // through kbd offers — the drain's wake rules need a sibling or
+            // queued entry, but an offer is neither. Yield is the reader's
+            // poll loop: if OUR fd-0 queue is non-empty, DON'T park — iret
+            // with EAX=0 so ring 3 retries the read immediately and gets
+            // the line. Park only when truly idle.)
+            {
+                extern int sys_proc_kbd_pending(void);
+                if (sys_proc_kbd_pending()) {
+                    syscall_set_ret(0);
+                    break;
+                }
+            }
             syscall_arm_park(0);
             break;
         }

@@ -17,6 +17,9 @@ int sys_proc_read_fd(int fd, char *buf, uint32_t len);
 // Keyboard line queue: shell offers completed lines, sys_read fd 0 drains.
 void sys_proc_kbd_offer(const char *line, uint32_t len);
 int sys_proc_kbd_read(char *buf, uint32_t len);
+// 1 when the kbd queue holds an unread line (drain wake rule for parked
+// readers — the line they wait for is already there; no sibling needed).
+int sys_proc_kbd_pending(void);
 
 // Owning terminal window of the CURRENT process (term_win field, -1 none).
 // Used by the SYS_WRITE fast path so stdio follows the spawner, not focus.
