@@ -1385,9 +1385,17 @@ void kernel_main(uint32_t mboot_phys) {
                                 }
                             }
                         } else {
-                            // yield/read-park: wake iff work exists
-                            extern int entry_pending_any(void);
+                            // yield/read-park: wake iff work exists.
+                            // READ-PARK EXTRA RULE (2026-09-09: sh typed
+                            // /bin/hello but never ran it — the offer sat in
+                            // the queue while sh slept BLOCKED: yield-wake
+                            // needs a queued entry or READY sibling, but a
+                            // kbd offer is neither. A parked READER with a
+                            // non-empty kbd queue is ALWAYS woken (the line
+                            // it waits for is already there).
+                            extern int sys_proc_kbd_pending(void);
                             wake = entry_pending_any() ? 1 : 0;
+                            if (!wake && sys_proc_kbd_pending()) wake = 1;
                             if (!wake) {
                                 for (int s = 0; s < MAX_PROCESSES; s++) {
                                     struct process *c = process_get_by_slot(s);

@@ -134,6 +134,13 @@ int sys_proc_kbd_read(char *buf, uint32_t len) {
     return (int)n;
 }
 
+int sys_proc_kbd_pending(void) {
+    uint32_t ef = spin_lock_irq(&kbd_lock);
+    int n = kbd_count;
+    spin_unlock_irq(&kbd_lock, ef);
+    return n > 0 ? 1 : 0;
+}
+
 // Owning terminal window of the CURRENT process (see term_win in the PCB).
 int sys_proc_term_win(void) {
     struct process *cur = process_current();
