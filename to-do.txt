@@ -53,6 +53,16 @@ The Big Missing Foundations
         P-384 CertificateVerify for P-384-leaf servers (chain verify HAS it),
         OCSP, cert pinning UI, AES-GCM.
 
+    [x] Adversarial security testing of TLS/PKI — DONE 2026-09-09
+        tests/test_adversarial.c (host, ASan+UBSan): 4000-round mutation fuzz
+        over the real example.com flight through cert_verify (only anchor-TBS
+        mutations may verify — none do) + 19-mode adversarial mock TLS 1.3
+        server (positive ECDSA + RSA-PSS controls, wrong-key/flipped/
+        wrong-transcript CV, hostname/expired, key-share swap MITM, flight
+        order, Finished flip, AEAD bit-flip, close_notify clean). 26/26 PASS.
+        Fixes: Finished failure now sets TLS_FAIL_MAC; cert_verify_trust_extra
+        test hook; tls_dbg on flight-parse failures.
+
     [~] Userland cutover (init + shell-from-disk) — IN PROGRESS, see
         ~/.commandcode/plans/userland-cutover.md Phases 0-4 DONE; Phase 5-6 partial:
         init spawns, /bin/sh prompts, but shell input delivers garbage + #PF

@@ -338,7 +338,10 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         while (p < (uint32_t)pl) {
             uint8_t t; uint32_t bl;
             uint32_t c = parse_hs(pt + p, pl - p, &t, &bl);
-            if (c == 0) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
+            if (c == 0) {
+                tls_dbg("[tls] flight parse failed at p=%u pl=%d\n", p, pl);
+                st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR;
+            }
             const uint8_t* body = pt + p + 4;
             // RFC 8446 §4.4: the encrypted flight is EXACTLY EncryptedExtensions,
             // Certificate, CertificateVerify, Finished — in that order, each
@@ -351,6 +354,9 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                 };
                 if (st->hs_next < 0 || st->hs_next > 3 ||
                     t != expect_types[st->hs_next]) {
+                    tls_dbg("[tls] flight order violation: got type %u, expected %u\n",
+                            t, st->hs_next >= 0 && st->hs_next <= 3
+                               ? expect_types[st->hs_next] : 0);
                     st->fail_reason = TLS_FAIL_PROTO;
                     return TLS_STEP_ERR;
                 }
@@ -363,6 +369,8 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                 if (bl > sizeof(st->cert_body)) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
                 memcpy(st->cert_body, body, bl); st->cert_bl = bl;
                 if (tls_parse_certificate(st->cert_body, st->cert_bl) != 0) {
+                    tls_dbg("[tls] Certificate structural parse failed (len=%u)\n",
+                            st->cert_bl);
                     st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR;
                 }
                 st->got_cert = 1;
@@ -496,8 +504,13 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         transcript_of(st->ch, st->ch_len, st->sh_body, st->sh_bl,
                       st->ee_body, st->ee_bl, st->cert_body, st->cert_bl,
                       st->cv_body, st->cv_bl, NULL, 0, tx_pre_sfin);
-        if (tls_verify_finished(st->s_fin_key, tx_pre_sfin, st->fin_body) != 0)
+        if (tls_verify_finished(st->s_fin_key, tx_pre_sfin, st->fin_body) != 0) {
+            // A bad server Finished is an authentication failure, not a
+            // transport error — flag it so the caller can distinguish it.
+            tls_dbg("[tls] server Finished INVALID\n");
+            st->fail_reason = TLS_FAIL_MAC;
             return TLS_STEP_ERR;
+        }
 
         uint8_t tx_through_sfin[32];
         transcript_of(st->ch, st->ch_len, st->sh_body, st->sh_bl,

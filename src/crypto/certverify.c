@@ -11,6 +11,10 @@
 //   certificate_list<0..2^24-1>            (3B len + entries)
 // entry = cert_data<1..2^24-1> (3B len + DER) + extensions<0..2^16-1> (2B len)
 
+// Single extra trust slot (test/research hook — see certverify.h).
+static uint8_t g_extra_trusted[32];
+static int g_extra_trusted_set = 0;
+
 static int spki_in_roots(const x509_cert* cert) {
     uint8_t hash[32];
     sha256(cert->spki.p, cert->spki.len, hash);
@@ -20,7 +24,18 @@ static int spki_in_roots(const x509_cert* cert) {
         for (int j = 0; j < 32; j++) diff |= hash[j] ^ rh[j];
         if (diff == 0) return 1;
     }
+    if (g_extra_trusted_set) {
+        uint8_t diff = 0;
+        for (int j = 0; j < 32; j++) diff |= hash[j] ^ g_extra_trusted[j];
+        if (diff == 0) return 1;
+    }
     return 0;
+}
+
+void cert_verify_trust_extra(const uint8_t* spki, uint32_t spki_len) {
+    if (!spki) { g_extra_trusted_set = 0; return; }
+    sha256(spki, spki_len, g_extra_trusted);
+    g_extra_trusted_set = 1;
 }
 
 static int verify_sig(const x509_cert* cert, const x509_cert* issuer) {
