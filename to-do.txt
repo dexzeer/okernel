@@ -41,6 +41,18 @@ The Big Missing Foundations
         retransmit (pure-ACK-only discipline), Jacobson/Karels RTO, 8-slot reorder
         buffer (per-connection reset). Still no Reno/CUBIC, still single-connection.
 
+    [x] TLS 1.3 server authentication (full PKI) — DONE 2026-09-09
+        From-scratch X.509/DER parser, ECDSA P-256+P-384 (Montgomery/Jacobian),
+        RSA PKCS#1 v1.5 + RSASSA-PSS (TLS 1.3 mandate), SHA-512/384, 14-root
+        store (SPKI-hash anchored, tools/gen_roots.py), SAN/wildcard hostname
+        match, CMOS RTC validity dates. cert-failure blocks the plain-HTTP
+        fallback (SECURITY WARNING page). Quick TLS hardening: RNG hard-fail,
+        uint32 transcript len, cipher check, alert discrimination, flight
+        order, random session id, narrowed sig-alg offer. Verified live in
+        QEMU (example.com) + self-signed rejection (test_certfail). Deferred:
+        P-384 CertificateVerify for P-384-leaf servers (chain verify HAS it),
+        OCSP, cert pinning UI, AES-GCM.
+
     [~] Userland cutover (init + shell-from-disk) — IN PROGRESS, see
         ~/.commandcode/plans/userland-cutover.md Phases 0-4 DONE; Phase 5-6 partial:
         init spawns, /bin/sh prompts, but shell input delivers garbage + #PF
