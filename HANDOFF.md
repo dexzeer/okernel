@@ -1878,3 +1878,110 @@ are one small GET so cwnd would buy nothing; the wins are latency + honesty):
   drained by the main loop with the tick held (switch_busy) — or simply never
   free PD pages (leak 8KB/exit; fine for a hobby shell — 16 slots max, PMM has
   MBs); (3) re-test sh+hello, then move to builtins (NEXT-4).
+
+## Session 2026-09-09 (later) — TLS 1.3 SERVER AUTHENTICATION (full PKI) — DONE
+
+The crypto stack's diabolical hole is closed: TLS 1.3 now actually
+authenticates the server. Before this session, `tls_parse_certificate` only
+checked DER framing and `tls_parse_certificate_verify` only checked the sig
+length — no X.509, no signatures, no roots, no hostname. Any MITM could
+present its own cert and own the session.
+
+### Quick TLS fixes (first commit e547676)
+1. **RNG hard-fail**: the `i*0x6D+0x13` fallback for ECDHE keys/CH random is
+   GONE — if `rand_bytes` fails the handshake aborts (TLS_FAIL_RNG).
+2. **uint8_t → uint32_t `ch_body_len`** (tls_client.c): the transcript
+   truncated mod 256 for hostnames ≳46 chars — silently wrong traffic keys.
+3. ServerHello **cipher_suite check** (must be 0x1303) + **session-id echo
+   check** (session_id is now RANDOM per handshake, not 32 zeros).
+4. **Alert discrimination** (tls_decrypt_one returns -2 + desc): close_notify
+   ends the fetch cleanly; any OTHER alert/MAC failure is an ERROR — the old
+   code delivered a tampered stream's partial bytes as a "successful" page,
+   and unauthenticated alerts in RECV_BODY were silently IGNORED (loop until
+   timeout).
+5. **Flight order enforced**: EE → Certificate → CertificateVerify →
+   Finished, each exactly once (hs_next in tls_state).
+6. **Sig-alg offer narrowed** to what we can verify (initially {0403,0503,
+   0401} — later +{0804,0805} for RSA-PSS, see below).
+
+### Full PKI (commit 4ff3815)
+- **`src/crypto/der.c/.h`** — minimal DER walker (low-tag-number only,
+  ≤4-byte lengths, no allocation; nodes are views).
+- **`src/crypto/x509.c/.h`** — RFC 5280 parser: TBS span, signature +
+  algorithm, SPKI (RSA n/e or EC point with named-curve OID), UTCTime/
+  GeneralizedTime validity, byte-exact issuer/subject DER (chain matching),
+  SAN dNSName (0x82) + BasicConstraints (CA/pathlen), outer==inner sig-alg
+  OID check, x509_hostname_match (exact + LEFTMOST-label wildcard, RFC 6125).
+- **`src/crypto/sha512.c/.h`** — SHA-512/384 (needed for ecdsa-with-SHA384
+  chain certs). TRAP: the length field is 128-bit big-endian at bytes
+  112..127 (a 64-bit length at 112 + stale 120..127 = silently wrong digests).
+- **`src/crypto/rsa.c/.h`** — RSA public-key verify only: u32-limb
+  Montgomery CIOS, R² by doubling, exponentiation with a `t[nl+1]`
+  OVERFLOW-WORD-AWARE conditional subtract (the bug that made sig^16 wrong:
+  when the CIOS tail's high word is set, the compare must subtract).
+  PKCS#1 v1.5 (DigestInfo prefixes for SHA-256/384/512) + **RSASSA-PSS**
+  (MGF1, saltLen=hLen) — RFC 8446 §4.4.3 REQUIRES PSS for RSA
+  CertificateVerify; a PKCS#1-only offer gets handshake_failure (alert 0x28)
+  from RSA-leaf servers.
+- **`src/crypto/ec.c/.h`** — ECDSA verify over P-256 AND P-384: Montgomery
+  field (u32 limbs), Jacobian dbl/add (a=-3), uniform double-and-add
+  ladder. TRAPS FIXED ALONG THE WAY: (a) the M=3(X²−Z⁴) constant was
+  4(X²−Z⁴) because add_fe_mod(m,m,m) twice doubles instead of tripling;
+  (b) the scalar-mult ladder MUST scan MSB-first — LSB-first while doubling
+  R computes the bit-reversed scalar (2G was right, 3G was garbage);
+  (c) fe_inv via Fermat in Montgomery form is the proper mont inverse.
+- **`tools/gen_roots.py` → `src/crypto/roots.c/.h`** — 14-root store
+  (SSL.com ECC/RSA 2022, ISRG X1/X2, GTS R1/R4, DigiCert G2, Amazon 1/3,
+  USERTrust RSA/ECC, GlobalSign R3, Sectigo R46/E46) embedded as SPKI DER +
+  SHA-256 hashes; matching is hash-to-hash in certverify.c.
+- **`src/crypto/certverify.c/.h`** — chain walk: parse ≤5 certs, verify each
+  sig with the next cert's key (ECDSA or RSA per the TBS sig alg), issuer/
+  subject byte match, CA + pathlen on issuers, dates on every cert, anchor
+  at a root by SPKI hash (cross-signed roots work — the cross-cert carries
+  the root's KEY), hostname match on the leaf, CV_ERR_* reason codes.
+- **`src/rtc.c/.h`** — CMOS RTC (ports 0x70/71, UIP-wait, BCD, read-twice,
+  sanity-gated year 2020..2099) → x509_set_now at boot (desktop.c).
+- **tls_client.c RECV_HS auth block**: cert_verify → parse leaf →
+  CertificateVerify = spaces64 || "TLS 1.3, server CertificateVerify" || 0x00
+  || transcript(CH..Certificate) — SIGNED-DATA IS CONTENT‖THASH (hashing
+  content alone fails) — verified per alg: 0x0403 ECDSA-P256/SHA256,
+  0x0503 ECDSA-P384/SHA384, 0x0804/0x0805 RSA-PSS SHA-256/384, 0x0401
+  RSA-PKCS1/SHA256, with the LEAF key. Failure → TLS_FAIL_CERT.
+- **No HTTP downgrade on cert failure** (desktop.c): tls_net records
+  tls_s.fail_reason; okai's fallback fires ONLY for transport-class
+  failures (DNS/timeout/unreachable). Cert/proto/MAC/alert/RNG failures
+  render a red SECURITY WARNING page (okai.c, tab cert_failed) and NEVER
+  retry over HTTP — a MITM forces that downgrade by killing the handshake.
+- **https://host:port/** — https_get_port threads the port (TLS path also
+  skips DNS for numeric IPs like the HTTP path does; UNCONDITIONAL
+  dns_resolve() would CLEAR the seeded cache and doom numeric hosts).
+
+### Verification
+- Host: tests/test_pki.c — 34 PASS: example.com chain (leaf ECDSA-P256/
+  SHA256, int P-256→P-384/SHA384, anchor SSL.com ECC Root 2022), tamper +
+  outer/inner alg mismatch rejection, hostname (6 cases incl. deep wildcard
+  + suffix spoof), validity windows, 5 RSA + 5 ECC root self-verifies,
+  full cert_verify + negatives. test_tls_client.c — PHASE 4 + MITM PASS
+  (same wire, verify_host=evil.example.attacker.io → rejected, reason=4).
+- QEMU: test_pki_qemu.py — `[rtc] wall clock: 2026-9-9`, example.com loads,
+  `[tls] certificate chain verified, host matched`. test_certfail.py —
+  self-signed RSA server (host :8443, python ssl): handshake completes
+  (PSS works), verification FAILS (reason=4), NO http fallback.
+- Regressions: test_nav 4/4, test_addrbar, test_subres, text build.
+  test_errors 2 known FAILs identical on the pre-session baseline.
+
+### Traps for the next agent
+- Advertised sig algs MUST match what the CV dispatcher verifies — offering
+  an unverifiable alg lets the server pick it and kills the handshake late.
+- The chain's ECDSA alg comes from the ISSUER cert's TBS sig_alg, not the
+  leaf's; the CV alg is independent of both.
+- Montgomery CIOS conditional subtract must include the overflow word
+  (t[nl]|t[nl+1]) — low-limb-only compare silently corrupts big values.
+- Scalar mult MSB-first. Always.
+- Host test gotchas that cost time: /tmp fixtures die mid-run (use
+  tests/fixtures/), python DER walking needs 128-byte SHA-512 blocks, and
+  GTS/SSL.com certs' P-384 prime has SEVEN 0xFFFFFFFF groups then
+  FFFFFFFE, FFFFFFFF, 0,0, FFFFFFFF — count them.
+- RSA-4096 chains fit cert_body[12288] (was 8192 — bumped).
+- NEXT crypto steps (optional): P-384 CV for P-384-leaf servers (chain
+  verify already has the curve), OCSP stapling, AES-GCM, session tickets.
