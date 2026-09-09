@@ -64,11 +64,13 @@ int tls_ext_append_psk_key_exchange_modes(uint8_t* buf, uint32_t cap, uint32_t* 
 // ---- ClientHello builder ----
 // Fills `out` with a complete handshake message: type(1) || len(3) || body.
 // `random32` must be 32 bytes of client random (caller seeds).
-// `x25519_pub` must be 32 bytes of our ephemeral public key.
-// `hostname` may be NULL to omit SNI.
+// `session_id` must be 32 random bytes (NOT zeros — the server echoes it
+// back and we verify the echo). `x25519_pub` must be 32 bytes of our
+// ephemeral public key. `hostname` may be NULL to omit SNI.
 // Returns total bytes written (header + body), or 0 on overflow.
 uint32_t tls_build_client_hello(uint8_t* out, uint32_t cap,
                                 const uint8_t random32[32],
+                                const uint8_t session_id[32],
                                 const uint8_t x25519_pub[32],
                                 const char* hostname);
 
@@ -77,7 +79,8 @@ uint32_t tls_build_client_hello(uint8_t* out, uint32_t cap,
 
 // Pulls the server's selected cipher_suite, version, and x25519 public key.
 // `sh_body` / `sh_len` = ServerHello handshake body (after the type+len hdr).
-// `out_cipher` / `out_random` (32B) / `out_pub` (32B) are filled.
+// `expect_session_id` = the 32 random bytes we sent in our ClientHello; the
+// server's echo MUST match. Rejects any cipher suite we did not offer.
 typedef struct {
     uint16_t cipher_suite;
     uint8_t  legacy_version;
@@ -87,6 +90,7 @@ typedef struct {
 } tls_server_hello;
 
 int tls_parse_server_hello(const uint8_t* sh_body, uint32_t sh_len,
+                           const uint8_t expect_session_id[32],
                            tls_server_hello* out);
 
 // Pull the server's chosen ALPN from an EncryptedExtensions body. Skips

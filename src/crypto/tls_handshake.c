@@ -78,24 +78,15 @@ int tls_ext_append_supported_groups(uint8_t* buf, uint32_t cap, uint32_t* pos) {
 }
 
 int tls_ext_append_signature_algorithms(uint8_t* buf, uint32_t cap, uint32_t* pos) {
-    // Match openssl's exact 13 entries — Python ssl was rejecting our CH
-    // with illegal_parameter when we offered a custom list. The exact
-    // openssl set is safe.
+    // Offer ONLY algorithms this client can actually verify (ec.c + rsa.c):
+    //   ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, rsa_pkcs1_sha256.
+    // Advertising unverifiable algorithms (RSA-PSS, Ed25519, ECDSA-P521...)
+    // lets the server pick one for CertificateVerify that we must then
+    // reject — fail at the offer, not mid-handshake.
     static const uint16_t algs[] = {
         0x0403, // ECDSA_SECP256R1_SHA256
         0x0503, // ECDSA_SECP384R1_SHA384
-        0x0603, // ECDSA_SECP521R1_SHA512
-        0x0807, // ED25519
-        0x0808, // ED448
-        0x0809, // RSA_PSS_PSS_SHA256
-        0x080a, // RSA_PSS_PSS_SHA384
-        0x080b, // RSA_PSS_PSS_SHA512
-        0x0804, // RSA_PSS_RSAE_SHA256
-        0x0805, // RSA_PSS_RSAE_SHA384
-        0x0806, // RSA_PSS_RSAE_SHA512
         0x0401, // RSA_PKCS1_SHA256
-        0x0501, // RSA_PKCS1_SHA384
-        0x0601, // RSA_PKCS1_SHA512
     };
     uint32_t n = sizeof(algs) / sizeof(algs[0]);
     uint32_t start = *pos;
@@ -191,6 +182,7 @@ int tls_ext_append_psk_key_exchange_modes(uint8_t* buf, uint32_t cap, uint32_t* 
 
 uint32_t tls_build_client_hello(uint8_t* out, uint32_t cap,
                                 const uint8_t random32[32],
+                                const uint8_t session_id[32],
                                 const uint8_t x25519_pub[32],
                                 const char* hostname) {
     // Build the body first into a scratch buffer, then prepend the
@@ -205,11 +197,11 @@ uint32_t tls_build_client_hello(uint8_t* out, uint32_t cap,
     if (!buf_has(sizeof(body), pos, 32)) return 0;
     memcpy(body + pos, random32, 32); pos += 32;
     // legacy_session_id (1B len + 32B data — used by TLS 1.3 for compat
-    // with middleboxes that expect it. Empty is also OK but some servers
-    // prefer non-empty.
+    // with middleboxes that expect it). Randomized per handshake (NOT
+    // hardcoded zeros): the server must echo it back, which we verify.
     if (!buf_has(sizeof(body), pos, 1 + 32)) return 0;
     body[pos++] = 32;
-    for (int i = 0; i < 32; i++) body[pos++] = 0;
+    for (int i = 0; i < 32; i++) body[pos++] = session_id[i];
     // cipher_suites (2B len + entries). Offer ONLY ChaCha20-Poly1305-SHA256
     // because we only implement SHA-256 + 32-byte key derivation. Servers
     // that pick AES-GCM would require SHA-384 keys we don't compute.
@@ -255,6 +247,7 @@ uint32_t tls_build_client_hello(uint8_t* out, uint32_t cap,
 // ---- ServerHello parser ----
 
 int tls_parse_server_hello(const uint8_t* sh, uint32_t sh_len,
+                           const uint8_t expect_session_id[32],
                            tls_server_hello* out) {
     // legacy_version(2) | random(32) | legacy_session_id_echo(1B len + 0..32)
     // | cipher_suite(2) | legacy_compression_method(1) | extensions(2B len + ...)
@@ -266,8 +259,19 @@ int tls_parse_server_hello(const uint8_t* sh, uint32_t sh_len,
     uint8_t sid_len = sh[p++];
     if (sid_len > 32) return -1;
     if (sh_len < p + sid_len + 2 + 1 + 2) return -1;
+    // RFC 8446 §4.1.3: the server MUST echo our legacy_session_id. A mismatch
+    // means this is not a genuine reply to our ClientHello.
+    if (sid_len != 32) return -1;
+    {
+        uint8_t diff = 0;
+        for (int i = 0; i < 32; i++) diff |= sh[p + i] ^ expect_session_id[i];
+        if (diff != 0) return -1;
+    }
     p += sid_len;
     out->cipher_suite = get_u16(sh + p); p += 2;
+    // We offered exactly one real cipher suite; anything else (a server
+    // "negotiating" an algorithm we cannot do) is a hard failure.
+    if (out->cipher_suite != TLS_CIPHER_CHACHA20_POLY1305_SHA256) return -1;
     if (sh[p] != 0) return -1;                  // compression_method
     p += 1;
     if (sh_len < p + 2) return -1;
