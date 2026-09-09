@@ -27,6 +27,11 @@
 // result is used. Returns CV_OK or a CV_ERR_* code.
 int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname);
 
+// Test/research hook: register ONE extra trusted SPKI (hash computed here),
+// consulted alongside the embedded store. Lets adversarial tests install a
+// mock root without polluting the production store. Passing NULL clears it.
+void cert_verify_trust_extra(const uint8_t* spki, uint32_t spki_len);
+
 // Parse just the leaf (first) certificate out of a Certificate message body.
 // Returns 0 and fills *leaf (views into msg_body), -1 on malformed input.
 int cert_leaf(const uint8_t* msg_body, uint32_t msg_len, x509_cert* leaf);
