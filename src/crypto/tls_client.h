@@ -38,6 +38,19 @@ struct tls_client_io {
 #define TLS_STEP_DONE   1   // out/out_len hold the full plaintext response
 #define TLS_STEP_ERR   -1   // handshake or transport failure
 
+// Why the state machine stopped. Recorded in tls_state.fail_reason so the
+// caller can distinguish "clean end" from "peer killed us" from "the
+// certificate chain failed to verify" — the okai must NOT fall back to plain
+// HTTP on the latter two (a MITM can force that by killing the handshake).
+#define TLS_FAIL_NONE        0
+#define TLS_FAIL_ALERT_CLOSE 1  // close_notify — clean EOF
+#define TLS_FAIL_ALERT       2  // fatal alert (tls_state.alert_desc)
+#define TLS_FAIL_MAC         3  // record decrypt/MAC failure (tampering?)
+#define TLS_FAIL_CERT        4  // certificate chain verification failed
+#define TLS_FAIL_HOSTNAME    5  // hostname does not match certificate
+#define TLS_FAIL_PROTO       6  // protocol violation
+#define TLS_FAIL_RNG         7  // entropy source unavailable (never synthesize keys)
+
 enum tls_phase {
     TLS_PH_SEND_CH = 0,  // build + send ClientHello
     TLS_PH_RECV_SH,      // read ServerHello (cleartext)
@@ -57,7 +70,7 @@ struct tls_state {
     uint32_t out_len;
 
     // Ephemeral handshake material
-    uint8_t priv[32], pub[32], random[32];
+    uint8_t priv[32], pub[32], random[32], session_id[32];
     uint8_t ch[1024]; uint32_t ch_len;
     uint8_t sh_body[4096]; uint32_t sh_bl;
     uint8_t c_hs_key[32], c_hs_iv[12];
@@ -72,6 +85,12 @@ struct tls_state {
     uint8_t c_ap_key[32], c_ap_iv[12], s_ap_key[32], s_ap_iv[12];
     uint8_t c_fin_key[32];
     uint64_t c_ap_seq, s_ap_seq;
+
+    // Handshake flight order: 0=expect EE, 1=CERT, 2=CV, 3=Finished.
+    int hs_next;
+    // Diagnostics / failure classification for the caller.
+    int fail_reason;   // TLS_FAIL_* (TLS_FAIL_NONE while running)
+    int alert_desc;    // alert description when fail_reason == TLS_FAIL_ALERT
 
     // Reassembly buffer for the record currently being read across steps.
     uint8_t rec_buf[TLS_RECORD_MAX_PAYLOAD + 5];

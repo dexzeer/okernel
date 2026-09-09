@@ -24,13 +24,15 @@ static void host_rng(uint8_t* out, uint32_t n) {
 }
 #endif
 
-static void tls_fill_random(uint8_t* out, uint32_t n) {
+// Fills `out` with n random bytes. Returns 0 on failure — callers MUST abort
+// the handshake in that case. Never synthesize deterministic "random": these
+// bytes become the ECDHE private key and the ClientHello nonce.
+static int tls_fill_random(uint8_t* out, uint32_t n) {
 #ifdef KERNEL
-    if (rand_bytes(out, n) != 1) {
-        for (uint32_t i = 0; i < n; i++) out[i] = (uint8_t)(i * 0x6D + 0x13);
-    }
+    return rand_bytes(out, n) == 1;
 #else
     host_rng(out, n);
+    return 1;
 #endif
 }
 
@@ -147,7 +149,8 @@ static int tls_recv_record_st(struct tls_state* st, const struct tls_client_io* 
 
 // Decrypt the single fully-buffered record (st->rec_buf) under the given keys.
 // Returns inner plaintext length (minus trailing content-type byte) on success,
-// 0 for a ChangeCipherSpec (caller skips), -1 on error/alert.
+// 0 for a ChangeCipherSpec (caller skips), -2 for an alert record (description
+// recorded in st->alert_desc), -1 on any other error (including MAC failure).
 static int tls_decrypt_one(struct tls_state* st, uint8_t key[32], uint8_t iv[12],
                            uint64_t* seq, uint8_t* pt, uint32_t ptcap,
                            uint8_t* ctype) {
@@ -155,7 +158,12 @@ static int tls_decrypt_one(struct tls_state* st, uint8_t key[32], uint8_t iv[12]
     tls_record v;
     if (tls_record_parse_header(st->rec_buf, 5, &v) != 5) return -1;
     if (v.type == TLS_CT_CHANGE_CIPHER_SPEC) { *ctype = TLS_CT_CHANGE_CIPHER_SPEC; return 0; }
-    if (v.type == TLS_CT_ALERT) return -1;
+    if (v.type == TLS_CT_ALERT) {
+        // Plaintext alert (pre-handshake). Body = level(1) + description(1).
+        if (rec_pl == 2) st->alert_desc = st->rec_buf[6];
+        *ctype = TLS_CT_ALERT;
+        return -2;
+    }
     if (v.type != TLS_CT_APPDATA) return -1;
     if (rec_pl < 16) return -1;
     uint32_t ct_len = rec_pl - 16;
@@ -187,6 +195,9 @@ void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
     st->phase = TLS_PH_SEND_CH;
     st->rec_have = 0;
     st->rec_pl = 0;
+    st->hs_next = 0;
+    st->fail_reason = TLS_FAIL_NONE;
+    st->alert_desc = -1;
 }
 
 // Advance the client by (at most) one blocking I/O op. Returns TLS_STEP_AGAIN
@@ -195,13 +206,27 @@ void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
 int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
     switch (st->phase) {
     case TLS_PH_SEND_CH: {
-        tls_fill_random(st->priv, 32);
+        // Entropy is mandatory: the private key and hello nonce MUST come
+        // from the CPRNG. If it is unavailable we abort — a predictable
+        // private key breaks confidentiality outright.
+        if (!tls_fill_random(st->priv, 32)) {
+            st->fail_reason = TLS_FAIL_RNG;
+            return TLS_STEP_ERR;
+        }
         st->priv[0] &= 248; st->priv[31] &= 127; st->priv[31] |= 64;
         x25519_public_key(st->pub, st->priv);
-        tls_fill_random(st->random, 32);
+        if (!tls_fill_random(st->random, 32)) {
+            st->fail_reason = TLS_FAIL_RNG;
+            return TLS_STEP_ERR;
+        }
+        if (!tls_fill_random(st->session_id, 32)) {
+            st->fail_reason = TLS_FAIL_RNG;
+            return TLS_STEP_ERR;
+        }
         st->ch_len = tls_build_client_hello(st->ch, sizeof(st->ch),
-                                            st->random, st->pub, st->host);
-        if (st->ch_len == 0) return TLS_STEP_ERR;
+                                            st->random, st->session_id,
+                                            st->pub, st->host);
+        if (st->ch_len == 0) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
         if (send_record(TLS_CT_HANDSHAKE, st->ch, st->ch_len, io) != 0)
             return TLS_STEP_ERR;
         st->phase = TLS_PH_RECV_SH;
@@ -215,24 +240,34 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         if (r < 0) return TLS_STEP_ERR;
 
         tls_record rec_v;
-        if (tls_record_parse_header(st->rec_buf, 5 + st->rec_pl, &rec_v) != 5)
+        if (tls_record_parse_header(st->rec_buf, 5 + st->rec_pl, &rec_v) != 5) {
+            st->fail_reason = TLS_FAIL_PROTO;
             return TLS_STEP_ERR;
-        if (rec_v.type != TLS_CT_HANDSHAKE) return TLS_STEP_ERR;
+        }
+        if (rec_v.type != TLS_CT_HANDSHAKE) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
 
         uint8_t hs_t; uint32_t hs_bl;
         uint32_t consumed = parse_hs(st->rec_buf + 5, st->rec_pl, &hs_t, &hs_bl);
-        if (consumed == 0 || hs_t != TLS_HS_SERVER_HELLO) return TLS_STEP_ERR;
+        if (consumed == 0 || hs_t != TLS_HS_SERVER_HELLO) {
+            st->fail_reason = TLS_FAIL_PROTO;
+            return TLS_STEP_ERR;
+        }
 
         tls_server_hello sh;
-        if (tls_parse_server_hello(st->rec_buf + 5 + 4, hs_bl, &sh) != 0)
+        if (tls_parse_server_hello(st->rec_buf + 5 + 4, hs_bl,
+                                   st->session_id, &sh) != 0) {
+            st->fail_reason = TLS_FAIL_PROTO;
             return TLS_STEP_ERR;
+        }
         st->sh_bl = hs_bl;
         for (uint32_t i = 0; i < hs_bl && i < sizeof(st->sh_body); i++)
             st->sh_body[i] = st->rec_buf[5 + 4 + i];
 
-        uint8_t ch_body_len = st->ch_len - 4;
-        uint8_t transcript_after_sh[32];
-        {
+        // ch_len includes the 4-byte handshake header. MUST be uint32_t: a
+        // uint8_t truncated mod 256 for long SNI hostnames (CH body > 255B),
+        // corrupting the transcript hash and killing the handshake.
+        uint32_t ch_body_len = st->ch_len - 4;
+        uint8_t transcript_after_sh[32];        {
             tls_transcript snap;
             tls_transcript_init(&snap);
             tls_transcript_update_msg(&snap, TLS_HS_CLIENT_HELLO,
@@ -244,7 +279,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
 
         uint8_t shared[32];
         x25519_shared_secret(shared, st->priv, sh.key_share);
-        if (shared_is_zero(shared)) return TLS_STEP_ERR;
+        if (shared_is_zero(shared)) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
         uint8_t early_secret[32]; tls_early_secret(NULL, 0, early_secret);
         uint8_t derived[32];
         tls_derive_secret(early_secret, derived);
@@ -272,39 +307,80 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         uint8_t ctype;
         int pl = tls_decrypt_one(st, st->s_hs_key, st->s_hs_iv,
                                  &st->s_seq, pt, sizeof(pt), &ctype);
-        if (pl < 0) return TLS_STEP_ERR;
+        if (pl < 0) {
+            // -2 = alert record; anything else is a MAC/decrypt failure
+            // (active tampering or corruption).
+            if (pl == -2 && ctype == TLS_CT_ALERT) {
+                st->fail_reason = TLS_FAIL_ALERT;
+            } else {
+                st->fail_reason = TLS_FAIL_MAC;
+            }
+            return TLS_STEP_ERR;
+        }
         if (ctype == TLS_CT_CHANGE_CIPHER_SPEC) { st->rec_have = 0; return TLS_STEP_AGAIN; }
-        if (ctype != TLS_CT_HANDSHAKE) return TLS_STEP_ERR;
+        if (ctype == TLS_CT_ALERT) {
+            // Encrypted alert mid-handshake: body = level(1) + description(1).
+            if (pl == 2) { st->alert_desc = pt[1]; st->fail_reason = TLS_FAIL_ALERT; }
+            else st->fail_reason = TLS_FAIL_PROTO;
+            return TLS_STEP_ERR;
+        }
+        if (ctype != TLS_CT_HANDSHAKE) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
 
         uint32_t p = 0;
         while (p < (uint32_t)pl) {
             uint8_t t; uint32_t bl;
             uint32_t c = parse_hs(pt + p, pl - p, &t, &bl);
-            if (c == 0) return TLS_STEP_ERR;
+            if (c == 0) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
             const uint8_t* body = pt + p + 4;
-            if (t == TLS_HS_ENCRYPTED_EXTENSIONS && !st->got_ee) {
-                if (bl > sizeof(st->ee_body)) return TLS_STEP_ERR;
+            // RFC 8446 §4.4: the encrypted flight is EXACTLY EncryptedExtensions,
+            // Certificate, CertificateVerify, Finished — in that order, each
+            // once. Enforce it: an unexpected or repeated message is a protocol
+            // violation, not something to tolerate.
+            {
+                static const uint8_t expect_types[4] = {
+                    TLS_HS_ENCRYPTED_EXTENSIONS, TLS_HS_CERTIFICATE,
+                    TLS_HS_CERTIFICATE_VERIFY, TLS_HS_FINISHED
+                };
+                if (st->hs_next < 0 || st->hs_next > 3 ||
+                    t != expect_types[st->hs_next]) {
+                    st->fail_reason = TLS_FAIL_PROTO;
+                    return TLS_STEP_ERR;
+                }
+            }
+            if (t == TLS_HS_ENCRYPTED_EXTENSIONS) {
+                if (bl > sizeof(st->ee_body)) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
                 memcpy(st->ee_body, body, bl); st->ee_bl = bl; st->got_ee = 1;
-            } else if (t == TLS_HS_CERTIFICATE && !st->got_cert) {
-                if (bl > sizeof(st->cert_body)) return TLS_STEP_ERR;
+                st->hs_next = 1;
+            } else if (t == TLS_HS_CERTIFICATE) {
+                if (bl > sizeof(st->cert_body)) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
                 memcpy(st->cert_body, body, bl); st->cert_bl = bl;
-                if (tls_parse_certificate(st->cert_body, st->cert_bl) != 0) return TLS_STEP_ERR;
+                if (tls_parse_certificate(st->cert_body, st->cert_bl) != 0) {
+                    st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR;
+                }
                 st->got_cert = 1;
-            } else if (t == TLS_HS_CERTIFICATE_VERIFY && !st->got_cv) {
-                if (bl > sizeof(st->cv_body)) return TLS_STEP_ERR;
+                st->hs_next = 2;
+            } else if (t == TLS_HS_CERTIFICATE_VERIFY) {
+                if (bl > sizeof(st->cv_body)) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
                 memcpy(st->cv_body, body, bl); st->cv_bl = bl;
-                if (tls_parse_certificate_verify(st->cv_body, st->cv_bl) != 0) return TLS_STEP_ERR;
+                if (tls_parse_certificate_verify(st->cv_body, st->cv_bl) != 0) {
+                    st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR;
+                }
                 st->got_cv = 1;
-            } else if (t == TLS_HS_FINISHED && !st->got_sfin) {
-                if (bl != 32) return TLS_STEP_ERR;
+                st->hs_next = 3;
+            } else { // TLS_HS_FINISHED
+                if (bl != 32) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
                 memcpy(st->fin_body, body, 32); st->fin_bl = 32; st->got_sfin = 1;
+                st->hs_next = 4;
             }
             p += c;
         }
         st->rec_have = 0;
         if (!st->got_sfin) return TLS_STEP_AGAIN;
 
-        if (!st->got_ee || !st->got_cert || !st->got_cv) return TLS_STEP_ERR;
+        if (!st->got_ee || !st->got_cert || !st->got_cv || st->hs_next != 4) {
+            st->fail_reason = TLS_FAIL_PROTO;
+            return TLS_STEP_ERR;
+        }
 
         uint8_t tx_pre_sfin[32];
         transcript_of(st->ch, st->ch_len, st->sh_body, st->sh_bl,
@@ -352,18 +428,55 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
     case TLS_PH_RECV_BODY: {
         int r = tls_recv_record_st(st, io);
         if (r == 0) return TLS_STEP_AGAIN;
-        if (r < 0) { st->phase = TLS_PH_DONE; return TLS_STEP_DONE; }
+        if (r < 0) {
+            // Transport EOF: we always send Connection: close, so the peer
+            // closing after the response IS the normal end of the body.
+            st->phase = TLS_PH_DONE;
+            return TLS_STEP_DONE;
+        }
 
         uint8_t pt[TLS_RECORD_MAX_PAYLOAD];
         uint8_t ctype;
         int pl = tls_decrypt_one(st, st->s_ap_key, st->s_ap_iv,
                                  &st->s_ap_seq, pt, sizeof(pt), &ctype);
-        if (pl < 0) { st->phase = TLS_PH_DONE; return TLS_STEP_DONE; }
+        if (pl < 0) {
+            // A MAC failure here is an ACTIVE attack (or corruption) on the
+            // stream — never deliver partial plaintext as if it were a clean
+            // response. Only close_notify ends the fetch "successfully".
+            if (pl == -2 && ctype == TLS_CT_ALERT) {
+                if (st->alert_desc == 0) {  // close_notify
+                    st->fail_reason = TLS_FAIL_ALERT_CLOSE;
+                    st->phase = TLS_PH_DONE;
+                    return TLS_STEP_DONE;
+                }
+                st->fail_reason = TLS_FAIL_ALERT;
+                return TLS_STEP_ERR;
+            }
+            st->fail_reason = TLS_FAIL_MAC;
+            return TLS_STEP_ERR;
+        }
         if (ctype == TLS_CT_CHANGE_CIPHER_SPEC) { st->rec_have = 0; return TLS_STEP_AGAIN; }
+        if (ctype == TLS_CT_ALERT) {
+            if (pl == 2) {
+                if (pt[1] == 0) {  // close_notify
+                    st->fail_reason = TLS_FAIL_ALERT_CLOSE;
+                    st->phase = TLS_PH_DONE;
+                    return TLS_STEP_DONE;
+                }
+                st->alert_desc = pt[1];
+                st->fail_reason = TLS_FAIL_ALERT;
+            } else {
+                st->fail_reason = TLS_FAIL_PROTO;
+            }
+            return TLS_STEP_ERR;
+        }
         if (ctype == TLS_CT_APPDATA) {
-            if (st->out_len + pl > st->out_cap) { st->phase = TLS_PH_DONE; return TLS_STEP_ERR; }
+            if (st->out_len + pl > st->out_cap) { st->fail_reason = TLS_FAIL_PROTO; st->phase = TLS_PH_DONE; return TLS_STEP_ERR; }
             memcpy(st->out + st->out_len, pt, pl);
             st->out_len += pl;
+        } else {
+            st->fail_reason = TLS_FAIL_PROTO;
+            return TLS_STEP_ERR;
         }
         st->rec_have = 0;
         return TLS_STEP_AGAIN;
