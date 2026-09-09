@@ -51,6 +51,8 @@ struct okai_tab {
     int last_resp_len;    // track HTTP response changes
     int is_https;         // 1 if URL used the https:// scheme
     int https_fell_back;  // 1 once we've already retried a failed HTTPS fetch over HTTP
+    int cert_failed;      // 1 = HTTPS failed certificate verification: render a
+                          // distinct security error and NEVER fall back to HTTP
     // CSS: parsed from <style> blocks of this page
     struct css_rule css_rules[CSS_MAX_RULES];
     int css_n;

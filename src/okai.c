@@ -71,6 +71,7 @@ static void okai_tab_reset(struct okai_tab* T) {
     T->last_resp_len = 0;
     T->is_https = 0;
     T->https_fell_back = 0;
+    T->cert_failed = 0;
     T->css_n = 0;
     T->css_text[0] = 0;
     T->link_count = 0;
@@ -502,6 +503,30 @@ void okai_render_content(int ed_id) {
     // different (benign) case.
     if (T->token_count == -1 && T->last_resp_len == 0) {
         window_set_text_color_rgb(b->win_id, 0xFF5555, 0x000000); // light red
+        if (T->cert_failed) {
+            window_puts(b->win_id, "\n SECURITY WARNING\n\n");
+            window_set_text_color_rgb(b->win_id, 0xAAAAAA, 0x000000);
+            window_puts(b->win_id, " The certificate for\n ");
+            {
+                int i = 0;
+                while (T->url[i] && i < view_w - 2) {
+                    char ch = T->url[i];
+                    if (ch < 32 || (unsigned char)ch >= 127) ch = '?';
+                    window_put_char(b->win_id, ch);
+                    i++;
+                }
+            }
+            window_puts(b->win_id, "\n failed verification.\n\n");
+            window_puts(b->win_id, " The connection may be intercepted,\n");
+            window_puts(b->win_id, " the site's certificate expired, or\n");
+            window_puts(b->win_id, " the identity does not match.\n\n");
+            window_puts(b->win_id, " Nothing was loaded and no HTTP\n");
+            window_puts(b->win_id, " fallback was attempted.\n");
+            window_set_text_color_rgb(b->win_id, default_fg, page_bg);
+            T->content_height = 10;
+            w->dirty = 1;
+            return;
+        }
         window_puts(b->win_id, "\n Unable to load page\n\n");
         window_set_text_color_rgb(b->win_id, 0xAAAAAA, 0x000000);
         window_puts(b->win_id, " The okai could not fetch:\n ");
@@ -938,7 +963,7 @@ int okai_start_sub_res_fetch(int id) {
         int is_https = (url[0]=='h' && url[1]=='t' && url[2]=='t' && url[3]=='p' &&
                         url[4]=='s' && url[5]==':');
         serial_printf("[okai] sub-res fetch: %s %s\n", type == 'c' ? "CSS" : "JS", url);
-        if (is_https) https_get(host, path);
+        if (is_https) https_get_port(host, path, (uint16_t)url_port);
         else { http_reset_conn_attempts(); http_get_port(host, path, (uint16_t)url_port); }
         return 0;
     }
@@ -1047,7 +1072,7 @@ int okai_start_fetch(int id) {
     }
     T->is_https = (T->url[0] == 'h' && T->url[1] == 't' && T->url[2] == 't' &&
                    T->url[3] == 'p' && T->url[4] == 's' && T->url[5] == ':');
-    if (T->is_https) https_get(host, path);
+    if (T->is_https) https_get_port(host, path, (uint16_t)url_port);
     else { http_reset_conn_attempts(); http_get_port(host, path, (uint16_t)url_port); }
     return 0;
 }
@@ -1214,6 +1239,7 @@ void okai_navigate(int id, const char* url) {
     T->title[0] = 0;
     T->redirect_count = 0;
     T->https_fell_back = 0;
+    T->cert_failed = 0;
 
     // Defer the request to the desktop response loop (single-connection owner
     // model); okai_start_fetch() derives scheme/host/path from T->url when it
@@ -1426,7 +1452,7 @@ int okai_check_redirect(int id, const char* resp, int len) {
     parse_url(T->url, host, path, &url_port);
     T->is_https = (abs[0]=='h'&&abs[1]=='t'&&abs[2]=='t'&&abs[3]=='p'&&
                    abs[4]=='s'&&abs[5]==':');
-    if (T->is_https) https_get(host, path);
+    if (T->is_https) https_get_port(host, path, (uint16_t)url_port);
     else { http_reset_conn_attempts(); http_get_port(host, path, (uint16_t)url_port); }
 
     serial_printf("[okai] redirect %d -> %s\n", T->redirect_count, abs);

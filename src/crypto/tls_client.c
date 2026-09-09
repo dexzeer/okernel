@@ -5,6 +5,12 @@
 #include "x25519.h"
 #include "aead.h"
 #include "hmac.h"
+#include "certverify.h"
+#include "x509.h"
+#include "rsa.h"
+#include "ec.h"
+#include "sha256.h"
+#include "sha512.h"
 #include <string.h>
 #include "tls_dbg.h"
 
@@ -227,8 +233,10 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                                             st->random, st->session_id,
                                             st->pub, st->host);
         if (st->ch_len == 0) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
-        if (send_record(TLS_CT_HANDSHAKE, st->ch, st->ch_len, io) != 0)
+        if (send_record(TLS_CT_HANDSHAKE, st->ch, st->ch_len, io) != 0) {
+            st->fail_reason = TLS_FAIL_PROTO;
             return TLS_STEP_ERR;
+        }
         st->phase = TLS_PH_RECV_SH;
         st->rec_have = 0;
         return TLS_STEP_AGAIN;
@@ -382,6 +390,108 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             return TLS_STEP_ERR;
         }
 
+        // ---- SERVER AUTHENTICATION ----
+        // RFC 8446 §4.4.2-4.4.4. Without this the "s" in https is decorative:
+        // any MITM can present its own certificate and complete the handshake.
+        // Order: chain -> anchor -> hostname, then the CertificateVerify
+        // signature (proof-of-possession of the leaf key), then Finished.
+        {
+            const char* vhost = st->verify_host ? st->verify_host : st->host;
+            int cvr = cert_verify(st->cert_body, st->cert_bl, vhost);
+            if (cvr != CV_OK) {
+                tls_dbg("[tls] cert verification failed: %s\n",
+                        cert_verify_strerror(cvr));
+                st->fail_reason = TLS_FAIL_CERT;
+                return TLS_STEP_ERR;
+            }
+
+            // CertificateVerify: signs 64 sp || "TLS 1.3, server
+            // CertificateVerify" || 0x00, hashed per the signature algorithm,
+            // with the LEAF certificate's key. Transcript covers CH..Certificate.
+            x509_cert leaf;
+            if (cert_leaf(st->cert_body, st->cert_bl, &leaf) != 0) {
+                tls_dbg("[tls] leaf certificate parse failed (len=%u)\n", st->cert_bl);
+                st->fail_reason = TLS_FAIL_CERT;
+                return TLS_STEP_ERR;
+            }
+            uint16_t cv_alg;
+            const uint8_t* cv_sig;
+            uint32_t cv_sig_len;
+            if (tls_parse_cv_sig(st->cv_body, st->cv_bl, &cv_alg, &cv_sig, &cv_sig_len) != 0) {
+                tls_dbg("[tls] CertificateVerify parse failed (len=%u)\n", st->cv_bl);
+                st->fail_reason = TLS_FAIL_CERT;
+                return TLS_STEP_ERR;
+            }
+            tls_dbg("[tls] leaf key_type=%d sig_alg=%d cv_alg=%04x sig_len=%u\n",
+                    leaf.key_type, leaf.sig_alg, cv_alg, cv_sig_len);
+            uint8_t cv_content[64 + 33 + 1];
+            memset(cv_content, 0x20, 64);
+            memcpy(cv_content + 64, "TLS 1.3, server CertificateVerify", 33);
+            cv_content[64 + 33] = 0x00;
+            uint32_t cv_content_len = 64 + 33 + 1;
+
+            uint8_t tx_through_cert[32];
+            transcript_of(st->ch, st->ch_len, st->sh_body, st->sh_bl,
+                          st->ee_body, st->ee_bl, st->cert_body, st->cert_bl,
+                          NULL, 0, NULL, 0, tx_through_cert);
+
+            // The signed data is content || transcript-hash-through-Certificate
+            // (RFC 8446 §4.4.3) — hashed per the signature algorithm below.
+            uint8_t signed_data[sizeof(cv_content) + 32];
+            memcpy(signed_data, cv_content, cv_content_len);
+            memcpy(signed_data + cv_content_len, tx_through_cert, 32);
+            uint32_t signed_len = cv_content_len + 32;
+
+            int vr = -2;
+            if (cv_alg == 0x0403) {          // ecdsa_secp256r1_sha256
+                if (leaf.key_type != X509_KEY_EC_P256) vr = -2;
+                else vr = ec_verify(X509_SIG_ECDSA_SHA256,
+                                    leaf.ec_point, leaf.ec_point_len,
+                                    signed_data, signed_len,
+                                    cv_sig, cv_sig_len);
+            } else if (cv_alg == 0x0503) {   // ecdsa_secp384r1_sha384
+                if (leaf.key_type != X509_KEY_EC_P384) vr = -2;
+                else vr = ec_verify(X509_SIG_ECDSA_SHA384,
+                                    leaf.ec_point, leaf.ec_point_len,
+                                    signed_data, signed_len,
+                                    cv_sig, cv_sig_len);
+            } else if (cv_alg == 0x0804) {   // rsa_pss_rsae_sha256 (TLS 1.3 mandate)
+                if (leaf.key_type != X509_KEY_RSA) vr = -2;
+                else {
+                    rsa_pub rk;
+                    if (rsa_pub_from_x509(&leaf, &rk) != 0) vr = -2;
+                    else vr = rsa_verify_pss(&rk, X509_SIG_RSA_SHA256,
+                                             signed_data, signed_len,
+                                             cv_sig, cv_sig_len);
+                }
+            } else if (cv_alg == 0x0805) {   // rsa_pss_rsae_sha384
+                if (leaf.key_type != X509_KEY_RSA) vr = -2;
+                else {
+                    rsa_pub rk;
+                    if (rsa_pub_from_x509(&leaf, &rk) != 0) vr = -2;
+                    else vr = rsa_verify_pss(&rk, X509_SIG_RSA_SHA384,
+                                             signed_data, signed_len,
+                                             cv_sig, cv_sig_len);
+                }
+            } else if (cv_alg == 0x0401) {   // rsa_pkcs1_sha256
+                if (leaf.key_type != X509_KEY_RSA) vr = -2;
+                else {
+                    rsa_pub rk;
+                    if (rsa_pub_from_x509(&leaf, &rk) != 0) vr = -2;
+                    else vr = rsa_verify_pkcs1(&rk, X509_SIG_RSA_SHA256,
+                                               signed_data, signed_len,
+                                               cv_sig, cv_sig_len);
+                }
+            }
+            if (vr != 0) {
+                tls_dbg("[tls] CertificateVerify signature INVALID (alg=%04x)\n",
+                        cv_alg);
+                st->fail_reason = TLS_FAIL_CERT;
+                return TLS_STEP_ERR;
+            }
+            tls_dbg("[tls] certificate chain verified, host matched\n");
+        }
+
         uint8_t tx_pre_sfin[32];
         transcript_of(st->ch, st->ch_len, st->sh_body, st->sh_bl,
                       st->ee_body, st->ee_bl, st->cert_body, st->cert_bl,
@@ -491,6 +601,12 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
 // Synchronous convenience wrapper (host tests / blocking I/O). Drives the state
 // machine to completion. Blocking recv() callers never return 0, so the loop
 // terminates at DONE/ERR.
+static int g_last_fail_reason = TLS_FAIL_NONE;
+
+int tls_last_fail_reason(void) {
+    return g_last_fail_reason;
+}
+
 int tls_client_run(const char* host, uint16_t port,
                    const uint8_t* request, uint32_t request_len,
                    uint8_t* out, uint32_t out_cap,
@@ -501,6 +617,7 @@ int tls_client_run(const char* host, uint16_t port,
     do {
         r = tls_state_step(&st, io);
     } while (r == TLS_STEP_AGAIN);
+    g_last_fail_reason = st.fail_reason;
     if (r == TLS_STEP_DONE) return (int)st.out_len;
     return -1;
 }

@@ -79,13 +79,15 @@ int tls_ext_append_supported_groups(uint8_t* buf, uint32_t cap, uint32_t* pos) {
 
 int tls_ext_append_signature_algorithms(uint8_t* buf, uint32_t cap, uint32_t* pos) {
     // Offer ONLY algorithms this client can actually verify (ec.c + rsa.c):
-    //   ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384, rsa_pkcs1_sha256.
-    // Advertising unverifiable algorithms (RSA-PSS, Ed25519, ECDSA-P521...)
-    // lets the server pick one for CertificateVerify that we must then
-    // reject — fail at the offer, not mid-handshake.
+    //   ecdsa_secp256r1_sha256, ecdsa_secp384r1_sha384,
+    //   rsa_pss_rsae_sha256, rsa_pss_rsae_sha384, rsa_pkcs1_sha256.
+    // RFC 8446 §4.4.3 mandates PSS schemes for RSA CertificateVerify — a
+    // PKCS#1-only offer gets handshake_failure from RSA-leaf servers.
     static const uint16_t algs[] = {
         0x0403, // ECDSA_SECP256R1_SHA256
         0x0503, // ECDSA_SECP384R1_SHA384
+        0x0804, // RSA_PSS_RSAE_SHA256
+        0x0805, // RSA_PSS_RSAE_SHA384
         0x0401, // RSA_PKCS1_SHA256
     };
     uint32_t n = sizeof(algs) / sizeof(algs[0]);
@@ -368,11 +370,23 @@ int tls_parse_certificate(const uint8_t* cert, uint32_t cert_len) {
 
 int tls_parse_certificate_verify(const uint8_t* cv, uint32_t cv_len) {
     if (cv_len < 4) return -1;
-    // skip signature_algorithm (2B) and length prefix (2B), validate
-    // signature fits
+    uint16_t alg = get_u16(cv);
     uint32_t sig_len = get_u16(cv + 2);
     if (cv_len < 4 + sig_len) return -1;
     if (sig_len == 0) return -1;
+    // Only algorithms this client can actually verify.
+    if (alg != 0x0403 && alg != 0x0503 && alg != 0x0804 &&
+        alg != 0x0805 && alg != 0x0401) return -1;
+    return 0;
+}
+
+int tls_parse_cv_sig(const uint8_t* cv, uint32_t cv_len, uint16_t* alg,
+                     const uint8_t** sig, uint32_t* sig_len) {
+    if (cv_len < 4) return -1;
+    *alg = get_u16(cv);
+    *sig_len = get_u16(cv + 2);
+    if (cv_len < 4 + *sig_len) return -1;
+    *sig = cv + 4;
     return 0;
 }
 

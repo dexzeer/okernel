@@ -114,7 +114,7 @@ int main(void) {
     sock_fd = -1;
 
     if (n < 0) {
-        fprintf(stderr, "[test] tls_client_run FAILED (returned %d)\n", n);
+        fprintf(stderr, "[test] tls_client_run FAILED (returned %d, fail_reason=%d)\n", n, tls_last_fail_reason());
         return 1;
     }
 
@@ -144,5 +144,46 @@ int main(void) {
 
     int ok = (n > 0 && has_http);
     printf("\n%s\n", ok ? "PHASE 4 PASS" : "PHASE 4 FAIL");
+    if (!ok) return 1;
+
+    // ---- MITM simulation: same wire, WRONG hostname ----
+    // The server's certificate says example.com; asking to authenticate it
+    // as "evil.example.attacker.io" MUST be rejected (hostname mismatch),
+    // and the "certificate chain does not terminate at a trusted root when
+    // we lie about everything" case is covered by test_pki fixtures.
+    sock_fd = tcp_connect(host, port);
+    if (sock_fd < 0) {
+        fprintf(stderr, "[test] reconnect failed; skipping MITM test\n");
+        return ok ? 0 : 1;
+    }
+    {
+        char req2[512];
+        int r2 = snprintf(req2, sizeof(req2),
+            "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", host);
+        struct tls_client_io io2 = { .send = bsd_send, .recv = bsd_recv, .user = NULL };
+        // Run the handshake with a DIFFERENT hostname for verification: we
+        // call the state machine directly so SNI says example.com (the wire
+        // stays truthful) but verification uses the attacker's name —
+        // exactly what a MITM-accommodating client would wrongly accept.
+        // Run the handshake with the TRUE SNI on the wire (so Cloudflare
+        // serves the example.com certificate) but verify the certificate
+        // against the ATTACKER'S hostname — exactly what a MITM-friendly
+        // client would wrongly accept.
+        struct tls_state st2;
+        tls_state_init(&st2, host, port,
+                       (const uint8_t*)req2, r2, response, sizeof(response));
+        st2.verify_host = "evil.example.attacker.io";
+        int r;
+        do { r = tls_state_step(&st2, &io2); } while (r == TLS_STEP_AGAIN);
+        int rejected = (r == TLS_STEP_ERR &&
+                        (st2.fail_reason == TLS_FAIL_HOSTNAME ||
+                         st2.fail_reason == TLS_FAIL_CERT));
+        printf("MITM simulation (wrong hostname rejected): %s (reason=%d)\n",
+               rejected ? "PASS" : "FAIL", st2.fail_reason); fprintf(stderr, "  [dbg] r=%d phase=%d alert=%d\n", r, st2.phase, st2.alert_desc);
+        ok = ok && rejected;
+        close(sock_fd);
+        sock_fd = -1;
+        printf("\n%s\n", ok ? "PHASE 4+MITM PASS" : "PHASE 4+MITM FAIL");
+    }
     return ok ? 0 : 1;
 }
