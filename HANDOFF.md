@@ -1991,8 +1991,10 @@ present its own cert and own the session.
 "Test the security of this": built `tests/test_adversarial.c` (host, gcc
 -m32 + ASan/UBSan) — a mutation fuzzer over a REAL example.com cert flight
 plus a full adversarial mock TLS 1.3 server. 26/26 PASS. The stack survived
-every attack class tried; two test-side and one client-side bug were found
-and fixed.
+every attack class tried; one client bug + one client gap were found and
+fixed; the rest of the session's bugs were in the MOCK (the production code
+held up). Commits: a63e003 (process.c SEED-SANITY, from earlier in the
+session) and 0eb3427 (adversarial suite).
 
 ### Section 1 — cert_verify mutation fuzz (4000 rounds, seeded LCG)
 - Mutates the REAL example.com flight fixture (from tests/fixtures/) at
@@ -2022,7 +2024,7 @@ record layer, openssl signs the test CVs) speaking the real client:
   garbage, oversized record length.
 - CLEAN: close_notify ends the fetch with the body delivered (ALERT_CLOSE).
 
-### Found and fixed
+### Found and fixed (production code)
 1. **CLIENT: Finished-verify failure had fail_reason=0** (tls_client.c) — a
    bad server Finished now sets TLS_FAIL_MAC (it is an authentication
    failure, not transport noise). Found BY the FIN_FLIPPED test.
@@ -2031,22 +2033,55 @@ record layer, openssl signs the test CVs) speaking the real client:
 3. **certverify: `cert_verify_trust_extra(spki, len)`** — single extra
    trusted-SPKI slot (NULL clears) so adversarial tests can install a mock
    root without touching the embedded store.
-4. Test-side: openssl stamps notBefore at GENERATION time — the mock section
-   sets x509_set_now to 23:00 the same day (never 14:00, certs are born
-   later); the EXPIRED run sets 2026-09-12 past its 1-day notAfter.
-5. Test-side traps that cost time (mock server): key_share ext body is
-   list(2)|group(2)|klen(2)|key(32) — the pub key is at +6, not +4; the
-   Certificate message needs its 4-byte hs header in the flight (body-only
-   reads as type 0); the client sends the record header and ciphertext as
-   SEPARATE send() calls (capture buffer is NOT contiguous records); the
-   server's own Finished must be in the transcript BEFORE "s ap traffic" is
-   derived (CH..server-Fin), the client's Finished after (resumption only);
-   nonce construction is seq-bytes XOR at bytes 4..11 (XORing the loop index
-   desyncs seq 0 — same bug class as HANDOFF 2026-09-08 transcript len).
+4. Earlier this session: **process.c SEED-SANITY** — process_switch_to
+   refuses to seed a near-zero (<64K) ESP (destroy zeroes esp; the guard
+   fires before the zombie-target check) — sp-=5 underflow would corrupt the
+   IDT/GDT region. Waiter reaps, tick retries (commit a63e003).
+
+### Hiccups — the debugging journey (all MOCK-side; keep for the next agent)
+Chronological, each looked like a crypto bug but was a mock bug:
+1. Fuzz false alarm "558 accepted": the whitelist flagged no-op rounds —
+   random-byte overwrite writing the SAME byte (1/256 x 4000 ~ 15 hits).
+   Fix: skip rounds where mut == msg. Lesson: count only real mutations.
+2. Control failed TLS_FAIL_MAC: parse_client_ch read the key_share pub at
+   +4 instead of +6 (klen(2) sits between group and key) — the mock ECDH'd
+   against a corrupted client key. Parser bug wearing MAC clothing.
+3. Flight order violation (got type 0, expected 11): the mock's Certificate
+   message went into the flight BODY-ONLY — the flight carries FULL
+   handshake messages (4-byte header included). Body-only parses as type 0.
+4. Control "certificate not yet valid": openssl stamps notBefore at
+   GENERATION time (~15:30Z); the test clock was 14:00. Mock now sets
+   23:00 same-day (EXPIRED: 2026-09-12, past its 1-day notAfter). Also the
+   KEYSHARE_SWAP branch was LOST in a rewrite (SH always carried share A) —
+   restored the share-B swap.
+5. DONE with out_len=0: try_queue_body assumed c_buf was contiguous records
+   — WRONG twice over: the CH record leads the capture, and the client sends
+   the record HEADER and the ciphertext as SEPARATE send() calls. Added a
+   record walk; also fixed the inner type check (fin_pt[0] is 20 =
+   TLS_HS_FINISHED, the CONTENT type 22 lives at fin_pt[4+32]).
+6. AEAD decrypt of the client Finished failed: the mock's nonce XORed the
+   LOOP INDEX (i) into bytes 4..11 instead of the SEQ bytes — with seq=0
+   the nonce must equal the IV. Diagnosed by recomputing the client-side
+   c hs traffic key inside the test (decrypted fine with the same key)
+   -> the nonce was the desync. Same class as the 2026-09-08 uint32
+   transcript-len bug: off-by-something in a 12-byte field.
+7. MAC failure on the BODY record: "s ap traffic" must span
+   CH..server-Finished — the mock hashed CH..CV (server Fin missing from
+   its own transcript), then briefly CH..SFin..CFin (client Fin added too
+   early; it only feeds the resumption master).
+8. Tooling: a python splice anchored on str.index matched an EARLIER
+   occurrence and quadruplicated a block (mock_recv/mtrans defs) — build
+   broke, spliced by line numbers instead. Lesson: never splice test files
+   by string search when the string appears in comments.
+9. ASan caught a REAL OOB in an early draft: request_len=44 for a 42-byte
+   request string — the client faithfully copied 44 bytes past a 43-byte
+   global. Fixed with sizeof(req)-1. The client trusting caller-supplied
+   lengths is BY DESIGN (like write(fd, buf, len)); callers must be honest.
+10. The printf-stripper left orphan args (build broke) and ate one CHECK
+    (the ECDSA positive control) — restored, re-verified 26/26.
 
 ### Verification
-- tests/test_adversarial.c: 26/26 PASS under ASan+UBSan (also caught a
-  wrong-length request buffer in an early draft — read past a global).
+- tests/test_adversarial.c: 26/26 PASS under ASan+UBSan.
 - Regressions: test_pki 34 PASS (0 failures), tls_client_test PHASE 4+MITM
   PASS, QEMU test_pki_qemu + test_certfail PASS on the rebuilt kernel
   (client change is desktop-side; text build unaffected).
@@ -2061,3 +2096,29 @@ record layer, openssl signs the test CVs) speaking the real client:
 - tests/adversarial/* are TEST-ONLY keys/certs (generated by
   tests/adversarial/gen_pki.sh, 10y validity, evil.example.com SAN). Never
   reference them from production code paths.
+- test_adversarial build (host, ASan):
+  gcc -m32 -O1 -g -fsanitize=address,undefined -Isrc/crypto -Isrc
+      -o /tmp/opencode/test_adversarial tests/test_adversarial.c
+      src/crypto/{tls_client,tls_record,tls_handshake,tls_keysched,sha256,
+      sha512,hmac,hkdf,aead,chacha20,poly1305,x25519,der,x509,rsa,ec,
+      certverify,roots}.c
+
+### Next steps (priority order)
+1. **P-384 CertificateVerify (0x0503) for P-384-leaf servers** — the chain
+   verifier already has the curve; only the CV dispatcher needs the case.
+   Small, and it unblocks real P-384 sites (Cloudflare-issued leaves).
+2. **AES-GCM (0x1302)** — the most common modern suite; needs from-scratch
+   AES-128 + GHASH. Only worth it if a target site refuses ChaCha20-Poly.
+3. **Extend the fuzzer**: mutate the FULL handshake (SH/EE/record layer,
+   not just the cert flight), add truncated-record + split-across-recv
+   modes to the mock (the client's rec_have path is untested for partial
+   records), and a random-garbage-first-byte-then-valid-SH mode.
+4. **Session resumption / tickets** — every sub-resource currently pays a
+   full handshake; tickets would make multi-fetch pages much cheaper.
+5. **Revocation (OCSP stapling)** — status_request parse + decision; low
+   priority (staples are rare) but note it in the SECURITY WARNING page.
+6. **Wire the host tests into a make target** (e.g. `make host-tests`:
+   test_pki + tls_client_test + test_adversarial) so the next agent runs
+   them by default after crypto changes.
+7. Deferred UX: cert pinning, security-warning page polish (from the PKI
+   session's deferred list).
