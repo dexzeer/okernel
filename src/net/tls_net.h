@@ -18,6 +18,7 @@
 // handshake + download); it runs asynchronously, driven by https_get_poll()
 // from the main loop, so the desktop never freezes during the load.
 void https_get(const char* host, const char* path);
+void https_get_port(const char* host, const char* path, uint16_t port); // https://host:port/
 
 // Advance the in-flight HTTPS fetch by one step (DNS / TCP / TLS). Call once
 // per main-loop iteration. When the response is ready, tls_is_done() returns 1.
@@ -32,6 +33,7 @@ int tls_is_active(void);
 
 // Check if the last https_get() completed with a buffered response.
 int tls_is_done(void);
+int tls_get_fail_reason(void); // TLS_FAIL_* of the last failed fetch (0 = none/success)
 
 // Get the TLS response (same interface as http_get_response).
 char* tls_get_response(void);

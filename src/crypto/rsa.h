@@ -34,4 +34,10 @@ int rsa_verify_pkcs1(const rsa_pub* k, int alg,
                      const uint8_t* msg, uint32_t msg_len,
                      const uint8_t* sig, uint32_t sig_len);
 
+// RSASSA-PSS verify (RFC 8017 §8.1.2, MGF1, saltLen = hLen) — REQUIRED by
+// RFC 8446 §4.4.3 for RSA keys in TLS 1.3 CertificateVerify. Returns 0/−1.
+int rsa_verify_pss(const rsa_pub* k, int alg,
+                   const uint8_t* msg, uint32_t msg_len,
+                   const uint8_t* sig, uint32_t sig_len);
+
 #endif

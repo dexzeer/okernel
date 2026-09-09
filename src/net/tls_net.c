@@ -52,6 +52,11 @@ static uint32_t tls_req_len;
 
 static int tls_done = 0;         // 1 once the response is buffered
 static int tls_peer_closed = 0;  // set by tcp_handle_packet on FIN
+// Why the last TLS fetch failed (TLS_FAIL_*); TLS_FAIL_NONE if the last
+// fetch succeeded or none ran. The okai uses this to REFUSE the plain-HTTP
+// fallback when the failure was a certificate/protocol failure — a MITM
+// can force exactly that downgrade by killing the TLS handshake.
+static int tls_fail_reason = 0;
 // TCP connection attempts for the current fetch. Bounded so an unreachable host
 // gives up instead of re-tcp_connect() forever (which would wedge the okai
 // single-owner fetch model).
@@ -59,6 +64,7 @@ static int tls_conn_attempts = 0;
 #define TLS_MAX_CONN_ATTEMPTS 4
 
 static uint32_t tls_resolved_ip = 0;
+static uint16_t tls_port = 443;   // destination TCP port (https default)
 
 // Fetch start tick, for a defensive timeout so a connection that can never
 // complete (e.g. unreachable host) stops the async machine instead of spinning
@@ -116,11 +122,13 @@ static int kernel_tcp_recv(uint8_t* buf, uint32_t cap, uint32_t timeout_ms, void
     return (int)to_read;
 }
 
-void https_get(const char* host, const char* path) {
+void https_get_port(const char* host, const char* path, uint16_t port) {
+    tls_port = port ? port : 443;
     tls_rx_reset();
     tls_response_len = 0;
     tls_response_overflow = 0;
     tls_response[0] = 0;
+    tls_fail_reason = 0;
     tls_active = 1;
     tls_phase = HP_DNS;
     tls_done = 0;
@@ -149,7 +157,20 @@ void https_get(const char* host, const char* path) {
     while (*req) tls_req_buf[rlen++] = *req++;
     tls_req_len = rlen;
 
-    dns_resolve(host);
+    // Numeric host ("10.0.2.2")? Seed the DNS cache and skip the query —
+    // same rule as the HTTP path. (Without this, https://10.0.2.2:8443/
+    // resolved nothing, aborting as a transport failure and downgrading
+    // to plain HTTP — exactly the downgrade a cert-failure must avoid.)
+    // A cached host skips the query too (dns_resolve() would clear the
+    // cache and re-send a doomed lookup).
+    {
+        uint32_t nip, dummy;
+        if (net_parse_ip(tls_host_buf, &nip)) {
+            dns_seed(tls_host_buf, nip);
+        } else if (!dns_is_resolved(&dummy, tls_host_buf) && !dns_is_pending()) {
+            dns_resolve(tls_host_buf);
+        }
+    }
     serial_puts("[tls-net] queued HTTPS ");
     serial_puts(host);
     serial_puts(tls_path);
@@ -222,7 +243,7 @@ void https_get_poll(void) {
                 serial_puts("[tls-net] giving up: host unreachable\n");
                 return;
             }
-            tcp_connect(tls_resolved_ip, 443);
+            tcp_connect(tls_resolved_ip, tls_port);
         }
         return;
     }
@@ -241,12 +262,14 @@ void https_get_poll(void) {
             tls_phase = HP_IDLE;
             serial_printf("[tls-net] received %u bytes\n", (unsigned)tls_s.out_len);
         } else if (r == TLS_STEP_ERR) {
+            tls_fail_reason = tls_s.fail_reason;
+            serial_printf("[tls-net] handshake/download FAILED (reason=%d)\n",
+                          tls_fail_reason);
             tls_response_len = 0;
             tls_response[0] = 0;
             tls_done = 0;
             tls_active = 0;
             tls_phase = HP_IDLE;
-            serial_puts("[tls-net] handshake/download FAILED\n");
         }
         return;
     }
@@ -275,4 +298,12 @@ int tls_is_done(void) {
 
 void tls_connection_closed(void) {
     tls_peer_closed = 1;
+}
+
+int tls_get_fail_reason(void) {
+    return tls_fail_reason;
+}
+
+void https_get(const char* host, const char* path) {
+    https_get_port(host, path, 443);
 }

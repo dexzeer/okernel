@@ -108,6 +108,12 @@ int tls_parse_certificate(const uint8_t* cert_body, uint32_t cert_len);
 // signature (2B-len-prefixed). Returns 0 on success, -1 on malformed.
 int tls_parse_certificate_verify(const uint8_t* cv_body, uint32_t cv_len);
 
+// Extract the CertificateVerify signature algorithm + raw signature bytes
+// (for cryptographic verification against the leaf key: ec.c / rsa.c).
+// Returns 0 on success; `sig` points into `cv_body`.
+int tls_parse_cv_sig(const uint8_t* cv_body, uint32_t cv_len, uint16_t* alg,
+                     const uint8_t** sig, uint32_t* sig_len);
+
 // Verify the server's Finished MAC.
 // `transcript_hash` is SHA-256 of all handshake messages up to (but NOT
 // including) the Finished itself.

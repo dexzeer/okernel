@@ -48,6 +48,10 @@ typedef struct {
     x509_blob issuer;
     x509_blob subject;
 
+    // Full SubjectPublicKeyInfo element (raw DER span) — used for root-store
+    // matching by SPKI hash and for TOFU-style fingerprinting.
+    x509_blob spki;
+
     // SubjectPublicKeyInfo.
     int key_type;                // X509_KEY_*
     // RSA: modulus and exponent as big-endian bytes (leading 0x00 stripped).

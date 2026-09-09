@@ -217,8 +217,11 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
 
     // subjectPublicKeyInfo
     {
+        uint32_t spki_start = t;
         der_node spki;
         if (der_expect(tb, tl, &t, DER_TAG_SEQUENCE, &spki) != 0) return -1;
+        out->spki.p = tb + spki_start;
+        out->spki.len = t - spki_start;   // full element incl. tag+len
         uint32_t s = 0;
         der_node alg_oid, param;
         if (parse_alg_id(spki.content, spki.content_len, &s, &alg_oid, &param) != 0)

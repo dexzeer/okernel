@@ -87,6 +87,7 @@ int dns_resolve(const char* hostname);
 int dns_is_resolved(uint32_t* ip, const char* host);
 // Seed the DNS cache with a literal address (numeric-IP URLs skip DNS).
 void dns_seed(const char* host, uint32_t ip);
+int net_parse_ip(const char* s, uint32_t* out); // "a.b.c.d" -> host-order IP (0 = fail)
 int dns_is_pending(void);
 
 // TCP connection

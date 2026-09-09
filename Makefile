@@ -46,6 +46,9 @@ DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o
              src/crypto/aead.o src/crypto/chacha20.o src/crypto/poly1305.o \
              src/crypto/x25519.o src/crypto/tls_record.o src/crypto/tls_handshake.o \
              src/crypto/tls_keysched.o src/crypto/tls_client.o src/crypto/rand.o \
+             src/crypto/sha512.o src/crypto/der.o src/crypto/x509.o \
+             src/crypto/rsa.o src/crypto/ec.o src/crypto/roots.o \
+             src/crypto/certverify.o src/rtc.o \
              src/net/tls_net.o
 
 .PHONY: all text desktop clean run debug

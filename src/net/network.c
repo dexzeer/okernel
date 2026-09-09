@@ -490,7 +490,7 @@ static void dns_fail_pending_http(void) {
 
 // Parse a strict dotted-quad ("10.0.2.2") into the DNS-cache layout
 // (first octet in the high byte). Returns 1 on success.
-static int net_parse_ip(const char* s, uint32_t* out) {
+int net_parse_ip(const char* s, uint32_t* out) {  // shared: TLS path skips DNS for numeric hosts
     uint32_t ip = 0;
     for (int oct = 0; oct < 4; oct++) {
         int val = 0, digits = 0;

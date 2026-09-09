@@ -62,6 +62,10 @@ enum tls_phase {
 struct tls_state {
     int phase;
     const char* host;
+    const char* verify_host;   // hostname used for certificate verification;
+                               // NULL = use `host`. Lets tests keep a truthful
+                               // SNI on the wire while checking a wrong name
+                               // (the MITM-accommodation scenario).
     uint16_t port;
     const uint8_t* request;
     uint32_t request_len;
@@ -79,7 +83,7 @@ struct tls_state {
     uint8_t hs_secret[32];
     uint8_t s_fin_key[32];
     uint64_t s_seq, c_seq;
-    uint8_t ee_body[4096], cert_body[8192], cv_body[1024], fin_body[64];
+    uint8_t ee_body[4096], cert_body[12288], cv_body[1024], fin_body[64];
     uint32_t ee_bl, cert_bl, cv_bl, fin_bl;
     int got_ee, got_cert, got_cv, got_sfin;
     uint8_t c_ap_key[32], c_ap_iv[12], s_ap_key[32], s_ap_iv[12];
@@ -102,6 +106,8 @@ void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
                     const uint8_t* request, uint32_t request_len,
                     uint8_t* out, uint32_t out_cap);
 int tls_state_step(struct tls_state* st, const struct tls_client_io* io);
+
+int tls_last_fail_reason(void); // TLS_FAIL_* of the most recent tls_client_run
 
 int tls_client_run(const char* host, uint16_t port,
                    const uint8_t* request, uint32_t request_len,

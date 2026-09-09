@@ -154,6 +154,105 @@ static const uint8_t DI_SHA512[19] = {
     0x30,0x51,0x30,0x0d,0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x03,0x05,0x00,0x04,0x40
 };
 
+// ---- RSASSA-PSS (RFC 8017 §8.1.2 / §9.1) — TLS 1.3 CertificateVerify ----
+//
+// RFC 8446 §4.4.3 requires RSA signatures in TLS 1.3 to use PSS schemes
+// (rsa_pss_rsae_*), regardless of what the chain uses. salt length = hash
+// length (the TLS-1.3 convention).
+
+// MGF1 (RFC 8017 appendix B.2.1): mask = Hash(seed || C) chained, C =
+// big-endian 32-bit counter from 0.
+static void mgf1(uint8_t* mask, uint32_t mask_len,
+                 const uint8_t* seed, uint32_t seed_len, int alg) {
+    uint32_t hash_len = (alg == X509_SIG_RSA_SHA384) ? 48 : 32;
+    uint32_t done = 0;
+    for (uint32_t ctr = 0; done < mask_len; ctr++) {
+        // input = seed || C(4, big-endian)
+        uint8_t buf[64 + 4];
+        // seed_len <= hLen <= 48 always here
+        memcpy(buf, seed, seed_len);
+        buf[seed_len]     = (uint8_t)(ctr >> 24);
+        buf[seed_len + 1] = (uint8_t)(ctr >> 16);
+        buf[seed_len + 2] = (uint8_t)(ctr >> 8);
+        buf[seed_len + 3] = (uint8_t)(ctr);
+        uint8_t h[SHA512_HASH_SIZE];
+        if (alg == X509_SIG_RSA_SHA384) sha384(buf, seed_len + 4, h);
+        else sha256(buf, seed_len + 4, h);
+        uint32_t take = mask_len - done < hash_len ? mask_len - done : hash_len;
+        memcpy(mask + done, h, take);
+        done += take;
+    }
+}
+
+int rsa_verify_pss(const rsa_pub* k, int alg,
+                   const uint8_t* msg, uint32_t msg_len,
+                   const uint8_t* sig, uint32_t sig_len) {
+    uint8_t hash[SHA512_HASH_SIZE];
+    uint32_t hLen;
+    if (alg == X509_SIG_RSA_SHA256) { sha256(msg, msg_len, hash); hLen = 32; }
+    else if (alg == X509_SIG_RSA_SHA384) { sha384(msg, msg_len, hash); hLen = 48; }
+    else return -1;
+
+    // sig^e mod n = EM, exactly the PKCS#1 block machinery.
+    if (sig_len != k->mod_bytes) return -1;
+    uint32_t s[RSA_MAX_LIMBS], base[RSA_MAX_LIMBS], res[RSA_MAX_LIMBS];
+    uint32_t t[RSA_MAX_LIMBS + 2];
+    if (be_to_limbs(sig, sig_len, s, RSA_MAX_LIMBS) < 0) return -1;
+    if (cmp_limbs(s, k->n, k->nl) >= 0) return -1;
+    mont_mul(base, s, k->r2, k, t);
+    uint32_t one[RSA_MAX_LIMBS];
+    memset(one, 0, sizeof(one)); one[0] = 1;
+    mont_mul(res, one, k->r2, k, t);
+    int ebits = 32 * k->el;
+    int started = 0;
+    for (int i = ebits - 1; i >= 0; i--) {
+        uint32_t bit = (k->e[i / 32] >> (i % 32)) & 1;
+        if (!started) { if (!bit) continue; started = 1;
+                        memcpy(res, base, sizeof(uint32_t) * (size_t)k->nl); continue; }
+        mont_mul(res, res, res, k, t);
+        if (bit) mont_mul(res, res, base, k, t);
+    }
+    mont_mul(res, res, one, k, t);
+    uint8_t em[RSA_MAX_LIMBS * 4];
+    limbs_to_be(res, k->nl, em, k->mod_bytes);
+    uint32_t em_len = k->mod_bytes;
+    // The recovered integer may be shorter than em_len if it had leading
+    // zeros — EMSA-PSS works on emLen = ceil((modBits-1)/8), which equals
+    // mod_bytes when modBits % 8 == 0... it does for our key sizes, and the
+    // leading byte of EM is guaranteed < 0x80 by the (modBits-1) bound.
+    // Verify em[0]'s top bit is clear instead of the exact length shape.
+
+    if (em[em_len - 1] != 0xBC) return -1;
+    uint32_t db_len = em_len - hLen - 1;
+    if (db_len < 32) return -1;             // salt(32) + PS(>=8) minimum-ish
+    const uint8_t* masked_db = em;
+    const uint8_t* h_rec = em + db_len;
+    uint8_t db[RSA_MAX_LIMBS * 4];
+    mgf1(db, db_len, h_rec, hLen, alg);
+    for (uint32_t i = 0; i < db_len; i++) db[i] ^= masked_db[i];
+    db[0] &= 0x7F;                          // clear leftmost bit
+    // DB must be 0x00...00 0x01 || salt
+    uint32_t ps_len = 0;
+    while (ps_len < db_len && db[ps_len] == 0) ps_len++;
+    if (ps_len == 0 || ps_len >= db_len) return -1;
+    if (db[ps_len] != 0x01) return -1;
+    const uint8_t* salt = db + ps_len + 1;
+    uint32_t sLen = db_len - ps_len - 1;
+    if (sLen != hLen) return -1;            // TLS 1.3: saltLen == hLen
+
+    // H' = Hash(0x00 x8 || mHash || salt)
+    uint8_t mb[8 + 64 + 64];
+    memset(mb, 0, 8);
+    memcpy(mb + 8, hash, hLen);
+    memcpy(mb + 8 + hLen, salt, sLen);
+    uint8_t h2[SHA512_HASH_SIZE];
+    if (alg == X509_SIG_RSA_SHA384) sha384(mb, 8 + hLen + sLen, h2);
+    else sha256(mb, 8 + hLen + sLen, h2);
+    uint8_t diff = 0;
+    for (uint32_t i = 0; i < hLen; i++) diff |= h2[i] ^ h_rec[i];
+    return diff == 0 ? 0 : -1;
+}
+
 int rsa_verify_pkcs1(const rsa_pub* k, int alg,
                      const uint8_t* msg, uint32_t msg_len,
                      const uint8_t* sig, uint32_t sig_len) {

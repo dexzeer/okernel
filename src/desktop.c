@@ -2,6 +2,8 @@
 #include "net/e1000.h"
 #include "net/network.h"
 #include "net/tls_net.h"
+#include "crypto/tls_client.h"  // TLS_FAIL_* reason codes for the no-downgrade gate
+#include "rtc.h"
 #include "graphics.h"
 #include "wallpaper.h"
 #include "window.h"
@@ -1321,6 +1323,21 @@ void kernel_main(uint32_t mboot_phys) {
         serial_printf("[rand] CPRNG seeded, ready=%d\n", rand_ready());
     }
 
+    // Wall clock for certificate validity checking (CMOS RTC, port I/O).
+    {
+        x509_time now;
+        if (rtc_read(&now) == 0) {
+            x509_set_now(&now);
+            serial_printf("[rtc] wall clock: %04d-%02d-%02d %02d:%02d:%02d\n",
+                          now.year, now.month, now.day,
+                          now.hour, now.minute, now.second);
+        } else {
+            // Keep the parser's build-date default; validity checks are
+            // approximate but sane.
+            serial_puts("[rtc] CMOS read failed, using build-date default\n");
+        }
+    }
+
     // Init input
     mouse_init_fb();
     keyboard_init();
@@ -2091,12 +2108,26 @@ void kernel_main(uint32_t mboot_phys) {
                         }
                     }
                 } else if (!tls_is_active() && !tls_is_done()) {
-                    // Fetch gave up (TLS timeout / unreachable / no A record).
-                    // If we haven't already, retry once over plain HTTP — some
-                    // hosts don't serve HTTPS. Ownership stays with this window;
-                    // the next loop iteration takes the HTTP branch (is_https is
-                    // now 0) so this branch won't re-fire.
-                    if (okai_fallback_http(bi) == 0) {
+                    // Fetch gave up. Classify: certificate/protocol failures
+                    // MUST NOT fall back to plain HTTP — a MITM can force that
+                    // downgrade by killing the TLS handshake. Only transport
+                    // failures (timeout / unreachable / no A record) downgrade.
+                    int fr = tls_get_fail_reason();
+                    int cert_fail = (fr == TLS_FAIL_CERT ||
+                                     fr == TLS_FAIL_HOSTNAME ||
+                                     fr == TLS_FAIL_PROTO ||
+                                     fr == TLS_FAIL_MAC ||
+                                     fr == TLS_FAIL_ALERT ||
+                                     fr == TLS_FAIL_RNG);
+                    if (cert_fail) {
+                        serial_printf("[okai] TLS cert failure (reason=%d), no HTTP fallback for %s\n",
+                                      fr, T->url);
+                        T->cert_failed = 1;
+                        okai_fetch_owner = -1;
+                        T->token_count = -1;
+                        T->last_resp_len = 0;
+                        okai_render_content(bi); // show SECURITY WARNING page
+                    } else if (okai_fallback_http(bi) == 0) {
                         serial_printf("[okai] http fallback in flight for %s\n", T->url);
                     } else {
                         okai_fetch_owner = -1;

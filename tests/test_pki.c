@@ -7,6 +7,7 @@
 #include "x509.h"
 #include "rsa.h"
 #include "ec.h"
+#include "certverify.h"
 
 static uint8_t buf[16384];
 
@@ -165,6 +166,55 @@ int main(void) {
             snprintf(nm, sizeof(nm), "self-verify %s", roots[i].file);
             CHECK(verify_with(rc.sig_alg, &rc, &rc) == 0, nm);
         }
+    }
+
+    printf("== full chain verification via cert_verify ==\n");
+    {
+        // Build a TLS 1.3 Certificate message body from the live chain:
+        // ctx_len(1)=0 | list_len(3) | entries { len(3) | DER | ext(2)=0 }
+        static uint8_t msg[32768];
+        uint32_t mp = 0;
+        msg[mp++] = 0;  // empty certificate_request_context
+        uint32_t lenpos = mp; mp += 3;
+        const char* files[] = {
+            "tests/fixtures/example_leaf.der",
+            "tests/fixtures/example_int1.der",
+            "tests/fixtures/example_int2.der",
+            "tests/fixtures/example_root_cross.der",
+        };
+        for (unsigned i = 0; i < sizeof(files)/sizeof(files[0]); i++) {
+            int cn = load(files[i], buf, sizeof(buf));
+            if (cn <= 0) { printf("  SKIP missing %s\n", files[i]); continue; }
+            msg[mp++] = (uint8_t)((uint32_t)cn >> 16);
+            msg[mp++] = (uint8_t)((uint32_t)cn >> 8);
+            msg[mp++] = (uint8_t)(cn & 0xff);
+            memcpy(msg + mp, buf, (size_t)cn); mp += (uint32_t)cn;
+            msg[mp++] = 0; msg[mp++] = 0;   // no entry extensions
+        }
+        msg[lenpos]   = 0;
+        msg[lenpos+1] = (uint8_t)(((mp - lenpos - 3) >> 8) & 0xff);
+        msg[lenpos+2] = (uint8_t)((mp - lenpos - 3) & 0xff);
+
+        x509_time now = { 2026, 9, 9, 14, 0, 0 };
+        x509_set_now(&now);
+        int r = cert_verify(msg, mp, "example.com");
+        CHECK(r == CV_OK, "cert_verify(example.com) full chain OK");
+        if (r != CV_OK)
+            printf("    -> %s\n", cert_verify_strerror(r));
+        r = cert_verify(msg, mp, "attacker.example.io");
+        CHECK(r == CV_ERR_HOSTNAME, "cert_verify rejects wrong hostname");
+        r = cert_verify(msg, mp, "a.b.example.com");
+        CHECK(r == CV_ERR_HOSTNAME, "cert_verify rejects deep wildcard");
+        x509_time past = { 2020, 1, 1, 0, 0, 0 };
+        x509_set_now(&past);
+        r = cert_verify(msg, mp, "example.com");
+        CHECK(r == CV_ERR_NOT_YET, "cert_verify rejects when clock is 2020");
+        x509_time future = { 2031, 1, 1, 0, 0, 0 };
+        x509_set_now(&future);
+        r = cert_verify(msg, mp, "example.com");
+        CHECK(r == CV_ERR_EXPIRED, "cert_verify rejects when clock is 2031");
+        x509_time now2 = { 2026, 9, 9, 14, 0, 0 };
+        x509_set_now(&now2);
     }
 
     printf("\n%s: %d failures\n", failures == 0 ? "PKI TESTS PASS" : "PKI TESTS FAIL", failures);
