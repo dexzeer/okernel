@@ -429,6 +429,16 @@ void process_switch_to(uint32_t pid) {
     // pointer under cli below (locals may be stale by then — see below).
     uint32_t seed_esp = next_esp;
     int need_seed = (next_eip == 0);
+    // SEED-SANITY (bisect 2026-09-09: post-hello cs=8 NULL-EIP with no rogue
+    // enter — a poisoned esp==0 (destroy zeroes esp, and the zombie-target
+    // guard below runs AFTER this write) would make sp-=5 underflow to
+    // 0xFFFFFFEC and the five stores corrupt the IDT/GDT region... then
+    // publish esp=0xFFFFFFEC and resume into garbage. Refuse to seed a zero
+    // (or absurdly-low, <64K — null-adjacent) ESP: return with the guard
+    // clear (the target is dead; its waiter reaps it; tick retries).
+    if (need_seed && seed_esp < 65536) {
+        return;
+    }
     if (need_seed) {
         uint32_t *sp = (uint32_t*)seed_esp;
         sp -= 5;
