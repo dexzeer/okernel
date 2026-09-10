@@ -127,6 +127,19 @@ int rsa_pub_from_x509(const x509_cert* cert, rsa_pub* k) {
     memset(k, 0, sizeof(*k));
 
     k->mod_bytes = cert->rsa_n_len;
+    // Strength floor (review #10/#15): bit-exact >= 2048 bits (a byte
+    // count alone admits 2040-bit keys in 256-byte fields). certverify.c
+    // enforces a byte floor on the path; this centralizes the exact rule
+    // for every rsa_pub user.
+    {
+        uint32_t bits = 0;
+        if (cert->rsa_n_len > 0) {
+            uint8_t top = cert->rsa_n[0];
+            bits = (cert->rsa_n_len - 1) * 8;
+            while (top) { bits++; top >>= 1; }
+        }
+        if (bits < 2048) return -1;
+    }
     int nl = be_to_limbs(cert->rsa_n, cert->rsa_n_len, k->n, RSA_MAX_LIMBS);
     if (nl <= 0) return -1;
     // Modulus must be odd and top-bit-set (proper RSA key).
@@ -135,6 +148,13 @@ int rsa_pub_from_x509(const x509_cert* cert, rsa_pub* k) {
 
     k->el = be_to_limbs(cert->rsa_e, cert->rsa_e_len, k->e, RSA_MAX_LIMBS);
     if (k->el <= 0) return -1;
+    // Exponent discipline (review #15): odd, >= 3, fits 32 bits.
+    // Rejects 0/1/2/even (degenerate or even-exponent keys) and absurdly
+    // large exponents (square-and-multiply cost + never seen in the wild;
+    // the real world is 3/17/257/65537). Documented tradeoff: revisit on
+    // interop evidence, not on theory.
+    if (k->el != 1) return -1;
+    if (k->e[0] < 3 || (k->e[0] & 1) == 0) return -1;
 
     k->n0inv = n0inv_of(k->n[0]);
     mont_compute_r2(k);
@@ -216,11 +236,10 @@ int rsa_verify_pss(const rsa_pub* k, int alg,
     uint8_t em[RSA_MAX_LIMBS * 4];
     limbs_to_be(res, k->nl, em, k->mod_bytes);
     uint32_t em_len = k->mod_bytes;
-    // The recovered integer may be shorter than em_len if it had leading
-    // zeros — EMSA-PSS works on emLen = ceil((modBits-1)/8), which equals
-    // mod_bytes when modBits % 8 == 0... it does for our key sizes, and the
-    // leading byte of EM is guaranteed < 0x80 by the (modBits-1) bound.
-    // Verify em[0]'s top bit is clear instead of the exact length shape.
+    // emBits = 8*emLen - 1 for our key sizes: the top bit MUST already be
+    // clear (review #16 — EMSA-PSS encoding rule). Masking without checking
+    // first accepts malformed encodings; check, THEN mask.
+    if (em_len == 0 || (em[0] & 0x80)) return -1;
 
     if (em[em_len - 1] != 0xBC) return -1;
     uint32_t db_len = em_len - hLen - 1;

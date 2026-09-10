@@ -30,6 +30,14 @@ struct tls_client_io {
 // drives tls_state_step() one call at a time from the main loop so the desktop
 // never freezes during the handshake/download.
 //
+// CONCURRENCY CONTRACT (review #6/#33): single-threaded, main-loop only.
+// No IRQ handler may enter tls_state_step/cert_verify/ec_verify/rsa_verify
+// (the timer ISR stirs the RNG only, and rand_* hold cli across transitions).
+// The ticket/pin caches are process-global by design (single connection at a
+// time; tls_net's fetch-owner model enforces it) — they persist across
+// connections with documented lifetimes, never across threads (none exist).
+// g_last_fail_reason is host-test-only for the same reason.
+//
 // recv() contract: returns >0 bytes read, -1 on peer close/error, 0 to signal
 // "would block" (no data yet) — the driver then yields to the main loop and
 // retries next tick. Blocking callers (host) never return 0.
@@ -37,6 +45,11 @@ struct tls_client_io {
 #define TLS_STEP_AGAIN 0   // need more I/O; driver should yield and retry
 #define TLS_STEP_DONE   1   // out/out_len hold the full plaintext response
 #define TLS_STEP_ERR   -1   // handshake or transport failure
+
+// Handshake reassembly cap (review #9): complete flights must fit. Real
+// flights run 1-4KB (our RSA-2048 chains ~2KB); 16KB covers RSA-4096
+// chains with headroom. Past this: reject, never truncate.
+#define TLS_HS_REASSEMBLY_MAX 16384
 
 // Why the state machine stopped. Recorded in tls_state.fail_reason so the
 // caller can distinguish "clean end" from "peer killed us" from "the
@@ -62,10 +75,15 @@ enum tls_phase {
 struct tls_state {
     int phase;
     const char* host;
-    const char* verify_host;   // hostname used for certificate verification;
+#ifndef KERNEL
+    const char* verify_host;   // HOST-ONLY test hook (review 2026-09-10 #12):
+                               // hostname used for certificate verification;
                                // NULL = use `host`. Lets tests keep a truthful
                                // SNI on the wire while checking a wrong name
-                               // (the MITM-accommodation scenario).
+                               // (the MITM-accommodation scenario). Absent
+                               // from production: authentication parameters
+                               // must not be mutable convenience fields.
+#endif
     uint16_t port;
     const uint8_t* request;
     uint32_t request_len;
@@ -123,6 +141,13 @@ struct tls_state {
     uint8_t rec_buf[TLS_RECORD_MAX_PAYLOAD + 5];
     uint32_t rec_have;
     uint32_t rec_pl;
+
+    // Handshake-message reassembly (RFC 8446 §5.1: messages may fragment
+    // across records). Decrypted HANDSHAKE payloads accumulate here;
+    // complete messages are dispatched in order, leftovers compacted.
+    // Zeroed by tls_state_init with the rest of the struct.
+    uint8_t hs_buf[TLS_HS_REASSEMBLY_MAX];
+    uint32_t hs_have;
 };
 
 void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
@@ -133,6 +158,14 @@ void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
 // Default 0 = unknown (stored tickets read age 0).
 void tls_state_set_now_ms(struct tls_state* st, uint64_t now_ms);
 int tls_state_step(struct tls_state* st, const struct tls_client_io* io);
+
+// Wipe all ephemeral key material in a finished/failed state (review #30):
+// ECDHE private, handshake/app secrets + keys/ivs, master + resumption
+// master, PSK offer state, transcript + record + reassembly buffers.
+// Preserves: out/out_len/out_cap (caller response), fail codes + detail,
+// phase, host pointers. Ticket/pin stores are connection-independent and
+// intentionally survive (documented lifetimes, not per-connection state).
+void tls_state_wipe(struct tls_state* st);
 
 int tls_last_fail_reason(void); // TLS_FAIL_* of the most recent tls_client_run
 

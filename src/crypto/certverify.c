@@ -73,7 +73,8 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
     uint32_t list_len = ((uint32_t)msg_body[p] << 16) |
                         ((uint32_t)msg_body[p+1] << 8) | msg_body[p+2];
     p += 3;
-    if (msg_len - p < list_len) return CV_ERR_PARSE;
+    // Exact framing (review #23, same discipline as tls_parse_certificate).
+    if (msg_len - p != list_len) return CV_ERR_PARSE;
 
     x509_cert certs[CERTVERIFY_MAX_CERTS];
     int ncerts = 0;
@@ -152,6 +153,18 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
         // issuer key strength (review #10, same floor as the leaf above)
         if (issuer->key_type == X509_KEY_RSA && issuer->rsa_n_len < 256)
             return CV_ERR_KEYUSE;
+        // AKI/SKI key binding (review #10): when the subject carries an
+        // AuthorityKeyIdentifier AND the issuer carries a
+        // SubjectKeyIdentifier, they MUST be equal — the chain is bound by
+        // key, not just by name (kills sibling-key substitution: same
+        // subject name, different key). Either side absent constrains
+        // nothing (legacy certs predate the extensions).
+        if (subject->has_aki && issuer->has_ski) {
+            if (subject->aki_len != issuer->ski_len ||
+                memcmp(subject->aki, issuer->ski,
+                       subject->aki_len) != 0)
+                return CV_ERR_CHAIN;
+        }
         // issuer key usage / EKU (review #6): a CA that may not sign
         // certs (no keyCertSign) or not for serverAuth (EKU without it)
         // cannot issue this path. Absent = unconstrained.
@@ -179,7 +192,7 @@ int cert_leaf(const uint8_t* msg_body, uint32_t msg_len, x509_cert* leaf) {
     uint32_t list_len = ((uint32_t)msg_body[p] << 16) |
                         ((uint32_t)msg_body[p+1] << 8) | msg_body[p+2];
     p += 3;                                  // skip certificate_list length
-    if (list_len == 0 || msg_len - p < list_len) return -1;
+    if (list_len == 0 || msg_len - p != list_len) return -1;
     uint32_t entry_len = ((uint32_t)msg_body[p] << 16) |
                          ((uint32_t)msg_body[p+1] << 8) | msg_body[p+2];
     p += 3;

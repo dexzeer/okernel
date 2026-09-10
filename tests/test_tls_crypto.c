@@ -55,6 +55,19 @@ int main(void) {
         "34007208d5b887185865", 42);
     check("HKDF TC1", out, okm1, 42);
 
+    // Oversize refusal (review #40): >8160B must FAIL, never clamp.
+    {
+        static uint8_t big_okm[9000];
+        int r1 = hkdf(salt, 13, ikm, 22, info, 10, big_okm, 9000);
+        printf("%-28s %s\n", "HKDF oversize refuses", r1 == -1 ? "PASS" : "FAIL");
+        if (r1 != -1) fails++;
+        uint8_t prk[32];
+        memset(prk, 0x11, 32);
+        int r2 = hkdf_expand(prk, info, 10, big_okm, 9000);
+        printf("%-28s %s\n", "HKDF-expand oversize refuses", r2 == -1 ? "PASS" : "FAIL");
+        if (r2 != -1) fails++;
+    }
+
     // ---- AEAD RFC 8439 §2.8.2 ----
     uint8_t key[32]; unhex(key,
         "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f", 32);

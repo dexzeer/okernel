@@ -14,8 +14,11 @@
 #define TLS_VERSION_TLS12 0x0303
 #define TLS_VERSION_TLS13 0x0304
 
-// Maximum plaintext a single record can carry (16KB + 1KB safety).
-#define TLS_RECORD_MAX_PAYLOAD 18432
+// Maximum record payload on the wire (RFC 8446 §5.1: TLSCiphertext
+// fragment < 2^14 + 256 = 16640 bytes; ChaCha20-Poly1305 expansion is
+// 1 content-type byte + 16 tag, inside the budget). Enforced at receive
+// (review 2026-09-10 #7); our sends are far smaller (handshake flight).
+#define TLS_RECORD_MAX_PAYLOAD 16640
 
 // Parsed record view: does not own its memory, just points into a buffer.
 typedef struct {

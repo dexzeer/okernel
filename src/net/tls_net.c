@@ -269,6 +269,9 @@ void https_get_poll(void) {
             tls_active = 0;
             tls_phase = HP_IDLE;
             serial_printf("[tls-net] received %u bytes\n", (unsigned)tls_s.out_len);
+            // Ephemeral keys must not linger in the static state until the
+            // next fetch (review #30). Response + outcome already copied out.
+            tls_state_wipe(&tls_s);
         } else if (r == TLS_STEP_ERR) {
             tls_fail_reason = tls_s.fail_reason;
             tls_fail_detail = tls_s.cert_detail;
@@ -279,6 +282,7 @@ void https_get_poll(void) {
             tls_done = 0;
             tls_active = 0;
             tls_phase = HP_IDLE;
+            tls_state_wipe(&tls_s);
         }
         return;
     }

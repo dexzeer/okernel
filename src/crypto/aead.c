@@ -22,6 +22,12 @@ static int mac_poly1305(const uint8_t key[32],
     // uninitialized stack on decrypt (UB + potential auth bypass). A MAC
     // primitive that can silently not-MAC is the worst bug class — refuse.
 #define AEAD_MAC_SCRATCH (20 * 1024)
+    // Non-reentrant by construction (review #41): single static buffer.
+    // Safe under the documented single-threaded contract (tls_client.h):
+    // AEAD runs in main-loop thread context only — never in IRQ handlers,
+    // never nested (decrypt verifies before decrypting; no reentry path).
+    // A streaming Poly1305 API would remove the buffer AND the 20KB cap;
+    // until then the cap is enforced loudly (see below), never silently.
     static uint8_t scratch[AEAD_MAC_SCRATCH];
     uint32_t total = aad_len + ct_len + 32 + 2 * 16;
     if (total > AEAD_MAC_SCRATCH) {

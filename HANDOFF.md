@@ -2473,3 +2473,106 @@ github.com → ithub.com → NXDOMAIN, misread as network failure).
   test_link_local).
 - Next crypto: OCSP validation, pin override UX (both deferred, honestly
   noted on the warning page), AES-GCM (excluded).
+
+---
+
+## Session 2026-09-10 (night) — deep-review response round 2 (78/78 + ASan clean)
+
+Second, much deeper external review (`cryptoholes.txt` rewritten: 48
+findings, 1633 lines, committed for provenance). Worked P0 fully + P1
+nearly fully in reviewer's priority order. Unchanged by design: full path
+building/policies/revocation semantics (documented limits), AES-GCM
+(excluded earlier), const-time assembly audit (needs a dedicated session).
+
+### P0 (all done)
+1. **SH OOB read (the reviewer's #1).** Oversize SH truncated the copy but
+   kept the attacker's length → transcript/parsers read OOB. Fixed:
+   reject-before-copy; audited every bounded copy (EE/CERT/CV were already
+   check-before-copy; fin exact; rec_buf arithmetic overflow-free).
+   Regression: MOCK_SH_BIG (>4KB SH → ERR). ASan would have caught the old
+   code (it caught two mock-side sizing slips below instead).
+2. **send_aead overflow.** `pt_len + 1 > sizeof` wraps at UINT32_MAX →
+   `pt_len >= sizeof` guard; all sums safe by construction after.
+3. **out_len wrap.** Subtraction form + explicit invariant check.
+4. **RNG re-architecture (Fortuna-lite).** Pools (fast/slow) + SHA-256
+   conditioner + source classes (BOOT/TIMER/INPUT/RDRAND); readiness =
+   reseed compressing ≥64B from ≥2 classes (NEVER a sample count); MAC is
+   personalization only (never counted); RDRAND probed via CPUID and mixed
+   as one class among several (absent under QEMU — pools carry it, logged);
+   per-call RDTSC nonce fold (snapshot divergence); fail-closed throughout.
+   Bug found by the new unit test: per-window mask wipe deadlocked
+   readiness without interrupt luck — mask is now lifetime-accumulative.
+   `tests/test_rng.c` (9 checks: fresh-closed, single-class flood refused,
+   two-class opens, stream advances) in host-tests.
+5. **Host RNG fail-closed.** /dev/urandom or abort (TLS_FAIL_RNG) — the
+   time/pid fallback is gone.
+6. **Concurrency.** cli/sti inside rand_* (timer ISR stirs while main loop
+   generates); single-threaded contract documented in tls_client.h/rand.h
+   (no IRQ crypto paths — verified: e1000 RX only memcpys).
+7. **Record cap 16640** (RFC 8446 §5.1) enforced at recv.
+8. **Seq exhaustion guards** on both AEAD paths.
+9. **Fragmentation.** RECV_HS reassembles handshake messages across records
+   (16KB hs_buf, cap-reject, trailing-after-Finished rejected, compaction).
+   MOCK_FRAGMENT (split mid-Certificate → DONE). Bisected: mock burned a
+   throwaway encode's seq before the split sends (MAC fail, not logic).
+10. **Fuzz infra.** `== 0. parser robustness` section (4000 garbage rounds
+    over every parser, range-checked codes) + `make host-tests-asan`.
+
+### P1 (done unless noted)
+- verify_host is `#ifndef KERNEL` (kernel never set it — verified).
+- CCS must be exactly `01` (was skip-anything).
+- HRR magic random explicitly rejected (would have poisoned all keys).
+- EE full validation (exact, no-dups, ALPN-if-present == http/1.1 —
+  live-verified against Cloudflare) + SH exact + SH/EE dup rejection
+  (MOCK_SH_TRAIL/SH_DUP/EE_DUP/EE_ALPN_H2, all ERR).
+- ECDSA canonical: strict DER INTEGER + 1<=r,s<n BEFORE reduction +
+  0x04 prefix + coordinates < p pre-montgomery (test_crypto_strict.c:
+  padded/r+n/zero/negative r, x==p, compressed prefix, RSA e∈{0,1,2,
+  even,>32b} — all rejected, controls pass).
+- DER: strict positive-INTEGER helper (n/e/serial/pathlen), alg-id full
+  consumption + per-alg params (RSA NULL-or-absent, ECDSA absent-only;
+  outer==inner incl. params), ext BOOLEAN strict, pathlen malformed→reject
+  (was: silent unconstrained!), full month/leap dates, TBS trailing
+  reject, cert framing exact (message + entries), certverify list exact.
+  (One self-caught pathlen-0-vs-zero-reject ordering bug along the way.)
+- AKI/SKI key binding in the walk (both-present → must match;
+  sibling-key substitution dead). IP SANs (v4, exact; DNS never matches
+  IP hosts and vice versa; leading-zero rejected). Hostnames: 253 cap
+  (no truncation), ASCII-only reject. Fixtures: at_ip/at_dnsip (openssl),
+  at_aki_ok/at_aki_bad (mint_aki.py + at_int.key). New `== 5.` section
+  (13 checks).
+- Zeroization: `secure_zero` (header-inline — host builds link libc, not
+  string.c) + `tls_state_wipe()` on DONE/ERR in tls_client_run AND tls_net
+  (static state must not linger between fetches).
+- Ticket clock gate (no offer with now_ms==0; tls_client_run stamps wall
+  time), oversized-nonce reject (MOCK_NST_BIGNONCE: dropped but flight
+  completes), true oldest-first pin eviction, hkdf_expand/hkdf → int
+  (refuse >8160 instead of clamp; expand_label bounds out_len too).
+- State-machine rejection table banner over tls_state_step (#28-lite;
+  full table refactor deferred — behavior already matches it).
+- Deferred with notes: full path policies/constraints (documented as
+  limits, not silent), OCSP validation semantics (page already honest),
+  TOFU persistence (PFS-shaped future), AEAD static scratch (documented
+  under the single-thread contract; streaming Poly1305 is the real fix),
+  const-time assembly audit, X25519 extra vectors (reviewer already
+  differentially validated the arithmetic: 100/100 vs python crypto).
+
+### Verification
+- `make host-tests` RC=0 (crypto/rng/strict/css/subres/pki PASS, 78/78
+  adversarial, live PHASE 4+MITM).
+- `make host-tests-asan` equivalent: 78/78, zero sanitizer findings (two
+  mock-side buffer slips fixed along the way — sh_wire/g_sh_body sizing
+  for SH_BIG; production SH cap is what the test targets).
+- QEMU final ISO: pki_qemu PASS (live Cloudflare through the entire new
+  strictness stack), sh_hello PASS, both ISOs link clean (text needed the
+  weak-hook for the keyboard RNG stir — rand.o stays desktop-only).
+- test_pki 0 failures (real chains survive serial/params/AKI/RSA-floor).
+
+### Traps (process)
+- python one-liners editing C arrays (names/enum) need order verification
+  after (caught a positional mismatch by diffing enum vs names).
+- Cross-run test globals (pin/ticket stores) need per-mode isolation
+  resets wherever leaf identity changes (documented pattern by now).
+- Mock seq discipline: encode EXACTLY what is queued, in queue order.
+- Fixture clocks stay mtime-relative (adv_clocks) — new fixtures (IP/AKI)
+  inherited this for free.

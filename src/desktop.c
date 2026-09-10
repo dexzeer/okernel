@@ -1021,25 +1021,24 @@ static void on_keypress(char c) {
     }
 }
 
-static int rand_stir_ticks = 0;
 static void on_timer(void) {
     tick_count++;
     // Scheduler tick FIRST (cheap, runs at IRQ): count down the running
     // user process's slice and round-robin on expiry. No-op when only the
     // kernel idle process exists — zero behavior change for existing flows.
     sched_tick();
-    // Keep mixing entropy into the CPRNG (forward secrecy) for the first ~32
-    // ticks. rand_seed() at boot already primed it to "ready"; this just
-    // continues folding fresh RDTSC + MAC jitter into the keystream.
-    if (rand_stir_ticks < 32) {
+    // Continuous entropy upkeep (review 2026-09-10 #4): every tick folds an
+    // RDTSC sample into the fast pool (TIMER class); every 16th stir the
+    // pool reseeds the key (see rand.c). Per-tick cost is a 32B memcpy —
+    // the reseed's two SHA-256 passes amortize to ~2us/160ms. The MAC is
+    // deliberately NOT mixed here (public, static — not entropy).
+    {
         uint8_t sample[32];
         uint64_t t = 0;
         __asm__ volatile("rdtsc" : "=A"(t));
-        uint8_t* mac = e1000_get_mac();
         for (int i = 0; i < 32; i++)
-            sample[i] = (uint8_t)((t >> ((i & 7) * 8)) ^ ((mac[i % 6] << 1) & 0xFF) ^ (rand_stir_ticks * 37 + i));
-        rand_stir(sample);
-        rand_stir_ticks++;
+            sample[i] = (uint8_t)((t >> ((i & 7) * 8)) & 0xFF);
+        rand_stir(sample); // TIMER class (wrapper)
     }
 }
 
@@ -1253,25 +1252,31 @@ void kernel_main(uint32_t mboot_phys) {
     net_set_event_callback(on_net_event);
 
     // Seed the ChaCha20 CPRNG used by the TLS client for key material.
-    // Mix RDTSC + the e1000 MAC, stir 32x so the CPRNG reaches "ready"
-    // immediately (rand_ready() requires 1024 bytes of mixed entropy).
+    // Honest model (review 2026-09-10 #4): the MAC is PUBLIC — it enters
+    // only as domain separation (rand_personalize, never counted). Real
+    // classes here: BOOT (RDTSC/RTC). RDRAND opportunistically. Readiness
+    // comes a few timer ticks later when TIMER-class samples arrive and a
+    // reseed compresses >= 64B from >= 2 classes — still long before any
+    // user-initiated fetch. rand_bytes() fails closed until then.
     {
         uint8_t* mac = e1000_get_mac();
+        rand_personalize(mac, 6);
         uint8_t seed[32];
         uint64_t tsc = 0;
         __asm__ volatile("rdtsc" : "=A"(tsc));
         for (int i = 0; i < 32; i++)
-            seed[i] = (uint8_t)(mac[i % 6] ^ ((tsc >> ((i & 7) * 8)) & 0xFF) ^ (i * 0x9E));
+            seed[i] = (uint8_t)(((tsc >> ((i & 7) * 8)) & 0xFF) ^ (i * 0x9E));
         rand_seed(seed);
-        for (int s = 0; s < 32; s++) {
+        for (int s = 0; s < 16; s++) {
             uint64_t t2 = 0;
             __asm__ volatile("rdtsc" : "=A"(t2));
             uint8_t sample[32];
             for (int i = 0; i < 32; i++)
-                sample[i] = (uint8_t)((t2 >> ((i & 7) * 8)) ^ ((mac[i % 6] << 1) & 0xFF) ^ (s * 37 + i));
-            rand_stir(sample);
+                sample[i] = (uint8_t)(((t2 >> ((i & 7) * 8)) & 0xFF) ^ (s * 37 + i));
+            rand_stir_src(sample, RAND_SRC_BOOT);
         }
-        serial_printf("[rand] CPRNG seeded, ready=%d\n", rand_ready());
+        serial_printf("[rand] CPRNG seeded (hw=%d), ready=%d (TIMER class pending)\n",
+                      rand_hw_init(), rand_ready());
     }
 
     // Eager ECDSA curve contexts (Montgomery params for P-256/P-384) so no
