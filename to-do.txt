@@ -80,10 +80,10 @@ The Big Missing Foundations
         TLS_FAIL_MAC; cert_verify_trust_extra test hook (host-only);
         tls_dbg on flight-parse failures. Run via `make host-tests`.
 
-    [~] Userland cutover (init + shell-from-disk) — MAJOR PROGRESS 2026-09-10,
-        Phases 0-4 DONE; Phase 5-6 now: init spawns, /bin/sh prompts AND
-        answers (`run /bin/hello` → hello → Back → sh `help` all live,
-        no post-run #PF — the exec EIP/ESP cross that killed init's child
-        is fixed, see HANDOFF 2026-09-10). `usermode` retires only after
-        sh input over serially-typed lines proves out end-to-end.
-        Regression: tests/headless/test_sh_hello.py (kept in tree).
+    [~] Userland cutover (init + shell-from-disk) — init spawns, /bin/sh
+        prompts AND answers (`run /bin/hello` → hello → Back → sh `help`
+        all live, no post-run #PF). 2026-09-10 evening: `usermode` command
+        + user_test.asm staging RETIRED (test_sh_hello.py is the regression;
+        `run /bin/hello` is the smoke test). Regression: sh_hello PASS,
+        links 5/5 PASS, certfail PASS post-cut. Left: fetch-owner race on
+        rapid re-okai (desktop, non-crypto).

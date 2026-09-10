@@ -61,14 +61,8 @@ void syscall_install_full(sys_munmap_hook_fn mu, sys_read_hook_fn r,
 // sys_exit clears it and latches completion; the main loop announces once.
 extern volatile int syscall_can_exit;
 
-// Main-loop IRET staging (shell arms, loop consumes once, then IRETs).
-extern volatile uint32_t user_entry_eip;
-extern volatile uint32_t user_entry_esp;
-extern volatile int user_entry_pending;
-extern volatile int user_entry_pid;
-
-// Entry run queue (replaces the single slot above for new code): stage
-// pid+eip+esp+owning-window per spawn; the main loop drains in order.
+// Entry run queue: stage pid+eip+esp+owning-window per spawn; the main
+// loop drains in order.
 int entry_enqueue(int pid, uint32_t eip, uint32_t esp, int win_id);
 int entry_dequeue(int *pid, uint32_t *eip, uint32_t *esp, int *win_id);
 int entry_pending_any(void);
@@ -76,14 +70,6 @@ int entry_pending_any(void);
 // Drain-side pid stash (main-loop IRET locals go stale across enter/exit).
 void drain_stash_pid(int pid);
 int drain_last_pid(void);
-
-// Ring-3 test image source (installed by desktop.c at boot; syscall.c is
-// COMMON and cannot reference the linked user_mode_test symbol directly).
-void syscall_install_usertest(const uint8_t *page, uint32_t off);
-void syscall_install_usertest_len(uint32_t len);
-uint8_t* user_test_page_base(void);
-uint32_t user_test_page_off(void);
-uint32_t user_test_len(void);
 
 // Returns 1 exactly once per sys_exit (main-loop poll, non-blocking).
 int user_mode_poll_finished(void);
