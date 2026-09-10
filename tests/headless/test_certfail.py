@@ -21,7 +21,7 @@ check("no HTTP fallback", "http fallback" not in s)
 check("chain verified NOT printed", "certificate chain verified" not in s)
 # failure must be a CERT-class reason (4=cert, 5=hostname, 6=proto)
 import re
-m = re.search(r"FAILED \(reason=(\d+)\)", s)
+m = re.search(r"FAILED \(reason=(\d+)", s)
 reason = int(m.group(1)) if m else -1
 check(f"reason is cert-class (got {reason})", reason in (4, 5, 6))
 vm.dump()

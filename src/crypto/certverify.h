@@ -19,6 +19,9 @@
 #define CV_ERR_HOSTNAME  6   // leaf does not match the requested host
 #define CV_ERR_CAFLAGS   7   // issuing cert lacks CA=true or violates pathlen
 #define CV_ERR_NO_CERT   8   // empty certificate flight
+#define CV_ERR_KEYUSE    9   // key usage/EKU violation or insufficient strength
+#define CV_ERR_PINCHANGED 10 // TOFU leaf pin mismatch (key changed since first visit)
+#define CV_ERR_MAX       CV_ERR_PINCHANGED // keep last: fuzzers bound checks here
 
 #define CERTVERIFY_MAX_CERTS 5
 
@@ -30,7 +33,12 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
 // Test/research hook: register ONE extra trusted SPKI (hash computed here),
 // consulted alongside the embedded store. Lets adversarial tests install a
 // mock root without polluting the production store. Passing NULL clears it.
+// HOST-ONLY (review 2026-09-10 #9): compiled out of the kernel — a runtime
+// root-store override in production would be pin-any-MITM. The kernel links
+// with -DKERNEL; host tests don't.
+#ifndef KERNEL
 void cert_verify_trust_extra(const uint8_t* spki, uint32_t spki_len);
+#endif
 
 // Parse just the leaf (first) certificate out of a Certificate message body.
 // Returns 0 and fills *leaf (views into msg_body), -1 on malformed input.

@@ -57,6 +57,9 @@ static int tls_peer_closed = 0;  // set by tcp_handle_packet on FIN
 // fallback when the failure was a certificate/protocol failure — a MITM
 // can force exactly that downgrade by killing the TLS handshake.
 static int tls_fail_reason = 0;
+// Certificate-failure detail (CV_ERR_* or 0): lets the browser print WHY
+// (expired? hostname? pin change?) instead of a generic warning.
+static int tls_fail_detail = 0;
 // TCP connection attempts for the current fetch. Bounded so an unreachable host
 // gives up instead of re-tcp_connect() forever (which would wedge the okai
 // single-owner fetch model).
@@ -129,6 +132,7 @@ void https_get_port(const char* host, const char* path, uint16_t port) {
     tls_response_overflow = 0;
     tls_response[0] = 0;
     tls_fail_reason = 0;
+    tls_fail_detail = 0;
     tls_active = 1;
     tls_phase = HP_DNS;
     tls_done = 0;
@@ -218,6 +222,10 @@ void https_get_poll(void) {
             tls_state_init(&tls_s, tls_host, 443,
                            (const uint8_t*)tls_req_buf, tls_req_len,
                            (uint8_t*)tls_response, sizeof(tls_response) - 1);
+            // Ticket-age clock: tick_count is ms since boot. The ticket
+            // cache (tls_client.c) uses it for lifetime expiry + the
+            // obfuscated ticket_age in PSK offers.
+            tls_state_set_now_ms(&tls_s, (uint64_t)tick_count);
             tls_phase = HP_TLS;
             serial_puts("[tls-net] TCP established, handshake...\n");
             return;
@@ -263,8 +271,9 @@ void https_get_poll(void) {
             serial_printf("[tls-net] received %u bytes\n", (unsigned)tls_s.out_len);
         } else if (r == TLS_STEP_ERR) {
             tls_fail_reason = tls_s.fail_reason;
-            serial_printf("[tls-net] handshake/download FAILED (reason=%d)\n",
-                          tls_fail_reason);
+            tls_fail_detail = tls_s.cert_detail;
+            serial_printf("[tls-net] handshake/download FAILED (reason=%d detail=%d)\n",
+                          tls_fail_reason, tls_fail_detail);
             tls_response_len = 0;
             tls_response[0] = 0;
             tls_done = 0;
@@ -302,6 +311,10 @@ void tls_connection_closed(void) {
 
 int tls_get_fail_reason(void) {
     return tls_fail_reason;
+}
+
+int tls_get_fail_detail(void) {
+    return tls_fail_detail;
 }
 
 void https_get(const char* host, const char* path) {

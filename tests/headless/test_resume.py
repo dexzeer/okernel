@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+# QEMU resumption proof v2: find a ticket-issuing host, then reload it.
+# Uses two `okai <url>` commands (separate tabs, same host) with
+# count-based waits (never stale-matches). Proves: ticket stored ->
+# PSK offered -> (accepted abbreviated | clean fallback) + page parses.
+import sys, time
+sys.path.insert(0, 'tests/headless')
+from okvm import OkVM
+
+HOSTS = ["https://www.google.com/", "https://github.com/",
+         "https://www.wikipedia.org/", "https://example.com/"]
+
+vm = OkVM("resume")
+time.sleep(14)
+
+def n_parse():
+    return vm.serial().count("https parse: count=")
+
+def fetch(url, timeout=120):
+    before = n_parse()
+    vm.type_string("okai %s\n" % url)
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if n_parse() > before:
+            return True
+        time.sleep(2)
+    return False
+
+ok = True
+ticket_host = None
+for h in HOSTS:
+    if fetch(h):
+        s = vm.serial()
+        print(h, "parse PASS")
+        if "ticket stored" in s:
+            ticket_host = h
+            print(h, "ISSUES TICKETS")
+            break
+        else:
+            print(h, "no tickets")
+    else:
+        print(h, "fetch FAIL")
+
+if ticket_host:
+    s0 = vm.serial().count("offering PSK")
+    if fetch(ticket_host):
+        s = vm.serial()
+        offered = vm.serial().count("offering PSK") > s0
+        accepted = "resumption accepted" in s
+        print("PSK offered on refetch:", "PASS" if offered else "FAIL")
+        print("resumption:", "ACCEPTED (abbreviated)" if accepted else "fallback/full")
+        ok = ok and offered
+    else:
+        print("refetch FAIL")
+        ok = False
+else:
+    print("NO TICKET ISSUER FOUND")
+    ok = False
+
+vm.kill()
+print("RESUME:", "PASS" if ok else "FAIL")
+sys.exit(0 if ok else 1)

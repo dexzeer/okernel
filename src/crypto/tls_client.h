@@ -90,8 +90,31 @@ struct tls_state {
     uint8_t c_fin_key[32];
     uint64_t c_ap_seq, s_ap_seq;
 
+    // Resumption basis (stashed at handshake end): master secret + the
+    // resumption master (through BOTH Finished messages). have_res gates
+    // ticket storage — no resumption state, no tickets kept.
+    uint8_t master[32]; int have_master;
+    uint8_t res_master[32]; int have_res;
+    // Clock for ticket-age accounting (ms). Set via tls_state_set_now_ms;
+    // 0 = unknown (ticket stored with age 0 — plausible, servers tolerate).
+    uint64_t now_ms;
+    // PSK offer state (this connection): 1 while a ticket was offered in
+    // the CH (early secret stashed for the handshake keys); psk_accepted
+    // set in RECV_SH iff the server selected our identity.
+    int offer_psk; int psk_accepted;
+    uint8_t psk_early[32];
+
+    // OCSP staple noted (RFC 8446 §4.4.2.1): a CertificateEntry carried a
+    // well-formed status_request. Presence only — content unenforced (see
+    // tls_cert_has_staple). Surfaced for the warning-page honesty note.
+    int got_staple;
+
     // Handshake flight order: 0=expect EE, 1=CERT, 2=CV, 3=Finished.
     int hs_next;
+    // Certificate-failure detail (CV_ERR_* or 0): set whenever fail_reason
+    // becomes TLS_FAIL_CERT/HOSTNAME so the browser can print WHY (expired?
+    // hostname? pin change?) instead of a generic warning.
+    int cert_detail;
     // Diagnostics / failure classification for the caller.
     int fail_reason;   // TLS_FAIL_* (TLS_FAIL_NONE while running)
     int alert_desc;    // alert description when fail_reason == TLS_FAIL_ALERT
@@ -105,6 +128,10 @@ struct tls_state {
 void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
                     const uint8_t* request, uint32_t request_len,
                     uint8_t* out, uint32_t out_cap);
+// Optional wall clock (ms) for ticket-age accounting. The kernel passes
+// tick_count at fetch time; host callers pass gettimeofday-ish ms.
+// Default 0 = unknown (stored tickets read age 0).
+void tls_state_set_now_ms(struct tls_state* st, uint64_t now_ms);
 int tls_state_step(struct tls_state* st, const struct tls_client_io* io);
 
 int tls_last_fail_reason(void); // TLS_FAIL_* of the most recent tls_client_run
@@ -113,5 +140,26 @@ int tls_client_run(const char* host, uint16_t port,
                    const uint8_t* request, uint32_t request_len,
                    uint8_t* out, uint32_t out_cap,
                    const struct tls_client_io* io);
+
+// ---- Trust-On-First-Use leaf pinning ----
+// Memory-only pin store (lost on reboot): hostname → verified leaf SPKI
+// hash. First verified visit stores; later visits with a DIFFERENT leaf key
+// fail closed (possible MITM with a rogue-but-valid cert, or a legitimate
+// rotation — indistinguishable without an override UX, which doesn't exist
+// yet; rotations are rare and the lockout ends at reboot).
+// Returns 0 (first-seen stored, or match), -1 (changed — old pin kept, so
+// every visit warns until reboot/re-pin window).
+// Test hook: tls_pin_clear() drops all pins.
+int tls_pin_check(const char* host, const uint8_t spki_hash[32]);
+void tls_pin_clear(void);
+
+// ---- Session-ticket cache (RFC 8446 §4.6.1) ----
+// Process-global, freestanding-safe (static slots, no allocation). Keyed by
+// hostname; each new connection to a known host may offer the ticket as a
+// PSK (see the offer path in tls_client.c). Tickets fuel resumption ONLY —
+// the first handshake to a host always fully verifies the chain.
+// Test/diagnostic hooks:
+int tls_ticket_have(const char* host); // 1 if an unexpired ticket is cached
+void tls_ticket_clear(void);           // drop all (tests, memory hygiene)
 
 #endif

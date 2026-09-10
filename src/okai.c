@@ -5,6 +5,7 @@
 #include "memory.h"
 #include "net/network.h"
 #include "net/tls_net.h"
+#include "crypto/certverify.h" // CV_ERR_* for the warning-page reason line
 #include "filesystem.h"
 #include "serial.h"
 #include "js/js_dom.h"
@@ -72,6 +73,7 @@ static void okai_tab_reset(struct okai_tab* T) {
     T->is_https = 0;
     T->https_fell_back = 0;
     T->cert_failed = 0;
+    T->cert_detail = 0;
     T->css_n = 0;
     T->css_text[0] = 0;
     T->link_count = 0;
@@ -517,13 +519,35 @@ void okai_render_content(int ed_id) {
                 }
             }
             window_puts(b->win_id, "\n failed verification.\n\n");
+            // Reason line (from the handshake's CV detail code) + honesty
+            // notes: revocation is never checked (no OCSP validation — a
+            // staple is noted, not trusted), and a changed key means the
+            // site's key differs from our first visit (possible MITM or a
+            // legitimate rotation; memory-only pins clear on reboot).
+            {
+                const char* why = NULL;
+                if (T->cert_detail == CV_ERR_PINCHANGED)
+                    why = " Reason: site key changed since first visit.\n";
+                else if (T->cert_detail == CV_ERR_EXPIRED)
+                    why = " Reason: certificate expired (or no clock).\n";
+                else if (T->cert_detail == CV_ERR_HOSTNAME)
+                    why = " Reason: name does not match certificate.\n";
+                else if (T->cert_detail == CV_ERR_KEYUSE)
+                    why = " Reason: key not valid for this use.\n";
+                else if (T->cert_detail == CV_ERR_ROOT)
+                    why = " Reason: unknown issuer (not in store).\n";
+                else if (T->cert_detail == CV_ERR_CHAIN)
+                    why = " Reason: chain signature invalid.\n";
+                if (why) window_puts(b->win_id, why);
+            }
             window_puts(b->win_id, " The connection may be intercepted,\n");
             window_puts(b->win_id, " the site's certificate expired, or\n");
             window_puts(b->win_id, " the identity does not match.\n\n");
             window_puts(b->win_id, " Nothing was loaded and no HTTP\n");
             window_puts(b->win_id, " fallback was attempted.\n");
+            window_puts(b->win_id, " Revocation is not checked (no OCSP).\n");
             window_set_text_color_rgb(b->win_id, default_fg, page_bg);
-            T->content_height = 10;
+            T->content_height = 12;
             w->dirty = 1;
             return;
         }
@@ -1240,6 +1264,7 @@ void okai_navigate(int id, const char* url) {
     T->redirect_count = 0;
     T->https_fell_back = 0;
     T->cert_failed = 0;
+    T->cert_detail = 0;
 
     // Defer the request to the desktop response loop (single-connection owner
     // model); okai_start_fetch() derives scheme/host/path from T->url when it

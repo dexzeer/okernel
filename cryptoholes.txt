@@ -1,0 +1,94 @@
+Everything's now been read — all 20 source files, all four rounds. Here's the complete, consolidated review.
+
+# Final Security Review: Hand-Rolled TLS 1.3 Stack
+
+**Scope:** `chacha20`, `poly1305`, `aead`, `hmac`, `hkdf`, `sha256`, `sha512`, `x25519`, `ec`, `rsa`, `der`, `x509`, `certverify`, `roots`, `rand`, `tls_keysched`, `tls_record`, `tls_handshake`, `tls_client` — fully read.
+
+**Bottom line up front:** The cryptography is in genuinely good shape — better than most commercial embedded stacks I've seen. Every 🔴 finding is a *systems* bug (silent failure modes, time, tickets), not a math bug. Fix list at the bottom is ordered; items 1–6 are the ones that matter.
+
+---
+
+## Verdict by layer
+
+| Layer | Files | Verdict |
+|---|---|---|
+| Stream cipher | `chacha20.c` | ✅ Correct per RFC 8439 |
+| MAC | `poly1305.c` | ✅ Correct (26-bit limbs, clamp, final-block edge cases right) |
+| AEAD | `aead.c` | ⚠️ One silent-failure hole (#1) |
+| Hash | `sha256.c`, `sha512.c` | ✅ Textbook FIPS 180-4; SHA-512 padding bug already fixed per comments |
+| KDF | `hmac.c`, `hkdf.c` | ✅ Correct; HKDF missing 255-block cap (minor) |
+| Key schedule | `tls_keysched.c` | ⚠️ One overflow in `tls_hkdf_expand_label` (#7) |
+| X25519 | `x25519.c` | ✅ Correct ladder, branchless cswap, fixed inversion; client-side zero-check covers low-order |
+| RSA | `rsa.c` | ✅ Correct PSS (saltLen=hLen enforced) + v1.5, Montgomery done right |
+| ECDSA | `ec.c` | ✅ Correct verify, on-curve check before use |
+| DER/X.509 | `der.c`, `x509.c` | ⚠️ Tight parser, but expiry/time model broken (#2), no EKU (#6) |
+| Chain verify | `certverify.c` | ⚠️ Sound walk; trust-injection hook (#9), no keyUsage |
+| RNG | `rand.c` | ⚠️ Decent design, XOR-only entropy mixing (#8-adjacent) |
+| TLS client | `tls_client.c` | ⚠️ Correct 1.3 state machine; tickets (#3) and cleartext-alert truncation (#5) |
+
+---
+
+## 🔴 Critical
+
+**1. `aead.c` — MAC silently skipped for inputs > 20 KB**
+`mac_poly1305` has no `else` on its scratch-size check: oversized input → encrypt path sends an **uninitialized tag**, decrypt path compares against **uninitialized stack memory** (UB + auth bypass). Fix: return `int`, refuse both directions when `total > AEAD_MAC_SCRATCH`. A MAC primitive that can silently not-MAC is the worst bug class in this archive.
+
+**2. `x509.c` — expiry checking frozen at build date**
+```c
+static x509_time g_now = { 2026, 9, 9, 0, 0, 0 };
+```
+If the kernel never calls `x509_set_now()` with a synced clock, every cert valid at build time is trusted **forever**. Fail-open on the most important check after the signature; no revocation checking exists as backstop. Fix: fail closed without a time source, or cap accepted `not_after` at build_date + firmware support window.
+
+**3. `tls_client.c` — NewSessionTicket hard-fails the connection**
+Post-handshake inner type `handshake` → `TLS_FAIL_PROTO`. OpenSSL and most TLS 1.3 servers send NewSessionTicket immediately after the handshake, typically *before* the HTTP response. Your client fails those fetches. (If your tests pass, your test server has tickets disabled — check.) Fix: parse and discard NST; implement or cleanly abort KeyUpdate.
+
+## 🟠 High
+
+**4. PKCS#1 v1.5 accepted in CertificateVerify** — `tls_parse_certificate_verify` and the `0x0401 → rsa_verify_pkcs1` dispatch both accept it; RFC 8446 §4.4.3 forbids it (PSS-only for CV). Restrict CV to `0x0403/0x0503/0x0804/0x0805`. Offering `0x0401` in `signature_algorithms` is fine — it's for chain certs.
+
+**5. Cleartext `close_notify` accepted post-handshake** — `tls_decrypt_one` returns `-2` for a *plaintext* alert even in the app-data phase, and the caller reports it as a **clean DONE with partial body**. An on-path attacker injects 7 unauthenticated bytes and truncates any response undetectably. This contradicts your own "never deliver partial plaintext as if clean" comment. Fix: post-handshake, cleartext ALERT must be an error. (Related: TCP EOF also reports DONE by design — that's the `Connection: close` tradeoff, but know this client can't distinguish truncation from completion.)
+
+**6. No EKU / keyUsage / critical-extension enforcement** — `x509.c` never parses EKU, so a `clientAuth`/`codeSigning` cert terminates successfully if chained. No `keyCertSign` check on CAs, no `digitalSignature` on the leaf, and unrecognized **critical** extensions are ignored (RFC 5280 requires rejection). Fix: parse EKU and require `serverAuth` when present; enforce keyUsage; reject unknown critical extensions.
+
+**7. `tls_hkdf_expand_label` stack overflow + lying length prefix** — `info[256]` with a full `uint32_t context_len` `memcpy` and no bounds check (long label + long context = stack smash); the label length byte can disagree with bytes written. Unreachable from your TLS path today (labels ≤ 12 chars, context = 32), but it's a reusable helper. Fix: two bounds checks, ~3 lines.
+
+## 🟡 Medium / Latent
+
+**8. Fixed-seed xorshift RNG in non-`KERNEL` builds** (`tls_client.c`) — X25519 private keys fully deterministic. Fine while every artifact stays private (as established); the day a binary ships, this becomes 🔴. Fix now with `#error` — zero cost.
+
+**9. `cert_verify_trust_extra()` compiled into production** — a global that overrides the root store. If any runtime path reaches it, it's pin-any-MITM. Guard behind `#ifdef TESTING`.
+
+**10. 1024-bit RSA accepted** (`x509.c` allows `rsa_n_len` down to 128 bytes) — enforce ≥ 2048 bits for leaf and issuer.
+
+**11. Smaller items:**
+- Record `seq` incremented before tag verification (`tls_decrypt_one`) — aborts today, desyncs the day retry logic exists.
+- ServerHello assumed alone/whole in one record — coalesced middlebox-compat records hard-fail (interop).
+- `rand.c` XOR-only entropy mixing — hash entropy in, don't XOR.
+- HKDF-expand no 255×32 cap (counter wraps to 0).
+- `ec.c` curve contexts built lazily behind a racy global — build at kernel init.
+- `parse_time` doesn't validate digits.
+- Unsynchronized globals (`g_last_fail_reason`, `g_extra_trusted_set`) — fine single-connection, hazard later.
+- `roots.c` (14 anchors, SPKI-hash pinned, generated): verify your generator covered the anchors you actually hit in the field (Let's Encrypt/ISRG isn't visible in what I sampled — confirm); SPKI-pinning means cross-signs work, root expiry is moot, and a generator bug fails closed. OK as designed.
+
+---
+
+## What you got right (do not "fix" these)
+
+Poly1305 limb math + clamp + the `len%16==0` no-extra-block case; ChaCha20 counter split; constant-time tag/Finished compares; HMAC/HKDF per RFC; the TLS 1.3 key schedule framing; X25519 ladder + clamping + zero-shared check; RSA PSS with `saltLen==hLen`; ECDSA with on-curve Q validation and strict DER; DER minimal-length enforcement; outer/inner sig-alg equality (kills algorithm-substitution); ClientHello offering only 1.3 + ChaCha + X25519; session-id echo; exact flight-order enforcement; empty-Certificate rejection; transcript handling for traffic secrets and CV; SHA-256/512 padding (the 512 128-bit-length bug is already fixed per your comments).
+
+---
+
+## Fix order
+
+1. `aead.c` oversized-MAC return code (1 day)
+2. `g_now` fail-closed time model (1 day + kernel clock plumbing decision)
+3. NewSessionTicket tolerance in `RECV_BODY` (1 day)
+4. CV algorithm whitelist drop `0x0401` (10 min)
+5. Reject cleartext alerts post-handshake (30 min)
+6. EKU + keyUsage + criticality in `x509.c` (1–2 days)
+7. HKDF bounds checks (30 min)
+8. `#error` the host RNG (5 min)
+9. `#ifdef TESTING` the trust hook; RSA ≥2048 floor (1 hour)
+10. Everything in the 🟡 bucket as routine hardening
+
+Items 1–6 take under a week and move this from "impressive hand-rolled stack" to "defensible production client." The math was never the problem — the failure modes were. That distribution is actually the *good* outcome for a codebase like this.

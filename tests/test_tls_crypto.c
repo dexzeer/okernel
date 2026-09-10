@@ -92,6 +92,21 @@ int main(void) {
     if (rc != -1) fails++;
     ct[5] ^= 0x40;
 
+    // Oversize refusal (review 2026-09-10 #1): >20KB MAC input must FAIL
+    // loudly, never emit/compare an unwritten tag.
+    {
+        static uint8_t big_in[25000], big_out[25000], big_tag[16];
+        for (int i = 0; i < 25000; i++) big_in[i] = (uint8_t)i;
+        rc = aead_chacha20_poly1305_encrypt(key, nonce, aad, 12,
+                                            big_in, 25000, big_out, big_tag);
+        printf("%-28s %s\n", "AEAD oversize encrypt refuses", rc == -1 ? "PASS" : "FAIL");
+        if (rc != -1) fails++;
+        rc = aead_chacha20_poly1305_decrypt(key, nonce, aad, 12,
+                                            big_in, 25000, big_tag, big_out);
+        printf("%-28s %s\n", "AEAD oversize decrypt refuses", rc == -1 ? "PASS" : "FAIL");
+        if (rc != -1) fails++;
+    }
+
     // ---- X25519 RFC 7748 §5.2 vectors ----
     uint8_t sc[32], u[32], pub[32];
     unhex(sc, "a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4", 32);

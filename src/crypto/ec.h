@@ -20,4 +20,11 @@ int ec_verify(int alg,
               const uint8_t* msg, uint32_t msg_len,
               const uint8_t* sig_der, uint32_t sig_len);
 
+// Eager curve-context build (review 2026-09-10 #11): the lazy first-use
+// build inside ec_verify races a preempting tick that re-enters verify on
+// another thread. Single-CPU + no IRQ-path callers make the race
+// theoretical today — but building once at boot (and in tests, lazily via
+// ec_verify's fallback) removes the class. Idempotent.
+void ec_init(void);
+
 #endif

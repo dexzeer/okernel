@@ -11,6 +11,11 @@ void hkdf_extract(const uint8_t* salt, uint32_t salt_len,
 
 void hkdf_expand(const uint8_t prk[32], const uint8_t* info, uint32_t info_len,
                  uint8_t* okm, uint32_t okm_len) {
+    // RFC 5869 §2.3: L <= 255*HashLen (counter is one octet). Clamp rather
+    // than wrap the counter (a wrap would repeat keystream — review
+    // 2026-09-10 #11). In-tree uses are <= 64B; the clamp is unreachable
+    // there by construction, loud by inspection here.
+    if (okm_len > 255 * 32) okm_len = 255 * 32;
     uint8_t t[32];
     uint32_t t_len = 0;
     uint32_t done = 0;
