@@ -18,6 +18,8 @@ static const uint8_t OID_SUBJECT_ALT_NAME[] = {0x55,0x1D,0x11};
 static const uint8_t OID_BASIC_CONSTRAINTS[]= {0x55,0x1D,0x13};
 static const uint8_t OID_KEY_USAGE[]        = {0x55,0x1D,0x0F};
 static const uint8_t OID_EXT_KEY_USAGE[]    = {0x55,0x1D,0x25};
+static const uint8_t OID_SUBJECT_KEY_ID[]   = {0x55,0x1D,0x0E};
+static const uint8_t OID_AUTH_KEY_ID[]      = {0x55,0x1D,0x23};
 static const uint8_t OID_EKU_SERVER_AUTH[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x01};
 static const uint8_t OID_EKU_ANY[]          = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x00};
 
@@ -87,7 +89,18 @@ static int parse_time(const der_node* t, x509_time* out) {
     out->minute = D2(6);
     out->second = has_sec ? D2(8) : 0;
     #undef D2
-    if (out->month < 1 || out->month > 12 || out->day < 1 || out->day > 31) return -1;
+    // Full calendar validation (review #21): month lengths + leap years.
+    // (Digit discipline already enforced above; these are range checks.)
+    if (out->month < 1 || out->month > 12 || out->day < 1) return -1;
+    {
+        static const uint8_t mdays[12] =
+            { 31,28,31,30,31,30,31,31,30,31,30,31 };
+        int leap = (out->year % 4 == 0 && out->year % 100 != 0) ||
+                   (out->year % 400 == 0);
+        uint32_t maxd = mdays[out->month - 1];
+        if (out->month == 2 && leap) maxd = 29;
+        if ((uint32_t)out->day > maxd) return -1;
+    }
     if (out->hour > 23 || out->minute > 59 || out->second > 60) return -1;
     return 0;
 }
@@ -102,16 +115,20 @@ static int parse_alg_id(const uint8_t* buf, uint32_t buf_len, uint32_t* off,
     uint32_t p = 0;
     if (der_expect(seq.content, seq.content_len, &p, DER_TAG_OID, oid_out) != 0)
         return -1;
-    if (param_out) {
-        if (p < seq.content_len) {
-            if (der_next(seq.content, seq.content_len, &p, param_out) != 0)
-                return -1;
-        } else {
-            param_out->tag = 0;   // absent
-            param_out->content = 0;
-            param_out->content_len = 0;
-        }
+    // Params are ALWAYS captured and the sequence must be fully consumed
+    // (review #18): trailing elements after OID/params used to be silently
+    // accepted (malformed AlgorithmIdentifiers parsed as valid).
+    der_node param;
+    if (p < seq.content_len) {
+        if (der_next(seq.content, seq.content_len, &p, &param) != 0)
+            return -1;
+    } else {
+        param.tag = 0;   // absent
+        param.content = 0;
+        param.content_len = 0;
     }
+    if (p != seq.content_len) return -1; // exactly OID + ≤1 params element
+    if (param_out) *param_out = param;
     return 0;
 }
 
@@ -125,6 +142,33 @@ static void int_bytes(const der_node* n, const uint8_t** out, uint32_t* out_len)
     // zeros is correct.
     *out = p;
     *out_len = len;
+}
+
+// Strict DER INTEGER for key material (review #17): minimal, non-negative.
+// allow_zero = 1 permits the value zero (pathLenConstraint); RSA parameters
+// always pass 0 (zero is never a valid modulus/exponent).
+// Rejects negative encodings (high bit without pad), unnecessary leading
+// pads, and empty content. Generic int_bytes() above stays for
+// informational fields; anything that reaches crypto arithmetic — and any
+// constraint with a fail-open default — goes through here.
+static int int_bytes_strict(const der_node* n, const uint8_t** out,
+                            uint32_t* out_len, int allow_zero) {
+    const uint8_t* p = n->content;
+    uint32_t len = n->content_len;
+    if (len == 0) return -1;
+    if (p[0] & 0x80) return -1;              // negative INTEGER
+    if (len > 1 && p[0] == 0x00) {
+        if (!(p[1] & 0x80)) return -1;       // unnecessary pad byte
+        p++; len--;                          // the single legal pad
+    }
+    if (!allow_zero) {
+        uint32_t i = 0;
+        while (i < len && p[i] == 0) i++;
+        if (i == len) return -1;             // zero forbidden here
+    }
+    *out = p;
+    *out_len = len;
+    return 0;
 }
 
 int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
@@ -151,8 +195,8 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
     (void)body;
 
     // signatureAlgorithm (outer, MUST match the inner one — compare OIDs).
-    der_node sig_alg_outer;
-    if (parse_alg_id(cb, clen, &c, &sig_alg_outer, NULL) != 0) return -1;
+    der_node sig_alg_outer, outer_param;
+    if (parse_alg_id(cb, clen, &c, &sig_alg_outer, &outer_param) != 0) return -1;
 
     // signatureValue BIT STRING.
     der_node sig_bits;
@@ -179,12 +223,18 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
         if (inner.content_len != 1 || inner.content[0] != 2) return -1; // v3
     }
 
-    // serialNumber
+    // serialNumber: positive INTEGER (strict — a negative/zero serial is
+    // malformed; the value itself is opaque to us).
     if (der_expect(tb, tl, &t, DER_TAG_INTEGER, &inner) != 0) return -1;
+    {
+        const uint8_t* sv;
+        uint32_t svl;
+        if (int_bytes_strict(&inner, &sv, &svl, 0) != 0) return -1;
+    }
 
     // signature (inner AlgorithmIdentifier) — determine cert's sig algorithm.
-    der_node sig_oid;
-    if (parse_alg_id(tb, tl, &t, &sig_oid, NULL) != 0) return -1;
+    der_node sig_oid, inner_param;
+    if (parse_alg_id(tb, tl, &t, &sig_oid, &inner_param) != 0) return -1;
     // RFC 5280 §4.1.1.2/§4.1.2.3: the outer signatureAlgorithm MUST equal
     // the inner one (same OID). A mismatch is a malformed/forged cert.
     if (sig_alg_outer.content_len != sig_oid.content_len ||
@@ -202,6 +252,30 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
         out->sig_alg = X509_SIG_ECDSA_SHA384;
     else
         return -1;   // unknown signature algorithm — do not trust
+
+    // Params discipline (review #18): outer and inner params must agree
+    // (same presence/shape/bytes — the AlgorithmIdentifiers must be equal,
+    // not just the OIDs), and per-alg shapes hold: RSA-* takes NULL (absent
+    // tolerated for interop — anything else malformed); ECDSA-* takes
+    // absent only.
+    {
+        int is_rsa = (out->sig_alg == X509_SIG_RSA_SHA256 ||
+                      out->sig_alg == X509_SIG_RSA_SHA384 ||
+                      out->sig_alg == X509_SIG_RSA_SHA512);
+        int outer_null = (outer_param.tag == DER_TAG_NULL &&
+                          outer_param.content_len == 0);
+        int inner_null = (inner_param.tag == DER_TAG_NULL &&
+                          inner_param.content_len == 0);
+        int outer_absent = (outer_param.tag == 0);
+        int inner_absent = (inner_param.tag == 0);
+        if (is_rsa) {
+            if (!((outer_null || outer_absent) &&
+                  (inner_null || inner_absent))) return -1;
+        } else {
+            if (!outer_absent || !inner_absent) return -1;
+        }
+        if (outer_absent != inner_absent) return -1; // identifiers must match
+    }
 
     // issuer Name (raw span for chain matching).
     uint32_t name_start = t;
@@ -264,10 +338,15 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                            DER_TAG_INTEGER, &nn) != 0) return -1;
             if (der_expect(rsakey.content, rsakey.content_len, &q,
                            DER_TAG_INTEGER, &ee) != 0) return -1;
-            int_bytes(&nn, &out->rsa_n, &out->rsa_n_len);
-            int_bytes(&ee, &out->rsa_e, &out->rsa_e_len);
+            // Strict key integers (review #17) + tight bounds (e fits the
+            // rsa_pub 32-bit-exponent rule; n bounds are sanity, strength
+            // is enforced exact in rsa_pub_from_x509 + certverify).
+            if (int_bytes_strict(&nn, &out->rsa_n, &out->rsa_n_len, 0) != 0)
+                return -1;
+            if (int_bytes_strict(&ee, &out->rsa_e, &out->rsa_e_len, 0) != 0)
+                return -1;
             if (out->rsa_n_len < 128 || out->rsa_n_len > 1024) return -1;
-            if (out->rsa_e_len < 1 || out->rsa_e_len > 8) return -1;
+            if (out->rsa_e_len < 1 || out->rsa_e_len > 4) return -1;
             out->key_type = X509_KEY_RSA;
         } else if (oid_is(&alg_oid, OID_EC_PUBLIC_KEY, sizeof(OID_EC_PUBLIC_KEY))) {
             // parameters: named curve OID (required)
@@ -311,13 +390,18 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
             der_node ext_oid;
             if (der_expect(ext.content, ext.content_len, &g,
                            DER_TAG_OID, &ext_oid) != 0) return -1;
-            // critical BOOLEAN DEFAULT FALSE — optional
+            // critical BOOLEAN DEFAULT FALSE — optional. Strict DER
+            // (review #19): present means exactly one byte, 0x00 or 0xFF.
+            // Anything else is malformed (the old code treated any
+            // non-0xFF byte as non-critical and carried on).
             int ext_critical = 0;
             if (g < ext.content_len && ext.content[g] == DER_TAG_BOOLEAN) {
                 if (der_expect(ext.content, ext.content_len, &g,
                                DER_TAG_BOOLEAN, &inner) != 0) return -1;
-                ext_critical = (inner.content_len == 1 &&
-                                inner.content[0] == 0xFF);
+                if (inner.content_len != 1 ||
+                    (inner.content[0] != 0x00 && inner.content[0] != 0xFF))
+                    return -1;
+                ext_critical = (inner.content[0] == 0xFF);
             }
             der_node val;
             if (der_expect(ext.content, ext.content_len, &g,
@@ -336,6 +420,19 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                 while (nn < names.content_len &&
                        out->san_count < X509_MAX_SAN) {
                     uint8_t tg = names.content[nn];
+                    if (tg == 0x87) {
+                        // iPAddress: 4 (v4) or 16 (v6) raw bytes. Keep v4.
+                        der_node ip;
+                        if (der_expect(names.content, names.content_len,
+                                       &nn, 0x87, &ip) != 0) return -1;
+                        if (ip.content_len == 4 && out->ip_san_count < 4) {
+                            for (int b = 0; b < 4; b++)
+                                out->ip_san[out->ip_san_count][b] =
+                                    ip.content[b];
+                            out->ip_san_count++;
+                        }
+                        continue;
+                    }
                     if (tg != 0x82) {   // only dNSName matters for us
                         der_node skip;
                         if (der_next(names.content, names.content_len,
@@ -369,13 +466,24 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                                       flag.content[0] == 0xFF);
                     }
                     if (b < bc.content_len) {
+                        // pathLenConstraint: strict positive INTEGER, ≤ 2
+                        // bytes (review #20). A 3+ byte (or negative)
+                        // encoding used to fall through leaving path_len =
+                        // -1 (unconstrained!) — malformed constraint must
+                        // reject the certificate, not lift the limit.
                         der_node pl;
                         if (der_expect(bc.content, bc.content_len, &b,
                                        DER_TAG_INTEGER, &pl) != 0) return -1;
-                        if (pl.content_len == 1)
-                            out->path_len = pl.content[0];
-                        else if (pl.content_len == 2)
-                            out->path_len = ((int)pl.content[0] << 8) | pl.content[1];
+                        {
+                            const uint8_t* pv;
+                            uint32_t pvl;
+                            if (int_bytes_strict(&pl, &pv, &pvl, 1) != 0 ||
+                                pvl > 2)
+                                return -1;
+                            out->path_len = 0;
+                            for (uint32_t k = 0; k < pvl; k++)
+                                out->path_len = (out->path_len << 8) | pv[k];
+                        }
                     }
                 }
             } else if (oid_is(&ext_oid, OID_KEY_USAGE,
@@ -418,6 +526,61 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                             out->eku_server_auth = 1;
                     }
                 }
+            } else if (oid_is(&ext_oid, OID_SUBJECT_KEY_ID,
+                              sizeof(OID_SUBJECT_KEY_ID))) {
+                // SubjectKeyIdentifier: ext value wraps an OCTET STRING
+                // whose content is the key identifier bytes.
+                ext_known = 1;
+                {
+                    uint32_t v = 0;
+                    der_node ski;
+                    if (der_expect(val.content, val.content_len, &v,
+                                   DER_TAG_OCTET_STRING, &ski) != 0) return -1;
+                    if (ski.content_len == 0) return -1;
+                    out->ski = ski.content;
+                    out->ski_len = ski.content_len;
+                    out->has_ski = 1;
+                }
+            } else if (oid_is(&ext_oid, OID_AUTH_KEY_ID,
+                              sizeof(OID_AUTH_KEY_ID))) {
+                // AuthorityKeyIdentifier: SEQ, scan for keyIdentifier [0]
+                // (primitive context tag 0x80). Other choices (issuer/serial)
+                // are ignored — key id is what binds the chain.
+                ext_known = 1;
+                {
+                    uint32_t v = 0;
+                    der_node akiseq;
+                    if (der_expect(val.content, val.content_len, &v,
+                                   DER_TAG_SEQUENCE, &akiseq) != 0) return -1;
+                    uint32_t q = 0;
+                    while (q < akiseq.content_len) {
+                        uint8_t tag = akiseq.content[q];
+                        // Context-specific [0..2]. [0] keyIdentifier must be
+                        // primitive; [1]/[2] (issuer/serial, legacy form —
+                        // [1] is constructed) are skipped by length.
+                        if ((tag & 0xC0) != 0x80 || (tag & 0x1F) > 2)
+                            return -1;
+                        q++;
+                        if (q >= akiseq.content_len) return -1;
+                        uint32_t ll = akiseq.content[q++];
+                        if (ll & 0x80) {
+                            uint32_t nbytes = ll & 0x7F;
+                            if (nbytes == 0 || nbytes > 4) return -1;
+                            if (q + nbytes > akiseq.content_len) return -1;
+                            ll = 0;
+                            for (uint32_t k = 0; k < nbytes; k++)
+                                ll = (ll << 8) | akiseq.content[q++];
+                        }
+                        if (q + ll > akiseq.content_len) return -1;
+                        if ((tag & 0x1F) == 0) {
+                            if ((tag & 0x20) || ll == 0) return -1;
+                            out->aki = akiseq.content + q;
+                            out->aki_len = ll;
+                            out->has_aki = 1;
+                        }
+                        q += ll;
+                    }
+                }
             }
             // RFC 5280 §4.2: unrecognized CRITICAL extensions MUST be
             // rejected (review 2026-09-10 #6). Non-critical unknowns stay
@@ -425,6 +588,10 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
             if (!ext_known && ext_critical) return -1;
         }
     }
+
+    // TBSCertificate fully consumed (review #22): trailing data after the
+    // extensions is malformed, not ignorable (differential-parsing class).
+    if (t != tl) return -1;
 
     return 0;
 }
@@ -447,14 +614,70 @@ static int label_count(const char* s) {
     return n;
 }
 
+// Strict IPv4 dotted-quad parse (review #37 helper): 4 decimal groups
+// 0-255, no leading zeros (avoid octal ambiguity), no trailing junk.
+// Returns 1 with bytes in out[4], else 0.
+static int parse_ipv4(const char* s, uint8_t out[4]) {
+    for (int g = 0; g < 4; g++) {
+        if (*s < '0' || *s > '9') return 0;
+        uint32_t v = 0;
+        int digits = 0;
+        if (s[0] == '0' && s[1] >= '0' && s[1] <= '9') return 0;
+        while (*s >= '0' && *s <= '9') {
+            v = v * 10 + (uint32_t)(*s - '0');
+            if (v > 255 || ++digits > 3) return 0;
+            s++;
+        }
+        out[g] = (uint8_t)v;
+        if (g < 3) {
+            if (*s != '.') return 0;
+            s++;
+        }
+    }
+    return *s == 0;
+}
+
 int x509_hostname_match(const x509_cert* cert, const char* host) {
     if (!host || !host[0]) return -1;
+    // Length discipline (review #36): DNS names cap at 253 octets. The old
+    // code silently truncated longer names into the 256B scratch and then
+    // compared the PREFIX — a security comparison must never shorten the
+    // identity. Reject overlong instead.
+    {
+        uint32_t full = 0;
+        while (host[full]) {
+            full++;
+            if (full > 253) return -1;
+        }
+        if (full == 0) return -1;
+    }
+    // ASCII-only policy (review #38): no IDNA/U-label processing exists in
+    // this stack, so non-ASCII hostnames are rejected explicitly rather
+    // than compared byte-wise against attacker-influenced SANs.
+    for (uint32_t i = 0; host[i]; i++)
+        if ((unsigned char)host[i] >= 128) return -1;
     // Strip one trailing dot (FQDN form).
     char h[256];
     uint32_t hl = 0;
     while (host[hl] && hl < sizeof(h) - 1) { h[hl] = host[hl]; hl++; }
     h[hl] = 0;
     if (hl && h[hl - 1] == '.') h[hl - 1] = 0;
+
+    // IP-literal hosts (review #37) match ONLY iPAddress SANs, byte-wise.
+    // dNSName entries — even IP-looking ones — never match an IP host
+    // (and IP hosts never match dNSName entries below).
+    {
+        uint8_t ip[4];
+        if (parse_ipv4(h, ip)) {
+            for (int i = 0; i < cert->ip_san_count; i++)
+                if (cert->ip_san[i][0] == ip[0] &&
+                    cert->ip_san[i][1] == ip[1] &&
+                    cert->ip_san[i][2] == ip[2] &&
+                    cert->ip_san[i][3] == ip[3])
+                    return 0;
+            return -1;
+        }
+    }
 
     for (int i = 0; i < cert->san_count; i++) {
         const uint8_t* s = cert->san[i].p;

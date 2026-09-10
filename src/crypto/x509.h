@@ -63,6 +63,16 @@ typedef struct {
     // subjectAltName dNSName entries (views into the source DER).
     struct { const uint8_t* p; uint32_t len; } san[X509_MAX_SAN];
     int san_count;
+    // subjectAltName iPAddress entries (IPv4 only, 4 bytes each; IPv6
+    // entries are ignored — no v6 stack exists to speak to).
+    uint8_t ip_san[4][4];
+    int ip_san_count;
+    // AuthorityKeyIdentifier keyIdentifier [0] + SubjectKeyIdentifier bytes
+    // (views). has_aki/has_ski gate matching in certverify.c: when BOTH are
+    // present on a subject/issuer pair they MUST be equal (binds the chain
+    // by key, not just by name); either absent constrains nothing.
+    const uint8_t* aki; uint32_t aki_len; int has_aki;
+    const uint8_t* ski; uint32_t ski_len; int has_ski;
 
     // BasicConstraints.
     int is_ca;

@@ -98,4 +98,23 @@ for n in at_ku_leaf at_eku_leaf at_crit_leaf; do
   openssl x509 -in $n.pem -outform DER -out $n.der
 done
 rm -f at_ku_leaf.csr at_eku_leaf.csr at_crit_leaf.csr
+
+# IP-SAN leaves (review #37 — signed by at_int; DNS-only confusion case
+# included). SAN IP form needs openssl IP: syntax (no python required).
+openssl ecparam -name prime256v1 -genkey -noout -out at_ip_leaf.key 2>/dev/null
+openssl req -new -key at_ip_leaf.key -out at_ip_leaf.csr -subj "/CN=1.2.3.4" 2>/dev/null
+openssl x509 -req -in at_ip_leaf.csr -CA at_int.pem -CAkey at_int.key \
+  -out at_ip_leaf.pem -days 3650 \
+  -extfile <(printf "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nsubjectAltName=IP:1.2.3.4") 2>/dev/null
+
+openssl ecparam -name prime256v1 -genkey -noout -out at_dnsip_leaf.key 2>/dev/null
+openssl req -new -key at_dnsip_leaf.key -out at_dnsip_leaf.csr -subj "/CN=1.2.3.4" 2>/dev/null
+openssl x509 -req -in at_dnsip_leaf.csr -CA at_int.pem -CAkey at_int.key \
+  -out at_dnsip_leaf.pem -days 3650 \
+  -extfile <(printf "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nsubjectAltName=DNS:1.2.3.4") 2>/dev/null
+
+for n in at_ip_leaf at_dnsip_leaf; do
+  openssl x509 -in $n.pem -outform DER -out $n.der
+done
+rm -f at_ip_leaf.csr at_dnsip_leaf.csr
 echo "test PKI ready"

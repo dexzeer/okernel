@@ -302,13 +302,24 @@ int tls_parse_server_hello(const uint8_t* sh, uint32_t sh_len,
     if (sh_len < p + 2) return -1;
     uint32_t ext_len = get_u16(sh + p); p += 2;
     if (sh_len < p + ext_len) return -1;
+    // Message-level exactness (review #24): the extension block must run
+    // to the END of the body — bytes after it are trailing garbage, not
+    // ignorable slack (differential-parsing class).
+    if (p + ext_len != sh_len) return -1;
     // Scan extensions for supported_versions and key_share.
+    // Strict (review #24): exact consumption (1..3 trailing bytes are
+    // malformed, not ignorable) and no duplicate extension types.
     int have_sv = 0, have_ks = 0;
     uint32_t eend = p + ext_len;
+    uint16_t seen[16];
+    uint32_t nseen = 0;
     while (p + 4 <= eend) {
         uint16_t etype = get_u16(sh + p); p += 2;
         uint16_t elen  = get_u16(sh + p); p += 2;
         if (p + elen > eend) return -1;
+        for (uint32_t i = 0; i < nseen && i < 16; i++)
+            if (seen[i] == etype) return -1;
+        if (nseen < 16) seen[nseen++] = etype;
         if (etype == TLS_EXT_SUPPORTED_VERSIONS && elen == 2) {
             if (get_u16(sh + p) != TLS_VERSION_TLS13) return -1;
             have_sv = 1;
@@ -322,6 +333,7 @@ int tls_parse_server_hello(const uint8_t* sh, uint32_t sh_len,
         }
         p += elen;
     }
+    if (p != eend) return -1;
     if (!have_sv || !have_ks) return -1;
     return 0;
 }
@@ -368,7 +380,9 @@ int tls_parse_certificate(const uint8_t* cert, uint32_t cert_len) {
     if (p + 3 > cert_len) return -1;
     uint32_t list_len = ((uint32_t)cert[p] << 16) | ((uint32_t)cert[p+1] << 8) | cert[p+2];
     p += 3;
-    if (cert_len < p + list_len) return -1;
+    // Exact framing (review #23): the list must END the message — trailing
+    // bytes after it are malformed, not ignorable.
+    if (cert_len != p + list_len) return -1;
     uint32_t eend = p + list_len;
     int saw_one = 0;
     while (p + 3 <= eend) {
@@ -386,6 +400,7 @@ int tls_parse_certificate(const uint8_t* cert, uint32_t cert_len) {
         if (p + ext_len > eend) return -1;
         p += ext_len;
     }
+    if (p != eend) return -1; // 1-2 trailing bytes: malformed
     return saw_one ? 0 : -1;
 }
 
@@ -648,4 +663,43 @@ int tls_cert_has_staple(const uint8_t* cert, uint32_t cert_len,
         p += ext_len;
     }
     return saw_one ? 0 : -1;
+}
+
+// ---- EncryptedExtensions validation (review 2026-09-10 #26/#27) ----
+
+// Full EE validation: exact framing (no trailing bytes), no duplicate
+// extensions, and ALPN — when the server selects one — MUST be exactly the
+// single protocol we offered ("http/1.1"). Anything else and the HTTP layer
+// above would mis-speak the connection (we have no h2 stack). Returns 0 if
+// the EE is acceptable, -1 otherwise. Unknown non-ALPN extensions are
+// tolerated (forward compat) but must be well-formed and unique.
+int tls_parse_ee_validate(const uint8_t* ee, uint32_t ee_len) {
+    if (ee_len < 2) return -1;
+    uint32_t ext_len = get_u16(ee);
+    if (ee_len != 2 + ext_len) return -1; // exact: no trailing bytes
+    uint32_t p = 2, eend = 2 + ext_len;
+    uint16_t seen[32];
+    uint32_t nseen = 0;
+    while (p + 4 <= eend) {
+        uint16_t etype = get_u16(ee + p); p += 2;
+        uint16_t elen = get_u16(ee + p); p += 2;
+        if (p + elen > eend) return -1;
+        for (uint32_t i = 0; i < nseen && i < 32; i++)
+            if (seen[i] == etype) return -1; // duplicates forbidden
+        if (nseen < 32) seen[nseen++] = etype;
+        if (etype == TLS_EXT_APPLICATION_LAYER_PROTOCOL) {
+            // ALPN body: list_len(2) || proto_len(1) || proto. Exactly one
+            // protocol, exactly "http/1.1" (8 bytes) — the only thing we
+            // offered and the only thing the HTTP layer speaks.
+            if (elen != 2 + 1 + 8) return -1;
+            if (get_u16(ee + p) != 1 + 8) return -1;
+            if (ee[p + 2] != 8) return -1;
+            static const char want[] = "http/1.1";
+            for (int i = 0; i < 8; i++)
+                if (ee[p + 3 + i] != (uint8_t)want[i]) return -1;
+        }
+        p += elen;
+    }
+    if (p != eend) return -1; // 1..3 trailing bytes: malformed
+    return 0;
 }

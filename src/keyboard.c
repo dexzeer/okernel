@@ -2,6 +2,7 @@
 #include "idt.h"
 #include "io.h"
 #include "serial.h"
+#include "crypto/rand.h"
 
 // Scancode set 1 → ASCII lookup (unshifted), 128 entries
 static const char scancode_ascii[128] = {
@@ -50,6 +51,22 @@ static int extended = 0; // 1 = received 0xE0 prefix
 
 static void keyboard_irq(void) {
     uint8_t scancode = inb(0x60);
+
+    // Entropy: keystroke arrival timing is the best interactive source on
+    // the machine (INPUT class). Cheap: RDTSC + scancode folded in.
+    // Weak hook: the CPRNG is desktop-only (text build has no rand.o), so
+    // text kernels skip stirring (no TLS needs it there).
+    {
+        extern void rand_stir_src(const uint8_t e[32], int src) __attribute__((weak));
+        if (rand_stir_src) {
+            uint64_t t = 0;
+            __asm__ volatile("rdtsc" : "=A"(t));
+            uint8_t sample[32];
+            for (int i = 0; i < 32; i++)
+                sample[i] = (uint8_t)(((t >> ((i & 7) * 8)) & 0xFF) ^ (scancode + i));
+            rand_stir_src(sample, RAND_SRC_INPUT);
+        }
+    }
 
     // Extended key prefix
     if (scancode == 0xE0) {

@@ -17,7 +17,8 @@ void tls_hkdf_expand_label(const uint8_t secret[32],
     uint8_t info[256];
     uint32_t label_len = strlen(label);
     if (6 + label_len > 255 || context_len > 255 ||
-        2 + 1 + 6 + label_len + 1 + context_len > sizeof(info)) {
+        2 + 1 + 6 + label_len + 1 + context_len > sizeof(info) ||
+        out_len > 255 * 32) {
         for (uint32_t i = 0; i < out_len; i++) out[i] = 0;
         return;
     }

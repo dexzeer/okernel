@@ -9,11 +9,12 @@ void hkdf_extract(const uint8_t* salt, uint32_t salt_len,
                   const uint8_t* ikm, uint32_t ikm_len,
                   uint8_t prk[32]);
 
-// okm_len <= 255*32. info may be NULL/0.
-void hkdf_expand(const uint8_t prk[32], const uint8_t* info, uint32_t info_len,
-                 uint8_t* okm, uint32_t okm_len);
+// Returns 0 on success, -1 when okm_len exceeds 255*32 (RFC 5869 bound;
+// callers must fail, not accept silently clamped output).
+int hkdf_expand(const uint8_t prk[32], const uint8_t* info, uint32_t info_len,
+                uint8_t* okm, uint32_t okm_len);
 
-void hkdf(const uint8_t* salt, uint32_t salt_len,
+int hkdf(const uint8_t* salt, uint32_t salt_len,
           const uint8_t* ikm, uint32_t ikm_len,
           const uint8_t* info, uint32_t info_len,
           uint8_t* okm, uint32_t okm_len);

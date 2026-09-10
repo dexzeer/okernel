@@ -105,6 +105,11 @@ int tls_parse_server_hello(const uint8_t* sh_body, uint32_t sh_len,
 int tls_parse_ee_alpn(const uint8_t* ee_body, uint32_t ee_len,
                       const uint8_t** alpn_out, uint32_t* alpn_len);
 
+// Full EE validation (review #26/#27): exact framing, no duplicate
+// extensions, ALPN-if-present must be exactly "http/1.1". Returns 0 if
+// acceptable, -1 otherwise.
+int tls_parse_ee_validate(const uint8_t* ee_body, uint32_t ee_len);
+
 // Confirm a Certificate handshake body parses (basic structural validation:
 // at least one cert entry, each entry's length matches its header). We do
 // NOT validate the certificate contents — the project skips verification.

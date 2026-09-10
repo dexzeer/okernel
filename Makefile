@@ -51,7 +51,7 @@ DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o
              src/crypto/certverify.o src/rtc.o \
              src/net/tls_net.o
 
-.PHONY: all text desktop clean run debug host-tests
+.PHONY: all text desktop clean run debug host-tests host-tests-asan
 
 # ---- Host tests (no QEMU; run from repo root — suites load tests/fixtures/*) ----
 # Offline must-pass: tls_crypto, css, subres, pki, adversarial (fast -O2 build;
@@ -67,12 +67,21 @@ HOST_CRYPTO_SRC = src/crypto/tls_client.c src/crypto/tls_record.c src/crypto/tls
 host-tests:
 	mkdir -p build-host
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tls_crypto tests/test_tls_crypto.c src/crypto/sha256.c src/crypto/hmac.c src/crypto/hkdf.c src/crypto/aead.c src/crypto/chacha20.c src/crypto/poly1305.c src/crypto/x25519.c && ./build-host/t_tls_crypto | tail -n 2
+	gcc -m32 -O2 -Isrc -Isrc/crypto -o build-host/t_rng tests/test_rng.c src/crypto/rand.c src/crypto/chacha20.c src/crypto/sha256.c && ./build-host/t_rng | tail -n 2
+	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_strict tests/test_crypto_strict.c $(HOST_CRYPTO_SRC) && ./build-host/t_strict | tail -n 2
 	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_css tests/test_css.c src/css.c src/html.c && ./build-host/t_css | tail -n 2
 	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_subres tests/test_subres.c src/html.c src/css.c && ./build-host/t_subres | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_pki tests/test_pki.c $(HOST_CRYPTO_SRC) && ./build-host/t_pki | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_adv tests/test_adversarial.c $(HOST_CRYPTO_SRC) && timeout 300 ./build-host/t_adv | tail -n 3
 	-gcc -m32 -DKERNEL=0 -Isrc -o build-host/t_td tests/test_text_decode.c src/html.c && ./build-host/t_td | tail -n 2; echo "(text_decode: 5 pre-existing Cyrillic FAILs expected)"
 	-gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tls_live tests/test_tls_client.c $(HOST_CRYPTO_SRC) && timeout 60 ./build-host/t_tls_live | tail -n 3; echo "(tls_client_test: needs internet; SKIP if unreachable)"
+
+# Sanitizer run of the adversarial suite (review P0 infra): every parser,
+# flight, and mock path under ASan+UBSan. Slow (~10 min, RSA-heavy) — run
+# after crypto/TLS changes, not on every edit.
+host-tests-asan:
+	mkdir -p build-host
+	gcc -m32 -O1 -g -fsanitize=address,undefined -Isrc/crypto -Isrc -o build-host/t_adv_asan tests/test_adversarial.c $(HOST_CRYPTO_SRC) && timeout 590 ./build-host/t_adv_asan | tail -n 3
 
 all: text
 

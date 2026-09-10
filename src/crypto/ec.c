@@ -408,6 +408,41 @@ void ec_init(void) {
     (void)ec_ctx_for(97);
 }
 
+// Strict DER INTEGER for ECDSA scalars (review #13): minimal encoding
+// (no negative, no unnecessary leading zero — at most the single 0x00 pad
+// that keeps a high-bit value positive), non-zero value. Advances *v/*vl
+// past the single legal pad. Rejects what scalar_from_be's mod-n reduction
+// would otherwise launder (r = n + valid_r must NOT become valid_r).
+static int strict_scalar_int(const uint8_t* p, uint32_t len,
+                             const uint8_t** v, uint32_t* vl) {
+    if (len == 0) return -1;
+    if (p[0] & 0x80) return -1;                 // negative INTEGER
+    if (len > 1 && p[0] == 0x00) {
+        if (!(p[1] & 0x80)) return -1;          // unnecessary pad byte
+        p++; len--;                             // the single legal pad
+    }
+    {
+        uint32_t i = 0;
+        while (i < len && p[i] == 0) i++;
+        if (i == len) return -1;                // zero scalar forbidden
+    }
+    *v = p; *vl = len;
+    return 0;
+}
+
+// value (minimal big-endian, no leading zeros) >= group order?
+static int be_ge_order(const uint8_t* b, uint32_t len, const montd* nd) {
+    uint32_t nbytes = (uint32_t)nd->nl * 4;
+    if (len != nbytes) return len > nbytes ? 1 : 0;
+    // Same length: top-down byte compare against n (limbs are LE).
+    for (uint32_t i = 0; i < nbytes; i++) {
+        uint32_t limb = nd->m[(nbytes - 1 - i) / 4];
+        uint8_t nb = (uint8_t)((limb >> (8 * ((nbytes - 1 - i) % 4))) & 0xFF);
+        if (b[i] != nb) return b[i] > nb ? 1 : 0;
+    }
+    return 0; // equal (== n, rejected by caller: must be < n)
+}
+
 // Check the affine point (mont coords) satisfies y^2 = x^3 - 3x + b.
 static int on_curve(const ec_ctx* c, const uint32_t* x, const uint32_t* y) {
     uint32_t x2[EC_MAX_LIMBS], x3[EC_MAX_LIMBS], t[EC_MAX_LIMBS], lhs[EC_MAX_LIMBS];
@@ -427,6 +462,10 @@ int ec_verify(int alg,
               const uint8_t* sig_der, uint32_t sig_len) {
     const ec_ctx* c = ec_ctx_for((int)point_len);
     if (!c) return -1;
+    // SEC1: only uncompressed points (0x04 || X || Y, exact size). A
+    // compressed/unknown prefix must not be misread as raw coordinates.
+    if (point_len != (uint32_t)c->nl * 4 * 2 + 1 || point[0] != 0x04)
+        return -1;
 
     // hash
     uint8_t hash[SHA512_HASH_SIZE];
@@ -448,13 +487,16 @@ int ec_verify(int alg,
     if (der_expect(seq.content, seq.content_len, &sp, DER_TAG_INTEGER, &ri) != 0) return -1;
     if (der_expect(seq.content, seq.content_len, &sp, DER_TAG_INTEGER, &si) != 0) return -1;
     if (sp != seq.content_len) return -1;
-    // strip sign-padding zero
-    const uint8_t* rb = ri.content; uint32_t rl = ri.content_len;
-    while (rl > 1 && rb[0] == 0) { rb++; rl--; }
-    const uint8_t* sb = si.content; uint32_t sl = si.content_len;
-    while (sl > 1 && sb[0] == 0) { sb++; sl--; }
-    if (rl == 0 || sl == 0 || rl > (uint32_t)c->nl * 4 || sl > (uint32_t)c->nl * 4)
-        return -1;
+    // Canonical scalars (review #13): strict DER + range BEFORE any
+    // modular reduction. r/s = 0, >= n, negative, or padded used to slide
+    // through scalar_from_be's mod-n fold and verify as somebody else.
+    const uint8_t* rb;
+    uint32_t rl;
+    const uint8_t* sb;
+    uint32_t sl;
+    if (strict_scalar_int(ri.content, ri.content_len, &rb, &rl) != 0) return -1;
+    if (strict_scalar_int(si.content, si.content_len, &sb, &sl) != 0) return -1;
+    if (be_ge_order(rb, rl, &c->nd) || be_ge_order(sb, sl, &c->nd)) return -1;
 
     // scalars: e (hash, truncated to order size), r, s; all mod n
     uint32_t e[EC_MAX_LIMBS], r[EC_MAX_LIMBS], s[EC_MAX_LIMBS];
@@ -514,6 +556,11 @@ int ec_verify(int alg,
     uint32_t qx[EC_MAX_LIMBS], qy[EC_MAX_LIMBS];
     be_to_limbs(point + 1, (uint32_t)c->nl * 4, qx, c->nl);
     be_to_limbs(point + 1 + (uint32_t)c->nl * 4, (uint32_t)c->nl * 4, qy, c->nl);
+    // SEC1 range (review #14): coordinates MUST be < p BEFORE Montgomery
+    // conversion (whose reduction would launder x = p + x_valid into a
+    // possibly-on-curve point). On-curve alone is not enough.
+    if (cmp_fe(qx, c->fd.m, c->nl) >= 0 || cmp_fe(qy, c->fd.m, c->nl) >= 0)
+        return -1;
     // point coords must be < p and on-curve
     {
         uint32_t xm[EC_MAX_LIMBS], ym[EC_MAX_LIMBS];

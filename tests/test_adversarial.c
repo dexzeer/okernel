@@ -71,7 +71,73 @@ static uint32_t build_cert_msg(uint8_t* msg, uint32_t cap,
     return mp;
 }
 
-// ---------------------------------------------------------------- 1. fuzz
+// ---------------------------------------------------------------- fuzz-0
+// Parser robustness fuzz (review 2026-09-10 P0): every externally reachable
+// parser gets random garbage + truncated valid inputs. Requirements: no
+// crash (ASan/UBSan build), return codes in {-1, 0} (or [CV_OK,
+// CV_ERR_MAX] for cert_verify). Deterministic LCG — reproducible.
+static void parser_fuzz_section(void) {
+    printf("== 0. parser robustness fuzz ==\n");
+    uint64_t frng = 0x243F6A8885A308D3ull;
+#define FNEXT32() (frng ^= frng << 13, frng ^= frng >> 7, frng ^= frng << 17, \
+                   (uint32_t)(frng & 0xFFFFFFFFu))
+    static uint8_t fbuf[2048];
+    static uint8_t sid[32];
+    {
+        // Clock for the cert_verify garbage rounds (garbage dies at PARSE
+        // before dates matter, but keep the state sane for the suite).
+        x509_time fn = { 2026, 9, 10, 12, 0, 0 };
+        x509_set_now(&fn);
+    }
+    int bad = 0;
+    // Random garbage, lengths 0..600 (covers empty, truncated, oversized).
+    for (int round = 0; round < 4000; round++) {
+        uint32_t len = FNEXT32() % 601;
+        for (uint32_t i = 0; i < len; i++) fbuf[i] = (uint8_t)(FNEXT32() & 0xff);
+        {
+            tls_record vr;
+            int r = tls_record_parse_header(fbuf, len < 5 ? len : 5, &vr);
+            if (r != 0 && r != 5) bad++;
+        }
+        {
+            tls_server_hello sh;
+            int r = tls_parse_server_hello(fbuf, len, sid, &sh);
+            if (r != 0 && r != -1) bad++;
+        }
+        if (tls_parse_certificate(fbuf, len) != 0 &&
+            tls_parse_certificate(fbuf, len) != -1) bad++;
+        if (tls_parse_certificate_verify(fbuf, len) != 0 &&
+            tls_parse_certificate_verify(fbuf, len) != -1) bad++;
+        {
+            uint16_t a; const uint8_t* s; uint32_t sl;
+            int q = tls_parse_cv_sig(fbuf, len, &a, &s, &sl);
+            if (q != 0 && q != -1) bad++;
+        }
+        {
+            struct tls_nst n;
+            int q = tls_parse_nst(fbuf, len, &n);
+            if (q != 0 && q != -1) bad++;
+        }
+        if (tls_parse_sh_psk(fbuf, len) < -2 ||
+            tls_parse_sh_psk(fbuf, len) > 0) bad++;
+        {
+            int present = 0;
+            int q = tls_cert_has_staple(fbuf, len, &present);
+            if (q != 0 && q != -1) bad++;
+        }
+        {
+            x509_cert c;
+            int q = x509_parse(fbuf, len > 1500 ? 1500 : len, &c);
+            if (q != 0 && q != -1) bad++;
+        }
+        {
+            int q = cert_verify(fbuf, len > 400 ? 400 : len, "example.com");
+            if (q < CV_OK || q > CV_ERR_MAX) bad++;
+        }
+    }
+    CHECK(bad == 0, "4000 garbage rounds: no crash, codes in range");
+#undef FNEXT32
+}
 
 static void fuzz_section(void) {
     printf("== 1. mutation fuzz: example.com cert flight ==\n");
@@ -232,12 +298,19 @@ enum mock_mode {
     MOCK_EE_FLIPPED,   // EE body byte flipped (transcript fork: must ERR)
     MOCK_NST,          // valid flight + NewSessionTicket + body (ticket stored)
     MOCK_NST_BAD,      // corrupt ticket (must ERR, nothing stored)
+    MOCK_NST_BIGNONCE, // 65B nonce (dropped, flight completes)
     MOCK_PSK_ACCEPT,   // offer verified (binder) + abbreviated flight (DONE)
     MOCK_PSK_FALLBACK, // offer ignored, full flight (DONE via fallback)
     MOCK_PSK_FOREIGN,  // server selects unoffered identity (must ERR)
     MOCK_CV_PKCS1,     // RSA PKCS#1 v1.5 CV (RFC-forbidden, must ERR)
     MOCK_STAPLE,       // stapled status_request noted, flight completes
     MOCK_STAPLE_BAD,   // malformed staple (must ERR)
+    MOCK_SH_BIG,       // >4KB ServerHello (must ERR, OOB regression)
+    MOCK_SH_TRAIL,     // SH with trailing bytes past exts (must ERR)
+    MOCK_SH_DUP,       // SH with duplicate extension (must ERR)
+    MOCK_EE_DUP,       // EE with duplicate extension (must ERR)
+    MOCK_EE_ALPN_H2,   // EE selecting h2 (must ERR — we speak http/1.1)
+    MOCK_FRAGMENT,     // flight split mid-Certificate (must DONE)
     MOCK_COUNT
 };
 
@@ -282,7 +355,7 @@ static uint8_t g_s_ap_key[32], g_s_ap_iv[12];
 static uint64_t g_s_ap_seq;
 static uint8_t g_resp[512];
 static uint32_t g_resp_len;
-static uint8_t g_sh_body[256];
+static uint8_t g_sh_body[4352]; // SH bodies to the 4KB+ SH_BIG size
 static uint32_t g_sh_len;
 static uint8_t g_sfin_msg[36];
 static uint32_t g_sfin_len;
@@ -422,13 +495,16 @@ static int try_queue_body(const uint8_t* resp, uint32_t resp_len) {
     static uint8_t rec[16500];
     // NST modes: encode + queue the ticket record FIRST (seq 0) so record
     // sequence numbers match queue order (body follows at seq 1).
-    if (g_mode == MOCK_NST || g_mode == MOCK_NST_BAD) {
-        static uint8_t nst[128];
+    if (g_mode == MOCK_NST || g_mode == MOCK_NST_BAD ||
+        g_mode == MOCK_NST_BIGNONCE) {
+        static uint8_t nst[256];
         uint32_t np = 0;
+        uint32_t nonce_len = (g_mode == MOCK_NST_BIGNONCE) ? 65 : 8;
         nst[np++] = 0; nst[np++] = 0; nst[np++] = 0; nst[np++] = 40; // hs header placeholder
         nst[np++] = 0; nst[np++] = 0; nst[np++] = 0x0e; nst[np++] = 0x10; // lifetime 3600
         nst[np++] = 0x12; nst[np++] = 0x34; nst[np++] = 0x56; nst[np++] = 0x78; // age_add
-        nst[np++] = 8; for (int i = 0; i < 8; i++) nst[np++] = (uint8_t)(0xC0 + i); // nonce
+        nst[np++] = (uint8_t)nonce_len;
+        for (uint32_t i = 0; i < nonce_len; i++) nst[np++] = (uint8_t)(0xC0 + i); // nonce
         nst[np++] = 0; nst[np++] = 32; for (int i = 0; i < 32; i++) nst[np++] = (uint8_t)(0xA0 + i); // ticket
         nst[np++] = 0; nst[np++] = 0; // no extensions
         // Fix the handshake header: type NST(4), body len = np - 4.
@@ -591,9 +667,10 @@ static const char* mode_name(int m) {
         "CIPHER_1302", "SID_BAD", "NO_KEYSHARE", "NO_CV", "DUP_EE",
         "FIN_FLIPPED", "ALERT", "APPDATA_BITFLIP", "CLOSE_NOTIFY",
         "GARBAGE_FIRST", "RECORD_OVERFLOW", "SPLIT", "TRUNCATED",
-        "SH_FLIPPED", "EE_FLIPPED", "NST", "NST_BAD",
+        "SH_FLIPPED", "EE_FLIPPED", "NST", "NST_BAD", "NST_BIGNONCE",
         "PSK_ACCEPT", "PSK_FALLBACK", "PSK_FOREIGN", "CV_PKCS1",
-        "STAPLE", "STAPLE_BAD"
+        "STAPLE", "STAPLE_BAD", "SH_BIG",
+        "SH_TRAIL", "SH_DUP", "EE_DUP", "EE_ALPN_H2", "FRAGMENT"
     };
     return names[m];
 }
@@ -801,7 +878,7 @@ static void mock_run(int mode, struct mock_result* res) {
     tls_handshake_secret(derived, shared, g_hs_secret);
 
     // --- ServerHello ---
-    uint8_t sh_body[160];
+    uint8_t sh_body[4352];
     uint32_t sp = 0;
     sh_body[sp++] = 0x03; sh_body[sp++] = 0x03;
     memset(sh_body + sp, 0xAB, 32); sp += 32;
@@ -842,12 +919,32 @@ static void mock_run(int mode, struct mock_result* res) {
         sh_body[sp++] = 0x00; sh_body[sp++] = 0x02;
         sh_body[sp++] = 0x00; sh_body[sp++] = 0x01;   // foreign identity
     }
+    // SH_BIG: pad ServerHello past the client's 4KB SH cap with an unknown
+    // extension (regression test for the SH OOB read, review #1: the old
+    // code truncated the copy but kept the attacker's length).
+    if (mode == MOCK_SH_BIG) {
+        sh_body[sp++] = 0x12; sh_body[sp++] = 0x34;
+        sh_body[sp++] = 0x0F; sh_body[sp++] = 0xA0;   // len 4000
+        for (int i = 0; i < 4000; i++) sh_body[sp++] = 0;
+    }
+    // SH_DUP: duplicate supported_versions extension (inside the ext block:
+    // ext_total covers it; the duplicate itself must ERR).
+    if (mode == MOCK_SH_DUP) {
+        sh_body[sp++] = 0x00; sh_body[sp++] = 0x2b;
+        sh_body[sp++] = 0x00; sh_body[sp++] = 0x02;
+        sh_body[sp++] = 0x03; sh_body[sp++] = 0x04;
+    }
     if (mode == MOCK_NO_KEYSHARE) sp = ext_len_pos + 2 + 6; // keep only the 6-byte supported_versions ext
     uint32_t ext_total = sp - ext_len_pos - 2;
     sh_body[ext_len_pos] = (uint8_t)(ext_total >> 8);
     sh_body[ext_len_pos + 1] = (uint8_t)(ext_total & 0xff);
+    // SH_TRAIL: two bytes past the extension block (ext_total does NOT cover
+    // them; the message length does) — exact-consumption violation, must ERR.
+    if (mode == MOCK_SH_TRAIL) {
+        sh_body[sp++] = 0xAA; sh_body[sp++] = 0xBB;
+    }
 
-    uint8_t sh_msg[200];
+    uint8_t sh_msg[4608];
     sh_msg[0] = TLS_HS_SERVER_HELLO;
     sh_msg[1] = 0; sh_msg[2] = (uint8_t)(sp >> 8); sh_msg[3] = (uint8_t)(sp & 0xff);
     memcpy(sh_msg + 4, sh_body, sp);
@@ -856,7 +953,7 @@ static void mock_run(int mode, struct mock_result* res) {
     // ORIGINAL SH, but the client RECEIVES a flipped server-random. Both
     // sides parse fine; the transcripts fork → flight keys diverge → the
     // encrypted flight fails MAC. Must ERR, never DONE.
-    uint8_t sh_wire[200];
+    uint8_t sh_wire[4608]; // matches sh_msg (SH_BIG needs 4KB+)
     memcpy(sh_wire, sh_msg, sh_msg_len);
     if (mode == MOCK_SH_FLIPPED) sh_wire[4 + 2 + 3] ^= 0x01;
 
@@ -912,15 +1009,39 @@ static void mock_run(int mode, struct mock_result* res) {
         // authentication rides the resumed ticket, checked by the Finished
         // MACs). g_abbrev records the path for the CHECK.
         int abbrev = (mode == MOCK_PSK_ACCEPT);
-        uint8_t ee_msg[6] = { TLS_HS_ENCRYPTED_EXTENSIONS, 0, 0, 2, 0, 0 };
+        // EE body per mode (default: empty extension list). EE_DUP repeats
+        // an extension type; EE_ALPN_H2 selects h2 (unspeakable for us).
+        uint8_t ee_body_raw[16]; uint32_t ee_body_len = 2;
+        ee_body_raw[0] = 0; ee_body_raw[1] = 0;
+        if (mode == MOCK_EE_DUP) {
+            ee_body_raw[0] = 0; ee_body_raw[1] = 8;
+            ee_body_raw[2] = 0xFF; ee_body_raw[3] = 0x00;
+            ee_body_raw[4] = 0; ee_body_raw[5] = 0;
+            ee_body_raw[6] = 0xFF; ee_body_raw[7] = 0x00;
+            ee_body_raw[8] = 0; ee_body_raw[9] = 0;
+            ee_body_len = 10;
+        } else if (mode == MOCK_EE_ALPN_H2) {
+            ee_body_raw[0] = 0; ee_body_raw[1] = 9;
+            ee_body_raw[2] = 0x00; ee_body_raw[3] = 0x10;
+            ee_body_raw[4] = 0x00; ee_body_raw[5] = 0x05;
+            ee_body_raw[6] = 0x00; ee_body_raw[7] = 0x03;
+            ee_body_raw[8] = 0x02; ee_body_raw[9] = 'h'; ee_body_raw[10] = '2';
+            ee_body_len = 11;
+        }
+        uint8_t ee_msg[4 + 16];
+        ee_msg[0] = TLS_HS_ENCRYPTED_EXTENSIONS;
+        ee_msg[1] = 0; ee_msg[2] = (uint8_t)(ee_body_len >> 8);
+        ee_msg[3] = (uint8_t)(ee_body_len & 0xff);
+        memcpy(ee_msg + 4, ee_body_raw, ee_body_len);
+        uint32_t ee_msg_len = 4 + ee_body_len;
         // EE_FLIPPED (wire-only MITM tamper, e.g. extension stripping): the
         // mock signs/computes over the ORIGINAL EE, but the client receives
         // flipped bytes. Transcripts fork at EE → CertificateVerify (signed
         // over mock-TH) fails client verification. Must ERR, never DONE.
-        uint8_t ee_wire[6];
-        memcpy(ee_wire, ee_msg, 6);
+        static uint8_t ee_wire[4 + 16];
+        memcpy(ee_wire, ee_msg, ee_msg_len);
         if (mode == MOCK_EE_FLIPPED) ee_wire[5] ^= 0x01;
-        mtrans_msg(&g_mt, TLS_HS_ENCRYPTED_EXTENSIONS, ee_msg + 4, 2);
+        mtrans_msg(&g_mt, TLS_HS_ENCRYPTED_EXTENSIONS, ee_msg + 4, ee_body_len);
 
         const char* chain[3] = { 0, 0, 0 };
         static uint8_t cert_msg[16384];
@@ -1014,7 +1135,7 @@ static void mock_run(int mode, struct mock_result* res) {
         // assemble the flight
         static uint8_t flight[16384];
         uint32_t fl = 0;
-        memcpy(flight + fl, ee_wire, 6); fl += 6;
+        memcpy(flight + fl, ee_wire, ee_msg_len); fl += ee_msg_len;
         if (!abbrev) {
         // Certificate: full handshake message = header(4) + body
         flight[fl] = TLS_HS_CERTIFICATE;
@@ -1036,21 +1157,36 @@ static void mock_run(int mode, struct mock_result* res) {
         memcpy(flight + fl, fin_msg, 36); fl += 36;
 
         if (mode == MOCK_DUP_EE) {
-            memmove(flight + 6, flight, fl);
-            memcpy(flight, ee_wire, 6);
-            fl += 6;
+            memmove(flight + ee_msg_len, flight, fl);
+            memcpy(flight, ee_wire, ee_msg_len);
+            fl += ee_msg_len;
         }
 
-        rl = enc_record(rec, sizeof(rec), s_hs_key, s_hs_iv, &s_seq,
-                        TLS_CT_HANDSHAKE, flight, fl);
-        if (rl == 0) { res->r = -3; return; }
-        q_put(rec, rl);
+        // (NOTE: encode exactly what is queued — a throwaway encode here
+        // would burn a sequence number and desync the client's nonces.)
+        if (mode == MOCK_FRAGMENT && fl > 100) {
+            uint32_t cut = fl / 2;
+            uint32_t r1 = enc_record(rec, sizeof(rec), s_hs_key, s_hs_iv,
+                                     &s_seq, TLS_CT_HANDSHAKE, flight, cut);
+            uint32_t r2 = enc_record(rec + r1, sizeof(rec) - r1,
+                                     s_hs_key, s_hs_iv,
+                                     &s_seq, TLS_CT_HANDSHAKE,
+                                     flight + cut, fl - cut);
+            if (r1 == 0 || r2 == 0) { res->r = -3; return; }
+            q_put(rec, r1 + r2); // [rec1][rec2] already contiguous
+        } else {
+            rl = enc_record(rec, sizeof(rec), s_hs_key, s_hs_iv, &s_seq,
+                            TLS_CT_HANDSHAKE, flight, fl);
+            if (rl == 0) { res->r = -3; return; }
+            q_put(rec, rl);
+        }
 
         g_expect_body = (mode == MOCK_VALID || mode == MOCK_RSA_PSS_VALID ||
                           mode == MOCK_P384_VALID || mode == MOCK_SPLIT ||
                           mode == MOCK_NST || mode == MOCK_NST_BAD ||
+                          mode == MOCK_NST_BIGNONCE ||
                           mode == MOCK_PSK_ACCEPT || mode == MOCK_PSK_FALLBACK ||
-                          mode == MOCK_STAPLE ||
+                          mode == MOCK_STAPLE || mode == MOCK_FRAGMENT ||
                           mode == MOCK_CLOSE_NOTIFY || mode == MOCK_APPDATA_BITFLIP);
         // TRUNCATED: cut the queue mid-flight-record (SH complete + 30B of
         // the encrypted flight). The client must ERR on the short close —
@@ -1199,6 +1335,16 @@ static void mock_section(void) {
     mock_run(MOCK_PSK_FOREIGN, &res);
     CHECK(res.r == TLS_STEP_ERR,
           "foreign PSK identity selection refused");
+    // Big-nonce isolation AFTER the PSK trio (which needs NST's ticket):
+    // clear, then prove an oversized nonce stores nothing yet still
+    // completes the flight (tickets are optional).
+    tls_ticket_clear();
+    mock_run(MOCK_NST_BIGNONCE, &res);
+    CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
+          memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
+          "oversize-nonce flight still completes");
+    CHECK(!tls_ticket_have("evil.example.com"),
+          "oversize nonce dropped, nothing stored");
     mock_run(MOCK_STAPLE, &res);
     CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
           memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0 && g_staple_seen,
@@ -1206,6 +1352,25 @@ static void mock_section(void) {
     mock_run(MOCK_STAPLE_BAD, &res);
     CHECK(res.r == TLS_STEP_ERR,
           "malformed staple rejected");
+    mock_run(MOCK_SH_BIG, &res);
+    CHECK(res.r == TLS_STEP_ERR,
+          "oversize ServerHello rejected (OOB regression)");
+    mock_run(MOCK_SH_TRAIL, &res);
+    CHECK(res.r == TLS_STEP_ERR,
+          "ServerHello trailing bytes rejected");
+    mock_run(MOCK_SH_DUP, &res);
+    CHECK(res.r == TLS_STEP_ERR,
+          "ServerHello duplicate extension rejected");
+    mock_run(MOCK_EE_DUP, &res);
+    CHECK(res.r == TLS_STEP_ERR,
+          "EncryptedExtensions duplicate rejected");
+    mock_run(MOCK_EE_ALPN_H2, &res);
+    CHECK(res.r == TLS_STEP_ERR,
+          "EncryptedExtensions selecting h2 rejected");
+    mock_run(MOCK_FRAGMENT, &res);
+    CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
+          memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
+          "fragmented flight reassembled");
 }
 
 static void keyuse_section(void) {
@@ -1290,11 +1455,100 @@ static void pin_section(void) {
     tls_pin_clear();
 }
 
+static void name_section(void) {
+    printf("== 5. AKI binding / IP SAN / hostname discipline ==\n");
+    static uint8_t rder[4096];
+    int rn = load("tests/adversarial/at_root.der", rder, sizeof(rder));
+    CHECK(rn > 0, "name anchor loads");
+    if (rn <= 0) return;
+    {
+        x509_cert rc;
+        if (x509_parse(rder, (uint32_t)rn, &rc) != 0) {
+            CHECK(0, "name anchor parses");
+            return;
+        }
+        cert_verify_trust_extra(rc.spki.p, rc.spki.len);
+    }
+    {
+        x509_time n, nx;
+        adv_clocks(&n, &nx);
+        x509_set_now(&n);
+    }
+    static uint8_t flight[16384];
+    // AKI binding: same issuer NAME, right vs wrong issuer KEY.
+    {
+        const char* okc[3] = { "tests/adversarial/at_aki_ok.der",
+                               "tests/adversarial/at_int.der",
+                               "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), okc, 3);
+        CHECK(fl > 0 && cert_verify(flight, fl, "evil.example.com") == CV_OK,
+              "matching AKI/SKI verifies");
+    }
+    {
+        const char* badc[3] = { "tests/adversarial/at_aki_bad.der",
+                                "tests/adversarial/at_int.der",
+                                "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), badc, 3);
+        CHECK(fl > 0 && cert_verify(flight, fl, "evil.example.com") == CV_ERR_CHAIN,
+              "mismatched AKI rejected (key, not name)");
+    }
+    // IP SANs: exact v4 match only; DNS never matches IP hosts and vice
+    // versa; leading-zero octet rejected (no octal ambiguity).
+    {
+        const char* ipc[3] = { "tests/adversarial/at_ip_leaf.der",
+                               "tests/adversarial/at_int.der",
+                               "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), ipc, 3);
+        CHECK(fl > 0, "ip flight builds");
+        if (fl > 0) {
+            CHECK(cert_verify(flight, fl, "1.2.3.4") == CV_OK,
+                  "IP SAN exact match verifies");
+            CHECK(cert_verify(flight, fl, "1.2.3.5") == CV_ERR_HOSTNAME,
+                  "IP mismatch rejected");
+            CHECK(cert_verify(flight, fl, "evil.example.com") == CV_ERR_HOSTNAME,
+                  "DNS name vs IP-only leaf rejected");
+            CHECK(cert_verify(flight, fl, "01.2.3.4") == CV_ERR_HOSTNAME,
+                  "leading-zero IP rejected");
+        }
+    }
+    // dNSName holding an IP string must NOT match an IP-literal host.
+    {
+        const char* dnc[3] = { "tests/adversarial/at_dnsip_leaf.der",
+                               "tests/adversarial/at_int.der",
+                               "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), dnc, 3);
+        CHECK(fl > 0, "dns-ip flight builds");
+        if (fl > 0)
+            CHECK(cert_verify(flight, fl, "1.2.3.4") == CV_ERR_HOSTNAME,
+                  "dNSName-IP never matches IP host");
+    }
+    // Hostname discipline: overlong + non-ASCII rejected, never truncated.
+    {
+        const char* chain[3] = { "tests/adversarial/at_leaf.der",
+                                 "tests/adversarial/at_int.der",
+                                 "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), chain, 3);
+        CHECK(fl > 0, "discipline flight builds");
+        if (fl > 0) {
+            static char longhost[300];
+            for (int i = 0; i < 254; i++) longhost[i] = 'a';
+            longhost[254] = 0;
+            CHECK(cert_verify(flight, fl, longhost) == CV_ERR_HOSTNAME,
+                  "254-char hostname rejected");
+            CHECK(cert_verify(flight, fl, "evil\xff.example.com") == CV_ERR_HOSTNAME,
+                  "non-ASCII hostname rejected");
+        }
+    }
+    cert_verify_trust_extra(NULL, 0);
+}
+
 int main(void) {
+    parser_fuzz_section();
     fuzz_section();
     mock_section();
     keyuse_section();
     pin_section();
+    name_section();
     printf("\n%s: %d passed, %d failed\n",
            failures == 0 ? "ADVERSARIAL TESTS PASS" : "ADVERSARIAL TESTS FAIL",
            passes, failures);

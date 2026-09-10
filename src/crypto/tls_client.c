@@ -19,34 +19,20 @@
 #endif
 
 #ifndef KERNEL
-// Host-test RNG (review 2026-09-10 #8): the old fixed-seed xorshift made
-// every host handshake's X25519 keys DETERMINISTIC. Host binaries are
-// test-only and never ship (production is the kernel CPRNG), but a fixed
-// seed is one copy-paste from a real hole — so read /dev/urandom, with a
-// time/pid-mixed xorshift only as a last resort (and never a constant).
+// Host-test RNG (review 2026-09-10 #5/#8): /dev/urandom ONLY — the old
+// time/pid-xorshift fallback was predictable, and silently downgrading
+// cryptographic randomness is never acceptable. If urandom is unavailable
+// the handshake aborts (tls_fill_random returns 0 → TLS_FAIL_RNG), exactly
+// like the kernel's not-ready CPRNG. Host binaries stay test-only
+// (production = kernel CPRNG); this just refuses to run them broken.
 #include <stdio.h>
 #include <time.h>
-#include <unistd.h>
-static uint64_t host_rng_state = 0;
-static void host_rng(uint8_t* out, uint32_t n) {
-    if (host_rng_state == 0) {
-        FILE* f = fopen("/dev/urandom", "rb");
-        if (f) {
-            uint64_t seed = 0;
-            size_t got = fread(&seed, 1, sizeof(seed), f);
-            fclose(f);
-            if (got == sizeof(seed) && seed != 0) host_rng_state = seed;
-        }
-        if (host_rng_state == 0)
-            host_rng_state = ((uint64_t)time(NULL) * 0x9E3779B97F4A7C15ull) ^
-                             ((uint64_t)getpid() << 32) ^ 0x123456789ABCDEF0ull;
-    }
-    for (uint32_t i = 0; i < n; i++) {
-        uint64_t x = host_rng_state;
-        x ^= x << 13; x ^= x >> 7; x ^= x << 17;
-        host_rng_state = x;
-        out[i] = (uint8_t)(x & 0xff);
-    }
+static int host_rng(uint8_t* out, uint32_t n) {
+    FILE* f = fopen("/dev/urandom", "rb");
+    if (!f) return 0;
+    size_t got = fread(out, 1, n, f);
+    fclose(f);
+    return got == n;
 }
 #endif
 
@@ -57,8 +43,7 @@ static int tls_fill_random(uint8_t* out, uint32_t n) {
 #ifdef KERNEL
     return rand_bytes(out, n) == 1;
 #else
-    host_rng(out, n);
-    return 1;
+    return host_rng(out, n);
 #endif
 }
 
@@ -139,8 +124,10 @@ struct tls_pin_slot {
     int used;
     char host[64];
     uint8_t spki_hash[32];
+    uint32_t seq; // insertion order: true oldest-first eviction (review #35)
 };
 static struct tls_pin_slot pin_slots[TLS_PIN_SLOTS];
+static uint32_t pin_seq;
 
 void tls_pin_clear(void) {
     for (uint32_t i = 0; i < sizeof(pin_slots); i++)
@@ -158,13 +145,20 @@ int tls_pin_check(const char* host, const uint8_t spki_hash[32]) {
         tls_dbg("[tls] PIN CHANGED for %s (possible MITM or rotation)\n", host);
         return -1; // changed: old pin kept (warns every visit till reboot)
     }
-    // First verified visit: store. Evict slot 0 past capacity (oldest
-    // approximation — rotation order; 8 hosts cover a browsing session).
-    int slot = 0;
+    // First verified visit: store. Past capacity, evict the OLDEST pin
+    // (lowest insertion seq — review #35: the old code always overwrote
+    // slot 0 despite claiming oldest-first). 8 hosts cover a session.
+    int slot = -1;
     for (int i = 0; i < TLS_PIN_SLOTS; i++)
         if (!pin_slots[i].used) { slot = i; break; }
+    if (slot < 0) {
+        slot = 0;
+        for (int i = 1; i < TLS_PIN_SLOTS; i++)
+            if (pin_slots[i].seq < pin_slots[slot].seq) slot = i;
+    }
     ticket_host_copy(pin_slots[slot].host, host);
     memcpy(pin_slots[slot].spki_hash, spki_hash, 32);
+    pin_slots[slot].seq = ++pin_seq;
     pin_slots[slot].used = 1;
     return 0;
 }
@@ -181,6 +175,15 @@ static void ticket_store(const char* host,
     if (!host || !host[0] || !ticket || ticket_len == 0 ||
         ticket_len > TLS_TICKET_MAX || !res_master || lifetime == 0)
         return;
+    // Oversized nonces are REJECTED, never truncated (review #32): the
+    // nonce feeds PSK derivation, and silently hashing a prefix would
+    // derive a different PSK than the server — worse, it normalizes
+    // shaking the client into degenerate inputs. Drop the ticket; the
+    // connection still completes (tickets are optional).
+    if (nonce_len > TLS_TICKET_NONCE_MAX) {
+        tls_dbg("[tls] ticket nonce too long (%uB), dropped\n", nonce_len);
+        return;
+    }
     int slot = -1;
     for (int i = 0; i < TLS_TICKET_SLOTS; i++)
         if (ticket_slots[i].used &&
@@ -195,8 +198,7 @@ static void ticket_store(const char* host,
     struct tls_ticket_slot* s = &ticket_slots[slot];
     ticket_host_copy(s->host, host);
     memcpy(s->ticket, ticket, ticket_len); s->ticket_len = ticket_len;
-    s->nonce_len = nonce_len > TLS_TICKET_NONCE_MAX ? TLS_TICKET_NONCE_MAX
-                                                   : nonce_len;
+    s->nonce_len = nonce_len; // bounded above (<= NONCE_MAX) by the reject
     if (nonce && s->nonce_len) memcpy(s->nonce, nonce, s->nonce_len);
     memcpy(s->res_master, res_master, 32);
     s->lifetime = lifetime;
@@ -209,6 +211,7 @@ static void ticket_store(const char* host,
 
 static void make_nonce(uint8_t nonce[12], const uint8_t iv[12], uint64_t seq) {
     memcpy(nonce, iv, 12);
+    // (The64-bit counter is BIG-ENDIAN, left-padded — see HANDOFF.)
     nonce[4] ^= (uint8_t)((seq >> 56) & 0xff);
     nonce[5] ^= (uint8_t)((seq >> 48) & 0xff);
     nonce[6] ^= (uint8_t)((seq >> 40) & 0xff);
@@ -231,11 +234,19 @@ static int send_aead(uint8_t key[32], const uint8_t iv[12], uint64_t* seq,
                      uint8_t ct_type, const uint8_t* pt, uint32_t pt_len,
                      const struct tls_client_io* io) {
     uint8_t inner[18432 + 1];
-    if (pt_len + 1 > sizeof(inner)) return -1;
+    // Overflow discipline (review 2026-09-10 #2): NEVER add before
+    // checking. `pt_len + 1 > sizeof` wraps at UINT32_MAX (→0, check
+    // passes, 4GB memcpy). Bound pt_len itself; every sum below is then
+    // safe by construction (pt_len ≤ 18432 → ct_len ≤ 18449).
+    if (pt_len >= sizeof(inner)) return -1;
     memcpy(inner, pt, pt_len);
     inner[pt_len] = ct_type;
 
-    uint8_t nonce[12]; make_nonce(nonce, iv, *seq); (*seq)++;
+    uint8_t nonce[12];
+    // Sequence exhaustion (review #8/#29): TLS 1.3 forbids nonce reuse —
+    // terminate before 2^64 wraps (practically unreachable; encoded anyway).
+    if (*seq == (uint64_t)0xFFFFFFFFFFFFFFFFull) return -1;
+    make_nonce(nonce, iv, *seq); (*seq)++;
 
     uint8_t ct[18432 + 16 + 1];
     uint8_t tag[16];
@@ -353,7 +364,12 @@ static int tls_decrypt_one(struct tls_state* st, uint8_t key[32], uint8_t iv[12]
     uint32_t rec_pl = st->rec_pl;
     tls_record v;
     if (tls_record_parse_header(st->rec_buf, 5, &v) != 5) return -1;
-    if (v.type == TLS_CT_CHANGE_CIPHER_SPEC) { *ctype = TLS_CT_CHANGE_CIPHER_SPEC; return 0; }
+    if (v.type == TLS_CT_CHANGE_CIPHER_SPEC) {
+        // Middlebox-compat CCS is exactly one 0x01 byte (review #25): any
+        // other shape is a protocol violation, not something to skip over.
+        if (rec_pl != 1 || st->rec_buf[5] != 0x01) return -1;
+        *ctype = TLS_CT_CHANGE_CIPHER_SPEC; return 0;
+    }
     if (v.type == TLS_CT_ALERT) {
         // Plaintext alert (pre-handshake). Body = level(1) + description(1).
         if (rec_pl == 2) st->alert_desc = st->rec_buf[6];
@@ -368,7 +384,10 @@ static int tls_decrypt_one(struct tls_state* st, uint8_t key[32], uint8_t iv[12]
     // bumping before verification desyncs the stream the day any retry
     // logic exists. (Today every failure aborts, so this is hygiene — but
     // cheap hygiene.)
-    uint8_t nonce[12]; make_nonce(nonce, iv, *seq);
+    uint8_t nonce[12];
+    // Same exhaustion guard as the send path (review #8/#29).
+    if (*seq == (uint64_t)0xFFFFFFFFFFFFFFFFull) return -1;
+    make_nonce(nonce, iv, *seq);
     uint8_t aad[5]; memcpy(aad, st->rec_buf, 5);
     uint8_t* enc = st->rec_buf + 5;
     if (aead_chacha20_poly1305_decrypt(key, nonce, aad, 5,
@@ -408,6 +427,20 @@ void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
 // Advance the client by (at most) one blocking I/O op. Returns TLS_STEP_AGAIN
 // when more I/O is required, TLS_STEP_DONE when the full response is in
 // st->out/st->out_len, or TLS_STEP_ERR on failure.
+//
+// STATE MACHINE (review #28 — explicit rejection table for a minimal
+// client; anything not listed below is PROTO by construction):
+//   SEND_CH -> RECV_SH: exactly one SH record, exact-consumed, no HRR
+//     (magic random rejected), session-id echo + cipher enforced.
+//   RECV_SH -> RECV_HS: flight EE, [CERT, CV,] Finished in order, each
+//     once (PSK-accepted: EE, Finished). CertificateRequest (client-auth),
+//     extra Certificates, or any other type → order violation.
+//     Fragmented messages reassembled (16KB cap); trailing bytes rejected.
+//   RECV_HS -> RECV_BODY: request sent; app keys live.
+//   RECV_BODY: APPDATA appended (overflow-checked); NST consumed+stored;
+//     KeyUpdate/unknown post-HS types rejected; plaintext alerts rejected;
+//     encrypted close_notify ends cleanly; EOF ends (Connection: close).
+//   No 0-RTT/early-data is ever sent. No client certificate exists.
 int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
     switch (st->phase) {
     case TLS_PH_SEND_CH: {
@@ -441,7 +474,14 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         // ECDHE share is always present (forward secrecy either way).
         // Guards: ticket must be fresh AND small (CH cap is 1024B).
         st->offer_psk = 0; st->psk_accepted = 0;
-        {
+        // Clock gate (review #31): no resumption offer without a
+        // trustworthy clock. With unknown time we can neither enforce the
+        // ticket lifetime nor report an honest age (age 0 for a months-old
+        // ticket is a lie the server shouldn't have to catch). The kernel
+        // always passes tick_count; host tls_client_run stamps wall time;
+        // the mock stamps a fixed ms. now_ms == 0 (unwired caller) → no
+        // offer, full handshake as if no ticket existed.
+        if (st->now_ms != 0) {
             const struct tls_ticket_slot* tslot = NULL;
             for (int i = 0; i < TLS_TICKET_SLOTS; i++)
                 if (ticket_host_eq(ticket_slots[i].host, st->host) &&
@@ -536,14 +576,42 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         }
 
         tls_server_hello sh;
+        // Length cap BEFORE copy (review 2026-09-10 #1: a >4096B SH body
+        // used to truncate the copy but keep the attacker's length — every
+        // later user (transcript, parsers) then read OOB past sh_body).
+        // Real ServerHellos are ~120B; 4KB is generous headroom, not a cap
+        // any legitimate server will notice.
+        if (hs_bl > sizeof(st->sh_body)) {
+            tls_dbg("[tls] oversize ServerHello (%uB) rejected\n", hs_bl);
+            st->fail_reason = TLS_FAIL_PROTO;
+            return TLS_STEP_ERR;
+        }
         if (tls_parse_server_hello(st->rec_buf + 5 + 4, hs_bl,
                                    st->session_id, &sh) != 0) {
             st->fail_reason = TLS_FAIL_PROTO;
             return TLS_STEP_ERR;
         }
         st->sh_bl = hs_bl;
-        for (uint32_t i = 0; i < hs_bl && i < sizeof(st->sh_body); i++)
+        for (uint32_t i = 0; i < hs_bl; i++)
             st->sh_body[i] = st->rec_buf[5 + 4 + i];
+
+        // HelloRetryRequest is explicitly unsupported (review #28): our CH
+        // is fixed-shape (X25519-only, ChaCha-only), so a server asking us
+        // to retry can never succeed — and silently misparsing the HRR
+        // random as a real server random would poison every key below.
+        // HRR magic (RFC 8446 §4.1.3): CF 21 AD 74 ...
+        {
+            static const uint8_t hrr_magic[16] = {
+                0xCF,0x21,0xAD,0x74,0xE5,0x9A,0x61,0x11,
+                0xBE,0x1D,0x8C,0x02,0x1E,0x65,0xB8,0x91 };
+            uint8_t diff = 0;
+            for (int i = 0; i < 16; i++) diff |= sh.random[i] ^ hrr_magic[i];
+            if (diff == 0) {
+                tls_dbg("[tls] HelloRetryRequest unsupported\n");
+                st->fail_reason = TLS_FAIL_PROTO;
+                return TLS_STEP_ERR;
+            }
+        }
 
         // ch_len includes the 4-byte handshake header. MUST be uint32_t: a
         // uint8_t truncated mod 256 for long SNI hostnames (CH body > 255B),
@@ -637,15 +705,24 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         }
         if (ctype != TLS_CT_HANDSHAKE) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
 
+        // Handshake-message reassembly (review #9 — RFC 8446 §5.1 permits
+        // fragmenting handshake messages across records; servers do it for
+        // large flights, e.g. RSA-4096 chains). Decrypted HANDSHAKE payloads
+        // accumulate in hs_buf; complete messages are parsed out below.
+        // Anything past TLS_HS_REASSEMBLY_MAX is rejected, not truncated.
+        if (st->hs_have + (uint32_t)pl > sizeof(st->hs_buf)) {
+            tls_dbg("[tls] flight exceeds reassembly cap\n");
+            st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR;
+        }
+        for (int i = 0; i < pl; i++) st->hs_buf[st->hs_have + i] = pt[i];
+        st->hs_have += (uint32_t)pl;
+
         uint32_t p = 0;
-        while (p < (uint32_t)pl) {
+        while (p + 4 <= st->hs_have) {
             uint8_t t; uint32_t bl;
-            uint32_t c = parse_hs(pt + p, pl - p, &t, &bl);
-            if (c == 0) {
-                tls_dbg("[tls] flight parse failed at p=%u pl=%d\n", p, pl);
-                st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR;
-            }
-            const uint8_t* body = pt + p + 4;
+            uint32_t c = parse_hs(st->hs_buf + p, st->hs_have - p, &t, &bl);
+            if (c == 0) break; // partial message at the end: await more
+            const uint8_t* body = st->hs_buf + p + 4;
             // RFC 8446 §4.4: the encrypted flight is EXACTLY EncryptedExtensions,
             // Certificate, CertificateVerify, Finished — in that order, each
             // once. Enforce it: an unexpected or repeated message is a protocol
@@ -675,6 +752,14 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             if (t == TLS_HS_ENCRYPTED_EXTENSIONS) {
                 if (bl > sizeof(st->ee_body)) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
                 memcpy(st->ee_body, body, bl); st->ee_bl = bl; st->got_ee = 1;
+                // Validate what the server selected (review #26/#27): exact
+                // framing, no duplicates, ALPN-if-present == "http/1.1".
+                // An h2-selecting server would otherwise break the HTTP
+                // layer above silently.
+                if (tls_parse_ee_validate(st->ee_body, st->ee_bl) != 0) {
+                    tls_dbg("[tls] EncryptedExtensions rejected\n");
+                    st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR;
+                }
                 st->hs_next = 1;
             } else if (t == TLS_HS_CERTIFICATE) {
                 if (bl > sizeof(st->cert_body)) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
@@ -712,8 +797,26 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             }
             p += c;
         }
+        // Compact: drop consumed messages, keep the partial tail (if any)
+        // for the next record. Bytes are only ever consumed as complete,
+        // order-valid messages — the tail is either empty or an incomplete
+        // message prefix.
+        if (p > 0) {
+            for (uint32_t i = p; i < st->hs_have; i++)
+                st->hs_buf[i - p] = st->hs_buf[i];
+            st->hs_have -= p;
+        }
         st->rec_have = 0;
         if (!st->got_sfin) return TLS_STEP_AGAIN;
+
+        // A complete Finished with bytes still buffered means trailing
+        // garbage rode in after it (the old code rejected this at parse;
+        // the reassembly buffer must not swallow it silently).
+        if (st->hs_have != 0) {
+            tls_dbg("[tls] trailing bytes after Finished\n");
+            st->fail_reason = TLS_FAIL_PROTO;
+            return TLS_STEP_ERR;
+        }
 
         if (!st->got_ee || st->hs_next != 4 ||
             (!st->psk_accepted && (!st->got_cert || !st->got_cv))) {
@@ -731,7 +834,11 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         // the authentication — only the original ticket holder, verified
         // during the full handshake that issued it, can compute them.
         if (!st->psk_accepted) {
+#ifdef KERNEL
+            const char* vhost = st->host;
+#else
             const char* vhost = st->verify_host ? st->verify_host : st->host;
+#endif
             int cvr = cert_verify(st->cert_body, st->cert_bl, vhost);
             if (cvr != CV_OK) {
                 tls_dbg("[tls] cert verification failed: %s\n",
@@ -828,9 +935,13 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             // TOFU leaf pin (see tls_client.h): first verified visit stores
             // the leaf SPKI hash; a later DIFFERENT key fails closed here
             // (no fallback — same gate as every CERT failure). Pin against
-            // the verified identity (verify_host override when testing).
+            // the verified identity (host-only verify_host override in tests).
             {
+#ifdef KERNEL
+                const char* phost = st->host;
+#else
                 const char* phost = st->verify_host ? st->verify_host : st->host;
+#endif
                 uint8_t ph[32];
                 sha256(leaf.spki.p, leaf.spki.len, ph);
                 if (tls_pin_check(phost, ph) != 0) {
@@ -982,7 +1093,12 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             return TLS_STEP_ERR;
         }
         if (ctype == TLS_CT_APPDATA) {
-            if (st->out_len + pl > st->out_cap) { st->fail_reason = TLS_FAIL_PROTO; st->phase = TLS_PH_DONE; return TLS_STEP_ERR; }
+            // Overflow discipline (review #3): NEVER `out_len + pl > cap`
+            // (wraps past 4GB after enough app data → heap... stack-buffer
+            // overwrite). Subtract instead; out_len <= out_cap is the
+            // maintained invariant (every append path checks first).
+            if (st->out_len > st->out_cap ||
+                (uint32_t)pl > st->out_cap - st->out_len) { st->fail_reason = TLS_FAIL_PROTO; st->phase = TLS_PH_DONE; return TLS_STEP_ERR; }
             memcpy(st->out + st->out_len, pt, pl);
             st->out_len += pl;
         } else {
@@ -1008,17 +1124,58 @@ int tls_last_fail_reason(void) {
     return g_last_fail_reason;
 }
 
+void tls_state_wipe(struct tls_state* st) {
+    if (!st) return;
+    secure_zero(st->priv, sizeof(st->priv));
+    secure_zero(st->ch, sizeof(st->ch));
+    secure_zero(st->sh_body, sizeof(st->sh_body));
+    secure_zero(st->c_hs_key, sizeof(st->c_hs_key));
+    secure_zero(st->c_hs_iv, sizeof(st->c_hs_iv));
+    secure_zero(st->s_hs_key, sizeof(st->s_hs_key));
+    secure_zero(st->s_hs_iv, sizeof(st->s_hs_iv));
+    secure_zero(st->c_hs_secret, sizeof(st->c_hs_secret));
+    secure_zero(st->hs_secret, sizeof(st->hs_secret));
+    secure_zero(st->s_fin_key, sizeof(st->s_fin_key));
+    secure_zero(st->ee_body, sizeof(st->ee_body));
+    secure_zero(st->cert_body, sizeof(st->cert_body));
+    secure_zero(st->cv_body, sizeof(st->cv_body));
+    secure_zero(st->fin_body, sizeof(st->fin_body));
+    secure_zero(st->c_ap_key, sizeof(st->c_ap_key));
+    secure_zero(st->c_ap_iv, sizeof(st->c_ap_iv));
+    secure_zero(st->s_ap_key, sizeof(st->s_ap_key));
+    secure_zero(st->s_ap_iv, sizeof(st->s_ap_iv));
+    secure_zero(st->c_fin_key, sizeof(st->c_fin_key));
+    secure_zero(st->master, sizeof(st->master));
+    secure_zero(st->res_master, sizeof(st->res_master));
+    secure_zero(st->psk_early, sizeof(st->psk_early));
+    secure_zero(st->rec_buf, sizeof(st->rec_buf));
+    secure_zero(st->hs_buf, sizeof(st->hs_buf));
+    st->have_master = st->have_res = 0;
+    st->offer_psk = st->psk_accepted = 0;
+    st->c_ap_seq = st->s_ap_seq = st->c_seq = st->s_seq = 0;
+}
+
 int tls_client_run(const char* host, uint16_t port,
                    const uint8_t* request, uint32_t request_len,
                    uint8_t* out, uint32_t out_cap,
                    const struct tls_client_io* io) {
     struct tls_state st;
     tls_state_init(&st, host, port, request, request_len, out, out_cap);
+#ifndef KERNEL
+    // Host wall clock for the ticket-age gate (review #31). The kernel
+    // passes tick_count at fetch time instead (see tls_net.c).
+    {
+        time_t tt = time(0);
+        if (tt > 0) tls_state_set_now_ms(&st, (uint64_t)tt * 1000u);
+    }
+#endif
     int r;
     do {
         r = tls_state_step(&st, io);
     } while (r == TLS_STEP_AGAIN);
     g_last_fail_reason = st.fail_reason;
-    if (r == TLS_STEP_DONE) return (int)st.out_len;
+    int out_len = (int)st.out_len;
+    tls_state_wipe(&st); // stack state must not outlive the call
+    if (r == TLS_STEP_DONE) return out_len;
     return -1;
 }

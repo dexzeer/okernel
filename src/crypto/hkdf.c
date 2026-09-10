@@ -1,5 +1,6 @@
 #include "hkdf.h"
 #include "hmac.h"
+#include <string.h>
 
 // RFC 5869. PRK = HMAC-Hash(salt, IKM); T(i) = HMAC-Hash(PRK, T(i-1) || info || i)
 
@@ -9,13 +10,13 @@ void hkdf_extract(const uint8_t* salt, uint32_t salt_len,
     hmac_sha256(salt, salt_len, ikm, ikm_len, prk);
 }
 
-void hkdf_expand(const uint8_t prk[32], const uint8_t* info, uint32_t info_len,
-                 uint8_t* okm, uint32_t okm_len) {
-    // RFC 5869 §2.3: L <= 255*HashLen (counter is one octet). Clamp rather
-    // than wrap the counter (a wrap would repeat keystream — review
-    // 2026-09-10 #11). In-tree uses are <= 64B; the clamp is unreachable
-    // there by construction, loud by inspection here.
-    if (okm_len > 255 * 32) okm_len = 255 * 32;
+int hkdf_expand(const uint8_t prk[32], const uint8_t* info, uint32_t info_len,
+                uint8_t* okm, uint32_t okm_len) {
+    // RFC 5869 §2.3: L <= 255*HashLen (counter is one octet). Refuse rather
+    // than wrap the counter (a wrap would repeat keystream) or silently
+    // clamp (review #40: a caller asking for 20KB must not get 8160 bytes
+    // and a success code). In-tree uses are <= 64B — unreachable there.
+    if (okm_len > 255 * 32) return -1;
     uint8_t t[32];
     uint32_t t_len = 0;
     uint32_t done = 0;
@@ -35,13 +36,16 @@ void hkdf_expand(const uint8_t prk[32], const uint8_t* info, uint32_t info_len,
         t_len = 32;
         counter++;
     }
+    return 0;
 }
 
-void hkdf(const uint8_t* salt, uint32_t salt_len,
-          const uint8_t* ikm, uint32_t ikm_len,
-          const uint8_t* info, uint32_t info_len,
-          uint8_t* okm, uint32_t okm_len) {
+int hkdf(const uint8_t* salt, uint32_t salt_len,
+         const uint8_t* ikm, uint32_t ikm_len,
+         const uint8_t* info, uint32_t info_len,
+         uint8_t* okm, uint32_t okm_len) {
     uint8_t prk[32];
     hkdf_extract(salt, salt_len, ikm, ikm_len, prk);
-    hkdf_expand(prk, info, info_len, okm, okm_len);
+    int rc = hkdf_expand(prk, info, info_len, okm, okm_len);
+    memset(prk, 0, sizeof(prk));
+    return rc;
 }
