@@ -207,6 +207,7 @@ static uint32_t c_len;
 enum mock_mode {
     MOCK_VALID = 0,
     MOCK_RSA_PSS_VALID,
+    MOCK_P384_VALID,
     MOCK_CV_WRONG_KEY,
     MOCK_CV_FLIPPED,
     MOCK_CV_GARBAGE_TRANSCRIPT,
@@ -224,6 +225,8 @@ enum mock_mode {
     MOCK_CLOSE_NOTIFY,
     MOCK_GARBAGE_FIRST,
     MOCK_RECORD_OVERFLOW,
+    MOCK_SPLIT,        // valid flight, server dribbles 7B/recv (rec_have path)
+    MOCK_TRUNCATED,    // flight cut short mid-record (must ERR, never hang)
     MOCK_COUNT
 };
 
@@ -382,6 +385,10 @@ static int mock_recv(uint8_t* out, uint32_t cap, uint32_t timeout_ms, void* user
         if (q_pos >= q_len) return -1;     // server closed
     }
     uint32_t take = q_len - q_pos < cap ? q_len - q_pos : cap;
+    // SPLIT: dribble at most 7 bytes per recv — the client's rec_have
+    // reassembly path (partial record headers AND bodies) must still
+    // complete the handshake byte-identically.
+    if (g_mode == MOCK_SPLIT && take > 7) take = 7;
     memcpy(out, q_buf + q_pos, take);
     q_pos += take;
     return (int)take;
@@ -396,7 +403,7 @@ static int mock_send(const uint8_t* buf, uint32_t len, void* user) {
 }
 
 static int sign_digest(const char* key, const uint8_t* data, uint32_t len,
-                       int pss, uint8_t* sig, uint32_t* sig_len) {
+                       int pss, int sha384, uint8_t* sig, uint32_t* sig_len) {
     mkdir(SCRATCH_DIR, 0777);
     static char path[256], cmd[640];
     snprintf(path, sizeof(path), SCRATCH_DIR "/data.bin");
@@ -409,6 +416,10 @@ static int sign_digest(const char* key, const uint8_t* data, uint32_t len,
         snprintf(cmd, sizeof(cmd),
                  "openssl dgst -sha256 -sigopt rsa_padding_mode:pss "
                  "-sigopt rsa_pss_saltlen:32 -sign %s -out %s " SCRATCH_DIR "/data.bin 2>/dev/null",
+                 key, path);
+    else if (sha384)
+        snprintf(cmd, sizeof(cmd),
+                 "openssl dgst -sha384 -sign %s -out %s " SCRATCH_DIR "/data.bin 2>/dev/null",
                  key, path);
     else
         snprintf(cmd, sizeof(cmd),
@@ -487,11 +498,11 @@ static uint32_t plain_record(uint8_t* out, uint8_t type, const uint8_t* pt, uint
 
 static const char* mode_name(int m) {
     static const char* names[] = {
-        "VALID", "RSA_PSS_VALID", "CV_WRONG_KEY", "CV_FLIPPED",
+        "VALID", "RSA_PSS_VALID", "P384_VALID", "CV_WRONG_KEY", "CV_FLIPPED",
         "CV_GARBAGE_TRANSCRIPT", "HOSTNAME_MISMATCH", "EXPIRED", "KEYSHARE_SWAP",
         "CIPHER_1302", "SID_BAD", "NO_KEYSHARE", "NO_CV", "DUP_EE",
         "FIN_FLIPPED", "ALERT", "APPDATA_BITFLIP", "CLOSE_NOTIFY",
-        "GARBAGE_FIRST", "RECORD_OVERFLOW"
+        "GARBAGE_FIRST", "RECORD_OVERFLOW", "SPLIT", "TRUNCATED"
     };
     return names[m];
 }
@@ -505,12 +516,23 @@ static void mock_run(int mode, struct mock_result* res) {
     static int loaded = 0;
     static uint8_t leaf_der[4096], root_der[4096];
     static int leaf_len, root_len;
+    static uint8_t p384_root_der[4096];
+    static int p384_root_len;
     if (!loaded) {
         leaf_len = load("tests/adversarial/at_leaf.der", leaf_der, sizeof(leaf_der));
         root_len = load("tests/adversarial/at_root.der", root_der, sizeof(root_der));
+        p384_root_len = load("tests/adversarial/at_p384_root.der",
+                             p384_root_der, sizeof(p384_root_der));
         loaded = 1;
+    }
+    // Single extra-trust slot: point it at whichever root anchors this
+    // mode's chain (P-384 modes use the P-384 root, everything else the
+    // P-256 root). Cheap per-run parse; keeps modes independent.
+    {
         x509_cert rc;
-        if (x509_parse(root_der, (uint32_t)root_len, &rc) == 0)
+        const uint8_t* rd = (mode == MOCK_P384_VALID) ? p384_root_der : root_der;
+        int rl = (mode == MOCK_P384_VALID) ? p384_root_len : root_len;
+        if (rl > 0 && x509_parse(rd, (uint32_t)rl, &rc) == 0)
             cert_verify_trust_extra(rc.spki.p, rc.spki.len);
     }
     (void)leaf_len;
@@ -653,10 +675,16 @@ static void mock_run(int mode, struct mock_result* res) {
             ? "tests/adversarial/at_leaf_expired.der"
             : (mode == MOCK_RSA_PSS_VALID)
             ? "tests/adversarial/at_rsa_leaf.der"
+            : (mode == MOCK_P384_VALID)
+            ? "tests/adversarial/at_p384_leaf.der"
             : "tests/adversarial/at_leaf.der";
         chain[0] = leaf_file;
-        chain[1] = "tests/adversarial/at_int.der";
-        chain[2] = "tests/adversarial/at_root.der";   // anchor terminates the path
+        chain[1] = (mode == MOCK_P384_VALID)
+            ? "tests/adversarial/at_p384_int.der"
+            : "tests/adversarial/at_int.der";
+        chain[2] = (mode == MOCK_P384_VALID)
+            ? "tests/adversarial/at_p384_root.der"
+            : "tests/adversarial/at_root.der";   // anchor terminates the path
         uint32_t cert_len = build_cert_msg(cert_msg, sizeof(cert_msg), chain, 3);
         if (cert_len == 0) { res->r = -3; return; }
         mtrans_msg(&g_mt, TLS_HS_CERTIFICATE, cert_msg, cert_len);
@@ -673,16 +701,18 @@ static void mock_run(int mode, struct mock_result* res) {
             memset(signed_data + 64 + 33 + 1, 0x5A, 32);
 
         int is_rsa = (mode == MOCK_RSA_PSS_VALID);
+        int is_p384 = (mode == MOCK_P384_VALID);
         const char* leaf_key = is_rsa ? "tests/adversarial/at_rsa_leaf.key"
-                                      : "tests/adversarial/at_leaf.key";
+                             : is_p384 ? "tests/adversarial/at_p384_leaf.key"
+                                       : "tests/adversarial/at_leaf.key";
         const char* sign_key = (mode == MOCK_CV_WRONG_KEY)
             ? "tests/adversarial/at_root.key" : leaf_key;
-        uint16_t cv_alg = is_rsa ? 0x0804 : 0x0403;
+        uint16_t cv_alg = is_rsa ? 0x0804 : is_p384 ? 0x0503 : 0x0403;
 
         uint8_t cv_sig[1024];
         uint32_t cv_sig_len = 0;
         if (sign_digest(sign_key, signed_data, sizeof(signed_data), is_rsa,
-                        cv_sig, &cv_sig_len) != 0) {
+                        is_p384, cv_sig, &cv_sig_len) != 0) {
             printf("    [mock] openssl signing failed (%s)\n", mode_name(mode));
             res->r = -3;
             return;
@@ -742,7 +772,13 @@ static void mock_run(int mode, struct mock_result* res) {
         q_put(rec, rl);
 
         g_expect_body = (mode == MOCK_VALID || mode == MOCK_RSA_PSS_VALID ||
-                         mode == MOCK_CLOSE_NOTIFY || mode == MOCK_APPDATA_BITFLIP);
+                          mode == MOCK_P384_VALID || mode == MOCK_SPLIT ||
+                          mode == MOCK_CLOSE_NOTIFY || mode == MOCK_APPDATA_BITFLIP);
+        // TRUNCATED: cut the queue mid-flight-record (SH complete + 30B of
+        // the encrypted flight). The client must ERR on the short close —
+        // never DONE (partial bytes are not a page) and never spin: the
+        // step loop below caps at 500 iters and the CHECK requires ERR.
+        if (mode == MOCK_TRUNCATED && q_len > 140) q_len = 140;
     }
 
     int iters = 0;
@@ -771,6 +807,9 @@ static void mock_section(void) {
     mock_run(MOCK_RSA_PSS_VALID, &res);
     CHECK(res.r == TLS_STEP_DONE && res.out_len > 0,
           "positive control: RSA leaf + PSS CertificateVerify completes");
+    mock_run(MOCK_P384_VALID, &res);
+    CHECK(res.r == TLS_STEP_DONE && res.out_len > 0,
+          "positive control: P-384 leaf + ECDSA-SHA384 CertificateVerify completes");
 
     mock_run(MOCK_CV_WRONG_KEY, &res);
     CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_CERT,
@@ -828,6 +867,13 @@ static void mock_section(void) {
     CHECK(res.r == TLS_STEP_ERR, "record-layer garbage rejected");
     mock_run(MOCK_RECORD_OVERFLOW, &res);
     CHECK(res.r == TLS_STEP_ERR, "oversized record length rejected");
+    mock_run(MOCK_SPLIT, &res);
+    CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
+          memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
+          "split delivery (7B/recv) still completes");
+    mock_run(MOCK_TRUNCATED, &res);
+    CHECK(res.r == TLS_STEP_ERR,
+          "truncated flight rejected (no hang, no partial DONE)");
 }
 
 int main(void) {

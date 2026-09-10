@@ -11,7 +11,10 @@ The Big Missing Foundations
     [~] Processes & Scheduling — MOSTLY DONE 2026-09-08, preemption live
         Process table, PCB (esp0/term_win/entered_ring3/park), round-robin preemptive
         tick + safe-point yield, fork (page copy, child EAX=0), zombies/wait/kill.
-        OPEN: ring-3 sh input bug (garbage line + fork-child #PF) — see HANDOFF 2026-09-08.
+        2026-09-10: per-slot `generation` guard in switch_to (abort on reuse
+        under the cli window) + PCB tail-growth convention; idt exec-redirect
+        reads user_eip/esp by offsetof (raw pcb[7]/pcb[8] crossed EIP/ESP —
+        fixed, see HANDOFF 2026-09-10).
 
     [x] System Call Interface — DONE 2026-09-08
         INT 0x80 ABI 0-17: print/exit/write/read/open/close/fork/exec/sbrk/pipe/dup/
@@ -46,24 +49,32 @@ The Big Missing Foundations
         RSA PKCS#1 v1.5 + RSASSA-PSS (TLS 1.3 mandate), SHA-512/384, 14-root
         store (SPKI-hash anchored, tools/gen_roots.py), SAN/wildcard hostname
         match, CMOS RTC validity dates. cert-failure blocks the plain-HTTP
-        fallback (SECURITY WARNING page). Quick TLS hardening: RNG hard-fail,
-        uint32 transcript len, cipher check, alert discrimination, flight
-        order, random session id, narrowed sig-alg offer. Verified live in
-        QEMU (example.com) + self-signed rejection (test_certfail). Deferred:
-        P-384 CertificateVerify for P-384-leaf servers (chain verify HAS it),
-        OCSP, cert pinning UI, AES-GCM.
+         fallback (SECURITY WARNING page). Quick TLS hardening: RNG hard-fail,
+         uint32 transcript len, cipher check, alert discrimination, flight
+         order, random session id, narrowed sig-alg offer. Verified live in
+         QEMU (example.com) + self-signed rejection (test_certfail). 2026-09-10:
+         P-384 CertificateVerify DONE with mock proof (was deferred); `make
+         host-tests` wires pki + adversarial + live client; text-build link
+         fixed (weak sys_proc_kbd_pending). Still deferred: OCSP, cert
+         pinning UI, AES-GCM.
 
-    [x] Adversarial security testing of TLS/PKI — DONE 2026-09-09
+    [x] Adversarial security testing of TLS/PKI — DONE 2026-09-09,
+        EXTENDED 2026-09-10 (P-384 leaf + ECDSA-SHA384 CV positive control,
+        7B/recv split-delivery control, truncated-flight rejection).
         tests/test_adversarial.c (host, ASan+UBSan): 4000-round mutation fuzz
         over the real example.com flight through cert_verify (only anchor-TBS
-        mutations may verify — none do) + 19-mode adversarial mock TLS 1.3
-        server (positive ECDSA + RSA-PSS controls, wrong-key/flipped/
+        mutations may verify — none do) + adversarial mock TLS 1.3 server
+        (positive ECDSA + RSA-PSS + P-384 controls, wrong-key/flipped/
         wrong-transcript CV, hostname/expired, key-share swap MITM, flight
-        order, Finished flip, AEAD bit-flip, close_notify clean). 26/26 PASS.
-        Fixes: Finished failure now sets TLS_FAIL_MAC; cert_verify_trust_extra
-        test hook; tls_dbg on flight-parse failures.
+        order, Finished flip, AEAD bit-flip, close_notify clean, split,
+        truncated). 29/29 PASS. Fixes: Finished failure now sets
+        TLS_FAIL_MAC; cert_verify_trust_extra test hook; tls_dbg on
+        flight-parse failures. Run via `make host-tests`.
 
-    [~] Userland cutover (init + shell-from-disk) — IN PROGRESS, see
-        ~/.commandcode/plans/userland-cutover.md Phases 0-4 DONE; Phase 5-6 partial:
-        init spawns, /bin/sh prompts, but shell input delivers garbage + #PF
-        (HANDOFF 2026-09-08 evening). `usermode` retires only after sh works.
+    [~] Userland cutover (init + shell-from-disk) — MAJOR PROGRESS 2026-09-10,
+        Phases 0-4 DONE; Phase 5-6 now: init spawns, /bin/sh prompts AND
+        answers (`run /bin/hello` → hello → Back → sh `help` all live,
+        no post-run #PF — the exec EIP/ESP cross that killed init's child
+        is fixed, see HANDOFF 2026-09-10). `usermode` retires only after
+        sh input over serially-typed lines proves out end-to-end.
+        Regression: tests/headless/test_sh_hello.py (kept in tree).
