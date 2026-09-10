@@ -2122,3 +2122,133 @@ Chronological, each looked like a crypto bug but was a mock bug:
    them by default after crypto changes.
 7. Deferred UX: cert pinning, security-warning page polish (from the PKI
    session's deferred list).
+
+---
+
+## Session 2026-09-10 (overnight) — host-tests target, P-384 CV proof, split/trunc fuzzer, generation guard, exec EIP/ESP cross ROOT-CAUSED
+
+Worked the adversarial session's Next-steps list top-down. Status: items 1
+(P-384 CV), 3 (fuzzer), 6 (host-tests) DONE and verified; item 2 (AES-GCM)
+DEFERRED (no site needs it — every target negotiates 0x1303; same call the
+PKI session made). Plus two drive-bys found by "test everything": a
+pre-existing text-build link break (fixed) and a real kernel bug (fixed,
+see Bisect below).
+
+### 1. `make host-tests` — DONE
+Makefile target (offline must-pass, informational never gates):
+- Must-pass: `t_tls_crypto` (ALL PASS), `t_css` (ALL PASS), `t_subres`
+  (0 failures — needs `src/css.c` on the link line: it refs `css_parse`),
+  `t_pki` (0 failures), `t_adv` fast `-O2` build + `timeout 300`
+  (29/29 PASS after the P-384 + split/trunc additions below).
+- Informational (`-` prefix): `t_td` (5 pre-existing Cyrillic FAILs,
+  unchanged since 2026-09-07) and the LIVE `t_tls_live` (needs internet;
+  passed tonight: 869 bytes + MITM rejected, PHASE 4+MITM PASS).
+- Binaries go to `build-host/` (repo-local — /tmp is wiped mid-run on this
+  host; `.gitignore`d). Suites run from repo root (fixtures are
+  `tests/...`-relative). Verified `make host-tests` RC=0 on the final tree.
+
+### 2. P-384 CertificateVerify positive control — DONE (was "only the CV
+dispatcher needs the case"; the dispatcher already had it — the TEST did not)
+- `tls_client.c` already handled 0x0503 and the CH offer already included
+  it — but NO test ever exercised a P-384 leaf end to end.
+- `tests/adversarial/gen_pki.sh` now mints a secp384r1 chain
+  (`at_p384_root/int/leaf`, `-sha384` throughout, SAN evil.example.com).
+  NOTE: regenerating re-keyed ALL existing fixtures (new at_root/int/leaf
+  keys) — test-only PKI, self-contained, committed consistently.
+- `test_adversarial.c`: new `MOCK_P384_VALID` mode (P-384 chain, openssl
+  `-sha384` CV sign via a new `sha384` flag on `sign_digest`, cv_alg 0x0503)
+  with per-mode extra-trust selection (single trust slot re-pointed at the
+  P-384 root for that mode). New CHECK: "P-384 leaf + ECDSA-SHA384 CV
+  completes".
+- Result: 27/27 at that point (later 29/29 with §3).
+
+### 3. Fuzzer extension — DONE (split delivery + truncated flight)
+- `MOCK_SPLIT`: `mock_recv` dribbles ≤7B per call through the whole
+  handshake — the client's `rec_have` reassembly path (previously untested
+  per this doc) now proven byte-identical: positive control, must DONE.
+- `MOCK_TRUNCATED`: queue cut to 140B (SH complete + 30B of the encrypted
+  flight, then close). Must ERR — never DONE on partial bytes, never spin
+  (step loop caps at 500 iters; the CHECK requires ERR).
+- Result: ADVERSARIAL TESTS PASS: 29 passed, 0 failed (fast build; ASan
+  build is 2-3x slower and timed out at 120s in this env — run it with a
+  bigger timeout if you touch crypto).
+
+### 4. Scheduler generation guard — DONE (code), open crash SUPERSEDED by §5
+- `struct process` gained `generation` (bumped on create, never cleared by
+  destroy); `process_switch_to` snapshots prev/next generations and aborts
+  under cli on mismatch (covers OUR-slot-reused, which the pid lookup
+  misses — pid lookup only covers target reuse since pids are monotonic).
+- The post-run #PF it was meant for (err=0 cr2=eip=esp=0) did NOT reproduce
+  in this session's runs; instead the sh_hello runs exposed §5.
+
+### 5. BISECT: exec resumed at EIP=user_esp / ESP=entered_ring3 — ROOT-CAUSED
+Symptom (new `tests/headless/test_sh_hello.py`: `run /bin/hello` → Back →
+init forks pid 3 → exec /bin/sh): deterministic
+`[ISR] Exception 14 err=4 cr2=0 eip=bfffffe0 esp=1 pid=3 cs=1b`.
+- Proof chain (all serial): `[fork]` teip=8049035/tesp=bfffffc0 →
+  frame+stub correct in memory at BOTH fork time and drain time (temp
+  probes, since removed: same phys 0x3df1000, stub 5b5f5e5dc3, f4=8049035)
+  → fault `@eip: 01 00 00 00 ec ff ff bf` = the exec-built `[argc=1]
+  [argv0]` header at final_esp=0xBFFFFFE0. So the IRET executed DATA as
+  code with EAX=0: EIP←0xBFFFFFE0 (= user_esp), ESP←1 (= entered_ring3).
+- Root cause: `src/idt.c` exec-redirect read `pcb[8]`/`pcb[7]` by RAW WORD
+  INDEX. Inserting `generation` after `state` shifted user_esp 7→8 and
+  user_eip 8→9, so new_eip read user_esp and new_esp read entered_ring3.
+  The old comment ("_Static_assert-free comment guards drift") described
+  exactly this failure mode. Bisect proof: struct-size-only change (new
+  .h + old .c) crashed identically; full revert was clean.
+- Fix: `generation` moved to END of struct (ABI churn minimized) AND
+  idt.c now `#include "process.h"` + reads by
+  `offsetof(struct process, user_eip/user_esp)/4` — raw indices are gone,
+  mid-struct inserts are safe again. The two local `process_current`
+  decls were retyped to the weak `struct process*` form (header-type
+  conflict otherwise); weak-NULL behavior in the text build preserved —
+  both ISOs link.
+- After fix: `test_sh_hello.py` FULL PASS (hello → Back → no #PF → sh
+  interactive: typed `help` answered by ring-3 sh). New regression test,
+  kept in tree. (Its first draft waited for text-mode "Available
+  commands"; desktop prints "Commands:" and sh owns the terminal here —
+  the test accepts either shell.)
+
+### 6. Drive-by: text build was BROKEN at base (fixed)
+`syscall.c` called `sys_proc_kbd_pending()` (desktop-only) without the
+weak attribute → `make text` failed to link on the BASE commit too
+(verified via stash). One-line fix: weak decl + NULL check. Both ISOs
+build again.
+
+### QEMU battery on the final kernel (all serial-ground-truth)
+- test_sh_hello: PASS (hello / Back / clean / sh-interactive)
+- test_nav 4/4: PASS · test_addrbar: PASS · test_pki_qemu: PASS (RTC +
+  chain verified, no CV-invalid) · test_certfail: PASS (self-signed
+  :8443 rejected reason=4, no HTTP fallback; server script is throwaway
+  in /tmp — recreate per the recipe: openssl RSA cert + python ssl
+  TLS1.3 server)
+- test_links: FAIL (HOMEPAGE pass; LINK/NEWTAB/SWITCH/CHROME-BOUNDS fail)
+  — PRE-EXISTING, fails IDENTICALLY on the base kernel (same 737
+  blue-pixel count): clicks register and links render, but the harness
+  converges to the wrong spot (mouse-gain/geometry drift). Needs a
+  harness-side look, not a kernel fix.
+
+### Traps for the next agent
+- NEVER read PCB fields by raw word index (`pcb[N]`) — use `offsetof`
+  (the exec-cross bug). `pid` via `pcb[0]` remains (first field, stable).
+- New `struct process` fields go LAST (tail-growth convention, see header).
+- /tmp is wiped mid-run on this host: test binaries, logs, and servers go
+  in `build-host/` / `~/okvm/`, never /tmp. (The ASan adversarial binary
+  died to this once tonight.)
+- `make host-tests` after ANY crypto/tls change; `test_sh_hello.py` after
+  ANY process/sched/syscall/paging change (it caught a deterministic
+  crash in one run).
+- Internet here flaps ("immaculous" amounts): QEMU failures on network
+  legs need a host `socket.create_connection(('example.com',443))` sanity
+  check before any kernel theorizing; prefer `test_certfail` (localhost
+  server) for offline TLS-negative proof.
+
+### Remaining next steps (re-prioritized)
+1. test_links harness (gain/geometry convergence) — kernel side proven
+   innocent (identical base failure); likely GAIN constant or stale origin.
+2. AES-GCM (0x1302) — still deferred, same rationale (no target needs it).
+3. Session tickets, OCSP, warning-page polish — unchanged.
+4. The 2026-09-09 post-run NULL-EIP #PF never reproduced tonight (6+
+   sh_hello runs, all clean after the offsetof fix — the exec-cross may
+   have BEEN one of its shapes); keep `test_sh_hello.py` in the loop.

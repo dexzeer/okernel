@@ -26,6 +26,7 @@ void process_init(void) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         processes[i].state = PROC_UNUSED;
         processes[i].pid = 0;
+        processes[i].generation = 0;
     }
     // PID 0 is the kernel (idle process)
     processes[0].pid = 0;
@@ -123,6 +124,11 @@ int process_create(void) {
     struct process *p = &processes[slot];
     p->pid = next_pid++;
     p->state = PROC_READY;
+    // Lifetime bump: destroy never clears this, so any tick holding a
+    // pre-cli snapshot of this slot detects reuse (generation mismatch).
+    // Wraps to 0 are skipped (0 = never-used).
+    p->generation++;
+    if (p->generation == 0) p->generation++;
 
     // Create a new page directory with kernel mappings
     p->page_dir = create_page_directory();
@@ -360,6 +366,7 @@ void process_switch_to(uint32_t pid) {
     uint32_t next_state = next->state;
     if (next_state != PROC_READY && next_state != PROC_RUNNING) return;
     uint32_t target_pid = next->pid;
+    uint32_t next_gen = next->generation;
     uint32_t next_esp = next->esp;
     uint32_t next_eip = next->eip;
     uint32_t next_pd = next->page_dir;
@@ -370,6 +377,7 @@ void process_switch_to(uint32_t pid) {
     struct process *prev = process_current();
     uint32_t prev_pid = prev->pid;
     if (prev_pid == pid) return; // Already running
+    uint32_t prev_gen = prev->generation;
     uint32_t prev_esp0 = prev->esp0_top;
     uint32_t *prev_esp_p = &prev->esp;
     uint32_t prev_slot = slot_of(prev);
@@ -471,6 +479,25 @@ void process_switch_to(uint32_t pid) {
         // save: just clear the guard, re-enable, and return WITHOUT
         // touching context_switch (our stack may already be someone else's).
         if (pv->state == PROC_UNUSED) {
+            switch_busy = 0;
+            __asm__ volatile("sti" ::: "memory");
+            return;
+        }
+        // GENERATION GUARD (2026-09-09 overnight: post-hello #PF narrowed to
+        // tick-into-reused-slot — the pid lookup above misses the case where
+        // OUR OWN slot was reaped AND reused between prologue and cli (same
+        // slot index, new pid+generation, state READY: passes every check
+        // above, but pv->esp is someone else's stack and saving there
+        // corrupts the new occupant). The target side is covered by the pid
+        // lookup (pids are monotonic, never reused until 2^32 wraps); still
+        // re-check its generation for symmetry. Abort on any mismatch —
+        // the waiter reaps, the tick retries next slice.
+        if (pv->generation != prev_gen) {
+            switch_busy = 0;
+            __asm__ volatile("sti" ::: "memory");
+            return;
+        }
+        if (nx->generation != next_gen) {
             switch_busy = 0;
             __asm__ volatile("sti" ::: "memory");
             return;

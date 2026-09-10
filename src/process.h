@@ -78,7 +78,15 @@ struct process {
     uint32_t mmap_next;    // next auto-mmap hint (grows down from stack gap)
     int fds[PROC_MAX_FDS]; // open-file indices, PROC_FD_* or -1 free
     int term_win;        // owning terminal window for stdio (PROC_FD_TERM
-                         // backing); -1 = none (falls back to focused)
+                          // backing); -1 = none (falls back to focused)
+    uint32_t generation;   // per-slot lifetime counter: bumped on every
+                            // create (never cleared by destroy) so a tick that
+                            // snapshots a PCB before its cli can detect slot
+                            // reuse under it (see process_switch_to). LAST
+                            // field by ABI convention: idt.c's exec-redirect
+                            // reads user_eip/esp by offsetof (see below), but
+                            // keeping growth at the tail minimizes churn for
+                            // any future raw-offset readers.
 };
 
 // Initialize the process table

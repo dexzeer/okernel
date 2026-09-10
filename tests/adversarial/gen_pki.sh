@@ -6,6 +6,7 @@
 #   at_leaf   ECDSA P-256 leaf, SAN: evil.example.com, *.evil.example.com
 #   at_leaf_expired  same but expired (notAfter in the past)
 #   at_rsa_leaf      RSA-2048 leaf (for RSA-PSS CV tests), SAN evil.example.com
+#   at_p384_root/int/leaf  ECDSA P-384 chain (for 0x0503 CV tests), SAN evil.example.com
 set -e
 cd "$(dirname "$0")"
 
@@ -45,4 +46,27 @@ for n in at_root at_int at_leaf at_leaf_expired at_rsa_leaf; do
   openssl x509 -in $n.pem -outform DER -out $n.der
 done
 rm -f at_int.csr at_leaf.csr at_leaf_expired.csr at_rsa_leaf.csr
+
+# P-384 chain (secp384r1 throughout — exercises the 0x0503 CV path end to end)
+openssl ecparam -name secp384r1 -genkey -noout -out at_p384_root.key 2>/dev/null
+openssl req -new -x509 -key at_p384_root.key -out at_p384_root.pem -days 3650 \
+  -subj "/CN=Adversarial Test P-384 Root" \
+  -addext "basicConstraints=critical,CA:TRUE" \
+  -addext "keyUsage=critical,keyCertSign" 2>/dev/null
+
+openssl ecparam -name secp384r1 -genkey -noout -out at_p384_int.key 2>/dev/null
+openssl req -new -key at_p384_int.key -out at_p384_int.csr -subj "/CN=Adversarial Test P-384 Intermediate" 2>/dev/null
+openssl x509 -req -sha384 -in at_p384_int.csr -CA at_p384_root.pem -CAkey at_p384_root.key \
+  -out at_p384_int.pem -days 3650 -extfile <(printf "basicConstraints=critical,CA:TRUE,pathlen:0\nkeyUsage=critical,keyCertSign\nsubjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid") 2>/dev/null
+
+openssl ecparam -name secp384r1 -genkey -noout -out at_p384_leaf.key 2>/dev/null
+openssl req -new -key at_p384_leaf.key -out at_p384_leaf.csr -subj "/CN=evil.example.com" 2>/dev/null
+openssl x509 -req -sha384 -in at_p384_leaf.csr -CA at_p384_int.pem -CAkey at_p384_int.key \
+  -out at_p384_leaf.pem -days 3650 \
+  -extfile <(printf "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:evil.example.com,DNS:*.evil.example.com") 2>/dev/null
+
+for n in at_p384_root at_p384_int at_p384_leaf; do
+  openssl x509 -in $n.pem -outform DER -out $n.der
+done
+rm -f at_p384_int.csr at_p384_leaf.csr
 echo "test PKI ready"

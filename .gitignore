@@ -27,4 +27,5 @@ okai-preview-binary
 tests/okai_preview
 tests/test_css
 tests/test_html_google
+build-host/
 __pycache__/

@@ -548,8 +548,8 @@ void syscall_handler(uint32_t eax, uint32_t ebx, uint32_t ecx, uint32_t edx) {
             // with EAX=0 so ring 3 retries the read immediately and gets
             // the line. Park only when truly idle.)
             {
-                extern int sys_proc_kbd_pending(void);
-                if (sys_proc_kbd_pending()) {
+                extern int sys_proc_kbd_pending(void) __attribute__((weak));
+                if (sys_proc_kbd_pending && sys_proc_kbd_pending()) {
                     syscall_set_ret(0);
                     break;
                 }

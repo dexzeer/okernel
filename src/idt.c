@@ -2,6 +2,10 @@
 #include "io.h"
 #include "serial.h"
 #include "syscall.h"
+#include <stddef.h> // offsetof (compiler-provided, freestanding-safe)
+#include "process.h" // struct offsets ONLY (user_eip/esp words below) — no
+                     // calls into process.o (desktop-only); all uses here go
+                     // through weak aliases, so the text build still links.
 
 // IDT entry structure
 struct idt_entry {
@@ -268,24 +272,28 @@ void isr_handler(int int_num) {
         // (CS pushed[11] stays 0x1B, SS pushed[14] stays 0x23).
         // Trap-safe: same address space (CR3 unchanged), same trap stack,
         // popa+iret proceed normally — only the resume address changes.
-        // NOTE: process.h field offsets (pid/state/page_dir/esp/ebp/eip/
-        // entered_ring3/user_esp/user_eip) are read via a local mirror to
-        // keep idt.c (COMMON, text build) from including process.h
-        // (desktop-only). The offsets are ABI — see process.h; a
-        // _Static_assert-free comment guards drift (both structs are u32s).
+        // NOTE: user_eip/esp are read by STRUCT OFFSET (never raw word
+        // indices — a hardcoded pcb[7]/pcb[8] silently crossed EIP/ESP the
+        // moment a field was inserted mid-struct, bisected 2026-09-10:
+        // exec resumed at EIP=user_esp ESP=entered_ring3).
         {
             extern int syscall_take_exec_redirect(void);
             extern uint32_t syscall_take_ret(void);
             if (syscall_take_exec_redirect()) {
                 // process_current is desktop-only (COMMON/text has no
                 // process.o): weak alias → NULL when unlinked; no redirect
-                // in text mode (exec hook is NULL there anyway).
-                extern void *process_current(void) __attribute__((weak));
+                // in text mode (exec hook is NULL there anyway). The decl
+                // comes from process.h (struct process*); redeclare weak so
+                // the text link (no definition) resolves it to NULL instead
+                // of failing.
+                extern struct process *process_current(void) __attribute__((weak));
                 if (process_current) {
                     uint32_t *pcb = (uint32_t*)process_current();
                     if (pcb) {
-                        uint32_t new_eip = pcb[8]; // user_eip
-                        uint32_t new_esp = pcb[7]; // user_esp
+                        uint32_t new_eip =
+                            pcb[offsetof(struct process, user_eip) / 4];
+                        uint32_t new_esp =
+                            pcb[offsetof(struct process, user_esp) / 4];
                         pushed[10] = new_eip;
                         pushed[13] = new_esp;
                     }
@@ -344,7 +352,7 @@ void isr_handler(int int_num) {
             // (0x08 = kernel fault vs 0x1B = user fault).
             uint32_t fpid = 0xFFFFFFFF;
             {
-                extern void *process_current(void) __attribute__((weak));
+                extern struct process *process_current(void) __attribute__((weak));
                 if (process_current) {
                     uint32_t *pcb = (uint32_t*)process_current();
                     if (pcb) fpid = pcb[0];
