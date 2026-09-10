@@ -594,7 +594,6 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  save      - force one file to disk\n");
         window_puts(win_id, "  locktest  - spinlock/mutex selftest\n");
         window_puts(win_id, "  ps        - list processes\n");
-        window_puts(win_id, "  usermode  - ring-3 test (use run /bin/hello)\n");
         window_puts(win_id, "  run       - run ELF program (/bin/*) [&]\n");
         window_puts(win_id, "  reboot    - reboot system\n");
         window_puts(win_id, "  shutdown  - power off\n");
@@ -889,54 +888,11 @@ static void shell_execute(int win_id, const char* input) {
         }
     }
     else if (str_eq(cmd_buf, "usermode")) {
-        // DEFERRED RING-3 ENTRY: never iret from inside the keyboard IRQ
-        // (the shell runs buried in its trap frame — parking there wedges the
-        // desktop: serial alive, screen/keyboard dead). Spawn a real process
-        // (private address space via sched_spawn_user), then ARM a main-loop
-        // pending flag carrying the PID; the main loop (plain ring-0 thread)
-        // prepares the space (CR3+ESP0) and performs the IRET next iteration.
-        // Ring 3 then runs on its own user stack; sys_exit resumes the main
-        // loop via user_exit_trampoline (full caller frame restore), which
-        // reaps the process and announces completion below.
-        extern volatile uint32_t user_entry_eip;
-        extern volatile uint32_t user_entry_esp;
-        extern volatile int user_entry_pending;
-        extern volatile int user_entry_pid;
-        if (syscall_can_exit || user_entry_pending) {
-            window_puts(win_id, "User mode already running.\n");
-        } else {
-        // user_test is position-independent (call/pop msg), so the image runs
-        // at 0x08048000 with the entry offset preserved. The spawn copies the
-        // FULL 4K source page (not just the 59B test): the msg tail (ebx+0x14)
-        // must land in the user page too.
-        extern void user_mode_test(void);
-        extern uint8_t* user_test_page_base(void);
-        extern uint32_t user_test_page_off(void);
-        extern uint32_t user_test_len(void);
-        uint32_t u_stack_top = 0xBFFFF000 + 4096;
-        uint32_t u_code = 0x08048000;
-        uint32_t test_len = user_test_len();
-        if (!test_len) test_len = 4096;
-        int pid = sched_spawn_user(user_test_page_base(), test_len,
-                                   u_code, u_stack_top);
-        if (pid < 0) {
-            window_puts(win_id, "usermode: out of memory\n");
-        } else {
-            struct process *up = process_get((uint32_t)pid);
-            serial_printf("[usermode] pid=%d code=%x stack=%x\n",
-                          pid, u_code, u_stack_top);
-            window_puts(win_id, "Entering user mode (ring 3)...\n");
-            syscall_can_exit = 1;
-            // Entry is u_code FLAT (spawn copied the image slice to page
-            // base — entry offset consumed at copy time, not at entry).
-            user_entry_eip = u_code;
-            user_entry_esp = u_stack_top;
-            user_entry_pid = pid;
-            if (up) { up->user_eip = user_entry_eip; up->user_esp = u_stack_top; }
-            user_entry_pending = 1;
-            window_puts(win_id, "User program starting.\n");
-        }
-        }
+        // Retired 2026-09-10: the legacy ring-3 smoke test (raw
+        // user_test image via sched_spawn_user) is superseded by
+        // `run /bin/hello` (ELF spawn through the entry drain,
+        // covered by tests/headless/test_sh_hello.py).
+        window_puts(win_id, "usermode retired; use run /bin/hello\n");
     }
     else if (str_eq(cmd_buf, "run")) {
         // run <path> [args...] [&]: spawn an ELF program from the VFS and
@@ -1223,17 +1179,11 @@ void kernel_main(uint32_t mboot_phys) {
                           sys_proc_fork, sys_proc_exec,
                           sys_proc_sbrk, sys_proc_pipe,
                           sys_proc_dup, sys_proc_wait,
-                          sys_proc_kill, sys_proc_mmap_anon);
-    // Ring-3 test image source for sched_spawn_user (page base + entry off).
-    {
-        extern void user_mode_test(void);
-        extern void user_mode_test_end(void);
-        uint32_t taddr = (uint32_t)user_mode_test;
-        uint32_t tend = (uint32_t)user_mode_test_end;
-        syscall_install_usertest((const uint8_t*)(taddr & 0xFFFFF000),
-                                 taddr & 0xFFF);
-        syscall_install_usertest_len(tend > taddr ? tend - taddr : 0);
-    }
+                           sys_proc_kill, sys_proc_mmap_anon);
+    // NOTE (retired 2026-09-10): the legacy user_test image staging
+    // (syscall_install_usertest*) lived here for sched_spawn_user; both are
+    // gone with the `usermode` command. Ring-3 entry now serves ELF spawns
+    // (run/init/fork) through the entry queue below.
     graphics_init(mboot_phys);
     window_init();
     fs_init();
@@ -1368,20 +1318,15 @@ void kernel_main(uint32_t mboot_phys) {
         // after the call (trampoline restores the caller frame:
         // EBP/ESI/EDI/ESP + segments): drain signals, unprepare, reap (or
         // leave zombies for wait()), announce, re-enable, loop on.
-        // Legacy single slot (usermode path) is drained first, then queued
-        // fork/spawn entries in order.
+        // (The legacy single-slot usermode path was retired 2026-09-10;
+        // only the queue remains.)
         for (;;) {
             uint32_t eip = 0, esp = 0;
             int pid = -1, win_id = -1, is_fork_child = 0;
-            if (user_entry_pending) {
-                eip = user_entry_eip; esp = user_entry_esp;
-                pid = user_entry_pid;
-                user_entry_pending = 0;
-                user_entry_pid = -1;
-            } else if (!entry_dequeue(&pid, &eip, &esp, &win_id)) {
+            if (!entry_dequeue(&pid, &eip, &esp, &win_id)) {
                 // queued entry (fork child or run-spawn)
             } else {
-                break; // queue + slot both empty
+                break; // queue empty
             }
             is_fork_child = (pid >= 0) ? sched_fork_take_child((uint32_t)pid) : 0;
             // EXITED-SKIP (2026-09-09: post-hello #PF err=0 cr2=0 eip=0 — a

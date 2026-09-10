@@ -2404,3 +2404,72 @@ fixed the night before.
 - Mock record order == seq order (encode in queue order).
 - Mock trust/clock/pin stores are cross-run globals: isolate modes that
   change identity, time, or trust (clear + per-mode clocks).
+
+---
+
+## Session 2026-09-10 (evening) — test_links green, usermode retired, resumption live
+
+### test_links: PASS 5/5 (harness-only fixes; kernel proven innocent twice)
+Bisect first: fails IDENTICALLY on base (same 737 blue-pixel count) → never
+the kernel. Three harness bugs, all stale-geometry class:
+1. **Dead-reckoning convergence.** `click_until` re-aimed from commanded
+   (not measured) deltas via `move()` — same gain error every retry, cursor
+   pinned (observed x=1199 vs target 1436 across all retries). Rewrote
+   closed-loop: click → read kernel `[mse]` press → correct residual →
+   repeat. Retries now converge geometrically.
+2. **Stale content cells.** Targets used 16x32; the grid is CONTENT_GW/GH =
+   12x24 (font_scale 1). Fixed in test_links, test_link_local, and
+   `okvm.click_link` (the shared primitive — also fixed its `c_row == row`
+   doc-vs-buffer confusion to `row + CHROME_ROWS`, gain 3.0 → 4.0, plus an
+   `expect_href` parameter that fails on WRONG-link hits instead of
+   compounding clicks in the wrong page).
+3. **Stale chrome geometry.** `plus_x` assumed 200px tabs; tabs cap at 300
+   (`nbx = 1318`, center 1334,81). Tab width animates on open (eases toward
+   target) — stable at 300 for 1–2 tabs, but wait out animations before
+   asserting chrome geometry in future tests.
+4. **CHROME-BOUNDS rewrote, not relaxed.** Old scan (y=126.., any blue)
+   sat INSIDE the 96px chrome and counted blue links + navy logo as bleed
+   (737 hits, deterministic). New: light-ramp pixels (gradient top half —
+   absent from links/logo, verified by PIL sampling) must be PRESENT in
+   the chrome band (positive control, 691 hits) and ABSENT just below it
+   (leak=0).
+5. **Test-logic bug:** NEWTAB awaited a SECOND "home rendered" that fires
+   once per tab (each extra click opened another tab). Now: button proof
+   (nav action=5) + "home rendered" already in log.
+Online proof: LINK HIT on example.com → `https parse: count=7` over real
+HTTPS. New `test_link_local.py`: full link-click loop against localhost
+fixture (offline-capable) — caught a REAL kernel bug below.
+
+### Kernel fix: resolve_href dropped :port
+Relative hrefs on `http://host:port/` resolved to `http://host/path`
+(port parsed then never re-emitted). Local link test exposed it
+(`...:8000/page2.html` → `:80`). Fixed (port captured + re-emitted in
+both absolute-path and relative branches). Covered by test_link_local.
+
+### usermode retired (Phase 6 exit)
+`run /bin/hello` + interactive sh proven by test_sh_hello (multiple green
+runs, no post-run crash since the offsetof fix). Removed: `usermode`
+command (→ "retired; use run /bin/hello" notice), boot staging block,
+legacy single-slot drain branch (queue only now), `sched_spawn_user`,
+syscall usertest staging + `user_entry_*` globals/decls, `src/user_test.asm`
++ Makefile obj. Kept: `syscall_can_exit` latch (run path), drain logs.
+Verified post-cut: sh_hello PASS, links 5/5 PASS, certfail PASS, both ISOs
+link with zero errors.
+
+### Resumption: live OFFER proven (github issues tickets)
+With WiFi back: github.com sends NSTs ("ticket stored"), refetch logs
+"offering PSK" → server takes the full-handshake fallback → page parses
+(RESUME PASS). Abbreviated-accept stays mock-proven (servers here ignore
+the offer; no cooperating host found). google sends no pre-close NSTs.
+New harness discipline: focus the terminal window (closed-loop click at
+(200,400)) before EVERY typed command — after any navigation, keystrokes
+land in the browser where 'g' (addr-bar hotkey) eats characters (observed:
+github.com → ithub.com → NXDOMAIN, misread as network failure).
+
+### Remaining
+- test_resume rapid re-okai parse miss (bytes arrive, no parse line) still
+  open — desktop fetch-owner race, out of crypto scope.
+- test_links LINK leg needs WiFi (mechanics covered offline by
+  test_link_local).
+- Next crypto: OCSP validation, pin override UX (both deferred, honestly
+  noted on the warning page), AES-GCM (excluded).

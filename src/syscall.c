@@ -24,13 +24,6 @@ struct entry_req {
 };
 static struct entry_req entry_queue[ENTRY_QUEUE_LEN];
 
-// Legacy single-slot staging (kept for the usermode path + text build).
-// New code should use entry_enqueue/entry_dequeue below.
-volatile uint32_t user_entry_eip = 0;
-volatile uint32_t user_entry_esp = 0;
-volatile int user_entry_pending = 0;
-volatile int user_entry_pid = -1;
-
 // Enqueue a ring-3 entry request. Returns 0 on success, -1 when full.
 int entry_enqueue(int pid, uint32_t eip, uint32_t esp, int win_id) {
     for (int i = 0; i < ENTRY_QUEUE_LEN; i++) {
@@ -61,29 +54,14 @@ int entry_dequeue(int *pid, uint32_t *eip, uint32_t *esp, int *win_id) {
     return -1;
 }
 
-// 1 when any entry request is pending (queue or legacy slot).
+// 1 when any entry request is pending (queue only; the legacy single slot
+// was retired with the `usermode` command 2026-09-10).
 int entry_pending_any(void) {
-    if (user_entry_pending) return 1;
     for (int i = 0; i < ENTRY_QUEUE_LEN; i++) {
         if (entry_queue[i].used) return 1;
     }
     return 0;
 }
-
-// Kernel copy of the ring-3 test image's source page + entry offset + len.
-// desktop.c installs these at boot (needs the linked user_mode_test symbol;
-// syscall.c is COMMON so it cannot reference it directly).
-static const uint8_t *user_test_src_page = 0;
-static uint32_t user_test_src_off = 0;
-static uint32_t user_test_src_len = 0;
-void syscall_install_usertest(const uint8_t *page, uint32_t off) {
-    user_test_src_page = page;
-    user_test_src_off = off;
-}
-void syscall_install_usertest_len(uint32_t len) { user_test_src_len = len; }
-uint8_t* user_test_page_base(void) { return (uint8_t*)user_test_src_page; }
-uint32_t user_test_page_off(void) { return user_test_src_off; }
-uint32_t user_test_len(void) { return user_test_src_len; }
 
 // Drain-side pid stash: the main-loop drain writes pid here BEFORE the IRET
 // (ring-0 thread context, live locals) and reads it back AFTER the trampoline

@@ -268,12 +268,25 @@ static void okai_resolve_href(struct okai* b, const char* href, char* out, int o
     char host[128]; int hi = 0;
     while (*p && *p != '/' && *p != ':' && hi < 127) host[hi++] = *p++;
     host[hi] = 0;
+    // Preserve a numeric :port suffix (bisected 2026-09-10: relative hrefs
+    // on http://host:port/ dropped the port and fetched :80 instead).
+    char port[8]; int pi = 0;
+    if (*p == ':') {
+        p++;
+        while (*p >= '0' && *p <= '9' && pi < 7) port[pi++] = *p++;
+    }
+    port[pi] = 0;
 
     const char* scheme = T->is_https ? "https://" : "http://";
     int i = 0;
     while (scheme[i] && i < outlen - 1) { out[i] = scheme[i]; i++; }
     int j = 0;
     while (host[j] && i < outlen - 1) { out[i] = host[j]; i++; j++; }
+    if (pi > 0) {
+        if (i < outlen - 1) out[i++] = ':';
+        int q = 0;
+        while (port[q] && i < outlen - 1) { out[i] = port[q]; i++; q++; }
+    }
 
     if (href[0] == '/') {
         int k = 0;

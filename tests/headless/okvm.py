@@ -155,18 +155,24 @@ class OkVM:
         self.mon("mouse_button 1", 0.22)
         self.mon("mouse_button 0", 0.35)
 
-    def click_link(self, row, col0, col1, max_iters=20):
+    def click_link(self, row, col0, col1, max_iters=20, expect_href=None):
         """CLOSED-LOOP link click: click, read the kernel-reported coordinates
         from serial, correct with a burst, repeat until inside the region.
         This is the single most reliable way to click anything in okernel.
-        Returns True if a `[okai] LINK HIT` line appears."""
+        Geometry (verified 2026-09-10 against the kernel hit-test): content
+        cells are CONTENT_GW x CONTENT_GH = 12x24 px (font_scale 1);
+        serial link rows are DOC rows, the hit-test uses BUFFER rows
+        (doc + CHROME_ROWS(3), scroll 0). expect_href (exact logged href)
+        rejects WRONG-link hits: any hit for another href returns False
+        immediately instead of compounding clicks in the new page.
+        Returns True iff the expected HIT appears (or any HIT when
+        expect_href is None)."""
         # content origin: FIRST okai window at (1010,60), no_titlebar, so the
-        # content grid starts at y+2 (serial link rows are DOC rows; the click
-        # hit-test uses BUFFER rows = doc + CHROME_ROWS(3))
+        # content grid starts at x+2/y+2 (border).
         ox, oy = 1012, 62
         tcol = (col0 + col1) // 2
-        tx = ox + tcol * 16 + 8
-        ty = oy + (row + 3) * 32 + 16  # +CHROME_ROWS for the reserved chrome
+        tx = ox + tcol * 12 + 6
+        ty = oy + (row + 3) * 24 + 12  # +CHROME_ROWS for the reserved chrome
         # Baseline LINK HIT count: stop at the FIRST hit. Verifying via a
         # later click leaves the cursor over the NEW window's links, where
         # stray confirmation clicks navigate again and pollute the lifecycle.
@@ -176,17 +182,19 @@ class OkVM:
             self.click()
             time.sleep(0.6)
             if self.serial().count("[okai] LINK HIT") > hits0:
-                return True
+                if expect_href is None:
+                    return True
+                return expect_href in self.serial()
             clicks = self.click_lines()
             if len(clicks) <= before:
                 continue  # click not registered (shouldn't happen)
             c_row, c_col, mx, my = clicks[-1]
-            if c_row == row and col0 <= c_col <= col1:
+            if c_row == row + 3 and col0 <= c_col <= col1:
                 time.sleep(1)
                 return "[okai] LINK HIT" in self.serial()
             dx, dy = tx - mx, ty - my
-            bx = max(-60, min(60, int(dx / 3.0)))
-            by = max(-60, min(60, int(dy / 3.0)))
+            bx = max(-60, min(60, int(dx / 4.0)))
+            by = max(-60, min(60, int(dy / 4.0)))
             if bx == 0 and abs(dx) > 6: bx = 1 if dx > 0 else -1
             if by == 0 and abs(dy) > 6: by = 1 if dy > 0 else -1
             self.burst(bx, by)

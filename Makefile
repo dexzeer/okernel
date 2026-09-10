@@ -39,7 +39,7 @@ TEXT_OBJ = src/vga.o src/shell.o src/terminal.o
 # fresh forktest never reached the ISO).
 USERLAND_GEN = $(wildcard userland/gen_*.h)
 src/userland_seed.o: $(USERLAND_GEN)
-DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/html.o src/css.o src/user_test.o \
+DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/html.o src/css.o \
               src/font_data.o \
               src/js/js_os.o src/js/js_var.o src/js/js_lex.o src/js/js_parse.o src/js/js_funcs.o src/js/js_math.o src/js/js_dom.o \
              src/crypto/sha256.o src/crypto/hmac.o src/crypto/hkdf.o \

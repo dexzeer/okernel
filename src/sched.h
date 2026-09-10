@@ -17,13 +17,6 @@ void sched_tick(void);
 // Voluntarily give up the rest of the time slice (sys_yield path).
 void sched_yield(void);
 
-// Spawn a user program as a process: allocates PCB + private address space,
-// maps the code/stack pages user-accessible IN THAT SPACE, copies the image,
-// and marks it READY. Returns pid or -1. Does NOT enter ring 3 itself —
-// entry goes through the main-loop drain (prepare + IRET), same as ELF spawn.
-int sched_spawn_user(const uint8_t *img, uint32_t img_len,
-                     uint32_t u_code, uint32_t u_stack_top);
-
 // Spawn an ELF program from a VFS path as a process: allocates PCB + private
 // address space, loads PT_LOAD segments + fresh user stack IN THAT SPACE,
 // builds argc/argv/env on the user stack, marks READY. Returns pid or -1.
