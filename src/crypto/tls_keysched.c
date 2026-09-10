@@ -10,17 +10,23 @@ void tls_hkdf_expand_label(const uint8_t secret[32],
     // HkdfLabel = length(2) || label_len(1) || "tls13 " + label ||
     //             context_len(1) || context
     // (RFC 8446 §7.1: <7..255> means 1-byte length-prefixed vector)
+    // BOUNDS (review 2026-09-10 #7): the old code clamped the label-length
+    // BYTE while writing fewer bytes (lying prefix) and memcpy'd a full
+    // uint32_t context_len into info[256] (stack smash past ~240B). Refuse
+    // loudly instead: zero the output so no caller proceeds on garbage.
     uint8_t info[256];
+    uint32_t label_len = strlen(label);
+    if (6 + label_len > 255 || context_len > 255 ||
+        2 + 1 + 6 + label_len + 1 + context_len > sizeof(info)) {
+        for (uint32_t i = 0; i < out_len; i++) out[i] = 0;
+        return;
+    }
     uint32_t p = 0;
     info[p++] = (uint8_t)(out_len >> 8);
     info[p++] = (uint8_t)(out_len & 0xff);
     static const char prefix[] = "tls13 ";
-    uint32_t full_label_len = 6 + strlen(label);
-    if (full_label_len > 255) full_label_len = 255; // safety
-    info[p++] = (uint8_t)full_label_len;
+    info[p++] = (uint8_t)(6 + label_len);
     memcpy(info + p, prefix, 6); p += 6;
-    uint32_t label_len = strlen(label);
-    if (label_len > 200) label_len = 200;
     memcpy(info + p, label, label_len); p += label_len;
     info[p++] = (uint8_t)context_len;
     if (context_len > 0) memcpy(info + p, context, context_len);

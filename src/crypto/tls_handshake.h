@@ -21,6 +21,8 @@
 #define TLS_EXT_SUPPORTED_VERSIONS         43
 #define TLS_EXT_KEY_SHARE                  51
 #define TLS_EXT_PSK_KEY_EXCHANGE_MODES     45
+#define TLS_EXT_PRE_SHARED_KEY             41
+#define TLS_EXT_STATUS_REQUEST             5
 
 // Named groups.
 #define TLS_GROUP_X25519 0x001D
@@ -60,6 +62,11 @@ int tls_ext_append_sni(uint8_t* buf, uint32_t cap, uint32_t* pos,
                       const char* hostname);
 int tls_ext_append_alpn_http11(uint8_t* buf, uint32_t cap, uint32_t* pos);
 int tls_ext_append_psk_key_exchange_modes(uint8_t* buf, uint32_t cap, uint32_t* pos);
+// status_request (RFC 8446 §4.2.2.1.1, empty OCSP form): advertises that we
+// accept a stapled OCSP response. Servers that staple answer with a
+// CertificateStatus message we parse (and currently note, not enforce —
+/// see tls_client.c RECV_BODY).
+int tls_ext_append_status_request(uint8_t* buf, uint32_t cap, uint32_t* pos);
 
 // ---- ClientHello builder ----
 // Fills `out` with a complete handshake message: type(1) || len(3) || body.
@@ -108,11 +115,62 @@ int tls_parse_certificate(const uint8_t* cert_body, uint32_t cert_len);
 // signature (2B-len-prefixed). Returns 0 on success, -1 on malformed.
 int tls_parse_certificate_verify(const uint8_t* cv_body, uint32_t cv_len);
 
+// OCSP staple presence in CertificateEntry extensions (RFC 8446 §4.4.2.1).
+// *present_out = 1 iff any entry carries a well-formed status_request.
+// Returns 0 on valid framing, -1 on malformed. Content unenforced (noted).
+int tls_cert_has_staple(const uint8_t* cert, uint32_t cert_len,
+                        int* present_out);
+
 // Extract the CertificateVerify signature algorithm + raw signature bytes
 // (for cryptographic verification against the leaf key: ec.c / rsa.c).
 // Returns 0 on success; `sig` points into `cv_body`.
 int tls_parse_cv_sig(const uint8_t* cv_body, uint32_t cv_len, uint16_t* alg,
                      const uint8_t** sig, uint32_t* sig_len);
+
+// ---- NewSessionTicket (RFC 8446 §4.6.1, post-handshake) ----
+//   ticket_lifetime(4) || ticket_age_add(4) || nonce(u8 len + 0..255) ||
+//   ticket(u16 len + opaque) || extensions(u16 len + bytes).
+// Views point into `body` (caller copies what it keeps). Extensions are
+// bounds-checked but otherwise ignored (early-data indication included).
+// Returns 0 on success, -1 on malformed.
+struct tls_nst {
+    uint32_t lifetime;       // seconds the ticket is valid for resumption
+    uint32_t age_add;        // obfuscation addend for ticket_age
+    const uint8_t* nonce; uint32_t nonce_len;
+    const uint8_t* ticket; uint32_t ticket_len;
+};
+int tls_parse_nst(const uint8_t* body, uint32_t bl, struct tls_nst* out);
+
+// Scan a ServerHello body for the pre_shared_key extension (sent iff the
+// server accepted our PSK offer). Returns 0 (accepted, identity 0), -1
+// (absent — clean fallback to the full handshake), -2 (present but
+// malformed or a foreign identity — attack, must abort).
+int tls_parse_sh_psk(const uint8_t* sh_body, uint32_t sh_len);
+
+// ---- PSK key material (RFC 8446 §4.2.11 / §7.1) ----
+// PSK = HKDF-Expand-Label(resumption_master, "resumption", ticket_nonce, 32).
+void tls_resumption_psk(const uint8_t res_master[32],
+                        const uint8_t* nonce, uint32_t nonce_len,
+                        uint8_t out_psk[32]);
+// binder key = HKDF-Expand-Label(early_secret, "res binder", "", 32)
+// (resumption PSKs always use the "res binder" label, never "ext binder").
+void tls_psk_binder_key(const uint8_t early_secret[32], uint8_t out[32]);
+
+// Builds a ClientHello identical to tls_build_client_hello plus a trailing
+// pre_shared_key extension (single identity + 32B binder). `binder` is
+// copied verbatim (caller passes 32 zero bytes, computes the real binder
+// over the truncated message, then patches st->ch at *binder_off_out).
+// Returns total bytes, 0 on overflow. See tls_client.c SEND_CH for the
+// binder computation (RFC 8446 §4.2.11.2).
+uint32_t tls_build_client_hello_psk(uint8_t* out, uint32_t cap,
+                                    const uint8_t random32[32],
+                                    const uint8_t session_id[32],
+                                    const uint8_t x25519_pub[32],
+                                    const char* hostname,
+                                    const uint8_t* ticket, uint32_t ticket_len,
+                                    uint32_t age_obf,
+                                    const uint8_t binder[32],
+                                    uint32_t* binder_off_out);
 
 // Verify the server's Finished MAC.
 // `transcript_hash` is SHA-256 of all handshake messages up to (but NOT

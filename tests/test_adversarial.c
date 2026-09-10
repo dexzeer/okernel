@@ -18,6 +18,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #include "tls_client.h"
 #include "tls_record.h"
@@ -165,7 +166,7 @@ static void fuzz_section(void) {
         else if (r == CV_ERR_PARSE) by_parse++;
         else if (r == CV_ERR_CHAIN) by_chain++;
         else if (r == CV_ERR_ROOT) by_root++;
-        else if (r > CV_OK && r <= CV_ERR_NO_CERT) by_other++;
+        else if (r > CV_OK && r <= CV_ERR_MAX) by_other++;
         else bad_code++;
     }
     printf("    %d mutations: rejected=%d accepted=%d (parse=%d chain=%d root=%d other=%d)\n",
@@ -180,7 +181,7 @@ static void fuzz_section(void) {
         for (uint32_t i = 0; i < gl; i++) mut[i] = (uint8_t)(NEXT32() & 0xff);
         int r = cert_verify(mut, gl, "example.com");
         if (r == CV_OK) g_bad++;
-        if (r < CV_OK || r > CV_ERR_NO_CERT) bad_code++;
+        if (r < CV_OK || r > CV_ERR_MAX) bad_code++;
     }
     CHECK(g_bad == 0, "no random garbage verifies");
     CHECK(bad_code == 0, "no garbage produces an out-of-range code");
@@ -227,6 +228,16 @@ enum mock_mode {
     MOCK_RECORD_OVERFLOW,
     MOCK_SPLIT,        // valid flight, server dribbles 7B/recv (rec_have path)
     MOCK_TRUNCATED,    // flight cut short mid-record (must ERR, never hang)
+    MOCK_SH_FLIPPED,   // SH random byte flipped (transcript fork: must ERR)
+    MOCK_EE_FLIPPED,   // EE body byte flipped (transcript fork: must ERR)
+    MOCK_NST,          // valid flight + NewSessionTicket + body (ticket stored)
+    MOCK_NST_BAD,      // corrupt ticket (must ERR, nothing stored)
+    MOCK_PSK_ACCEPT,   // offer verified (binder) + abbreviated flight (DONE)
+    MOCK_PSK_FALLBACK, // offer ignored, full flight (DONE via fallback)
+    MOCK_PSK_FOREIGN,  // server selects unoffered identity (must ERR)
+    MOCK_CV_PKCS1,     // RSA PKCS#1 v1.5 CV (RFC-forbidden, must ERR)
+    MOCK_STAPLE,       // stapled status_request noted, flight completes
+    MOCK_STAPLE_BAD,   // malformed staple (must ERR)
     MOCK_COUNT
 };
 
@@ -237,6 +248,29 @@ struct mock_result {
     uint32_t out_len;
     uint8_t out[4096];
 };
+
+// Clocks derived from the TEST PKI mtimes (gen_pki.sh stamps notBefore at
+// generation time): normal = leaf mtime + 2h (inside every 3650-day
+// window), expired-case = expired-leaf mtime + 2 days (past its 1-day
+// notAfter). Fixed calendar dates rot on every regen and red the whole
+// suite (bisected 2026-09-10: notBefore=Sep-10 vs clock Sep-09); mtimes
+// never rot. Falls back to 2026-09-10 when stat fails.
+static void adv_clocks(x509_time* normal, x509_time* expired) {
+    time_t base = 0, expb = 0;
+    struct stat st;
+    if (stat("tests/adversarial/at_leaf.der", &st) == 0) base = st.st_mtime;
+    if (stat("tests/adversarial/at_leaf_expired.der", &st) == 0) expb = st.st_mtime;
+    time_t tn = base ? base + 7200 : 1780272000;   // ~2026-09-10
+    time_t te = expb ? expb + 172800 : 1780444800; // ~gen+2d
+    struct tm* g = gmtime(&tn);
+    normal->year = 1900 + g->tm_year; normal->month = g->tm_mon + 1;
+    normal->day = g->tm_mday; normal->hour = g->tm_hour;
+    normal->minute = g->tm_min; normal->second = g->tm_sec;
+    g = gmtime(&te);
+    expired->year = 1900 + g->tm_year; expired->month = g->tm_mon + 1;
+    expired->day = g->tm_mday; expired->hour = g->tm_hour;
+    expired->minute = g->tm_min; expired->second = g->tm_sec;
+}
 
 // mock state needed by the lazy body path
 struct mtrans { tls_transcript t; };
@@ -255,6 +289,18 @@ static uint32_t g_sfin_len;
 static int g_body_queued;
 static int g_expect_body;
 static int g_mode;
+// Cross-run resumption truth (MOCK_NST → MOCK_PSK_*): the ticket bytes the
+// mock issued plus the resumption master it independently derived (same
+// inputs as the client: full key schedule + both-fin transcript). Lets the
+// ACCEPT mock verify the offered binder with no shared secrets beyond the
+// protocol itself.
+static uint8_t psv_ticket[64]; static uint32_t psv_ticket_len;
+static uint8_t psv_nonce[16]; static uint32_t psv_nonce_len;
+static uint8_t psv_res_master[32]; static int psv_have;
+// Set when the mock sends the abbreviated (EE+Finished, no cert) flight.
+static int g_abbrev;
+// Last run's staple flag (client state), for the STAPLE CHECKs.
+static int g_staple_seen;
 
 static int mock_recv(uint8_t* out, uint32_t cap, uint32_t timeout_ms, void* user);
 static int mock_send(const uint8_t* buf, uint32_t len, void* user);
@@ -348,7 +394,22 @@ static int try_queue_body(const uint8_t* resp, uint32_t resp_len) {
     mtrans_msg(&g_mt, TLS_HS_FINISHED, g_sfin_msg + 4, g_sfin_len - 4);
     uint8_t tx_pre_cfin[32];
     mtrans_hash(&g_mt, tx_pre_cfin);
-    mtrans_msg(&g_mt, TLS_HS_FINISHED, fin_pt + 5, 32);
+    mtrans_msg(&g_mt, TLS_HS_FINISHED, fin_pt + 4, 32);
+    // Resumption truth for the later PSK modes: resumption_master over the
+    // both-Finished transcript (g_mt now holds exactly CH..cFin), saved iff
+    // this run issued the ticket the client will offer back.
+    if (g_mode == MOCK_NST) {
+        uint8_t tx_both[32], derived2[32], master[32];
+        mtrans_hash(&g_mt, tx_both);
+        tls_derive_secret(g_hs_secret, derived2);
+        tls_master_secret(derived2, master);
+        tls_traffic_secret(master, "res master", tx_both, psv_res_master);
+        for (int i = 0; i < 32; i++) psv_ticket[i] = (uint8_t)(0xA0 + i);
+        psv_ticket_len = 32;
+        for (int i = 0; i < 8; i++) psv_nonce[i] = (uint8_t)(0xC0 + i);
+        psv_nonce_len = 8;
+        psv_have = 1;
+    }
 
     uint8_t derived2[32], master[32];
     tls_derive_secret(g_hs_secret, derived2);
@@ -359,6 +420,33 @@ static int try_queue_body(const uint8_t* resp, uint32_t resp_len) {
     g_s_ap_seq = 0;
 
     static uint8_t rec[16500];
+    // NST modes: encode + queue the ticket record FIRST (seq 0) so record
+    // sequence numbers match queue order (body follows at seq 1).
+    if (g_mode == MOCK_NST || g_mode == MOCK_NST_BAD) {
+        static uint8_t nst[128];
+        uint32_t np = 0;
+        nst[np++] = 0; nst[np++] = 0; nst[np++] = 0; nst[np++] = 40; // hs header placeholder
+        nst[np++] = 0; nst[np++] = 0; nst[np++] = 0x0e; nst[np++] = 0x10; // lifetime 3600
+        nst[np++] = 0x12; nst[np++] = 0x34; nst[np++] = 0x56; nst[np++] = 0x78; // age_add
+        nst[np++] = 8; for (int i = 0; i < 8; i++) nst[np++] = (uint8_t)(0xC0 + i); // nonce
+        nst[np++] = 0; nst[np++] = 32; for (int i = 0; i < 32; i++) nst[np++] = (uint8_t)(0xA0 + i); // ticket
+        nst[np++] = 0; nst[np++] = 0; // no extensions
+        // Fix the handshake header: type NST(4), body len = np - 4.
+        nst[0] = TLS_HS_NEW_SESSION_TICKET;
+        uint32_t nbl = np - 4;
+        nst[1] = (uint8_t)((nbl >> 16) & 0xff);
+        nst[2] = (uint8_t)((nbl >> 8) & 0xff);
+        nst[3] = (uint8_t)(nbl & 0xff);
+        // NST_BAD: zero the ticket_len (valid framing, empty ticket — the
+        // parser must reject; ticket_len sits at 4(hs)+4+4+1+8 = offset 21).
+        if (g_mode == MOCK_NST_BAD) { nst[4 + 17] = 0; nst[4 + 18] = 0; }
+        // NOTE: separate record buffer — rec is used for the body below.
+        static uint8_t nrec[16500];
+        uint32_t nrl = enc_record(nrec, sizeof(nrec), g_s_ap_key, g_s_ap_iv,
+                                  &g_s_ap_seq, TLS_CT_HANDSHAKE, nst, np);
+        if (nrl == 0) { printf("    [tqb] NST enc_record returned 0\n"); return 0; }
+        q_put(nrec, nrl);
+    }
     uint32_t rl = enc_record(rec, sizeof(rec), g_s_ap_key, g_s_ap_iv,
                              &g_s_ap_seq, TLS_CT_APPDATA, resp, resp_len);
     if (rl == 0) { printf("    [tqb] enc_record returned 0\n"); return 0; }
@@ -502,9 +590,120 @@ static const char* mode_name(int m) {
         "CV_GARBAGE_TRANSCRIPT", "HOSTNAME_MISMATCH", "EXPIRED", "KEYSHARE_SWAP",
         "CIPHER_1302", "SID_BAD", "NO_KEYSHARE", "NO_CV", "DUP_EE",
         "FIN_FLIPPED", "ALERT", "APPDATA_BITFLIP", "CLOSE_NOTIFY",
-        "GARBAGE_FIRST", "RECORD_OVERFLOW", "SPLIT", "TRUNCATED"
+        "GARBAGE_FIRST", "RECORD_OVERFLOW", "SPLIT", "TRUNCATED",
+        "SH_FLIPPED", "EE_FLIPPED", "NST", "NST_BAD",
+        "PSK_ACCEPT", "PSK_FALLBACK", "PSK_FOREIGN", "CV_PKCS1",
+        "STAPLE", "STAPLE_BAD"
     };
     return names[m];
+}
+
+// Parse the client's offered pre_shared_key (last CH extension): extracts
+// the identity bytes + binder, and INDEPENDENTLY recomputes the expected
+// binder (separate truncation code from the client's: parse-driven, not
+// offset arithmetic). Returns 1 iff identity == psv_ticket AND the binder
+// verifies under psv_res_master. Anything else (absent/malformed/mismatch)
+// returns 0 — the mock must then ignore (fallback) or abort per mode.
+static int mock_check_psk_offer(void) {
+    if (!psv_have) return 0;
+    if (c_len < 5 + 4) return 0;
+    uint32_t ch_rplen = ((uint32_t)c_buf[3] << 8) | c_buf[4];
+    if (c_buf[0] != TLS_CT_HANDSHAKE || 5 + ch_rplen > c_len) return 0;
+    if (c_buf[5] != TLS_HS_CLIENT_HELLO) return 0;
+    uint32_t body_len = ((uint32_t)c_buf[6] << 16) |
+                        ((uint32_t)c_buf[7] << 8) | c_buf[8];
+    if (5 + 4 + body_len > c_len || body_len < 34) return 0;
+    const uint8_t* body = c_buf + 9;
+    // Walk to extensions: ver(2) random(32) sid(u8+n) ciphers(u16+n)
+    // comp(u8+n) ext_total(u16).
+    uint32_t p = 2 + 32;
+    if (p + 1 > body_len) return 0;
+    p += 1 + body[p];
+    if (p + 2 > body_len) return 0;
+    p += 2 + ((body[p] << 8) | body[p+1]);
+    if (p + 1 > body_len) return 0;
+    p += 1 + body[p];
+    if (p + 2 > body_len) return 0;
+    uint32_t ext_total = (body[p] << 8) | body[p+1]; p += 2;
+    uint32_t eend = p + ext_total;
+    if (eend > body_len) return 0;
+    const uint8_t* id = NULL; uint32_t id_len = 0;
+    const uint8_t* binder = NULL;
+    while (p + 4 <= eend) {
+        uint16_t et = (uint16_t)((body[p] << 8) | body[p+1]);
+        uint16_t l = (uint16_t)((body[p+2] << 8) | body[p+3]);
+        p += 4;
+        if (p + l > eend) return 0;
+        if (et == 41) { // pre_shared_key (last ext by construction)
+            if (l < 2 + 2 + 4 + 2 + 32) return 0;
+            uint32_t q = p;
+            uint32_t list_len = (body[q] << 8) | body[q+1]; q += 2;
+            uint32_t ilen = (body[q] << 8) | body[q+1]; q += 2;
+            if (2 + ilen + 4 > list_len) return 0;
+            id = body + q; id_len = ilen; q += ilen + 4; // skip age
+            if (q + 2 > p + l) return 0;
+            uint32_t blen = (body[q] << 8) | body[q+1]; q += 2;
+            if (blen != 32 || q + 32 > p + l) return 0;
+            binder = body + q;
+        }
+        p += l;
+    }
+    if (!id || !binder || id_len != psv_ticket_len) return 0;
+    for (uint32_t i = 0; i < id_len; i++)
+        if (id[i] != psv_ticket[i]) return 0;
+    // Independent binder recompute: ClientHello1 = type || len(trunc) ||
+    // body[:trunc], trunc through the binders-length field (binder = last
+    // 32B of the message body).
+    uint32_t trunc = body_len - 32;
+    uint8_t psk[32], early[32], bkey[32], th[32], want[32];
+    tls_resumption_psk(psv_res_master, psv_nonce, psv_nonce_len, psk);
+    tls_early_secret(psk, 32, early);
+    tls_psk_binder_key(early, bkey);
+    {
+        tls_transcript t;
+        tls_transcript_init(&t);
+        uint8_t hdr[4];
+        hdr[0] = TLS_HS_CLIENT_HELLO;
+        hdr[1] = (uint8_t)((trunc >> 16) & 0xff);
+        hdr[2] = (uint8_t)((trunc >> 8) & 0xff);
+        hdr[3] = (uint8_t)(trunc & 0xff);
+        tls_transcript_update(&t, hdr, 4);
+        tls_transcript_update(&t, body, trunc);
+        tls_transcript_final(&t, th);
+    }
+    hmac_sha256(bkey, 32, th, 32, want);
+    for (int i = 0; i < 32; i++)
+        if (want[i] != binder[i]) return 0;
+    return 1;
+}
+
+// Patch the first CertificateEntry of a built Certificate message body to
+// carry a status_request extension (RFC 8446 §4.4.2.1): type 5, body
+// type=ocsp(1) + 1-byte dummy response. bad != 0 makes the inner length
+// lie (claims 8, holds 5). Returns the new message length (list_len fixed
+// up), 0 on internal error.
+static uint32_t staple_patch(uint8_t* msg, uint32_t cap, uint32_t len, int bad) {
+    static const uint8_t ext_good[] =
+        { 0x00,0x09, 0x00,0x05, 0x00,0x05, 0x01, 0x00,0x00,0x01, 0xAA };
+    static const uint8_t ext_bad[] =
+        { 0x00,0x09, 0x00,0x05, 0x00,0x14, 0x01, 0x00,0x00, 0xAA, 0xAA };
+    const uint8_t* ext = bad ? ext_bad : ext_good;
+    if (len < 1 + 3 + 3 + 2 || len + 9 > cap) return 0;
+    uint32_t list_len = ((uint32_t)msg[1] << 16) |
+                        ((uint32_t)msg[2] << 8) | msg[3];
+    uint32_t cert_len = ((uint32_t)msg[4] << 16) |
+                        ((uint32_t)msg[5] << 8) | msg[6];
+    uint32_t eoff = 4 + 3 + cert_len; // ext_len field of entry 0
+    if (eoff + 2 > len || msg[eoff] != 0 || msg[eoff+1] != 0) return 0;
+    // Replace the 2-byte empty ext block with the 11-byte staple block:
+    // tail shifts right by 9 (11 - 2).
+    memmove(msg + eoff + 11, msg + eoff + 2, len - (eoff + 2));
+    memcpy(msg + eoff, ext, 11);
+    list_len += 9;
+    msg[1] = (uint8_t)((list_len >> 16) & 0xff);
+    msg[2] = (uint8_t)((list_len >> 8) & 0xff);
+    msg[3] = (uint8_t)(list_len & 0xff);
+    return len + 9;
 }
 
 static void mock_run(int mode, struct mock_result* res) {
@@ -512,6 +711,8 @@ static void mock_run(int mode, struct mock_result* res) {
     g_mode = mode;
     g_body_queued = 0;
     g_expect_body = 0;
+    g_abbrev = 0;
+    g_staple_seen = 0;
 
     static int loaded = 0;
     static uint8_t leaf_der[4096], root_der[4096];
@@ -550,16 +751,14 @@ static void mock_run(int mode, struct mock_result* res) {
     tls_state_init(&st, "evil.example.com", 443,
                    (const uint8_t*)req, (uint32_t)(sizeof(req) - 1),
                    res->out, sizeof(res->out));
+    tls_state_set_now_ms(&st, 1000000); // exercise the ticket-age clock path
     if (mode == MOCK_HOSTNAME_MISMATCH) verify_host = "example.com";
     st.verify_host = verify_host;
 
     {
-        x509_time n;
-        if (mode == MOCK_EXPIRED) {
-            n.year = 2026; n.month = 9; n.day = 12; n.hour = 0; n.minute = 0; n.second = 0;
-        } else {
-            n.year = 2026; n.month = 9; n.day = 9; n.hour = 23; n.minute = 0; n.second = 0;
-        }
+        x509_time n, nx;
+        adv_clocks(&n, &nx);
+        if (mode == MOCK_EXPIRED) n = nx;
         x509_set_now(&n);
     }
 
@@ -588,7 +787,16 @@ static void mock_run(int mode, struct mock_result* res) {
     uint8_t shared[32];
     x25519_shared_secret(shared, srv_priv, client_pub);
     uint8_t early[32], derived[32];
-    tls_early_secret(NULL, 0, early);
+    // PSK_ACCEPT runs on the resumption-derived early secret (same inputs
+    // as the client: saved resumption master + ticket nonce). Everything
+    // else uses the zero early secret (plain 1-RTT).
+    if (mode == MOCK_PSK_ACCEPT && psv_have) {
+        uint8_t mpsk[32];
+        tls_resumption_psk(psv_res_master, psv_nonce, psv_nonce_len, mpsk);
+        tls_early_secret(mpsk, 32, early);
+    } else {
+        tls_early_secret(NULL, 0, early);
+    }
     tls_derive_secret(early, derived);
     tls_handshake_secret(derived, shared, g_hs_secret);
 
@@ -618,6 +826,22 @@ static void mock_run(int mode, struct mock_result* res) {
         x25519_public_key(srv_pub_B, srv_priv_B);
         memcpy(sh_body + sp - 32, srv_pub_B, 32);
     }
+    // PSK modes: ServerHello carries pre_shared_key (identity 0 = accept,
+    // 1 = foreign selection the client must refuse). ACCEPT requires a
+    // verified offer (independent binder recompute); a bad binder aborts
+    // into the alert path below (client ERRs — the math proof by
+    // contradiction).
+    int psk_ok = 0;
+    if (mode == MOCK_PSK_ACCEPT) psk_ok = mock_check_psk_offer();
+    if (mode == MOCK_PSK_ACCEPT && psk_ok) {
+        sh_body[sp++] = 0x00; sh_body[sp++] = 0x29;   // pre_shared_key
+        sh_body[sp++] = 0x00; sh_body[sp++] = 0x02;
+        sh_body[sp++] = 0x00; sh_body[sp++] = 0x00;   // selected_identity 0
+    } else if (mode == MOCK_PSK_FOREIGN) {
+        sh_body[sp++] = 0x00; sh_body[sp++] = 0x29;
+        sh_body[sp++] = 0x00; sh_body[sp++] = 0x02;
+        sh_body[sp++] = 0x00; sh_body[sp++] = 0x01;   // foreign identity
+    }
     if (mode == MOCK_NO_KEYSHARE) sp = ext_len_pos + 2 + 6; // keep only the 6-byte supported_versions ext
     uint32_t ext_total = sp - ext_len_pos - 2;
     sh_body[ext_len_pos] = (uint8_t)(ext_total >> 8);
@@ -628,6 +852,13 @@ static void mock_run(int mode, struct mock_result* res) {
     sh_msg[1] = 0; sh_msg[2] = (uint8_t)(sp >> 8); sh_msg[3] = (uint8_t)(sp & 0xff);
     memcpy(sh_msg + 4, sh_body, sp);
     uint32_t sh_msg_len = 4 + sp;
+    // SH_FLIPPED (wire-only MITM tamper): the mock's transcript/keys use the
+    // ORIGINAL SH, but the client RECEIVES a flipped server-random. Both
+    // sides parse fine; the transcripts fork → flight keys diverge → the
+    // encrypted flight fails MAC. Must ERR, never DONE.
+    uint8_t sh_wire[200];
+    memcpy(sh_wire, sh_msg, sh_msg_len);
+    if (mode == MOCK_SH_FLIPPED) sh_wire[4 + 2 + 3] ^= 0x01;
 
     mtrans_init(&g_mt);
     mtrans_msg(&g_mt, TLS_HS_CLIENT_HELLO, c_buf + 9, c_len - 9);
@@ -646,10 +877,20 @@ static void mock_run(int mode, struct mock_result* res) {
 
     uint8_t rec[16500];
     uint64_t s_seq = 0;
-    uint32_t rl = plain_record(rec, TLS_CT_HANDSHAKE, sh_msg, sh_msg_len);
+    uint32_t rl = plain_record(rec, TLS_CT_HANDSHAKE, sh_wire, sh_msg_len);
     q_put(rec, rl);
 
-    if (mode == MOCK_GARBAGE_FIRST) {
+    // PSK_ACCEPT with an UNVERIFIED offer: binder (or identity) doesn't
+    // check out — the server aborts with a fatal alert instead of any
+    // flight. The committed test expects the client to produce a binder
+    // this mock accepts, so reaching here fails the run LOUDLY (the math
+    // proof by contradiction: wrong binder math can never yield DONE).
+    if (mode == MOCK_PSK_ACCEPT && !psk_ok) {
+        q_reset();
+        uint8_t al[2] = { 0x02, 0x28 };   // fatal handshake_failure
+        rl = plain_record(rec, TLS_CT_ALERT, al, 2);
+        q_put(rec, rl);
+    } else if (mode == MOCK_GARBAGE_FIRST) {
         q_reset();
         uint8_t junk[100];
         for (int i = 0; i < 100; i++) junk[i] = (uint8_t)(0x30 + (i * 7) & 0xff);
@@ -664,16 +905,32 @@ static void mock_run(int mode, struct mock_result* res) {
         rl = plain_record(rec, TLS_CT_ALERT, al, 2);
         q_put(rec, rl);
     } else if (mode != MOCK_CIPHER_1302 && mode != MOCK_SID_BAD &&
-               mode != MOCK_NO_KEYSHARE) {
+               mode != MOCK_NO_KEYSHARE &&
+               !(mode == MOCK_PSK_ACCEPT && !psk_ok)) {
         // ---- encrypted flight ----
+        // PSK_ACCEPT abbreviates to EE + Finished (no Certificate/CV —
+        // authentication rides the resumed ticket, checked by the Finished
+        // MACs). g_abbrev records the path for the CHECK.
+        int abbrev = (mode == MOCK_PSK_ACCEPT);
         uint8_t ee_msg[6] = { TLS_HS_ENCRYPTED_EXTENSIONS, 0, 0, 2, 0, 0 };
+        // EE_FLIPPED (wire-only MITM tamper, e.g. extension stripping): the
+        // mock signs/computes over the ORIGINAL EE, but the client receives
+        // flipped bytes. Transcripts fork at EE → CertificateVerify (signed
+        // over mock-TH) fails client verification. Must ERR, never DONE.
+        uint8_t ee_wire[6];
+        memcpy(ee_wire, ee_msg, 6);
+        if (mode == MOCK_EE_FLIPPED) ee_wire[5] ^= 0x01;
         mtrans_msg(&g_mt, TLS_HS_ENCRYPTED_EXTENSIONS, ee_msg + 4, 2);
 
         const char* chain[3] = { 0, 0, 0 };
         static uint8_t cert_msg[16384];
+        uint32_t cert_len = 0;
+        uint32_t cv_msg_len = 0;
+        static uint8_t cv_msg[1200];
+        if (!abbrev) {
         const char* leaf_file = (mode == MOCK_EXPIRED)
             ? "tests/adversarial/at_leaf_expired.der"
-            : (mode == MOCK_RSA_PSS_VALID)
+            : (mode == MOCK_RSA_PSS_VALID || mode == MOCK_CV_PKCS1)
             ? "tests/adversarial/at_rsa_leaf.der"
             : (mode == MOCK_P384_VALID)
             ? "tests/adversarial/at_p384_leaf.der"
@@ -685,8 +942,15 @@ static void mock_run(int mode, struct mock_result* res) {
         chain[2] = (mode == MOCK_P384_VALID)
             ? "tests/adversarial/at_p384_root.der"
             : "tests/adversarial/at_root.der";   // anchor terminates the path
-        uint32_t cert_len = build_cert_msg(cert_msg, sizeof(cert_msg), chain, 3);
+        cert_len = build_cert_msg(cert_msg, sizeof(cert_msg), chain, 3);
         if (cert_len == 0) { res->r = -3; return; }
+        // STAPLE modes: graft a status_request extension onto entry 0
+        // (good or malformed). The mock transcript follows the wire bytes.
+        if (mode == MOCK_STAPLE || mode == MOCK_STAPLE_BAD) {
+            cert_len = staple_patch(cert_msg, sizeof(cert_msg), cert_len,
+                                    mode == MOCK_STAPLE_BAD);
+            if (cert_len == 0) { res->r = -3; return; }
+        }
         mtrans_msg(&g_mt, TLS_HS_CERTIFICATE, cert_msg, cert_len);
 
         // CertificateVerify over spaces||label||0||TH(CH..CERT)
@@ -700,19 +964,25 @@ static void mock_run(int mode, struct mock_result* res) {
         if (mode == MOCK_CV_GARBAGE_TRANSCRIPT)
             memset(signed_data + 64 + 33 + 1, 0x5A, 32);
 
-        int is_rsa = (mode == MOCK_RSA_PSS_VALID);
+        int is_rsa = (mode == MOCK_RSA_PSS_VALID || mode == MOCK_CV_PKCS1);
         int is_p384 = (mode == MOCK_P384_VALID);
         const char* leaf_key = is_rsa ? "tests/adversarial/at_rsa_leaf.key"
                              : is_p384 ? "tests/adversarial/at_p384_leaf.key"
                                        : "tests/adversarial/at_leaf.key";
         const char* sign_key = (mode == MOCK_CV_WRONG_KEY)
             ? "tests/adversarial/at_root.key" : leaf_key;
-        uint16_t cv_alg = is_rsa ? 0x0804 : is_p384 ? 0x0503 : 0x0403;
+        // CV_PKCS1: RSA PKCS#1 v1.5 signature (non-PSS openssl path) under
+        // cv_alg 0x0401 — RFC 8446 §4.4.3 forbids it; the client must reject
+        // even though the signature itself is cryptographically valid.
+        int use_pkcs1 = (mode == MOCK_CV_PKCS1);
+        uint16_t cv_alg = is_rsa ? (use_pkcs1 ? 0x0401 : 0x0804)
+                          : is_p384 ? 0x0503 : 0x0403;
 
         uint8_t cv_sig[1024];
         uint32_t cv_sig_len = 0;
-        if (sign_digest(sign_key, signed_data, sizeof(signed_data), is_rsa,
-                        is_p384, cv_sig, &cv_sig_len) != 0) {
+        if (sign_digest(sign_key, signed_data, sizeof(signed_data),
+                        is_rsa && !use_pkcs1, is_p384,
+                        cv_sig, &cv_sig_len) != 0) {
             printf("    [mock] openssl signing failed (%s)\n", mode_name(mode));
             res->r = -3;
             return;
@@ -720,7 +990,6 @@ static void mock_run(int mode, struct mock_result* res) {
         if (mode == MOCK_CV_FLIPPED && cv_sig_len > 0)
             cv_sig[cv_sig_len - 1] ^= 0x01;
 
-        uint8_t cv_msg[1200];
         cv_msg[0] = TLS_HS_CERTIFICATE_VERIFY;
         cv_msg[1] = 0;
         cv_msg[2] = (uint8_t)((4 + cv_sig_len) >> 8);
@@ -730,10 +999,12 @@ static void mock_run(int mode, struct mock_result* res) {
         cv_msg[6] = (uint8_t)(cv_sig_len >> 8);
         cv_msg[7] = (uint8_t)(cv_sig_len & 0xff);
         memcpy(cv_msg + 8, cv_sig, cv_sig_len);
-        uint32_t cv_msg_len = 8 + cv_sig_len;
+        cv_msg_len = 8 + cv_sig_len;
         mtrans_msg(&g_mt, TLS_HS_CERTIFICATE_VERIFY, cv_msg + 4, cv_msg_len - 4);
+        } // !abbrev (abbreviated flights carry no Certificate/CV at all)
 
-        // server Finished over the transcript through CV
+        // server Finished over the transcript through CV — or through EE
+        // alone when abbreviated (no cert/CV legs at all).
         uint8_t tx_cv[32], s_fin_key[32], fin[32];
         mtrans_hash(&g_mt, tx_cv);
         tls_finished_key(s_hs_traffic, s_fin_key);
@@ -743,7 +1014,8 @@ static void mock_run(int mode, struct mock_result* res) {
         // assemble the flight
         static uint8_t flight[16384];
         uint32_t fl = 0;
-        memcpy(flight + fl, ee_msg, 6); fl += 6;
+        memcpy(flight + fl, ee_wire, 6); fl += 6;
+        if (!abbrev) {
         // Certificate: full handshake message = header(4) + body
         flight[fl] = TLS_HS_CERTIFICATE;
         flight[fl+1] = (uint8_t)((cert_len >> 16) & 0xff);
@@ -754,6 +1026,9 @@ static void mock_run(int mode, struct mock_result* res) {
         if (mode != MOCK_NO_CV) {
             memcpy(flight + fl, cv_msg, cv_msg_len); fl += cv_msg_len;
         }
+        } else {
+            g_abbrev = 1; // abbreviated: EE + Finished only, no cert/CV
+        }
         uint8_t fin_msg[36] = { TLS_HS_FINISHED, 0, 0, 32, 0 };
         memcpy(fin_msg + 4, fin, 32);
         memcpy(g_sfin_msg, fin_msg, 36);
@@ -762,7 +1037,7 @@ static void mock_run(int mode, struct mock_result* res) {
 
         if (mode == MOCK_DUP_EE) {
             memmove(flight + 6, flight, fl);
-            memcpy(flight, ee_msg, 6);
+            memcpy(flight, ee_wire, 6);
             fl += 6;
         }
 
@@ -773,6 +1048,9 @@ static void mock_run(int mode, struct mock_result* res) {
 
         g_expect_body = (mode == MOCK_VALID || mode == MOCK_RSA_PSS_VALID ||
                           mode == MOCK_P384_VALID || mode == MOCK_SPLIT ||
+                          mode == MOCK_NST || mode == MOCK_NST_BAD ||
+                          mode == MOCK_PSK_ACCEPT || mode == MOCK_PSK_FALLBACK ||
+                          mode == MOCK_STAPLE ||
                           mode == MOCK_CLOSE_NOTIFY || mode == MOCK_APPDATA_BITFLIP);
         // TRUNCATED: cut the queue mid-flight-record (SH complete + 30B of
         // the encrypted flight). The client must ERR on the short close —
@@ -791,22 +1069,33 @@ static void mock_run(int mode, struct mock_result* res) {
     res->fail_reason = st.fail_reason;
     res->alert_desc = st.alert_desc;
     res->out_len = st.out_len;
+    // Staple visibility for the CHECK (got_staple lives in the run's state).
+    g_staple_seen = st.got_staple;
 }
 
 static void mock_section(void) {
     printf("== 2. adversarial mock TLS server ==\n");
 
     struct mock_result res;
-    x509_time now = { 2026, 9, 9, 14, 0, 0 };
-    x509_set_now(&now);
+    {
+        x509_time n, nx;
+        adv_clocks(&n, &nx);
+        x509_set_now(&n);
+    }
 
     mock_run(MOCK_VALID, &res);
     CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
           memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
           "positive control: valid ECDSA flight completes");
+    // Pin isolation: every positive control below presents a DIFFERENT leaf
+    // key for the same mock hostname — without a clear the TOFU pin (set
+    // by the previous mode) would correctly refuse them. Real servers have
+    // distinct names; the mock reuses one.
+    tls_pin_clear();
     mock_run(MOCK_RSA_PSS_VALID, &res);
     CHECK(res.r == TLS_STEP_DONE && res.out_len > 0,
           "positive control: RSA leaf + PSS CertificateVerify completes");
+    tls_pin_clear();
     mock_run(MOCK_P384_VALID, &res);
     CHECK(res.r == TLS_STEP_DONE && res.out_len > 0,
           "positive control: P-384 leaf + ECDSA-SHA384 CertificateVerify completes");
@@ -856,6 +1145,7 @@ static void mock_section(void) {
     CHECK(res.r == TLS_STEP_ERR &&
           (res.fail_reason == TLS_FAIL_ALERT || res.fail_reason == TLS_FAIL_PROTO),
           "fatal alert rejected");
+    tls_pin_clear(); // P-384 pin above would refuse these ECDSA leaves
     mock_run(MOCK_APPDATA_BITFLIP, &res);
     CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_MAC,
           "app-data ciphertext bit-flip rejected (AEAD)");
@@ -867,6 +1157,7 @@ static void mock_section(void) {
     CHECK(res.r == TLS_STEP_ERR, "record-layer garbage rejected");
     mock_run(MOCK_RECORD_OVERFLOW, &res);
     CHECK(res.r == TLS_STEP_ERR, "oversized record length rejected");
+    tls_pin_clear(); // P-384 pin above would refuse this ECDSA leaf
     mock_run(MOCK_SPLIT, &res);
     CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
           memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
@@ -874,11 +1165,136 @@ static void mock_section(void) {
     mock_run(MOCK_TRUNCATED, &res);
     CHECK(res.r == TLS_STEP_ERR,
           "truncated flight rejected (no hang, no partial DONE)");
+    mock_run(MOCK_SH_FLIPPED, &res);
+    CHECK(res.r == TLS_STEP_ERR,
+          "tampered ServerHello rejected (transcript fork)");
+    mock_run(MOCK_EE_FLIPPED, &res);
+    CHECK(res.r == TLS_STEP_ERR,
+          "tampered EncryptedExtensions rejected (transcript fork)");
+    tls_ticket_clear();
+    mock_run(MOCK_NST, &res);
+    CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
+          memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
+          "NewSessionTicket consumed, body still delivered");
+    CHECK(tls_ticket_have("evil.example.com"),
+          "ticket cached for the host after NST");
+    CHECK(!tls_ticket_have("other.example.com"),
+          "no ticket cached for other hosts");
+    mock_run(MOCK_NST_BAD, &res);
+    CHECK(res.r == TLS_STEP_ERR,
+          "corrupt ticket rejected (no silent keep)");
+    mock_run(MOCK_CV_PKCS1, &res);
+    CHECK(res.r == TLS_STEP_ERR,
+          "RSA PKCS#1 CertificateVerify rejected (PSS-only per RFC)");
+    // Resumption: NST run above cached evil.example.com's ticket in the
+    // client store — the PSK modes below offer it back.
+    mock_run(MOCK_PSK_ACCEPT, &res);
+    CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
+          memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0 && g_abbrev,
+          "PSK accept: binder verifies, abbreviated flight completes");
+    mock_run(MOCK_PSK_FALLBACK, &res);
+    CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
+          memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0 && !g_abbrev,
+          "PSK fallback: ignored offer still completes full handshake");
+    mock_run(MOCK_PSK_FOREIGN, &res);
+    CHECK(res.r == TLS_STEP_ERR,
+          "foreign PSK identity selection refused");
+    mock_run(MOCK_STAPLE, &res);
+    CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
+          memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0 && g_staple_seen,
+          "stapled status_request noted, flight completes");
+    mock_run(MOCK_STAPLE_BAD, &res);
+    CHECK(res.r == TLS_STEP_ERR,
+          "malformed staple rejected");
+}
+
+static void keyuse_section(void) {
+    printf("== 3. key usage / EKU / criticality negatives ==\n");
+    // Anchor the adversarial test root (host-only hook) so the ONLY
+    // possible failure below is the targeted usage check — never trust.
+    static uint8_t rder[4096];
+    int rn = load("tests/adversarial/at_root.der", rder, sizeof(rder));
+    CHECK(rn > 0, "ku/eku anchor loads");
+    if (rn <= 0) return;
+    {
+        x509_cert rc;
+        if (x509_parse(rder, (uint32_t)rn, &rc) != 0) {
+            CHECK(0, "ku/eku anchor parses");
+            return;
+        }
+        cert_verify_trust_extra(rc.spki.p, rc.spki.len);
+    }
+    {
+        x509_time n, nx;
+        adv_clocks(&n, &nx);
+        x509_set_now(&n);
+    }
+    static uint8_t flight[16384];
+    // keyUsage without digitalSignature (keyEncipherment only)
+    {
+        const char* chain[3] = { "tests/adversarial/at_ku_leaf.der",
+                                 "tests/adversarial/at_int.der",
+                                 "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), chain, 3);
+        CHECK(fl > 0, "ku flight builds");
+        int r = cert_verify(flight, fl, "evil.example.com");
+        CHECK(r == CV_ERR_KEYUSE, "leaf without digitalSignature rejected");
+    }
+    // EKU without serverAuth (clientAuth only)
+    {
+        const char* chain[3] = { "tests/adversarial/at_eku_leaf.der",
+                                 "tests/adversarial/at_int.der",
+                                 "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), chain, 3);
+        CHECK(fl > 0, "eku flight builds");
+        int r = cert_verify(flight, fl, "evil.example.com");
+        CHECK(r == CV_ERR_KEYUSE, "leaf EKU without serverAuth rejected");
+    }
+    // Unknown CRITICAL extension: parse itself must fail.
+    {
+        static uint8_t cder[4096];
+        int cn = load("tests/adversarial/at_crit_leaf.der", cder, sizeof(cder));
+        CHECK(cn > 0, "critical-ext leaf loads");
+        if (cn > 0) {
+            x509_cert cc;
+            CHECK(x509_parse(cder, (uint32_t)cn, &cc) != 0,
+                  "unknown critical extension rejected at parse");
+        }
+    }
+    // Control: the good leaf still verifies (usage checks don't false-fire
+    // on real chains — the at_* PKI carries KU digitalSignature throughout).
+    {
+        const char* chain[3] = { "tests/adversarial/at_leaf.der",
+                                 "tests/adversarial/at_int.der",
+                                 "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), chain, 3);
+        CHECK(fl > 0 && cert_verify(flight, fl, "evil.example.com") == CV_OK,
+              "usage-enforcing control still verifies");
+    }
+    cert_verify_trust_extra(NULL, 0);
+}
+
+static void pin_section(void) {
+    printf("== 4. TOFU pin store ==\n");
+    static uint8_t hA[32], hB[32];
+    for (int i = 0; i < 32; i++) { hA[i] = (uint8_t)(0x10 + i); hB[i] = (uint8_t)(0x80 + i); }
+    tls_pin_clear();
+    CHECK(tls_pin_check("a.example.com", hA) == 0, "first visit pins");
+    CHECK(tls_pin_check("a.example.com", hA) == 0, "same key matches");
+    CHECK(tls_pin_check("a.example.com", hB) != 0, "changed key refuses");
+    CHECK(tls_pin_check("a.example.com", hA) == 0, "old pin kept (matches again)");
+    CHECK(tls_pin_check("b.example.com", hB) == 0, "pins are per-host");
+    CHECK(tls_pin_check(NULL, hA) != 0, "null host refuses");
+    tls_pin_clear();
+    CHECK(tls_pin_check("a.example.com", hB) == 0, "clear re-pins");
+    tls_pin_clear();
 }
 
 int main(void) {
     fuzz_section();
     mock_section();
+    keyuse_section();
+    pin_section();
     printf("\n%s: %d passed, %d failed\n",
            failures == 0 ? "ADVERSARIAL TESTS PASS" : "ADVERSARIAL TESTS FAIL",
            passes, failures);

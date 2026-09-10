@@ -55,21 +55,30 @@ The Big Missing Foundations
          QEMU (example.com) + self-signed rejection (test_certfail). 2026-09-10:
          P-384 CertificateVerify DONE with mock proof (was deferred); `make
          host-tests` wires pki + adversarial + live client; text-build link
-         fixed (weak sys_proc_kbd_pending). Still deferred: OCSP, cert
-         pinning UI, AES-GCM.
+         fixed (weak sys_proc_kbd_pending). 2026-09-10 (day, review response):
+         AEAD oversize hard-fail; fail-closed clock; CV PSS-only; cleartext
+         alerts rejected; EKU/KU/critical enforcement; HKDF bounds; host RNG;
+         trust hook out of kernel; RSA>=2048; SH-exact/seq/time-digit/ec_init
+         hardening. Session resumption (NST store + PSK offer/accept/fallback,
+         mock-proven incl. independent binder check); OCSP status_request sent
+         + staple noted (validation deferred, page says so); TOFU leaf pinning
+         + reason-specific SECURITY WARNING page. Still deferred: OCSP
+         validation, pin override UX, AES-GCM.
 
     [x] Adversarial security testing of TLS/PKI — DONE 2026-09-09,
-        EXTENDED 2026-09-10 (P-384 leaf + ECDSA-SHA384 CV positive control,
-        7B/recv split-delivery control, truncated-flight rejection).
+        EXTENDED 2026-09-10 (P-384 CV, split/truncated/SH-flip/EE-flip,
+        NST store+reject, PSK accept/fallback/foreign, PKCS1-CV reject,
+        staple note+reject, KU/EKU/critical negatives, TOFU pin unit).
         tests/test_adversarial.c (host, ASan+UBSan): 4000-round mutation fuzz
         over the real example.com flight through cert_verify (only anchor-TBS
         mutations may verify — none do) + adversarial mock TLS 1.3 server
         (positive ECDSA + RSA-PSS + P-384 controls, wrong-key/flipped/
         wrong-transcript CV, hostname/expired, key-share swap MITM, flight
         order, Finished flip, AEAD bit-flip, close_notify clean, split,
-        truncated). 29/29 PASS. Fixes: Finished failure now sets
-        TLS_FAIL_MAC; cert_verify_trust_extra test hook; tls_dbg on
-        flight-parse failures. Run via `make host-tests`.
+        truncated, SH/EE forks, NST, PSK trio, PKCS1, staples) + keyuse +
+        pin sections. 56/56 PASS. Fixes: Finished failure now sets
+        TLS_FAIL_MAC; cert_verify_trust_extra test hook (host-only);
+        tls_dbg on flight-parse failures. Run via `make host-tests`.
 
     [~] Userland cutover (init + shell-from-disk) — MAJOR PROGRESS 2026-09-10,
         Phases 0-4 DONE; Phase 5-6 now: init spawns, /bin/sh prompts AND

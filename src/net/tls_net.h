@@ -34,6 +34,7 @@ int tls_is_active(void);
 // Check if the last https_get() completed with a buffered response.
 int tls_is_done(void);
 int tls_get_fail_reason(void); // TLS_FAIL_* of the last failed fetch (0 = none/success)
+int tls_get_fail_detail(void); // CV_ERR_* detail when reason is CERT class (0 = none)
 
 // Get the TLS response (same interface as http_get_response).
 char* tls_get_response(void);

@@ -402,6 +402,12 @@ static const ec_ctx* ec_ctx_for(int point_len) {
     return 0;
 }
 
+void ec_init(void) {
+    // Eager build (see header): idempotent, safe to call twice.
+    (void)ec_ctx_for(65);
+    (void)ec_ctx_for(97);
+}
+
 // Check the affine point (mont coords) satisfies y^2 = x^3 - 3x + b.
 static int on_curve(const ec_ctx* c, const uint32_t* x, const uint32_t* y) {
     uint32_t x2[EC_MAX_LIMBS], x3[EC_MAX_LIMBS], t[EC_MAX_LIMBS], lhs[EC_MAX_LIMBS];

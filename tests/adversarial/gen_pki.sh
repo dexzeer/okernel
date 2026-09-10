@@ -69,4 +69,33 @@ for n in at_p384_root at_p384_int at_p384_leaf; do
   openssl x509 -in $n.pem -outform DER -out $n.der
 done
 rm -f at_p384_int.csr at_p384_leaf.csr
+
+# NEGATIVE fixtures (review 2026-09-10 #6 — must all be REJECTED):
+#   at_ku_leaf   keyUsage WITHOUT digitalSignature (keyEncipherment only)
+#   at_eku_leaf  EKU WITHOUT serverAuth (clientAuth only)
+#   at_crit_leaf unknown CRITICAL extension (1.2.3.4.5.6) — parse must fail
+# (all leaf certs signed by at_int, SAN evil.example.com so that ONLY the
+# targeted check fails, never hostname)
+openssl ecparam -name prime256v1 -genkey -noout -out at_ku_leaf.key 2>/dev/null
+openssl req -new -key at_ku_leaf.key -out at_ku_leaf.csr -subj "/CN=evil.example.com" 2>/dev/null
+openssl x509 -req -in at_ku_leaf.csr -CA at_int.pem -CAkey at_int.key \
+  -out at_ku_leaf.pem -days 3650 \
+  -extfile <(printf "basicConstraints=CA:FALSE\nkeyUsage=critical,keyEncipherment\nextendedKeyUsage=serverAuth\nsubjectAltName=DNS:evil.example.com") 2>/dev/null
+
+openssl ecparam -name prime256v1 -genkey -noout -out at_eku_leaf.key 2>/dev/null
+openssl req -new -key at_eku_leaf.key -out at_eku_leaf.csr -subj "/CN=evil.example.com" 2>/dev/null
+openssl x509 -req -in at_eku_leaf.csr -CA at_int.pem -CAkey at_int.key \
+  -out at_eku_leaf.pem -days 3650 \
+  -extfile <(printf "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nextendedKeyUsage=clientAuth\nsubjectAltName=DNS:evil.example.com") 2>/dev/null
+
+openssl ecparam -name prime256v1 -genkey -noout -out at_crit_leaf.key 2>/dev/null
+openssl req -new -key at_crit_leaf.key -out at_crit_leaf.csr -subj "/CN=evil.example.com" 2>/dev/null
+openssl x509 -req -in at_crit_leaf.csr -CA at_int.pem -CAkey at_int.key \
+  -out at_crit_leaf.pem -days 3650 \
+  -extfile <(printf "basicConstraints=CA:FALSE\nkeyUsage=digitalSignature\nsubjectAltName=DNS:evil.example.com\n1.2.3.4.5.6=critical,DER:05:00") 2>/dev/null
+
+for n in at_ku_leaf at_eku_leaf at_crit_leaf; do
+  openssl x509 -in $n.pem -outform DER -out $n.der
+done
+rm -f at_ku_leaf.csr at_eku_leaf.csr at_crit_leaf.csr
 echo "test PKI ready"

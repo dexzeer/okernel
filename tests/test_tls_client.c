@@ -11,6 +11,8 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include "tls_client.h"
+#include "x509.h"
+#include <time.h>
 
 // ---- BSD socket wrappers for tls_client_io ----
 static int sock_fd = -1;
@@ -82,6 +84,15 @@ static int tcp_connect(const char* host, uint16_t port) {
 }
 
 int main(void) {
+    // Fail-closed clock (review 2026-09-10 #2): cert_verify refuses every
+    // chain until a real clock is set. Host source = system time.
+    {
+        time_t tt = time(NULL);
+        struct tm* g = gmtime(&tt);
+        x509_time now = { (int)(1900 + g->tm_year), g->tm_mon + 1, g->tm_mday,
+                          g->tm_hour, g->tm_min, g->tm_sec };
+        x509_set_now(&now);
+    }
     const char* host = "example.com";
     uint16_t port = 443;
 

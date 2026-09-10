@@ -53,6 +53,7 @@ struct okai_tab {
     int https_fell_back;  // 1 once we've already retried a failed HTTPS fetch over HTTP
     int cert_failed;      // 1 = HTTPS failed certificate verification: render a
                           // distinct security error and NEVER fall back to HTTP
+    int cert_detail;      // CV_ERR_* code for the message above (0 = generic)
     // CSS: parsed from <style> blocks of this page
     struct css_rule css_rules[CSS_MAX_RULES];
     int css_n;

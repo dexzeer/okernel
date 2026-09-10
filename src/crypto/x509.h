@@ -67,6 +67,18 @@ typedef struct {
     // BasicConstraints.
     int is_ca;
     int path_len;                // -1 when absent
+
+    // KeyUsage (2.5.29.15, BIT STRING): content bytes as they appear after
+    // the unused-bits octet (bit 0 = digitalSignature ... bit 5 =
+    // keyCertSign, MSB-first in byte 0). has_key_usage = extension present.
+    int has_key_usage;
+    uint8_t ku[2];               // first two content bytes (0-padded)
+    // ExtendedKeyUsage (2.5.29.37): has_eku = present; eku_server_auth =
+    // serverAuth (1.3.6.1.5.5.7.3.1) or anyExtendedKeyUsage present.
+    // Absent EKU constrains nothing (legacy certs); present EKU without
+    // serverAuth fails a TLS-server chain (enforced in certverify.c).
+    int has_eku;
+    int eku_server_auth;
 } x509_cert;
 
 // Parse a DER certificate. Returns 0 on success, -1 on malformed input.
@@ -80,6 +92,9 @@ int x509_time_cmp(const x509_time* a, const x509_time* b);
 // host tests: explicit). Returns previous value.
 void x509_set_now(const x509_time* now);
 const x509_time* x509_get_now(void);
+// 1 after x509_set_now() ran (real clock), 0 while only the build-date
+// placeholder is live. cert_verify fails closed while 0 (review #2).
+int x509_time_known(void);
 
 // RFC 6125 hostname match against SAN entries: exact match, or wildcard
 // "*" for the LEFTMOST label only ("*.example.com" matches a.example.com,

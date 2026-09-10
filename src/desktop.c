@@ -22,6 +22,7 @@
 #include "js/js_dom.h"
 #include "theme.h"
 #include "crypto/rand.h"
+#include "crypto/ec.h" // ec_init() eager curve build (see ec.h)
 #include "process.h"
 #include "sched.h"
 #include "sys_proc.h"
@@ -1323,6 +1324,10 @@ void kernel_main(uint32_t mboot_phys) {
         serial_printf("[rand] CPRNG seeded, ready=%d\n", rand_ready());
     }
 
+    // Eager ECDSA curve contexts (Montgomery params for P-256/P-384) so no
+    // first-verify lazy build can race preemption (review 2026-09-10 #11).
+    ec_init();
+
     // Wall clock for certificate validity checking (CMOS RTC, port I/O).
     {
         x509_time now;
@@ -1332,9 +1337,10 @@ void kernel_main(uint32_t mboot_phys) {
                           now.year, now.month, now.day,
                           now.hour, now.minute, now.second);
         } else {
-            // Keep the parser's build-date default; validity checks are
-            // approximate but sane.
-            serial_puts("[rtc] CMOS read failed, using build-date default\n");
+            // No clock: cert_verify now FAILS CLOSED (review 2026-09-10 #2)
+            // — HTTPS refuses every chain rather than trusting build-date
+            // validity forever. HTTP still works; fix the CMOS battery.
+            serial_puts("[rtc] CMOS read failed, no clock: HTTPS disabled (fail-closed)\n");
         }
     }
 
@@ -2123,6 +2129,7 @@ void kernel_main(uint32_t mboot_phys) {
                         serial_printf("[okai] TLS cert failure (reason=%d), no HTTP fallback for %s\n",
                                       fr, T->url);
                         T->cert_failed = 1;
+                        T->cert_detail = tls_get_fail_detail();
                         okai_fetch_owner = -1;
                         T->token_count = -1;
                         T->last_resp_len = 0;

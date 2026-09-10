@@ -2252,3 +2252,155 @@ build again.
 4. The 2026-09-09 post-run NULL-EIP #PF never reproduced tonight (6+
    sh_hello runs, all clean after the offsetof fix — the exec-cross may
    have BEEN one of its shapes); keep `test_sh_hello.py` in the loop.
+
+---
+
+## Session 2026-09-10 (day) — external review response + resumption + OCSP/pinning (56/56)
+
+An external reviewer read all 20 crypto files (report saved as
+`cryptoholes.txt`, in-tree, UNTRACKED — reviewer's working copy, don't
+commit). Verdict: math correct, all findings are systems bugs. Worked every
+numbered item except AES-GCM (user-deferred); review's #3 (NST) was already
+fixed the night before.
+
+### Review fixes (all in-tree, all host-proven)
+1. **AEAD oversize = hard error.** `mac_poly1305` had no else-branch
+   (unwritten tag / uninit compare). Now returns int; encrypt wipes output
+   + returns -1, decrypt refuses before comparing. `send_aead` propagates.
+   Test: 25KB vectors in test_tls_crypto (both directions refuse).
+2. **Fail-closed clock.** `x509_time_known()` (set only by `x509_set_now`);
+   `cert_verify` returns EXPIRED while unknown. Kernel RTC path kept;
+   RTC-failure message now says HTTPS is disabled. `test_tls_client.c`
+   sets time from `time()/gmtime()` (it relied on the placeholder).
+3. **NST tolerance** — pre-existing (night session); reviewer confirmed the
+   hole independently (their test servers send tickets; ours didn't).
+4. **CV is PSS-only.** 0x0401 dropped from `tls_parse_certificate_verify`
+   AND the dispatch (defense in depth); stays in the sig-algs OFFER (chain
+   certs legitimately use PKCS#1). Test: MOCK_CV_PKCS1 (valid RSA-PSS-key
+   signature under 0x0401 → rejected).
+5. **Cleartext alerts rejected post-SH.** RECV_HS + RECV_BODY: outer-type
+   ALERT (unauthenticated, `pl == -2`) is now always PROTO — including a
+   post-handshake plaintext close_notify, which used to report clean DONE
+   with a partial body (truncation attack: 7 injected bytes). Encrypted
+   inner close_notify still ends cleanly (CLOSE_NOTIFY control green).
+   MAC failures keep TLS_FAIL_MAC (KEYSHARE_SWAP control depends on it).
+6. **EKU/KeyUsage/criticality.** Parser captures critical flag + KU bits +
+   EKU (serverAuth/anyEKU); unknown-critical → parse fail. certverify
+   enforces: leaf digitalSignature + serverAuth-when-EKU-present; issuers
+   keyCertSign + serverAuth-when-EKU-present; new CV_ERR_KEYUSE (9).
+   Fixtures: at_ku_leaf (no digitalSignature), at_eku_leaf
+   (clientAuth-only), at_crit_leaf (unknown critical OID) — all rejected;
+   control verifies. New `== 3. key usage` mock section.
+7. **HKDF bounds.** expand_label refuses (zeroed output) on label/context
+   overflow instead of smashing info[256] + lying length bytes; hkdf_expand
+   clamps at 255 blocks (counter-wrap keystream repeat).
+8. **Host RNG.** /dev/urandom-seeded (time/pid fallback); fixed seed gone.
+   Host binaries stay test-only (production = kernel CPRNG).
+9. **Trust hook out of the kernel.** `cert_verify_trust_extra` + slot are
+   `#ifndef KERNEL` (no production callers existed — verified by grep).
+10. **RSA ≥ 2048.** Leaf + every issuer reject < 256B moduli (KEYUSE).
+11. **Quicks:** seq consumes only after successful decrypt; SH must fill
+    its record exactly (no silent coalesce-drop); parse_time validates
+    every digit; `ec_init()` eager build called at boot (lazy fallback
+    kept for host tests); rand XOR-then-rekey documented sound (rekey is
+    the ChaCha PRF call — the combiner, not the XOR); ISRG X1/X2 confirmed
+    in roots + live (letsencrypt.org chain verified in QEMU).
+    Skipped: g_last_fail_reason sync (single-connection, noted).
+
+### Session resumption (RFC 8446 §4.6.1/§4.2.11/§7.1) — DONE, mock-proven
+- **Store:** RECV_BODY consumes post-handshake handshake records; NST
+  (type 4) parsed + bound to the stashed resumption master (transcript
+  through BOTH Finisheds) and cached per-host (4 slots, latest wins,
+  lifetime-enforced, ticket ≤ 1024B). Malformed/foreign types → PROTO.
+  Modes: MOCK_NST (DONE + cached), MOCK_NST_BAD (ERR, nothing kept).
+- **Offer:** SEND_CH upgrades to a PSK-carrying CH (byte-identical base +
+  trailing ext) when a fresh small ticket exists: PSK = resumption-expand,
+  early/binder-key derived, binder = HMAC over ClientHello1 (truncated
+  through the binders-length field) patched in. ECDHE always present
+  (forward secrecy either way); offering never weakens (fallback clean).
+- **Accept/fallback:** RECV_SH detects selected_identity 0 (accept) /
+  absent (zero-early fallback) / foreign (PROTO abort). Accept abbreviates
+  the flight (EE→Finished, no cert/CV — auth via Finished MACs under
+  PSK-mixed keys); all three transcripts branch on psk_accepted
+  (transcript_st helper — cert/CV legs omitted, never hashed-empty).
+- **Proofs:** MOCK_PSK_ACCEPT (mock INDEPENDENTLY recomputes the binder
+  from saved resumption truth — wrong client math alerts → ERR by
+  contradiction; passes), MOCK_PSK_FALLBACK (DONE), MOCK_PSK_FOREIGN
+  (ERR). Bisected along the way: a mock off-by-one (`fin_pt+5` fed the
+  post-cFin transcript shifted by one — invisible until resumption used
+  it) and a mock seq inversion (body encoded seq 0 queued after NST
+  seq 1). Client offer needs no clock (age 0 + age_add when unknown);
+  kernel passes tick_count (tls_net). **Freestanding trap hit:**
+  64-bit `/ 1000` in ticket_fresh needs libgcc `__udivdi3` (absent) —
+  compare in ms with a multiply instead.
+- **Live: BLOCKED (no ticket issuer reachable).** test_resume.py kept:
+  Cloudflare (example.com) and google send NO pre-close NSTs on our
+  `Connection: close` fetches (github/wikipedia failed on flaky net).
+  Recipe: watch serial for "ticket stored", refetch same host, expect
+  "offering PSK" + ("resumption accepted" | clean fallback parse).
+  Mock proof (independent binder verification) stands as the correctness
+  argument; every live full handshake still passes (fallback-safe design
+  + FALLBACK control).
+
+### OCSP stapling — offer + note (validation deferred, honestly)
+- CH (both builders) sends RFC 6066 status_request, CORRECT 5-byte empty
+  form (type + empty responder list + empty extensions). **Incident:** a
+  first 1-byte form was malformed — servers answered decode_error (caught
+  by certfail going PROTO-reason-6 instead of CERT-4; also explained a
+  QEMU "stall" misdiagnosed as environmental). Fixed + covered by every
+  live fetch since.
+- `tls_cert_has_staple()` walks CertificateEntry extensions for a
+  well-formed status_request; malformed entry framing fails the flight.
+  Content unenforced (no OCSP parser/responder PKI — multi-day build for
+  a rare extension); the warning page now SAYS revocation is unchecked.
+- **Live proof:** `OCSP staple present (noted, unenforced)` observed on
+  example.com (Cloudflare staples). Modes: MOCK_STAPLE (DONE + seen),
+  MOCK_STAPLE_BAD (ERR).
+
+### TOFU pinning + warning page — DONE
+- `tls_pin_check()` (8 slots, memory-only, first-seen wins, mismatch keeps
+  old pin): checked after every verified full handshake against the
+  verified identity; change → CERT failure (new CV_ERR_PINCHANGED 10,
+  CV_ERR_MAX bumped — fuzz range auto-follows). Abbreviated resumptions
+  skip (no new key learned). Rotation lockout ends at reboot (documented;
+  no override UX exists yet — next UI step, not silently added).
+  Unit section `== 4. TOFU pin store` (8 checks). Mock isolation needed
+  `tls_pin_clear()` before key-changing modes (VALID/RSA/P-384/SPLIT
+  share one mock hostname — the pin correctly fired on each change,
+  which initially reddened the suite; clears are test-harness isolation,
+  not production behavior).
+- `cert_detail` (CV_ERR_* or 0) plumbed tls_client → tls_net →
+  `T->cert_detail`; warning page prints the specific reason
+  (expired/hostname/key-use/root/chain/pin-change) + "Revocation is not
+  checked (no OCSP)." Serial FAILED line gained `detail=N` (certfail
+  regex updated — it required `)` right after the digits).
+
+### Verification state
+- `make host-tests` RC=0: crypto/css/subres/pki PASS, **adversarial 56/56**
+  (fuzz + 30 mock modes + keyuse + pin sections), text_decode 5 known,
+  live PHASE 4+MITM PASS.
+- QEMU (final ISO): sh_hello PASS, nav 4/4 PASS, addrbar PASS, certfail
+  PASS (reason=4, no fallback), pki_qemu PASS (pre-CH-fix ISO; CH bytes
+  changed since — re-run on next network window), resume BLOCKED above.
+- test_links still red-identical-on-base (harness, untouched).
+
+### Observed (non-crypto, recorded, not pursued)
+- Rapid second `okai <same-url>` completes TLS (869B) but never prints
+  the parse line — fetch-owner/tab race on back-to-back same-URL fetches?
+  Out of crypto scope; needs a desktop look.
+- Fixture clocks: gen_pki.sh stamps notBefore at generation; mock clocks
+  are now fixture-mtime-relative (adv_clocks) — regens can't red the
+  suite again (this bit once tonight).
+
+### Traps for the next agent (process lessons from this session)
+- Read-then-edit: three near-misses tonight from oldString boundaries
+  eating neighbors (a deleted fn body, a deleted CHECK, a deleted decl).
+  Always re-read the region after structural edits; the suite caught
+  everything, but slowly. Prefer small unique anchors over big blocks.
+- `-Wshadow` would have caught the mock `cert_len` shadow instantly;
+  consider adding it to the host-test build lines (not CFLAGS — kernel
+  build has its own warnings posture).
+- Fuzz reason ranges must follow CV_ERR_MAX, never a fixed code.
+- Mock record order == seq order (encode in queue order).
+- Mock trust/clock/pin stores are cross-run globals: isolate modes that
+  change identity, time, or trust (clear + per-mode clocks).

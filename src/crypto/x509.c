@@ -16,6 +16,10 @@ static const uint8_t OID_ECDSA_SHA256[]     = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x0
 static const uint8_t OID_ECDSA_SHA384[]     = {0x2A,0x86,0x48,0xCE,0x3D,0x04,0x03,0x03};
 static const uint8_t OID_SUBJECT_ALT_NAME[] = {0x55,0x1D,0x11};
 static const uint8_t OID_BASIC_CONSTRAINTS[]= {0x55,0x1D,0x13};
+static const uint8_t OID_KEY_USAGE[]        = {0x55,0x1D,0x0F};
+static const uint8_t OID_EXT_KEY_USAGE[]    = {0x55,0x1D,0x25};
+static const uint8_t OID_EKU_SERVER_AUTH[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x01};
+static const uint8_t OID_EKU_ANY[]          = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x00};
 
 static int oid_is(const der_node* n, const uint8_t* oid, uint32_t oid_len) {
     return der_content_eq(n, oid, oid_len);
@@ -24,9 +28,17 @@ static int oid_is(const der_node* n, const uint8_t* oid, uint32_t oid_len) {
 // "now" for validity checking. Defaults to the build-era date so a host
 // test that forgets to set it still sees modern certificates as valid.
 static x509_time g_now = { 2026, 9, 9, 0, 0, 0 };
+// Fail-closed clock discipline (review 2026-09-10 #2): the default above is
+// a BUILD-TIME placeholder, not a time source. cert_verify refuses every
+// chain until someone with a real clock (kernel RTC at boot, explicit set
+// in tests) calls x509_set_now(). Otherwise every cert valid at build time
+// would be trusted FOREVER on a clockless machine — fail-open on the most
+// important check after the signature, with no revocation backstop.
+static int g_now_known = 0;
 
-void x509_set_now(const x509_time* now) { g_now = *now; }
+void x509_set_now(const x509_time* now) { g_now = *now; g_now_known = 1; }
 const x509_time* x509_get_now(void)     { return &g_now; }
+int x509_time_known(void)               { return g_now_known; }
 
 int x509_time_cmp(const x509_time* a, const x509_time* b) {
     if (a->year    != b->year)    return a->year    < b->year    ? -1 : 1;
@@ -41,6 +53,14 @@ int x509_time_cmp(const x509_time* a, const x509_time* b) {
 static int parse_time(const der_node* t, x509_time* out) {
     const uint8_t* p = t->content;
     uint32_t len = t->content_len;
+    // Digit discipline (review 2026-09-10 #11): every consumed byte must be
+    // ASCII 0-9 (plus the trailing Z). The old code subtracted '0' without
+    // checking, so bytes like ':' (0x3A) folded into plausible values.
+    for (uint32_t i = 0; i < len; i++) {
+        uint8_t c = p[i];
+        if (i == len - 1) { if (c != 'Z') return -1; }
+        else if (c < '0' || c > '9') return -1;
+    }
     if (t->tag == DER_TAG_UTC_TIME) {
         // YYMMDDHHMMZ (11) .. YYMMDDHHMMSSZ (13)
         if (len < 11 || len > 13) return -1;
@@ -292,16 +312,21 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
             if (der_expect(ext.content, ext.content_len, &g,
                            DER_TAG_OID, &ext_oid) != 0) return -1;
             // critical BOOLEAN DEFAULT FALSE — optional
+            int ext_critical = 0;
             if (g < ext.content_len && ext.content[g] == DER_TAG_BOOLEAN) {
                 if (der_expect(ext.content, ext.content_len, &g,
                                DER_TAG_BOOLEAN, &inner) != 0) return -1;
+                ext_critical = (inner.content_len == 1 &&
+                                inner.content[0] == 0xFF);
             }
             der_node val;
             if (der_expect(ext.content, ext.content_len, &g,
                            DER_TAG_OCTET_STRING, &val) != 0) return -1;
+            int ext_known = 0;
 
             if (oid_is(&ext_oid, OID_SUBJECT_ALT_NAME,
                        sizeof(OID_SUBJECT_ALT_NAME))) {
+                ext_known = 1;
                 // GeneralNames = SEQUENCE OF GeneralName; dNSName = [2] IA5
                 uint32_t v = 0;
                 der_node names;
@@ -326,6 +351,7 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                 }
             } else if (oid_is(&ext_oid, OID_BASIC_CONSTRAINTS,
                               sizeof(OID_BASIC_CONSTRAINTS))) {
+                ext_known = 1;
                 uint32_t v = 0;
                 der_node bc;
                 if (der_expect(val.content, val.content_len, &v,
@@ -352,8 +378,51 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                             out->path_len = ((int)pl.content[0] << 8) | pl.content[1];
                     }
                 }
+            } else if (oid_is(&ext_oid, OID_KEY_USAGE,
+                              sizeof(OID_KEY_USAGE))) {
+                // KeyUsage BIT STRING: first content byte = unused-bits
+                // count, then bytes MSB-first (bit 0 = digitalSignature in
+                // byte 0 bit 7 ... bit 5 = keyCertSign in byte 0 bit 2).
+                ext_known = 1;
+                {
+                    uint32_t v = 0;
+                    der_node ku;
+                    if (der_expect(val.content, val.content_len, &v,
+                                   DER_TAG_BIT_STRING, &ku) != 0) return -1;
+                    if (ku.content_len < 2) return -1; // unused-bits + ≥1 byte
+                    out->has_key_usage = 1;
+                    out->ku[0] = ku.content[1];
+                    out->ku[1] = ku.content_len > 2 ? ku.content[2] : 0;
+                }
+            } else if (oid_is(&ext_oid, OID_EXT_KEY_USAGE,
+                              sizeof(OID_EXT_KEY_USAGE))) {
+                // ExtendedKeyUsage SEQUENCE OF OID. Records presence plus
+                // whether serverAuth (or anyExtendedKeyUsage) is asserted.
+                ext_known = 1;
+                {
+                    uint32_t v = 0;
+                    der_node ekus;
+                    if (der_expect(val.content, val.content_len, &v,
+                                   DER_TAG_SEQUENCE, &ekus) != 0) return -1;
+                    out->has_eku = 1;
+                    out->eku_server_auth = 0;
+                    uint32_t q = 0;
+                    while (q < ekus.content_len) {
+                        der_node eku;
+                        if (der_expect(ekus.content, ekus.content_len, &q,
+                                       DER_TAG_OID, &eku) != 0) return -1;
+                        if (oid_is(&eku, OID_EKU_SERVER_AUTH,
+                                   sizeof(OID_EKU_SERVER_AUTH)) ||
+                            oid_is(&eku, OID_EKU_ANY,
+                                   sizeof(OID_EKU_ANY)))
+                            out->eku_server_auth = 1;
+                    }
+                }
             }
-            // unknown extensions: ignored (we don't enforce criticality)
+            // RFC 5280 §4.2: unrecognized CRITICAL extensions MUST be
+            // rejected (review 2026-09-10 #6). Non-critical unknowns stay
+            // ignored (CT poison/SCTs, policies, AKI/SKI, CRLDPs...).
+            if (!ext_known && ext_critical) return -1;
         }
     }
 

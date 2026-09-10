@@ -28,7 +28,13 @@ static void rng_rekey(void) {
 }
 
 void rand_seed(const uint8_t entropy[32]) {
-    // XOR entropy into key and nonce, then rekey.
+    // XOR entropy into key and nonce, then rekey. NOTE on the XOR
+    // (review 2026-09-10 #11): XOR alone would be a weak combiner, but
+    // every stir/seed is immediately followed by rng_rekey() — a full
+    // ChaCha20 block over the mixed state XORed back — so the effective
+    // combiner is XOR-then-PRF, the standard CPRNG reseed shape (cf.
+    // NIST SP 800-90A reseed mixing). The PRF call is what hashes the
+    // entropy in; XOR is just the injection step.
     for (int i = 0; i < 32; i++) rng_key[i] ^= entropy[i];
     for (int i = 0; i < 12; i++) rng_nonce[i] ^= entropy[i % 32];
     rng_bytes_generated = 0;
