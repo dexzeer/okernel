@@ -83,6 +83,16 @@ host-tests-asan:
 	mkdir -p build-host
 	gcc -m32 -O1 -g -fsanitize=address,undefined -Isrc/crypto -Isrc -o build-host/t_adv_asan tests/test_adversarial.c $(HOST_CRYPTO_SRC) && timeout 590 ./build-host/t_adv_asan | tail -n 3
 
+# Interop driver (manual): builds only — the run needs a local TLS 1.3
+# server on 127.0.0.1 (openssl s_server, python ssl, or TLS-Attacker).
+# Usage: start server with an at_* chain, then
+#   ./build-host/t_tlsa [port] [twice] [root.der] [TLSA_ROOT=..] [TLSA_SLEEP=n]
+# (25s overall deadline per round; PASS on HTTP bytes; the trust hook holds
+# one root per process, default tests/adversarial/at_root.der)
+tls-interop:
+	mkdir -p build-host
+	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tlsa tests/test_tls_attacker.c $(HOST_CRYPTO_SRC)
+
 all: text
 
 # ---- Text mode build ----

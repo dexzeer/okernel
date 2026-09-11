@@ -169,14 +169,19 @@ int tls_ext_append_alpn_http11(uint8_t* buf, uint32_t cap, uint32_t* pos) {
 }
 
 int tls_ext_append_psk_key_exchange_modes(uint8_t* buf, uint32_t cap, uint32_t* pos) {
-    // PSK key exchange modes (RFC 8446 §4.2.9): only_psk_ke (1) and
-    // psk_dhe_ke (2). We use psk_dhe_ke to support both modes.
+    // PSK key exchange modes (RFC 8446 §4.2.9): psk_ke (0) offers PSK-only
+    // (no forward secrecy — we never use it); psk_dhe_ke (1) mixes the PSK
+    // with a fresh ECDHE share (our only mode; the share is always sent).
+    // NOTE: the values are 0/1 — an earlier revision wrote 2 here (off by
+    // one from a misread enum), which real servers treat as "no common
+    // mode" and silently decline the PSK (clean fallback hid the bug;
+    // mocks don't check modes so they accepted). Caught by OpenSSL interop.
     uint32_t start = *pos;
     if (!buf_has(cap, start, 6)) return -1;
     put_u16(buf + start, TLS_EXT_PSK_KEY_EXCHANGE_MODES);
     put_u16(buf + start + 2, 2);    // body length
     buf[start + 4] = 1;             // list length
-    buf[start + 5] = 2;             // psk_dhe_ke
+    buf[start + 5] = 1;             // psk_dhe_ke
     *pos = start + 6;
     return 0;
 }
@@ -526,7 +531,7 @@ void tls_psk_binder_key(const uint8_t early_secret[32], uint8_t out[32]) {
 // binder over the truncated CH (see tls_client.c SEND_CH), builds with a
 // zero placeholder, then patches the real binder at *binder_off_out.
 // Returns total message bytes (0 on overflow); *binder_off_out is the offset
-// of the binder bytes from `out` (always total-32 on success).
+// of the binder VALUE bytes from `out` (always total-32 on success).
 uint32_t tls_build_client_hello_psk(uint8_t* out, uint32_t cap,
                                     const uint8_t random32[32],
                                     const uint8_t session_id[32],
@@ -573,10 +578,13 @@ uint32_t tls_build_client_hello_psk(uint8_t* out, uint32_t cap,
     if (tls_ext_append_psk_key_exchange_modes(body, sizeof(body), &pos) < 0) return 0;
     // pre_shared_key (last extension, RFC §4.2.11):
     //   identities: list_len(2) || ticket_len(2) || ticket || age(4)
-    //   binders:    binders_len(2) || binder(32)
+    //   binders:    binders_len(2) || entry_len(1) || binder(32)
+    // (PskBinderEntry is a <32..255> vector: the u8 length prefix is part
+    // of the wire encoding. Omitting it makes the offer malformed — real
+    // servers ignore the PSK and fall back to a full handshake.)
     {
         uint32_t id_list_len = 2 + ticket_len + 4;
-        uint32_t ext_body_len = 2 + id_list_len + 2 + 32;
+        uint32_t ext_body_len = 2 + id_list_len + 2 + 1 + 32;
         if (!buf_has(sizeof(body), pos, 4 + ext_body_len)) return 0;
         put_u16(body + pos, TLS_EXT_PRE_SHARED_KEY); pos += 2;
         put_u16(body + pos, (uint16_t)ext_body_len); pos += 2;
@@ -587,7 +595,8 @@ uint32_t tls_build_client_hello_psk(uint8_t* out, uint32_t cap,
         body[pos++] = (uint8_t)((age_obf >> 16) & 0xff);
         body[pos++] = (uint8_t)((age_obf >> 8) & 0xff);
         body[pos++] = (uint8_t)(age_obf & 0xff);
-        put_u16(body + pos, 32); pos += 2;   // binders list length
+        put_u16(body + pos, 33); pos += 2;   // binders list length (1 + 32)
+        body[pos++] = 32;                    // PskBinderEntry length prefix
         memcpy(body + pos, binder, 32); pos += 32;
     }
     put_u16(body + ext_start, pos - ext_start - 2);

@@ -558,9 +558,11 @@ void okai_render_content(int ed_id) {
             window_puts(b->win_id, " the identity does not match.\n\n");
             window_puts(b->win_id, " Nothing was loaded and no HTTP\n");
             window_puts(b->win_id, " fallback was attempted.\n");
-            window_puts(b->win_id, " Revocation is not checked (no OCSP).\n");
+            window_puts(b->win_id, " Revocation: stapled OCSP is enforced\n");
+            window_puts(b->win_id, " when sent; absent staples are not\n");
+            window_puts(b->win_id, " fetched (soft-fail).\n");
             window_set_text_color_rgb(b->win_id, default_fg, page_bg);
-            T->content_height = 12;
+            T->content_height = 14;
             w->dirty = 1;
             return;
         }
