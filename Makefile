@@ -42,7 +42,7 @@ src/userland_seed.o: $(USERLAND_GEN)
 DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/html.o src/css.o \
               src/font_data.o \
               src/js/js_os.o src/js/js_var.o src/js/js_lex.o src/js/js_parse.o src/js/js_funcs.o src/js/js_math.o src/js/js_dom.o \
-             src/crypto/sha256.o src/crypto/hmac.o src/crypto/hkdf.o \
+             src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/chacha20.o src/crypto/poly1305.o \
              src/crypto/x25519.o src/crypto/tls_record.o src/crypto/tls_handshake.o \
              src/crypto/tls_keysched.o src/crypto/tls_client.o src/crypto/rand.o \
@@ -59,14 +59,14 @@ DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o
 # Informational (never gates): text_decode (5 pre-existing Cyrillic FAILs) and
 # the live-network tls_client_test (needs internet to example.com:443).
 HOST_CRYPTO_SRC = src/crypto/tls_client.c src/crypto/tls_record.c src/crypto/tls_handshake.c \
-              src/crypto/tls_keysched.c src/crypto/sha256.c src/crypto/sha512.c \
+              src/crypto/tls_keysched.c src/crypto/sha256.c src/crypto/sha1.c src/crypto/ocsp.c src/crypto/sha512.c \
               src/crypto/hmac.c src/crypto/hkdf.c src/crypto/aead.c \
               src/crypto/chacha20.c src/crypto/poly1305.c src/crypto/x25519.c \
               src/crypto/der.c src/crypto/x509.c src/crypto/rsa.c \
               src/crypto/ec.c src/crypto/certverify.c src/crypto/roots.c
 host-tests:
 	mkdir -p build-host
-	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tls_crypto tests/test_tls_crypto.c src/crypto/sha256.c src/crypto/hmac.c src/crypto/hkdf.c src/crypto/aead.c src/crypto/chacha20.c src/crypto/poly1305.c src/crypto/x25519.c && ./build-host/t_tls_crypto | tail -n 2
+	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tls_crypto tests/test_tls_crypto.c src/crypto/sha256.c src/crypto/sha1.c src/crypto/hmac.c src/crypto/hkdf.c src/crypto/aead.c src/crypto/chacha20.c src/crypto/poly1305.c src/crypto/x25519.c && ./build-host/t_tls_crypto | tail -n 2
 	gcc -m32 -O2 -Isrc -Isrc/crypto -o build-host/t_rng tests/test_rng.c src/crypto/rand.c src/crypto/chacha20.c src/crypto/sha256.c && ./build-host/t_rng | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_strict tests/test_crypto_strict.c $(HOST_CRYPTO_SRC) && ./build-host/t_strict | tail -n 2
 	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_css tests/test_css.c src/css.c src/html.c && ./build-host/t_css | tail -n 2

@@ -122,7 +122,7 @@ static void parser_fuzz_section(void) {
             tls_parse_sh_psk(fbuf, len) > 0) bad++;
         {
             int present = 0;
-            int q = tls_cert_has_staple(fbuf, len, &present);
+            int q = tls_cert_has_staple(fbuf, len, &present, NULL, NULL);
             if (q != 0 && q != -1) bad++;
         }
         {
@@ -305,6 +305,8 @@ enum mock_mode {
     MOCK_CV_PKCS1,     // RSA PKCS#1 v1.5 CV (RFC-forbidden, must ERR)
     MOCK_STAPLE,       // stapled status_request noted, flight completes
     MOCK_STAPLE_BAD,   // malformed staple (must ERR)
+    MOCK_STAPLE_REVOKED, // valid sig, revoked status (must ERR)
+    MOCK_STAPLE_STALE,   // valid sig, aged past nextUpdate (must ERR)
     MOCK_SH_BIG,       // >4KB ServerHello (must ERR, OOB regression)
     MOCK_SH_TRAIL,     // SH with trailing bytes past exts (must ERR)
     MOCK_SH_DUP,       // SH with duplicate extension (must ERR)
@@ -669,7 +671,7 @@ static const char* mode_name(int m) {
         "GARBAGE_FIRST", "RECORD_OVERFLOW", "SPLIT", "TRUNCATED",
         "SH_FLIPPED", "EE_FLIPPED", "NST", "NST_BAD", "NST_BIGNONCE",
         "PSK_ACCEPT", "PSK_FALLBACK", "PSK_FOREIGN", "CV_PKCS1",
-        "STAPLE", "STAPLE_BAD", "SH_BIG",
+        "STAPLE", "STAPLE_BAD", "STAPLE_REVOKED", "STAPLE_STALE", "SH_BIG",
         "SH_TRAIL", "SH_DUP", "EE_DUP", "EE_ALPN_H2", "FRAGMENT"
     };
     return names[m];
@@ -754,33 +756,117 @@ static int mock_check_psk_offer(void) {
     return 1;
 }
 
+// Mint a real OCSP response with openssl (responder = at_int itself) for
+// the CURRENT at_leaf (serial read at runtime — regen-safe). revoked != 0
+// marks the leaf revoked in a scratch index. Returns response bytes in out
+// (cap-checked), length via out_len. Mirrors sign_digest's system() style.
+static int mint_ocsp(int revoked, uint8_t* out, uint32_t cap,
+                     uint32_t* out_len) {
+    static char cmd[1024], serial[128];
+    // Leaf serial (hex, no 0x).
+    snprintf(cmd, sizeof(cmd),
+             "openssl x509 -in tests/adversarial/at_leaf.der -inform DER "
+             "-noout -serial 2>/dev/null");
+    FILE* pf = popen(cmd, "r");
+    if (!pf) return -1;
+    if (!fgets(serial, sizeof(serial), pf)) { pclose(pf); return -1; }
+    pclose(pf);
+    char* nl = strchr(serial, '\n');
+    if (nl) *nl = 0;
+    if (strncmp(serial, "serial=", 7) != 0) return -1;
+    const char* hex = serial + 7;
+    // Scratch CA database (V = valid, R = revoked).
+    mkdir(SCRATCH_DIR, 0777);
+    snprintf(cmd, sizeof(cmd), SCRATCH_DIR "/ocsp_index");
+    FILE* f = fopen(cmd, "w");
+    if (!f) return -1;
+    // expiry far future; revocation date = now for R entries.
+    fprintf(f, "%c\t30000101000000Z\t%s\t%s\t%s\t/CN=evil.example.com\n",
+            revoked ? 'R' : 'V', revoked ? "260101000000Z" : "",
+            hex, revoked ? "unknown" : "unknown");
+    fclose(f);
+    // Responder bundle (cert + key) for -rsigner.
+    snprintf(cmd, sizeof(cmd),
+             "cat tests/adversarial/at_int.key tests/adversarial/at_int.pem "
+             "> " SCRATCH_DIR "/ocsp_rsigner.pem 2>/dev/null");
+    if (system(cmd) != 0) return -1;
+    // Request for the leaf, then the response.
+    snprintf(cmd, sizeof(cmd),
+             "openssl ocsp -issuer tests/adversarial/at_int.pem "
+             "-cert tests/adversarial/at_leaf.pem -reqout " SCRATCH_DIR "/ocsp_req.der "
+             "2>/dev/null");
+    if (system(cmd) != 0) return -1;
+    snprintf(cmd, sizeof(cmd),
+             "openssl ocsp -index " SCRATCH_DIR "/ocsp_index "
+             "-CA tests/adversarial/at_int.pem "
+             "-rsigner " SCRATCH_DIR "/ocsp_rsigner.pem "
+             "-reqin " SCRATCH_DIR "/ocsp_req.der "
+             "-respout " SCRATCH_DIR "/ocsp_resp.der -ndays 7 2>/dev/null");
+    if (system(cmd) != 0) return -1;
+    snprintf(cmd, sizeof(cmd), SCRATCH_DIR "/ocsp_resp.der");
+    f = fopen(cmd, "rb");
+    if (!f) return -1;
+    int n = (int)fread(out, 1, cap, f);
+    fclose(f);
+    if (n <= 0) return -1;
+    *out_len = (uint32_t)n;
+    return 0;
+}
+
 // Patch the first CertificateEntry of a built Certificate message body to
 // carry a status_request extension (RFC 8446 §4.4.2.1): type 5, body
-// type=ocsp(1) + 1-byte dummy response. bad != 0 makes the inner length
-// lie (claims 8, holds 5). Returns the new message length (list_len fixed
-// up), 0 on internal error.
-static uint32_t staple_patch(uint8_t* msg, uint32_t cap, uint32_t len, int bad) {
-    static const uint8_t ext_good[] =
-        { 0x00,0x09, 0x00,0x05, 0x00,0x05, 0x01, 0x00,0x00,0x01, 0xAA };
+// type=ocsp(1) + response bytes (or the legacy 1-byte dummy when resp is
+// NULL). bad != 0 makes the inner length lie (claims 8, holds 5).
+// Returns the new message length (list_len fixed up), 0 on error.
+static uint32_t staple_patch(uint8_t* msg, uint32_t cap, uint32_t len,
+                             const uint8_t* resp, uint32_t resplen, int bad) {
     static const uint8_t ext_bad[] =
         { 0x00,0x09, 0x00,0x05, 0x00,0x14, 0x01, 0x00,0x00, 0xAA, 0xAA };
-    const uint8_t* ext = bad ? ext_bad : ext_good;
-    if (len < 1 + 3 + 3 + 2 || len + 9 > cap) return 0;
+    if (bad) {
+        if (len < 1 + 3 + 3 + 2 || len + 9 > cap) return 0;
+        uint32_t list_len = ((uint32_t)msg[1] << 16) |
+                            ((uint32_t)msg[2] << 8) | msg[3];
+        uint32_t cert_len = ((uint32_t)msg[4] << 16) |
+                            ((uint32_t)msg[5] << 8) | msg[6];
+        uint32_t eoff = 4 + 3 + cert_len;
+        if (eoff + 2 > len || msg[eoff] != 0 || msg[eoff+1] != 0) return 0;
+        memmove(msg + eoff + 11, msg + eoff + 2, len - (eoff + 2));
+        memcpy(msg + eoff, ext_bad, 11);
+        list_len += 9;
+        msg[1] = (uint8_t)((list_len >> 16) & 0xff);
+        msg[2] = (uint8_t)((list_len >> 8) & 0xff);
+        msg[3] = (uint8_t)(list_len & 0xff);
+        return len + 9;
+    }
+    // Real staple: ext = type(2) + extlen(2) + body(type(1) + rlen(3) + resp).
+    uint32_t body_len = 1 + 3 + resplen;
+    uint32_t ext_total = 4 + body_len;
+    uint32_t block = 2 + ext_total; // entry ext_len field + extensions
+    if (!resp || resplen == 0 || resplen > 1800) return 0;
+    if (len < 1 + 3 + 3 + 2 || len + block - 2 > cap) return 0;
     uint32_t list_len = ((uint32_t)msg[1] << 16) |
                         ((uint32_t)msg[2] << 8) | msg[3];
     uint32_t cert_len = ((uint32_t)msg[4] << 16) |
                         ((uint32_t)msg[5] << 8) | msg[6];
-    uint32_t eoff = 4 + 3 + cert_len; // ext_len field of entry 0
+    uint32_t eoff = 4 + 3 + cert_len;
     if (eoff + 2 > len || msg[eoff] != 0 || msg[eoff+1] != 0) return 0;
-    // Replace the 2-byte empty ext block with the 11-byte staple block:
-    // tail shifts right by 9 (11 - 2).
-    memmove(msg + eoff + 11, msg + eoff + 2, len - (eoff + 2));
-    memcpy(msg + eoff, ext, 11);
-    list_len += 9;
+    memmove(msg + eoff + block, msg + eoff + 2, len - (eoff + 2));
+    uint8_t* e = msg + eoff;
+    e[0] = (uint8_t)((ext_total >> 8) & 0xff);
+    e[1] = (uint8_t)(ext_total & 0xff);
+    e[2] = 0x00; e[3] = 0x05;
+    e[4] = (uint8_t)((body_len >> 8) & 0xff);
+    e[5] = (uint8_t)(body_len & 0xff);
+    e[6] = 0x01;
+    e[7] = (uint8_t)((resplen >> 16) & 0xff);
+    e[8] = (uint8_t)((resplen >> 8) & 0xff);
+    e[9] = (uint8_t)(resplen & 0xff);
+    memcpy(e + 10, resp, resplen);
+    list_len += block - 2;
     msg[1] = (uint8_t)((list_len >> 16) & 0xff);
     msg[2] = (uint8_t)((list_len >> 8) & 0xff);
     msg[3] = (uint8_t)(list_len & 0xff);
-    return len + 9;
+    return len + block - 2;
 }
 
 static void mock_run(int mode, struct mock_result* res) {
@@ -836,6 +922,16 @@ static void mock_run(int mode, struct mock_result* res) {
         x509_time n, nx;
         adv_clocks(&n, &nx);
         if (mode == MOCK_EXPIRED) n = nx;
+        // STAPLE_STALE: the minted response is fresh as of real-now; run
+        // the validation clock 30 days ahead so it reads as aged past its
+        // 7-day nextUpdate (the stale condition, no openssl date tricks).
+        if (mode == MOCK_STAPLE_STALE) {
+            time_t tt = time(0) + 30 * 86400;
+            struct tm* g = gmtime(&tt);
+            n.year = 1900 + g->tm_year; n.month = g->tm_mon + 1;
+            n.day = g->tm_mday; n.hour = g->tm_hour;
+            n.minute = g->tm_min; n.second = g->tm_sec;
+        }
         x509_set_now(&n);
     }
 
@@ -1065,11 +1161,29 @@ static void mock_run(int mode, struct mock_result* res) {
             : "tests/adversarial/at_root.der";   // anchor terminates the path
         cert_len = build_cert_msg(cert_msg, sizeof(cert_msg), chain, 3);
         if (cert_len == 0) { res->r = -3; return; }
-        // STAPLE modes: graft a status_request extension onto entry 0
-        // (good or malformed). The mock transcript follows the wire bytes.
-        if (mode == MOCK_STAPLE || mode == MOCK_STAPLE_BAD) {
-            cert_len = staple_patch(cert_msg, sizeof(cert_msg), cert_len,
-                                    mode == MOCK_STAPLE_BAD);
+        // STAPLE modes: graft a status_request extension onto entry 0.
+        // STAPLE/STAPLE_REVOKED/STAPLE_STALE carry REAL openssl-minted
+        // responses (good/revoked); STAPLE_BAD carries framing garbage.
+        // The mock transcript follows the wire bytes either way.
+        if (mode == MOCK_STAPLE || mode == MOCK_STAPLE_BAD ||
+            mode == MOCK_STAPLE_REVOKED || mode == MOCK_STAPLE_STALE) {
+            if (mode == MOCK_STAPLE_BAD) {
+                cert_len = staple_patch(cert_msg, sizeof(cert_msg), cert_len,
+                                        NULL, 0, 1);
+            } else {
+                static uint8_t ocsp_resp[2048];
+                uint32_t ocsp_len = 0;
+                if (mint_ocsp(mode == MOCK_STAPLE_REVOKED,
+                              ocsp_resp, sizeof(ocsp_resp),
+                              &ocsp_len) != 0) {
+                    printf("    [mock] ocsp mint failed (%s)\n",
+                           mode_name(mode));
+                    res->r = -3;
+                    return;
+                }
+                cert_len = staple_patch(cert_msg, sizeof(cert_msg), cert_len,
+                                        ocsp_resp, ocsp_len, 0);
+            }
             if (cert_len == 0) { res->r = -3; return; }
         }
         mtrans_msg(&g_mt, TLS_HS_CERTIFICATE, cert_msg, cert_len);
@@ -1352,6 +1466,12 @@ static void mock_section(void) {
     mock_run(MOCK_STAPLE_BAD, &res);
     CHECK(res.r == TLS_STEP_ERR,
           "malformed staple rejected");
+    mock_run(MOCK_STAPLE_REVOKED, &res);
+    CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_CERT,
+          "revoked staple fails closed (no fallback class)");
+    mock_run(MOCK_STAPLE_STALE, &res);
+    CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_CERT,
+          "stale staple fails closed");
     mock_run(MOCK_SH_BIG, &res);
     CHECK(res.r == TLS_STEP_ERR,
           "oversize ServerHello rejected (OOB regression)");
@@ -1452,6 +1572,23 @@ static void pin_section(void) {
     CHECK(tls_pin_check(NULL, hA) != 0, "null host refuses");
     tls_pin_clear();
     CHECK(tls_pin_check("a.example.com", hB) == 0, "clear re-pins");
+    // Persistence round-trip (P2): export, wipe, import, match. Malformed
+    // blobs rejected without touching the live store.
+    {
+        static uint8_t blob[1024];
+        uint32_t bl = tls_pin_export(blob, sizeof(blob));
+        CHECK(bl > 8, "export writes a header + entry");
+        tls_pin_clear();
+        CHECK(tls_pin_check("a.example.com", hB) == 0, "wiped store re-pins (control)");
+        tls_pin_clear();
+        CHECK(tls_pin_import(blob, bl) == 0, "import accepts");
+        CHECK(tls_pin_check("a.example.com", hB) == 0, "imported pin matches");
+        CHECK(tls_pin_check("a.example.com", hA) != 0, "imported pin refuses change");
+        CHECK(tls_pin_import(blob, 3) != 0, "truncated blob rejected");
+        blob[0] = 'X';
+        CHECK(tls_pin_import(blob, bl) != 0, "bad magic rejected");
+        CHECK(tls_pin_check("a.example.com", hB) == 0, "failed imports keep store");
+    }
     tls_pin_clear();
 }
 
@@ -1521,6 +1658,39 @@ static void name_section(void) {
         if (fl > 0)
             CHECK(cert_verify(flight, fl, "1.2.3.4") == CV_ERR_HOSTNAME,
                   "dNSName-IP never matches IP host");
+    }
+    // NameConstraints: permitted DNS subtree (mint_nc.py chains hang off
+    // at_root — at_int's pathlen:0 forbids sub-CAs, which would fail the
+    // wrong check).
+    {
+        const char* okc[4] = { "tests/adversarial/at_nc_ok.der",
+                               "tests/adversarial/at_nc_int.der",
+                               "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), okc, 3);
+        CHECK(fl > 0, "nc-ok flight builds");
+        if (fl > 0)
+            CHECK(cert_verify(flight, fl, "www.example.com") == CV_OK,
+                  "in-namespace leaf under constrained CA verifies");
+    }
+    {
+        const char* badc[4] = { "tests/adversarial/at_nc_bad.der",
+                                "tests/adversarial/at_nc_int.der",
+                                "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), badc, 3);
+        CHECK(fl > 0, "nc-bad flight builds");
+        if (fl > 0)
+            CHECK(cert_verify(flight, fl, "evil.example.io") == CV_ERR_CAFLAGS,
+                  "out-of-namespace leaf rejected by permitted subtree");
+    }
+    {
+        const char* xlc[4] = { "tests/adversarial/at_nc_xlf.der",
+                               "tests/adversarial/at_nc_xint.der",
+                               "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), xlc, 3);
+        CHECK(fl > 0, "nc-excluded flight builds");
+        if (fl > 0)
+            CHECK(cert_verify(flight, fl, "www.example.com") == CV_ERR_CAFLAGS,
+                  "excluded-namespace leaf rejected");
     }
     // Hostname discipline: overlong + non-ASCII rejected, never truncated.
     {

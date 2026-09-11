@@ -21,7 +21,8 @@
 #define CV_ERR_NO_CERT   8   // empty certificate flight
 #define CV_ERR_KEYUSE    9   // key usage/EKU violation or insufficient strength
 #define CV_ERR_PINCHANGED 10 // TOFU leaf pin mismatch (key changed since first visit)
-#define CV_ERR_MAX       CV_ERR_PINCHANGED // keep last: fuzzers bound checks here
+#define CV_ERR_OCSP      11  // stapled OCSP response invalid/stale/revoked
+#define CV_ERR_MAX       CV_ERR_OCSP     // keep last: fuzzers bound checks here
 
 #define CERTVERIFY_MAX_CERTS 5
 
@@ -29,6 +30,11 @@
 // `hostname`. All views live inside `msg_body` — keep it alive while the
 // result is used. Returns CV_OK or a CV_ERR_* code.
 int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname);
+
+// Explicit-argument signature verification (chain walk + OCSP share it).
+int cert_sig_verify(int sig_alg, const x509_cert* issuer,
+                    const uint8_t* tbs, uint32_t tbs_len,
+                    const uint8_t* sig, uint32_t sig_len);
 
 // Test/research hook: register ONE extra trusted SPKI (hash computed here),
 // consulted alongside the embedded store. Lets adversarial tests install a
@@ -43,6 +49,11 @@ void cert_verify_trust_extra(const uint8_t* spki, uint32_t spki_len);
 // Parse just the leaf (first) certificate out of a Certificate message body.
 // Returns 0 and fills *leaf (views into msg_body), -1 on malformed input.
 int cert_leaf(const uint8_t* msg_body, uint32_t msg_len, x509_cert* leaf);
+
+// Parse the DIRECT ISSUER (second) certificate out of a Certificate message
+// body (for OCSP: the responder must be the issuing CA). Returns 0 and
+// fills *issuer (views into msg_body), -1 when absent/malformed.
+int cert_issuer(const uint8_t* msg_body, uint32_t msg_len, x509_cert* issuer);
 
 // Convenience for serial logging: CV_* code -> short string.
 const char* cert_verify_strerror(int code);

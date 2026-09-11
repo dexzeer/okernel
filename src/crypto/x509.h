@@ -35,6 +35,9 @@ typedef struct {
 typedef struct {
     // Raw TBSertificate bytes (the signature covers exactly these).
     x509_blob tbs;
+    // Serial number INTEGER content (minimal-encoding views not guaranteed;
+    // compare numerically — see ocsp.c serial matching).
+    x509_blob serial;
     // Signature BIT STRING payload (DER RSASSA-PKCS1-v1_5 EM for RSA certs,
     // DER ECDSA-Sig-Value r||s for EC certs), and the algorithm that made it.
     x509_blob signature;
@@ -54,6 +57,11 @@ typedef struct {
 
     // SubjectPublicKeyInfo.
     int key_type;                // X509_KEY_*
+    // Raw subjectPublicKey BIT STRING content (INCLUDING the leading
+    // unused-bits octet, which is always 0x00 here). OCSP issuerKeyHash
+    // hashes the value after that octet; keeping the view avoids DER
+    // re-encoding (needed for RSA issuers).
+    const uint8_t* keybits; uint32_t keybits_len;
     // RSA: modulus and exponent as big-endian bytes (leading 0x00 stripped).
     const uint8_t* rsa_n; uint32_t rsa_n_len;
     const uint8_t* rsa_e; uint32_t rsa_e_len;
@@ -73,6 +81,23 @@ typedef struct {
     // by key, not just by name); either absent constrains nothing.
     const uint8_t* aki; uint32_t aki_len; int has_aki;
     const uint8_t* ski; uint32_t ski_len; int has_ski;
+
+    // NameConstraints (2.5.29.30): dNSName + iPAddress permitted/excluded
+    // subtrees (views for DNS; copied addr+mask for IP). has_nc = present.
+    // Other GeneralName types are skipped (documented v4/DNS-only scope).
+    // Enforcement (certverify.c, per name type, only when that type is
+    // constrained): every constrained-type name below the CA must match
+    // >= 1 permitted entry (if any exist) and no excluded entry.
+#define X509_MAX_NC 4
+    struct { const uint8_t* p; uint32_t len; } permit_dns[X509_MAX_NC];
+    int n_permit_dns;
+    struct { const uint8_t* p; uint32_t len; } exclude_dns[X509_MAX_NC];
+    int n_exclude_dns;
+    struct { uint8_t addr[4]; uint8_t mask[4]; } permit_ip[X509_MAX_NC];
+    int n_permit_ip;
+    struct { uint8_t addr[4]; uint8_t mask[4]; } exclude_ip[X509_MAX_NC];
+    int n_exclude_ip;
+    int has_nc;
 
     // BasicConstraints.
     int is_ca;
@@ -97,6 +122,14 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out);
 
 // -1 if a < b, 0 equal, 1 if a > b.
 int x509_time_cmp(const x509_time* a, const x509_time* b);
+
+// Parse a DER time element (UTCTime/GeneralizedTime, Zulu) into *out.
+// Exported for the OCSP module (same validity clock domain). Returns 0/-1.
+int x509_parse_time(const der_node* t, x509_time* out);
+
+// out = t + days (calendar-correct, leap-aware). Used for freshness
+// windows with clock-skew tolerance.
+void x509_time_add_days(const x509_time* t, int days, x509_time* out);
 
 // Set the "now" used for validity checks (kernel: CMOS RTC at boot;
 // host tests: explicit). Returns previous value.

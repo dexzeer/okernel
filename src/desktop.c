@@ -1188,6 +1188,19 @@ void kernel_main(uint32_t mboot_phys) {
     fs_init();
     pfs_init(); // ATA disk + mount-or-format (diskless = VFS-only, safe)
     userland_seed(); // /bin/* + /sbin/init from embedded ELFs (skips present)
+    // TOFU pin persistence (P2): reload last boot's verified leaf pins so
+    // a reboot doesn't re-open the first-visit window to a network-only
+    // attacker. Malformed files are ignored (fail-open to empty store =
+    // plain TOFU, never a wedge).
+    {
+        extern int tls_pin_import(const uint8_t* in, uint32_t len);
+        if (fs_exists("/.pins")) {
+            static uint8_t pinbuf[1024];
+            int n = fs_read("/.pins", pinbuf, sizeof(pinbuf));
+            if (n > 0 && tls_pin_import(pinbuf, (uint32_t)n) == 0)
+                serial_puts("[pins] restored pin store\n");
+        }
+    }
     // PID 1 is spawned LAZILY (first terminal creation) instead of here:
     // sched_spawn_elf needs the PFS/VFS settled AND the entry drain must be
     // reachable (main loop running). Spawning here (pre-loop) wedges the
@@ -1726,6 +1739,20 @@ void kernel_main(uint32_t mboot_phys) {
         net_poll();
         http_poll();
         https_get_poll(); // advance any in-flight async HTTPS fetch
+        // Persist TOFU pins on change (write-through VFS, same as editor).
+        {
+            extern int tls_pin_dirty(void);
+            extern void tls_pin_clean(void);
+            extern uint32_t tls_pin_export(uint8_t* out, uint32_t cap);
+            if (tls_pin_dirty()) {
+                static uint8_t pinbuf[1024];
+                uint32_t n = tls_pin_export(pinbuf, sizeof(pinbuf));
+                if (n > 0 && fs_write("/.pins", pinbuf, (int)n) > 0) {
+                    tls_pin_clean();
+                    serial_puts("[pins] pin store saved\n");
+                }
+            }
+        }
 
         // Legacy completion poll: the trampoline path above already announces
         // inline AND latches user_exited (hijack calls note_exited) — so by

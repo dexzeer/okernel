@@ -3,6 +3,7 @@
 #include <stdint.h>
 #include "hmac.h"
 #include "hkdf.h"
+#include "sha1.h"
 #include "aead.h"
 #include "x25519.h"
 
@@ -29,6 +30,20 @@ static void unhex(uint8_t* out, const char* hex, int n) {
 
 int main(void) {
     uint8_t out[64];
+
+    // ---- SHA-1 FIPS 180-4 / RFC 3174 vectors ----
+    {
+        uint8_t h[20], want[20];
+        sha1(NULL, 0, h);
+        unhex(want, "da39a3ee5e6b4b0d3255bfef95601890afd80709", 20);
+        check("SHA1 empty", h, want, 20);
+        sha1((const uint8_t*)"abc", 3, h);
+        unhex(want, "a9993e364706816aba3e25717850c26c9cd0d89d", 20);
+        check("SHA1 abc", h, want, 20);
+        sha1((const uint8_t*)"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq", 56, h);
+        unhex(want, "84983e441c3bd26ebaae4aa1f95129e5e54670f1", 20);
+        check("SHA1 448-bit", h, want, 20);
+    }
 
     // ---- HMAC-SHA256 RFC 4231 TC1 ----
     uint8_t k20[20]; memset(k20, 0x0b, 20);

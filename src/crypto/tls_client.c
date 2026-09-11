@@ -6,6 +6,7 @@
 #include "aead.h"
 #include "hmac.h"
 #include "certverify.h"
+#include "ocsp.h"
 #include "x509.h"
 #include "rsa.h"
 #include "ec.h"
@@ -134,6 +135,58 @@ void tls_pin_clear(void) {
         ((uint8_t*)pin_slots)[i] = 0;
 }
 
+// ---- Pin persistence (P2: TOFU pins survive reboot via VFS) ----
+// Wire format: "OKPIN1"(6) || version u8 (1) || count u8 (<=8) ||
+// entries of host[64] + spki_hash[32]. The desktop serializes on change
+// and loads at boot (see desktop.c); the threat model is network-only
+// attackers (disk-write attackers already own VFS + kernel — persistence
+// buys nothing against them, and claims nothing more).
+static int pin_dirty_flag = 0;
+
+int tls_pin_dirty(void) { return pin_dirty_flag; }
+void tls_pin_clean(void) { pin_dirty_flag = 0; }
+
+uint32_t tls_pin_export(uint8_t* out, uint32_t cap) {
+    uint32_t n = 0;
+    for (int i = 0; i < TLS_PIN_SLOTS; i++)
+        if (pin_slots[i].used) n++;
+    if (cap < 8 + n * (64 + 32)) return 0;
+    out[0] = 'O'; out[1] = 'K'; out[2] = 'P'; out[3] = 'I'; out[4] = 'N';
+    out[5] = '1'; out[6] = 1; out[7] = (uint8_t)n;
+    uint32_t p = 8;
+    for (int i = 0; i < TLS_PIN_SLOTS; i++) {
+        if (!pin_slots[i].used) continue;
+        for (int j = 0; j < 64; j++) out[p++] = (uint8_t)pin_slots[i].host[j];
+        for (int j = 0; j < 32; j++) out[p++] = pin_slots[i].spki_hash[j];
+    }
+    return p;
+}
+
+int tls_pin_import(const uint8_t* in, uint32_t len) {
+    if (!in || len < 8) return -1;
+    if (in[0] != 'O' || in[1] != 'K' || in[2] != 'P' || in[3] != 'I' ||
+        in[4] != 'N' || in[5] != '1' || in[6] != 1)
+        return -1;
+    uint32_t n = in[7];
+    if (n > TLS_PIN_SLOTS || 8 + n * (64 + 32) != len) return -1;
+    tls_pin_clear();
+    uint32_t p = 8;
+    for (uint32_t i = 0; i < n; i++) {
+        int valid = 0;
+        for (int j = 0; j < 64; j++) {
+            pin_slots[i].host[j] = (char)in[p++];
+            if (pin_slots[i].host[j]) valid = 1;
+        }
+        if (!valid) { tls_pin_clear(); return -1; } // empty hostname
+        for (int j = 0; j < 32; j++)
+            pin_slots[i].spki_hash[j] = in[p++];
+        pin_slots[i].seq = ++pin_seq;
+        pin_slots[i].used = 1;
+    }
+    pin_dirty_flag = 0;
+    return 0;
+}
+
 int tls_pin_check(const char* host, const uint8_t spki_hash[32]) {
     if (!host || !host[0] || !spki_hash) return -1;
     for (int i = 0; i < TLS_PIN_SLOTS; i++) {
@@ -160,6 +213,7 @@ int tls_pin_check(const char* host, const uint8_t spki_hash[32]) {
     memcpy(pin_slots[slot].spki_hash, spki_hash, 32);
     pin_slots[slot].seq = ++pin_seq;
     pin_slots[slot].used = 1;
+    pin_dirty_flag = 1; // desktop persists on change
     return 0;
 }
 
@@ -771,14 +825,29 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                 }
                 {
                     int staple = 0;
+                    const uint8_t* sbytes = 0;
+                    uint32_t sblen = 0;
                     if (tls_cert_has_staple(st->cert_body, st->cert_bl,
-                                            &staple) != 0) {
+                                            &staple, &sbytes, &sblen) != 0) {
                         tls_dbg("[tls] Certificate entry framing failed\n");
                         st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR;
                     }
                     st->got_staple = staple;
-                    if (staple)
-                        tls_dbg("[tls] OCSP staple present (noted, unenforced)\n");
+                    st->staple_len = 0;
+                    if (staple) {
+                        // Oversized staples fail closed (same discipline as
+                        // every bounded copy here — never truncate crypto
+                        // inputs silently).
+                        if (sblen == 0 || sblen > sizeof(st->staple)) {
+                            tls_dbg("[tls] staple size %u rejected\n", sblen);
+                            st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR;
+                        }
+                        for (uint32_t i = 0; i < sblen; i++)
+                            st->staple[i] = sbytes[i];
+                        st->staple_len = sblen;
+                        tls_dbg("[tls] OCSP staple present (%uB, validating post-auth)\n",
+                                sblen);
+                    }
                 }
                 st->got_cert = 1;
                 st->hs_next = 2;
@@ -947,6 +1016,31 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                 if (tls_pin_check(phost, ph) != 0) {
                     st->fail_reason = TLS_FAIL_CERT;
                     st->cert_detail = CV_ERR_PINCHANGED;
+                    return TLS_STEP_ERR;
+                }
+            }
+            // OCSP staple validation (P2): the chain verified above, so
+            // `leaf` is authentic and the flight's second cert is the
+            // direct issuer the responder must be. A present-but-invalid
+            // staple fails closed (revoked/stale/forged — indistinguishable
+            // from attack, and the warning page discloses enforcement).
+            // Absent staple: soft-fail proceed (documented model).
+            if (st->got_staple) {
+                x509_cert issuer;
+                int ocsp_rc;
+                if (cert_issuer(st->cert_body, st->cert_bl, &issuer) != 0) {
+                    tls_dbg("[tls] staple with unparsable issuer\n");
+                    st->fail_reason = TLS_FAIL_CERT;
+                    st->cert_detail = CV_ERR_OCSP;
+                    return TLS_STEP_ERR;
+                }
+                ocsp_rc = ocsp_check_staple(st->staple, st->staple_len,
+                                           &leaf, &issuer, x509_get_now());
+                tls_dbg("[tls] OCSP staple verdict: %s\n",
+                        ocsp_strerror(ocsp_rc));
+                if (ocsp_rc != OCSP_OK) {
+                    st->fail_reason = TLS_FAIL_CERT;
+                    st->cert_detail = CV_ERR_OCSP;
                     return TLS_STEP_ERR;
                 }
             }

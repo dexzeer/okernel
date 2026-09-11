@@ -20,6 +20,7 @@ static const uint8_t OID_KEY_USAGE[]        = {0x55,0x1D,0x0F};
 static const uint8_t OID_EXT_KEY_USAGE[]    = {0x55,0x1D,0x25};
 static const uint8_t OID_SUBJECT_KEY_ID[]   = {0x55,0x1D,0x0E};
 static const uint8_t OID_AUTH_KEY_ID[]      = {0x55,0x1D,0x23};
+static const uint8_t OID_NAME_CONSTRAINTS[] = {0x55,0x1D,0x1E};
 static const uint8_t OID_EKU_SERVER_AUTH[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x01};
 static const uint8_t OID_EKU_ANY[]          = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x00};
 
@@ -52,8 +53,36 @@ int x509_time_cmp(const x509_time* a, const x509_time* b) {
     return 0;
 }
 
-static int parse_time(const der_node* t, x509_time* out) {
-    const uint8_t* p = t->content;
+void x509_time_add_days(const x509_time* t, int days, x509_time* out) {
+    static const uint8_t mdays[12] =
+        { 31,28,31,30,31,30,31,31,30,31,30,31 };
+    *out = *t;
+    if (days >= 0) {
+        while (days-- > 0) {
+            int leap = (out->year % 4 == 0 && out->year % 100 != 0) ||
+                       (out->year % 400 == 0);
+            uint32_t maxd = mdays[out->month - 1];
+            if (out->month == 2 && leap) maxd = 29;
+            if ((uint32_t)++out->day > maxd) {
+                out->day = 1;
+                if (++out->month > 12) { out->month = 1; out->year++; }
+            }
+        }
+    } else {
+        while (days++ < 0) {
+            if (--out->day < 1) {
+                if (--out->month < 1) { out->month = 12; out->year--; }
+                int leap = (out->year % 4 == 0 && out->year % 100 != 0) ||
+                           (out->year % 400 == 0);
+                uint32_t maxd = mdays[out->month - 1];
+                if (out->month == 2 && leap) maxd = 29;
+                out->day = (int)maxd;
+            }
+        }
+    }
+}
+
+int x509_parse_time(const der_node* t, x509_time* out) {    const uint8_t* p = t->content;
     uint32_t len = t->content_len;
     // Digit discipline (review 2026-09-10 #11): every consumed byte must be
     // ASCII 0-9 (plus the trailing Z). The old code subtracted '0' without
@@ -224,12 +253,14 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
     }
 
     // serialNumber: positive INTEGER (strict — a negative/zero serial is
-    // malformed; the value itself is opaque to us).
+    // malformed). Retained as a view for OCSP certID matching.
     if (der_expect(tb, tl, &t, DER_TAG_INTEGER, &inner) != 0) return -1;
     {
         const uint8_t* sv;
         uint32_t svl;
         if (int_bytes_strict(&inner, &sv, &svl, 0) != 0) return -1;
+        out->serial.p = inner.content;
+        out->serial.len = inner.content_len;
     }
 
     // signature (inner AlgorithmIdentifier) — determine cert's sig algorithm.
@@ -298,7 +329,7 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
             if (der_expect(validity.content, validity.content_len, &v, tg, &tn) != 0)
                 return -1;
             x509_time* dst = (which == 0) ? &out->not_before : &out->not_after;
-            if (parse_time(&tn, dst) != 0) return -1;
+            if (x509_parse_time(&tn, dst) != 0) return -1;
         }
         if (v != validity.content_len) return -1;
     }
@@ -327,6 +358,8 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
             if (der_expect(spki.content, spki.content_len, &s,
                            DER_TAG_BIT_STRING, &keybits) != 0) return -1;
             if (keybits.content_len < 1 || keybits.content[0] != 0) return -1;
+            out->keybits = keybits.content;
+            out->keybits_len = keybits.content_len;
             // BIT STRING payload = DER RSAPublicKey = SEQUENCE { n, e }
             uint32_t r = 0;
             der_node rsakey;
@@ -362,6 +395,8 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
             if (der_expect(spki.content, spki.content_len, &s,
                            DER_TAG_BIT_STRING, &keybits) != 0) return -1;
             if (keybits.content_len < 1 || keybits.content[0] != 0) return -1;
+            out->keybits = keybits.content;
+            out->keybits_len = keybits.content_len;
             out->ec_point = keybits.content + 1;
             out->ec_point_len = keybits.content_len - 1;
             int want = (curve == X509_KEY_EC_P256) ? 65 : 97;
@@ -580,6 +615,106 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                         }
                         q += ll;
                     }
+                }
+            } else if (oid_is(&ext_oid, OID_NAME_CONSTRAINTS,
+                              sizeof(OID_NAME_CONSTRAINTS))) {
+                // NameConstraints SEQ { [0] permitted, [1] excluded }, each a
+                // SEQ OF GeneralName. Records dNSName [2] (IA5, ASCII-checked)
+                // and iPAddress [7] (v4: 4-byte host or 8-byte addr+mask);
+                // every other GeneralName type is skipped (documented
+                // DNS/v4-only scope). Lengths short- or long-form (capped).
+                ext_known = 1;
+                {
+                    uint32_t v = 0;
+                    der_node ncseq;
+                    if (der_expect(val.content, val.content_len, &v,
+                                   DER_TAG_SEQUENCE, &ncseq) != 0) return -1;
+                    if (v != val.content_len) return -1; // exact outer SEQ
+                    uint32_t q = 0;
+                    while (q < ncseq.content_len) {
+                        uint8_t ctag = ncseq.content[q];
+                        if (ctag != 0xA0 && ctag != 0xA1) return -1;
+                        int is_permit = (ctag == 0xA0);
+                        q++;
+                        if (q >= ncseq.content_len) return -1;
+                        uint32_t ll = ncseq.content[q++];
+                        if (ll & 0x80) {
+                            uint32_t nb = ll & 0x7F;
+                            if (nb == 0 || nb > 2) return -1;
+                            if (q + nb > ncseq.content_len) return -1;
+                            ll = 0;
+                            for (uint32_t k = 0; k < nb; k++)
+                                ll = (ll << 8) | ncseq.content[q++];
+                        }
+                        if (q + ll > ncseq.content_len) return -1;
+                        {
+                            uint32_t w = q;
+                            der_node gseq;
+                            if (der_expect(ncseq.content, q + ll, &w,
+                                           DER_TAG_SEQUENCE, &gseq) != 0)
+                                return -1;
+                            if (w != q + ll) return -1; // exact inner SEQ
+                            uint32_t g = 0;
+                            while (g < gseq.content_len) {
+                                uint8_t gt = gseq.content[g];
+                                if (gt == 0x82) {
+                                    der_node dns;
+                                    if (der_expect(gseq.content,
+                                                   gseq.content_len, &g,
+                                                   0x82, &dns) != 0) return -1;
+                                    for (uint32_t bi = 0; bi < dns.content_len; bi++)
+                                        if (dns.content[bi] >= 128) return -1;
+                                    if (is_permit) {
+                                        if (out->n_permit_dns < X509_MAX_NC) {
+                                            out->permit_dns[out->n_permit_dns].p = dns.content;
+                                            out->permit_dns[out->n_permit_dns].len = dns.content_len;
+                                            out->n_permit_dns++;
+                                        }
+                                    } else if (out->n_exclude_dns < X509_MAX_NC) {
+                                        out->exclude_dns[out->n_exclude_dns].p = dns.content;
+                                        out->exclude_dns[out->n_exclude_dns].len = dns.content_len;
+                                        out->n_exclude_dns++;
+                                    }
+                                } else if (gt == 0x87) {
+                                    der_node ipn;
+                                    if (der_expect(gseq.content,
+                                                   gseq.content_len, &g,
+                                                   0x87, &ipn) != 0) return -1;
+                                    // v4 only: 4 bytes (host, /32) or 8 bytes
+                                    // (addr + mask). Store masked addr + mask
+                                    // (matcher applies the mask to subjects).
+                                    if (ipn.content_len == 4 ||
+                                        ipn.content_len == 8) {
+                                        int* ncnt = is_permit ? &out->n_permit_ip
+                                                              : &out->n_exclude_ip;
+                                        if (*ncnt < X509_MAX_NC) {
+                                            int si = (*ncnt)++;
+                                            for (int b = 0; b < 4; b++) {
+                                                uint8_t m = (ipn.content_len == 8)
+                                                    ? ipn.content[4 + b] : 0xFF;
+                                                if (is_permit) {
+                                                    out->permit_ip[si].addr[b] =
+                                                        ipn.content[b] & m;
+                                                    out->permit_ip[si].mask[b] = m;
+                                                } else {
+                                                    out->exclude_ip[si].addr[b] =
+                                                        ipn.content[b] & m;
+                                                    out->exclude_ip[si].mask[b] = m;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // else: v6/other lengths skipped (scope)
+                                } else {
+                                    der_node skip;
+                                    if (der_next(gseq.content, gseq.content_len,
+                                                 &g, &skip) != 0) return -1;
+                                }
+                            }
+                        }
+                        q += ll;
+                    }
+                    out->has_nc = 1;
                 }
             }
             // RFC 5280 §4.2: unrecognized CRITICAL extensions MUST be
