@@ -29,8 +29,16 @@ def load_cert(p):
 # not name constraints).
 int_key = load_key(f"{D}/at_root.key")
 int_cert = load_cert(f"{D}/at_root.pem")
-now = datetime.datetime.now(datetime.timezone.utc)
-far = now + datetime.timedelta(days=3000)
+# Hermetic clocks (cryptoholes follow-up, 2026-09-11): the suite validates
+# at leaf-mtime + 2h (adv_clocks), so mint relative to that SAME frozen
+# base — never wall-clock now. Wall-minted notBefore drifts past the test
+# clock within a day and reds every validity check (bisected: regen at
+# wall-now broke the pre-existing NC tests). notAfter stays far-future.
+import os as _os
+_base = datetime.datetime.fromtimestamp(
+    _os.path.getmtime(f"{D}/at_leaf.der"), tz=datetime.timezone.utc)
+now = _base
+far = _base + datetime.timedelta(days=3000)
 
 def ca(name, cn, ski_tag, permit=None, exclude=None):
     key = ec.generate_private_key(ec.SECP256R1())
@@ -103,3 +111,85 @@ leaf("at_nc_bad", "evil.example.io", _, nc)
 _, ncx = ca("at_nc_xint", "NC Excluded Intermediate", b"xint0000000000001",
             exclude=["example.com"])
 leaf("at_nc_xlf", "www.example.com", _, ncx)
+
+# --- cryptoholes fail-closed fixtures (must FAIL verification) ---
+import ipaddress
+
+# 1. Overflow: 5 permitted DNS subtrees (parser cap X509_MAX_NC=4).
+_, ncover = ca("at_nc_over", "NC Overflow Intermediate", b"over00000000000001",
+               permit=["a.example.com", "b.example.com", "c.example.com",
+                       "d.example.com", "e.example.com"])
+leaf("at_nc_over_leaf", "www.a.example.com", _, ncover)
+
+# 2. Unsupported name form: directoryName permitted subtree.
+b2 = (x509.CertificateBuilder()
+      .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME,
+                                                  "NC DirName Intermediate")]))
+      .issuer_name(int_cert.subject)
+      .public_key(ec.generate_private_key(ec.SECP256R1()).public_key())
+      .serial_number(x509.random_serial_number())
+      .not_valid_before(now - datetime.timedelta(hours=1))
+      .not_valid_after(far)
+      .add_extension(x509.BasicConstraints(ca=True, path_length=0), True)
+      .add_extension(x509.SubjectKeyIdentifier(b"nc-ski-dir00000001"), False)
+      .add_extension(x509.NameConstraints(
+          permitted_subtrees=[x509.DirectoryName(x509.Name(
+              [x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Constrained")]))],
+          excluded_subtrees=None), True)
+      .sign(int_key, hashes.SHA256()))
+with open(f"{D}/at_nc_dir.der", "wb") as f:
+    f.write(b2.public_bytes(serialization.Encoding.DER))
+print("wrote at_nc_dir", flush=True)
+leaf("at_nc_dir_leaf", "www.example.com", int_key,
+     x509.load_der_x509_certificate(open(f"{D}/at_nc_dir.der", "rb").read()))
+
+# 3. Unsupported address form: IPv6 excluded subtree.
+_, ncv6 = ca("at_nc_ip6", "NC IPv6 Intermediate", b"ip600000000000001",
+             exclude=["example.com"])
+# (cryptography takes DNSName strs above; build the v6 variant explicitly)
+b3 = (x509.CertificateBuilder()
+      .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME,
+                                                  "NC IPv6 Intermediate")]))
+      .issuer_name(int_cert.subject)
+      .public_key(ec.generate_private_key(ec.SECP256R1()).public_key())
+      .serial_number(x509.random_serial_number())
+      .not_valid_before(now - datetime.timedelta(hours=1))
+      .not_valid_after(far)
+      .add_extension(x509.BasicConstraints(ca=True, path_length=0), True)
+      .add_extension(x509.SubjectKeyIdentifier(b"nc-ski-ip60000001"), False)
+      .add_extension(x509.NameConstraints(
+          permitted_subtrees=None,
+          excluded_subtrees=[x509.IPAddress(
+              ipaddress.IPv6Network("2001:db8::/32"))]), True)
+      .sign(int_key, hashes.SHA256()))
+with open(f"{D}/at_nc_ip6.der", "wb") as f:
+    f.write(b3.public_bytes(serialization.Encoding.DER))
+print("wrote at_nc_ip6", flush=True)
+leaf("at_nc_ip6_leaf", "www.example.com", int_key,
+     x509.load_der_x509_certificate(open(f"{D}/at_nc_ip6.der", "rb").read()))
+
+# 4. SAN overflow: leaf with 17 DNS SANs (parser cap X509_MAX_SAN=16),
+#    signed by at_int (pathlen:0 allows leaves, not sub-CAs).
+at_int_key = load_key(f"{D}/at_int.key")
+at_int_cert = load_cert(f"{D}/at_int.pem")
+at_int_ski = at_int_cert.extensions.get_extension_for_class(
+    x509.SubjectKeyIdentifier).value.digest
+san17 = [x509.DNSName(f"h{i}.example.com") for i in range(17)]
+leaf17_key = ec.generate_private_key(ec.SECP256R1())
+c17 = (x509.CertificateBuilder()
+       .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME,
+                                                   "h0.example.com")]))
+       .issuer_name(at_int_cert.subject)
+       .public_key(leaf17_key.public_key())
+       .serial_number(x509.random_serial_number())
+       .not_valid_before(now - datetime.timedelta(hours=1))
+       .not_valid_after(far)
+       .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+       .add_extension(x509.SubjectAlternativeName(san17), False)
+       .add_extension(x509.AuthorityKeyIdentifier(
+           key_identifier=at_int_ski, authority_cert_issuer=None,
+           authority_cert_serial_number=None), False)
+       .sign(at_int_key, hashes.SHA256()))
+with open(f"{D}/at_san_over.der", "wb") as f:
+    f.write(c17.public_bytes(serialization.Encoding.DER))
+print("wrote at_san_over", flush=True)

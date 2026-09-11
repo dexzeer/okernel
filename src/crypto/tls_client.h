@@ -204,7 +204,9 @@ int tls_pin_import(const uint8_t* in, uint32_t len); // 0 ok, -1 malformed
 // PSK (see the offer path in tls_client.c). Tickets fuel resumption ONLY —
 // the first handshake to a host always fully verifies the chain.
 // Test/diagnostic hooks:
-int tls_ticket_have(const char* host); // 1 if an unexpired ticket is cached
+int tls_ticket_have(const char* host, uint64_t now_ms); // 1 if an unexpired
+    // ticket is cached AS OF now_ms (explicit trusted time, ms — pass the
+    // same clock given to tls_state_set_now_ms; 0/unknown is NOT fresh).
 void tls_ticket_clear(void);           // drop all (tests, memory hygiene)
 
 #endif

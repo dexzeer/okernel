@@ -1,6 +1,11 @@
-// Host unit test for the Fortuna-lite RNG gate (review 2026-09-10 #4):
-// fail-closed until >= 64B from >= 2 source classes; single-class
-// flooding (even 16+ stirs, even zeros) must NOT declare readiness.
+// Host unit test for the Fortuna-lite RNG gate (review 2026-09-10 #4,
+// tiers cryptoholes #1): fail-closed until a declaring reseed compresses
+// enough window bytes from enough classes. Host tests never call
+// rand_hw_init, so hw_present stays 0 → the no-hardware tier applies:
+// >= 128B window, >= 2 window classes at >= 32B each, >= 3 lifetime
+// classes (BOOT+TIMER+INPUT). Single-class flooding (even 16+ stirs,
+// even zeros) must NOT declare readiness; neither must two weak classes
+// without the third, nor a lone weak sample piggybacking on bulk.
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
@@ -27,13 +32,30 @@ int main(void) {
     CHECK(rand_ready() == 0, "single-class flood stays closed");
     CHECK(rand_bytes(out, 32) == 0, "still fails closed");
 
-    // Second class arrives -> reseed declares ready.
+    // Second class arrives, but the no-hardware tier needs THREE lifetime
+    // classes — still closed (this is the cryptoholes #1 tightening: two
+    // weak label-only classes no longer suffice).
     for (int i = 0; i < 16; i++) {
         uint8_t s[32];
         for (int j = 0; j < 32; j++) s[j] = (uint8_t)(i * 31 + j * 7 + 1);
         rand_stir_src(s, RAND_SRC_TIMER);
     }
-    CHECK(rand_ready() == 1, "two classes declare ready");
+    CHECK(rand_ready() == 0, "two classes still closed (need three, no hw)");
+    CHECK(rand_bytes(out, 32) == 0, "still fails closed");
+
+    // Third class arrives interleaved (production reality: TIMER ticks
+    // constantly, so any INPUT lands in a mixed window — segregated
+    // 16-batches would reseed single-class windows and legitimately wait).
+    for (int i = 0; i < 8; i++) {
+        uint8_t s[32], t[32];
+        for (int j = 0; j < 32; j++) {
+            s[j] = (uint8_t)(i * 13 + j * 3 + 2);
+            t[j] = (uint8_t)(i * 17 + j * 5 + 3);
+        }
+        rand_stir_src(s, RAND_SRC_INPUT);
+        rand_stir_src(t, RAND_SRC_TIMER);
+    }
+    CHECK(rand_ready() == 1, "three classes declare ready");
     CHECK(rand_bytes(out, 32) == 1, "rand_bytes works when ready");
 
     // Stream advances (no stuck output).

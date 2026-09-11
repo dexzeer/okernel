@@ -1265,12 +1265,16 @@ void kernel_main(uint32_t mboot_phys) {
     net_set_event_callback(on_net_event);
 
     // Seed the ChaCha20 CPRNG used by the TLS client for key material.
-    // Honest model (review 2026-09-10 #4): the MAC is PUBLIC — it enters
-    // only as domain separation (rand_personalize, never counted). Real
-    // classes here: BOOT (RDTSC/RTC). RDRAND opportunistically. Readiness
-    // comes a few timer ticks later when TIMER-class samples arrive and a
-    // reseed compresses >= 64B from >= 2 classes — still long before any
-    // user-initiated fetch. rand_bytes() fails closed until then.
+    // Honest model (review 2026-09-10 #4, tiers cryptoholes #1): the MAC
+    // is PUBLIC — it enters only as domain separation (rand_personalize,
+    // never counted). Real classes here: BOOT (RDTSC/RTC). RDRAND/RDSEED
+    // opportunistically (rand_hw_init establishes the hardware tier when
+    // the CPU has it). Readiness comes later: with hardware, a reseed
+    // compressing >= 64B from a window with 2 classes; without, >= 128B
+    // with BOOT+TIMER+INPUT lifetime classes (keystrokes typed for the
+    // fetch URL and NIC RX both stir INPUT, so the first user-initiated
+    // fetch always follows qualifying input). rand_bytes() fails closed
+    // until then — no TLS without established entropy.
     {
         uint8_t* mac = e1000_get_mac();
         rand_personalize(mac, 6);
