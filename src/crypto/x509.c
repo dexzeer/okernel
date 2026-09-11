@@ -446,21 +446,29 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
             if (oid_is(&ext_oid, OID_SUBJECT_ALT_NAME,
                        sizeof(OID_SUBJECT_ALT_NAME))) {
                 ext_known = 1;
-                // GeneralNames = SEQUENCE OF GeneralName; dNSName = [2] IA5
+                // GeneralNames = SEQUENCE OF GeneralName; dNSName = [2] IA5.
+                // Fail-closed caps (cryptoholes #5): RELEVANT entries
+                // (dNSName, IPv4 iPAddress) beyond the tables FAIL the
+                // parse — silently dropping the 17th SAN would erase
+                // matchable policy. Irrelevant forms (otherName, rfc822,
+                // URIs, ...) carry no DNS/IP match semantics and are
+                // skipped freely; IPv6 addresses are skipped (no v6 stack
+                // exists to match or dial them). The whole list is still
+                // walked, so malformed trailing entries fail as before.
                 uint32_t v = 0;
                 der_node names;
                 if (der_expect(val.content, val.content_len, &v,
                                DER_TAG_SEQUENCE, &names) != 0) return -1;
                 uint32_t nn = 0;
-                while (nn < names.content_len &&
-                       out->san_count < X509_MAX_SAN) {
+                while (nn < names.content_len) {
                     uint8_t tg = names.content[nn];
                     if (tg == 0x87) {
                         // iPAddress: 4 (v4) or 16 (v6) raw bytes. Keep v4.
                         der_node ip;
                         if (der_expect(names.content, names.content_len,
                                        &nn, 0x87, &ip) != 0) return -1;
-                        if (ip.content_len == 4 && out->ip_san_count < 4) {
+                        if (ip.content_len == 4) {
+                            if (out->ip_san_count >= 4) return -1;
                             for (int b = 0; b < 4; b++)
                                 out->ip_san[out->ip_san_count][b] =
                                     ip.content[b];
@@ -477,6 +485,7 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                     der_node dns;
                     if (der_expect(names.content, names.content_len, &nn,
                                    0x82, &dns) != 0) return -1;
+                    if (out->san_count >= X509_MAX_SAN) return -1;
                     out->san[out->san_count].p = dns.content;
                     out->san[out->san_count].len = dns.content_len;
                     out->san_count++;
@@ -619,10 +628,18 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
             } else if (oid_is(&ext_oid, OID_NAME_CONSTRAINTS,
                               sizeof(OID_NAME_CONSTRAINTS))) {
                 // NameConstraints SEQ { [0] permitted, [1] excluded }, each a
-                // SEQ OF GeneralName. Records dNSName [2] (IA5, ASCII-checked)
-                // and iPAddress [7] (v4: 4-byte host or 8-byte addr+mask);
-                // every other GeneralName type is skipped (documented
-                // DNS/v4-only scope). Lengths short- or long-form (capped).
+                // SEQ OF GeneralName. NARROW FAIL-CLOSED validator
+                // (cryptoholes #2/#3/#4): records dNSName [2] (IA5,
+                // ASCII-checked) and iPAddress [7] (v4: 4-byte host or
+                // 8-byte addr+mask). ANY other GeneralName form present —
+                // directoryName, rfc822Name, URI, otherName, x400Address,
+                // ediPartyName, IPv6 addresses, ... — FAILS THE PARSE:
+                // unenforceable policy must never silently vanish into an
+                // accept (a CA saying "only these directoryNames" while we
+                // check only SANs is a policy bypass). Overflow past
+                // X509_MAX_NC per list likewise fails — never truncate
+                // policy by dropping the fifth constraint.
+                // Lengths short- or long-form (capped).
                 ext_known = 1;
                 {
                     uint32_t v = 0;
@@ -665,12 +682,14 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                                     for (uint32_t bi = 0; bi < dns.content_len; bi++)
                                         if (dns.content[bi] >= 128) return -1;
                                     if (is_permit) {
-                                        if (out->n_permit_dns < X509_MAX_NC) {
-                                            out->permit_dns[out->n_permit_dns].p = dns.content;
-                                            out->permit_dns[out->n_permit_dns].len = dns.content_len;
-                                            out->n_permit_dns++;
-                                        }
-                                    } else if (out->n_exclude_dns < X509_MAX_NC) {
+                                        if (out->n_permit_dns >= X509_MAX_NC)
+                                            return -1; // policy overflow: fail, never drop
+                                        out->permit_dns[out->n_permit_dns].p = dns.content;
+                                        out->permit_dns[out->n_permit_dns].len = dns.content_len;
+                                        out->n_permit_dns++;
+                                    } else {
+                                        if (out->n_exclude_dns >= X509_MAX_NC)
+                                            return -1; // policy overflow: fail, never drop
                                         out->exclude_dns[out->n_exclude_dns].p = dns.content;
                                         out->exclude_dns[out->n_exclude_dns].len = dns.content_len;
                                         out->n_exclude_dns++;
@@ -683,32 +702,39 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                                     // v4 only: 4 bytes (host, /32) or 8 bytes
                                     // (addr + mask). Store masked addr + mask
                                     // (matcher applies the mask to subjects).
-                                    if (ipn.content_len == 4 ||
-                                        ipn.content_len == 8) {
+                                    // Anything else (notably IPv6) FAILS:
+                                    // an unenforceable address policy must
+                                    // not vanish (cryptoholes #3).
+                                    if (ipn.content_len != 4 &&
+                                        ipn.content_len != 8) return -1;
+                                    {
                                         int* ncnt = is_permit ? &out->n_permit_ip
                                                               : &out->n_exclude_ip;
-                                        if (*ncnt < X509_MAX_NC) {
-                                            int si = (*ncnt)++;
-                                            for (int b = 0; b < 4; b++) {
-                                                uint8_t m = (ipn.content_len == 8)
-                                                    ? ipn.content[4 + b] : 0xFF;
-                                                if (is_permit) {
-                                                    out->permit_ip[si].addr[b] =
-                                                        ipn.content[b] & m;
-                                                    out->permit_ip[si].mask[b] = m;
-                                                } else {
-                                                    out->exclude_ip[si].addr[b] =
-                                                        ipn.content[b] & m;
-                                                    out->exclude_ip[si].mask[b] = m;
-                                                }
+                                        if (*ncnt >= X509_MAX_NC)
+                                            return -1; // policy overflow: fail, never drop
+                                        int si = (*ncnt)++;
+                                        for (int b = 0; b < 4; b++) {
+                                            uint8_t m = (ipn.content_len == 8)
+                                                ? ipn.content[4 + b] : 0xFF;
+                                            if (is_permit) {
+                                                out->permit_ip[si].addr[b] =
+                                                    ipn.content[b] & m;
+                                                out->permit_ip[si].mask[b] = m;
+                                            } else {
+                                                out->exclude_ip[si].addr[b] =
+                                                    ipn.content[b] & m;
+                                                out->exclude_ip[si].mask[b] = m;
                                             }
                                         }
                                     }
-                                    // else: v6/other lengths skipped (scope)
                                 } else {
-                                    der_node skip;
-                                    if (der_next(gseq.content, gseq.content_len,
-                                                 &g, &skip) != 0) return -1;
+                                    // Any other GeneralName form in a
+                                    // NameConstraints policy (directoryName,
+                                    // rfc822Name, URI, otherName, x400,
+                                    // ediParty, ...) FAILS the parse — we
+                                    // cannot enforce it, so we must not
+                                    // accept the chain (cryptoholes #3/#4).
+                                    return -1;
                                 }
                             }
                         }

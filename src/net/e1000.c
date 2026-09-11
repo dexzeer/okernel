@@ -392,6 +392,25 @@ void e1000_poll(void) {
     while (rx_descs[rx_cur].status & RXD_STAT_DD) {
         uint16_t len = rx_descs[rx_cur].length;
 
+        // Entropy: packet-arrival timing is network jitter the local
+        // attacker doesn't fully control (INPUT class for the CPRNG
+        // tiers). Sample is RDTSC + length + ring index — never packet
+        // contents (attacker-controlled bytes must not dominate the pool;
+        // the SHA-256 pool conditioner would contain them anyway, but
+        // timing-only is the honest claim). Weak hook: text build has no
+        // rand.o (same pattern as keyboard.c).
+        {
+            extern void rand_stir_src(const uint8_t e[32], int src) __attribute__((weak));
+            if (rand_stir_src) {
+                uint64_t t = 0;
+                __asm__ volatile("rdtsc" : "=A"(t));
+                uint8_t sample[32];
+                for (int i = 0; i < 32; i++)
+                    sample[i] = (uint8_t)(((t >> ((i & 7) * 8)) & 0xFF) ^ (len + rx_cur + i));
+                rand_stir_src(sample, 0x04 /* RAND_SRC_INPUT */);
+            }
+        }
+
         serial_puts("[e1000_rx] pkt len=");
         serial_putchar(hex[(len >> 8) & 0xF]);
         serial_putchar(hex[(len >> 4) & 0xF]);

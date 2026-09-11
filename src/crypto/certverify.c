@@ -212,7 +212,9 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
 // subject name of a constrained type must match >= 1 permitted entry
 // (when any exist) and no excluded entry. Unconstrained types and
 // absent extensions pass silently. Only SAN dNSName/iPAddress names are
-// examined (the parser's DNS/v4 scope); CN is not a SAN and is ignored.
+// examined (the parser admits only DNS/IPv4 names into the model — any
+// other constrained name form fails the parse first, so there is nothing
+// left unenforced here); CN is not a SAN and is ignored.
 static int ci_byte(uint8_t c) {
     if (c >= 'A' && c <= 'Z') c += 32;
     return c;

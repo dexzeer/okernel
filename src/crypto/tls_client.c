@@ -93,23 +93,27 @@ static int ticket_host_eq(const char a[64], const char* b) {
     }
 }
 
-// Expiry check against `now_ms` (0 = clock unknown → never expire on age;
-// a zero lifetime still rejects — the server said "don't resume").
+// Expiry check against `now_ms` (cryptoholes #7: freshness REQUIRES an
+// explicit trusted time — now_ms == 0 (clock unknown) is NOT fresh, never
+// "don't expire". The old zero-means-eternal mode let tls_ticket_have()
+// report arbitrarily old tickets as fresh. A zero lifetime still rejects
+// (the server said "don't resume").
 // NOTE: freestanding i386 has no 64-bit divide (no libgcc) — compare in
 // milliseconds with a multiply, never divide.
 static int ticket_fresh(const struct tls_ticket_slot* s, uint64_t now_ms) {
     if (!s->used || s->ticket_len == 0 || s->lifetime == 0) return 0;
-    if (now_ms != 0 && now_ms >= s->received_ms) {
+    if (now_ms == 0) return 0; // unknown clock: fail closed, not eternal
+    if (now_ms >= s->received_ms) {
         if (now_ms - s->received_ms > (uint64_t)s->lifetime * 1000u) return 0;
     }
     return 1;
 }
 
-int tls_ticket_have(const char* host) {
+int tls_ticket_have(const char* host, uint64_t now_ms) {
     if (!host) return 0;
     for (int i = 0; i < TLS_TICKET_SLOTS; i++)
         if (ticket_host_eq(ticket_slots[i].host, host) &&
-            ticket_fresh(&ticket_slots[i], 0))
+            ticket_fresh(&ticket_slots[i], now_ms))
             return 1;
     return 0;
 }
@@ -448,6 +452,17 @@ static int tls_decrypt_one(struct tls_state* st, uint8_t key[32], uint8_t iv[12]
                                        enc, ct_len, enc + ct_len, pt) != 0)
         return -1;
     (*seq)++;
+    // Inner content-type + padding (RFC 8446 §5.4 — cryptoholes #6 was a
+    // FALSE POSITIVE, kept strip-first deliberately): the wire layout is
+    // content || zero-padding || inner_content_type, and the parse is to
+    // strip trailing zeros FIRST, then read the last remaining byte as the
+    // type. Type-first (read last byte, then strip) BREAKS close_notify:
+    // alert [01,00] + type 21 would strip the 0x00 description byte and
+    // misdeliver [01] (proven by test: type-first fails CLOSE_NOTIFY).
+    // Strip-first is provably safe: the type byte is last and nonzero for
+    // every valid record, so stripping can never reach past it into
+    // content. Zero-tailed content + padding stays ambiguous by design
+    // (indistinguishable — the receiver correctly delivers both).
     int plen = ct_len;
     while (plen > 0 && pt[plen - 1] == 0) plen--;
     if (plen == 0) return -1;

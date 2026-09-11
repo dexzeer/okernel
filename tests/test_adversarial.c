@@ -933,6 +933,21 @@ static void mock_run(int mode, struct mock_result* res) {
         x509_time n, nx;
         adv_clocks(&n, &nx);
         if (mode == MOCK_EXPIRED) n = nx;
+        // STAPLE modes validate openssl-minted responses (thisUpdate =
+        // wall-clock mint time, nextUpdate +7d). The mtime-frozen suite
+        // clock drifts behind wall time (fixtures age; skew tolerance is
+        // 1d), so these modes run on wall clock like STALE does — the
+        // chain windows are 10y wide, so wall stays inside for a decade.
+        // (Bisected 2026-09-11: mtime-clock +26h reds the good-staple
+        // check as future-dated. Environmental, not a stack bug.)
+        if (mode == MOCK_STAPLE || mode == MOCK_STAPLE_BAD ||
+            mode == MOCK_STAPLE_REVOKED) {
+            time_t tt = time(0);
+            struct tm* g = gmtime(&tt);
+            n.year = 1900 + g->tm_year; n.month = g->tm_mon + 1;
+            n.day = g->tm_mday; n.hour = g->tm_hour;
+            n.minute = g->tm_min; n.second = g->tm_sec;
+        }
         // STAPLE_STALE: the minted response is fresh as of real-now; run
         // the validation clock 30 days ahead so it reads as aged past its
         // 7-day nextUpdate (the stale condition, no openssl date tricks).
@@ -1437,9 +1452,11 @@ static void mock_section(void) {
     CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
           memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
           "NewSessionTicket consumed, body still delivered");
-    CHECK(tls_ticket_have("evil.example.com"),
+    CHECK(tls_ticket_have("evil.example.com", 1000000),
           "ticket cached for the host after NST");
-    CHECK(!tls_ticket_have("other.example.com"),
+    CHECK(!tls_ticket_have("evil.example.com", 0),
+          "unknown clock (0) is not fresh (cryptoholes #7)");
+    CHECK(!tls_ticket_have("other.example.com", 1000000),
           "no ticket cached for other hosts");
     mock_run(MOCK_NST_BAD, &res);
     CHECK(res.r == TLS_STEP_ERR,
@@ -1468,7 +1485,7 @@ static void mock_section(void) {
     CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
           memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
           "oversize-nonce flight still completes");
-    CHECK(!tls_ticket_have("evil.example.com"),
+    CHECK(!tls_ticket_have("evil.example.com", 1000000),
           "oversize nonce dropped, nothing stored");
     mock_run(MOCK_STAPLE, &res);
     CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
@@ -1702,6 +1719,50 @@ static void name_section(void) {
         if (fl > 0)
             CHECK(cert_verify(flight, fl, "www.example.com") == CV_ERR_CAFLAGS,
                   "excluded-namespace leaf rejected");
+    }
+    // cryptoholes #2/#3/#4/#5 — fail-closed parser limits. Each chain is
+    // otherwise fully valid (hostname matches, signatures good); the ONLY
+    // defect is unenforceable/truncated policy, which must fail the parse
+    // (CV_ERR_PARSE), never silently vanish into an accept.
+    {
+        const char* ovc[4] = { "tests/adversarial/at_nc_over_leaf.der",
+                               "tests/adversarial/at_nc_over.der",
+                               "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), ovc, 3);
+        CHECK(fl > 0, "nc-overflow flight builds");
+        if (fl > 0)
+            CHECK(cert_verify(flight, fl, "www.a.example.com") == CV_ERR_PARSE,
+                  "5-constraint NC (cap 4) fails closed, not truncated");
+    }
+    {
+        const char* dnc[4] = { "tests/adversarial/at_nc_dir_leaf.der",
+                               "tests/adversarial/at_nc_dir.der",
+                               "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), dnc, 3);
+        CHECK(fl > 0, "nc-dirname flight builds");
+        if (fl > 0)
+            CHECK(cert_verify(flight, fl, "www.example.com") == CV_ERR_PARSE,
+                  "directoryName NC fails closed (unenforceable here)");
+    }
+    {
+        const char* v6c[4] = { "tests/adversarial/at_nc_ip6_leaf.der",
+                               "tests/adversarial/at_nc_ip6.der",
+                               "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), v6c, 3);
+        CHECK(fl > 0, "nc-ipv6 flight builds");
+        if (fl > 0)
+            CHECK(cert_verify(flight, fl, "www.example.com") == CV_ERR_PARSE,
+                  "IPv6 NC fails closed (unenforceable here)");
+    }
+    {
+        const char* soc[4] = { "tests/adversarial/at_san_over.der",
+                               "tests/adversarial/at_int.der",
+                               "tests/adversarial/at_root.der" };
+        uint32_t fl = build_cert_msg(flight, sizeof(flight), soc, 3);
+        CHECK(fl > 0, "san-overflow flight builds");
+        if (fl > 0)
+            CHECK(cert_verify(flight, fl, "h0.example.com") == CV_ERR_PARSE,
+                  "17-SAN leaf (cap 16) fails closed, not truncated");
     }
     // Hostname discipline: overlong + non-ASCII rejected, never truncated.
     {

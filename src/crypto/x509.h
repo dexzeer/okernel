@@ -82,12 +82,14 @@ typedef struct {
     const uint8_t* aki; uint32_t aki_len; int has_aki;
     const uint8_t* ski; uint32_t ski_len; int has_ski;
 
-    // NameConstraints (2.5.29.30): dNSName + iPAddress permitted/excluded
-    // subtrees (views for DNS; copied addr+mask for IP). has_nc = present.
-    // Other GeneralName types are skipped (documented v4/DNS-only scope).
-    // Enforcement (certverify.c, per name type, only when that type is
-    // constrained): every constrained-type name below the CA must match
-    // >= 1 permitted entry (if any exist) and no excluded entry.
+    // NameConstraints (2.5.29.30): NARROW FAIL-CLOSED validator.
+    // dNSName + IPv4 iPAddress permitted/excluded subtrees are recorded
+    // AND enforced (see nc_pair_ok in certverify.c). ANY other GeneralName
+    // form present in the policy (directoryName, rfc822Name, URI,
+    // otherName, x400Address, ediPartyName, IPv6 addresses, ...) FAILS
+    // THE PARSE — unenforceable policy must never silently vanish into an
+    // accept (cryptoholes #2/#3/#4). Overflow past X509_MAX_NC per list
+    // likewise fails; policy is never truncated.
 #define X509_MAX_NC 4
     struct { const uint8_t* p; uint32_t len; } permit_dns[X509_MAX_NC];
     int n_permit_dns;

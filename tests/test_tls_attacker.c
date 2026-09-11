@@ -112,6 +112,7 @@ int main(int argc, char** argv) {
     if (getenv("TLSA_PORT")) port = atoi(getenv("TLSA_PORT"));
 
     // Fail-closed clock from wall time.
+    uint64_t wall_ms = 0;
     {
         time_t tt = time(NULL);
         struct tm* g = gmtime(&tt);
@@ -119,6 +120,7 @@ int main(int argc, char** argv) {
                           g->tm_hour, g->tm_min, g->tm_sec };
         x509_set_now(&now);
         printf("[tlsa] clock: %04d-%02d-%02d\n", now.year, now.month, now.day);
+        wall_ms = (uint64_t)tt * 1000u;
     }
     // Trust a test root (host-only hook — never in production). The hook
     // holds ONE SPKI hash, so one root per process: argv[3] (or TLSA_ROOT)
@@ -159,7 +161,7 @@ int main(int argc, char** argv) {
         if (n > 0) {
             printf("[tlsa] first bytes: %.60s\n", out);
             printf("[tlsa] ticket cached: %s\n",
-                   tls_ticket_have("evil.example.com") ? "yes" : "no");
+                   tls_ticket_have("evil.example.com", wall_ms) ? "yes" : "no");
         }
         close(sock_fd); sock_fd = -1;
         if (n < 0) {
