@@ -62,8 +62,13 @@ The Big Missing Foundations
          hardening. Session resumption (NST store + PSK offer/accept/fallback,
          mock-proven incl. independent binder check); OCSP status_request sent
          + staple noted (validation deferred, page says so); TOFU leaf pinning
-         + reason-specific SECURITY WARNING page. Still deferred: OCSP
-         validation, pin override UX, AES-GCM.
+         + reason-specific SECURITY WARNING page. 2026-09-11 (P2 round):
+         OCSP response validation DONE (issuer-signed only, freshness,
+         openssl-minted mock proofs good/revoked/stale/malformed); TOFU
+         pins persisted via PFS `/.pins` (proven across reboots); root
+         store audited (14 anchors, reproducible). Still deferred: OCSP
+         delegated responders, pin override UX, path policies, AES-GCM,
+         multi-session, const-time asm.
 
     [x] Adversarial security testing of TLS/PKI — DONE 2026-09-09,
         EXTENDED 2026-09-10 (P-384 CV, split/truncated/SH-flip/EE-flip,

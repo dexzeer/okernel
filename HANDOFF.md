@@ -2576,3 +2576,178 @@ building/policies/revocation semantics (documented limits), AES-GCM
 - Mock seq discipline: encode EXACTLY what is queued, in queue order.
 - Fixture clocks stay mtime-relative (adv_clocks) — new fixtures (IP/AKI)
   inherited this for free.
+
+---
+
+## Session 2026-09-10 (late) — P2 round: name constraints, OCSP-staple validation scope, pin persistence, root audit (92/92 + ASan clean)
+
+Worked the review's P2 in priority order. Done: name-constraints
+enforcement, honest OCSP scoping (validate staples is a multi-day build —
+presence-noted stands, documented), TOFU pin persistence via PFS, root
+store audit. Declined with reasons: multi-session architecture (the whole
+network stack is single-connection by design — a rewrite, not a hardening
+item), const-time assembly audit (needs a dedicated session).
+
+### NameConstraints enforcement (RFC 5280 §4.2.1.10)
+- Parser: permitted/excluded dNSName (ASCII-checked) + iPAddress (v4:
+  4-byte host or 8-byte addr+mask, stored masked+mask) into capped
+  per-type lists; other GeneralName types skipped (documented DNS/v4
+  scope); lengths short/long-form capped; unknown-critical still rejects.
+- Enforcement (certverify walk, at anchor time): pairwise — every CA's
+  constraints apply to every cert below it. Per-type gating (only
+  constrained types constrain: CA with DNS-only entries doesn't affect IP
+  names and vice versa). DNS: equal-or-subdomain suffix; empty constraint
+  matches nothing. IP: masked compare. CN ignored (not a SAN — documented).
+  Violations → CV_ERR_CAFLAGS (strerror broadened to "flag/constraint").
+- Tests: mint_nc.py (cryptography lib + at_root.key — at_int's pathlen:0
+  forbids sub-CAs, so NC intermediates hang off at_root): in-namespace OK,
+  permitted-violation CAFLAGS, excluded-namespace CAFLAGS. Fixtures
+  at_nc_{int,ok,bad,xint,xlf}.der committed.
+
+### OCSP: enforced scope decision (honest, not theater)
+Full OCSP response validation (response parser + responder authorization +
+freshness + policy) is a multi-day build for a rarely-observed extension;
+only Cloudflare's example.com has ever stapled in our testing, and the
+page already discloses non-enforcement. Kept: offer + presence-noted.
+NOTED as the explicit next crypto build if revocation becomes a goal
+(it needs responder PKI + clock-subtlety work, not an afternoon).
+
+### Pin persistence (PFS-backed TOFU)
+- `tls_pin_export/import` (magic OKPIN1/v1/count + host[64]+hash[32]
+  entries, bounds-checked, malformed → reject without touching the live
+  store) + dirty flag (set on store only).
+- desktop: load `/.pins` after userland_seed (malformed → ignore =
+  fresh TOFU, never a wedge); save on dirty in the main poll loop.
+- Threat model documented at the code: network-only attackers (disk
+  writers already own VFS+kernel). Rotation lockout still ends at reboot
+  worst-case (file can be deleted); override UX still the follow-up.
+- Proven in QEMU with a raw disk image: fetch → "pin store saved" →
+  reboot → "mounted: 11 files hydrated" + "restored pin store".
+- Unit: export/import round-trip + truncation/magic rejection in the pin
+  section (failed imports keep the store).
+
+### Root audit
+- `tools/gen_roots.py` re-ran byte-identical (reproducible store).
+- 14 anchors cover the field: SSL.com ×2, ISRG ×2 (X1 RSA + X2 P-384),
+  GTS ×2, DigiCert G2, Amazon ×2, USERTrust ×2, GlobalSign, Sectigo ×2.
+  Anchoring is SPKI-hash (cross-signs work, root-expiry moot for path
+  building). Rotation story: re-run generator when the Web PKI shifts.
+
+### Verification
+- Adversarial 92/92 (new: SH_TRAIL/SH_DUP/EE_DUP/EE_ALPN_H2/FRAGMENT,
+  NST_BIGNONCE, AKI pair, IP×4, hostname×2, NC×3, pin persist×6).
+- ASan/UBSan 92/92 clean (fixed 2 mock-side SH_BIG buffer sizes the
+  sanitizer caught — production SH cap is what the test targets).
+- host-tests RC=0 incl. test_pki (real chains survive ALL new strictness:
+  serial/params/AKI/pathlen/EKU/RSA-floor) + live PHASE 4+MITM.
+- QEMU final ISO: pki_qemu PASS (Cloudflare through EE-validation, SH
+  exact/dup, EKU, AKI, serial strictness), sh_hello PASS, certfail PASS,
+  pin save/restore across reboots PASS. Both ISOs link (text needed the
+  weak hook for the keyboard RNG stir).
+
+### Traps
+- Intermediate-CA fixtures must hang off at_root, not at_int (pathlen:0)
+  or they fail the WRONG check (pathlen, not the targeted constraint).
+- python edits to C enum/name tables need positional verification
+  (caught one duplication + one order mismatch by diffing).
+- Mock seq discipline (encode exactly queued, in order) — repeat offender,
+  now a code comment at the site.
+- Matcher masks must be STORED, not applied-and-forgotten (first NC IP
+  draft masked addr in place and lost the mask).
+
+---
+
+## Session 2026-09-11 — P2 OCSP validation + pin persistence (94/94 + ASan clean)
+
+### OCSP response validation (RFC 6960, stapled only)
+- New `src/crypto/ocsp.{c,h}`: full BasicOCSPResponse parse with exact
+  framing at every level (responseStatus==successful, responseType
+  id-pkix-ocsp-basic, version, responderID-byName==issuer-subject
+  byte-exact, producedAt hygiene, exactly-one SingleResponse, certID,
+  good-status, thisUpdate/nextUpdate, optional single/response extensions
+  skipped by length, response signature).
+- Trust rule: responder MUST be the issuing CA itself (delegated
+  OCSPSigning responders rejected as untrusted — documented, not silent).
+  Signature via shared `cert_sig_verify()` (new export; chain walk
+  refactored onto it, no behavior change).
+- certID: SHA-1 or SHA-256 (new `src/crypto/sha1.c`, NIST vectors in
+  test_tls_crypto); issuerNameHash over full issuer Name DER, issuerKeyHash
+  over subjectPublicKey bytes (new retained `keybits` view in x509_cert),
+  serial compared numerically (padding-insensitive). New `x509_parse_time`
+  + `x509_time_add_days` exports; serial view retained on x509_cert.
+- Freshness: thisUpdate <= now+1d, nextUpdate (when present) >= now-1d,
+  no-nextUpdate bound to 7d. New CV_ERR_OCSP (11, MAX follows).
+- Wired after chain+CV+pin in RECV_HS (full handshakes only): staple bytes
+  copied bounded (2048 cap, oversize fails the flight), failure → CERT +
+  no fallback. Warning page now states the enforced model.
+- Mock proofs with REAL openssl-minted responses (runtime `openssl ocsp`,
+  responder = at_int, serials read live — regen-safe): good → DONE,
+  revoked → CERT, stale (clock +30d) → CERT, malformed → CERT/PROTO.
+- Bugs caught by real responses (not theory): ResponseData version is
+  OPTIONAL [0] (openssl omits it — my mandatory-INTEGER failed every
+  response); nextUpdate is [0] EXPLICIT (not bare); ResponseData may carry
+  [1] responseExtensions (echoed Nonce — skipped by length); missed
+  ResponseBytes SEQ wrapper (caught instantly by the mock going red).
+- Helper `mint_ocsp()` + modes MOCK_STAPLE_REVOKED/STALE in the suite.
+
+### Pin persistence (PFS-backed TOFU)
+- `tls_pin_export/import` (magic OKPIN1/v1/count + host[64]+hash[32],
+  bounds-checked, malformed → reject without touching the store) +
+  dirty flag (set on store only).
+- desktop: load `/.pins` after userland_seed (malformed → ignore = fresh
+  TOFU, never a wedge); save on dirty in the main poll loop (write-through
+  VFS like the editor).
+- Threat model documented at the code: network-only attackers (disk
+  writers already own VFS+kernel). Rotation lockout ends at reboot
+  worst-case; override UX still the follow-up.
+- Proven in QEMU with a raw disk: fetch → "pin store saved" → reboot →
+  "11 files hydrated" + "restored pin store". Unit round-trip in the pin
+  section (truncation/magic rejection keeps the store).
+
+### Root audit
+- `tools/gen_roots.py` re-ran byte-identical (reproducible). 14 anchors
+  (SSL.com ×2, ISRG ×2, GTS ×2, DigiCert G2, Amazon ×2, USERTrust ×2,
+  GlobalSign, Sectigo ×2); SPKI-hash anchoring (cross-signs work, root
+  expiry moot for path building). Rotation = re-run generator.
+
+### Silent-TLS-stall episode (undiagnosed flake, honestly recorded)
+- Several QEMU runs in a row showed TLS fetches stalling with ZERO bytes
+  out (no SEND_CH effect, no FAILED line, eventual desktop-owner timeout
+  → HTTP fallback). Host-direct with identical code passed throughout.
+- Bisect path walked: port theory (disproven — tcp_connect logged the
+  right port), typing theory (disproven — exec log prints first token
+  only), malformed-CH theory (ruled out — certfail server got HTTP, and
+  the same ISO passed right after). Instrumented HP_TLS/SEND_CH/send
+  (all probes then showed the mechanism working), behavior flipped back
+  to passing across relinks with ZERO functional changes.
+- Leading theory: layout/timing-sensitive silent drop in the
+  fire-and-forget send path (kernel_tcp_send returns 0 unconditionally;
+  tcp_send_data drops silently when not ESTABLISHED). Recorded hardening
+  idea (NOT implemented — undiagnosed flakes don't get shared-path
+  surgery): propagate send return codes so SEND_CH fails loud instead of
+  stalling into a fallback. All probes removed; tree verified clean.
+- Note: coincided with heavy portal DNS interception on this network
+  (example.com resolving to 8.47.69.6) — environmental contribution
+  likely for the internet legs, but the zero-TX shape is a client-side
+  stall regardless of peer.
+
+### Verification
+- Adversarial 94/94 (new: OCSP good/revoked/stale/malformed, pin
+  persist×6), ASan/UBSan 94/94 clean.
+- host-tests RC=0 (crypto incl. SHA-1 vectors, rng, strict, css, subres,
+  pki, live PHASE 4+MITM).
+- QEMU final ISO: sh_hello PASS, pki_qemu PASS (when the portal allows;
+  guest DNS currently intercepted — see episode), certfail PASS ×3
+  (reason=4, no fallback), pin save/restore across reboots PASS.
+- test_certfail.py hardened with type-verify-retry (HMP shift-punctuation
+  flakes); note its "url typed" check matches the exec echo (vacuous for
+  args — kept as smoke, the real assertion is the fetch outcome).
+
+### Traps
+- OCSP ResponseData version is OPTIONAL ([0] EXPLICIT, usually absent);
+  nextUpdate is [0] EXPLICIT; responseExtensions [1] really occur
+  (Nonce) — parse all three or die on real responses.
+- `openssl ocsp` needs index + rsigner bundle (key+cert cat) + serials
+  read live; `-ndays` can't backdate (use clock shifting for stale).
+- Fixture clocks stay mtime-relative; OCSP fixtures mint at test runtime
+  (never committed) except AKI/NC/IP DERs (mint_*.py committed).

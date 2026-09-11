@@ -18,6 +18,8 @@ static uint8_t g_extra_trusted[32];
 static int g_extra_trusted_set = 0;
 #endif
 
+static int nc_pair_ok(const x509_cert* issuer, const x509_cert* subject);
+
 static int spki_in_roots(const x509_cert* cert) {
     uint8_t hash[32];
     sha256(cert->spki.p, cert->spki.len, hash);
@@ -45,23 +47,31 @@ void cert_verify_trust_extra(const uint8_t* spki, uint32_t spki_len) {
 }
 #endif
 
-static int verify_sig(const x509_cert* cert, const x509_cert* issuer) {
-    int alg = cert->sig_alg;
-    if (alg == X509_SIG_RSA_SHA256 || alg == X509_SIG_RSA_SHA384 ||
-        alg == X509_SIG_RSA_SHA512) {
+// Explicit-argument signature verification (shared by the chain walk and
+// the OCSP module): verify `sig` over `tbs` with `issuer`'s key under the
+// given signature algorithm (chain signatures AND OCSP response
+// signatures both use PKCS#1 v1.5 for RSA — never PSS outside CV).
+int cert_sig_verify(int sig_alg, const x509_cert* issuer,
+                    const uint8_t* tbs, uint32_t tbs_len,
+                    const uint8_t* sig, uint32_t sig_len) {
+    if (sig_alg == X509_SIG_RSA_SHA256 || sig_alg == X509_SIG_RSA_SHA384 ||
+        sig_alg == X509_SIG_RSA_SHA512) {
         rsa_pub k;
         if (rsa_pub_from_x509(issuer, &k) != 0) return -1;
-        return rsa_verify_pkcs1(&k, alg, cert->tbs.p, cert->tbs.len,
-                                cert->signature.p, cert->signature.len);
+        return rsa_verify_pkcs1(&k, sig_alg, tbs, tbs_len, sig, sig_len);
     }
-    if (alg == X509_SIG_ECDSA_SHA256 || alg == X509_SIG_ECDSA_SHA384) {
+    if (sig_alg == X509_SIG_ECDSA_SHA256 || sig_alg == X509_SIG_ECDSA_SHA384) {
         if (issuer->key_type != X509_KEY_EC_P256 &&
             issuer->key_type != X509_KEY_EC_P384) return -1;
-        return ec_verify(alg, issuer->ec_point, issuer->ec_point_len,
-                         cert->tbs.p, cert->tbs.len,
-                         cert->signature.p, cert->signature.len);
+        return ec_verify(sig_alg, issuer->ec_point, issuer->ec_point_len,
+                         tbs, tbs_len, sig, sig_len);
     }
     return -1;
+}
+
+static int verify_sig(const x509_cert* cert, const x509_cert* issuer) {
+    return cert_sig_verify(cert->sig_alg, issuer, cert->tbs.p, cert->tbs.len,
+                           cert->signature.p, cert->signature.len);
 }
 
 int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname) {
@@ -178,10 +188,91 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
 
         if (verify_sig(subject, issuer) != 0) return CV_ERR_CHAIN;
 
-        // anchored?
-        if (spki_in_roots(issuer)) return CV_OK;
+        // anchored? Name constraints apply before accepting (below).
+        if (spki_in_roots(issuer)) {
+            // issuer is certs[i+1]: its constraints (and every CA above
+            // the leaf up to it — enforced pairwise as the walk descended
+            // is NOT how RFC does it; constraints accumulate from ALL CAs
+            // above each subject) — so check every issuer/subject pair
+            // with the subject below the issuer now that the anchor holds.
+            for (int a = 1; a <= i + 1; a++) {
+                for (int b = 0; b < a; b++) {
+                    if (nc_pair_ok(&certs[a], &certs[b]) != 0)
+                        return CV_ERR_CAFLAGS;
+                }
+            }
+            return CV_OK;
+        }
     }
     return CV_ERR_ROOT;
+}
+
+// ---- NameConstraints enforcement (P2 review round) ----
+// Per name TYPE, gated on the issuer constraining that type: every
+// subject name of a constrained type must match >= 1 permitted entry
+// (when any exist) and no excluded entry. Unconstrained types and
+// absent extensions pass silently. Only SAN dNSName/iPAddress names are
+// examined (the parser's DNS/v4 scope); CN is not a SAN and is ignored.
+static int ci_byte(uint8_t c) {
+    if (c >= 'A' && c <= 'Z') c += 32;
+    return c;
+}
+
+// DNS constraint match (RFC 5280 §4.2.1.10): equal, or subject ends with
+// "." + constraint. Empty constraint matches nothing.
+static int dns_constrained_match(const uint8_t* sub, uint32_t sl,
+                                 const uint8_t* con, uint32_t cl) {
+    if (cl == 0 || sl < cl) return 0;
+    for (uint32_t i = 0; i < cl; i++)
+        if (ci_byte(sub[sl - cl + i]) != ci_byte(con[i])) return 0;
+    if (sl == cl) return 1;
+    return sub[sl - cl - 1] == '.';
+}
+
+static int nc_pair_ok(const x509_cert* issuer, const x509_cert* subject) {
+    if (!issuer->has_nc) return 0;
+    // DNS SANs.
+    for (int s = 0; s < subject->san_count; s++) {
+        const uint8_t* nm = subject->san[s].p;
+        uint32_t nl = subject->san[s].len;
+        if (issuer->n_exclude_dns > 0 || issuer->n_permit_dns > 0) {
+            int permitted = (issuer->n_permit_dns == 0);
+            for (int k = 0; k < issuer->n_permit_dns; k++)
+                if (dns_constrained_match(nm, nl, issuer->permit_dns[k].p,
+                                          issuer->permit_dns[k].len)) {
+                    permitted = 1;
+                    break;
+                }
+            if (!permitted) return -1;
+            for (int k = 0; k < issuer->n_exclude_dns; k++)
+                if (dns_constrained_match(nm, nl, issuer->exclude_dns[k].p,
+                                          issuer->exclude_dns[k].len))
+                    return -1;
+        }
+    }
+    // IP SANs.
+    for (int s = 0; s < subject->ip_san_count; s++) {
+        const uint8_t* ip = subject->ip_san[s];
+        if (issuer->n_exclude_ip > 0 || issuer->n_permit_ip > 0) {
+            int permitted = (issuer->n_permit_ip == 0);
+            for (int k = 0; k < issuer->n_permit_ip; k++) {
+                int m = 1;
+                for (int b = 0; b < 4; b++)
+                    if ((ip[b] & issuer->permit_ip[k].mask[b]) !=
+                        issuer->permit_ip[k].addr[b]) { m = 0; break; }
+                if (m) { permitted = 1; break; }
+            }
+            if (!permitted) return -1;
+            for (int k = 0; k < issuer->n_exclude_ip; k++) {
+                int m = 1;
+                for (int b = 0; b < 4; b++)
+                    if ((ip[b] & issuer->exclude_ip[k].mask[b]) !=
+                        issuer->exclude_ip[k].addr[b]) { m = 0; break; }
+                if (m) return -1;
+            }
+        }
+    }
+    return 0;
 }
 
 int cert_leaf(const uint8_t* msg_body, uint32_t msg_len, x509_cert* leaf) {
@@ -200,6 +291,41 @@ int cert_leaf(const uint8_t* msg_body, uint32_t msg_len, x509_cert* leaf) {
     return x509_parse(msg_body + p, entry_len, leaf);
 }
 
+// Step one CertificateEntry (cert DER + extensions), exact bounds. *p is
+// the entry start (at the 3-byte cert length); on success *p moves past
+// the whole entry. Returns 0/-1.
+static int cert_entry_step(const uint8_t* msg, uint32_t msg_len, uint32_t* p) {
+    if (*p + 3 > msg_len) return -1;
+    uint32_t entry_len = ((uint32_t)msg[*p] << 16) |
+                         ((uint32_t)msg[*p+1] << 8) | msg[*p+2];
+    *p += 3;
+    if (entry_len == 0 || *p + entry_len > msg_len) return -1;
+    *p += entry_len;
+    if (*p + 2 > msg_len) return -1;
+    uint32_t ext_len = ((uint32_t)msg[*p] << 8) | msg[*p+1];
+    *p += 2;
+    if (*p + ext_len > msg_len) return -1;
+    *p += ext_len;
+    return 0;
+}
+
+int cert_issuer(const uint8_t* msg_body, uint32_t msg_len, x509_cert* issuer) {
+    if (msg_len < 7) return -1;
+    uint32_t ctx_len = msg_body[0];
+    uint32_t p = 1 + ctx_len;
+    if (p + 3 > msg_len) return -1;
+    uint32_t list_start = p + 3;
+    // Skip entry 0 (leaf), parse entry 1 (direct issuer).
+    uint32_t q = list_start;
+    if (cert_entry_step(msg_body, msg_len, &q) != 0) return -1;
+    if (q + 3 > msg_len) return -1;
+    uint32_t entry_len = ((uint32_t)msg_body[q] << 16) |
+                         ((uint32_t)msg_body[q+1] << 8) | msg_body[q+2];
+    q += 3;
+    if (entry_len == 0 || q + entry_len > msg_len) return -1;
+    return x509_parse(msg_body + q, entry_len, issuer);
+}
+
 const char* cert_verify_strerror(int code) {
     switch (code) {
     case CV_OK:            return "ok";
@@ -209,10 +335,11 @@ const char* cert_verify_strerror(int code) {
     case CV_ERR_EXPIRED:   return "certificate expired";
     case CV_ERR_NOT_YET:   return "certificate not yet valid";
     case CV_ERR_HOSTNAME:  return "hostname mismatch";
-    case CV_ERR_CAFLAGS:   return "CA flag/pathlen violation";
+    case CV_ERR_CAFLAGS:   return "CA flag/constraint violation";
     case CV_ERR_NO_CERT:   return "empty certificate flight";
     case CV_ERR_KEYUSE:    return "key usage or strength violation";
     case CV_ERR_PINCHANGED: return "server key changed since first visit";
+    case CV_ERR_OCSP:      return "OCSP staple invalid/stale/revoked";
     default:               return "unknown";
     }
 }

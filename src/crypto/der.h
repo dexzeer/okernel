@@ -14,6 +14,7 @@
 #define DER_TAG_OCTET_STRING  0x04
 #define DER_TAG_NULL          0x05
 #define DER_TAG_OID           0x06
+#define DER_TAG_ENUMERATED    0x0A
 #define DER_TAG_UTF8_STRING   0x0C
 #define DER_TAG_PRINTABLE     0x13
 #define DER_TAG_IA5_STRING    0x16

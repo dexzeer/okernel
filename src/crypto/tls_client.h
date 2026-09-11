@@ -126,6 +126,12 @@ struct tls_state {
     // well-formed status_request. Presence only — content unenforced (see
     // tls_cert_has_staple). Surfaced for the warning-page honesty note.
     int got_staple;
+    // Stapled OCSP response bytes (copied for post-auth validation — the
+    // cert_body views stay alive, but an explicit bounded copy keeps the
+    // validator's lifetime independent). Cap 2048B (real staples run
+    // 500-1500B); larger staples fail the flight, not the parser.
+    uint8_t staple[2048];
+    uint32_t staple_len;
 
     // Handshake flight order: 0=expect EE, 1=CERT, 2=CV, 3=Finished.
     int hs_next;
@@ -185,6 +191,12 @@ int tls_client_run(const char* host, uint16_t port,
 // Test hook: tls_pin_clear() drops all pins.
 int tls_pin_check(const char* host, const uint8_t spki_hash[32]);
 void tls_pin_clear(void);
+// Persistence (desktop serializes to VFS `/.pins` on change, loads at
+// boot; network-attacker threat model — see tls_client.c).
+int tls_pin_dirty(void);
+void tls_pin_clean(void);
+uint32_t tls_pin_export(uint8_t* out, uint32_t cap); // bytes written, 0 = cap
+int tls_pin_import(const uint8_t* in, uint32_t len); // 0 ok, -1 malformed
 
 // ---- Session-ticket cache (RFC 8446 §4.6.1) ----
 // Process-global, freestanding-safe (static slots, no allocation). Keyed by

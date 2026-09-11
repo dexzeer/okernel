@@ -122,9 +122,12 @@ int tls_parse_certificate_verify(const uint8_t* cv_body, uint32_t cv_len);
 
 // OCSP staple presence in CertificateEntry extensions (RFC 8446 §4.4.2.1).
 // *present_out = 1 iff any entry carries a well-formed status_request.
-// Returns 0 on valid framing, -1 on malformed. Content unenforced (noted).
+// When non-NULL, *resp_out/*resp_len_out receive a view of the FIRST
+// staple's response bytes (inside `cert`) for validation. Returns 0 on
+// valid framing, -1 on malformed. Content unenforced here (see ocsp.c).
 int tls_cert_has_staple(const uint8_t* cert, uint32_t cert_len,
-                        int* present_out);
+                        int* present_out, const uint8_t** resp_out,
+                        uint32_t* resp_len_out);
 
 // Extract the CertificateVerify signature algorithm + raw signature bytes
 // (for cryptographic verification against the leaf key: ec.c / rsa.c).

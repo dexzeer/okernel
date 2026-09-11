@@ -612,15 +612,15 @@ uint32_t tls_build_client_hello_psk(uint8_t* out, uint32_t cap,
 // malformed framing (caller fails the flight, same discipline as the
 // structural parse above).
 //
-// NOTE on enforcement: presence is NOTED, content is NOT validated (no
-// OCSP response parser, no responder chain, no freshness check — a
-// multi-day build for a rarely-seen extension). The browser's SECURITY
-// WARNING page says revocation is unchecked, so this stays honest: staples
-// never break availability, never imply verification.
+// NOTE on enforcement: presence is NOTED here; content is validated by
+// ocsp.c at the caller's discretion (see tls_client.c RECV_HS).
 int tls_cert_has_staple(const uint8_t* cert, uint32_t cert_len,
-                        int* present_out) {
+                        int* present_out, const uint8_t** resp_out,
+                        uint32_t* resp_len_out) {
     if (!cert || !present_out) return -1;
     *present_out = 0;
+    if (resp_out) *resp_out = 0;
+    if (resp_len_out) *resp_len_out = 0;
     if (cert_len < 4) return -1;
     uint32_t ctx_len = cert[0];
     uint32_t p = 1 + ctx_len;
@@ -654,8 +654,12 @@ int tls_cert_has_staple(const uint8_t* cert, uint32_t cert_len,
                 cert[q] == 1) {
                 uint32_t rlen = ((uint32_t)cert[q+1] << 16) |
                                 ((uint32_t)cert[q+2] << 8) | cert[q+3];
-                if (4 + rlen <= el) {
+                if (4 + rlen <= el && !*present_out) {
+                    // First staple wins (a flight carries one per entry;
+                    // entries share the responder here — first suffices).
                     *present_out = 1;
+                    if (resp_out) *resp_out = cert + q + 4;
+                    if (resp_len_out) *resp_len_out = rlen;
                 }
             }
             q += el;
