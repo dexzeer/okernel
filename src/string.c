@@ -67,3 +67,4 @@ char* strncpy(char* dst, const char* src, unsigned int n) {
     for (; i < n; i++) dst[i] = 0;
     return dst;
 }
+

@@ -49,7 +49,7 @@ struct open_file {
 #define PROC_NSIG 3
 
 // Process control block.
-// Lifetime: created by process_create (usermode command / fork), reaped by
+// Lifetime: created by process_create (run/fork), reaped by
 // process_destroy (sys_exit path / shell). page_dir is the PHYS address of a
 // private directory (PD 0-767 private user-low, PD 768-1023 shared kernel).
 // kernel_stack is a HIGH virtual address (kmalloc'd); esp0_top is the TSS

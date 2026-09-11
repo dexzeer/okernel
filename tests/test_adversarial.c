@@ -708,13 +708,20 @@ static int mock_check_psk_offer(void) {
     if (eend > body_len) return 0;
     const uint8_t* id = NULL; uint32_t id_len = 0;
     const uint8_t* binder = NULL;
+    int modes_ok = 0; // psk_key_exchange_modes must offer psk_dhe_ke (1);
+    // real servers silently decline the PSK otherwise (interop 2026-09-11:
+    // we once sent mode 2 and every live server fell back — mock it).
     while (p + 4 <= eend) {
         uint16_t et = (uint16_t)((body[p] << 8) | body[p+1]);
         uint16_t l = (uint16_t)((body[p+2] << 8) | body[p+3]);
         p += 4;
         if (p + l > eend) return 0;
+        if (et == 45) { // psk_key_exchange_modes
+            for (uint16_t mi = 1; mi < l; mi++)
+                if (body[p + mi] == 1) modes_ok = 1;
+        }
         if (et == 41) { // pre_shared_key (last ext by construction)
-            if (l < 2 + 2 + 4 + 2 + 32) return 0;
+            if (l < 2 + 2 + 4 + 2 + 1 + 32) return 0;
             uint32_t q = p;
             uint32_t list_len = (body[q] << 8) | body[q+1]; q += 2;
             uint32_t ilen = (body[q] << 8) | body[q+1]; q += 2;
@@ -722,18 +729,22 @@ static int mock_check_psk_offer(void) {
             id = body + q; id_len = ilen; q += ilen + 4; // skip age
             if (q + 2 > p + l) return 0;
             uint32_t blen = (body[q] << 8) | body[q+1]; q += 2;
-            if (blen != 32 || q + 32 > p + l) return 0;
-            binder = body + q;
+            // RFC 8446 §4.2.11.2: binders<33..> with a u8-prefixed
+            // PskBinderEntry — 33B total, entry len byte must be 32.
+            if (blen != 33 || q + 33 > p + l) return 0;
+            if (body[q] != 32) return 0;
+            binder = body + q + 1;
         }
         p += l;
     }
     if (!id || !binder || id_len != psv_ticket_len) return 0;
+    if (!modes_ok) return 0; // no common kex mode: server must ignore PSK
     for (uint32_t i = 0; i < id_len; i++)
         if (id[i] != psv_ticket[i]) return 0;
     // Independent binder recompute: ClientHello1 = type || len(trunc) ||
-    // body[:trunc], trunc through the binders-length field (binder = last
-    // 32B of the message body).
-    uint32_t trunc = body_len - 32;
+    // body[:trunc], trunc right after the u16 binders-length field (the
+    // binder entry prefix + 32B value are the last 33B of the body).
+    uint32_t trunc = body_len - 33;
     uint8_t psk[32], early[32], bkey[32], th[32], want[32];
     tls_resumption_psk(psv_res_master, psv_nonce, psv_nonce_len, psk);
     tls_early_secret(psk, 32, early);

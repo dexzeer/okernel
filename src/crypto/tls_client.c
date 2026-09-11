@@ -561,11 +561,19 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                     age_obf, zero_binder, &binder_off);
                 if (psk_len != 0 && binder_off + 32 == psk_len) {
                     // Truncated transcript: type(1) || len(3, truncated) ||
-                    // body[0..truncated), truncated at the binders LENGTH
-                    // field (binder values excluded). This is ClientHello1
-                    // (RFC §4.2.11.2) — the server reconstructs the identical
-                    // prefix to check the binder.
-                    uint32_t trunc_body = binder_off - 4;
+                    // body[0..truncated), truncated right AFTER the u16
+                    // binders-length field (binder entry prefix + values
+                    // excluded). This is ClientHello1 (RFC §4.2.11.2) — the
+                    // server reconstructs the identical prefix to check the
+                    // binder. binder_off points at the binder VALUES (msg
+                    // units, incl 4B HS header); the u16 field starts 3B
+                    // earlier (u16 len + u8 entry len), and body units drop
+                    // the 4B header: trunc_body = binder_off - 3 + 2 - 4.
+                    // (An earlier revision used -4, then -7 — both wrong by
+                    // up to 2B; caught because real servers *and* the mock
+                    // disagreed with us. The mock's parse-driven trunc
+                    // body_len-33 was right all along.)
+                    uint32_t trunc_body = binder_off - 5;
                     tls_transcript bt;
                     tls_transcript_init(&bt);
                     {

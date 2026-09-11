@@ -2751,3 +2751,130 @@ NOTED as the explicit next crypto build if revocation becomes a goal
   read live; `-ndays` can't backdate (use clock shifting for stale).
 - Fixture clocks stay mtime-relative; OCSP fixtures mint at test runtime
   (never committed) except AKI/NC/IP DERs (mint_*.py committed).
+
+---
+
+## Next steps (2026-09-11 — live session, in progress)
+
+### 0. Land the current tree (uncommitted)
+- `M src/crypto/tls_client.c, src/okai.c, src/process.h, src/string.c` +
+  `?? tests/test_tls_attacker.c` (test_links/usermode/port-fix session —
+  verify green, then commit; message names the three items).
+
+### 1. Independent-stack interop loop (IN PROGRESS, then verify + commit)
+- Harness: portable Temurin JREs in `~/tls-att/` (17 present, **21 is the
+  one that runs the jars** — class v65), `apps/TLS-Server.jar`,
+  `tests/test_tls_attacker.c` (BSD sockets + `tls_client_run` + host-only
+  trust hook + wall clock + 25s deadline; unbuffered stdio).
+- DONE: full handshake vs CPython/OpenSSL 3.0 serving our test chain —
+  chain+hostname+CV verified, NST stored (192B/7200s), HTTP body received,
+  close_notify clean. Proves the whole client against a second stack.
+- TODO: RSA-leaf + P-384-leaf interop (bundles in `/tmp/opencode/`
+  — REBUILD as `~/tls-att/*bundle.pem`, /tmp gets wiped); resumption
+  double-run (call `tls_client_run` twice in-process → abbreviated?).
+- TLS-Attacker server sends a CANNED 77B ServerHello (no key_share/sv —
+  correctly rejected); real handshakes need `-workflow_trace_type` config
+  research (time-boxed, else defer — openssl + mock cover the space).
+- Housekeeping: kill stray `s_server`/java processes by PID (`echo $!`),
+  NEVER `pkill -f <pattern>` (matches your own shell → suicide, observed
+  twice); driver must keep the overall deadline (blocking `tls_client_run`
+  + timeout-0 recv spins forever otherwise).
+
+### 2. Trust-anchor termination gap (REAL BUG found via interop)
+- `certverify` anchors ONLY on in-flight SPKI match. Flights without a
+  root-key cert (openssl serving [leaf,int], i.e. most of the real web)
+  fail `CV_ERR_ROOT` even with a valid chain to a stored root.
+  Cloudflare works only because it ships a cross-cert.
+- Fix: store root subject Names in `roots.c` (extend `gen_roots.py`),
+  anchor by name match + verify with stored root key. Tests: mock 2-cert
+  flight (needs a `trust_extra`-style name hook for the test root).
+- Pre-req for calling this a general browser stack.
+
+### 3. Verify + commit
+- `make host-tests`, `make host-tests-asan` (slow), both ISOs link clean,
+  QEMU: `test_sh_hello.py`, `test_pki_qemu.py` (portal permitting),
+  `test_certfail.py`, `test_links.py`, `test_resume.py` as network allows.
+
+### 4. Deferred backlog (unchanged — oldest first)
+- OCSP delegated responders; pin override UX; path policies / full
+  constraints beyond NC; const-time assembly audit; X25519 extra vectors.
+- Rapid re-`okai` same-URL parse miss (desktop fetch-owner race).
+- `test_links` LINK leg + `test_resume.py` need real WiFi (offline legs
+  covered by `test_link_local.py`).
+- AES-GCM (0x1302) — excluded unless a target site refuses ChaCha20.
+
+---
+
+## Interop session results (2026-09-11 late — lands as commit below)
+
+### Proven (independent stacks)
+- Full TLS 1.3 handshakes vs CPython/OpenSSL 3.0 AND vs a from-scratch
+  pure-Python server (`/tmp/opencode/pyserver.py`, itself validated by
+  `openssl s_client` completing handshake+app-data against it):
+  P-256/ECDSA, RSA-PSS, P-384/ECDSA leaf chains — chain+hostname+CV live,
+  NST stored, HTTP body, close_notify clean. `make tls-interop` builds
+  `build-host/t_tlsa [port] [twice] [root.der]` (one root per process —
+  the host trust hook holds a single SPKI hash).
+- Live ABBREVIATED handshake vs pyserver: `t_tlsa 4447 twice` → PASS x2
+  (BINDER OK server-side, EE+Finished only, app data). Resumption logic
+  proven correct end-to-end (offer/binder/abbreviated/resumption keys).
+
+### Real PSK-offer bugs found + fixed (all covered by suite now)
+1. Missing PskBinderEntry u8 length prefix (binders u16=32 not 33) —
+   servers ignored the PSK (clean fallback hid it).
+2. psk_key_exchange_modes value 2 (invalid; correct psk_dhe_ke=1) —
+   servers decline (mock now checks modes and would have caught it).
+3. ClientHello1 truncation off by up to 2B (`binder_off-4`, then `-7`;
+   correct `-5` = values_off - 3 (u16+u8) + 2 (u16 kept) - 4 (HS hdr)).
+   Mock's parse-driven `body_len-33` was right all along; the 1-test
+   failure after fix #1 exposed it.
+- Mock `mock_check_psk_offer` now enforces RFC framing (33B/u8=32),
+  modes (dhe present), and independent binder recompute.
+
+### Pyserver bugs found (test-harness-only, all fixed there)
+- AAD length off-by-one (inner content length forgot the +1 type byte;
+  RFC S5.2 AAD uses OUTER header: 0x17 + ct_len incl. tag).
+- AAD type byte: outer 0x17, not inner 0x16.
+- Must echo client legacy session_id in SH (else `invalid session id`).
+- CCS payload is exactly 1 byte (`01`), not a header echo.
+- ALPN echo only when solicited (else `unsolicited extension`).
+- App-traffic seq RESETS per key change (RFC S5.3) — continuing seq
+  breaks every client; ours was right (`s_ap_seq=0` after flight seq 0).
+- Our empty-context `tls_derive_secret` for master confirmed correct
+  (s_client keylog cross-check); BOTH Derive "derived" steps use "".
+
+### OPEN: OpenSSL declines our PSK (deterministic, unexplained)
+- `t_tlsa 444[35] twice` round 2 → `tls_psk_do_binder:binder does not
+  verify` (fatal illegal_parameter), s_server AND python-openssl-server,
+  age 0 AND age 4s, all chains with matching roots.
+- Our offer is byte-perfect per RFC (verified over s_server's own `-msg`
+  hex dump: framing strictly valid, modes=01, binders 33/32, age honest,
+  ticket+nonce wire-exact) and verifies 4 ways (self-consistent KDF,
+  Python recompute, mock independent recompute, pyserver BINDER OK).
+- s_client resumes fine against the same servers (control passes).
+- Ruled out: framing, modes, binder math, res_master (pyserver-identical
+  + proves ours), nonce/ticket (wire-exact), age 0 (4s also rejected),
+  ALPN (s_client+ALPN resumes), slots (single-slot overwrite, pairs
+  intact), cipher/groups/SNI (same-or-superset), transience (3/3 deterministic).
+- Next probes (not yet tried): minimal-CH bisection (drop status_request
+  / shrink cipher list — no mechanism, but cheap); read OpenSSL
+  `tls_parse_ctos_psk` source when available; test a second independent
+  client stack against the same servers (Botan? GnuTLS?) to see if the
+  decline is OpenSSL-policy (not our bytes).
+- Resumption stays PROVEN (pyserver + mock matrix); OpenSSL-accept is
+  the open item, not resumption-correctness.
+
+### Housekeeping (learned hard)
+- NEVER `pkill -f <pattern>` (matches own shell → suicide ×3); kill by
+  PID from `ss -ltnp` (`grep -oP "pid=\K[0-9]+"`).
+- Connection aliasing across shell calls is the #1 time sink: always
+  match artifacts by client_random, single-conn logs, atomic commands.
+- `openssl s_server` serves ONLY the leaf from `-cert` (no chain!) —
+  use `-cert_chain <int+root>` for full flights.
+- s_server `-naccept N` EXITS after N accepts (mysterious refusals);
+  use large budgets. Single-threaded python servers wedge on half-open
+  conns (tee proxies!) — restart freely, never tee a single-threaded
+  server without half-close handling.
+- CPython does NOT read SSLKEYLOGFILE env — set `ctx.keylog_filename`.
+- OpenSSL ticket nonces observed as counters (`00..00`, `00..01`);
+  two NSTs per handshake; tickets 192B (openssl) — all server-opaque.
