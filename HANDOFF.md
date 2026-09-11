@@ -2878,3 +2878,54 @@ NOTED as the explicit next crypto build if revocation becomes a goal
 - CPython does NOT read SSLKEYLOGFILE env — set `ctx.keylog_filename`.
 - OpenSSL ticket nonces observed as counters (`00..00`, `00..01`);
   two NSTs per handshake; tickets 192B (openssl) — all server-opaque.
+
+---
+
+## Cryptoholes review disposition (2026-09-12, commit 3035064)
+
+Fresh external review (`cryptoholes.txt`, 7 findings) verified item by
+item against the tree, fixed, and re-attacked. Adversarial 103/103
+plain + ASan/UBSan, host-tests green, ISOs link, sh_hello PASS, interop
+regression green (P-256/RSA/P-384 full HS vs OpenSSL, resumption PASS
+x2 vs pyserver, TLS-Attacker canned flight still rejected).
+
+1. **RNG labels (Critical) — FIXED (tiered model).** Old gate (64B from
+   any 2 labelled classes) stood. New: declaring reseed needs window
+   bytes >= 64B (hw) / >= 128B (no hw) + >= 2 window classes at >= 32B
+   each + lifetime >= 2 incl. hardware bit (hw) / >= 3 BOOT+TIMER+INPUT
+   (no hw). RDSEED class (0x10, tried first) added; hw tier requires
+   actually-stirred hw bytes; NIC RX stirs INPUT timing (keyboard
+   already did). Labels bounded to 0x1F (no invented classes).
+   Verified live: QEMU guest (hw=0, fail-closed at boot) completes a
+   verified TLS handshake after typed input (chain verified in serial).
+   Residual risk documented in rand.h (deterministic-VM caveat).
+2. **NC overflow fail-open (High) — FIXED.** 5th+ constraint per list
+   now fails the parse (was silently dropped).
+3. **secure_zero missing (High) — ALREADY FIXED** (volatile wipe in
+   src/string.h, review #30). No action.
+4. **directoryName/DN + unsupported NC forms (Medium) — FIXED.**
+   Any NC GeneralName outside dNSName/IPv4-iPAddress fails the parse
+   (covers directoryName, rfc822, URI, otherName, x400, edi, IPv6).
+   Narrow-validator contract documented in x509.h; public-web risk
+   (constrained intermediates with exotic NC) accepted per review.
+5. **SAN/NC truncation (Medium) — FIXED.** Relevant SANs past caps
+   (16 DNS / 4 IPv4) fail; whole list still walked (late malformed
+   entries still fail). Irrelevant SAN forms + v6 SANs still skipped
+   (no match semantics — safe). Fixtures: at_nc_over/dir/ip6 (+leaves),
+   at_san_over (17 SANs); mint_nc.py mints hermetically off the frozen
+   leaf-mtime base (see below), 8 new CHECKs.
+6. **Padding parser (Medium) — FALSE POSITIVE, documented in code.**
+   Strip-first is provably correct (type byte last+nonzero stops the
+   strip; content never eaten). Type-first BREAKS close_notify
+   ([01,00]+21 strips the description byte — demonstrated: flipping
+   to type-first fails the CLOSE_NOTIFY suite test). Review's example
+   ([41,00]+17) parses correctly under strip-first.
+7. **Ticket clockless freshness (Low/Med) — FIXED.**
+   `tls_ticket_have(host, now_ms)`; 0/unknown is NOT fresh. Offer path
+   unchanged (already gated). Test asserts have(...,0)==0.
+
+Collateral fix (environmental, not the stack): OCSP good-staple test
+reddened when fixture mtime-clock drifted >24h behind wall minting
+(1d skew tolerance) — STAPLE modes now run on wall clock (chain
+windows are 10y wide); mint_nc.py fixtures mint off the frozen base
+so re-regens never rot.
