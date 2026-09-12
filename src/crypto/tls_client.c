@@ -14,6 +14,7 @@
 #include "sha512.h"
 #include <string.h>
 #include "tls_dbg.h"
+#include "memwipe.h" // secure_zero: unconditional, path-independent (#8)
 
 #ifdef KERNEL
 #include "rand.h"
@@ -48,12 +49,6 @@ static int tls_fill_random(uint8_t* out, uint32_t n) {
 #endif
 }
 
-int shared_is_zero(const uint8_t s[32]) {
-    uint8_t acc = 0;
-    for (int i = 0; i < 32; i++) acc |= s[i];
-    return acc == 0;
-}
-
 // ---- Session-ticket cache (RFC 8446 §4.6.1) ----
 // Process-global static slots (freestanding-safe, no allocation). One slot
 // per host; a new ticket for a known host replaces the old (latest wins —
@@ -82,15 +77,64 @@ static void ticket_host_copy(char dst[64], const char* src) {
     dst[i] = 0;
 }
 
-static int ticket_host_eq(const char a[64], const char* b) {
-    uint32_t i = 0;
-    for (;;) {
-        char ca = i < 64 ? a[i] : 0, cb = b[i];
-        if (ca != cb) return 0;
-        if (!ca) return 1;
-        i++;
-        if (i > 70) return 0;
+// ---- Hostname canonicalization (cryptoholes round 4, P0) ----
+// ONE canonical form feeds SNI, certificate matching, pin lookup/storage,
+// and ticket lookup/storage, so "this hostname is pinned" means exactly
+// what the certificate verifier checked. Form: ASCII lowercase, one
+// terminal dot removed (FQDN form), LDH labels (letters/digits/hyphen,
+// no empty/leading/trailing-hyphen labels, no underscores), total ≤ 63
+// (fits the pin/ticket slots; longer names fail closed here rather than
+// truncating into a colliding cache key). IPv4 literals pass through
+// unchanged (digits+dots satisfy the label rules; the matcher routes
+// them to iPAddress SANs). Non-ASCII (no IDNA in this stack), IPv6
+// literals, and empty names are rejected. Returns 0 + fills `out` on
+// success, -1 on invalid input (all callers fail closed).
+int tls_canon_host(char out[64], const char* in) {
+    if (!in) return -1;
+    uint32_t len = 0;
+    while (in[len]) {
+        len++;
+        if (len > 64) return -1; // overlong even before stripping
     }
+    if (len == 0) return -1;
+    if (in[len - 1] == '.') len--; // strip one FQDN dot ("a.." stays invalid)
+    if (len == 0 || len > 63) return -1;
+    uint32_t label_len = 0;
+    for (uint32_t i = 0; i < len; i++) {
+        char c = in[i];
+        if (c >= 'A' && c <= 'Z') c += 32; // ASCII fold
+        if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+              c == '-' || c == '.')) return -1;
+        if (c == '.') {
+            // Label just ended: must be non-empty and not end in '-'.
+            // (label_len==0 also catches a leading dot.)
+            if (label_len == 0 || out[i - 1] == '-') return -1;
+            label_len = 0;
+            out[i] = '.';
+            continue;
+        }
+        // Label must not start with '-'.
+        if (label_len == 0 && c == '-') return -1;
+        out[i] = c;
+        label_len++;
+    }
+    // Final label: non-empty (no trailing dot remains) and no trailing '-'.
+    if (label_len == 0 || out[len - 1] == '-') return -1;
+    out[len] = 0;
+    return 0;
+}
+
+// Byte-exact compare of canonical hostnames. Both sides are NUL-
+// terminated within 63 bytes by construction (tls_canon_host at every
+// entry point), so the loop always terminates at the NUL; the bound is
+// explicit (cryptoholes round 4, #9 — the old ternary-guarded form
+// confused -Warray-bounds once both sides became char[64]).
+static int ticket_host_eq(const char a[64], const char* b) {
+    for (uint32_t i = 0; i < 64; i++) {
+        if (a[i] != b[i]) return 0;
+        if (a[i] == 0) return 1;
+    }
+    return 0; // unreachable (canonical names NUL-terminate by <= 63)
 }
 
 // Expiry check against `now_ms` (cryptoholes #7: freshness REQUIRES an
@@ -111,8 +155,12 @@ static int ticket_fresh(const struct tls_ticket_slot* s, uint64_t now_ms) {
 
 int tls_ticket_have(const char* host, uint64_t now_ms) {
     if (!host) return 0;
+    // Canonicalize at the boundary (cryptoholes round 4, P0): a ticket
+    // stored for "example.com" must be found via "EXAMPLE.COM." too.
+    char chost[64];
+    if (tls_canon_host(chost, host) != 0) return 0;
     for (int i = 0; i < TLS_TICKET_SLOTS; i++)
-        if (ticket_host_eq(ticket_slots[i].host, host) &&
+        if (ticket_host_eq(ticket_slots[i].host, chost) &&
             ticket_fresh(&ticket_slots[i], now_ms))
             return 1;
     return 0;
@@ -123,23 +171,180 @@ void tls_ticket_clear(void) {
         ((uint8_t*)ticket_slots)[i] = 0;
 }
 
-// Case-insensitive byte match (HTTP header names are case-insensitive;
-// no locale, no tolower table — ASCII fold inline).
-static int hdr_name_at(const uint8_t* p, uint32_t avail, const char* name) {
+// ---- HTTP framing parser (cryptoholes round 4, P1) ----
+// Line-oriented header analysis SHARED by the completeness gate
+// (tls_response_complete below) and the body consumer (http_dechunk in
+// net/network.c). One parser, zero framing differentials by construction:
+// both sides read the same verdict struct (declared in tls_client.h, full
+// policy documented there). The old code did substring scans
+// ("content-length:" / "chunked" matchable mid-line inside another
+// header's value); this parses header-line := field-name ":" OWS
+// field-value one line at a time (RFC 9112 §5) and only recognizes a
+// framing header when the field-NAME itself matches exactly.
+static int http_is_tchar(uint8_t c) {
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9')) return 1;
+    switch (c) {
+    case '!': case '#': case '$': case '%': case '&': case '\'':
+    case '*': case '+': case '-': case '.': case '^': case '_':
+    case '`': case '|': case '~':
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int http_is_ows(uint8_t c) { return c == ' ' || c == '\t'; }
+
+// ASCII case-insensitive compare of a name span against a lowercase literal.
+static int http_name_eq(const uint8_t* p, uint32_t n, const char* lit) {
     uint32_t i = 0;
-    for (;; i++) {
-        char n = name[i];
-        if (n == 0) return 1;
-        if (i >= avail) return 0;
+    for (;;) {
+        char l = lit[i];
+        if (l == 0) return n == i;
+        if (i >= n) return 0;
         uint8_t c = p[i];
         if (c >= 'A' && c <= 'Z') c += 32;
-        if ((char)c != (n >= 'A' && n <= 'Z' ? n + 32 : n)) return 0;
+        if (c != (uint8_t)l) return 0;
+        i++;
     }
+}
+
+// Compare two value spans for byte-identity.
+static int http_val_eq(const uint8_t* a, uint32_t an,
+                       const uint8_t* b, uint32_t bn) {
+    if (an != bn) return 0;
+    for (uint32_t i = 0; i < an; i++)
+        if (a[i] != b[i]) return 0;
+    return 1;
+}
+
+// Parse one Transfer-Encoding field-value: comma-separated tokens, chunked
+// must appear exactly once and LAST. Returns 1 if chunked-final, 0 if a
+// valid non-chunked-final list, -1 if malformed.
+static int http_parse_te_value(const uint8_t* v, uint32_t vn) {
+    uint32_t i = 0;
+    int items = 0, chunked_seen = 0, last_chunked = 0;
+    for (;;) {
+        while (i < vn && http_is_ows(v[i])) i++;
+        uint32_t ts = i;
+        // Scan to ',' or end; interior bytes must be tchar or OWS (OWS
+        // before the comma is legal: "gzip , chunked").
+        while (i < vn && v[i] != ',') {
+            if (!http_is_tchar(v[i]) && !http_is_ows(v[i])) return -1;
+            i++;
+        }
+        uint32_t te = i;
+        while (te > ts && http_is_ows(v[te - 1])) te--;
+        if (te == ts) return -1; // empty element ("a,,b", leading/trailing comma)
+        for (uint32_t k = ts; k < te; k++)
+            if (!http_is_tchar(v[k])) return -1; // interior space, not a token
+        items++;
+        last_chunked = (te - ts == 7 && http_name_eq(v + ts, te - ts, "chunked"));
+        if (last_chunked) {
+            if (chunked_seen) return -1; // "chunked" applied twice (RFC: MUST NOT)
+            chunked_seen = 1;
+        }
+        if (i >= vn) break;
+        i++; // skip ','
+    }
+    if (!items) return -1;
+    return (chunked_seen && last_chunked) ? 1 : 0;
+}
+
+// Parse the header block `hdr[0..hdr_len)`: every byte must belong to a
+// CRLF-terminated, non-empty line; the first line is the status line
+// (required non-empty, otherwise unvalidated — framing doesn't depend on
+// it); the rest must be field-lines. Pure function, single pass, all
+// loops bounded by hdr_len (fuzzed under ASan — see test_adversarial.c).
+void http_parse_framing(const uint8_t* hdr, uint32_t hdr_len,
+                        struct http_framing* out) {
+    struct http_framing fr;
+    fr.malformed = 0; fr.has_cl = 0; fr.content_length = 0;
+    fr.te_present = 0; fr.chunked = 0;
+    const uint8_t* cl_val = 0;
+    uint32_t cl_len = 0;
+    uint32_t pos = 0;
+    int first = 1;
+    while (pos < hdr_len) {
+        // Find end of line (must be CRLF; bare CR or LF inside is malformed).
+        uint32_t eol = pos;
+        while (eol < hdr_len && hdr[eol] != '\r' && hdr[eol] != '\n') eol++;
+        if (eol + 1 >= hdr_len || hdr[eol] != '\r' || hdr[eol + 1] != '\n') {
+            fr.malformed = 1;
+            break;
+        }
+        uint32_t llen = eol - pos;
+        if (llen == 0) { fr.malformed = 1; break; } // blank line in block
+        if (first) {
+            first = 0;
+            pos = eol + 2;
+            continue; // status line: required present, otherwise unparsed
+        }
+        // Obs-fold (continuation) has no place in a pre-split block: a
+        // line starting with OWS is malformed, not a continuation.
+        if (http_is_ows(hdr[pos])) { fr.malformed = 1; break; }
+        // field-name: non-empty run of tchars ending at ':'.
+        uint32_t ns = pos;
+        while (pos < eol && http_is_tchar(hdr[pos])) pos++;
+        uint32_t nn = pos - ns;
+        if (nn == 0 || pos >= eol || hdr[pos] != ':') {
+            fr.malformed = 1;
+            break;
+        }
+        pos++; // skip ':'
+        while (pos < eol && http_is_ows(hdr[pos])) pos++;
+        uint32_t vs = pos, ve = eol;
+        while (ve > vs && http_is_ows(hdr[ve - 1])) ve--;
+        if (http_name_eq(hdr + ns, nn, "content-length")) {
+            // Value must be 1*DIGIT (after OWS strip). Saturate, never wrap.
+            if (ve == vs) { fr.malformed = 1; break; }
+            uint32_t val = 0;
+            for (uint32_t k = vs; k < ve; k++) {
+                if (hdr[k] < '0' || hdr[k] > '9') {
+                    fr.malformed = 1;
+                    break;
+                }
+                if (val <= 0xFFFFFFFu)
+                    val = val * 10 + (uint32_t)(hdr[k] - '0');
+                else
+                    val = 0xFFFFFFFFu;
+            }
+            if (fr.malformed) break;
+            if (!fr.has_cl) {
+                fr.has_cl = 1;
+                fr.content_length = val;
+                cl_val = hdr + vs;
+                cl_len = ve - vs;
+            } else if (!http_val_eq(cl_val, cl_len, hdr + vs, ve - vs)) {
+                fr.malformed = 1; // conflicting duplicate CL
+                break;
+            }
+        } else if (http_name_eq(hdr + ns, nn, "transfer-encoding")) {
+            int r = http_parse_te_value(hdr + vs, ve - vs);
+            if (r < 0) { fr.malformed = 1; break; }
+            fr.te_present = 1;
+            if (r == 1) fr.chunked = 1;
+        }
+        pos = eol + 2;
+    }
+    // TE + CL together are forbidden (RFC 9112 §6.2/6.3): no framing
+    // verdict both sides could agree on, so report malformed and let both
+    // sides fail closed (gate: SHORT; consumer: no dechunk).
+    if (!fr.malformed && fr.te_present && fr.has_cl) {
+        fr.malformed = 1;
+        fr.has_cl = 0;
+        fr.chunked = 0;
+    }
+    *out = fr;
 }
 
 // HTTP response completeness (cryptoholes #1): decides whether `len`
 // bytes prove a COMPLETE message, are provably SHORT (truncated), or
-// carry no length signal (UNKNOWN, close-delimited). Pure function.
+// carry no length signal (UNKNOWN, close-delimited). Framing comes from
+// the shared line-oriented parser above (never substring scans); the
+// chunked-body walk below is the read-only mirror of the dechunker.
+// Pure function.
 int tls_response_complete(const uint8_t* resp, uint32_t len) {
     if (!resp || len == 0) return TLS_RESP_SHORT; // nothing arrived
     // Headers end at the first blank line.
@@ -154,82 +359,51 @@ int tls_response_complete(const uint8_t* resp, uint32_t len) {
         }
     }
     if (!found) return TLS_RESP_SHORT; // headers themselves cut
-    // Chunked? Walk chunk sizes to the terminal 0-chunk (mirror of the
-    // dechunker, read-only). A chunked body without its terminator is
-    // truncated, full stop.
-    for (uint32_t i = 0; i + 18 <= body; i++) {
-        if (hdr_name_at(resp + i, body - i, "transfer-encoding:")) {
-            // value runs to end of line; look for the "chunked" token
-            uint32_t e = i + 18;
-            while (e < body && resp[e] != '\r') e++;
-            int is_chunked = 0;
-            for (uint32_t k = i + 18; k + 7 <= e && !is_chunked; k++) {
-                int m = 1;
-                for (int t = 0; t < 7; t++) {
-                    uint8_t d = resp[k + (uint32_t)t];
-                    if (d >= 'A' && d <= 'Z') d += 32;
-                    if (d != (uint8_t)"chunked"[t]) { m = 0; break; }
-                }
-                if (m) is_chunked = 1;
-            }
-            if (!is_chunked) break; // value isn't chunked: fall through
-            // walk chunks; need terminal "0" chunk + final blank line
-            {
-                uint32_t rd = body;
-                int complete = 0;
-                while (rd < len) {
-                    uint32_t size = 0;
-                    int digits = 0;
-                    while (rd < len) {
-                        uint8_t c = resp[rd];
-                        int v = -1;
-                        if (c >= '0' && c <= '9') v = c - '0';
-                        else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
-                        else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
-                        else break;
-                        if (size > 0xFFFFFFFu) break; // absurd: malformed
-                        size = size * 16 + (uint32_t)v;
-                        digits++;
-                        rd++;
-                    }
-                    if (!digits) break; // malformed mid-body
-                    while (rd < len && resp[rd] != '\n') rd++;
-                    if (rd < len) rd++;
-                    if (size == 0) {
-                        // terminal chunk: need the final blank line
-                        if (rd + 1 < len && resp[rd] == '\r' &&
-                            resp[rd+1] == '\n') complete = 1;
-                        break;
-                    }
-                    if (rd + size > len) break; // data runs off the end
-                    rd += size;
-                    if (rd + 1 < len && resp[rd] == '\r' &&
-                        resp[rd+1] == '\n') rd += 2;
-                    else break; // missing chunk CRLF
-                }
-                return complete ? TLS_RESP_COMPLETE : TLS_RESP_SHORT;
-            }
-        }
-    }
-    // Content-Length? Decimal value; body shorter than declared = cut.
-    for (uint32_t i = 0; i + 15 <= body; i++) {
-        if (hdr_name_at(resp + i, body - i, "content-length:")) {
-            uint32_t j = i + 15;
-            while (j < body && (resp[j] == ' ' || resp[j] == '\t')) j++;
-            uint32_t declared = 0;
+    // Header block = [0, body-2): every header line with its CRLF (the
+    // remaining \r\n is the blank line). body >= 4 always, so body-2 >= 2.
+    struct http_framing fr;
+    http_parse_framing(resp, body - 2, &fr);
+    if (fr.malformed) return TLS_RESP_SHORT; // fail closed, never guess
+    if (fr.chunked) {
+        // Walk chunk sizes to the terminal 0-chunk. A chunked body without
+        // its terminator is truncated, full stop.
+        uint32_t rd = body;
+        int complete = 0;
+        while (rd < len) {
+            uint32_t size = 0;
             int digits = 0;
-            while (j < body && resp[j] >= '0' && resp[j] <= '9') {
-                if (declared <= 0xFFFFFFFu)
-                    declared = declared * 10 + (uint32_t)(resp[j] - '0');
-                else
-                    declared = 0xFFFFFFFFu; // saturate, never wrap
+            while (rd < len) {
+                uint8_t c = resp[rd];
+                int v = -1;
+                if (c >= '0' && c <= '9') v = c - '0';
+                else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+                else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+                else break;
+                if (size > 0xFFFFFFFu) break; // absurd: malformed
+                size = size * 16 + (uint32_t)v;
                 digits++;
-                j++;
+                rd++;
             }
-            if (!digits) return TLS_RESP_SHORT; // unparseable length
-            return (len - body < declared) ? TLS_RESP_SHORT
-                                           : TLS_RESP_COMPLETE;
+            if (!digits) break; // malformed mid-body
+            while (rd < len && resp[rd] != '\n') rd++;
+            if (rd < len) rd++;
+            if (size == 0) {
+                // terminal chunk: need the final blank line
+                if (rd + 1 < len && resp[rd] == '\r' &&
+                    resp[rd+1] == '\n') complete = 1;
+                break;
+            }
+            if (rd + size > len) break; // data runs off the end
+            rd += size;
+            if (rd + 1 < len && resp[rd] == '\r' &&
+                resp[rd+1] == '\n') rd += 2;
+            else break; // missing chunk CRLF
         }
+        return complete ? TLS_RESP_COMPLETE : TLS_RESP_SHORT;
+    }
+    if (fr.has_cl) {
+        return (len - body < fr.content_length) ? TLS_RESP_SHORT
+                                                : TLS_RESP_COMPLETE;
     }
     return TLS_RESP_UNKNOWN; // close-delimited: no signal either way
 }
@@ -293,6 +467,18 @@ static const struct preload_pin preload_pins[] = {
 #endif
 };
 
+// A non-canonical preload entry (uppercase, FQDN dot, overlong) would
+// NEVER match a canonicalized lookup — a silent dead pin. Self-check it.
+int tls_preload_selfcheck(void) {
+    for (unsigned i = 0;
+         i < sizeof(preload_pins) / sizeof(preload_pins[0]); i++) {
+        char c[64];
+        if (tls_canon_host(c, preload_pins[i].host) != 0) return -1;
+        if (!ticket_host_eq(c, preload_pins[i].host)) return -1;
+    }
+    return 0;
+}
+
 // ---- Pin persistence (P2: TOFU pins survive reboot via VFS) ----
 // Wire format: "OKPIN1"(6) || version u8 (1) || count u8 (<=8) ||
 // entries of host[64] + spki_hash[32]. The desktop serializes on change
@@ -330,12 +516,22 @@ int tls_pin_import(const uint8_t* in, uint32_t len) {
     tls_pin_clear();
     uint32_t p = 8;
     for (uint32_t i = 0; i < n; i++) {
+        char raw[64];
         int valid = 0;
         for (int j = 0; j < 64; j++) {
-            pin_slots[i].host[j] = (char)in[p++];
-            if (pin_slots[i].host[j]) valid = 1;
+            raw[j] = (char)in[p++];
+            if (raw[j]) valid = 1;
         }
         if (!valid) { tls_pin_clear(); return -1; } // empty hostname
+        // Re-canonicalize on load (cryptoholes round 4, P0): pins written
+        // by older builds may hold non-canonical names (case/FQDN-dot);
+        // normalize so lookups hit, and drop anything invalid. Disk is
+        // trusted for integrity here (threat model: network-only), so
+        // this is hygiene, not a security boundary.
+        if (tls_canon_host(pin_slots[i].host, raw) != 0) {
+            tls_pin_clear();
+            return -1;
+        }
         for (int j = 0; j < 32; j++)
             pin_slots[i].spki_hash[j] = in[p++];
         pin_slots[i].seq = ++pin_seq;
@@ -347,31 +543,34 @@ int tls_pin_import(const uint8_t* in, uint32_t len) {
 
 int tls_pin_check(const char* host, const uint8_t spki_hash[32]) {
     if (!host || !host[0] || !spki_hash) return -1;
+    // Canonicalize at the boundary: "GITHUB.COM" must hit the same slot
+    // as "github.com" (cryptoholes round 4, P0). Invalid → refuse.
+    char chost[64];
+    if (tls_canon_host(chost, host) != 0) return -1;
     for (int i = 0; i < TLS_PIN_SLOTS; i++) {
         if (!pin_slots[i].used) continue;
-        if (!ticket_host_eq(pin_slots[i].host, host)) continue;
+        if (!ticket_host_eq(pin_slots[i].host, chost)) continue;
         uint8_t diff = 0;
         for (int j = 0; j < 32; j++) diff |= pin_slots[i].spki_hash[j] ^ spki_hash[j];
         if (diff == 0) return 0; // match: same key as first visit
-        tls_dbg("[tls] PIN CHANGED for %s (possible MITM or rotation)\n", host);
+        tls_dbg("[tls] PIN CHANGED for %s (possible MITM or rotation)\n", chost);
         return -1; // changed: old pin kept (warns every visit till reboot)
     }
-    // No dynamic pin yet: consult the preload table (exact hostname).
+    // No dynamic pin yet: consult the preload table (canonical hostnames —
+    // self-checked by tls_preload_selfcheck in host tests).
     // A preloaded host MUST match on first visit (-2 = preload mismatch,
     // distinct from key-change so the UI can name it). Non-preloaded
     // hosts fall through to first-visit store below (plain TOFU).
     {
-        char hbuf[64];
-        ticket_host_copy(hbuf, host);
         for (unsigned i = 0;
              i < sizeof(preload_pins) / sizeof(preload_pins[0]); i++) {
-            if (!ticket_host_eq(hbuf, preload_pins[i].host)) continue;
+            if (!ticket_host_eq(chost, preload_pins[i].host)) continue;
             uint8_t diff = 0;
             for (int j = 0; j < 32; j++)
                 diff |= preload_pins[i].hash[j] ^ spki_hash[j];
             if (diff != 0) {
                 tls_dbg("[tls] PRELOAD pin mismatch for %s (possible MITM)\n",
-                        host);
+                        chost);
                 return -2;
             }
             break; // matched: store below like any first visit
@@ -388,7 +587,7 @@ int tls_pin_check(const char* host, const uint8_t spki_hash[32]) {
         for (int i = 1; i < TLS_PIN_SLOTS; i++)
             if (pin_slots[i].seq < pin_slots[slot].seq) slot = i;
     }
-    ticket_host_copy(pin_slots[slot].host, host);
+    ticket_host_copy(pin_slots[slot].host, chost);
     memcpy(pin_slots[slot].spki_hash, spki_hash, 32);
     pin_slots[slot].seq = ++pin_seq;
     pin_slots[slot].used = 1;
@@ -408,6 +607,14 @@ static void ticket_store(const char* host,
     if (!host || !host[0] || !ticket || ticket_len == 0 ||
         ticket_len > TLS_TICKET_MAX || !res_master || lifetime == 0)
         return;
+    // Canonicalize at the boundary (cryptoholes round 4, P0): the ticket
+    // key must be the same string the pin layer and SNI use. (In practice
+    // `host` here is always st->host, already canonical — this is defense
+    // in depth, and it replaces the old silent 63-char truncation, which
+    // let distinct long names collide in the cache.)
+    char chost[64];
+    if (tls_canon_host(chost, host) != 0) return; // invalid: don't store
+    host = chost;
     // Oversized nonces are REJECTED, never truncated (review #32): the
     // nonce feeds PSK derivation, and silently hashing a prefix would
     // derive a different PSK than the server — worse, it normalizes
@@ -613,6 +820,12 @@ static int tls_decrypt_one(struct tls_state* st, uint8_t key[32], uint8_t iv[12]
     if (rec_pl < 16) return -1;
     uint32_t ct_len = rec_pl - 16;
     if (ct_len > ptcap) return -1;
+    // Narrowing proof (cryptoholes round 4, #9): ct_len <= ptcap, and every
+    // ptcap at every call site is a stack record buffer (<= 18432) — fits
+    // int with huge margin. The range check makes it executable; plen stays
+    // signed because -1 is the error return below.
+    if (ct_len > 0x7FFFFFFFu) return -1;
+    int plen = (int)ct_len;
     // Sequence consumes ONLY on successful decrypt (review 2026-09-10 #11):
     // bumping before verification desyncs the stream the day any retry
     // logic exists. (Today every failure aborts, so this is hygiene — but
@@ -638,7 +851,6 @@ static int tls_decrypt_one(struct tls_state* st, uint8_t key[32], uint8_t iv[12]
     // every valid record, so stripping can never reach past it into
     // content. Zero-tailed content + padding stays ambiguous by design
     // (indistinguishable — the receiver correctly delivers both).
-    int plen = ct_len;
     while (plen > 0 && pt[plen - 1] == 0) plen--;
     if (plen == 0) return -1;
     *ctype = pt[plen - 1];
@@ -653,7 +865,15 @@ void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
                     const uint8_t* request, uint32_t request_len,
                     uint8_t* out, uint32_t out_cap) {
     for (uint32_t i = 0; i < sizeof(*st); i++) ((uint8_t*)st)[i] = 0;
-    st->host = host;
+    // Canonicalize ONCE at the boundary (cryptoholes round 4, P0): every
+    // downstream consumer (SNI, cert_verify, pin, ticket) sees this same
+    // string. Invalid input → empty host → SNI omitted + cert check fails
+    // (fail closed, no silent truncation, no caller-lifetime dependence).
+    if (!host || tls_canon_host(st->host_canon, host) != 0) {
+        st->host_canon[0] = 0;
+        tls_dbg("[tls] invalid hostname rejected at init\n");
+    }
+    st->host = st->host_canon;
     st->port = port;
     st->request = request;
     st->request_len = request_len;
@@ -901,8 +1121,9 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         }
 
         uint8_t shared[32];
-        x25519_shared_secret(shared, st->priv, sh.key_share);
-        if (shared_is_zero(shared)) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
+        // Low-order peer share is rejected INSIDE the primitive (returns 0);
+        // no separate caller-side check to forget (cryptoholes P0).
+        if (!x25519_shared_secret(shared, st->priv, sh.key_share)) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
         // PSK accept (RFC 8446 §4.2.11): the server echoes pre_shared_key
         // with selected_identity 0 iff it took our offer. Accepted → the
         // handshake runs on the PSK-mixed early secret and the flight skips
@@ -984,16 +1205,19 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         // large flights, e.g. RSA-4096 chains). Decrypted HANDSHAKE payloads
         // accumulate in hs_buf; complete messages are parsed out below.
         // Anything past TLS_HS_REASSEMBLY_MAX is rejected, not truncated.
-        if (st->hs_have + (uint32_t)pl > sizeof(st->hs_buf)) {
+        // Narrowing proof (round 4, #9): pl >= 0 by the pl<0 return above;
+        // convert once and use the unsigned form everywhere below.
+        uint32_t upl = (uint32_t)pl;
+        if (st->hs_have + upl > sizeof(st->hs_buf)) {
             tls_dbg("[tls] flight exceeds reassembly cap\n");
             st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR;
         }
-        for (int i = 0; i < pl; i++) st->hs_buf[st->hs_have + i] = pt[i];
-        st->hs_have += (uint32_t)pl;
+        for (uint32_t i = 0; i < upl; i++) st->hs_buf[st->hs_have + i] = pt[i];
+        st->hs_have += upl;
 
         uint32_t p = 0;
         while (p + 4 <= st->hs_have) {
-            uint8_t t; uint32_t bl;
+            uint8_t t = 0; uint32_t bl = 0;
             uint32_t c = parse_hs(st->hs_buf + p, st->hs_have - p, &t, &bl);
             if (c == 0) break; // partial message at the end: await more
             const uint8_t* body = st->hs_buf + p + 4;
@@ -1126,7 +1350,16 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
 #ifdef KERNEL
             const char* vhost = st->host;
 #else
-            const char* vhost = st->verify_host ? st->verify_host : st->host;
+            // Test hook: canonicalize the override too, so the tested
+            // identity is always the canonical form (invalid → "" → the
+            // hostname check fails closed below).
+            char vhost_canon[64];
+            const char* vhost = st->host;
+            if (st->verify_host) {
+                if (tls_canon_host(vhost_canon, st->verify_host) != 0)
+                    vhost_canon[0] = 0;
+                vhost = vhost_canon;
+            }
 #endif
             int cvr = cert_verify(st->cert_body, st->cert_bl, vhost);
             if (cvr != CV_OK) {
@@ -1399,7 +1632,11 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             uint32_t hp = 0;
             int saw_nst = 0;
             while (hp < (uint32_t)pl) {
-                uint8_t t; uint32_t bl;
+                // Zero-init: parse_hs may return 0 without setting outputs,
+                // and t is read in the rejection debug print below. (This
+                // also silences -Wmaybe-uninitialized, which surfaced here
+                // once unrelated edits moved the optimizer's inlining.)
+                uint8_t t = 0; uint32_t bl = 0;
                 uint32_t c = parse_hs(pt + hp, (uint32_t)pl - hp, &t, &bl);
                 if (c == 0 || t != TLS_HS_NEW_SESSION_TICKET) {
                     tls_dbg("[tls] post-handshake msg type %u rejected\n", t);
@@ -1445,10 +1682,13 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             // (wraps past 4GB after enough app data → heap... stack-buffer
             // overwrite). Subtract instead; out_len <= out_cap is the
             // maintained invariant (every append path checks first).
+            // Narrowing proof (round 4, #9): pl >= 0 by the pl<0 return
+            // above; convert once, use unsigned below.
+            uint32_t upl = (uint32_t)pl;
             if (st->out_len > st->out_cap ||
-                (uint32_t)pl > st->out_cap - st->out_len) { st->fail_reason = TLS_FAIL_PROTO; st->phase = TLS_PH_DONE; return TLS_STEP_ERR; }
-            memcpy(st->out + st->out_len, pt, pl);
-            st->out_len += pl;
+                upl > st->out_cap - st->out_len) { st->fail_reason = TLS_FAIL_PROTO; st->phase = TLS_PH_DONE; return TLS_STEP_ERR; }
+            memcpy(st->out + st->out_len, pt, upl);
+            st->out_len += upl;
         } else {
             st->fail_reason = TLS_FAIL_PROTO;
             return TLS_STEP_ERR;

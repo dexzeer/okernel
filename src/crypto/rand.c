@@ -194,13 +194,22 @@ static int hw_bytes(int cls, int (*pull)(uint32_t*)) {
     uint8_t hw[32];
     for (int i = 0; i < 8; i++) {
         uint32_t w = 0;
-        if (!pull(&w)) return 0;
+        if (!pull(&w)) { memset(hw, 0, sizeof(hw)); return 0; }
         hw[4*i] = (uint8_t)(w & 0xff); hw[4*i+1] = (uint8_t)((w >> 8) & 0xff);
         hw[4*i+2] = (uint8_t)((w >> 16) & 0xff); hw[4*i+3] = (uint8_t)(w >> 24);
     }
+    // Presence is established by successfully pulled bytes, and it is
+    // recorded BEFORE those bytes can trigger a reseed (cryptoholes
+    // round 4, #7): rand_stir_src() reseeds when the fast pool fills, and
+    // rng_reseed() reads hw_present to pick the readiness tier. Setting
+    // the flag after the stir evaluated the OLD tier — harmless in the
+    // normal boot sequence (other gates hold readiness closed), but need-
+    // lessly subtle. Set-then-stir makes the tier decision see the sample
+    // that triggered it. (Also: wipe the stack buffer on the early-return
+    // path above — partial hardware bytes must not linger.)
+    hw_present = 1; // hardware bytes actually mixed (not just CPUID claims)
     rand_stir_src(hw, cls);
     memset(hw, 0, sizeof(hw));
-    hw_present = 1; // hardware bytes actually mixed (not just CPUID claims)
     return 1;
 }
 

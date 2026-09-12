@@ -61,8 +61,9 @@ static const uint64_t IV384[8] = {
 
 static void sha512_transform(sha512_ctx* ctx) {
     uint64_t W[80];
+    // (uint32_t) voices the narrowing the loop bound proves (i in 0..15).
     for (int i = 0; i < 16; i++) {
-        uint32_t j = i * 8;
+        uint32_t j = (uint32_t)i * 8u;
         W[i] = ((uint64_t)ctx->buf[j]     << 56) | ((uint64_t)ctx->buf[j+1] << 48) |
                ((uint64_t)ctx->buf[j+2]   << 40) | ((uint64_t)ctx->buf[j+3] << 32) |
                ((uint64_t)ctx->buf[j+4]   << 24) | ((uint64_t)ctx->buf[j+5] << 16) |
