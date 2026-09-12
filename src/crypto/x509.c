@@ -23,6 +23,7 @@ static const uint8_t OID_AUTH_KEY_ID[]      = {0x55,0x1D,0x23};
 static const uint8_t OID_NAME_CONSTRAINTS[] = {0x55,0x1D,0x1E};
 static const uint8_t OID_EKU_SERVER_AUTH[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x01};
 static const uint8_t OID_EKU_ANY[]          = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x00};
+static const uint8_t OID_TLS_FEATURE[]      = {0x2B,0x06,0x01,0x05,0x05,0x07,0x01,0x18};
 
 static int oid_is(const der_node* n, const uint8_t* oid, uint32_t oid_len) {
     return der_content_eq(n, oid, oid_len);
@@ -568,6 +569,38 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                             oid_is(&eku, OID_EKU_ANY,
                                    sizeof(OID_EKU_ANY)))
                             out->eku_server_auth = 1;
+                    }
+                }
+            } else if (oid_is(&ext_oid, OID_TLS_FEATURE,
+                              sizeof(OID_TLS_FEATURE))) {
+                // TLSFeature (RFC 7633 Must-Staple): SEQUENCE OF INTEGER;
+                // status_request(5) asserted means the server MUST staple
+                // an OCSP response (enforced in tls_client.c). Malformed
+                // framing fails closed; other feature codes are ignored
+                // (no semantics for a TLS client).
+                ext_known = 1;
+                {
+                    uint32_t v = 0;
+                    der_node feats;
+                    if (der_expect(val.content, val.content_len, &v,
+                                   DER_TAG_SEQUENCE, &feats) != 0) return -1;
+                    uint32_t q = 0;
+                    while (q < feats.content_len) {
+                        der_node fnum;
+                        if (der_expect(feats.content, feats.content_len, &q,
+                                       DER_TAG_INTEGER, &fnum) != 0) return -1;
+                        // Numeric 5 (leading zeros tolerated — fail-closed
+                        // toward enforcement, never away from it).
+                        uint32_t bi = 0;
+                        while (bi < fnum.content_len &&
+                               fnum.content[bi] == 0) bi++;
+                        uint32_t rem = fnum.content_len - bi;
+                        uint32_t fv = 0;
+                        if (rem <= 4) {
+                            for (uint32_t k = 0; k < rem; k++)
+                                fv = (fv << 8) | fnum.content[bi + k];
+                            if (fv == 5) out->has_must_staple = 1;
+                        }
                     }
                 }
             } else if (oid_is(&ext_oid, OID_SUBJECT_KEY_ID,

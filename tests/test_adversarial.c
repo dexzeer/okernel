@@ -307,6 +307,10 @@ enum mock_mode {
     MOCK_STAPLE_BAD,   // malformed staple (must ERR)
     MOCK_STAPLE_REVOKED, // valid sig, revoked status (must ERR)
     MOCK_STAPLE_STALE,   // valid sig, aged past nextUpdate (must ERR)
+    MOCK_MUSTSTAPLE,     // Must-Staple leaf, NO staple (must ERR)
+    MOCK_MUSTSTAPLE_OK,  // Must-Staple leaf + valid staple (must DONE)
+    MOCK_PRELOAD_OK,     // preloaded host, matching key (must DONE)
+    MOCK_PRELOAD_BAD,    // preloaded host, different key (must ERR PRELOAD)
     MOCK_SH_BIG,       // >4KB ServerHello (must ERR, OOB regression)
     MOCK_SH_TRAIL,     // SH with trailing bytes past exts (must ERR)
     MOCK_SH_DUP,       // SH with duplicate extension (must ERR)
@@ -321,6 +325,7 @@ enum mock_mode {
 struct mock_result {
     int r;
     int fail_reason;
+    int cert_detail;
     int alert_desc;
     uint32_t out_len;
     uint8_t out[4096];
@@ -678,7 +683,9 @@ static const char* mode_name(int m) {
         "GARBAGE_FIRST", "RECORD_OVERFLOW", "SPLIT", "TRUNCATED",
         "SH_FLIPPED", "EE_FLIPPED", "NST", "NST_BAD", "NST_BIGNONCE",
         "PSK_ACCEPT", "PSK_FALLBACK", "PSK_FOREIGN", "CV_PKCS1",
-        "STAPLE", "STAPLE_BAD", "STAPLE_REVOKED", "STAPLE_STALE", "SH_BIG",
+        "STAPLE", "STAPLE_BAD", "STAPLE_REVOKED", "STAPLE_STALE",
+        "MUSTSTAPLE", "MUSTSTAPLE_OK", "PRELOAD_OK", "PRELOAD_BAD",
+        "SH_BIG",
         "SH_TRAIL", "SH_DUP", "EE_DUP", "EE_ALPN_H2", "FRAGMENT",
         "SH_SPLIT", "APP_TRUNCATED"
     };
@@ -779,13 +786,12 @@ static int mock_check_psk_offer(void) {
 // the CURRENT at_leaf (serial read at runtime — regen-safe). revoked != 0
 // marks the leaf revoked in a scratch index. Returns response bytes in out
 // (cap-checked), length via out_len. Mirrors sign_digest's system() style.
-static int mint_ocsp(int revoked, uint8_t* out, uint32_t cap,
-                     uint32_t* out_len) {
+static int mint_ocsp(int revoked, const char* leaf_pem, uint8_t* out,
+                     uint32_t cap, uint32_t* out_len) {
     static char cmd[1024], serial[128];
-    // Leaf serial (hex, no 0x).
+    // Leaf serial (hex, no 0x) for the given leaf (PEM).
     snprintf(cmd, sizeof(cmd),
-             "openssl x509 -in tests/adversarial/at_leaf.der -inform DER "
-             "-noout -serial 2>/dev/null");
+             "openssl x509 -in %s -noout -serial 2>/dev/null", leaf_pem);
     FILE* pf = popen(cmd, "r");
     if (!pf) return -1;
     if (!fgets(serial, sizeof(serial), pf)) { pclose(pf); return -1; }
@@ -812,8 +818,8 @@ static int mint_ocsp(int revoked, uint8_t* out, uint32_t cap,
     // Request for the leaf, then the response.
     snprintf(cmd, sizeof(cmd),
              "openssl ocsp -issuer tests/adversarial/at_int.pem "
-             "-cert tests/adversarial/at_leaf.pem -reqout " SCRATCH_DIR "/ocsp_req.der "
-             "2>/dev/null");
+             "-cert %s -reqout " SCRATCH_DIR "/ocsp_req.der "
+             "2>/dev/null", leaf_pem);
     if (system(cmd) != 0) return -1;
     snprintf(cmd, sizeof(cmd),
              "openssl ocsp -index " SCRATCH_DIR "/ocsp_index "
@@ -935,6 +941,9 @@ static void mock_run(int mode, struct mock_result* res) {
                    res->out, sizeof(res->out));
     tls_state_set_now_ms(&st, 1000000); // exercise the ticket-age clock path
     if (mode == MOCK_HOSTNAME_MISMATCH) verify_host = "example.com";
+    // Preload modes verify (and pin-check) as the preloaded test host.
+    if (mode == MOCK_PRELOAD_OK || mode == MOCK_PRELOAD_BAD)
+        verify_host = "preload-test.example.com";
     st.verify_host = verify_host;
 
     {
@@ -949,7 +958,7 @@ static void mock_run(int mode, struct mock_result* res) {
         // (Bisected 2026-09-11: mtime-clock +26h reds the good-staple
         // check as future-dated. Environmental, not a stack bug.)
         if (mode == MOCK_STAPLE || mode == MOCK_STAPLE_BAD ||
-            mode == MOCK_STAPLE_REVOKED) {
+            mode == MOCK_STAPLE_REVOKED || mode == MOCK_MUSTSTAPLE_OK) {
             time_t tt = time(0);
             struct tm* g = gmtime(&tt);
             n.year = 1900 + g->tm_year; n.month = g->tm_mon + 1;
@@ -974,6 +983,7 @@ static void mock_run(int mode, struct mock_result* res) {
     if (r != TLS_STEP_AGAIN || c_len < 100) {
         res->r = (r == TLS_STEP_DONE) ? -2 : r;
         res->fail_reason = st.fail_reason;
+        res->cert_detail = st.cert_detail;
         return;
     }
     uint8_t client_sid[32], client_pub[32];
@@ -1197,6 +1207,12 @@ static void mock_run(int mode, struct mock_result* res) {
             ? "tests/adversarial/at_rsa_leaf.der"
             : (mode == MOCK_P384_VALID)
             ? "tests/adversarial/at_p384_leaf.der"
+            : (mode == MOCK_MUSTSTAPLE || mode == MOCK_MUSTSTAPLE_OK)
+            ? "tests/adversarial/at_ms_leaf.der"
+            : (mode == MOCK_PRELOAD_OK)
+            ? "tests/adversarial/at_preload_leaf.der"
+            : (mode == MOCK_PRELOAD_BAD)
+            ? "tests/adversarial/at_preload_bad.der"
             : "tests/adversarial/at_leaf.der";
         chain[0] = leaf_file;
         chain[1] = (mode == MOCK_P384_VALID)
@@ -1210,16 +1226,21 @@ static void mock_run(int mode, struct mock_result* res) {
         // STAPLE modes: graft a status_request extension onto entry 0.
         // STAPLE/STAPLE_REVOKED/STAPLE_STALE carry REAL openssl-minted
         // responses (good/revoked); STAPLE_BAD carries framing garbage.
+        // MUSTSTAPLE_OK carries a real response minted for the MS leaf.
         // The mock transcript follows the wire bytes either way.
         if (mode == MOCK_STAPLE || mode == MOCK_STAPLE_BAD ||
-            mode == MOCK_STAPLE_REVOKED || mode == MOCK_STAPLE_STALE) {
+            mode == MOCK_STAPLE_REVOKED || mode == MOCK_STAPLE_STALE ||
+            mode == MOCK_MUSTSTAPLE_OK) {
             if (mode == MOCK_STAPLE_BAD) {
                 cert_len = staple_patch(cert_msg, sizeof(cert_msg), cert_len,
                                         NULL, 0, 1);
             } else {
                 static uint8_t ocsp_resp[2048];
                 uint32_t ocsp_len = 0;
-                if (mint_ocsp(mode == MOCK_STAPLE_REVOKED,
+                const char* lpem = (mode == MOCK_MUSTSTAPLE_OK)
+                    ? "tests/adversarial/at_ms_leaf.pem"
+                    : "tests/adversarial/at_leaf.pem";
+                if (mint_ocsp(mode == MOCK_STAPLE_REVOKED, lpem,
                               ocsp_resp, sizeof(ocsp_resp),
                               &ocsp_len) != 0) {
                     printf("    [mock] ocsp mint failed (%s)\n",
@@ -1245,10 +1266,15 @@ static void mock_run(int mode, struct mock_result* res) {
         if (mode == MOCK_CV_GARBAGE_TRANSCRIPT)
             memset(signed_data + 64 + 33 + 1, 0x5A, 32);
 
-        int is_rsa = (mode == MOCK_RSA_PSS_VALID || mode == MOCK_CV_PKCS1);
+        int is_rsa = (mode == MOCK_RSA_PSS_VALID || mode == MOCK_CV_PKCS1 ||
+                      mode == MOCK_PRELOAD_BAD);
         int is_p384 = (mode == MOCK_P384_VALID);
+        int is_ms = (mode == MOCK_MUSTSTAPLE || mode == MOCK_MUSTSTAPLE_OK);
         const char* leaf_key = is_rsa ? "tests/adversarial/at_rsa_leaf.key"
                              : is_p384 ? "tests/adversarial/at_p384_leaf.key"
+                             : is_ms ? "tests/adversarial/at_ms_leaf.key"
+                             : (mode == MOCK_PRELOAD_BAD)
+                             ? "tests/adversarial/at_rsa_leaf.key"
                                        : "tests/adversarial/at_leaf.key";
         const char* sign_key = (mode == MOCK_CV_WRONG_KEY)
             ? "tests/adversarial/at_root.key" : leaf_key;
@@ -1348,6 +1374,8 @@ static void mock_run(int mode, struct mock_result* res) {
                           mode == MOCK_PSK_ACCEPT || mode == MOCK_PSK_FALLBACK ||
                           mode == MOCK_STAPLE || mode == MOCK_FRAGMENT ||
                           mode == MOCK_SH_SPLIT || mode == MOCK_APP_TRUNCATED ||
+                          mode == MOCK_MUSTSTAPLE_OK ||
+                          mode == MOCK_PRELOAD_OK || mode == MOCK_PRELOAD_BAD ||
                           mode == MOCK_CLOSE_NOTIFY || mode == MOCK_APPDATA_BITFLIP);
         // TRUNCATED: cut the queue mid-flight-record (SH complete + 30B of
         // the encrypted flight). The client must ERR on the short close —
@@ -1364,6 +1392,7 @@ static void mock_run(int mode, struct mock_result* res) {
 
     res->r = r;
     res->fail_reason = st.fail_reason;
+    res->cert_detail = st.cert_detail;
     res->alert_desc = st.alert_desc;
     res->out_len = st.out_len;
     // Staple visibility for the CHECK (got_staple lives in the run's state).
@@ -1524,6 +1553,27 @@ static void mock_section(void) {
     mock_run(MOCK_STAPLE_STALE, &res);
     CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_CERT,
           "stale staple fails closed");
+    tls_pin_clear(); // MS leaf is a fresh key for evil.example.com
+    mock_run(MOCK_MUSTSTAPLE, &res);
+    CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_CERT,
+          "unstapled Must-Staple leaf refused (revocation unchecked)");
+    mock_run(MOCK_MUSTSTAPLE_OK, &res);
+    CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
+          memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
+          "stapled Must-Staple leaf completes");
+    tls_pin_clear(); // MS key above would refuse the at_leaf flights below
+    // Preloaded pins (cryptoholes follow-up): preloaded host + matching
+    // key completes and pins; same host + different key fails PRELOAD
+    // (cleared between so BAD exercises the preload path, not key-change).
+    mock_run(MOCK_PRELOAD_OK, &res);
+    CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
+          memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
+          "preloaded host with matching key completes");
+    tls_pin_clear();
+    mock_run(MOCK_PRELOAD_BAD, &res);
+    CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_CERT &&
+          res.cert_detail == CV_ERR_PRELOAD,
+          "preloaded host with different key refused (PRELOAD, not generic)");
     mock_run(MOCK_SH_BIG, &res);
     CHECK(res.r == TLS_STEP_ERR,
           "oversize ServerHello rejected (OOB regression)");
@@ -1849,6 +1899,71 @@ static void name_section(void) {
         if (fl > 0)
             CHECK(cert_verify(flight, fl, "h0.example.com") == CV_ERR_PARSE,
                   "17-SAN leaf (cap 16) fails closed, not truncated");
+    }
+    // Serial blocklist (cryptoholes follow-up — CRLSet-nano): list the
+    // leaf's (issuer, serial), verify fails REVOKED; clear restores OK;
+    // wrong-issuer entry does not block; malformed import rejected and
+    // export/import round-trips.
+    {
+        static uint8_t lder[4096], ider[4096];
+        int ln = load("tests/adversarial/at_leaf.der", lder, sizeof(lder));
+        int inl = load("tests/adversarial/at_int.der", ider, sizeof(ider));
+        CHECK(ln > 0 && inl > 0, "blocklist fixture loads");
+        if (ln > 0 && inl > 0) {
+            x509_cert leaf, intc;
+            CHECK(x509_parse(lder, (uint32_t)ln, &leaf) == 0 &&
+                  x509_parse(ider, (uint32_t)inl, &intc) == 0,
+                  "blocklist certs parse");
+            uint8_t ihash[32];
+            sha256(intc.spki.p, intc.spki.len, ihash);
+            const char* chain[3] = { "tests/adversarial/at_leaf.der",
+                                     "tests/adversarial/at_int.der",
+                                     "tests/adversarial/at_root.der" };
+            uint32_t fl = build_cert_msg(flight, sizeof(flight), chain, 3);
+            CHECK(fl > 0, "blocklist flight builds");
+            tls_blocklist_clear();
+            CHECK(tls_blocklist_add(ihash, leaf.serial.p,
+                                    leaf.serial.len) == 0,
+                  "blocklist add ok");
+            if (fl > 0)
+                CHECK(cert_verify(flight, fl, "evil.example.com") ==
+                      CV_ERR_REVOKED, "listed (issuer, serial) refused");
+            tls_blocklist_clear();
+            if (fl > 0)
+                CHECK(cert_verify(flight, fl, "evil.example.com") == CV_OK,
+                      "clear restores acceptance");
+            // Wrong issuer hash: same serial must NOT block.
+            {
+                uint8_t wrong[32];
+                for (int i = 0; i < 32; i++) wrong[i] = ihash[i] ^ 0xFF;
+                CHECK(tls_blocklist_add(wrong, leaf.serial.p,
+                                        leaf.serial.len) == 0,
+                      "wrong-issuer add ok");
+                if (fl > 0)
+                    CHECK(cert_verify(flight, fl, "evil.example.com") ==
+                          CV_OK, "wrong-issuer entry does not block");
+                tls_blocklist_clear();
+            }
+            // Malformed imports rejected; export/import round-trips.
+            {
+                uint8_t bad[8] = { 'O', 'K', 'R', 'V', 'K', '1', 9, 9 };
+                CHECK(tls_blocklist_import(bad, sizeof(bad)) != 0,
+                      "malformed blocklist import rejected");
+                CHECK(tls_blocklist_add(ihash, leaf.serial.p,
+                                        leaf.serial.len) == 0,
+                      "re-add ok");
+                static uint8_t exp[512];
+                uint32_t en = tls_blocklist_export(exp, sizeof(exp));
+                CHECK(en > 8, "export writes entries");
+                tls_blocklist_clear();
+                CHECK(tls_blocklist_import(exp, en) == 0,
+                      "export/import round-trips");
+                if (fl > 0)
+                    CHECK(cert_verify(flight, fl, "evil.example.com") ==
+                          CV_ERR_REVOKED, "re-imported entry still blocks");
+                tls_blocklist_clear();
+            }
+        }
     }
     // Hostname discipline: overlong + non-ASCII rejected, never truncated.
     {

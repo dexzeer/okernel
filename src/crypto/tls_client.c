@@ -250,6 +250,49 @@ void tls_pin_clear(void) {
         ((uint8_t*)pin_slots)[i] = 0;
 }
 
+// ---- Preloaded first-visit pins (cryptoholes follow-up — nano-HPKP) ----
+// Curated (hostname, SPKI-hash) pairs for high-value hosts. On the FIRST
+// verified visit (no dynamic pin yet), the leaf MUST match — a mismatch
+// fails closed (CV_ERR_PRELOAD, returns -2 below). Later visits use the
+// normal dynamic TOFU pin (seeded by the verified first visit).
+// Contract notes (read before touching):
+// - EXACT hostname match only (no suffix/wildcard scope — surprises kill).
+// - NO expiry: expiry would silently unprotect (worse than a loud brick).
+//   Rotation bricks the host to the warning page until the pin is updated
+//   here — same UX as key-change alarms, and pins clear on reboot is NOT
+//   available for these (compiled in). Acceptable because the set is
+//   tiny, curated, and updated with the tree (same cadence as roots.c).
+// - Rotation procedure: run tools/gen_preload.py HOST (fetches the live
+//   SPKI hash AND prints the C snippet — NEVER hand-type hashes; a
+//   transcription slip bricked a host in testing, bisected 2026-09-12).
+//   VERIFY with a live fetch before committing (a wrong pin bricks the
+//   host — the hash pipeline must match our SPKI view byte-exactly,
+//   validated once via test hook below).
+// - Multi-key frontends: only list hosts verified to serve ONE leaf key
+//   (or accept alarms on rotation). Never list a host you haven't checked.
+struct preload_pin { const char* host; uint8_t hash[32]; };
+static const struct preload_pin preload_pins[] = {
+    // github.com (Sectigo E36, 90-day certs — verify quarterly).
+    // SPKI 2026-09-12: ff088be6...
+    { "github.com", { 0xff,0x08,0x8b,0xe6,0xf8,0x0e,0x2e,0x0c,0x04,0x0f,0x8d,0x56,0x4b,0x40,0xcd,0x17,
+                      0xc4,0x22,0x4c,0x15,0x51,0xfc,0xfe,0x35,0x29,0xdd,0x7a,0xde,0xd9,0x85,0xc4,0xad } },
+    // cloudflare.com (Google WE1, 90-day certs — verify quarterly).
+    // SPKI 2026-09-12: 7708e62c...
+    { "cloudflare.com", { 0x77,0x08,0xe6,0x2c,0x2d,0x16,0x39,0x63,0x4c,0xc0,0x93,0xcc,0x1e,0x2e,0xbb,0x19,
+                      0x80,0xe7,0xad,0x00,0xeb,0x2e,0x4e,0x5c,0x15,0x59,0x66,0x7a,0xeb,0x6c,0x18,0x2b } },
+    // www.ssl.com (own CA vendor hierarchy — anchors to our embedded RSA
+    // root; doubles as the live end-to-end check of roots+preload).
+    // SPKI 2026-09-12: c36cb888...
+    { "www.ssl.com", { 0xc3,0x6c,0xb8,0x88,0x4c,0xbb,0x34,0xbb,0x6d,0x9a,0xe3,0xa4,0x24,0xec,0x1f,0x59,
+                      0xbd,0x99,0x94,0x3e,0xa8,0xa2,0x5e,0x7a,0x7a,0x7d,0x67,0x10,0x3d,0xb8,0xde,0x27 } },
+#ifndef KERNEL
+    // Suite fixture (host tests only): at_leaf's key for a test hostname.
+    // SPKI d2ce9d30... (verified byte-exact vs our parser).
+    { "preload-test.example.com", { 0xd2,0xce,0x9d,0x30,0x1d,0x3a,0xa6,0xdb,0x0b,0xf0,0xe4,0xa3,0x23,0xbf,0x1b,0xa9,
+                      0xcf,0x00,0x10,0x1e,0xe9,0xf2,0xfa,0x52,0x6c,0xd1,0x04,0x30,0x75,0xd5,0x4c,0x04 } },
+#endif
+};
+
 // ---- Pin persistence (P2: TOFU pins survive reboot via VFS) ----
 // Wire format: "OKPIN1"(6) || version u8 (1) || count u8 (<=8) ||
 // entries of host[64] + spki_hash[32]. The desktop serializes on change
@@ -312,6 +355,27 @@ int tls_pin_check(const char* host, const uint8_t spki_hash[32]) {
         if (diff == 0) return 0; // match: same key as first visit
         tls_dbg("[tls] PIN CHANGED for %s (possible MITM or rotation)\n", host);
         return -1; // changed: old pin kept (warns every visit till reboot)
+    }
+    // No dynamic pin yet: consult the preload table (exact hostname).
+    // A preloaded host MUST match on first visit (-2 = preload mismatch,
+    // distinct from key-change so the UI can name it). Non-preloaded
+    // hosts fall through to first-visit store below (plain TOFU).
+    {
+        char hbuf[64];
+        ticket_host_copy(hbuf, host);
+        for (unsigned i = 0;
+             i < sizeof(preload_pins) / sizeof(preload_pins[0]); i++) {
+            if (!ticket_host_eq(hbuf, preload_pins[i].host)) continue;
+            uint8_t diff = 0;
+            for (int j = 0; j < 32; j++)
+                diff |= preload_pins[i].hash[j] ^ spki_hash[j];
+            if (diff != 0) {
+                tls_dbg("[tls] PRELOAD pin mismatch for %s (possible MITM)\n",
+                        host);
+                return -2;
+            }
+            break; // matched: store below like any first visit
+        }
     }
     // First verified visit: store. Past capacity, evict the OLDEST pin
     // (lowest insertion seq — review #35: the old code always overwrote
@@ -1169,9 +1233,11 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
 #endif
                 uint8_t ph[32];
                 sha256(leaf.spki.p, leaf.spki.len, ph);
-                if (tls_pin_check(phost, ph) != 0) {
+                int prc = tls_pin_check(phost, ph);
+                if (prc != 0) {
                     st->fail_reason = TLS_FAIL_CERT;
-                    st->cert_detail = CV_ERR_PINCHANGED;
+                    st->cert_detail = (prc == -2) ? CV_ERR_PRELOAD
+                                                  : CV_ERR_PINCHANGED;
                     return TLS_STEP_ERR;
                 }
             }
@@ -1180,6 +1246,17 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             // direct issuer the responder must be. A present-but-invalid
             // staple fails closed (revoked/stale/forged — indistinguishable
             // from attack, and the warning page discloses enforcement).
+            // Must-Staple (RFC 7633, cryptoholes follow-up): a leaf
+            // asserting TLSFeature status_request(5) WITHOUT a staple
+            // fails closed too — that combination means revocation went
+            // unchecked against the issuer's explicit policy (previously
+            // soft-fail; the industry fix for silent-OCSP-stripping).
+            if (!st->got_staple && leaf.has_must_staple) {
+                tls_dbg("[tls] Must-Staple leaf without staple: refusing\n");
+                st->fail_reason = TLS_FAIL_CERT;
+                st->cert_detail = CV_ERR_OCSP;
+                return TLS_STEP_ERR;
+            }
             // Absent staple: soft-fail proceed (documented model).
             if (st->got_staple) {
                 x509_cert issuer;
