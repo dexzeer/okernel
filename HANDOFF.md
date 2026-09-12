@@ -3054,3 +3054,57 @@ User asked to fix three of the four stated caveats.
 4. **Close-delimited truncation — NOT FIXABLE** (protocol-inherent;
    curl/browsers identical). Covered as far as possible (close_notify
    + framing checks); HTTP/2 would fix it properly (future).
+
+---
+
+## Cryptoholes round 3 disposition (2026-09-12, commit 6ae95cc)
+
+Third review (score 6.5/10). Headline P0 (X25519 timing) fixed and
+proven; KAT/fuzz gaps filled; assembly inspected. Adversarial 130/130
+plain + ASan/UBSan, host suites green, ISOs link, sh_hello PASS,
+interop green (P-256/RSA/P-384 vs OpenSSL, resumption x2 vs pyserver,
+TLS-Attacker full-HS x3 key types + mutilation-reject + fragmentation).
+
+P0 — X25519 secret-dependent branch: FIXED. fe_mul121665 fold is now
+fixed-16-iteration (was `if (carry)` + `&& t`); fe_tobytes drops two
+`if (c)` guards and masks the negativity + revert/keep selects
+(SAR/ALU, cmov-friendly, no reliance on cmov). Proven: 500-case
+LCG differential vs old code BIT-IDENTICAL + RFC 7748 vectors +
+DH-commutativity x8 committed. (One revision dropped the vv>>16
+feedback — wrong for negative carry whose SAR saturates at -1;
+bisected by the differential, reverted to fixed-count original body.)
+Disassembly under real kernel flags (-O2 -fno-pic etc.): every forward
+conditional jump is a fixed-trip loop exit; ladder cswap/bit-selects
+compiled to cmov/cmovne; fe_invert's public-exponent bit-test needs no
+secret handling. volatile secure_zero survives as per-byte movb stores
+(no memset folding, no rep stos).
+Low-order points: clamp (priv = 0 mod 8) kills the whole small
+subgroup to exactly zero — the existing all-zero caller rejection
+covers orders 1/2/4/8 completely. Committed u=0/u=1 zero-output tests
++ threat-model note (ephemeral client-only: malicious peer gains
+nothing; API stays as-is with documented rationale).
+
+P1 — KAT gaps: FILLED from independent sources (openssl CLI, stdlib
+HMAC/HKDF). SHA-256 (3), SHA-384/512 (2+2), HMAC-4231 TC3/TC4/TC6
+(big-key path)/TC7, HKDF-5869 TC2 (PRK+OKM)/TC3 (zero salt/info),
+plus DH-commutativity. RSA-PSS/ECDSA already differential vs openssl
+CLI signing in the mock. (Caught a test bug this way: TC6 length
+54 vs 55 — vectors validate the tests too.)
+
+P1 — fuzz gaps: EE + Finished direct garbage rounds added (all listed
+surfaces now covered: DER/X.509/Cert/SH/EE/CV/Finished/OCSP/NST/
+record/SH-psk/staple). libFuzzer/MSan unavailable (no clang
+toolchain) — ASan+UBSan + 4000-round deterministic fuzz stand;
+documented, not fixable here.
+
+P2 — bespoke crypto: stays (freestanding kernel, nothing linkable).
+Compensated per the review's own prescription: equivalence vs
+independent implementations (OpenSSL/pyserver/TLS-Attacker interop +
+RFC/NIST vectors) + fuzz corpus. Documented as deliberate.
+
+Also in this round: SH fragmentation reassembly (REQ from this
+review's list; MOCK_SH_SPLIT test), truncation completeness section
+(8 unit CHECKs), APP_TRUNCATED mock. TLS-Attacker battery re-run
+green on the final tree (full HS x3, mutilations rejected,
+fragmentation). Resumption 3rd opinion still blocked (no session
+continuity in single workflows) — unchanged, documented previously.
