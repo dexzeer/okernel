@@ -2980,3 +2980,32 @@ canned flight still rejected with new SH-reassembly code).
    zero the block first (pure keystream, MSan-clean). Added soak test
    (200 reseed-crossing draws advance, ready latches), hw_init smoke,
    u32 counter-exhaustion fail-closed guard.
+
+---
+
+## TLS-Attacker interop (2026-09-12 — full success this time)
+
+Canned workflows are TLS1.2-only (fixed SH random `60b4…`, only
+renegotiation_info ext — correctly rejected; debug log proves
+server-side cause: HighestClientProtocolVersion detected as TLS12).
+Real handshakes need `-workflow_input` with a custom trace
+(`tests/tlsattacker-server13.xml`, schema learned from
+`-workflow_output` dumps + JAXB error messages which name exact
+expected elements: `configuredMessages`, `SupportedVersions`,
+`KeyShareExtension`, `Application`).
+
+Results (Java/BouncyCastle crypto — third independent stack):
+- Full HS P-256/ECDSA, RSA-PSS, P-384/ECDSA-SHA384: all PASS
+  (chain+hostname+CV live, HTTP body, clean close). Recipe in the
+  Makefile comment (full chain WITH root via -cert; explicit
+  -signature_hash_algo/-signature_algo_cert per key type — the
+  default CV selection emits RSA-PSS even for EC keys).
+- Mutilated flights (Certificate dropped / CertificateVerify
+  dropped): both correctly rejected (PROTO order enforcement vs
+  real-stack messages).
+- TCP_FRAGMENTATION delivery: PASS (SH + flight reassembly).
+- Resumption 3rd opinion still blocked: no session continuity across
+  connections in single workflows (canned PSK flows can't complete
+  round 1; forging an accepting workflow would skip verification and
+  prove nothing). OpenSSL-decline question unchanged; our offer is
+  proven-correct vs pyserver + mock + self-consistency.
