@@ -1,241 +1,169 @@
-Yep. I inspected the uploaded stack as a static security review. The primitives look reasonably disciplined, and I spot-checked the X25519 implementation against a reference implementation successfully. But there are several holes I would fix before calling this production-grade.
+I reviewed the uploaded stack as a security/code audit, including the TLS 1.3 client, X25519, AEAD, RSA/ECDSA, X.509, OCSP, HKDF, and RNG layers.
+
+There are some good defenses already present, but I found several holes worth fixing.
 
 ### Highest priority
 
-| Severity   | Finding                                                              | Impact                                                              |
-| ---------- | -------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| Critical   | **RNG readiness is based on labels, not entropy quality**            | Potentially predictable X25519 keys                                 |
-| High       | **NameConstraints fail open for unsupported/overflowed constraints** | Certificate-chain policy bypass in constrained PKIs                 |
-| High       | **`secure_zero()` is missing from the supplied tree**                | Secret-wiping path does not build cleanly                           |
-| Medium     | **NameConstraints don't cover `directoryName` / subject DN**         | Constraints can be bypassed where those name forms matter           |
-| Medium     | **SAN/NC limits silently discard additional entries**                | Security policy can disappear by exceeding parser caps              |
-| Medium     | **TLS 1.3 record padding parser destroys trailing zero bytes**       | Application-data corruption                                         |
-| Low/Medium | **Ticket expiration helper has an unsafe `now_ms == 0` mode**        | Stale tickets can remain logically valid for callers using that API |
+1. **Truncated TLS response can be reported as a clean success**
 
-## 1. The RNG is the biggest concern
+   `tls_client.c:1129-1135` treats any `recv()` failure/EOF as normal completion:
 
-Your readiness condition is effectively:
+   > `if (r < 0) ... TLS_PH_DONE`
 
-```c
-if (!rng_ready_flag && pool0_n * 32 >= 64) {
-    int classes = 0;
-    for (...) 
-        if (pool_src_mask & (1 << b)) classes++;
-    if (classes >= 2) rng_ready_flag = 1;
-}
-```
+   That is dangerous because `tls_recv_record_st()` can return `-1` with a **partially received TLS record** in `rec_buf`. More importantly, the client accepts EOF after application data without requiring an authenticated `close_notify`.
 
-But `pool_src_mask` is caller-supplied metadata:
+   An on-path attacker who can terminate the TCP connection can therefore potentially turn:
 
-```c
-rand_stir_src(entropy, src)
-```
+   `complete response` → `truncated response`
 
-So two sources can be declared different while both contain predictable data.
+   while the API returns `TLS_STEP_DONE`.
 
-Worse, `rand_seed()` establishes the BOOT class, then wipes the pool. Later predictable timer samples can combine with the persistent BOOT label and eventually satisfy the two-class requirement.
+   This is a **response-integrity/truncation vulnerability**, particularly serious because the API exposes only `out/out_len`, so callers can easily interpret the result as complete.
 
-That means the security property is essentially:
+   **Fix:** distinguish:
 
-> "I received enough bytes carrying two different labels"
+   * EOF before any response bytes: policy-dependent
+   * EOF with `rec_have != 0`: fatal truncation
+   * EOF without authenticated `close_notify`: normally fatal unless the HTTP layer has independently established message completeness, e.g. validated `Content-Length`.
 
-rather than:
+2. **`tls_state_wipe()` does not compile from the supplied sources**
 
-> "I have accumulated enough unpredictable entropy."
+   `tls_client.c:1246+` calls `secure_zero()`, but there is no definition or declaration anywhere in the supplied `.c/.h` files.
 
-Since these bytes become the X25519 private key, this is potentially catastrophic.
+   My direct compile produced:
 
-**Fix:** readiness needs to depend on an actual trusted entropy source. On the kernel side, I'd make RDRAND one contributor and require an actual platform entropy source, hardware RNG, bootloader-provided randomness, etc. If entropy isn't established, stay unavailable. Don't treat timers, TSC, counters, packet timing, or source labels as sufficient entropy.
+   `error: implicit declaration of function ‘secure_zero’`
 
-Also, `rand_stir_src()` should not be an API where arbitrary callers can manufacture "entropy source diversity."
+   The supplied `tls_client.o` is also stale relative to the source: it does not reference `secure_zero` at all.
 
-## 2. NameConstraints has a genuine fail-open path
+   This means the archive contains **source/object divergence**, which is a real supply-chain/build-integrity problem for crypto code. You can end up reviewing one implementation while the build consumes another.
 
-You explicitly support only DNS and IPv4:
+   **Fix:** clean-build everything from source, delete checked-in `.o` files, and make CI fail on stale/generated object mismatches.
 
-```c
-// Other GeneralName types are skipped
-```
+3. **AEAD has a global static scratch buffer**
 
-That's dangerous for a security validator.
+   `aead.c:31`:
 
-More importantly, you silently stop recording constraints once the fixed limit is reached:
+   ```c
+   static uint8_t scratch[AEAD_MAC_SCRATCH];
+   ```
 
-```c
-if (out->n_permit_dns < X509_MAX_NC) {
-    ...
-}
-```
+   The code explicitly relies on a single-threaded contract. That's fragile for a crypto primitive. Any future interrupt, callback, nested invocation, parallel connection, or accidental reentrancy corrupts the MAC computation.
 
-Same for excluded DNS/IP constraints.
+   This is currently mitigated by the stated architecture, so I'd call it **medium severity**, but it is exactly the kind of assumption that eventually gets violated.
 
-So a certificate can contain more than four constraints and the excess constraints simply disappear from the security model.
+   **Fix:** make Poly1305 streaming, or put the scratch/context in caller-owned state.
 
-For security-sensitive parsers, this should be:
+### Certificate validation concerns
 
-```c
-if (out->n_permit_dns >= X509_MAX_NC)
-    return -1;
-```
+4. **The certificate-chain builder is order-dependent**
 
-not "ignore the fifth one."
+   `cert_verify()` only walks the certificates in the order supplied by the server:
 
-Likewise for SANs. If you only support 16 SANs, **reject certificates containing more than 16 relevant entries**, rather than silently truncating the set.
+   `leaf -> cert[1] -> cert[2] -> ... -> trusted SPKI`
 
-## 3. Unsupported NameConstraints should fail closed
+   It does not perform path building or try alternate issuers.
 
-You parse only:
+   That's mainly an interoperability/availability problem rather than a direct authentication bypass, but it means valid chains can fail depending on server ordering or cross-signing structure.
 
-* `dNSName`
-* IPv4 `iPAddress`
+5. **Trust is actually SPKI pinning, not conventional CA validation**
 
-but skip other GeneralName types.
+   `spki_in_roots()` accepts a certificate whenever its SPKI hash matches an embedded root hash.
 
-That's acceptable as a product limitation only if the certificate is rejected when it contains a NameConstraints policy you cannot enforce.
+   That's a legitimate trust model, but it means the embedded "roots" are really **public-key pins**. In particular, when the leaf SPKI itself matches an embedded root, `cert_verify()` returns success without requiring that leaf to chain to anything.
 
-Otherwise:
+   If intentional, document this prominently. If the intended model is conventional Web PKI, this is a semantic hole.
 
-```text
-CA says: "only these directoryName/IP/DNS names are permitted"
-                 ↓
-your parser ignores directoryName
-                 ↓
-chain accepted
-```
+6. **RSA modulus validation is incomplete**
 
-That is a policy bypass.
+   `rsa_pub_from_x509()` checks:
 
-The same principle applies to IPv6 constraints. Your stack doesn't speak IPv6, which is fine, but an IPv6 NameConstraint shouldn't silently vanish if you're claiming general X.509 chain validation.
+   * odd modulus
+   * at least 2048 bits
+   * exponent is odd and >= 3
+   * exponent fits one 32-bit limb
 
-## 4. NameConstraints don't validate subject DN
+   But it doesn't enforce the normal RSA public-key constraint `e < n`.
 
-`nc_pair_ok()` only checks:
+   This is unlikely to produce a practical authentication bypass because the key is attacker-controlled and verification remains mathematically constrained, but it should be tightened.
 
-```c
-subject->san[]
-subject->ip_san[]
-```
+### TLS protocol limitations
 
-It does not check `directoryName` constraints against the subject DN.
+7. **ServerHello fragmentation is rejected**
 
-That matters particularly for CA certificates, because NameConstraints apply to distinguished names as well as SAN name forms.
+   The state machine requires the entire ServerHello to be in the first record:
 
-If you want a deliberately narrow validator, I'd make the contract explicit:
+   `tls_client.c:639-652`
 
-> "We reject any NameConstraints containing unsupported name forms."
+   TLS permits handshake messages to be fragmented across records. This is an interoperability/DoS issue, not normally an authentication break.
 
-Do not present the current behavior as general RFC 5280 enforcement.
+   The later handshake reassembly code correctly handles fragmentation, so this looks like an inconsistent implementation boundary.
 
-## 5. Secret wiping/build issue
+8. **No TLS KeyUpdate support**
 
-The supplied source calls:
+   Post-handshake code explicitly rejects anything other than NewSessionTicket.
+
+   That's acceptable for a deliberately minimal client if documented, but a compliant TLS 1.3 peer can send KeyUpdate. Again, mostly availability/interoperability rather than a cryptographic hole.
+
+### RNG
+
+The RNG is better than I'd expect for a freestanding implementation. It has:
+
+* hardware RNG integration
+* entropy source classes
+* reseeding
+* forward rekeying
+* readiness gating
+* no deterministic fallback
+
+But one thing bothers me:
+
+`rng_rekey()` does:
 
 ```c
-secure_zero(...)
+chacha20_encrypt(rng_key, rng_nonce, rng_counter, block, block, 64);
 ```
 
-throughout `tls_state_wipe()`, but there is no definition or declaration anywhere in the archive.
+where `block` is uninitialized input. ChaCha20 encryption mathematically makes this equivalent to generating keystream, so the output is fine, but it triggers compiler diagnostics and is needlessly obscure.
 
-A normal compile of the supplied `.c` files produces an implicit-declaration error.
+I'd replace it with an explicit ChaCha20 block/keystream API or zero the input buffer first.
 
-Even if another part of the eventual kernel provides it, this is worth fixing immediately because wiping secrets should have a very explicit implementation and API.
+More importantly, **the RNG needs dedicated statistical/cryptographic state-transition tests**, especially around:
 
-Use something like a compiler-resistant zeroization primitive, not an ordinary `memset()` that an optimizer can potentially eliminate.
+* snapshot/restore
+* first-seed readiness
+* repeated reseeding
+* source failure
+* RDRAND/RDSEED failure
+* counter exhaustion
 
-## 6. TLS record padding handling is wrong
+### Crypto primitives
 
-This is subtle but real:
+I tested the supplied implementations against standard vectors for:
 
-```c
-int plen = ct_len;
-while (plen > 0 && pt[plen - 1] == 0) plen--;
-```
+* SHA-256
+* ChaCha20
+* Poly1305
+* X25519
 
-TLS 1.3 plaintext is:
+Those basic vectors passed. In particular, the X25519 implementation produced the RFC 7748 known result, so I do **not** see an obvious primitive-level break there.
 
-```text
-content || zero-padding || inner_content_type
-```
-
-You should remove zero padding **before the final content-type byte**, not strip every zero byte from the end of the whole plaintext.
-
-Your current code can corrupt valid application data ending in `0x00`.
-
-For example:
-
-```text
-HTTP/application content: 41 00
-content type:             17
-```
-
-should produce:
-
-```text
-41 00
-```
-
-but the parser's zero stripping can incorrectly remove the `00`.
-
-Not a cryptographic break, but definitely a protocol correctness bug.
-
-## 7. Ticket API has an unsafe clockless mode
-
-You deliberately prevent resumption in the main handshake when:
-
-```c
-st->now_ms == 0
-```
-
-which is good.
-
-But:
-
-```c
-tls_ticket_have(host)
-```
-
-calls:
-
-```c
-ticket_fresh(..., 0)
-```
-
-and `ticket_fresh()` interprets zero as "don't expire based on age."
-
-That API is therefore capable of reporting an arbitrarily old ticket as fresh.
-
-I'd remove the ambiguous zero-clock semantics entirely. Make freshness require an explicit trusted time value, or have a separate `ticket_available()` operation that doesn't claim freshness.
-
-## What looks good
-
-A few things are notably solid:
-
-* X25519 is implemented with clamping and constant-time conditional swaps.
-* You reject an all-zero X25519 shared secret.
-* ChaCha20-Poly1305 nonce construction and sequence-number handling are thoughtfully structured.
-* AEAD authentication is checked before decryption.
-* RSA signatures enforce modulus-size/key sanity.
-* RSA CertificateVerify uses PSS rather than PKCS#1 v1.5.
-* Certificate AlgorithmIdentifier parameters are handled unusually carefully.
-* Certificate chain signatures are actually checked against the issuer key.
-* Leaf hostname matching is SAN-only and doesn't fall back to CN.
-* Wildcards are restricted to the leftmost label.
-* IP literals don't match `dNSName`.
-* You reject unknown critical X.509 extensions.
-* The certificate-message framing is strict.
-* The TLS state machine is deliberately narrow, which is generally preferable for a small embedded client.
+The AEAD construction also follows RFC 8439 correctly and uses a constant-time 16-byte tag comparison.
 
 ### My priority order
 
-I'd fix these in this order:
+| Priority     | Finding                                                             | Impact                           |
+| ------------ | ------------------------------------------------------------------- | -------------------------------- |
+| Critical-ish | EOF/truncation treated as successful TLS completion                 | Response integrity               |
+| High         | Source/object mismatch + broken clean build                         | Build integrity                  |
+| Medium       | Global AEAD scratch buffer                                          | Reentrancy/concurrency           |
+| Medium       | Trust model is SPKI pinning rather than ordinary CA path validation | Authentication semantics         |
+| Medium       | No ServerHello fragmentation                                        | Interoperability/DoS             |
+| Low/Medium   | RSA `e < n` not enforced                                            | Key validation                   |
+| Low/Medium   | No TLS KeyUpdate                                                    | Interoperability                 |
+| Low          | Uninitialized buffer passed as ChaCha plaintext                     | Code quality/compiler robustness |
 
-1. **RNG entropy/readiness model**
-2. **NameConstraints fail-open behavior**
-3. **Reject parser-limit overflow instead of truncating security-relevant fields**
-4. **Implement and verify `secure_zero()`**
-5. **Fix TLS 1.3 zero-padding parsing**
-6. **Eliminate the clockless ticket-freshness ambiguity**
-7. Then fuzz the DER/X.509/TLS parsers aggressively
+The **EOF/truncation issue is the one I'd fix first**. It crosses the boundary from "minimal TLS implementation limitation" into "application can accept attacker-truncated authenticated data as a successful response."
 
-The most important architectural point is that this stack is much stronger as a **narrow TLS client** than as a general-purpose X.509 implementation. That's a good design choice, but the parser needs to reject anything outside the narrow security model rather than silently ignoring pieces of policy.
+If you want, I can next do a **line-by-line adversarial audit of the TLS/X.509 path**, concentrating specifically on authentication bypasses rather than interoperability issues.
 

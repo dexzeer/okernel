@@ -123,6 +123,117 @@ void tls_ticket_clear(void) {
         ((uint8_t*)ticket_slots)[i] = 0;
 }
 
+// Case-insensitive byte match (HTTP header names are case-insensitive;
+// no locale, no tolower table — ASCII fold inline).
+static int hdr_name_at(const uint8_t* p, uint32_t avail, const char* name) {
+    uint32_t i = 0;
+    for (;; i++) {
+        char n = name[i];
+        if (n == 0) return 1;
+        if (i >= avail) return 0;
+        uint8_t c = p[i];
+        if (c >= 'A' && c <= 'Z') c += 32;
+        if ((char)c != (n >= 'A' && n <= 'Z' ? n + 32 : n)) return 0;
+    }
+}
+
+// HTTP response completeness (cryptoholes #1): decides whether `len`
+// bytes prove a COMPLETE message, are provably SHORT (truncated), or
+// carry no length signal (UNKNOWN, close-delimited). Pure function.
+int tls_response_complete(const uint8_t* resp, uint32_t len) {
+    if (!resp || len == 0) return TLS_RESP_SHORT; // nothing arrived
+    // Headers end at the first blank line.
+    uint32_t body = 0;
+    int found = 0;
+    for (uint32_t i = 0; i + 3 < len; i++) {
+        if (resp[i] == '\r' && resp[i+1] == '\n' &&
+            resp[i+2] == '\r' && resp[i+3] == '\n') {
+            body = i + 4;
+            found = 1;
+            break;
+        }
+    }
+    if (!found) return TLS_RESP_SHORT; // headers themselves cut
+    // Chunked? Walk chunk sizes to the terminal 0-chunk (mirror of the
+    // dechunker, read-only). A chunked body without its terminator is
+    // truncated, full stop.
+    for (uint32_t i = 0; i + 18 <= body; i++) {
+        if (hdr_name_at(resp + i, body - i, "transfer-encoding:")) {
+            // value runs to end of line; look for the "chunked" token
+            uint32_t e = i + 18;
+            while (e < body && resp[e] != '\r') e++;
+            int is_chunked = 0;
+            for (uint32_t k = i + 18; k + 7 <= e && !is_chunked; k++) {
+                int m = 1;
+                for (int t = 0; t < 7; t++) {
+                    uint8_t d = resp[k + (uint32_t)t];
+                    if (d >= 'A' && d <= 'Z') d += 32;
+                    if (d != (uint8_t)"chunked"[t]) { m = 0; break; }
+                }
+                if (m) is_chunked = 1;
+            }
+            if (!is_chunked) break; // value isn't chunked: fall through
+            // walk chunks; need terminal "0" chunk + final blank line
+            {
+                uint32_t rd = body;
+                int complete = 0;
+                while (rd < len) {
+                    uint32_t size = 0;
+                    int digits = 0;
+                    while (rd < len) {
+                        uint8_t c = resp[rd];
+                        int v = -1;
+                        if (c >= '0' && c <= '9') v = c - '0';
+                        else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
+                        else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
+                        else break;
+                        if (size > 0xFFFFFFFu) break; // absurd: malformed
+                        size = size * 16 + (uint32_t)v;
+                        digits++;
+                        rd++;
+                    }
+                    if (!digits) break; // malformed mid-body
+                    while (rd < len && resp[rd] != '\n') rd++;
+                    if (rd < len) rd++;
+                    if (size == 0) {
+                        // terminal chunk: need the final blank line
+                        if (rd + 1 < len && resp[rd] == '\r' &&
+                            resp[rd+1] == '\n') complete = 1;
+                        break;
+                    }
+                    if (rd + size > len) break; // data runs off the end
+                    rd += size;
+                    if (rd + 1 < len && resp[rd] == '\r' &&
+                        resp[rd+1] == '\n') rd += 2;
+                    else break; // missing chunk CRLF
+                }
+                return complete ? TLS_RESP_COMPLETE : TLS_RESP_SHORT;
+            }
+        }
+    }
+    // Content-Length? Decimal value; body shorter than declared = cut.
+    for (uint32_t i = 0; i + 15 <= body; i++) {
+        if (hdr_name_at(resp + i, body - i, "content-length:")) {
+            uint32_t j = i + 15;
+            while (j < body && (resp[j] == ' ' || resp[j] == '\t')) j++;
+            uint32_t declared = 0;
+            int digits = 0;
+            while (j < body && resp[j] >= '0' && resp[j] <= '9') {
+                if (declared <= 0xFFFFFFFu)
+                    declared = declared * 10 + (uint32_t)(resp[j] - '0');
+                else
+                    declared = 0xFFFFFFFFu; // saturate, never wrap
+                digits++;
+                j++;
+            }
+            if (!digits) return TLS_RESP_SHORT; // unparseable length
+            return (len - body < declared) ? TLS_RESP_SHORT
+                                           : TLS_RESP_COMPLETE;
+        }
+    }
+    return TLS_RESP_UNKNOWN; // close-delimited: no signal either way
+}
+
 // ---- Trust-On-First-Use leaf pinning (see tls_client.h) ----
 #define TLS_PIN_SLOTS 8
 struct tls_pin_slot {
@@ -499,7 +610,8 @@ void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
 //
 // STATE MACHINE (review #28 — explicit rejection table for a minimal
 // client; anything not listed below is PROTO by construction):
-//   SEND_CH -> RECV_SH: exactly one SH record, exact-consumed, no HRR
+//   SEND_CH -> RECV_SH: one SH message (possibly fragmented across
+//     records — reassembled, 4KB cap), exact-consumed, no HRR
 //     (magic random rejected), session-id echo + cipher enforced.
 //   RECV_SH -> RECV_HS: flight EE, [CERT, CV,] Finished in order, each
 //     once (PSK-accepted: EE, Finished). CertificateRequest (client-auth),
@@ -508,7 +620,10 @@ void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
 //   RECV_HS -> RECV_BODY: request sent; app keys live.
 //   RECV_BODY: APPDATA appended (overflow-checked); NST consumed+stored;
 //     KeyUpdate/unknown post-HS types rejected; plaintext alerts rejected;
-//     encrypted close_notify ends cleanly; EOF ends (Connection: close).
+//     encrypted close_notify ends cleanly (saw_close=1); EOF with a
+//     partial record buffered is fatal truncation (PROTO, no fallback);
+//     clean-boundary EOF ends the STREAM (DONE) — message COMPLETENESS
+//     still needs close_notify or HTTP framing (tls_response_complete).
 //   No 0-RTT/early-data is ever sent. No client certificate exists.
 int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
     switch (st->phase) {
@@ -621,6 +736,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         }
         st->phase = TLS_PH_RECV_SH;
         st->rec_have = 0;
+        st->hs_have = 0; // SH reassembly starts empty (hs_buf reused later)
         return TLS_STEP_AGAIN;
     }
 
@@ -636,17 +752,33 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         }
         if (rec_v.type != TLS_CT_HANDSHAKE) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
 
-        uint8_t hs_t; uint32_t hs_bl;
-        uint32_t consumed = parse_hs(st->rec_buf + 5, st->rec_pl, &hs_t, &hs_bl);
-        if (consumed == 0 || hs_t != TLS_HS_SERVER_HELLO) {
+        // ServerHello reassembly (cryptoholes #7 — RFC 8446 §5.1 permits
+        // fragmenting handshake messages across records; the flight path
+        // already reassembles, the SH path wrongly required one record).
+        // Accumulate payloads; parse when a complete message is present.
+        // Cap: a storable SH (4KB body cap below + header).
+        if (st->hs_have + st->rec_pl > sizeof(st->sh_body) + 4) {
+            tls_dbg("[tls] ServerHello exceeds reassembly cap\n");
             st->fail_reason = TLS_FAIL_PROTO;
             return TLS_STEP_ERR;
         }
-        // ServerHello fills its record exactly (review 2026-09-10 #11):
+        for (uint32_t i = 0; i < st->rec_pl; i++)
+            st->hs_buf[st->hs_have + i] = st->rec_buf[5 + i];
+        st->hs_have += st->rec_pl;
+        st->rec_have = 0;
+
+        uint8_t hs_t; uint32_t hs_bl;
+        uint32_t consumed = parse_hs(st->hs_buf, st->hs_have, &hs_t, &hs_bl);
+        if (consumed == 0) return TLS_STEP_AGAIN; // partial: await records
+        if (hs_t != TLS_HS_SERVER_HELLO) {
+            st->fail_reason = TLS_FAIL_PROTO;
+            return TLS_STEP_ERR;
+        }
+        // ServerHello fills its record(s) exactly (review 2026-09-10 #11):
         // trailing bytes would be a coalesced second message we would
         // silently drop. Real servers always send SH alone (plaintext,
         // middlebox-compat shape).
-        if (consumed != st->rec_pl) {
+        if (consumed != st->hs_have) {
             tls_dbg("[tls] SH record has trailing bytes\n");
             st->fail_reason = TLS_FAIL_PROTO;
             return TLS_STEP_ERR;
@@ -663,14 +795,14 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             st->fail_reason = TLS_FAIL_PROTO;
             return TLS_STEP_ERR;
         }
-        if (tls_parse_server_hello(st->rec_buf + 5 + 4, hs_bl,
+        if (tls_parse_server_hello(st->hs_buf + 4, hs_bl,
                                    st->session_id, &sh) != 0) {
             st->fail_reason = TLS_FAIL_PROTO;
             return TLS_STEP_ERR;
         }
         st->sh_bl = hs_bl;
         for (uint32_t i = 0; i < hs_bl; i++)
-            st->sh_body[i] = st->rec_buf[5 + 4 + i];
+            st->sh_body[i] = st->hs_buf[4 + i];
 
         // HelloRetryRequest is explicitly unsupported (review #28): our CH
         // is fixed-shape (X25519-only, ChaCha-only), so a server asking us
@@ -746,6 +878,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
 
         st->phase = TLS_PH_RECV_HS;
         st->rec_have = 0;
+        st->hs_have = 0; // flight reassembly starts empty (hs_buf reused)
         return TLS_STEP_AGAIN;
     }
 
@@ -1129,8 +1262,23 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         int r = tls_recv_record_st(st, io);
         if (r == 0) return TLS_STEP_AGAIN;
         if (r < 0) {
-            // Transport EOF: we always send Connection: close, so the peer
-            // closing after the response IS the normal end of the body.
+            // Transport EOF (cryptoholes #1 — truncation integrity):
+            // EOF mid-record (rec_have != 0) is a DEFINITE truncation —
+            // an attacker cutting the connection here turns a complete
+            // response into a prefix while bytes sit undecryptable.
+            // Fatal, no HTTP fallback (same bucket as other PROTO).
+            if (st->rec_have != 0) {
+                tls_dbg("[tls] EOF mid-record: truncated flight\n");
+                st->fail_reason = TLS_FAIL_PROTO;
+                st->rec_have = 0;
+                return TLS_STEP_ERR;
+            }
+            // Clean record boundary. We always send Connection: close, so
+            // the peer closing after the response IS the normal end of
+            // the body — but only HTTP framing (Content-Length, checked
+            // by the caller via tls_response_complete) or an
+            // authenticated close_notify (saw_close) proves COMPLETENESS.
+            // The DONE here means "stream ended", not "message complete".
             st->phase = TLS_PH_DONE;
             return TLS_STEP_DONE;
         }
@@ -1161,11 +1309,16 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             // Post-handshake handshake message: the only legal one here is
             // NewSessionTicket (RFC 8446 §4.6.1). Servers (Cloudflare et al.)
             // routinely send 2 per connection, sometimes BEFORE app data —
-            // without this branch the flight dies as PROTO. Each ticket is
-            // bound to this connection's resumption master and cached for a
-            // future PSK offer. Anything else (KeyUpdate, rogue flight) is a
-            // protocol violation. Malformed tickets are fatal too (RFC §6):
-            // silently keeping a corrupt ticket would resume into garbage.
+            // without this branch the flight dies as PROTO. KeyUpdate and
+            // anything else are rejected (cryptoholes #8 — deliberate
+            // minimalism, not a protocol judgment: our connections are
+            // single short fetches, never near rekey volume, and rejecting
+            // unknown post-handshake traffic fail-closed is the safe
+            // default; a KeyUpdate-sending peer just sees us abort).
+            // Each ticket is bound to this connection's resumption master
+            // and cached for a future PSK offer. Malformed tickets are
+            // fatal too (RFC §6): silently keeping a corrupt ticket would
+            // resume into garbage.
             uint32_t hp = 0;
             int saw_nst = 0;
             while (hp < (uint32_t)pl) {
@@ -1199,6 +1352,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             if (pl == 2) {
                 if (pt[1] == 0) {  // close_notify
                     st->fail_reason = TLS_FAIL_ALERT_CLOSE;
+                    st->saw_close = 1; // authenticated stream end (see above)
                     st->phase = TLS_PH_DONE;
                     return TLS_STEP_DONE;
                 }

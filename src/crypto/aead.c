@@ -6,44 +6,21 @@
 // keystream at counter 0; payload encrypted at counter 1. MAC input is
 // aad || pad16 || ct || pad16 || le64(aad_len) || le64(ct_len).
 
-static void put_le64(uint8_t* p, uint64_t v) {
-    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i));
-}
-
 static int mac_poly1305(const uint8_t key[32],
                         const uint8_t* aad, uint32_t aad_len,
                         const uint8_t* ct, uint32_t ct_len,
                         uint8_t tag[16]) {
-    // total = aad + pad + ct + pad + 16 bytes of lengths, assembled in a
-    // fixed cap buffer (poly1305_auth is one-shot; no streaming API).
-    // OVERSIZE IS A HARD ERROR (review 2026-09-10 #1): the old code had no
-    // else-branch, so oversized inputs left `tag` unwritten on encrypt
-    // (peer receives stack garbage as the tag) and compared against
-    // uninitialized stack on decrypt (UB + potential auth bypass). A MAC
-    // primitive that can silently not-MAC is the worst bug class — refuse.
-#define AEAD_MAC_SCRATCH (20 * 1024)
-    // Non-reentrant by construction (review #41): single static buffer.
-    // Safe under the documented single-threaded contract (tls_client.h):
-    // AEAD runs in main-loop thread context only — never in IRQ handlers,
-    // never nested (decrypt verifies before decrypting; no reentry path).
-    // A streaming Poly1305 API would remove the buffer AND the 20KB cap;
-    // until then the cap is enforced loudly (see below), never silently.
-    static uint8_t scratch[AEAD_MAC_SCRATCH];
-    uint32_t total = aad_len + ct_len + 32 + 2 * 16;
-    if (total > AEAD_MAC_SCRATCH) {
-        for (int i = 0; i < 16; i++) tag[i] = 0;
+    // Streaming Poly1305 over aad || pad16 || ct || pad16 || le64 lens
+    // (cryptoholes #3): all state is stack-local — no statics, fully
+    // reentrant. The input CAP stays (review 2026-09-10 #1 — now a pure
+    // length check, no buffer): oversized inputs fail loudly instead of
+    // hashing unbounded memory on a caller bug (u64 sum: u32 lengths
+    // could wrap 4GB). TLS records cap far below this at the record
+    // layer; the cap here is defense in depth for future callers.
+#define AEAD_MAX_INPUT (20 * 1024)
+    if ((uint64_t)aad_len + (uint64_t)ct_len + 63u > AEAD_MAX_INPUT)
         return -1;
-    }
-    {
-        uint32_t o = 0;
-        for (uint32_t i = 0; i < aad_len; i++) scratch[o++] = aad[i];
-        while (o % 16) scratch[o++] = 0;
-        for (uint32_t i = 0; i < ct_len; i++) scratch[o++] = ct[i];
-        while (o % 16) scratch[o++] = 0;
-        put_le64(scratch + o, aad_len); o += 8;
-        put_le64(scratch + o, ct_len); o += 8;
-        poly1305_auth(key, scratch, o, tag);
-    }
+    poly1305_auth_pieces(key, aad, aad_len, ct, ct_len, tag);
     return 0;
 }
 

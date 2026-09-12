@@ -313,6 +313,8 @@ enum mock_mode {
     MOCK_EE_DUP,       // EE with duplicate extension (must ERR)
     MOCK_EE_ALPN_H2,   // EE selecting h2 (must ERR — we speak http/1.1)
     MOCK_FRAGMENT,     // flight split mid-Certificate (must DONE)
+    MOCK_SH_SPLIT,     // ServerHello split across 2 records (must DONE)
+    MOCK_APP_TRUNCATED, // valid flight+body, last app record cut (must ERR)
     MOCK_COUNT
 };
 
@@ -540,6 +542,11 @@ static int try_queue_body(const uint8_t* resp, uint32_t resp_len) {
                         &g_s_ap_seq, TLS_CT_ALERT, cn, 2);
         if (rl) q_put(rec, rl);
     }
+    // APP_TRUNCATED (cryptoholes #1): the body was just queued above; cut
+    // the TAIL mid-app-record (10B off the end lands inside the last
+    // record: 5B header + ~50B body + 16B tag). EOF with a partial record
+    // buffered must ERR (PROTO truncation), never DONE as a full page.
+    if (g_mode == MOCK_APP_TRUNCATED && q_len > 30) q_len -= 10;
     g_body_queued = 1;
     return 1;
 }
@@ -672,7 +679,8 @@ static const char* mode_name(int m) {
         "SH_FLIPPED", "EE_FLIPPED", "NST", "NST_BAD", "NST_BIGNONCE",
         "PSK_ACCEPT", "PSK_FALLBACK", "PSK_FOREIGN", "CV_PKCS1",
         "STAPLE", "STAPLE_BAD", "STAPLE_REVOKED", "STAPLE_STALE", "SH_BIG",
-        "SH_TRAIL", "SH_DUP", "EE_DUP", "EE_ALPN_H2", "FRAGMENT"
+        "SH_TRAIL", "SH_DUP", "EE_DUP", "EE_ALPN_H2", "FRAGMENT",
+        "SH_SPLIT", "APP_TRUNCATED"
     };
     return names[m];
 }
@@ -1096,8 +1104,20 @@ static void mock_run(int mode, struct mock_result* res) {
 
     uint8_t rec[16500];
     uint64_t s_seq = 0;
-    uint32_t rl = plain_record(rec, TLS_CT_HANDSHAKE, sh_wire, sh_msg_len);
-    q_put(rec, rl);
+    uint32_t rl = 0;
+    if (mode == MOCK_SH_SPLIT) {
+        // cryptoholes #7: ServerHello fragmented across two records
+        // (RFC 8446 §5.1 permits it) — must reassemble and complete.
+        uint32_t cut = 30; // mid-body split
+        rl = plain_record(rec, TLS_CT_HANDSHAKE, sh_wire, cut);
+        q_put(rec, rl);
+        rl = plain_record(rec, TLS_CT_HANDSHAKE, sh_wire + cut,
+                          sh_msg_len - cut);
+        q_put(rec, rl);
+    } else {
+        rl = plain_record(rec, TLS_CT_HANDSHAKE, sh_wire, sh_msg_len);
+        q_put(rec, rl);
+    }
 
     // PSK_ACCEPT with an UNVERIFIED offer: binder (or identity) doesn't
     // check out — the server aborts with a fatal alert instead of any
@@ -1327,6 +1347,7 @@ static void mock_run(int mode, struct mock_result* res) {
                           mode == MOCK_NST_BIGNONCE ||
                           mode == MOCK_PSK_ACCEPT || mode == MOCK_PSK_FALLBACK ||
                           mode == MOCK_STAPLE || mode == MOCK_FRAGMENT ||
+                          mode == MOCK_SH_SPLIT || mode == MOCK_APP_TRUNCATED ||
                           mode == MOCK_CLOSE_NOTIFY || mode == MOCK_APPDATA_BITFLIP);
         // TRUNCATED: cut the queue mid-flight-record (SH complete + 30B of
         // the encrypted flight). The client must ERR on the short close —
@@ -1441,6 +1462,9 @@ static void mock_section(void) {
     mock_run(MOCK_TRUNCATED, &res);
     CHECK(res.r == TLS_STEP_ERR,
           "truncated flight rejected (no hang, no partial DONE)");
+    mock_run(MOCK_APP_TRUNCATED, &res);
+    CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_PROTO,
+          "app-phase mid-record EOF rejected as truncation (cryptoholes #1)");
     mock_run(MOCK_SH_FLIPPED, &res);
     CHECK(res.r == TLS_STEP_ERR,
           "tampered ServerHello rejected (transcript fork)");
@@ -1519,6 +1543,68 @@ static void mock_section(void) {
     CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
           memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
           "fragmented flight reassembled");
+    mock_run(MOCK_SH_SPLIT, &res);
+    CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
+          memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
+          "fragmented ServerHello reassembled (cryptoholes #7)");
+}
+
+static void truncation_section(void) {
+    printf("== 2b. truncation completeness (cryptoholes #1) ==\n");
+    // Complete Content-Length body.
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_COMPLETE, "complete C-L body accepted");
+    }
+    // Short body vs declared length.
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 50\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_SHORT, "short C-L body is truncation");
+    }
+    // Headers cut mid-flight.
+    {
+        static const char r[] = "HTTP/1.1 200 OK\r\nContent-Len";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_SHORT, "cut headers are truncation");
+    }
+    // Empty input.
+    {
+        CHECK(tls_response_complete((const uint8_t*)"", 0) ==
+              TLS_RESP_SHORT, "empty response is truncation");
+    }
+    // No length signal: close-delimited, unknowable either way.
+    {
+        static const char r[] = "HTTP/1.1 200 OK\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_UNKNOWN, "lengthless body is UNKNOWN");
+    }
+    // Chunked with terminator.
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            "5\r\nhello\r\n0\r\n\r\n";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_COMPLETE, "terminated chunked body accepted");
+    }
+    // Chunked cut before the terminal chunk.
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+            "5\r\nhello\r\n";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_SHORT, "unterminated chunked body is truncation");
+    }
+    // Case-insensitive header names.
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\ncontent-length: 5\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_COMPLETE, "header names case-insensitive");
+    }
 }
 
 static void keyuse_section(void) {
@@ -1788,6 +1874,7 @@ int main(void) {
     parser_fuzz_section();
     fuzz_section();
     mock_section();
+    truncation_section();
     keyuse_section();
     pin_section();
     name_section();

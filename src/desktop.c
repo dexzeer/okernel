@@ -2032,7 +2032,17 @@ void kernel_main(uint32_t mboot_phys) {
                     int resp_len = tls_get_response_len();
                     char* resp = tls_get_response();
                     if (resp && resp_len > 0) {
-                        okai_sub_res_done(bi, resp, resp_len);
+                        // Same truncation gate as the main fetch: never
+                        // feed a cut sub-resource (CSS/JS) to the parsers.
+                        // Skipped (not failed) — the page renders without
+                        // it, which is availability-safe either way.
+                        if (!tls_saw_close_notify() &&
+                            tls_response_complete((const uint8_t*)resp,
+                                                  (uint32_t)resp_len) == TLS_RESP_SHORT) {
+                            serial_puts("[okai] TLS sub-resource truncated, skipping\n");
+                        } else {
+                            okai_sub_res_done(bi, resp, resp_len);
+                        }
                     }
                     if (okai_start_sub_res_fetch(bi) != 0) {
                         okai_render_content(bi);
@@ -2068,7 +2078,24 @@ void kernel_main(uint32_t mboot_phys) {
                     int resp_len = tls_get_response_len();
                     char* resp = tls_get_response();
                     if (resp && resp_len > 0) {
-                        if (okai_check_redirect(bi, resp, resp_len)) {
+                        // Truncation integrity (cryptoholes #1): without an
+                        // authenticated close_notify, HTTP framing must
+                        // prove the message complete. SHORT = attacker-cut
+                        // stream: no render, no HTTP fallback (same bucket
+                        // as cert failures). UNKNOWN (close-delimited, no
+                        // length signal) accepts per curl-parity — that
+                        // ambiguity is inherent to HTTP, not our bug.
+                        if (!tls_saw_close_notify() &&
+                            tls_response_complete((const uint8_t*)resp,
+                                                  (uint32_t)resp_len) == TLS_RESP_SHORT) {
+                            serial_printf("[okai] TLS response truncated for %s, no HTTP fallback\n",
+                                          T->url);
+                            T->truncated = 1;
+                            okai_fetch_owner = -1;
+                            T->token_count = -1;
+                            T->last_resp_len = 0;
+                            okai_render_content(bi); // show TRUNCATED warning
+                        } else if (okai_check_redirect(bi, resp, resp_len)) {
                             // 3xx followed; owner stays bi, new fetch issued
                         } else {
                             resp_len = http_dechunk(resp, resp_len);

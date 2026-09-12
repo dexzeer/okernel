@@ -74,6 +74,7 @@ static void okai_tab_reset(struct okai_tab* T) {
     T->https_fell_back = 0;
     T->cert_failed = 0;
     T->cert_detail = 0;
+    T->truncated = 0;
     T->css_n = 0;
     T->css_text[0] = 0;
     T->link_count = 0;
@@ -518,6 +519,24 @@ void okai_render_content(int ed_id) {
     // different (benign) case.
     if (T->token_count == -1 && T->last_resp_len == 0) {
         window_set_text_color_rgb(b->win_id, 0xFF5555, 0x000000); // light red
+        if (T->truncated) {
+            // Truncated secure response (cryptoholes #1): the connection
+            // ended mid-message with no authenticated close and short of
+            // the declared framing. Never render partial bytes as a page,
+            // never fall back to HTTP (an on-path attacker truncates
+            // exactly this way).
+            window_puts(b->win_id, "\n RESPONSE TRUNCATED\n\n");
+            window_set_text_color_rgb(b->win_id, 0xAAAAAA, 0x000000);
+            window_puts(b->win_id, " The secure connection ended\n");
+            window_puts(b->win_id, " mid-response. The page may have\n");
+            window_puts(b->win_id, " been cut by an attacker.\n\n");
+            window_puts(b->win_id, " Nothing was loaded and no HTTP\n");
+            window_puts(b->win_id, " fallback was attempted.\n");
+            window_set_text_color_rgb(b->win_id, default_fg, page_bg);
+            T->content_height = 10;
+            w->dirty = 1;
+            return;
+        }
         if (T->cert_failed) {
             window_puts(b->win_id, "\n SECURITY WARNING\n\n");
             window_set_text_color_rgb(b->win_id, 0xAAAAAA, 0x000000);
@@ -1280,6 +1299,7 @@ void okai_navigate(int id, const char* url) {
     T->https_fell_back = 0;
     T->cert_failed = 0;
     T->cert_detail = 0;
+    T->truncated = 0;
 
     // Defer the request to the desktop response loop (single-connection owner
     // model); okai_start_fetch() derives scheme/host/path from T->url when it
