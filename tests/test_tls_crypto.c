@@ -4,6 +4,8 @@
 #include "hmac.h"
 #include "hkdf.h"
 #include "sha1.h"
+#include "sha256.h"
+#include "sha512.h"
 #include "aead.h"
 #include "x25519.h"
 
@@ -45,6 +47,37 @@ int main(void) {
         check("SHA1 448-bit", h, want, 20);
     }
 
+    // ---- SHA-256 FIPS 180-4 vectors (independent: openssl dgst) ----
+    {
+        uint8_t h[32], want[32];
+        sha256(NULL, 0, h);
+        unhex(want, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", 32);
+        check("SHA256 empty", h, want, 32);
+        sha256((const uint8_t*)"abc", 3, h);
+        unhex(want, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", 32);
+        check("SHA256 abc", h, want, 32);
+        sha256((const uint8_t*)"abcdbcdecdefdefgefghijk", 23, h);
+        unhex(want, "a5b737cd348c26a58acefd68ed33ea70f05dc01a69dbf4ca972a38453e51836c", 32);
+        check("SHA256 184-bit", h, want, 32);
+    }
+
+    // ---- SHA-384 / SHA-512 FIPS 180-4 vectors (independent: openssl) ----
+    {
+        uint8_t h[64], w48[48], w64[64];
+        sha384(NULL, 0, h);
+        unhex(w48, "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b", 48);
+        check("SHA384 empty", h, w48, 48);
+        sha384((const uint8_t*)"abc", 3, h);
+        unhex(w48, "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7", 48);
+        check("SHA384 abc", h, w48, 48);
+        sha512(NULL, 0, h);
+        unhex(w64, "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e", 64);
+        check("SHA512 empty", h, w64, 64);
+        sha512((const uint8_t*)"abc", 3, h);
+        unhex(w64, "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f", 64);
+        check("SHA512 abc", h, w64, 64);
+    }
+
     // ---- HMAC-SHA256 RFC 4231 TC1 ----
     uint8_t k20[20]; memset(k20, 0x0b, 20);
     hmac_sha256(k20, 20, (const uint8_t*)"Hi There", 8, out);
@@ -59,6 +92,36 @@ int main(void) {
         "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843", 32);
     check("HMAC TC2", out, hmac2, 32);
 
+    // ---- HMAC-SHA256 RFC 4231 TC3/TC4/TC6/TC7 (independent: openssl) ----
+    // TC3: 20B key, 50B data. TC4: 25B key. TC6/TC7: 131B key (larger
+    // than the 64B block — exercises the key-hashing path).
+    {
+        uint8_t k3[20]; memset(k3, 0xaa, 20);
+        uint8_t d3[50]; memset(d3, 0xdd, 50);
+        hmac_sha256(k3, 20, d3, 50, out);
+        uint8_t h3[32]; unhex(h3,
+            "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe", 32);
+        check("HMAC TC3", out, h3, 32);
+        uint8_t k4[25];
+        for (int i = 0; i < 25; i++) k4[i] = (uint8_t)(i + 1);
+        uint8_t d4[50]; memset(d4, 0xcd, 50);
+        hmac_sha256(k4, 25, d4, 50, out);
+        uint8_t h4[32]; unhex(h4,
+            "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b", 32);
+        check("HMAC TC4", out, h4, 32);
+        uint8_t k131[131]; memset(k131, 0xaa, 131);
+        hmac_sha256(k131, 131,
+            (const uint8_t*)"Test Using Larger Than Block-Sized Key - Hash Key First", 55, out);
+        uint8_t h6[32]; unhex(h6,
+            "ad47763c29284e9399feab51e0e79c9c5869cd06617d14fe69f0af19ffbd51cd", 32);
+        check("HMAC TC6 big-key", out, h6, 32);
+        hmac_sha256(k131, 131,
+            (const uint8_t*)"This is a test using a larger than block-size key and a larger than block-size data. The key needs to be hashed before being used by the HMAC algorithm.", 152, out);
+        uint8_t h7[32]; unhex(h7,
+            "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2", 32);
+        check("HMAC TC7 big-both", out, h7, 32);
+    }
+
     // ---- HKDF RFC 5869 TC1 ----
     uint8_t ikm[22]; memset(ikm, 0x0b, 22);
     uint8_t salt[13]; unhex(salt, "000102030405060708090a0b0c", 13);
@@ -69,6 +132,45 @@ int main(void) {
         "2d2d0a90cf1a5a4c5db02d56ecc4c5bf"
         "34007208d5b887185865", 42);
     check("HKDF TC1", out, okm1, 42);
+
+    // ---- HKDF RFC 5869 TC2 (80B IKM/salt/info, 82B output) ----
+    {
+        uint8_t ikm2[80], salt2[80], info2[80], prk2[32], okm2[82];
+        for (int i = 0; i < 80; i++) {
+            ikm2[i] = (uint8_t)i;
+            salt2[i] = (uint8_t)(0x60 + i);
+            info2[i] = (uint8_t)(0xb0 + i);
+        }
+        hkdf_extract(salt2, 80, ikm2, 80, prk2);
+        uint8_t prk2w[32]; unhex(prk2w,
+            "06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244", 32);
+        check("HKDF TC2 PRK", prk2, prk2w, 32);
+        if (hkdf_expand(prk2, info2, 80, okm2, 82) != 0) { fails++; printf("HKDF TC2 expand failed\n"); }
+        else {
+            uint8_t okm2w[82]; unhex(okm2w,
+                "b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c"
+                "59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71"
+                "cc30c58179ec3e87c14c01d5c1f3434f1d87", 82);
+            check("HKDF TC2 OKM", okm2, okm2w, 82);
+        }
+    }
+
+    // ---- HKDF RFC 5869 TC3 (zero-length salt and info) ----
+    {
+        uint8_t ikm3[22]; memset(ikm3, 0x0b, 22);
+        uint8_t prk3[32], okm3[42];
+        hkdf_extract(NULL, 0, ikm3, 22, prk3);
+        uint8_t prk3w[32]; unhex(prk3w,
+            "19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04", 32);
+        check("HKDF TC3 PRK", prk3, prk3w, 32);
+        if (hkdf_expand(prk3, NULL, 0, okm3, 42) != 0) { fails++; printf("HKDF TC3 expand failed\n"); }
+        else {
+            uint8_t okm3w[42]; unhex(okm3w,
+                "8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d"
+                "9d201395faa4b61a96c8", 42);
+            check("HKDF TC3 OKM", okm3, okm3w, 42);
+        }
+    }
 
     // Oversize refusal (review #40): >8160B must FAIL, never clamp.
     {
@@ -169,6 +271,57 @@ int main(void) {
     x25519_shared_secret(shared2, bob_priv, alice_pub_want);
     check("X25519 shared (A)", shared1, shared_want, 32);
     check("X25519 shared (B)", shared2, shared_want, 32);
+
+    // ---- X25519 low-order inputs (cryptoholes P0) ----
+    // Clamped scalars are 0 mod 8, so every small-subgroup peer point
+    // (orders 1, 2, 4, 8 all divide 8) yields EXACTLY zero: the
+    // caller's all-zero rejection (shared_is_zero in tls_client.c)
+    // therefore covers the whole small subgroup, not just one case.
+    // These assert the primitive side (zero out); the caller side is
+    // covered by the handshake tests (zero shared → PROTO fail).
+    {
+        uint8_t zero[32], one[32], sc2[32], oo[32], zref[32];
+        memset(zero, 0, 32);
+        memset(one, 0, 32); one[0] = 1;
+        memset(zref, 0, 32);
+        for (int i = 0; i < 32; i++) sc2[i] = (uint8_t)(i * 3 + 1);
+        x25519_shared_secret(oo, sc2, zero);
+        check("X25519 low-order u=0 -> zero", oo, zref, 32);
+        x25519_shared_secret(oo, sc2, one);
+        check("X25519 low-order u=1 -> zero", oo, zref, 32);
+    }
+
+    // ---- X25519 DH commutativity (cryptoholes P0 assurance) ----
+    // x25519(a, x25519(b, G)) == x25519(b, x25519(a, G)) for random
+    // pairs: implementation-agnostic self-consistency (no fixtures).
+    // Combined with the RFC vectors above (absolute correctness), this
+    // catches nearly any arithmetic regression.
+    {
+        uint64_t lcg = 0x9E3779B97F4A7C15ull;
+        int ok = 1;
+        for (int t = 0; t < 8 && ok; t++) {
+            uint8_t a[32], b[32], pa[32], pb[32], s1[32], s2[32];
+            for (int i = 0; i < 32; i++) {
+                lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+                a[i] = (uint8_t)(lcg >> 33);
+                lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
+                b[i] = (uint8_t)(lcg >> 33);
+            }
+            x25519_public_key(pa, a);
+            x25519_public_key(pb, b);
+            x25519_shared_secret(s1, a, pb);
+            x25519_shared_secret(s2, b, pa);
+            if (memcmp(s1, s2, 32) != 0) ok = 0;
+            // shared secrets must be non-degenerate for random keys
+            {
+                int z = 1;
+                for (int i = 0; i < 32; i++) if (s1[i]) z = 0;
+                if (z) ok = 0;
+            }
+        }
+        printf("%-28s %s\n", "X25519 DH commutativity x8", ok ? "PASS" : "FAIL");
+        if (!ok) fails++;
+    }
 
     printf("\n%s\n", fails ? "SOME TESTS FAILED" : "ALL CRYPTO TESTS PASSED");
     return fails != 0;

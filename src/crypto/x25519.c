@@ -1,6 +1,11 @@
 // x25519.c — RFC 7748, tweetnacl-style 16x16-bit limb field arithmetic.
 // Field: GF(2^255-19), 16 limbs of 16 bits (little-endian).
-// Montgomery ladder with cswap (constant-time shape; not hardened).
+// Montgomery ladder with cswap. Constant-time discipline (cryptoholes P0):
+// no secret-dependent branches or trip counts anywhere on the ladder
+// path — fixed loop bounds, arithmetic masking (x86 SAR/ALU, no cmov
+// reliance), verified by disassembly (see HANDOFF). The one residual is
+// fe_invert's bit-test, which indexes a PUBLIC constant (p-2): identical
+// pattern every execution, no secret dependence.
 #include "x25519.h"
 
 typedef int32_t fe16[16]; // signed 16-bit limbs in 32-bit holders
@@ -15,8 +20,10 @@ static void fe_tobytes(uint8_t s[32], const fe16 h) {
     fe16 t;
     for (int i = 0; i < 16; i++) t[i] = h[i];
 
-    // carry into non-negative limbs (two passes absorb negative slack from
-    // fe_sub; a single pass left negative top limbs → wrong output for a<b)
+    // carry into non-negative limbs (two fixed passes absorb negative
+    // slack from fe_sub; a single pass left negative top limbs → wrong
+    // output for a<b). The fold below is an UNCONDITIONAL add (adding
+    // 38*0 when c==0 is identical — no branch needed).
     for (int pass = 0; pass < 2; pass++) {
         int64_t c = 0;
         for (int i = 0; i < 16; i++) {
@@ -25,15 +32,20 @@ static void fe_tobytes(uint8_t s[32], const fe16 h) {
             c = v >> 16;
         }
         // carry out of the top limb has weight 2^256 ≡ 38 (mod p)
-        if (c) t[0] += (int32_t)(38 * c);
+        t[0] += (int32_t)(38 * c);
     }
 
-    // if the value is negative overall, add p once (limb-wise: p's limbs are
-    // 0xFFED, 0xFFFF x14, 0x7FFF — equivalent to -19 / +0xFFFF / +0x7FFF)
-    if (t[15] < 0) {
-        t[0] -= 19;
-        for (int i = 1; i < 15; i++) t[i] += 0xFFFF;
-        t[15] += 0x7FFF;
+    // if the value is negative overall, add p once (limb-wise: p's limbs
+    // are 0xFFED, 0xFFFF x14, 0x7FFF — equivalent to -19 / +0xFFFF /
+    // +0x7FFF). Branchless: m is all-ones iff t[15] < 0 (x86 SAR — same
+    // idiom as the carry shifts above); every add is masked, and the two
+    // carry passes always run (exact carry propagation preserves value,
+    // normalizing at most — never dropping, unlike a fold-then-truncate).
+    {
+        int32_t m = t[15] >> 31;
+        t[0] -= 19 & m;
+        for (int i = 1; i < 15; i++) t[i] += 0xFFFF & m;
+        t[15] += 0x7FFF & m;
         for (int pass = 0; pass < 2; pass++) {
             int64_t c = 0;
             for (int i = 0; i < 16; i++) {
@@ -41,7 +53,7 @@ static void fe_tobytes(uint8_t s[32], const fe16 h) {
                 t[i] = (int32_t)(v & 0xFFFF);
                 c = v >> 16;
             }
-            if (c) t[0] += (int32_t)(38 * c);
+            t[0] += (int32_t)(38 * c);
         }
     }
 
@@ -55,21 +67,30 @@ static void fe_tobytes(uint8_t s[32], const fe16 h) {
         t[i] = v & 0xFFFF;
     }
     // (a carry out would mean t was within 19 of 2^256 — impossible for our
-    // magnitudes; fold defensively anyway)
-    if (carry) t[0] += 38 * carry;
+    // magnitudes; fold unconditionally anyway — adding 0 when carry==0)
+    t[0] += 38 * carry;
 
     int bit255 = (t[15] >> 15) & 1; // set => t+19 >= 2^255 => t >= p: keep
-    if (!bit255) {
-        // t < p: revert the +19
-        int32_t borrow = 19;
+    // Branchless revert-or-keep: rm is all-ones iff reverting (!bit255).
+    // revert path = borrow chain over t (limbs are normalized 16-bit here,
+    // so borrows stay 0/1); keep path = t with the 2^255 bit cleared
+    // ((t+19) - 2^255 = t - p). Selected limb-wise — no branch.
+    {
+        int32_t rm = -(bit255 ^ 1);
+        int32_t borrow = 19 & rm;
         for (int i = 0; i < 16; i++) {
             int32_t v = t[i] - borrow;
-            if (v < 0) { v += 0x10000; borrow = 1; } else borrow = 0;
-            t[i] = v;
+            int32_t nb = (v >> 31) & 1; // 1 iff v < 0 (x86 SAR)
+            int32_t rv = v + (nb << 16);
+            int32_t kv = (i == 15) ? (t[i] & 0x7FFF) : t[i];
+            borrow = nb & rm; // propagate only while reverting... see below
+            t[i] = (rv & rm) | (kv & ~rm);
         }
-    } else {
-        // keep, and the mask IS the 2^255 subtraction: (t+19) - 2^255 = t - p
-        t[15] &= 0x7FFF;
+        // NOTE on `borrow = nb & rm`: when keeping (rm==0) the borrow
+        // chain still RUNS (fixed trip count) but its state is discarded
+        // by the select — the only observable is timing, which is now
+        // input-independent (same ops every execution).
+        (void)borrow;
     }
     for (int i = 0; i < 16; i++) {
         s[2*i] = (uint8_t)(t[i] & 0xFF);
@@ -118,21 +139,26 @@ static void fe_mul(fe16 h, const fe16 a, const fe16 b) {
 static void fe_sq(fe16 h, const fe16 a) { fe_mul(h, a, a); }
 
 static void fe_mul121665(fe16 h, const fe16 a) {
-    // h = a * 121665 (Montgomery a24)
+    // h = a * 121665 (Montgomery a24), branchless (cryptoholes P0): the
+    // old `if (carry)` + `&& t` trip count varied per ladder step with
+    // secret data. Fixed 16 iterations, always: once t reaches 0 the
+    // remaining iterations are provable no-ops (h[k] is 16-bit by then,
+    // so vv>>16 contributes 0 and h[k] is rewritten identically) — hence
+    // behavior is EXACTLY the old loop's in every case, minus the leak.
+    // (An earlier revision dropped the vv>>16 feedback and kept wide
+    // limbs; that mishandles negative carry, whose arithmetic shift
+    // saturates at -1 instead of draining — bisected by differential.)
     int64_t carry = 0;
     for (int i = 0; i < 16; i++) {
         int64_t t = (int64_t)a[i] * 121665 + carry;
         h[i] = (int32_t)(t & 0xFFFF);
         carry = t >> 16;
     }
-    // fold the overflow (weight 2^256 ≡ 38)
-    if (carry) {
-        int64_t t = carry * 38;
-        for (int k = 0; k < 16 && t; k++) {
-            int64_t vv = h[k] + (t & 0xFFFF);
-            t = (t >> 16) + (vv >> 16);
-            h[k] = (int32_t)(vv & 0xFFFF);
-        }
+    int64_t t = carry * 38;
+    for (int k = 0; k < 16; k++) {
+        int64_t vv = (int64_t)h[k] + (t & 0xFFFF);
+        t = (t >> 16) + (vv >> 16);
+        h[k] = (int32_t)(vv & 0xFFFF);
     }
 }
 
