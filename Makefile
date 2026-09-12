@@ -90,6 +90,17 @@ host-tests-asan:
 #   ./build-host/t_tlsa [port] [twice] [root.der] [TLSA_ROOT=..] [TLSA_SLEEP=n]
 # (25s overall deadline per round; PASS on HTTP bytes; the trust hook holds
 # one root per process, default tests/adversarial/at_root.der)
+# TLS-Attacker recipe (canned workflows are TLS1.2-only and correctly
+# rejected — use the custom trace + explicit sig algos):
+#   J=~/tls-att/jdk-21.0.12.1+1-jre/bin/java
+#   $J -jar ~/tls-att/apps/TLS-Server.jar -port 4443 -cert <chain-with-root> \
+#     -key <leaf.key> -version TLS13 -cipher TLS_CHACHA20_POLY1305_SHA256 \
+#     -named_group ECDH_X25519 -signature_hash_algo ECDSA_SHA256 \
+#     -signature_algo_cert ECDSA_SHA256 \
+#     -workflow_input tests/tlsattacker-server13.xml
+# (RSA: -signature_hash_algo RSA_PSS_RSAE_SHA256; P-384: ECDSA_SHA384.
+# Schema learned from -workflow_output dumps; JAXB errors name the exact
+# expected elements: configuredMessages, SupportedVersions, Application.)
 tls-interop:
 	mkdir -p build-host
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tlsa tests/test_tls_attacker.c $(HOST_CRYPTO_SRC)
