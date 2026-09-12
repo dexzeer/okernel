@@ -69,6 +69,41 @@ int main(void) {
     CHECK(rand_ready() == 1, "personalize keeps ready");
     CHECK(rand_bytes(out, 16) == 1, "draws after personalize");
 
+    // State transitions (cryptoholes #9): soak across many reseeds —
+    // readiness latches, the stream keeps advancing (no stuck state, no
+    // reseed-window deadlock), draws stay usable.
+    {
+        uint8_t prev[32], cur[32];
+        CHECK(rand_bytes(prev, 32) == 1, "soak baseline draw");
+        int stuck = 0;
+        for (int i = 0; i < 200; i++) {
+            uint8_t s[32];
+            for (int j = 0; j < 32; j++) s[j] = (uint8_t)(i * 29 + j * 11 + 5);
+            // cycle classes so every reseed window stays mixed
+            rand_stir_src(s, (i & 1) ? RAND_SRC_TIMER : RAND_SRC_INPUT);
+            if (rand_bytes(cur, 32) != 1) { stuck = -1; break; }
+            if (memcmp(prev, cur, 32) == 0) { stuck = 1; break; }
+            memcpy(prev, cur, 32);
+        }
+        CHECK(stuck == 0, "200 reseed-crossing draws all advance");
+        CHECK(rand_ready() == 1, "ready latches across reseeds");
+    }
+
+    // Hardware path smoke: rand_hw_init must never crash and must leave
+    // the state coherent (ready stays, draws advance) whether the host
+    // has RDRAND/RDSEED or not. (True failure injection — CPUID without
+    // RDRAND, partial pulls — is not controllable from userspace; the
+    // no-hw tier above is the enforced fallback and is fully tested.)
+    {
+        uint8_t before[32], after[32];
+        CHECK(rand_bytes(before, 32) == 1, "pre-hw draw");
+        int hw = rand_hw_init();
+        CHECK(hw == 0 || hw == 1, "hw_init returns sane value");
+        CHECK(rand_ready() == 1, "ready survives hw_init");
+        CHECK(rand_bytes(after, 32) == 1, "post-hw draw");
+        CHECK(memcmp(before, after, 32) != 0, "hw stir advances stream");
+    }
+
     if (fails == 0) printf("RNG TESTS PASS: 0 failures\n");
     else printf("RNG TESTS FAIL: %d failures\n", fails);
     return fails == 0 ? 0 : 1;

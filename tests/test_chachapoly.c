@@ -87,5 +87,42 @@ int main(void) {
         for (int i = 0; i < 300; i++) if (rt[i] != pt[i]) { ok = 0; break; }
         printf("ChaCha20 round-trip: %s\n", ok ? "PASS" : "FAIL");
     }
+    // Streaming equivalence (cryptoholes #3): auth_pieces(aad, ct) must
+    // equal one-shot over aad||pad16||ct||pad16||le64 lens for adversarial
+    // lengths (0/1/15/16/17/100 — every pad-alignment class), and a
+    // byte-at-a-time stream must equal the one-shot (chunk boundaries
+    // must not perturb the 2^128 framing).
+    {
+        static const uint32_t lens[] = { 0, 1, 5, 15, 16, 17, 33, 100 };
+        uint8_t key[32], aad[128], ct[128], ref[512], t1[16], t2[16];
+        for (int i = 0; i < 32; i++) key[i] = (uint8_t)(i * 13 + 5);
+        for (int i = 0; i < 128; i++) { aad[i] = (uint8_t)(i * 7 + 1); ct[i] = (uint8_t)(i * 3 + 9); }
+        int ok = 1;
+        for (unsigned ai = 0; ai < sizeof(lens)/sizeof(lens[0]) && ok; ai++)
+            for (unsigned ci = 0; ci < sizeof(lens)/sizeof(lens[0]) && ok; ci++) {
+                uint32_t al = lens[ai], cl = lens[ci], o = 0;
+                memcpy(ref + o, aad, al); o += al;
+                while (o % 16) ref[o++] = 0;
+                memcpy(ref + o, ct, cl); o += cl;
+                while (o % 16) ref[o++] = 0;
+                uint64_t all = al, cll = cl;
+                for (int i = 0; i < 8; i++) { ref[o++] = (uint8_t)(all >> (8*i)); }
+                for (int i = 0; i < 8; i++) { ref[o++] = (uint8_t)(cll >> (8*i)); }
+                poly1305_auth(key, ref, o, t1);
+                poly1305_auth_pieces(key, aad, al, ct, cl, t2);
+                if (memcmp(t1, t2, 16) != 0) ok = 0;
+                // byte-at-a-time streaming equals one-shot
+                {
+                    poly1305_stream st;
+                    poly1305_stream_init(&st, key);
+                    for (uint32_t i = 0; i < o && ok; i++)
+                        poly1305_stream_update(&st, ref + i, 1);
+                    uint8_t t3[16];
+                    poly1305_stream_final(&st, t3);
+                    if (memcmp(t1, t3, 16) != 0) ok = 0;
+                }
+            }
+        printf("Poly1305 streaming: %s\n", ok ? "PASS" : "FAIL");
+    }
     return 0;
 }

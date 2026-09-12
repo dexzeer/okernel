@@ -52,6 +52,12 @@ static uint32_t tls_req_len;
 
 static int tls_done = 0;         // 1 once the response is buffered
 static int tls_peer_closed = 0;  // set by tcp_handle_packet on FIN
+// Whether the finished fetch ended with an authenticated close_notify
+// (cryptoholes #1 — snapshot BEFORE tls_state_wipe, which preserves it
+// in tls_s but the desktop reads through here). Without it, message
+// completeness needs HTTP framing (tls_response_complete at the render
+// path); a SHORT body with no close is truncation, never success.
+static int tls_last_saw_close = 0;
 // Why the last TLS fetch failed (TLS_FAIL_*); TLS_FAIL_NONE if the last
 // fetch succeeded or none ran. The okai uses this to REFUSE the plain-HTTP
 // fallback when the failure was a certificate/protocol failure — a MITM
@@ -265,6 +271,7 @@ void https_get_poll(void) {
                 tls_response_overflow = 1;
                 serial_puts("[tls-net] WARNING: response exceeded buffer, truncating\n");
             }
+            tls_last_saw_close = tls_s.saw_close;
             tls_done = 1;
             tls_active = 0;
             tls_phase = HP_IDLE;
@@ -307,6 +314,10 @@ int tls_get_response_len(void) {
 
 int tls_is_done(void) {
     return tls_done;
+}
+
+int tls_saw_close_notify(void) {
+    return tls_last_saw_close;
 }
 
 void tls_connection_closed(void) {

@@ -33,6 +33,11 @@ int tls_is_active(void);
 
 // Check if the last https_get() completed with a buffered response.
 int tls_is_done(void);
+// 1 if the finished fetch ended with an authenticated close_notify
+// (cryptoholes #1). Without it, the render path must prove message
+// completeness via HTTP framing (tls_response_complete) — a SHORT body
+// with no close is truncation, never success.
+int tls_saw_close_notify(void);
 int tls_get_fail_reason(void); // TLS_FAIL_* of the last failed fetch (0 = none/success)
 int tls_get_fail_detail(void); // CV_ERR_* detail when reason is CERT class (0 = none)
 

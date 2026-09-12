@@ -34,6 +34,11 @@ static uint32_t pool_cls_win[RAND_NCLASS];
 // 64 bytes of keystream used as scratch to extract new key material.
 static void rng_rekey(void) {
     uint8_t block[64];
+    // Zero input first (cryptoholes #9): chacha20_encrypt is out = in XOR
+    // keystream, so uninitialized input would mix stack garbage into the
+    // key (harmless-but-opaque) and trip memory diagnostics. Explicit
+    // zeros make the output pure keystream — auditable and MSan-clean.
+    memset(block, 0, sizeof(block));
     chacha20_encrypt(rng_key, rng_nonce, rng_counter, block, block, 64);
     rng_counter++;
 
@@ -221,6 +226,11 @@ int rand_bytes(uint8_t* out, uint32_t len) {
     int rc = 0;
     RNG_CLI();
     if (!rng_ready_flag) goto out;
+    // Counter-exhaustion guard (cryptoholes #9 — same discipline as the
+    // TLS sequence guards): 2^32 blocks is unreachable in practice, but
+    // a wrapped (key, nonce, counter) triple would repeat keystream, so
+    // fail closed with wide margin rather than reason about it.
+    if (rng_counter >= 0xFFFFFFF0u) goto out;
     // Snapshot divergence: fresh RDTSC folded into the nonce per call, so
     // two boots/snapshots with identical pools still diverge immediately.
     {
@@ -230,8 +240,11 @@ int rand_bytes(uint8_t* out, uint32_t len) {
             rng_nonce[i] ^= (uint8_t)((t >> (8 * i)) & 0xFF);
     }
     while (len > 0) {
-        // Generate 64 bytes of keystream, use them, then rekey.
+        // Generate 64 bytes of keystream, use them, then rekey. Input
+        // zeroed first (same cryptoholes #9 reason as rng_rekey: pure
+        // keystream out, no stack-garbage mixing, MSan-clean).
         uint8_t block[64];
+        memset(block, 0, sizeof(block));
         chacha20_encrypt(rng_key, rng_nonce, rng_counter, block, block, 64);
         rng_counter++;
 

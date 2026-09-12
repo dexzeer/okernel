@@ -154,6 +154,12 @@ struct tls_state {
     // Zeroed by tls_state_init with the rest of the struct.
     uint8_t hs_buf[TLS_HS_REASSEMBLY_MAX];
     uint32_t hs_have;
+    // Set on authenticated close_notify (cryptoholes #1): lets the caller
+    // distinguish "complete, peer-closed-cleanly" from "EOF with no
+    // close" (which needs HTTP Content-Length framing to prove complete
+    // — see tls_response_complete). Preserved by tls_state_wipe (like
+    // out/fail codes, unlike key material).
+    int saw_close;
 };
 
 void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
@@ -169,8 +175,9 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io);
 // ECDHE private, handshake/app secrets + keys/ivs, master + resumption
 // master, PSK offer state, transcript + record + reassembly buffers.
 // Preserves: out/out_len/out_cap (caller response), fail codes + detail,
-// phase, host pointers. Ticket/pin stores are connection-independent and
-// intentionally survive (documented lifetimes, not per-connection state).
+// phase, host pointers, saw_close. Ticket/pin stores are
+// connection-independent and intentionally survive (documented lifetimes,
+// not per-connection state).
 void tls_state_wipe(struct tls_state* st);
 
 int tls_last_fail_reason(void); // TLS_FAIL_* of the most recent tls_client_run
@@ -208,5 +215,17 @@ int tls_ticket_have(const char* host, uint64_t now_ms); // 1 if an unexpired
     // ticket is cached AS OF now_ms (explicit trusted time, ms — pass the
     // same clock given to tls_state_set_now_ms; 0/unknown is NOT fresh).
 void tls_ticket_clear(void);           // drop all (tests, memory hygiene)
+
+// ---- HTTP response completeness over a TLS stream (cryptoholes #1) ----
+// A clean EOF (or missing close_notify) ends the STREAM, not provably the
+// MESSAGE: an on-path attacker cutting TCP turns a complete response into
+// a prefix. Verdicts: COMPLETE (framing proves it), SHORT (provably cut),
+// UNKNOWN (close-delimited: no length signal — unknowable, curl-parity
+// accept). Pure function of response bytes (host-testable); the caller
+// (desktop fetch-complete) fails SHORT as truncation (no HTTP fallback).
+#define TLS_RESP_COMPLETE 0
+#define TLS_RESP_SHORT    1
+#define TLS_RESP_UNKNOWN  2
+int tls_response_complete(const uint8_t* resp, uint32_t len);
 
 #endif

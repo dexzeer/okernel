@@ -54,6 +54,9 @@ struct okai_tab {
     int cert_failed;      // 1 = HTTPS failed certificate verification: render a
                           // distinct security error and NEVER fall back to HTTP
     int cert_detail;      // CV_ERR_* code for the message above (0 = generic)
+    int truncated;        // 1 = secure response proven TRUNCATED (EOF without
+                          // close_notify and short of Content-Length framing):
+                          // render a distinct warning, NEVER fall back
     // CSS: parsed from <style> blocks of this page
     struct css_rule css_rules[CSS_MAX_RULES];
     int css_n;

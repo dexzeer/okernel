@@ -155,6 +155,11 @@ int rsa_pub_from_x509(const x509_cert* cert, rsa_pub* k) {
     // interop evidence, not on theory.
     if (k->el != 1) return -1;
     if (k->e[0] < 3 || (k->e[0] & 1) == 0) return -1;
+    // e < n (cryptoholes #6): implied today (e < 2^32 <= 2^2047 <= n by
+    // the floors above), enforced explicitly so a future floor change
+    // cannot silently admit degenerate keys. Single-limb n with e >= n
+    // is the only shape that could violate it.
+    if (k->nl < 2 && k->e[0] >= k->n[0]) return -1;
 
     k->n0inv = n0inv_of(k->n[0]);
     mont_compute_r2(k);

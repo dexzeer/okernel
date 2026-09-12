@@ -136,6 +136,13 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
     // leaf = certs[0]; each certs[i] is verified with certs[i+1]'s key until
     // a chain cert's SPKI matches an embedded root (trust anchor). Cross-
     // signed roots work naturally: the cross-cert carries the root's KEY.
+    // ORDER-DEPENDENT by design (cryptoholes #4): no path building, no
+    // alternate-issuer search — the flight must arrive leaf-first per
+    // RFC 8446 §4.4.2 (every compliant server does). Reordering a valid
+    // chain fails CLOSED (availability, never auth bypass: we never accept
+    // on a partial walk). Full path building would only matter with
+    // name-bound anchors (see HANDOFF trust-anchor item); under SPKI
+    // pinning the anchor must be in-flight anyway.
     // ---- key usage / EKU on the leaf (review 2026-09-10 #6) ----
     // A clientAuth/codeSigning-only leaf must not terminate a TLS-server
     // chain even if perfectly chained. Absent extensions constrain nothing
@@ -145,7 +152,22 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
     if (certs[0].has_eku && !certs[0].eku_server_auth)
         return CV_ERR_KEYUSE; // EKU present without serverAuth
 
-    if (spki_in_roots(&certs[0])) return CV_OK;   // pinned/self-rooted leaf
+    if (spki_in_roots(&certs[0])) {
+        // Pinned/self-rooted leaf (cryptoholes #5 — trust model note):
+        // our "roots" are SPKI pins, not CA names. Hostname, validity,
+        // key-strength, and KU/EKU were all enforced above; what remains
+        // unprovable from the chain alone is KEY POSSESSION (normally
+        // established by the TLS CertificateVerify before this runs —
+        // cert_verify MUST only be called post-CV, documented contract).
+        // Defense in depth: the pinned leaf must ALSO verify as
+        // self-signed. A forged leaf carrying a root's PUBLIC key (minted
+        // without the root private key) fails here even if CV were ever
+        // skipped — only the true root cert (or a root-key-signed leaf,
+        // same key) passes. Cross-signed intermediates anchor through
+        // the walk below, not here.
+        if (verify_sig(&certs[0], &certs[0]) != 0) return CV_ERR_CHAIN;
+        return CV_OK;
+    }
 
     for (int i = 0; i + 1 < ncerts; i++) {
         const x509_cert* subject = &certs[i];
