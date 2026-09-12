@@ -3009,3 +3009,48 @@ Results (Java/BouncyCastle crypto — third independent stack):
   round 1; forging an accepting workflow would skip verification and
   prove nothing). OpenSSL-decline question unchanged; our offer is
   proven-correct vs pyserver + mock + self-consistency.
+
+---
+
+## Caveat fixes (2026-09-12, commit above)
+
+User asked to fix three of the four stated caveats.
+
+1. **Revocation gap — FIXED (two layers).**
+   (a) Must-Staple (RFC 7633): TLSFeature status_request(5) parsed in
+   x509.c (numeric-5, fail-closed framing); leaf asserting it without a
+   valid staple fails the handshake (CV_ERR_OCSP bucket). Fixture
+   at_ms_leaf + MOCK_MUSTSTAPLE (refused, right reason logged) +
+   MOCK_MUSTSTAPLE_OK (stapled completes). Matches industry direction
+   (no live OCSP fetching — privacy/latency/soft-fail reasons as used
+   by Chrome/Firefox CRLSet/CRLite models).
+   (b) Serial blocklist (CRLSet-nano): (issuer-SP Hash, serial) table
+   in certverify.c (8 slots, numeric serial compare, export/import
+   OKRVK1 format mirroring pins); checked for leaf+in-flight
+   intermediates at anchor time (CV_ERR_REVOKED + UI reason line);
+   /.revoked loaded at boot (malformed = ignored, never a wedge).
+   11 new CHECKs (add/clear/wrong-issuer/import/export/roundtrip).
+2. **First-visit MITM — NARROWED (preloaded pins).** Root pinning
+   already forces CA-level capability (network-only attacker gets
+   nothing, first visit or not); persistent TOFU alarms key changes.
+   Added compiled first-visit pins (exact host, no expiry — expiry
+   would silently unprotect; rotation bricks loudly to the warning
+   page until updated, same UX as key-change): github.com,
+   cloudflare.com, www.ssl.com + test-only entry. New CV_ERR_PRELOAD
+   + UI line. Verified: mock PRELOAD_OK/BAD (exact detail code),
+   production pins byte-exact vs live certs through our own parser,
+   and full live production path — real www.ssl.com chain verifies
+   against EMBEDDED roots with no hooks (first time) + preload
+   matches. tools/gen_preload.py generates entries (hand-typing
+   hashes caused one wrong-pin incident — always generate).
+   Full CT/SCT verification deferred with reasons (precert TBS
+   reconstruction brittleness; curl/OpenSSL/Go all skip it too).
+3. **Deterministic-VM randomness — FIXED (two layers).** Boot jitter
+   loop (port-I/O + memory churn RDTSC deltas, BOOT class) + PFS seed
+   file (/.rngseed: stirred at boot if present, refreshed with fresh
+   output once ready per boot — Linux random-seed pattern; disk-read
+   attackers out of scope per existing threat model). Verified live:
+   QEMU guest (no RDRAND) completes verified TLS after typed input.
+4. **Close-delimited truncation — NOT FIXABLE** (protocol-inherent;
+   curl/browsers identical). Covered as far as possible (close_notify
+   + framing checks); HTTP/2 would fix it properly (future).
