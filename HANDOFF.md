@@ -2929,3 +2929,54 @@ reddened when fixture mtime-clock drifted >24h behind wall minting
 (1d skew tolerance) — STAPLE modes now run on wall clock (chain
 windows are 10y wide); mint_nc.py fixtures mint off the frozen base
 so re-regens never rot.
+
+---
+
+## Cryptoholes round 2 disposition (2026-09-12, commit 7cfd158)
+
+Second external review (8 findings + RNG note). Verified each against
+the tree, fixed, re-attacked. Adversarial 113/113 plain + ASan/UBSan,
+host suites green, ISOs link, sh_hello PASS, interop green (P-256/RSA/
+P-384 full HS vs OpenSSL, resumption x2 vs pyserver, TLS-Attacker
+canned flight still rejected with new SH-reassembly code).
+
+1. **EOF/truncation as success (Critical-ish) — FIXED (layered).**
+   TLS: mid-record EOF (rec_have!=0) is now fatal PROTO (no fallback);
+   authenticated close_notify sets saw_close (snapshotted past wipe,
+   accessor for desktop). New pure helper tls_response_complete():
+   COMPLETE (C-L satisfied / chunked terminated) vs SHORT (headers cut,
+   short body, unterminated chunks) vs UNKNOWN (close-delimited,
+   curl-parity accept). Desktop: SHORT with no close renders a distinct
+   TRUNCATED warning (new T->truncated flag, never falls back);
+   truncated sub-resources are skipped, never fed to parsers. Tests:
+   MOCK_APP_TRUNCATED (mid-record EOF must ERR) + 8 helper unit CHECKs.
+2. **Build integrity (High) — ALREADY CLEAN.** No .o tracked; .gitignore
+   covers *.o/*.bin/*.iso/isodir/build-host. secure_zero present.
+   Nothing to do.
+3. **AEAD static scratch (Medium) — FIXED (real streaming).** Poly1305
+   init/update/final API (partial-block carry, no statics); one-shot
+   reimplemented on top (RFC vectors still pass); AEAD cap kept as a
+   pure u64 length check (t_tls_crypto oversize test still passes).
+   Fully reentrant now. Streaming equivalence proven across pad-
+   alignment classes + byte-at-a-time feeding (new chachapoly vectors,
+   wired into host-tests).
+4. **Chain order (Medium) — DOCUMENTED limitation.** RFC 8446 §4.4.2
+   mandates leaf-first order; we fail closed on anything else
+   (availability, never auth). Path building awaits name-bound anchors.
+5. **SPKI-pin leaf self-match (Medium) — HARDENED + DOCUMENTED.**
+   Hostname/validity/strength/KU/EKU already precede pin-match; added
+   self-signature verification on pin-match (forged root-key leaf
+   fails without the root key — holds even if CV were skipped) +
+   prominent trust-model contract in roots.h/certverify.c.
+6. **RSA e<n (Low/Med) — EXPLICIT.** Implied by floors (e<2^32<=n) but
+   now enforced directly (future-proof if floors ever change).
+7. **SH fragmentation (Medium) — FIXED.** RECV_SH reassembles across
+   records (4KB cap, trailing rule kept); hs_buf lifecycle made
+   explicit at both transitions. New MOCK_SH_SPLIT test.
+8. **KeyUpdate (Low/Med) — DOCUMENTED minimalism.** Short single-fetch
+   connections never approach rekey volume; unknown post-HS traffic
+   fails closed (safe default, may abort against chatty peers).
+9. **RNG uninit ChaCha input (Low) — FIXED.** Both rand.c call sites
+   zero the block first (pure keystream, MSan-clean). Added soak test
+   (200 reseed-crossing draws advance, ready latches), hw_init smoke,
+   u32 counter-exhaustion fail-closed guard.
