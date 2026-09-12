@@ -20,6 +20,121 @@ static int g_extra_trusted_set = 0;
 
 static int nc_pair_ok(const x509_cert* issuer, const x509_cert* subject);
 
+// ---- Serial blocklist (see certverify.h) ----
+struct cert_block {
+    uint8_t issuer_hash[32];
+    uint8_t serial[TLS_BLOCKLIST_SERIAL_MAX];
+    uint32_t serial_len; // 0 = free slot (DER INTEGERs are never empty)
+};
+static struct cert_block block_slots[TLS_BLOCKLIST_SLOTS];
+
+int tls_blocklist_add(const uint8_t issuer_spki_hash[32],
+                      const uint8_t* serial, uint32_t serial_len) {
+    if (!issuer_spki_hash || !serial || serial_len == 0 ||
+        serial_len > TLS_BLOCKLIST_SERIAL_MAX)
+        return -1;
+    for (int i = 0; i < TLS_BLOCKLIST_SLOTS; i++) {
+        if (block_slots[i].serial_len != 0) continue;
+        for (int j = 0; j < 32; j++)
+            block_slots[i].issuer_hash[j] = issuer_spki_hash[j];
+        for (uint32_t j = 0; j < serial_len; j++)
+            block_slots[i].serial[j] = serial[j];
+        block_slots[i].serial_len = serial_len;
+        return 0;
+    }
+    return -1; // full
+}
+
+void tls_blocklist_clear(void) {
+    for (uint32_t i = 0; i < sizeof(block_slots); i++)
+        ((uint8_t*)block_slots)[i] = 0;
+}
+
+uint32_t tls_blocklist_export(uint8_t* out, uint32_t cap) {
+    uint32_t n = 0;
+    for (int i = 0; i < TLS_BLOCKLIST_SLOTS; i++)
+        if (block_slots[i].serial_len != 0) n++;
+    uint32_t need = 8;
+    for (int i = 0; i < TLS_BLOCKLIST_SLOTS; i++)
+        if (block_slots[i].serial_len != 0)
+            need += 32 + 1 + block_slots[i].serial_len;
+    if (!out || cap < need) return 0;
+    out[0] = 'O'; out[1] = 'K'; out[2] = 'R'; out[3] = 'V'; out[4] = 'K';
+    out[5] = '1'; out[6] = 1; out[7] = (uint8_t)n;
+    uint32_t p = 8;
+    for (int i = 0; i < TLS_BLOCKLIST_SLOTS; i++) {
+        if (block_slots[i].serial_len == 0) continue;
+        for (int j = 0; j < 32; j++) out[p++] = block_slots[i].issuer_hash[j];
+        out[p++] = (uint8_t)block_slots[i].serial_len;
+        for (uint32_t j = 0; j < block_slots[i].serial_len; j++)
+            out[p++] = block_slots[i].serial[j];
+    }
+    return p;
+}
+
+int tls_blocklist_import(const uint8_t* in, uint32_t len) {
+    if (!in || len < 8) return -1;
+    if (in[0] != 'O' || in[1] != 'K' || in[2] != 'R' || in[3] != 'V' ||
+        in[4] != 'K' || in[5] != '1' || in[6] != 1)
+        return -1;
+    uint32_t n = in[7];
+    if (n > TLS_BLOCKLIST_SLOTS) return -1;
+    // Exact-length + per-entry bounds BEFORE touching the store (no
+    // partial import on malformed input).
+    uint32_t p = 8;
+    for (uint32_t i = 0; i < n; i++) {
+        if (p + 33 > len) return -1;
+        uint32_t sl = in[p + 32];
+        if (sl == 0 || sl > TLS_BLOCKLIST_SERIAL_MAX) return -1;
+        if (p + 33 + sl > len) return -1;
+        p += 33 + sl;
+    }
+    if (p != len) return -1;
+    tls_blocklist_clear();
+    p = 8;
+    for (uint32_t i = 0; i < n; i++) {
+        for (int j = 0; j < 32; j++) block_slots[i].issuer_hash[j] = in[p++];
+        uint32_t sl = in[p++];
+        for (uint32_t j = 0; j < sl; j++) block_slots[i].serial[j] = in[p++];
+        block_slots[i].serial_len = sl;
+    }
+    return 0;
+}
+
+// Numeric DER-INTEGER equality (leading zeros ignored). Mirrors ocsp.c's
+// int_eq; kept local to avoid cross-module coupling for 10 lines.
+static int serial_eq_num(const uint8_t* a, uint32_t al,
+                         const uint8_t* b, uint32_t bl) {
+    while (al > 0 && a[0] == 0) { a++; al--; }
+    while (bl > 0 && b[0] == 0) { b++; bl--; }
+    if (al != bl) return 0;
+    if (al == 0) return 0; // empty INTEGER matches nothing (not even empty)
+    for (uint32_t i = 0; i < al; i++)
+        if (a[i] != b[i]) return 0;
+    return 1;
+}
+
+// 1 if any in-flight issuer/subject pair hits the blocklist (leaf and
+// intermediates with in-flight issuers; roots are unpinned, not listed).
+static int cert_revoked(const x509_cert* certs, int ncerts) {
+    for (int i = 0; i + 1 < ncerts; i++) {
+        uint8_t ihash[32];
+        sha256(certs[i+1].spki.p, certs[i+1].spki.len, ihash);
+        for (int s = 0; s < TLS_BLOCKLIST_SLOTS; s++) {
+            if (block_slots[s].serial_len == 0) continue;
+            uint8_t diff = 0;
+            for (int j = 0; j < 32; j++)
+                diff |= ihash[j] ^ block_slots[s].issuer_hash[j];
+            if (diff != 0) continue;
+            if (serial_eq_num(certs[i].serial.p, certs[i].serial.len,
+                              block_slots[s].serial,
+                              block_slots[s].serial_len))
+                return 1;
+        }
+    }
+    return 0;
+}
+
 static int spki_in_roots(const x509_cert* cert) {
     uint8_t hash[32];
     sha256(cert->spki.p, cert->spki.len, hash);
@@ -166,6 +281,8 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
         // same key) passes. Cross-signed intermediates anchor through
         // the walk below, not here.
         if (verify_sig(&certs[0], &certs[0]) != 0) return CV_ERR_CHAIN;
+        // Local revocations apply to pinned leaves too.
+        if (cert_revoked(certs, ncerts)) return CV_ERR_REVOKED;
         return CV_OK;
     }
 
@@ -223,6 +340,8 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
                         return CV_ERR_CAFLAGS;
                 }
             }
+            // Local revocations are the last gate before accepting.
+            if (cert_revoked(certs, ncerts)) return CV_ERR_REVOKED;
             return CV_OK;
         }
     }
@@ -364,6 +483,8 @@ const char* cert_verify_strerror(int code) {
     case CV_ERR_KEYUSE:    return "key usage or strength violation";
     case CV_ERR_PINCHANGED: return "server key changed since first visit";
     case CV_ERR_OCSP:      return "OCSP staple invalid/stale/revoked";
+    case CV_ERR_REVOKED:   return "serial on local blocklist";
+    case CV_ERR_PRELOAD:   return "preloaded pin mismatch (possible MITM)";
     default:               return "unknown";
     }
 }

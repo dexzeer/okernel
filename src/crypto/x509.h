@@ -116,6 +116,11 @@ typedef struct {
     // serverAuth fails a TLS-server chain (enforced in certverify.c).
     int has_eku;
     int eku_server_auth;
+    // TLSFeature (1.3.6.1.5.5.1.24, RFC 7633 Must-Staple): set when the
+    // extension lists status_request (5). A Must-Staple LEAF without a
+    // stapled OCSP response fails the handshake (enforced in tls_client.c
+    // where staple state lives — cert_verify itself is staple-unaware).
+    int has_must_staple;
 } x509_cert;
 
 // Parse a DER certificate. Returns 0 on success, -1 on malformed input.

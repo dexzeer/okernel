@@ -193,8 +193,10 @@ int tls_client_run(const char* host, uint16_t port,
 // fail closed (possible MITM with a rogue-but-valid cert, or a legitimate
 // rotation — indistinguishable without an override UX, which doesn't exist
 // yet; rotations are rare and the lockout ends at reboot).
+// Preloaded hosts (compiled table in tls_client.c): first visit MUST match
+// (-2 below) — narrows the TOFU first-visit window for high-value hosts.
 // Returns 0 (first-seen stored, or match), -1 (changed — old pin kept, so
-// every visit warns until reboot/re-pin window).
+// every visit warns until reboot/re-pin window), -2 (preload mismatch).
 // Test hook: tls_pin_clear() drops all pins.
 int tls_pin_check(const char* host, const uint8_t spki_hash[32]);
 void tls_pin_clear(void);

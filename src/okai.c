@@ -570,6 +570,10 @@ void okai_render_content(int ed_id) {
                     why = " Reason: unknown issuer (not in store).\n";
                 else if (T->cert_detail == CV_ERR_CHAIN)
                     why = " Reason: chain signature invalid.\n";
+                else if (T->cert_detail == CV_ERR_REVOKED)
+                    why = " Reason: certificate revoked (local blocklist).\n";
+                else if (T->cert_detail == CV_ERR_PRELOAD)
+                    why = " Reason: site key differs from pinned key.\n";
                 if (why) window_puts(b->win_id, why);
             }
             window_puts(b->win_id, " The connection may be intercepted,\n");

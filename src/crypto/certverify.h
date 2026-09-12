@@ -21,8 +21,10 @@
 #define CV_ERR_NO_CERT   8   // empty certificate flight
 #define CV_ERR_KEYUSE    9   // key usage/EKU violation or insufficient strength
 #define CV_ERR_PINCHANGED 10 // TOFU leaf pin mismatch (key changed since first visit)
-#define CV_ERR_OCSP      11  // stapled OCSP response invalid/stale/revoked
-#define CV_ERR_MAX       CV_ERR_OCSP     // keep last: fuzzers bound checks here
+#define CV_ERR_OCSP      11 // stapled OCSP response invalid/stale/revoked
+#define CV_ERR_REVOKED   12 // leaf/intermediate serial on the local blocklist
+#define CV_ERR_PRELOAD   13 // preloaded first-visit pin mismatch (possible MITM)
+#define CV_ERR_MAX       CV_ERR_PRELOAD   // keep last: fuzzers bound checks here
 
 #define CERTVERIFY_MAX_CERTS 5
 
@@ -57,5 +59,24 @@ int cert_issuer(const uint8_t* msg_body, uint32_t msg_len, x509_cert* issuer);
 
 // Convenience for serial logging: CV_* code -> short string.
 const char* cert_verify_strerror(int code);
+
+// ---- Serial blocklist (cryptoholes follow-up — CRLSet-nano) ----
+// Local revocations: (issuer-SPKI-hash, serial) pairs checked against
+// every in-flight issuer/subject pair at anchor time. Covers the
+// no-staple revocation gap for CURATED entries (admin-placed /.revoked,
+// mirrored to tests via tls_blocklist_add). Leaf + intermediates with
+// in-flight issuers are checked; roots are removed by unpinning, not
+// listed. Serial compare is numeric (leading zeros ignored).
+#define TLS_BLOCKLIST_SLOTS 8
+#define TLS_BLOCKLIST_SERIAL_MAX 20
+// 0 ok, -1 bad args/full/oversize serial. Overwrites nothing on failure.
+int tls_blocklist_add(const uint8_t issuer_spki_hash[32],
+                      const uint8_t* serial, uint32_t serial_len);
+void tls_blocklist_clear(void);
+// Wire format "OKRVK1"(6) || version u8 (1) || count u8 || entries of
+// issuer_hash[32] + serial_len u8 + serial. export: bytes written
+// (0 = cap too small); import: 0 ok (replaces store), -1 malformed.
+uint32_t tls_blocklist_export(uint8_t* out, uint32_t cap);
+int tls_blocklist_import(const uint8_t* in, uint32_t len);
 
 #endif

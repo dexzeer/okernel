@@ -1201,6 +1201,39 @@ void kernel_main(uint32_t mboot_phys) {
                 serial_puts("[pins] restored pin store\n");
         }
     }
+    // RNG seed continuity (cryptoholes follow-up — Linux random-seed
+    // pattern): stir last boot's refreshed seed (if any) as BOOT-class
+    // input, so two bit-identical VM boots still diverge. Fixed 64B raw;
+    // wrong size or unreadable = ignored (never a wedge). Threat note:
+    // the file is disk-readable — it is continuity bonus inside the
+    // tiered model (never sufficient alone for readiness), and the
+    // network-attacker model doesn't grant disk reads (same bar as pins).
+    {
+        extern void rand_stir_src(const uint8_t e[32], int src);
+        if (fs_exists("/.rngseed")) {
+            static uint8_t seedfile[64];
+            int n = fs_read("/.rngseed", seedfile, sizeof(seedfile));
+            if (n == (int)sizeof(seedfile)) {
+                rand_stir_src(seedfile, RAND_SRC_BOOT);
+                rand_stir_src(seedfile + 32, RAND_SRC_BOOT);
+                serial_puts("[rand] stirred saved seed file\n");
+            }
+        }
+    }
+    // Local revocation blocklist (cryptoholes follow-up — CRLSet-nano):
+    // curated (issuer, serial) pairs in /.revoked (see tls_blocklist_*
+    // for the wire format). Malformed files are ignored (fail-open to
+    // an empty list — plain Web-PKI validation, never a wedge). Place
+    // entries with external tooling; this just loads them.
+    {
+        extern int tls_blocklist_import(const uint8_t* in, uint32_t len);
+        if (fs_exists("/.revoked")) {
+            static uint8_t rvkbuf[512];
+            int n = fs_read("/.revoked", rvkbuf, sizeof(rvkbuf));
+            if (n > 0 && tls_blocklist_import(rvkbuf, (uint32_t)n) == 0)
+                serial_puts("[revoke] restored serial blocklist\n");
+        }
+    }
     // PID 1 is spawned LAZILY (first terminal creation) instead of here:
     // sched_spawn_elf needs the PFS/VFS settled AND the entry drain must be
     // reachable (main loop running). Spawning here (pre-loop) wedges the
@@ -1290,6 +1323,26 @@ void kernel_main(uint32_t mboot_phys) {
             uint8_t sample[32];
             for (int i = 0; i < 32; i++)
                 sample[i] = (uint8_t)(((t2 >> ((i & 7) * 8)) & 0xFF) ^ (s * 37 + i));
+            rand_stir_src(sample, RAND_SRC_BOOT);
+        }
+        // Jitter entropy (cryptoholes follow-up): time tight loops of
+        // port-I/O + memory churn with RDTSC. Each delta's low bits carry
+        // host scheduling/interrupt jitter — the one source even a coarse
+        // virtual TSC cannot fully flatten (jitterentropy-lite). Stirred
+        // as BOOT class (boot-time source by definition); the tier gates
+        // still require TIMER+INPUT (or hardware) before readiness.
+        // ~16k port reads ≈ milliseconds at boot.
+        for (int s = 0; s < 16; s++) {
+            uint64_t t0 = 0, t1 = 0;
+            __asm__ volatile("rdtsc" : "=A"(t0));
+            uint8_t sink = 0;
+            for (volatile int k = 0; k < 1000; k++)
+                sink ^= inb(0x80);
+            __asm__ volatile("rdtsc" : "=A"(t1));
+            uint64_t dt = t1 - t0;
+            uint8_t sample[32];
+            for (int i = 0; i < 32; i++)
+                sample[i] = (uint8_t)(((dt >> ((i & 3) * 8)) & 0xFF) ^ (uint8_t)(s * 53 + i) ^ sink);
             rand_stir_src(sample, RAND_SRC_BOOT);
         }
         serial_printf("[rand] CPRNG seeded (hw=%d), ready=%d (TIMER class pending)\n",
@@ -1754,6 +1807,24 @@ void kernel_main(uint32_t mboot_phys) {
                 if (n > 0 && fs_write("/.pins", pinbuf, (int)n) > 0) {
                     tls_pin_clean();
                     serial_puts("[pins] pin store saved\n");
+                }
+            }
+        }
+        // Refresh the RNG seed file once per boot after readiness
+        // (cryptoholes follow-up — Linux random-seed pattern): the next
+        // boot stirs these bytes, so even two bit-identical VM boots
+        // diverge. Write-once gust (flag-gated); failures are silent —
+        // the seed is continuity bonus, never a readiness input.
+        {
+            extern int rand_ready(void);
+            extern int rand_bytes(uint8_t* out, uint32_t len);
+            static int seed_saved = 0;
+            if (!seed_saved && rand_ready()) {
+                static uint8_t seedbuf[64];
+                if (rand_bytes(seedbuf, sizeof(seedbuf))) {
+                    if (fs_write("/.rngseed", seedbuf, sizeof(seedbuf)) > 0)
+                        serial_puts("[rand] seed file refreshed\n");
+                    seed_saved = 1;
                 }
             }
         }

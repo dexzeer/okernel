@@ -80,6 +80,7 @@ static int load(const char* path, uint8_t* out, uint32_t cap) {
 
 // Fresh TCP connection per round (resumption test needs sequential
 // connections sharing only the in-process ticket store).
+static uint32_t g_dial_ip = 0x7F000001; // default 127.0.0.1 (TLSA_HOST)
 static int new_conn(int port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -87,7 +88,7 @@ static int new_conn(int port) {
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)port);
-    sa.sin_addr.s_addr = htonl(0x7F000001);
+    sa.sin_addr.s_addr = htonl(g_dial_ip);
     if (connect(fd, (struct sockaddr*)&sa, sizeof(sa)) != 0) {
         close(fd);
         return -1;
@@ -110,6 +111,21 @@ int main(int argc, char** argv) {
     int port = 4443;
     if (argc > 1) port = atoi(argv[1]);
     if (getenv("TLSA_PORT")) port = atoi(getenv("TLSA_PORT"));
+    // Live-production mode: TLSA_HOST=dotted-quad overrides the dial IP,
+    // TLSA_SNI overrides SNI/hostname/verify name, TLSA_PRODROOT=1 skips
+    // the test trust hook (embedded production roots only). Tests the
+    // REAL trust path incl. preload pins, e.g.:
+    //   TLSA_HOST=44.210.169.149 TLSA_SNI=www.ssl.com TLSA_PRODROOT=1
+    //     ./build-host/t_tlsa 443
+    const char* sni = "evil.example.com";
+    if (getenv("TLSA_HOST")) {
+        unsigned a, b, c, d;
+        if (sscanf(getenv("TLSA_HOST"), "%u.%u.%u.%u", &a, &b, &c, &d) == 4 &&
+            a < 256 && b < 256 && c < 256 && d < 256)
+            g_dial_ip = (a << 24) | (b << 16) | (c << 8) | d;
+        else { printf("[tlsa] bad TLSA_HOST\n"); return 2; }
+    }
+    if (getenv("TLSA_SNI")) sni = getenv("TLSA_SNI");
 
     // Fail-closed clock from wall time.
     uint64_t wall_ms = 0;
@@ -126,21 +142,29 @@ int main(int argc, char** argv) {
     // holds ONE SPKI hash, so one root per process: argv[3] (or TLSA_ROOT)
     // selects it, defaulting to the P-256 chain root. Run P-384 chains as
     // ./t_tlsa 4443 twice tests/adversarial/at_p384_root.der
-    const char* troot = "tests/adversarial/at_root.der";
-    if (argc > 3) troot = argv[3];
-    if (getenv("TLSA_ROOT")) troot = getenv("TLSA_ROOT");
-    static uint8_t rder[4096];
-    int rn = load(troot, rder, sizeof(rder));
-    if (rn <= 0) { printf("[tlsa] no root fixture %s\n", troot); return 2; }
-    x509_cert rc;
-    if (x509_parse(rder, (uint32_t)rn, &rc) != 0) {
-        printf("[tlsa] root parse failed %s\n", troot);
-        return 2;
+    // TLSA_PRODROOT=1 skips the hook (production roots + preload test).
+    if (!getenv("TLSA_PRODROOT")) {
+        const char* troot = "tests/adversarial/at_root.der";
+        if (argc > 3) troot = argv[3];
+        if (getenv("TLSA_ROOT")) troot = getenv("TLSA_ROOT");
+        static uint8_t rder[4096];
+        int rn = load(troot, rder, sizeof(rder));
+        if (rn <= 0) { printf("[tlsa] no root fixture %s\n", troot); return 2; }
+        x509_cert rc;
+        if (x509_parse(rder, (uint32_t)rn, &rc) != 0) {
+            printf("[tlsa] root parse failed %s\n", troot);
+            return 2;
+        }
+        cert_verify_trust_extra(rc.spki.p, rc.spki.len);
     }
-    cert_verify_trust_extra(rc.spki.p, rc.spki.len);
 
-    static const char req[] =
-        "GET / HTTP/1.1\r\nHost: evil.example.com\r\nConnection: close\r\n\r\n";
+    static char req[512];
+    {
+        int rl = snprintf(req, sizeof(req),
+            "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", sni);
+        if (rl <= 0 || rl >= (int)sizeof(req)) return 2;
+        (void)rl;
+    }
     static uint8_t out[262144];
     struct tls_client_io io = { .send = tlsa_send, .recv = tlsa_recv, .user = 0 };
     int rounds = (argc > 2 && arg_eq(argv[2], "twice")) ? 2 : 1;
@@ -152,16 +176,19 @@ int main(int argc, char** argv) {
         }
         sock_fd = new_conn(port);
         if (sock_fd < 0) { perror("[tlsa] connect"); return 2; }
-        printf("[tlsa] TCP connected to 127.0.0.1:%d (round %d)\n", port, round + 1);
-        int n = tls_client_run("evil.example.com", (uint16_t)port,
-                               (const uint8_t*)req, (uint32_t)sizeof(req) - 1,
+        printf("[tlsa] TCP connected to %u.%u.%u.%u:%d %s (round %d)\n",
+               (g_dial_ip >> 24) & 0xFF, (g_dial_ip >> 16) & 0xFF,
+               (g_dial_ip >> 8) & 0xFF, g_dial_ip & 0xFF, port, sni,
+               round + 1);
+        int n = tls_client_run(sni, (uint16_t)port,
+                               (const uint8_t*)req, (uint32_t)strlen(req),
                                out, sizeof(out), &io);
         int fr = tls_last_fail_reason();
         printf("[tlsa] run done: n=%d fail_reason=%d\n", n, fr);
         if (n > 0) {
             printf("[tlsa] first bytes: %.60s\n", out);
             printf("[tlsa] ticket cached: %s\n",
-                   tls_ticket_have("evil.example.com", wall_ms) ? "yes" : "no");
+                   tls_ticket_have(sni, wall_ms) ? "yes" : "no");
         }
         close(sock_fd); sock_fd = -1;
         if (n < 0) {
