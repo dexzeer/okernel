@@ -1,169 +1,351 @@
-I reviewed the uploaded stack as a security/code audit, including the TLS 1.3 client, X25519, AEAD, RSA/ECDSA, X.509, OCSP, HKDF, and RNG layers.
+I reviewed the uploaded stack as a security-focused code audit, not just a style pass.
 
-There are some good defenses already present, but I found several holes worth fixing.
+**Overall: 6.5/10 for a security-critical TLS/crypto stack.**
 
-### Highest priority
+The architecture is substantially better than I expected for a custom implementation. There is clear evidence of iterative security review, strict parsing, bounds discipline, fail-closed behavior, and deliberate protocol minimization. But there are still a few holes that I would treat as blockers before calling this production-grade cryptography.
 
-1. **Truncated TLS response can be reported as a clean success**
+### Biggest holes
 
-   `tls_client.c:1129-1135` treats any `recv()` failure/EOF as normal completion:
+| Severity | Finding                                                                          | Impact                                                                    |
+| -------- | -------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| Critical | **X25519 is not fully constant-time**                                            | Private-key-dependent timing leakage                                      |
+| High     | **Entire primitive suite is custom crypto**                                      | Large unquantified implementation/correctness risk                        |
+| High     | **No visible differential/KAT/fuzz test suite in the archive**                   | Hard to establish that edge cases are actually covered                    |
+| High     | **RNG design is bespoke and fairly complicated**                                 | Entropy/security assumptions are harder to validate                       |
+| Medium   | **X25519 has no low-order-output rejection**                                     | Potential invalid-curve/small-order handling weakness depending on caller |
+| Medium   | **TLS implementation deliberately rejects legitimate protocol features**         | Availability/interoperability risk, especially KeyUpdate/HRR              |
+| Medium   | **Trust store is SPKI-based rather than conventional root-cert/path validation** | Strong custom trust semantics, potentially surprising operationally       |
 
-   > `if (r < 0) ... TLS_PH_DONE`
+## 1. Critical: X25519 has a secret-dependent branch
 
-   That is dangerous because `tls_recv_record_st()` can return `-1` with a **partially received TLS record** in `rec_buf`. More importantly, the client accepts EOF after application data without requiring an authenticated `close_notify`.
+This is the most important concrete issue I found.
 
-   An on-path attacker who can terminate the TCP connection can therefore potentially turn:
-
-   `complete response` → `truncated response`
-
-   while the API returns `TLS_STEP_DONE`.
-
-   This is a **response-integrity/truncation vulnerability**, particularly serious because the API exposes only `out/out_len`, so callers can easily interpret the result as complete.
-
-   **Fix:** distinguish:
-
-   * EOF before any response bytes: policy-dependent
-   * EOF with `rec_have != 0`: fatal truncation
-   * EOF without authenticated `close_notify`: normally fatal unless the HTTP layer has independently established message completeness, e.g. validated `Content-Length`.
-
-2. **`tls_state_wipe()` does not compile from the supplied sources**
-
-   `tls_client.c:1246+` calls `secure_zero()`, but there is no definition or declaration anywhere in the supplied `.c/.h` files.
-
-   My direct compile produced:
-
-   `error: implicit declaration of function ‘secure_zero’`
-
-   The supplied `tls_client.o` is also stale relative to the source: it does not reference `secure_zero` at all.
-
-   This means the archive contains **source/object divergence**, which is a real supply-chain/build-integrity problem for crypto code. You can end up reviewing one implementation while the build consumes another.
-
-   **Fix:** clean-build everything from source, delete checked-in `.o` files, and make CI fail on stale/generated object mismatches.
-
-3. **AEAD has a global static scratch buffer**
-
-   `aead.c:31`:
-
-   ```c
-   static uint8_t scratch[AEAD_MAC_SCRATCH];
-   ```
-
-   The code explicitly relies on a single-threaded contract. That's fragile for a crypto primitive. Any future interrupt, callback, nested invocation, parallel connection, or accidental reentrancy corrupts the MAC computation.
-
-   This is currently mitigated by the stated architecture, so I'd call it **medium severity**, but it is exactly the kind of assumption that eventually gets violated.
-
-   **Fix:** make Poly1305 streaming, or put the scratch/context in caller-owned state.
-
-### Certificate validation concerns
-
-4. **The certificate-chain builder is order-dependent**
-
-   `cert_verify()` only walks the certificates in the order supplied by the server:
-
-   `leaf -> cert[1] -> cert[2] -> ... -> trusted SPKI`
-
-   It does not perform path building or try alternate issuers.
-
-   That's mainly an interoperability/availability problem rather than a direct authentication bypass, but it means valid chains can fail depending on server ordering or cross-signing structure.
-
-5. **Trust is actually SPKI pinning, not conventional CA validation**
-
-   `spki_in_roots()` accepts a certificate whenever its SPKI hash matches an embedded root hash.
-
-   That's a legitimate trust model, but it means the embedded "roots" are really **public-key pins**. In particular, when the leaf SPKI itself matches an embedded root, `cert_verify()` returns success without requiring that leaf to chain to anything.
-
-   If intentional, document this prominently. If the intended model is conventional Web PKI, this is a semantic hole.
-
-6. **RSA modulus validation is incomplete**
-
-   `rsa_pub_from_x509()` checks:
-
-   * odd modulus
-   * at least 2048 bits
-   * exponent is odd and >= 3
-   * exponent fits one 32-bit limb
-
-   But it doesn't enforce the normal RSA public-key constraint `e < n`.
-
-   This is unlikely to produce a practical authentication bypass because the key is attacker-controlled and verification remains mathematically constrained, but it should be tightened.
-
-### TLS protocol limitations
-
-7. **ServerHello fragmentation is rejected**
-
-   The state machine requires the entire ServerHello to be in the first record:
-
-   `tls_client.c:639-652`
-
-   TLS permits handshake messages to be fragmented across records. This is an interoperability/DoS issue, not normally an authentication break.
-
-   The later handshake reassembly code correctly handles fragmentation, so this looks like an inconsistent implementation boundary.
-
-8. **No TLS KeyUpdate support**
-
-   Post-handshake code explicitly rejects anything other than NewSessionTicket.
-
-   That's acceptable for a deliberately minimal client if documented, but a compliant TLS 1.3 peer can send KeyUpdate. Again, mostly availability/interoperability rather than a cryptographic hole.
-
-### RNG
-
-The RNG is better than I'd expect for a freestanding implementation. It has:
-
-* hardware RNG integration
-* entropy source classes
-* reseeding
-* forward rekeying
-* readiness gating
-* no deterministic fallback
-
-But one thing bothers me:
-
-`rng_rekey()` does:
+In `x25519.c`, the field multiplication helper contains:
 
 ```c
-chacha20_encrypt(rng_key, rng_nonce, rng_counter, block, block, 64);
+if (carry) {
+    ...
+}
 ```
 
-where `block` is uninitialized input. ChaCha20 encryption mathematically makes this equivalent to generating keystream, so the output is fine, but it triggers compiler diagnostics and is needlessly obscure.
+inside `fe_mul121665()`.
 
-I'd replace it with an explicit ChaCha20 block/keystream API or zero the input buffer first.
+That `carry` depends on the field element, which ultimately depends on the secret scalar during X25519. So although the Montgomery ladder itself has the right fixed-iteration/cswap structure, this operation can introduce secret-dependent execution time.
 
-More importantly, **the RNG needs dedicated statistical/cryptographic state-transition tests**, especially around:
+Your own header comment essentially acknowledges the issue:
 
-* snapshot/restore
-* first-seed readiness
-* repeated reseeding
-* source failure
-* RDRAND/RDSEED failure
-* counter exhaustion
+> "constant-time shape; not hardened"
 
-### Crypto primitives
+That's an important distinction.
 
-I tested the supplied implementations against standard vectors for:
+**Fix:** make the reduction path branchless, or replace the field implementation with a thoroughly reviewed constant-time X25519 implementation. I would strongly prefer the latter.
 
-* SHA-256
+This is the one issue I would classify as a genuine cryptographic side-channel rather than merely an interoperability concern.
+
+## 2. The biggest architectural hole: you're implementing the primitives yourself
+
+You've got custom implementations of:
+
 * ChaCha20
 * Poly1305
 * X25519
+* P-256
+* P-384
+* RSA
+* SHA-1
+* SHA-256
+* SHA-384/512
+* HMAC
+* HKDF
+* DER
+* X.509
+* OCSP
+* TLS 1.3
 
-Those basic vectors passed. In particular, the X25519 implementation produced the RFC 7748 known result, so I do **not** see an obvious primitive-level break there.
+The individual code is impressively careful. For example, I see explicit handling for integer canonicalization, RSA modulus size, overflow, DER length encoding, AEAD limits, sequence exhaustion, TLS transcript framing, certificate constraints, etc.
 
-The AEAD construction also follows RFC 8439 correctly and uses a constant-time 16-byte tag comparison.
+But the security problem isn't just "is each function obviously wrong?"
 
-### My priority order
+It's the **combinatorial assurance problem**.
 
-| Priority     | Finding                                                             | Impact                           |
-| ------------ | ------------------------------------------------------------------- | -------------------------------- |
-| Critical-ish | EOF/truncation treated as successful TLS completion                 | Response integrity               |
-| High         | Source/object mismatch + broken clean build                         | Build integrity                  |
-| Medium       | Global AEAD scratch buffer                                          | Reentrancy/concurrency           |
-| Medium       | Trust model is SPKI pinning rather than ordinary CA path validation | Authentication semantics         |
-| Medium       | No ServerHello fragmentation                                        | Interoperability/DoS             |
-| Low/Medium   | RSA `e < n` not enforced                                            | Key validation                   |
-| Low/Medium   | No TLS KeyUpdate                                                    | Interoperability                 |
-| Low          | Uninitialized buffer passed as ChaCha plaintext                     | Code quality/compiler robustness |
+A mature library such as a well-reviewed TLS/crypto implementation has accumulated enormous amounts of adversarial testing around exactly these boundaries. Here, you own all those boundaries.
 
-The **EOF/truncation issue is the one I'd fix first**. It crosses the boundary from "minimal TLS implementation limitation" into "application can accept attacker-truncated authenticated data as a successful response."
+For something handling private keys or authenticating remote systems, I'd move from:
 
-If you want, I can next do a **line-by-line adversarial audit of the TLS/X.509 path**, concentrating specifically on authentication bypasses rather than interoperability issues.
+> "I reviewed the implementation carefully"
+
+to:
+
+> "I can demonstrate equivalence against independent implementations and have fuzzed the parser/state machine."
+
+That distinction matters.
+
+## 3. RNG: thoughtful, but I'd simplify it
+
+The RNG is much better than a naïve homemade PRNG.
+
+Good decisions include:
+
+* `/dev/urandom` rather than the old predictable fallback
+* RDRAND/RDSEED treated as entropy sources rather than sole trust anchors
+* multiple entropy classes
+* freshness requirements
+* forward rekeying
+* output counter exhaustion checks
+* explicit readiness gating
+* zeroing temporary buffers
+* snapshot-divergence handling
+
+But this is a lot of bespoke entropy machinery.
+
+The security argument now depends on subtle properties of:
+
+```text
+entropy classes
+    ↓
+pool accumulation
+    ↓
+SHA-256 conditioning
+    ↓
+XOR into ChaCha key
+    ↓
+rekey
+    ↓
+output
+    ↓
+another rekey
+```
+
+I'd much rather have the platform CSPRNG be the primary source and make the rest supplementary.
+
+In particular, avoid making the security argument depend on `RDTSC`, entropy diversity heuristics, or assumptions about RDRAND/RDSEED. Those are useful supplements, not things I'd want at the center of the proof.
+
+## 4. X25519 should explicitly reject an all-zero shared secret
+
+Your public API is:
+
+```c
+void x25519_shared_secret(...)
+```
+
+and ultimately just calls:
+
+```c
+x25519(out, priv, peer_pub);
+```
+
+There is no visible check that the resulting shared secret is nonzero.
+
+RFC 7748 specifically recommends checking for the all-zero output when X25519 is used for key agreement.
+
+This matters because small-order inputs can produce an all-zero result. If the caller blindly feeds that into HKDF, you have a predictable shared-secret situation.
+
+**Fix:**
+
+```text
+shared = X25519(...)
+if (constant_time_is_zero(shared, 32))
+    reject
+```
+
+Better still, make the API return an error so callers cannot accidentally ignore the requirement.
+
+## 5. Your TLS state machine is secure-looking but intentionally narrow
+
+This is a deliberate design choice, not necessarily a vulnerability.
+
+You explicitly reject:
+
+* HelloRetryRequest
+* client authentication
+* KeyUpdate
+* arbitrary post-handshake messages
+* 0-RTT
+* some certificate forms
+* various unsupported X.509 constructs
+
+For a constrained HTTPS client, that's reasonable.
+
+The important distinction is:
+
+**fail closed = good security behavior, but it can still be a DoS/interoperability surface.**
+
+An attacker who can influence the server path could potentially make connections fail by inducing a legitimate-but-unsupported protocol feature.
+
+That's generally preferable to accepting something incorrectly, but document it as a capability limitation.
+
+## 6. Certificate validation is one of the stronger parts
+
+This section is considerably better than many custom TLS stacks.
+
+I specifically like:
+
+* validity checking for every certificate
+* hostname validation before acceptance
+* SAN/IP distinction
+* constrained wildcard handling
+* explicit ASCII hostname policy
+* RSA ≥2048-bit floor
+* KU/EKU checking
+* AKI/SKI binding when available
+* CA/path-length checks
+* critical-extension rejection
+* exact DER/TLS framing
+* name-constraints enforcement
+* local serial blocklisting
+* fail-closed behavior when time isn't available
+
+The comments show that you've already found several realistic parser/security bugs and corrected them.
+
+One caveat: the trust model is unusual. You're effectively anchoring on **SPKI hashes**, rather than conventional root certificate identities. That's perfectly viable for a constrained appliance/client, but it should be treated as a deliberate trust model rather than "normal PKI."
+
+## 7. RSA/ECDSA verification looks reasonably disciplined
+
+The RSA implementation has good defensive characteristics:
+
+* ≥2048-bit modulus
+* odd modulus
+* restricted exponent
+* strict signature length
+* `s < n`
+* PSS structure validation
+* constant-time-ish final hash comparison
+
+And ECDSA has:
+
+* strict DER integers
+* zero/range checks
+* point validation
+* curve-specific handling
+* fixed public verification parameters
+
+Since these operations use public verification inputs, the variable-time scalar operations aren't automatically a secret-leak problem in the same way that X25519's private scalar operations are.
+
+## 8. Memory hygiene is good, but verify compiler behavior
+
+You explicitly wipe sensitive TLS state:
+
+```c
+secure_zero(st->priv, ...)
+secure_zero(st->master, ...)
+secure_zero(st->res_master, ...)
+...
+```
+
+That's good.
+
+I'd still audit `secure_zero()` itself and verify the generated assembly under your actual compiler/optimization settings. A secure wipe primitive needs to survive dead-store elimination.
+
+Similarly, I'd inspect compiler output for:
+
+* X25519
+* field reduction
+* scalar multiplication
+* `secure_zero`
+* constant-time comparisons
+
+Source-level "branchless" crypto isn't sufficient evidence.
+
+---
+
+# What I'd fix first
+
+If this were my codebase, my priority list would be:
+
+### P0
+
+**1. Replace/fix X25519**
+
+Specifically:
+
+* eliminate the secret-dependent branch
+* make field arithmetic genuinely constant-time
+* check/reject all-zero shared secrets
+* test against RFC 7748 vectors
+* test malicious low-order inputs
+* inspect optimized assembly
+
+### P1
+
+**2. Build an independent cryptographic test harness**
+
+For every primitive, compare against a second implementation.
+
+At minimum:
+
+```text
+ChaCha20       RFC 8439 vectors
+Poly1305       RFC 8439 vectors
+X25519         RFC 7748 vectors + low-order cases
+SHA-1/256/384/512  NIST vectors
+HMAC           RFC 4231
+HKDF           RFC 5869
+RSA-PSS        OpenSSL/BoringSSL
+ECDSA          OpenSSL/BoringSSL
+AES/AEAD       independent implementation if applicable
+```
+
+Then differential-test TLS handshakes against several independent servers.
+
+### P1
+
+**3. Fuzz DER/X.509/TLS parsing**
+
+This is probably the highest ROI testing investment after X25519.
+
+Fuzz:
+
+```text
+DER parser
+X.509 parser
+Certificate message
+ServerHello
+EncryptedExtensions
+CertificateVerify
+Finished
+OCSP
+NewSessionTicket
+TLS record framing
+```
+
+Run with:
+
+```text
+ASan
+UBSan
+MSan
+-fsanitize-undefined-trap-on-error
+```
+
+and ideally libFuzzer/AFL++.
+
+### P2
+
+**4. Reduce bespoke crypto where possible**
+
+If the environment allows it, use a mature crypto library for the primitives and retain your custom TLS policy/state-machine layer.
+
+If this is intentionally a freestanding/kernel environment, then the custom implementation makes more sense, but the testing burden becomes correspondingly much higher.
+
+---
+
+# My scorecard
+
+| Component                |      Score |
+| ------------------------ | ---------: |
+| Cryptographic primitives |       6/10 |
+| Key agreement            |   **4/10** |
+| Randomness               |       7/10 |
+| AEAD                     |       8/10 |
+| KDF/hash layer           |       8/10 |
+| X.509 validation         |       8/10 |
+| TLS state machine        |       7/10 |
+| Memory/bounds discipline |     8.5/10 |
+| Fail-closed behavior     |       9/10 |
+| Test/assurance evidence  |   **4/10** |
+| Overall                  | **6.5/10** |
+
+**Bottom line:** this isn't a reckless homemade crypto stack. It has clearly had serious security review and many obvious classes of bugs have already been eliminated. The remaining problem is that the stack has crossed into the territory where **implementation assurance and side-channel analysis matter as much as functional correctness**.
+
+The X25519 issue and lack of an independent test/fuzz corpus are the two things I'd attack immediately.
 

@@ -126,6 +126,20 @@ static void parser_fuzz_section(void) {
             if (q != 0 && q != -1) bad++;
         }
         {
+            // EncryptedExtensions body + Finished MAC (cryptoholes fuzz
+            // gap): garbage must return 0/-1 only (verified key/hash —
+            // any key is fine, we assert crash-freedom + code range).
+            int q = tls_parse_ee_validate(fbuf, len);
+            if (q != 0 && q != -1) bad++;
+        }
+        {
+            static const uint8_t fkey[32] = { 1 };
+            uint8_t th[32];
+            for (int i = 0; i < 32; i++) th[i] = (uint8_t)i;
+            int q = tls_verify_finished(fkey, th, fbuf);
+            if (q != 0 && q != -1) bad++;
+        }
+        {
             x509_cert c;
             int q = x509_parse(fbuf, len > 1500 ? 1500 : len, &c);
             if (q != 0 && q != -1) bad++;
