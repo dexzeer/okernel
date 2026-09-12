@@ -1016,7 +1016,9 @@ static void mock_run(int mode, struct mock_result* res) {
     x25519_public_key(srv_pub_A, srv_priv);
 
     uint8_t shared[32];
-    x25519_shared_secret(shared, srv_priv, client_pub);
+    // Mock keys are full-order; rejection here is an internal error —
+    // fail the mock loudly rather than continuing with a bogus secret.
+    if (!x25519_shared_secret(shared, srv_priv, client_pub)) { res->r = -2; return; }
     uint8_t early[32], derived[32];
     // PSK_ACCEPT runs on the resumption-derived early secret (same inputs
     // as the client: saved resumption master + ticket nonce). Everything
@@ -1525,6 +1527,14 @@ static void mock_section(void) {
           "unknown clock (0) is not fresh (cryptoholes #7)");
     CHECK(!tls_ticket_have("other.example.com", 1000000),
           "no ticket cached for other hosts");
+    // Canonicalization (cryptoholes round 4, P0): the ticket stored for
+    // "evil.example.com" must be found through case/FQDN-dot spellings.
+    CHECK(tls_ticket_have("EVIL.EXAMPLE.COM", 1000000),
+          "ticket found via uppercase spelling");
+    CHECK(tls_ticket_have("evil.example.com.", 1000000),
+          "ticket found via FQDN-dot spelling");
+    CHECK(!tls_ticket_have("evil.example.com..", 1000000),
+          "double-dot spelling is invalid (no false hit)");
     mock_run(MOCK_NST_BAD, &res);
     CHECK(res.r == TLS_STEP_ERR,
           "corrupt ticket rejected (no silent keep)");
@@ -1669,6 +1679,194 @@ static void truncation_section(void) {
         CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
               TLS_RESP_COMPLETE, "header names case-insensitive");
     }
+    // ---- Line-oriented framing (cryptoholes round 4, P1) ----
+    // A framing header inside ANOTHER header's value is not a header.
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\nX-Note: content-length: 99\r\n"
+            "Content-Length: 5\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_COMPLETE, "CL inside a value is not a header");
+    }
+    // "chunked" as a substring of another value does not frame: the
+    // parser reports chunked=0, so gate (CL satisfied) and consumer
+    // (strip-only, no dechunk) agree.
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\nX-Mode: chunked-ish\r\n"
+            "Content-Length: 8\r\n\r\ndeadbeef";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_COMPLETE, "value-embedded chunked is not TE");
+        struct http_framing fr;
+        static const char h[] =
+            "HTTP/1.1 200 OK\r\nX-Mode: chunked-ish\r\nContent-Length: 8\r\n";
+        http_parse_framing((const uint8_t*)h, sizeof(h) - 1, &fr);
+        CHECK(!fr.malformed && !fr.chunked && fr.has_cl &&
+              fr.content_length == 8, "parser: no chunked flag from a value");
+    }
+    // Duplicate identical Content-Length: accepted (one verdict).
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_COMPLETE, "identical duplicate CL accepted");
+    }
+    // Conflicting Content-Length: malformed, never COMPLETE.
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello!";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_SHORT, "conflicting duplicate CL refused");
+    }
+    // Transfer-Encoding + Content-Length: forbidden combination, refused.
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n"
+            "Content-Length: 11\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_SHORT, "TE+CL refused (no agreed framing)");
+    }
+    // TE without chunked, no CL: close-delimited (UNKNOWN), not malformed.
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_UNKNOWN, "non-chunked TE is close-delimited");
+    }
+    // Chunked not final: not chunked framing (close-delimited).
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked, gzip\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_UNKNOWN, "non-final chunked is not chunked framing");
+    }
+    // Multi-coding ending in chunked: chunked framing applies.
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip, chunked\r\n\r\n"
+            "5\r\nhello\r\n0\r\n\r\n";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_COMPLETE, "chunked-final multi-coding dechunks");
+    }
+    // Structural malformations: all fail closed, never COMPLETE.
+    {
+        static const char r1[] =
+            "HTTP/1.1 200 OK\r\nContent-Length 5\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r1, sizeof(r1) - 1) ==
+              TLS_RESP_SHORT, "missing colon refused");
+        static const char r2[] =
+            "HTTP/1.1 200 OK\r\nContent-Length : 5\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r2, sizeof(r2) - 1) ==
+              TLS_RESP_SHORT, "space before colon refused");
+        static const char r3[] =
+            "HTTP/1.1 200 OK\r\nX-A: 1\r\n folded: 2\r\nContent-Length: 5\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r3, sizeof(r3) - 1) ==
+              TLS_RESP_SHORT, "obs-fold refused");
+        static const char r4[] =
+            "HTTP/1.1 200 OK\r\nContent-Length:\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r4, sizeof(r4) - 1) ==
+              TLS_RESP_SHORT, "empty CL refused");
+        static const char r5[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: 5x\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r5, sizeof(r5) - 1) ==
+              TLS_RESP_SHORT, "non-digit CL refused");
+        static const char r6[] =
+            "HTTP/1.1 200 OK\r\n: 5\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r6, sizeof(r6) - 1) ==
+              TLS_RESP_SHORT, "empty field name refused");
+    }
+    // OWS around the value is stripped, not significant.
+    {
+        static const char r[] =
+            "HTTP/1.1 200 OK\r\nContent-Length: \t 5 \t\r\n\r\nhello";
+        CHECK(tls_response_complete((const uint8_t*)r, sizeof(r) - 1) ==
+              TLS_RESP_COMPLETE, "OWS around CL stripped");
+    }
+}
+
+// HTTP framing fuzz (cryptoholes P2-10): deterministic header-soup through
+// the shared parser + the gate. Properties: (a) termination on every
+// input (a hang fails the suite via timeout); (b) verdicts in-range;
+// (c) gate/parser AGREEMENT — COMPLETE with has_cl implies the body
+// really covers the declared length (re-derived independently here);
+// (d) determinism (same input, same verdict twice). Memory safety rides
+// along: the ASan build turns any parser OOB read/write into a failure.
+static uint64_t hf_rng = 0x48545450F5A5E548ull;
+#define HF_NEXT() (hf_rng ^= hf_rng << 13, hf_rng ^= hf_rng >> 7, \
+                   hf_rng ^= hf_rng << 17, (uint32_t)(hf_rng & 0xFFFFFFFFu))
+
+static void http_fuzz_section(void) {
+    printf("== 2c. HTTP framing fuzz (cryptoholes P2-10) ==\n");
+    static const char* toks[] = {
+        "Content-Length:", "content-length:", "CONTENT-LENGTH:",
+        "Transfer-Encoding:", "transfer-encoding:", "chunked", "Chunked",
+        "gzip", "0", "5", "99", "007", ": ", " ", "\t", ",", "\r\n",
+        "X-Note: chunked", "X-CL: content-length: 5", "HTTP/1.1 200 OK",
+        "hello", "deadbeef", "5\r\nhello\r\n0\r\n\r\n", "..", "-",
+        // Whole clean templates (guarantee every verdict stays reachable
+        // amid the soup; may be cut mid-splice by the length cap).
+        "HTTP/1.1 200 OK\r\nX-A: b\r\n\r\nxy",
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nxy",
+        "HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nxy",
+        "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+    };
+    static uint8_t soup[512];
+    int saw_c = 0, saw_s = 0, saw_u = 0, agree = 1, det = 1;
+    const int ROUNDS = 4000;
+    for (int t = 0; t < ROUNDS; t++) {
+        uint32_t n = HF_NEXT() % sizeof(soup);
+        uint32_t p = 0;
+        while (p < n) {
+            uint32_t r = HF_NEXT();
+            if ((r & 7) == 0) {
+                // splice a framing token (bias toward adversarial shapes)
+                const char* tk = toks[(r >> 3) % (sizeof(toks) / sizeof(toks[0]))];
+                uint32_t k = 0;
+                while (tk[k] && p < n) soup[p++] = (uint8_t)tk[k++];
+            } else {
+                // raw byte from the HTTP alphabet (incl. controls/del)
+                static const char ab[] =
+                    "abcXYZ019 \t-:.,;()[]{}<>\\\"'=\r\n\x01\x7f\x80\xff";
+                soup[p++] = (uint8_t)ab[r % (sizeof(ab) - 1)];
+            }
+        }
+        int v1 = tls_response_complete(soup, n);
+        int v2 = tls_response_complete(soup, n);
+        if (v1 != v2) det = 0;
+        if (v1 < 0 || v1 > 2) { agree = 0; break; }
+        if (v1 == TLS_RESP_COMPLETE) saw_c = 1;
+        else if (v1 == TLS_RESP_SHORT) saw_s = 1;
+        else saw_u = 1;
+        // Agreement: COMPLETE + has_cl => body covers declared length.
+        if (v1 == TLS_RESP_COMPLETE) {
+            uint32_t body = 0;
+            int found = 0;
+            for (uint32_t i = 0; i + 3 < n; i++) {
+                if (soup[i] == '\r' && soup[i+1] == '\n' &&
+                    soup[i+2] == '\r' && soup[i+3] == '\n') {
+                    body = i + 4;
+                    found = 1;
+                    break;
+                }
+            }
+            if (found && body >= 2 && body <= n) {
+                struct http_framing fr;
+                http_parse_framing(soup, body - 2, &fr);
+                if (fr.malformed) agree = 0;
+                else if (fr.has_cl && n - body < fr.content_length) agree = 0;
+            }
+        }
+        // Direct parser sweep on arbitrary slices (OOB probe under ASan).
+        {
+            uint32_t hn = (n > 0) ? HF_NEXT() % (n + 1) : 0;
+            struct http_framing fr;
+            http_parse_framing(soup, hn, &fr);
+            (void)fr;
+        }
+    }
+    CHECK(det, "framing verdicts deterministic");
+    CHECK(agree, "COMPLETE agrees with parsed framing (4000 rounds)");
+    CHECK(saw_c && saw_s && saw_u, "fuzz reaches all three verdicts");
 }
 
 static void keyuse_section(void) {
@@ -1766,6 +1964,92 @@ static void pin_section(void) {
         blob[0] = 'X';
         CHECK(tls_pin_import(blob, bl) != 0, "bad magic rejected");
         CHECK(tls_pin_check("a.example.com", hB) == 0, "failed imports keep store");
+    }
+    tls_pin_clear();
+    // ---- Hostname canonicalization (cryptoholes round 4, P0) ----
+    // Case/FQDN-dot variants must resolve to ONE pin-cache key, and the
+    // compiled preload table must already be canonical (else dead pins).
+    {
+        char c[64];
+        // NOTE: no strcmp in this TU — -Isrc shadows <string.h> with the
+        // kernel's freestanding header (memcmp/strlen only). Byte-compare
+        // with explicit lengths, matching the rest of this file.
+        CHECK(tls_canon_host(c, "GITHUB.COM") == 0 &&
+              !memcmp(c, "github.com", 11), "canon lowercases");
+        CHECK(tls_canon_host(c, "Github.Com.") == 0 &&
+              !memcmp(c, "github.com", 11), "canon strips one FQDN dot");
+        CHECK(tls_canon_host(c, "1.2.3.4") == 0 &&
+              !memcmp(c, "1.2.3.4", 8), "canon passes IPv4 through");
+        CHECK(tls_canon_host(c, "localhost") == 0 &&
+              !memcmp(c, "localhost", 10), "canon accepts single label");
+        CHECK(tls_canon_host(c, "") != 0, "canon rejects empty");
+        CHECK(tls_canon_host(c, NULL) != 0, "canon rejects NULL");
+        CHECK(tls_canon_host(c, ".") != 0, "canon rejects bare dot");
+        CHECK(tls_canon_host(c, ".a.com") != 0, "canon rejects leading dot");
+        CHECK(tls_canon_host(c, "a..b.com") != 0, "canon rejects empty label");
+        CHECK(tls_canon_host(c, "a.com..") != 0, "canon rejects double trailing dot");
+        CHECK(tls_canon_host(c, "-a.com") != 0, "canon rejects leading hyphen");
+        CHECK(tls_canon_host(c, "a-.com") != 0, "canon rejects trailing hyphen");
+        CHECK(tls_canon_host(c, "a_b.com") != 0, "canon rejects underscore");
+        CHECK(tls_canon_host(c, "a b.com") != 0, "canon rejects space");
+        CHECK(tls_canon_host(c, "a.com:443") != 0, "canon rejects port suffix");
+        CHECK(tls_canon_host(c, "[::1]") != 0, "canon rejects IPv6 literal");
+        {
+            // 64-char name: over the 63 cap → fail closed, never truncate.
+            char big[70];
+            for (int i = 0; i < 64; i++) big[i] = 'a';
+            big[64] = 0;
+            CHECK(tls_canon_host(c, big) != 0, "canon rejects overlong (no truncation)");
+        }
+        {
+            // 63-char boundary: longest accepted name round-trips the pin
+            // cache exactly (comparator bound + no truncation).
+            char maxn[64];
+            for (int i = 0; i < 63; i++) maxn[i] = 'b';
+            maxn[63] = 0;
+            CHECK(tls_canon_host(c, maxn) == 0, "canon accepts 63-char name");
+            tls_pin_clear();
+            CHECK(tls_pin_check(maxn, hA) == 0, "63-char name stores");
+            CHECK(tls_pin_check(maxn, hA) == 0, "63-char name matches");
+            CHECK(tls_pin_check(maxn, hB) == -1, "63-char changed key refuses");
+            tls_pin_clear();
+        }
+        CHECK(tls_preload_selfcheck() == 0, "preload table is canonical");
+        // Init canonicalizes once: SNI/cert/pin/ticket all see this string.
+        {
+            static struct tls_state st;
+            static uint8_t req[1], out[64];
+            tls_state_init(&st, "GITHUB.COM.", 443, req, 0, out, sizeof(out));
+            CHECK(!memcmp(st.host, "github.com", 11),
+                  "init canonicalizes host for SNI/cert/pin/ticket");
+            tls_state_init(&st, "bad..host", 443, req, 0, out, sizeof(out));
+            CHECK(st.host[0] == 0, "init fails closed on invalid hostname");
+        }
+        // Pin-cache key equivalence: one store, every spelling hits it.
+        // (hA is NOT the real github preload hash, so a missed lookup
+        // would fall into preload → -2, not 0: the assertions below
+        // distinguish "same slot" from "separate slot".)
+        tls_pin_clear();
+        CHECK(tls_pin_check("c.example.com", hA) == 0, "canon: first visit stores");
+        CHECK(tls_pin_check("C.EXAMPLE.COM", hA) == 0, "canon: uppercase hits same slot");
+        CHECK(tls_pin_check("c.example.com.", hA) == 0, "canon: FQDN dot hits same slot");
+        CHECK(tls_pin_check("C.Example.Com.", hB) == -1, "canon: changed key on alias is PIN CHANGE, not new slot");
+        CHECK(tls_pin_check("c.example.com", hA) == 0, "canon: original still matches");
+        tls_pin_clear();
+        // Import normalizes legacy non-canonical entries to the same key.
+        {
+            static uint8_t blob[1024], raw[64 + 32];
+            for (int i = 0; i < 64 + 32; i++) raw[i] = 0;
+            const char* leg = "D.EXAMPLE.COM.";
+            for (int i = 0; leg[i]; i++) raw[i] = (uint8_t)leg[i];
+            for (int i = 0; i < 32; i++) raw[64 + i] = hB[i];
+            blob[0]='O'; blob[1]='K'; blob[2]='P'; blob[3]='I';
+            blob[4]='N'; blob[5]='1'; blob[6]=1; blob[7]=1;
+            for (int i = 0; i < 64 + 32; i++) blob[8 + i] = raw[i];
+            CHECK(tls_pin_import(blob, 8 + 64 + 32) == 0, "import normalizes legacy case");
+            CHECK(tls_pin_check("d.example.com", hB) == 0, "normalized import matches canonical");
+            tls_pin_clear();
+        }
     }
     tls_pin_clear();
 }
@@ -2004,6 +2288,7 @@ int main(void) {
     fuzz_section();
     mock_section();
     truncation_section();
+    http_fuzz_section();
     keyuse_section();
     pin_section();
     name_section();

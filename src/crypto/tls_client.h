@@ -74,7 +74,13 @@ enum tls_phase {
 
 struct tls_state {
     int phase;
-    const char* host;
+    const char* host; // ALWAYS canonical (see tls_canon_host): set once in
+                      // tls_state_init from the caller string into host_canon
+                      // below, so SNI/cert/pin/ticket provably agree. Points
+                      // at host_canon (struct-owned, never caller memory).
+                      // Empty ("") iff the caller name was invalid — the
+                      // handshake then fails closed at certificate check.
+    char host_canon[64];
 #ifndef KERNEL
     const char* verify_host;   // HOST-ONLY test hook (review 2026-09-10 #12):
                                // hostname used for certificate verification;
@@ -187,6 +193,18 @@ int tls_client_run(const char* host, uint16_t port,
                    uint8_t* out, uint32_t out_cap,
                    const struct tls_client_io* io);
 
+// ---- Hostname canonicalization (cryptoholes round 4, P0) ----
+// ONE canonical form (ASCII lowercase, one terminal dot stripped, LDH
+// labels, total <= 63) feeds SNI, certificate matching, pin lookup/storage
+// and ticket lookup/storage, so "pinned" means exactly what the verifier
+// checked. Returns 0 + fills out[64] on success, -1 on invalid input
+// (callers fail closed). IPv4 literals pass through unchanged.
+int tls_canon_host(char out[64], const char* in);
+// Self-check: every compiled preload_pins[] entry is already canonical
+// (a non-canonical entry would NEVER match — silent dead pin). Returns 0
+// iff all entries canonicalize to themselves. Host-test entry point.
+int tls_preload_selfcheck(void);
+
 // ---- Trust-On-First-Use leaf pinning ----
 // Memory-only pin store (lost on reboot): hostname → verified leaf SPKI
 // hash. First verified visit stores; later visits with a DIFFERENT leaf key
@@ -229,5 +247,25 @@ void tls_ticket_clear(void);           // drop all (tests, memory hygiene)
 #define TLS_RESP_SHORT    1
 #define TLS_RESP_UNKNOWN  2
 int tls_response_complete(const uint8_t* resp, uint32_t len);
+
+// ---- Shared HTTP framing parser (cryptoholes round 4, P1) ----
+// Line-oriented header analysis (RFC 9112 §5) used by BOTH the
+// completeness gate above and the body consumer (http_dechunk in
+// net/network.c) — one parser, zero framing differentials. `hdr` is the
+// header block WITHOUT the terminating blank line (every byte belongs to
+// a CRLF-terminated line). Policy: duplicate Content-Length accepted only
+// if byte-identical (else malformed); Transfer-Encoding + Content-Length
+// together are malformed; TE without chunked-final is close-delimited
+// (not malformed); anything structurally unparseable is malformed.
+// Callers map malformed -> fail closed (gate: SHORT; consumer: no dechunk).
+struct http_framing {
+    int malformed;
+    int has_cl;
+    uint32_t content_length; // valid iff has_cl
+    int te_present;
+    int chunked;             // TE present with chunked as FINAL coding
+};
+void http_parse_framing(const uint8_t* hdr, uint32_t hdr_len,
+                        struct http_framing* out);
 
 #endif

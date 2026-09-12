@@ -1,4 +1,5 @@
 #include "network.h"
+#include "../crypto/tls_client.h" // http_parse_framing (shared framing)
 #include "e1000.h"
 #include "../io.h"
 #include "../serial.h"
@@ -1558,13 +1559,21 @@ int http_dechunk(char* buf, int len) {
     }
     if (body < 0) return len;
 
-    // only dechunk when the server actually said chunked (detect BEFORE
-    // shifting the body, since the headers get moved away below)
+    // Framing decision from the SHARED line-oriented parser (crypto/
+    // tls_client.c): dechunk if and only if the parser says
+    // Transfer-Encoding ends in chunked. The old substring sniff for
+    // "chunked" anywhere in the headers disagreed with the completeness
+    // gate (cryptoholes round 4, P1): a "chunked" token inside another
+    // header's VALUE (or a case-variant name) made this dechunk a plain
+    // Content-Length body — corrupting it whenever the body began with
+    // hex digits — while the gate had blessed it COMPLETE via CL. One
+    // parser, zero differentials by construction. Malformed blocks also
+    // take the strip-only path (the gate already refused to bless them).
     int chunked = 0;
-    for (int i = 0; i < body - 7; i++) {
-        if (buf[i] == 'c' && buf[i+1] == 'h' && buf[i+2] == 'u' &&
-            buf[i+3] == 'n' && buf[i+4] == 'k' && buf[i+5] == 'e' &&
-            buf[i+6] == 'd') { chunked = 1; break; }
+    {
+        struct http_framing fr;
+        http_parse_framing((const uint8_t*)buf, (uint32_t)body - 2, &fr);
+        chunked = !fr.malformed && fr.chunked;
     }
 
     // Shift the body to the start of the buffer so callers (html_parse etc.)

@@ -10,6 +10,19 @@ static void put_u16(uint8_t* p, uint16_t v) {
     p[1] = (uint8_t)(v & 0xff);
 }
 
+// Checked u16 emission (cryptoholes round 4, #9): every wire length prefix
+// is range-proven at the emission site, and the narrowing is then an
+// explicit cast. A silently truncated length would fork our transcript
+// view from the server's, so the proof is executable (return -1), never
+// a bare cast or a comment. All values here are small by construction
+// (bounded stack buffers, capped tickets, canonical hostnames), so the
+// check documents the invariant; it must never fire.
+static int put_u16_ck(uint8_t* p, uint32_t v) {
+    if (v > 0xFFFFu) return -1;
+    put_u16(p, (uint16_t)v);
+    return 0;
+}
+
 static uint16_t get_u16(const uint8_t* p) {
     return ((uint16_t)p[0] << 8) | p[1];
 }
@@ -69,8 +82,8 @@ int tls_ext_append_supported_groups(uint8_t* buf, uint32_t cap, uint32_t* pos) {
     uint32_t body_len = 2 + list_len;
     if (!buf_has(cap, start, 4 + body_len)) return -1;
     put_u16(buf + start, TLS_EXT_SUPPORTED_GROUPS);
-    put_u16(buf + start + 2, body_len);
-    put_u16(buf + start + 4, list_len);
+    if (put_u16_ck(buf + start + 2, body_len) < 0) return -1;
+    if (put_u16_ck(buf + start + 4, list_len) < 0) return -1;
     for (uint32_t i = 0; i < n; i++) {
         put_u16(buf + start + 6 + 2 * i, groups[i]);
     }
@@ -97,8 +110,8 @@ int tls_ext_append_signature_algorithms(uint8_t* buf, uint32_t cap, uint32_t* po
     uint32_t body_len = 2 + list_len;
     if (!buf_has(cap, start, 4 + body_len)) return -1;
     put_u16(buf + start, TLS_EXT_SIGNATURE_ALGORITHMS);
-    put_u16(buf + start + 2, body_len);
-    put_u16(buf + start + 4, list_len);
+    if (put_u16_ck(buf + start + 2, body_len) < 0) return -1;
+    if (put_u16_ck(buf + start + 4, list_len) < 0) return -1;
     // Write algorithms in big-endian wire order. The `algs` array is in
     // host byte order (little-endian on x86); we MUST byte-swap each entry.
     for (uint32_t i = 0; i < n; i++) {
@@ -120,8 +133,8 @@ int tls_ext_append_key_share_x25519(uint8_t* buf, uint32_t cap, uint32_t* pos,
     uint32_t body_len = 2 + list_len;
     if (!buf_has(cap, start, 4 + body_len)) return -1;
     put_u16(buf + start, TLS_EXT_KEY_SHARE);
-    put_u16(buf + start + 2, body_len);
-    put_u16(buf + start + 4, list_len);
+    if (put_u16_ck(buf + start + 2, body_len) < 0) return -1;
+    if (put_u16_ck(buf + start + 4, list_len) < 0) return -1;
     put_u16(buf + start + 6, TLS_GROUP_X25519);
     put_u16(buf + start + 8, 32);
     memcpy(buf + start + 10, pub, 32);
@@ -131,8 +144,24 @@ int tls_ext_append_key_share_x25519(uint8_t* buf, uint32_t cap, uint32_t* pos,
 
 int tls_ext_append_sni(uint8_t* buf, uint32_t cap, uint32_t* pos,
                       const char* hostname) {
-    if (!hostname) return 0;  // omit
+    if (!hostname || !hostname[0]) return 0;  // omit (empty = invalid name)
+    // RFC 6066 §3: literal IPv4/IPv6 addresses are NOT permitted in
+    // ServerNameList. Omit SNI for IPv4 literals (canonical form is the
+    // dotted quad itself); IPv6 never survives canonicalization.
+    {
+        int dots = 0, digits = 0;
+        for (const char* p = hostname; *p; p++) {
+            if (*p == '.') dots++;
+            else if (*p >= '0' && *p <= '9') digits++;
+            else { dots = -1; break; }
+        }
+        if (dots == 3 && digits > 0) return 0; // IPv4 literal: omit
+    }
     uint32_t hlen = strlen(hostname);
+    // Belt-and-braces on top of canonicalization (state hostnames are
+    // already <= 63): a direct caller with a longer name fails closed
+    // instead of emitting a truncated SNI.
+    if (hlen > 63) return -1;
     // SNI: list_len(2) | list_bytes where list_bytes = { name_type(1)=0 | name_len(2) | name }
     // list_len = bytes inside the list (excluding itself)
     uint32_t entry_len = 1 + 2 + hlen;
@@ -141,10 +170,10 @@ int tls_ext_append_sni(uint8_t* buf, uint32_t cap, uint32_t* pos,
     uint32_t start = *pos;
     if (!buf_has(cap, start, 4 + body_len)) return -1;
     put_u16(buf + start, TLS_EXT_SERVER_NAME);
-    put_u16(buf + start + 2, body_len);
-    put_u16(buf + start + 4, list_len);
+    if (put_u16_ck(buf + start + 2, body_len) < 0) return -1;
+    if (put_u16_ck(buf + start + 4, list_len) < 0) return -1;
     buf[start + 6] = 0;  // host_name
-    put_u16(buf + start + 7, hlen);
+    if (put_u16_ck(buf + start + 7, hlen) < 0) return -1;
     memcpy(buf + start + 9, hostname, hlen);
     *pos = start + 4 + body_len;
     return 0;
@@ -154,14 +183,16 @@ int tls_ext_append_alpn_http11(uint8_t* buf, uint32_t cap, uint32_t* pos) {
     // ALPN: list_len(2) | list_bytes where list_bytes = { proto_len(1) | proto }
     // list_len describes the bytes that follow the list_len field.
     const char* proto = "http/1.1";
-    uint32_t proto_len = 8;
-    uint32_t list_len = 1 + proto_len;   // 9 bytes inside the list
+    // Fixed protocol string: u8-typed so the single-byte emission below
+    // narrows nothing (the wire value is a manifest constant, 8).
+    const uint8_t proto_len = 8;
+    uint32_t list_len = 1u + proto_len;  // 9 bytes inside the list
     uint32_t body_len = 2 + list_len;    // list_len field + list_bytes
     uint32_t start = *pos;
     if (!buf_has(cap, start, 4 + body_len)) return -1;
     put_u16(buf + start, TLS_EXT_APPLICATION_LAYER_PROTOCOL);
-    put_u16(buf + start + 2, body_len);
-    put_u16(buf + start + 4, list_len);
+    if (put_u16_ck(buf + start + 2, body_len) < 0) return -1;
+    if (put_u16_ck(buf + start + 4, list_len) < 0) return -1;
     buf[start + 6] = proto_len;
     memcpy(buf + start + 7, proto, proto_len);
     *pos = start + 4 + body_len;
@@ -240,7 +271,8 @@ uint32_t tls_build_client_hello(uint8_t* out, uint32_t cap,
     };
     uint32_t cs_n = sizeof(ciphers) / sizeof(ciphers[0]);
     if (!buf_has(sizeof(body), pos, 2 + 2 * cs_n)) return 0;
-    put_u16(body + pos, 2 * cs_n); pos += 2;
+    if (put_u16_ck(body + pos, 2 * cs_n) < 0) return 0;
+    pos += 2;
     for (uint32_t i = 0; i < cs_n; i++) put_u16(body + pos + 2 * i, ciphers[i]);
     pos += 2 * cs_n;
     // legacy_compression_methods (1B len + 0x00)
@@ -262,7 +294,7 @@ uint32_t tls_build_client_hello(uint8_t* out, uint32_t cap,
     if (tls_ext_append_status_request(body, sizeof(body), &pos) < 0) return 0;
     if (tls_ext_append_psk_key_exchange_modes(body, sizeof(body), &pos) < 0) return 0;
     // Patch extensions length
-    put_u16(body + ext_start, pos - ext_start - 2);
+    if (put_u16_ck(body + ext_start, pos - ext_start - 2) < 0) return 0;
 
     // Build handshake message: type(1) || len(3) || body
     uint32_t body_len = pos;
@@ -294,7 +326,7 @@ int tls_parse_server_hello(const uint8_t* sh, uint32_t sh_len,
     if (sid_len != 32) return -1;
     {
         uint8_t diff = 0;
-        for (int i = 0; i < 32; i++) diff |= sh[p + i] ^ expect_session_id[i];
+        for (uint32_t i = 0; i < 32; i++) diff |= sh[p + i] ^ expect_session_id[i];
         if (diff != 0) return -1;
     }
     p += sid_len;
@@ -559,7 +591,8 @@ uint32_t tls_build_client_hello_psk(uint8_t* out, uint32_t cap,
     };
     uint32_t cs_n = sizeof(ciphers) / sizeof(ciphers[0]);
     if (!buf_has(sizeof(body), pos, 2 + 2 * cs_n)) return 0;
-    put_u16(body + pos, 2 * cs_n); pos += 2;
+    if (put_u16_ck(body + pos, 2 * cs_n) < 0) return 0;
+    pos += 2;
     for (uint32_t i = 0; i < cs_n; i++) put_u16(body + pos + 2 * i, ciphers[i]);
     pos += 2 * cs_n;
     if (!buf_has(sizeof(body), pos, 2)) return 0;
@@ -587,9 +620,15 @@ uint32_t tls_build_client_hello_psk(uint8_t* out, uint32_t cap,
         uint32_t ext_body_len = 2 + id_list_len + 2 + 1 + 32;
         if (!buf_has(sizeof(body), pos, 4 + ext_body_len)) return 0;
         put_u16(body + pos, TLS_EXT_PRE_SHARED_KEY); pos += 2;
-        put_u16(body + pos, (uint16_t)ext_body_len); pos += 2;
-        put_u16(body + pos, (uint16_t)id_list_len); pos += 2;
-        put_u16(body + pos, (uint16_t)ticket_len); pos += 2;
+        // ticket_len comes from our own cache (capped at TLS_TICKET_MAX
+        // = 1024 at store time); the checked emission below re-proves the
+        // bound at the narrowing point instead of bare-casting it.
+        if (put_u16_ck(body + pos, ext_body_len) < 0) return 0;
+        pos += 2;
+        if (put_u16_ck(body + pos, id_list_len) < 0) return 0;
+        pos += 2;
+        if (put_u16_ck(body + pos, ticket_len) < 0) return 0;
+        pos += 2;
         memcpy(body + pos, ticket, ticket_len); pos += ticket_len;
         body[pos++] = (uint8_t)((age_obf >> 24) & 0xff);
         body[pos++] = (uint8_t)((age_obf >> 16) & 0xff);
@@ -599,7 +638,7 @@ uint32_t tls_build_client_hello_psk(uint8_t* out, uint32_t cap,
         body[pos++] = 32;                    // PskBinderEntry length prefix
         memcpy(body + pos, binder, 32); pos += 32;
     }
-    put_u16(body + ext_start, pos - ext_start - 2);
+    if (put_u16_ck(body + ext_start, pos - ext_start - 2) < 0) return 0;
 
     uint32_t body_len = pos;
     uint32_t total = 4 + body_len;
@@ -708,7 +747,7 @@ int tls_parse_ee_validate(const uint8_t* ee, uint32_t ee_len) {
             if (get_u16(ee + p) != 1 + 8) return -1;
             if (ee[p + 2] != 8) return -1;
             static const char want[] = "http/1.1";
-            for (int i = 0; i < 8; i++)
+            for (uint32_t i = 0; i < 8; i++)
                 if (ee[p + 3 + i] != (uint8_t)want[i]) return -1;
         }
         p += elen;

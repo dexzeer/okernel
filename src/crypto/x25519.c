@@ -250,6 +250,24 @@ void x25519_public_key(uint8_t pub[32], const uint8_t priv[32]) {
     x25519(pub, priv, basepoint);
 }
 
-void x25519_shared_secret(uint8_t out[32], const uint8_t priv[32], const uint8_t peer_pub[32]) {
+// Constant-time all-zero test (no early exit: loop bound and memory
+// accesses are input-independent).
+static int secret_is_zero(const uint8_t s[32]) {
+    uint8_t acc = 0;
+    for (int i = 0; i < 32; i++) acc |= s[i];
+    return acc == 0;
+}
+
+// RFC 7748 §6.1: reject the all-zero shared secret (low-order peer
+// point). The rejection lives HERE, inside the primitive, so no caller
+// can forget it (cryptoholes P0). Returns 1 on success, 0 on rejection;
+// `out` is zeroed in both cases on the reject path (it already is zero,
+// made explicit so no stale stack data can leak into HKDF).
+int x25519_shared_secret(uint8_t out[32], const uint8_t priv[32], const uint8_t peer_pub[32]) {
     x25519(out, priv, peer_pub);
+    if (secret_is_zero(out)) {
+        for (int i = 0; i < 32; i++) out[i] = 0;
+        return 0;
+    }
+    return 1;
 }

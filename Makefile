@@ -51,7 +51,7 @@ DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o
              src/crypto/certverify.o src/rtc.o \
              src/net/tls_net.o
 
-.PHONY: all text desktop clean run debug host-tests host-tests-asan
+.PHONY: all text desktop clean run debug host-tests host-tests-asan diff-oracle diff-test tls-interop
 
 # ---- Host tests (no QEMU; run from repo root — suites load tests/fixtures/*) ----
 # Offline must-pass: tls_crypto, css, subres, pki, adversarial (fast -O2 build;
@@ -83,6 +83,19 @@ host-tests:
 host-tests-asan:
 	mkdir -p build-host
 	gcc -m32 -O1 -g -fsanitize=address,undefined -Isrc/crypto -Isrc -o build-host/t_adv_asan tests/test_adversarial.c $(HOST_CRYPTO_SRC) && timeout 590 ./build-host/t_adv_asan | tail -n 3
+
+# Independent differential: okernel primitives vs Python `cryptography`
+# (OpenSSL-backed — fully independent C code). X25519 (both directions +
+# low-order rejection agreement), SHA-256, HMAC, HKDF, ChaCha20-Poly1305
+# (enc/dec/tamper). Needs: python3-cryptography. Run after crypto changes.
+DIFF_ORACLE_SRC = src/crypto/sha256.c src/crypto/hmac.c src/crypto/hkdf.c \
+              src/crypto/aead.c src/crypto/chacha20.c src/crypto/poly1305.c \
+              src/crypto/x25519.c
+diff-oracle:
+	mkdir -p build-host
+	gcc -m32 -O2 -Isrc/crypto -o build-host/diff_oracle tests/differential/diff_oracle.c $(DIFF_ORACLE_SRC)
+diff-test: diff-oracle
+	python3 tests/differential/test_crypto_diff.py 200
 
 # Interop driver (manual): builds only — the run needs a local TLS 1.3
 # server on 127.0.0.1 (openssl s_server, python ssl, or TLS-Attacker).

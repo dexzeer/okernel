@@ -39,9 +39,10 @@ static void sha256_transform(sha256_ctx* ctx) {
     uint32_t W[64];
     uint32_t T1, T2;
 
-    // Message schedule (§6.2.2 step 1)
+    // Message schedule (§6.2.2 step 1). The (uint32_t) cast voices the
+    // narrowing the loop bound already proves (i in 0..15, so i*4 fits).
     for (int i = 0; i < 16; i++) {
-        uint32_t j = i * 4;
+        uint32_t j = (uint32_t)i * 4u;
         W[i] = ((uint32_t)ctx->buf[j] << 24) |
                ((uint32_t)ctx->buf[j+1] << 16) |
                ((uint32_t)ctx->buf[j+2] << 8) |
@@ -109,23 +110,24 @@ void sha256_final(sha256_ctx* ctx, uint8_t hash[SHA256_HASH_SIZE]) {
         ctx->buf_len = 0;
     }
     while (ctx->buf_len < 56) ctx->buf[ctx->buf_len++] = 0;
-    // Append 64-bit length in big-endian
+    // Append 64-bit length in big-endian. Each line is masked to 8 bits
+    // first — the (uint8_t) cast voices a narrowing the mask proves.
     uint64_t bits = ctx->total_bits;
-    ctx->buf[56] = (bits >> 56) & 0xFF;
-    ctx->buf[57] = (bits >> 48) & 0xFF;
-    ctx->buf[58] = (bits >> 40) & 0xFF;
-    ctx->buf[59] = (bits >> 32) & 0xFF;
-    ctx->buf[60] = (bits >> 24) & 0xFF;
-    ctx->buf[61] = (bits >> 16) & 0xFF;
-    ctx->buf[62] = (bits >> 8) & 0xFF;
-    ctx->buf[63] = bits & 0xFF;
+    ctx->buf[56] = (uint8_t)((bits >> 56) & 0xFF);
+    ctx->buf[57] = (uint8_t)((bits >> 48) & 0xFF);
+    ctx->buf[58] = (uint8_t)((bits >> 40) & 0xFF);
+    ctx->buf[59] = (uint8_t)((bits >> 32) & 0xFF);
+    ctx->buf[60] = (uint8_t)((bits >> 24) & 0xFF);
+    ctx->buf[61] = (uint8_t)((bits >> 16) & 0xFF);
+    ctx->buf[62] = (uint8_t)((bits >> 8) & 0xFF);
+    ctx->buf[63] = (uint8_t)(bits & 0xFF);
     sha256_transform(ctx);
-    // Output
+    // Output (mask-proven narrowings, cast voices the type — see above).
     for (int i = 0; i < 8; i++) {
-        hash[i * 4]     = (ctx->state[i] >> 24) & 0xFF;
-        hash[i * 4 + 1] = (ctx->state[i] >> 16) & 0xFF;
-        hash[i * 4 + 2] = (ctx->state[i] >> 8) & 0xFF;
-        hash[i * 4 + 3] = ctx->state[i] & 0xFF;
+        hash[i * 4]     = (uint8_t)((ctx->state[i] >> 24) & 0xFF);
+        hash[i * 4 + 1] = (uint8_t)((ctx->state[i] >> 16) & 0xFF);
+        hash[i * 4 + 2] = (uint8_t)((ctx->state[i] >> 8) & 0xFF);
+        hash[i * 4 + 3] = (uint8_t)(ctx->state[i] & 0xFF);
     }
 }
 

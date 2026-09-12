@@ -267,28 +267,34 @@ int main(void) {
     check("X25519 bob pub", pub, bob_pub_want, 32);
 
     uint8_t shared1[32], shared2[32];
-    x25519_shared_secret(shared1, alice_priv, bob_pub_want);
-    x25519_shared_secret(shared2, bob_priv, alice_pub_want);
+    // Primitive returns 1 on success (P0: rejection is inside the API).
+    int r1 = x25519_shared_secret(shared1, alice_priv, bob_pub_want);
+    int r2 = x25519_shared_secret(shared2, bob_priv, alice_pub_want);
     check("X25519 shared (A)", shared1, shared_want, 32);
     check("X25519 shared (B)", shared2, shared_want, 32);
+    {
+        int ok = (r1 == 1 && r2 == 1);
+        printf("%-28s %s\n", "X25519 shared returns 1", ok ? "PASS" : "FAIL");
+        if (!ok) fails++;
+    }
 
     // ---- X25519 low-order inputs (cryptoholes P0) ----
     // Clamped scalars are 0 mod 8, so every small-subgroup peer point
-    // (orders 1, 2, 4, 8 all divide 8) yields EXACTLY zero: the
-    // caller's all-zero rejection (shared_is_zero in tls_client.c)
-    // therefore covers the whole small subgroup, not just one case.
-    // These assert the primitive side (zero out); the caller side is
-    // covered by the handshake tests (zero shared → PROTO fail).
+    // (orders 1, 2, 4, 8 all divide 8) yields EXACTLY zero. The
+    // primitive itself rejects (returns 0) — no caller check to forget.
     {
         uint8_t zero[32], one[32], sc2[32], oo[32], zref[32];
         memset(zero, 0, 32);
         memset(one, 0, 32); one[0] = 1;
         memset(zref, 0, 32);
         for (int i = 0; i < 32; i++) sc2[i] = (uint8_t)(i * 3 + 1);
-        x25519_shared_secret(oo, sc2, zero);
+        int rz = x25519_shared_secret(oo, sc2, zero);
         check("X25519 low-order u=0 -> zero", oo, zref, 32);
-        x25519_shared_secret(oo, sc2, one);
+        int ro = x25519_shared_secret(oo, sc2, one);
         check("X25519 low-order u=1 -> zero", oo, zref, 32);
+        int ok = (rz == 0 && ro == 0);
+        printf("%-28s %s\n", "X25519 low-order returns 0", ok ? "PASS" : "FAIL");
+        if (!ok) fails++;
     }
 
     // ---- X25519 DH commutativity (cryptoholes P0 assurance) ----
@@ -309,8 +315,8 @@ int main(void) {
             }
             x25519_public_key(pa, a);
             x25519_public_key(pb, b);
-            x25519_shared_secret(s1, a, pb);
-            x25519_shared_secret(s2, b, pa);
+            if (!x25519_shared_secret(s1, a, pb)) ok = 0;
+            if (!x25519_shared_secret(s2, b, pa)) ok = 0;
             if (memcmp(s1, s2, 32) != 0) ok = 0;
             // shared secrets must be non-degenerate for random keys
             {
