@@ -3108,3 +3108,92 @@ review's list; MOCK_SH_SPLIT test), truncation completeness section
 green on the final tree (full HS x3, mutilations rejected,
 fragmentation). Resumption 3rd opinion still blocked (no session
 continuity in single workflows) — unchanged, documented previously.
+
+---
+
+## Cryptoholes round 4 disposition (2026-09-12, commit 1ea10d8)
+
+Fourth review (score 7.5/10, up from 6.5). Both Highs closed structurally;
+all P0 + P1 items done; P2 differential/fuzz are now permanent tooling.
+Adversarial 183/183 plain + ASan/UBSan, all host suites green, both ISOs
+link, sh_hello PASS, pyserver + TLS-Attacker (P-256/RSA full-HS) green.
+
+P0-1 — X25519 fail-closed API: DONE as prescribed. `x25519_shared_secret`
+now returns int (1 ok / 0 reject) with the constant-time zero test INSIDE
+the primitive (`secret_is_zero` in x25519.c); `shared_is_zero` removed
+from tls_client.c (no second path to forget). Reject path re-zeroes `out`.
+Tests assert rc==1 on vectors and rc==0 on u=0/u=1.
+
+P0-2 — hostname canonicalization: DONE as prescribed (one function,
+applied at every boundary). `tls_canon_host()` (lowercase + strip one
+FQDN dot + LDH label validation, ≤63 fail-closed instead of truncating
+into colliding cache keys; IPv4 passes through, IDNA/IPv6 rejected).
+Applied in: tls_state_init (st->host now points at struct-owned canonical
+buffer — also fixes the old caller-memory aliasing), tls_pin_check,
+pin store, tls_pin_import (re-normalizes legacy entries), tls_ticket_have,
+ticket_store (replaces silent truncation). SNI/cert/pin/ticket provably
+see one string. Plus: SNI omitted for empty hosts and IPv4 literals (RFC
+6066 §3); verify_host hook canonicalized; `tls_preload_selfcheck()`
+(self-test: a non-canonical preload entry would be a silent dead pin).
+28 new CHECKs incl. pin-slot equivalence (alias spellings hit ONE slot —
+changed-key-on-alias gives PIN-CHANGE -1, not a new slot), ticket
+case-equivalence after a real mock NST, 63-char boundary roundtrip.
+Found while testing: -Isrc shadows <string.h> with the kernel header
+(no strcmp in test TUs — used memcmp, matching file convention).
+
+P0-3 — full corpus + independent differential: DONE. RFC 7748 §5.2 already
+fully in-suite (Alice/Bob pubs + both shared directions); new permanent
+tool `tests/differential/` (oracle C program + Python driver, `make
+diff-oracle`/`make diff-test`): 200 random X25519 pairs × both directions
++ low-order u=0/u=1 (BOTH sides reject — ValueError vs rc 0: rejection
+agreement) + SHA-256/HMAC/HKDF/AEAD-enc-dec-tamper, all vs
+python-`cryptography` 41.0.7: DIFFERENTIAL PASS.
+
+RNG #6/#7: hw_present is now set BEFORE the hw sample can trigger a
+reseed (set-then-stir; also wipes the stack buffer on pull failure);
+rand.h split into PUBLIC vs TRUSTED-INTERNAL with the enumerated call-site
+audit (boot/desktop TIMER-ISR/keyboard/NIC/rand.c; no ring-3 exists to
+abuse classification) + removed a duplicated macro block (was missing
+RDSEED/NCLASS).
+
+Build #8: `secure_zero` moved from src/string.h to unconditional
+`src/crypto/memwipe.h` (works with or without -Isrc; proven with
+-Isrc/crypto only + -Werror=implicit-function-declaration).
+
+Build #9: ZERO -Wconversion/-Wsign-conversion across all 19 crypto TUs.
+Policy: external/length values get executable range checks (put_u16_ck
+emitter threading errors; plen/ct_len proofs); constant-bounded locals
+get explicit casts voicing a locally-visible bound. Also fixed two
+latent issues the pass exposed: ticket_host_eq rewritten with an explicit
+bound (old ternary form newly tripped -Warray-bounds; equivalent on all
+reachable inputs) and two maybe-uninitialized `t` reads in reassembly
+debug prints (zero-init; the warning surfaced only after unrelated edits
+moved the optimizer).
+
+P1-4/5 — HTTP framing: DONE beyond the letter. `http_parse_framing()`
+(RFC 9112 §5 line grammar, exact-name match only) feeds BOTH
+tls_response_complete AND http_dechunk (net/network.c) — one parser, zero
+differentials by construction. The consumer fix was REQUIRED, not
+optional: okai sub-resources call http_dechunk with no completeness gate,
+and its old "chunked"-substring sniff would dechunk a CL body whose
+headers merely mentioned chunked (corruption when the body led with hex).
+Policy: identical dup-CL ok / distinct dup-CL malformed / TE+CL malformed
+/ TE-without-chunked-final close-delimited (UNKNOWN, strip-only —
+agreement without breaking exotic servers) / structural malformations
+fail closed (SHORT; strip-only at consumer). 20 new gate CHECKs + 4000-
+round deterministic soup fuzz (P2-10) asserting determinism, verdict
+coverage, and gate/parser agreement (COMPLETE+CL ⇒ body covers length),
+all under ASan.
+
+P2-8/9/11: differential + fuzz + asm-verification are now committed
+tooling/tests rather than one-off runs (asm re-verified round 3;
+X25519 return-type change doesn't alter the ladder/codegen).
+
+Self-inflicted note: ran `pkill -f srv_bundle` once and matched my own
+shell (the documented suicide) — recovered by PID, no harm; the rule
+stands.
+
+Open (unchanged, still documented): OpenSSL-PSK-decline quirk, CT
+verification deferred, HTTP/2 future, TLS-Attacker resumption continuity
+(no session continuity in single workflows — P-384/mutilation/fragment
+battery from round 3 stands on untouched parse paths).
