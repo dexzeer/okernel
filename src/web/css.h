@@ -211,6 +211,9 @@ void css_resolve_url(const char* base, const char* rel, int rlen, char* out, int
 // Stats for diagnostics.
 void css_stats(const struct wstyleset* ss, int* rules, int* styles, int* sheets);
 
+// Anonymous-box style: initial values + parent's inherited properties.
+void css_anon_style(const struct wstyle* parent, int display, struct wstyle* out);
+
 // ---- colors --------------------------------------------------------------------
 // Parse a CSS color string; returns 1 and ARGB on success.
 int  css_parse_color(const char* s, int len, uint32_t* argb);

@@ -404,3 +404,18 @@ Older, fully-resolved narratives were collapsed. Newest first.
 2. **Sub-resource CSS fidelity:** the 128KB `OKAI_CSS_TEXT` truncates large bundles, and the `http_dechunk`-on-TLS length is bogus (682KB logged for a 210KB sheet) — investigate the length computation.
 3. **Re-run headless suites** (`test_links.py`, `test_link_local.py`, `test_errors.py`, `test_google.py`, `test_nav.py`) after the renderer changes.
 4. **Deferred (unchanged):** CT/SCT verification, HTTP/2, OpenSSL-PSK inquiry, broader CSS (pseudo-classes, gradients), CJK fonts.
+
+---
+
+## WIP 2026-10-06 — new web engine (src/web/), renderer rewrite phases 0-5
+
+Done + tested (host): Phase 0 kernel heap (real free/coalesce, RAM-sized, PSE high alias, QEMU -m 512; boot-tested 128MB+512MB);
+fonts (TrueType rasterizer + Noto subsets, tests/web/test_font.c); HTML5 parser (85/85 trees == html5lib incl. 17 real sites,
+tests/web/html5_diff.py); CSS engine (54/54 unit tests, corpus clean under ASan, tests/web/test_css.c); URL resolver.
+Corpus: `python3 tools/fetch_corpus.py` (not committed).
+
+In progress: layout. Written but NOT yet compiled: src/web/layout.h, lay_int.h, lay_tree.c, lay_main.c.
+Still to write: lay_inline.c (IFC/line breaking), lay_flex.c, lay_grid.c, lay_table.c, lay_dl.c (display list),
+paint.c, wdoc.c (doc controller), image decoders (inflate/PNG/JPEG/GIF) + gzip, okai/desktop integration
+(page surface blit in okai_paint_overlays, pixel hit-testing), Makefile wiring, headless QEMU verification.
+None of src/web is linked into the kernel yet; the shipped browser is unchanged.
