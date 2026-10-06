@@ -24,6 +24,7 @@
 #define WNF_REMOVED   0x02   // detached by script
 #define WNF_FOCUSED   0x04   // form control has keyboard focus (UI state)
 #define WNF_HOVER     0x08
+#define WNF_FOCUS_WITHIN 0x10 // self or a descendant has focus
 
 struct wnode {
     uint8_t  type;

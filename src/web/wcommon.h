@@ -62,6 +62,22 @@ static inline int w_ieq(const char* s, int n, const char* lit) {
         if (w_lower((unsigned char)s[i]) != lit[i]) return 0;
     return i == n && lit[i] == 0;
 }
+// strstr (the kernel's freestanding libc has none)
+static inline const char* w_strstr(const char* h, const char* n) {
+    if (!*n) return h;
+    for (; *h; h++) {
+        int i = 0;
+        while (n[i] && h[i] == n[i]) i++;
+        if (!n[i]) return h;
+    }
+    return 0;
+}
+
+static inline int w_ieq_n(const char* a, const char* b, int n) {
+    for (int i = 0; i < n; i++)
+        if (w_lower((unsigned char)a[i]) != w_lower((unsigned char)b[i])) return 0;
+    return 1;
+}
 static inline int w_ieq_prefix(const char* s, int n, const char* lit) {
     int i = 0;
     for (; lit[i]; i++)
@@ -81,6 +97,20 @@ static inline int32_t w_muldiv(int32_t a, int32_t b, int32_t d) {
     if (hi >= ud) return neg ? INT32_MIN + 1 : INT32_MAX; // overflow: saturate
     __asm__("divl %4" : "=a"(q), "=d"(r) : "a"(lo), "d"(hi), "rm"(ud));
     (void)r;
+    return neg ? -(int32_t)q : (int32_t)q;
+}
+
+// Signed 64/32 division without libgcc; d > 0. Saturates when the quotient
+// does not fit in int32.
+static inline int32_t w_div64(int64_t num, int32_t d) {
+    int neg = 0;
+    if (num < 0) { num = -num; neg = 1; }
+    uint64_t u = (uint64_t)num;
+    uint32_t hi = (uint32_t)(u >> 32), lo = (uint32_t)u, q, r;
+    if (hi >= (uint32_t)d) return neg ? INT32_MIN + 1 : INT32_MAX;
+    __asm__("divl %4" : "=a"(q), "=d"(r) : "a"(lo), "d"(hi), "rm"((uint32_t)d));
+    (void)r;
+    if (q > 0x7FFFFFFFu) return neg ? INT32_MIN + 1 : INT32_MAX;
     return neg ? -(int32_t)q : (int32_t)q;
 }
 
