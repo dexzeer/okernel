@@ -202,8 +202,8 @@ static int32_t atan2_deg(int32_t y, int32_t x) {
     if (x == 0 && y == 0) return 0;
     int64_t len = isqrt64((uint64_t)((int64_t)x * x + (int64_t)y * y));
     if (!len) return 0;
-    int32_t sn = w_div64((int64_t)y << 16, (int32_t)len);
-    int32_t cs = w_div64((int64_t)x << 16, (int32_t)len);
+    int32_t sn = w_div64((int64_t)y * 65536, (int32_t)len);
+    int32_t cs = w_div64((int64_t)x * 65536, (int32_t)len);
     // search the sin table
     int best = 0;
     int32_t bd = INT32_MAX;
@@ -229,16 +229,16 @@ static void pb_arc(struct pbuf* p, int32_t x0, int32_t y0, int32_t rx, int32_t r
     int32_t dx2 = (x0 - x) / 2, dy2 = (y0 - y) / 2;
     int32_t x1p = fmul(cp, dx2) + fmul(sp, dy2);
     int32_t y1p = -fmul(sp, dx2) + fmul(cp, dy2);
-    int32_t X = w_div64((int64_t)x1p << 16, rx);
-    int32_t Y = w_div64((int64_t)y1p << 16, ry);
+    int32_t X = w_div64((int64_t)x1p * 65536, rx);
+    int32_t Y = w_div64((int64_t)y1p * 65536, ry);
     int32_t dd = fmul(X, X) + fmul(Y, Y);
     if (dd > 65536) {
         // radii too small: scale them up so the arc just fits
         int32_t sq = (int32_t)isqrt64((uint64_t)dd << 16);
         rx = fmul(rx, sq);
         ry = fmul(ry, sq);
-        X = w_div64((int64_t)X << 16, sq);
-        Y = w_div64((int64_t)Y << 16, sq);
+        X = w_div64((int64_t)X * 65536, sq);
+        Y = w_div64((int64_t)Y * 65536, sq);
         dd = 65536;
     }
     if (dd <= 0) { pb_point(p, x, y, 0); return; }
@@ -677,8 +677,8 @@ void wsvg_paint(struct wsurf* s, struct wdom* d, const struct wstyleset* ss, int
     if (node < 0 || w <= 0 || h <= 0) return;
     // viewBox -> viewport (xMidYMid meet)
     struct mat m = mat_id();
-    m.e = x << 16;
-    m.f = y << 16;
+    m.e = x * 65536;
+    m.f = y * 65536;
     int vl;
     const char* vb = wdom_attr(d, node, A_viewbox, &vl);
     int32_t v4[4];

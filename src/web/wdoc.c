@@ -7,6 +7,7 @@
 #include "image.h"
 #include "wurl.h"
 #include "wcommon.h"
+#include "css_int.h"
 
 enum { RES_CSS, RES_IMG };
 enum { RS_PENDING, RS_INFLIGHT, RS_DONE, RS_FAILED };
@@ -24,6 +25,7 @@ struct wres {
 
 struct wdimg {
     int w, h;
+    int svg_scale;          // rendered at N x the intrinsic size (crisper)
     uint32_t* px;
     int state;              // 0 pending, 1 ok, 2 failed
     int res;
@@ -138,10 +140,120 @@ static int res_add(struct wdoc* d, const char* url, int kind, int32_t order, con
     return d->nres++;
 }
 
+// ---- SVG documents as images ------------------------------------------------------
+
+static int looks_svg(const char* b, int len) {
+    int n = len < 1024 ? len : 1024;
+    for (int i = 0; i + 4 <= n; i++)
+        if (b[i] == '<' && (b[i + 1] == 's' || b[i + 1] == 'S') && w_ieq_prefix(b + i + 1, n - i - 1, "svg")) return 1;
+    return 0;
+}
+
+static int32_t svg_len_attr(struct wdom* dom, int el, int atom) {
+    int vl;
+    const char* v = wdom_attr(dom, el, atom, &vl);
+    if (!v) return -1;
+    int32_t m; int u;
+    if (!cv_number(v, vl, &m, &u) || m <= 0) return -1;
+    if (u < vl && v[u] == '%') return -1;
+    return m / 1000;
+}
+
+// Rasterize an SVG file into straight ARGB (alpha recovered by rendering on
+// black and on white).
+static int svg_to_image(const char* bytes, int len, int* W, int* H, uint32_t** out) {
+    struct wdom* dom = whtml_parse(bytes, len, "utf-8");
+    if (!dom) return 0;
+    int root = -1;
+    for (int i = dom->n[0].first; i >= 0; i = wdom_next(dom, i, 0))
+        if (dom->n[i].type == WN_ELEM && dom->n[i].ns == NS_SVG && dom->n[i].tag == T_svg) { root = i; break; }
+    if (root < 0) { wdom_free(dom); return 0; }
+    int32_t w = svg_len_attr(dom, root, A_width), h = svg_len_attr(dom, root, A_height);
+    int vl;
+    const char* vb = wdom_attr(dom, root, A_viewbox, &vl);
+    int32_t vw = 0, vh = 0;
+    if (vb) {
+        int32_t v[4]; int k = 0, pos = 0;
+        while (k < 4 && pos < vl) {
+            while (pos < vl && (vb[pos] == ' ' || vb[pos] == ',')) pos++;
+            int32_t m; int u;
+            if (!cv_number(vb + pos, vl - pos, &m, &u)) break;
+            v[k++] = m;
+            pos += u;
+        }
+        if (k == 4) { vw = v[2] / 1000; vh = v[3] / 1000; }
+    }
+    if (w <= 0 && h <= 0) { w = vw > 0 ? vw : 300; h = vh > 0 ? vh : 150; }
+    else if (w <= 0) w = (vw > 0 && vh > 0) ? h * vw / vh : h;
+    else if (h <= 0) h = (vw > 0 && vh > 0) ? w * vh / vw : w;
+    // render small icons at 2x for crisper downscaling, cap large ones
+    int scale = (w < 128 && h < 128) ? 2 : 1;
+    int RW = w * scale, RH = h * scale;
+    while (RW > 1024 || RH > 1024) { RW /= 2; RH /= 2; }
+    if (RW < 1) RW = 1;
+    if (RH < 1) RH = 1;
+    struct wstyleset* ss = css_set_new(dom);
+    if (!ss) { wdom_free(dom); return 0; }
+    // <style> elements inside the SVG
+    for (int i = dom->n[0].first; i >= 0; i = wdom_next(dom, i, 0)) {
+        if (dom->n[i].type != WN_ELEM || dom->n[i].tag != T_style) continue;
+        char buf[16384];
+        int n = wdom_text_content(dom, i, buf, sizeof buf);
+        css_set_add_sheet(ss, buf, n, "", -1);
+    }
+    css_compute_all(ss, RW, RH);
+    uint32_t* black = (uint32_t*)w_malloc((size_t)RW * RH * 4);
+    uint32_t* white = (uint32_t*)w_malloc((size_t)RW * RH * 4);
+    if (!black || !white) { w_free(black); w_free(white); css_set_free(ss); wdom_free(dom); return 0; }
+    struct wsurf sf;
+    sf.w = RW; sf.h = RH; sf.stride = RW;
+    sf.px = black;
+    ws_reset_clip(&sf);
+    for (int i = 0; i < RW * RH; i++) black[i] = 0;
+    wsvg_paint(&sf, dom, ss, root, 0, 0, RW, RH, 0xFF000000, 255);
+    sf.px = white;
+    ws_reset_clip(&sf);
+    for (int i = 0; i < RW * RH; i++) white[i] = 0xFFFFFF;
+    wsvg_paint(&sf, dom, ss, root, 0, 0, RW, RH, 0xFF000000, 255);
+    for (int i = 0; i < RW * RH; i++) {
+        uint32_t b = black[i], wh = white[i];
+        int a = 255 - (int)(((wh >> 8) & 255) - ((b >> 8) & 255));
+        if (a < 0) a = 0;
+        if (a > 255) a = 255;
+        uint32_t px = 0;
+        if (a) {
+            int r = ((b >> 16) & 255) * 255 / a, g = ((b >> 8) & 255) * 255 / a, bl = (b & 255) * 255 / a;
+            if (r > 255) r = 255;
+            if (g > 255) g = 255;
+            if (bl > 255) bl = 255;
+            px = ((uint32_t)a << 24) | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)bl;
+        }
+        black[i] = px;
+    }
+    w_free(white);
+    css_set_free(ss);
+    wdom_free(dom);
+    *W = RW / scale > 0 ? RW : RW;
+    *H = RH;
+    *out = black;
+    return scale;
+}
+
 static void img_decode_into(struct wdoc* d, int slot, const char* bytes, int len) {
     struct wdimg* im = &d->img[slot];
     int w = 0, h = 0;
     uint32_t* px = 0;
+    if (len > 0 && looks_svg(bytes, len)) {
+        int sc = svg_to_image(bytes, len, &w, &h, &px);
+        if (sc) {
+            im->px = px;
+            im->w = w;
+            im->h = h;
+            im->svg_scale = sc;
+            im->state = 1;
+        } else im->state = 2;
+        return;
+    }
     if (len > 0 && wimage_decode((const uint8_t*)bytes, len, MAX_IMG_DIM, &w, &h, &px)) {
         im->w = w;
         im->h = h;
@@ -176,18 +288,12 @@ static int img_slot(struct wdoc* d, const char* url) {
         char mime[64];
         char* bytes = wdoc_data_url(url, (int)strlen(url), &bl, mime, sizeof mime);
         if (bytes) {
-            if (w_strstr(mime, "svg")) im->state = 2; // svg images: not rendered as <img>
-            else img_decode_into(d, slot, bytes, bl);
+            img_decode_into(d, slot, bytes, bl);
             w_free(bytes);
         } else im->state = 2;
     } else if (w_ieq_prefix(url, n, "http:") || w_ieq_prefix(url, n, "https:")) {
-        // svg files as <img>: unsupported (no standalone svg document renderer)
-        int sv = n > 4 && w_ieq(url + n - 4, 4, ".svg");
-        if (sv) im->state = 2;
-        else {
-            int r = res_add(d, url, RES_IMG, 0, 0, 0);
-            if (r >= 0) { d->res[r].img = slot; d->img[slot].res = r; }
-        }
+        int r = res_add(d, url, RES_IMG, 0, 0, 0);
+        if (r >= 0) { d->res[r].img = slot; d->img[slot].res = r; }
     } else im->state = 2;
     return slot;
 }
@@ -233,7 +339,11 @@ static int lay_img_node(void* ctx, int node, int* w, int* h) {
     if (node < 0 || node >= d->d->nn || !d->node_img) return -1;
     int slot = d->node_img[node];
     if (slot < 0) return -1;
-    if (d->img[slot].state == 1) { *w = d->img[slot].w; *h = d->img[slot].h; }
+    if (d->img[slot].state == 1) {
+        int sc = d->img[slot].svg_scale > 0 ? d->img[slot].svg_scale : 1;
+        *w = d->img[slot].w / sc;
+        *h = d->img[slot].h / sc;
+    }
     return slot;
 }
 
@@ -242,7 +352,11 @@ static int lay_img_url(void* ctx, const char* url, int* w, int* h) {
     *w = *h = 0;
     int slot = img_slot(d, url);
     if (slot < 0) return -1;
-    if (d->img[slot].state == 1) { *w = d->img[slot].w; *h = d->img[slot].h; }
+    if (d->img[slot].state == 1) {
+        int sc = d->img[slot].svg_scale > 0 ? d->img[slot].svg_scale : 1;
+        *w = d->img[slot].w / sc;
+        *h = d->img[slot].h / sc;
+    }
     return slot;
 }
 
