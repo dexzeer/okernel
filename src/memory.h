@@ -13,8 +13,13 @@ uint32_t pmm_get_total_pages(void);
 uint32_t pmm_get_used_pages(void);
 uint32_t pmm_get_free_pages(void);
 
-// Simple kernel heap allocator
+// Kernel heap (segregated fit, coalescing, 16-byte aligned, IRQ-safe).
+// kfree/krealloc validate the block; bad or double frees are logged and
+// ignored.
 void* kmalloc(uint32_t size);
+void* kcalloc(uint32_t n, uint32_t size);
+void* krealloc(void* ptr, uint32_t size);
 void kfree(void* ptr);
+void heap_stats(uint32_t* total, uint32_t* used, uint32_t* peak, uint32_t* largest_free);
 
 #endif

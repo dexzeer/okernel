@@ -45,7 +45,7 @@ class OkVM:
             try: os.unlink(f)
             except FileNotFoundError: pass
 
-        cmd = ["qemu-system-i386", "-cdrom", ISO, "-boot", "d", "-vga", "std",
+        cmd = ["qemu-system-i386", "-m", os.environ.get("OKVM_MEM", "512"), "-cdrom", ISO, "-boot", "d", "-vga", "std",
                "-serial", f"file:{self.LOG}", "-display", "none",
                "-monitor", f"unix:{self.SOCK},server,nowait", "-no-reboot"]
         if extra_net:  # e1000 + SLIRP user networking (10.0.2.x)

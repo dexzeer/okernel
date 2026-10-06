@@ -917,6 +917,13 @@ static void shell_execute(int win_id, const char* input) {
         put_uint(buf, total); window_puts(win_id, "  Total: "); window_puts(win_id, buf); window_puts(win_id, " MB\n");
         put_uint(buf, used);  window_puts(win_id, "  Used:  "); window_puts(win_id, buf); window_puts(win_id, " MB\n");
         put_uint(buf, free);  window_puts(win_id, "  Free:  "); window_puts(win_id, buf); window_puts(win_id, " MB\n");
+        uint32_t ht, hu, hp, hl;
+        heap_stats(&ht, &hu, &hp, &hl);
+        window_puts(win_id, "Kernel heap:\n");
+        put_uint(buf, ht >> 20); window_puts(win_id, "  Size:  "); window_puts(win_id, buf); window_puts(win_id, " MB\n");
+        put_uint(buf, hu >> 10); window_puts(win_id, "  Used:  "); window_puts(win_id, buf); window_puts(win_id, " KB\n");
+        put_uint(buf, hp >> 10); window_puts(win_id, "  Peak:  "); window_puts(win_id, buf); window_puts(win_id, " KB\n");
+        put_uint(buf, hl >> 10); window_puts(win_id, "  Largest free: "); window_puts(win_id, buf); window_puts(win_id, " KB\n");
     }
     else if (str_eq(cmd_buf, "uptime")) {
         uint32_t seconds = tick_count / 100;

@@ -31,6 +31,9 @@ static void map_4mb_at(uint32_t phys_base, uint32_t pd_index, uint32_t flags) {
     pt_count++;
 }
 
+// Kernel MMIO window (paging_map): 16 x 4MB above the RAM alias.
+#define MMIO_VBASE_HI 0xF8000000u
+
 static void map_4mb_high(uint32_t phys_base) {
     map_4mb_at(phys_base, PD_KERNEL_BASE + ((phys_base >> 22) & 0x3F), 0x03);
 }
@@ -53,6 +56,26 @@ void paging_init(uint32_t framebuffer_addr) {
             pt_count++;
         }
         map_4mb_high(addr);
+    }
+
+    // RAM above 128M: high alias only, as 4MB PSE pages (no page tables —
+    // these PDEs are never walked by the 4K-PT helpers, which only touch the
+    // user half). The alias ends below the MMIO window (0xF8000000) and below
+    // an identity-mapped framebuffer that might sit in the high range.
+    {
+        uint32_t ram = pmm_get_total_pages() * 4096u;
+        uint32_t lim = MMIO_VBASE_HI - KERNEL_VBASE;
+        if (framebuffer_addr >= KERNEL_VBASE &&
+            (framebuffer_addr & 0xFFC00000) - KERNEL_VBASE < lim)
+            lim = (framebuffer_addr & 0xFFC00000) - KERNEL_VBASE;
+        if (ram > lim) ram = lim;
+        uint32_t cr4;
+        __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= 0x10; // PSE
+        __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
+        for (uint32_t addr = 0x08000000; addr + 0x00400000 <= ram; addr += 0x00400000)
+            page_directory[PD_KERNEL_BASE + (addr >> 22)] = addr | 0x83; // P|RW|PS
+        serial_printf("[paging] high alias covers %u MB\n", ram >> 20);
     }
 
     // Map framebuffer (typically 0xFD000000, ~8.3MB for 1920x1080x32).
@@ -81,7 +104,7 @@ void paging_init(uint32_t framebuffer_addr) {
 
 // Map a 4MB phys region into the kernel high MMIO window (0xC8000000+) and
 // return its HIGH virtual address. Never returns phys.
-#define MMIO_VBASE 0xC8000000u
+#define MMIO_VBASE MMIO_VBASE_HI
 static uint32_t mmio_next = MMIO_VBASE;
 
 void* paging_map(uint32_t phys_addr) {
@@ -94,7 +117,7 @@ void* paging_map(uint32_t phys_addr) {
         if ((pt[0] & 0xFFC00000) == base)
             return (void*)(v + off);
     }
-    if (mmio_next + 0x00400000 > 0xC8000000u + 16 * 0x00400000) return 0;
+    if (mmio_next + 0x00400000 > MMIO_VBASE + 16 * 0x00400000) return 0;
     uint32_t vbase = mmio_next;
     map_4mb_at(base, vbase >> 22, 0x03);
     mmio_next += 0x00400000;
