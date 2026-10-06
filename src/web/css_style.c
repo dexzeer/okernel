@@ -2615,3 +2615,17 @@ const struct wstyle* css_pseudo_of(const struct wstyleset* ss, int node, int whi
     int32_t i = ss->node_pseudo[node * 3 + which - 1];
     return i >= 0 ? &ss->styles[i] : 0;
 }
+
+// Style for an anonymous box: initial values + the parent's inherited ones.
+void css_anon_style(const struct wstyle* parent, int display, struct wstyle* out) {
+    if (!initial_ready) initial_init();
+    memcpy(out, &initial, sizeof *out);
+    if (parent) {
+        for (int p = 1; p < P_COUNT; p++) if (inherited_prop(p)) copy_prop(out, parent, p);
+        out->lh_factor = parent->lh_factor;
+        out->vars = parent->vars;
+        out->deco_inh = parent->deco_inh | parent->deco_line;
+        out->deco_inh_color = parent->deco_line ? parent->deco_color : parent->deco_inh_color;
+    }
+    out->display = (uint8_t)display;
+}
