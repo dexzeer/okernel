@@ -110,5 +110,26 @@ def main():
         print('fetch', n)
         fetch_site(n, SITES[n])
 
-if __name__ == '__main__':
+
+# manifest.tsv (url \t file) for the C test harnesses
+def write_tsv(name):
+    d = os.path.join('tests', 'web', 'corpus', name)
+    try:
+        m = json.load(open(os.path.join(d, 'manifest.json')))
+    except Exception:
+        return
+    with open(os.path.join(d, 'manifest.tsv'), 'w') as f:
+        for u, v in m.items():
+            if u == '__page__':
+                f.write('PAGE\t%s\t%s\n' % (v['url'], v['file']))
+            else:
+                f.write('%s\t%s\t%s\n' % (u, v['file'], v.get('type', '')))
+
+if __name__ == '__main__' and len(sys.argv) > 1 and sys.argv[1] == '--tsv':
+    for n in os.listdir(os.path.join('tests', 'web', 'corpus')):
+        write_tsv(n)
+
+if __name__ == '__main__' and not (len(sys.argv) > 1 and sys.argv[1] == '--tsv'):
     main()
+    for n in (sys.argv[1:] or list(SITES)):
+        write_tsv(n)
