@@ -383,7 +383,7 @@ int wr_fill(struct wraster* r, int x0, int y0, int x1, int y1, int evenodd,
             int first = -1, last = -1;
             for (int xx = 0; xx < bw; xx++) {
                 acc += cv[xx];
-                int32_t a = ((acc << 9) - ar[xx]) >> 9;
+                int32_t a = ((acc * 512) - ar[xx]) / 512;
                 if (a < 0) a = -a;
                 if (evenodd) {
                     a &= 511;

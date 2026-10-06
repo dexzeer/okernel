@@ -51,14 +51,14 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
     for (int c = fb->first; c >= 0; c = L->b[c].next) total++;
     if (total > MAXFI) total = MAXFI;
     // per-call scratch (flex containers nest): items + order + per-line arrays
-    size_t need = (size_t)(total + 1) * (sizeof(struct fitem) + 5 * sizeof(int32_t));
+    size_t need = (size_t)(total + 2) * (sizeof(struct fitem) + 5 * sizeof(int32_t));
     char* scratch = (char*)w_malloc(need);
     if (!scratch) { *content_h = 0; return; }
     struct fitem* items = (struct fitem*)scratch;
-    int* order = (int*)(items + total + 1);
-    int* line_start = order + total + 1;
-    int32_t* line_cross = line_start + total + 1;
-    int32_t* line_off = line_cross + total + 1;
+    int* order = (int*)(items + total + 2);
+    int* line_start = order + total + 2;
+    int32_t* line_cross = line_start + total + 2;
+    int32_t* line_off = line_cross + total + 2;
     int n = 0;
     for (int c = fb->first; c >= 0; c = L->b[c].next) {
         struct lbox* cb = &L->b[c];

@@ -232,7 +232,12 @@ void wfont_metrics(const struct wfont* f, struct wfmetrics* m) {
 
 // Width (LU) of codepoints with no outline: CJK bitmaps are square (1em),
 // everything else draws a tofu box 0.6em wide.
+static int is_pua(uint32_t cp) {
+    return (cp >= 0xE000 && cp <= 0xF8FF) || cp >= 0xF0000;
+}
+
 static int32_t missing_adv(int px, uint32_t cp) {
+    if (is_pua(cp)) return 0; // icon-font glyphs: invisible without the webfont
     if (cjk_glyph_for(cp)) return PX(px);
     return PX(px) * 6 / 10;
 }
@@ -602,7 +607,7 @@ int32_t wfont_draw(struct wsurf* s, const struct wfont* f, int32_t x, int32_t y,
         int r = resolve(fi, cp, &gid);
         int32_t adv;
         if (r < 0) {
-            if (is_zero_width(cp)) continue;
+            if (is_zero_width(cp) || is_pua(cp)) continue;
             const uint8_t* bits = cjk_glyph_for(cp);
             int pxx = LU_FLOOR(pen);
             if (bits) draw_cjk(s, pxx, base_y, px, bits, argb);
