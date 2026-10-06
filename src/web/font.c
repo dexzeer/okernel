@@ -507,7 +507,7 @@ static struct gent* glyph_get(int fi, int synth, int px, uint32_t gid, int phase
     if (!e) return 0;
     e->key = key; e->w = (int16_t)w; e->h = (int16_t)hh;
     e->left = (int16_t)left; e->top = (int16_t)top;
-    if (w * hh) {
+    if (w > 0 && hh > 0) {
         memset(e->bm, 0, (size_t)(w * hh));
         if (!g_r_init) { wr_init(&g_r); g_r_init = 1; }
         if (!gamma_ready) gamma_init();

@@ -671,8 +671,8 @@ static const struct kw KW_BSTYLE[] = {
 };
 static const struct kw KW_TALIGN[] = {
     {"start", TA_START}, {"left", TA_LEFT}, {"right", TA_RIGHT}, {"center", TA_CENTER},
-    {"justify", TA_JUSTIFY}, {"end", TA_END}, {"-webkit-center", TA_CENTER},
-    {"-moz-center", TA_CENTER}, {"-webkit-left", TA_LEFT}, {"-webkit-right", TA_RIGHT},
+    {"justify", TA_JUSTIFY}, {"end", TA_END}, {"-webkit-center", TA_WEBKIT_CENTER},
+    {"-moz-center", TA_WEBKIT_CENTER}, {"-webkit-left", TA_LEFT}, {"-webkit-right", TA_RIGHT},
     {"-moz-left", TA_LEFT}, {"-moz-right", TA_RIGHT}, {"match-parent", TA_START},
     {"-webkit-match-parent", TA_START}, {"justify-all", TA_JUSTIFY}, {0, 0}
 };
@@ -1321,6 +1321,62 @@ static void logical_pair(struct dctx* c, int p_start, int p_end, const char* s, 
     emit_len(c, p_end, b, bl, flags);
 }
 
+// grid-template / grid: "<rows> / <columns>" or the ASCII-art form
+// "'a a' 40px 'b c' 1fr / 1fr 2fr"; "none" resets all three.
+static void grid_template_sh(struct dctx* c, const char* s, int len) {
+    const char* t = s; int tl = len;
+    cv_trim(&t, &tl);
+    if (w_ieq(t, tl, "none")) {
+        emit_raw(c, P_GRID_TEMPLATE_ROWS, "none", 4);
+        emit_raw(c, P_GRID_TEMPLATE_COLUMNS, "none", 4);
+        emit_raw(c, P_GRID_TEMPLATE_AREAS, "none", 4);
+        return;
+    }
+    // top-level slash
+    int slash = -1, depth = 0;
+    for (int i = 0; i < tl; i++) {
+        char ch = t[i];
+        if (ch == '"' || ch == '\'') { char q = ch; i++; while (i < tl && t[i] != q) i++; continue; }
+        if (ch == '(') depth++;
+        else if (ch == ')') depth--;
+        else if (ch == '/' && !depth) { slash = i; break; }
+    }
+    const char* rows = t; int rl = slash >= 0 ? slash : tl;
+    const char* cols = slash >= 0 ? t + slash + 1 : "none"; int cl = slash >= 0 ? tl - slash - 1 : 4;
+    // auto-flow forms of the "grid" shorthand: ignore the flow keyword part
+    if (w_ieq_prefix(rows, rl, "auto-flow") || w_ieq_prefix(cols, cl, " auto-flow")) return;
+    int has_str = 0;
+    for (int i = 0; i < rl; i++) if (rows[i] == '"' || rows[i] == '\'') has_str = 1;
+    if (has_str) {
+        // split strings (areas) from row sizes
+        char areas[1024], sizes[512];
+        int na = 0, ns = 0;
+        int i = 0;
+        while (i < rl) {
+            if (rows[i] == '"' || rows[i] == '\'') {
+                char q = rows[i];
+                int st = i;
+                i++;
+                while (i < rl && rows[i] != q) i++;
+                i++;
+                if (na + (i - st) + 1 < (int)sizeof areas) { memcpy(areas + na, rows + st, i - st); na += i - st; areas[na++] = ' '; }
+                continue;
+            }
+            if (ns < (int)sizeof sizes - 1) sizes[ns++] = rows[i];
+            i++;
+        }
+        emit_raw(c, P_GRID_TEMPLATE_AREAS, areas, na);
+        int all_ws = 1;
+        for (int k = 0; k < ns; k++) if (!w_isspace((unsigned char)sizes[k])) all_ws = 0;
+        if (all_ws) emit_raw(c, P_GRID_TEMPLATE_ROWS, "none", 4);
+        else emit_raw(c, P_GRID_TEMPLATE_ROWS, sizes, ns);
+    } else {
+        emit_raw(c, P_GRID_TEMPLATE_ROWS, rows, rl);
+        emit_raw(c, P_GRID_TEMPLATE_AREAS, "none", 4);
+    }
+    emit_raw(c, P_GRID_TEMPLATE_COLUMNS, cols, cl);
+}
+
 static int has_var(const char* s, int len) {
     for (int i = 0; i + 4 <= len; i++)
         if ((s[i] == 'v' || s[i] == 'V') && w_ieq_prefix(s + i, len - i, "var(")) return 1;
@@ -1335,7 +1391,7 @@ enum {
     H_BORDER_SIDE, H_BWIDTH, H_FONT, H_FWEIGHT, H_FSIZE, H_LHEIGHT, H_FLEX, H_GRIDPAIR,
     H_GRIDAREA, H_BG, H_DECO, H_DECOLINE, H_LIST, H_GAP, H_PLACE, H_OVERFLOW, H_RADIUS,
     H_RADIUS1, H_BSPACING, H_WS, H_LOGICAL, H_ZINDEX, H_ORDER, H_BGCOLOR, H_OUTLINE,
-    H_FLEXFLOW, H_INSET, H_LSTYPE, H_IGNORE
+    H_FLEXFLOW, H_INSET, H_LSTYPE, H_IGNORE, H_GRIDTEMPLATE
 };
 
 struct propdef {
@@ -1563,6 +1619,13 @@ static const struct propdef PROPS[] = {
     {"fill", H_RAW, P_FILL, 0, 0, 0},
     {"stroke", H_RAW, P_STROKE, 0, 0, 0},
     {"stroke-width", H_LEN, P_STROKE_WIDTH, 0, 16, 0},
+    {"mask-image", H_RAW, P_MASK, 0, 0, 0},
+    {"-webkit-mask-image", H_RAW, P_MASK, 0, 0, 0},
+    {"mask", H_RAW, P_MASK, 0, 0, 0},
+    {"-webkit-mask", H_RAW, P_MASK, 0, 0, 0},
+    {"-webkit-mask-box-image", H_RAW, P_MASK, 0, 0, 0},
+    {"grid-template", H_GRIDTEMPLATE, 0, 0, 0, 0},
+    {"grid", H_GRIDTEMPLATE, 0, 0, 0, 0},
     {0, 0, 0, 0, 0, 0}
 };
 
@@ -1695,6 +1758,7 @@ static int apply_prop(struct dctx* c, const struct propdef* pd, const char* v, i
     case H_WS: white_space(c, v, vl); break;
     case H_LOGICAL: logical_pair(c, pd->prop, pd->p2, v, vl, pd->flags); break;
     case H_IGNORE: break;
+    case H_GRIDTEMPLATE: grid_template_sh(c, v, vl); break;
     }
     return c->sh->ndecl - before;
 }
@@ -1746,6 +1810,9 @@ static int longhands_of(const struct propdef* pd, int* out) {
     case H_BSPACING: out[n++] = P_BORDER_SPACING; break;
     case H_WS: out[n++] = P_WHITE_SPACE; break;
     case H_IGNORE: break;
+    case H_GRIDTEMPLATE:
+        out[n++] = P_GRID_TEMPLATE_ROWS; out[n++] = P_GRID_TEMPLATE_COLUMNS; out[n++] = P_GRID_TEMPLATE_AREAS;
+        break;
     default: out[n++] = pd->prop; break;
     }
     return n;
