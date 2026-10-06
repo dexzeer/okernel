@@ -19,7 +19,10 @@ struct multiboot_info {
 // Each bit represents one 4KB page
 // 0 = free, 1 = used
 #define PAGE_SIZE 4096
-#define BITMAP_SIZE (128 * 1024 / 8) // Support up to 128MB of RAM
+// Up to 896MB: the high alias (paging_init) spans 0xC0000000-0xF8000000;
+// RAM beyond that has no kernel virtual address and is left unmanaged.
+#define MAX_RAM_PAGES (896u * 256u)
+#define BITMAP_SIZE (MAX_RAM_PAGES / 8)
 static uint8_t bitmap[BITMAP_SIZE];
 
 static uint32_t total_pages = 0;
@@ -166,13 +169,83 @@ uint32_t pmm_get_total_pages(void) { return total_pages; }
 uint32_t pmm_get_used_pages(void) { return used_pages; }
 uint32_t pmm_get_free_pages(void) { return total_pages - used_pages; }
 
-// ---- Simple kernel heap (bump allocator) ----
-static uint32_t heap_start = 0;
-static uint32_t heap_ptr = 0;
-// Backbuffer + wallpaper cache are 8.3MB each at 1920x1080x32bpp, plus
-// window/content buffers — 16MB was exhausted and the wallpaper cache
-// kmalloc silently returned NULL
-#define HEAP_SIZE (48 * 1024 * 1024) // 48MB heap
+// ---- Kernel heap: segregated-fit allocator with boundary tags ----
+//
+// One contiguous HIGH-virtual region right after _kernel_end, sized from the
+// RAM GRUB reports (paging_init maps all of RAM into the high alias). Blocks
+// carry a 16-byte header {size|flags, prev_size, magic, pad}; free blocks
+// thread a doubly-linked list through their payload and are binned by size
+// (64 classes: 4 sub-bins per power of two). kfree validates the magic, so a
+// bad/double free is logged and ignored instead of corrupting the heap, and
+// coalesces with both neighbours. Allocations are 16-byte aligned. All entry
+// points run with interrupts masked (IRQ paths may allocate).
+//
+// The heap used to be a 48MB bump allocator whose kfree was a no-op; the web
+// engine allocates/frees per page load, so it needs a real one.
+
+#define HB_HDR      16u
+#define HB_ALIGN    16u
+#define HB_MIN      32u           // smallest block (header + 2 list pointers)
+#define HB_USED     1u            // size field flag: this block allocated
+#define HB_PFREE    2u            // size field flag: previous block is free
+#define HB_MAGIC_U  0xA110C8EDu
+#define HB_MAGIC_F  0xF4EEB10Cu
+#define HB_NBINS    64
+
+struct hblock {
+    uint32_t size;      // whole block bytes (multiple of 16) | flags
+    uint32_t prev_size; // valid when HB_PFREE: size of the free block before
+    uint32_t magic;
+    uint32_t pad;
+    struct hblock* next; // free blocks only
+    struct hblock* prev;
+};
+
+static uint32_t heap_start = 0, heap_end = 0;
+static struct hblock* bins[HB_NBINS];
+static uint64_t bin_map = 0;
+static uint32_t heap_used = 0, heap_peak = 0;
+
+#define HB_SIZE(b) ((b)->size & ~15u)
+#define HB_NEXT_BLK(b) ((struct hblock*)((uint8_t*)(b) + HB_SIZE(b)))
+
+static inline uint32_t irq_save(void) {
+    uint32_t f;
+    __asm__ volatile("pushfl; popl %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void irq_restore(uint32_t f) {
+    __asm__ volatile("pushl %0; popfl" :: "r"(f) : "memory", "cc");
+}
+
+static int hb_bin(uint32_t sz) {
+    // sz >= 32. Classes: exact 16-byte steps up to 256, then 4 per power of 2.
+    if (sz < 256) return (int)(sz >> 4);                // 2..15
+    int lg = 31 - __builtin_clz(sz);                    // >= 8
+    int sub = (int)((sz >> (lg - 2)) & 3);
+    int b = 16 + (lg - 8) * 4 + sub;
+    return b < HB_NBINS ? b : HB_NBINS - 1;
+}
+
+static void hb_unlink(struct hblock* b) {
+    int i = hb_bin(HB_SIZE(b));
+    if (b->prev) b->prev->next = b->next; else bins[i] = b->next;
+    if (b->next) b->next->prev = b->prev;
+    if (!bins[i]) bin_map &= ~(1ull << i);
+}
+
+static void hb_insert(struct hblock* b) {
+    int i = hb_bin(HB_SIZE(b));
+    b->magic = HB_MAGIC_F;
+    b->prev = 0;
+    b->next = bins[i];
+    if (bins[i]) bins[i]->prev = b;
+    bins[i] = b;
+    bin_map |= 1ull << i;
+    // footer protocol: the following block learns our size + free state
+    struct hblock* n = HB_NEXT_BLK(b);
+    if ((uint32_t)n < heap_end) { n->prev_size = HB_SIZE(b); n->size |= HB_PFREE; }
+}
 
 void heap_init(void) {
     // Heap lives in HIGH virtual (CPU uses virt); the bitmap tracks PHYS
@@ -180,44 +253,161 @@ void heap_init(void) {
     extern uint32_t _kernel_end;
     uint32_t kend_phys = V2P((uint32_t)&_kernel_end);
     uint32_t start_page = (kend_phys + PAGE_SIZE - 1) / PAGE_SIZE;
-    uint32_t needed = HEAP_SIZE / PAGE_SIZE;
 
-    // Heap virtual base = page-aligned high _kernel_end
+    // Size from RAM: everything above the kernel minus a reserve for the
+    // PMM (user pages, page tables, stacks). 128MB RAM keeps ~1/6 back; the
+    // high alias ends at 0xF8000000 (see paging_init), which caps us too.
+    uint32_t avail = total_pages > start_page ? total_pages - start_page : 0;
+    uint32_t reserve = total_pages / 6;
+    if (reserve < 4096) reserve = 4096;               // >= 16MB for the PMM
+    uint32_t pages = avail > reserve ? avail - reserve : avail / 2;
+    if (pages > (768u << 8)) pages = 768u << 8;       // <= 768MB
+    if (pages < (32u << 8)) pages = (avail * 3) / 4;  // tiny-RAM fallback
+
     heap_start = (start_page * PAGE_SIZE) + KERNEL_VBASE;
-    heap_ptr = heap_start;
+    heap_end = heap_start + pages * PAGE_SIZE;
+    for (uint32_t i = 0; i < pages; i++) bitmap_set(start_page + i);
+    used_pages += pages;
 
-    // Mark these pages as used
-    for (uint32_t i = 0; i < needed; i++) {
-        bitmap_set(start_page + i);
-    }
-    used_pages += needed;
+    for (int i = 0; i < HB_NBINS; i++) bins[i] = 0;
+    bin_map = 0;
+    // One big free block, plus a 16-byte used sentinel at the very end so
+    // coalescing never walks off the region.
+    struct hblock* sentinel = (struct hblock*)(heap_end - HB_HDR);
+    sentinel->size = HB_HDR | HB_USED;
+    sentinel->magic = HB_MAGIC_U;
+    struct hblock* b = (struct hblock*)heap_start;
+    b->size = (heap_end - heap_start - HB_HDR);
+    b->prev_size = 0;
+    hb_insert(b);
+    serial_printf("[mem] heap %u MB at %x\n", (pages * PAGE_SIZE) >> 20, heap_start);
+}
+
+static struct hblock* hb_find(uint32_t need) {
+    int i = hb_bin(need);
+    // Search the exact bin first (blocks there may be smaller than need)
+    for (struct hblock* b = bins[i]; b; b = b->next)
+        if (HB_SIZE(b) >= need) return b;
+    uint64_t m = (i + 1 < 64) ? (bin_map & ~((2ull << i) - 1)) : 0;
+    if (!m) return 0;
+    uint32_t lo = (uint32_t)m; // no libgcc: split the 64-bit ctz
+    int j = lo ? __builtin_ctz(lo) : 32 + __builtin_ctz((uint32_t)(m >> 32));
+    return bins[j]; // every block in a higher bin is large enough
 }
 
 void* kmalloc(uint32_t size) {
     if (heap_start == 0) heap_init();
-    if (size == 0 || size > HEAP_SIZE) return 0;
+    if (size == 0 || size > heap_end - heap_start) return 0;
+    uint32_t need = (size + HB_HDR + HB_ALIGN - 1) & ~(HB_ALIGN - 1);
+    if (need < HB_MIN) need = HB_MIN;
 
-    // Align to 4 bytes
-    size = (size + 3) & ~3;
-
-    // Reject before advancing — a failed alloc must not push heap_ptr past
-    // the end and starve every later kmalloc
-    if (heap_ptr + size > heap_start + HEAP_SIZE) {
-        // Fail loud, not silent: a NULL kmalloc used to surface pages later
-        // as a blank window / missing wallpaper with no trace. This line
-        // costs nothing unless the heap is actually exhausted.
-        serial_printf("[diag] kmalloc FAIL size=%u used=%u\n",
-                      size, (unsigned)(heap_ptr - heap_start));
+    uint32_t fl = irq_save();
+    struct hblock* b = hb_find(need);
+    if (!b) {
+        irq_restore(fl);
+        serial_printf("[diag] kmalloc FAIL size=%u used=%u\n", size, heap_used);
         return 0;
     }
+    hb_unlink(b);
+    uint32_t bsz = HB_SIZE(b);
+    uint32_t pflag = b->size & HB_PFREE;
+    if (bsz - need >= HB_MIN) {
+        struct hblock* r = (struct hblock*)((uint8_t*)b + need);
+        r->size = bsz - need;
+        r->prev_size = 0;
+        b->size = need | HB_USED | pflag;
+        hb_insert(r);
+    } else {
+        b->size = bsz | HB_USED | pflag;
+        struct hblock* n = HB_NEXT_BLK(b);
+        if ((uint32_t)n < heap_end) n->size &= ~HB_PFREE;
+    }
+    b->magic = HB_MAGIC_U;
+    heap_used += HB_SIZE(b);
+    if (heap_used > heap_peak) heap_peak = heap_used;
+    irq_restore(fl);
+    return (uint8_t*)b + HB_HDR;
+}
 
-    uint32_t addr = heap_ptr;
-    heap_ptr += size;
-
-    return (void*)addr;
+static int hb_valid(void* ptr) {
+    uint32_t p = (uint32_t)ptr;
+    if (p < heap_start + HB_HDR || p >= heap_end || (p & (HB_ALIGN - 1))) return 0;
+    struct hblock* b = (struct hblock*)(p - HB_HDR);
+    return b->magic == HB_MAGIC_U && (b->size & HB_USED);
 }
 
 void kfree(void* ptr) {
-    // Bump allocator doesn't free — just a no-op for now
-    (void)ptr;
+    if (!ptr) return;
+    uint32_t fl = irq_save();
+    if (!hb_valid(ptr)) {
+        irq_restore(fl);
+        serial_printf("[diag] kfree: bad or double free %x\n", (uint32_t)ptr);
+        return;
+    }
+    struct hblock* b = (struct hblock*)((uint8_t*)ptr - HB_HDR);
+    uint32_t sz = HB_SIZE(b);
+    heap_used -= sz;
+    uint32_t pflag = b->size & HB_PFREE;
+    b->size = sz | pflag;
+    // merge forward
+    struct hblock* n = HB_NEXT_BLK(b);
+    if ((uint32_t)n < heap_end && !(n->size & HB_USED)) {
+        hb_unlink(n);
+        sz += HB_SIZE(n);
+        n->magic = 0;
+        b->size = sz | pflag;
+    }
+    // merge backward
+    if (pflag) {
+        struct hblock* p = (struct hblock*)((uint8_t*)b - b->prev_size);
+        hb_unlink(p);
+        b->magic = 0;
+        sz += HB_SIZE(p);
+        p->size = sz | (p->size & HB_PFREE);
+        b = p;
+    }
+    hb_insert(b);
+    irq_restore(fl);
+}
+
+void* kcalloc(uint32_t n, uint32_t size) {
+    if (size && n > 0xFFFFFFFFu / size) return 0;
+    uint32_t t = n * size;
+    uint8_t* p = (uint8_t*)kmalloc(t);
+    if (p) for (uint32_t i = 0; i < t; i++) p[i] = 0;
+    return p;
+}
+
+void* krealloc(void* ptr, uint32_t size) {
+    if (!ptr) return kmalloc(size);
+    if (!size) { kfree(ptr); return 0; }
+    if (!hb_valid(ptr)) {
+        serial_printf("[diag] krealloc: bad pointer %x\n", (uint32_t)ptr);
+        return 0;
+    }
+    struct hblock* b = (struct hblock*)((uint8_t*)ptr - HB_HDR);
+    uint32_t have = HB_SIZE(b) - HB_HDR;
+    if (size <= have) return ptr;
+    uint8_t* q = (uint8_t*)kmalloc(size);
+    if (!q) return 0;
+    uint32_t* s = (uint32_t*)ptr; uint32_t* d = (uint32_t*)q;
+    for (uint32_t i = 0; i < have / 4; i++) d[i] = s[i];
+    kfree(ptr);
+    return q;
+}
+
+void heap_stats(uint32_t* total, uint32_t* used, uint32_t* peak, uint32_t* largest_free) {
+    if (heap_start == 0) heap_init();
+    uint32_t fl = irq_save();
+    if (total) *total = heap_end - heap_start;
+    if (used) *used = heap_used;
+    if (peak) *peak = heap_peak;
+    if (largest_free) {
+        uint32_t big = 0;
+        for (int i = HB_NBINS - 1; i >= 0 && !big; i--)
+            for (struct hblock* b = bins[i]; b; b = b->next)
+                if (HB_SIZE(b) > big) big = HB_SIZE(b);
+        *largest_free = big;
+    }
+    irq_restore(fl);
 }

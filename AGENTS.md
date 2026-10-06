@@ -16,12 +16,12 @@ Requires: `gcc` (multilib), `nasm`, `ld`, `grub-mkrescue`, `xorriso`, `mtools`.
 
 Desktop QEMU command (must use `-vga std` for framebuffer; `-device e1000` for networking — okai/HTTPS need it):
 ```bash
-qemu-system-i386 -cdrom kanarchy-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0
+qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0
 ```
 
 Serial debug variant (for TLS/network bring-up — serial is ground truth for network bugs):
 ```bash
-qemu-system-i386 -cdrom kanarchy-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0 -nographic -serial stdio
+qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0 -nographic -serial stdio
 ```
 
 ## Gotchas that will bite you
