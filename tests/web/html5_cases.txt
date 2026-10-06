@@ -1,0 +1,142 @@
+#---- empty
+#---- text only
+Hello world
+#---- doctype basic
+<!DOCTYPE html><html><head><title>T</title></head><body><p>Hi</p></body></html>
+#---- implied html head body
+<title>x</title><p>one<p>two
+#---- unclosed p in div
+<div><p>a<div>b</div>c</div>
+#---- li implied end
+<ul><li>one<li>two<ul><li>nested</ul><li>three</ul>
+#---- dd dt
+<dl><dt>a<dd>b<dt>c<dd>d</dl>
+#---- headings close
+<h1>a<h2>b</h1>c
+#---- adoption agency basic
+<p><b>1<p>2</b>3</p>
+#---- adoption agency misnested
+<b>1<i>2</b>3</i>4
+#---- adoption agency with div
+<a href=x>1<div>2</a>3</div>
+#---- nested a
+<a href=1>one<a href=2>two</a>
+#---- formatting reconstruction
+<p><b><i>bold italic<p>still</i>after
+#---- noahs ark
+<b><b><b><b>x</b></b></b></b>y
+#---- table basic
+<table><tr><td>1<td>2<tr><td>3</table>
+#---- table implied tbody
+<table><td>x</td></table>
+#---- foster parenting text
+<table>foo<tr><td>bar</td></tr>baz</table>
+#---- foster parenting elements
+<table><div>x</div><tr><td>y</table>
+#---- table in p
+<!DOCTYPE html><p><table><tr><td>x</table>
+#---- table in p quirks
+<p><table><tr><td>x</table>
+#---- caption colgroup
+<table><caption>c<col><tr><td>x</table>
+#---- nested tables
+<table><tr><td><table><tr><td>inner</table>after</td></tr></table>
+#---- select
+<select><option>a<option>b<optgroup><option>c</select>after
+#---- select in table
+<table><tr><td><select><option>x</td></tr></table>
+#---- form nesting
+<form><form><input name=a></form>
+#---- form in table
+<table><form><tr><td><input></td></tr></form></table>
+#---- void elements
+<p>a<br>b<img src=x.png alt="y">c<hr>d
+#---- end br
+</br>x
+#---- end p without start
+</p>x
+#---- pre leading newline
+<pre>
+line1
+line2</pre>
+#---- textarea
+<textarea>
+  <b>not bold</b> &amp; x</textarea>
+#---- title rcdata
+<title>a &lt; <b>b</b></title>
+#---- script rawtext
+<script>if (a < b && c > d) { document.write("</div>") }</script><p>x
+#---- style rawtext
+<style>p > a { color: red }</style><p>x
+#---- comments
+<!-- top --><p>a<!-- in --> b<!---->c<!--->d
+#---- bogus comment
+<p>a<?xml version="1.0"?>b</p>
+#---- entities
+<p>&amp; &lt; &gt; &quot; &nbsp; &copy &copy; &notit; &notin; &#65; &#x42; &#128; &#0; &bogus;</p>
+#---- attr entities
+<a href="?a=1&b=2&amp;c=3&copy=4&copy;">x</a>
+#---- unquoted attrs
+<div class=a id=b data-x=c>y</div>
+#---- duplicate attrs
+<div id=a id=b class=c>x</div>
+#---- uppercase
+<DIV CLASS="A"><P>Text</P></DIV>
+#---- svg
+<p>a<svg viewBox="0 0 10 10"><circle cx=5 cy=5 r=4 /><foreignObject><p>html</p></foreignObject></svg>b
+#---- svg breakout
+<svg><path d="M0 0"/><div>out</div></svg>
+#---- math
+<math><mi>x</mi><mo>+</mo><mn>1</mn></math>
+#---- noscript scripting off
+<noscript><p>enable js</p></noscript><p>x
+#---- noscript in head
+<head><noscript><link rel=stylesheet href=a.css></noscript></head><body>x
+#---- body attrs merge
+<body class=a><p>x<body id=b>
+#---- html attrs merge
+<html lang=en><p>x</p><html dir=rtl>
+#---- after body content
+<body>a</body>b</html>c
+#---- nested buttons
+<button>a<button>b</button>
+#---- nobr
+<nobr>a<nobr>b</nobr>
+#---- ruby
+<ruby>a<rp>(<rt>b<rp>)</ruby>
+#---- image to img
+<image src=x>
+#---- frameset
+<frameset><frame src=a><frame src=b></frameset>
+#---- headings nested in p
+<p><h3>x</h3>
+#---- li in div
+<ul><li><div><li>x</div></ul>
+#---- marquee object
+<p><object><p>x</object>y
+#---- table text whitespace
+<table>
+  <tr>
+    <td>a</td>
+  </tr>
+</table>
+#---- stray end tags
+</div></span><p>x</p></table>
+#---- deep inline
+<span><span><span><em><strong>deep</strong></em></span></span></span>
+#---- realistic nav
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Site</title><link rel="stylesheet" href="/s.css"></head><body><header class="top"><nav><ul><li><a href="/">Home</a></li><li><a href="/about">About</a></li></ul></nav></header><main><article><h1>Hello</h1><p>Some <em>text</em> &mdash; here.</p></article></main><footer>&copy; 2026</footer></body></html>
+#---- cdata in svg
+<svg><![CDATA[a<b]]></svg>
+#---- cdata in html
+<p><![CDATA[x]]></p>
+#---- eof in tag
+<p>a<b class="x
+#---- eof in comment
+<p>a<!-- never ends
+#---- lt not tag
+<p>a < b <3 c</p>
+#---- end tag open bogus
+<p>a</ x>b</p>
+#---- template
+<template><p>x</p></template><p>y
