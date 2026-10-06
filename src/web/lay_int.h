@@ -4,6 +4,7 @@
 #include "layout.h"
 #include "font.h"
 #include "wcommon.h"
+#include "css_int.h"
 
 // ---- boxes --------------------------------------------------------------------
 enum {

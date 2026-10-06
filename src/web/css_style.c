@@ -50,7 +50,7 @@ static const char UA_CSS[] =
 "abbr[title],acronym[title]{text-decoration:underline dotted}"
 "a:link{color:#0000EE;text-decoration:underline;cursor:pointer}"
 "mark{background-color:yellow;color:black}"
-"center{text-align:center}"
+"center{text-align:-webkit-center}"
 "hr{color:gray;border-style:inset;border-width:1px;margin-top:.5em;margin-bottom:.5em;"
 "margin-left:auto;margin-right:auto;overflow:hidden}"
 "table{border-spacing:2px;border-collapse:separate;box-sizing:border-box;text-indent:0}"
@@ -1748,7 +1748,7 @@ static void gen_hints(struct wstyleset* ss, int el, int* first, int* count) {
             // align=bottom on caption
             if (w_ieq(v, vl, "bottom")) hint(ss, "caption-side", "bottom", 6);
         } else {
-            if (w_ieq(v, vl, "center") || w_ieq(v, vl, "middle")) hint(ss, "text-align", "center", 6);
+            if (w_ieq(v, vl, "center") || w_ieq(v, vl, "middle")) hint(ss, "text-align", "-webkit-center", 14);
             else if (w_ieq(v, vl, "left")) hint(ss, "text-align", "left", 4);
             else if (w_ieq(v, vl, "right")) hint(ss, "text-align", "right", 5);
             else if (w_ieq(v, vl, "justify")) hint(ss, "text-align", "justify", 7);
@@ -1957,6 +1957,7 @@ static void copy_prop(struct wstyle* dst, const struct wstyle* src, int p) {
     case P_FILL: dst->fill = src->fill; dst->fill_none = src->fill_none; break;
     case P_STROKE: dst->stroke = src->stroke; dst->stroke_none = src->stroke_none; break;
     case P_STROKE_WIDTH: dst->stroke_width = src->stroke_width; break;
+    case P_MASK: dst->has_mask = src->has_mask; break;
     }
 }
 
@@ -2226,6 +2227,7 @@ static void apply_decl(struct cctx* c, int p, const struct cdecl* d) {
     case P_FILL: { raw = draw_of(c, d, &len); int none; s->fill = paint_color(raw, len, &none); s->fill_none = (uint8_t)none; break; }
     case P_STROKE: { raw = draw_of(c, d, &len); int none; s->stroke = paint_color(raw, len, &none); s->stroke_none = (uint8_t)none; break; }
     case P_STROKE_WIDTH: if (dlen(c, d, fs, &w) && w.t == WL_LEN) s->stroke_width = w.px; break;
+    case P_MASK: raw = draw_of(c, d, &len); cv_trim(&raw, &len); s->has_mask = len > 0 && !w_ieq(raw, len, "none"); break;
     }
 }
 

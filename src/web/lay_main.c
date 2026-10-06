@@ -112,7 +112,7 @@ static int first_inflow(struct wlayout* L, int bi) {
         if (lb_is_inflow(&L->b[c])) return c;
     return -1;
 }
-static int last_inflow(struct wlayout* L, int bi) {
+static int __attribute__((unused)) last_inflow(struct wlayout* L, int bi) {
     int r = -1;
     for (int c = L->b[bi].first; c >= 0; c = L->b[c].next)
         if (lb_is_inflow(&L->b[c])) r = c;
@@ -759,6 +759,9 @@ void lay_box(struct wlayout* L, int bi, int32_t avail, int32_t forced_w, int32_t
         // centering via auto margins
         if (!(b->flags & (BF_INLINE_LEVEL | BF_FLOAT | BF_ABS))) {
             int aml = s->margin[3].t == WL_AUTO, amr = s->margin[1].t == WL_AUTO;
+            if (!aml && !amr && b->parent >= 0 && L->b[b->parent].st &&
+                L->b[b->parent].st->text_align == TA_WEBKIT_CENTER && b->m[1] == 0 && b->m[3] == 0)
+                aml = amr = 1;
             int32_t free = avail - b->w - b->m[1] - b->m[3];
             if (aml && amr && free > 0) { b->m[3] = free / 2; b->m[1] = free - free / 2; }
             else if (aml && free > 0) b->m[3] = free;
@@ -796,6 +799,10 @@ void lay_box(struct wlayout* L, int bi, int32_t avail, int32_t forced_w, int32_t
     // auto margins (block-level in normal flow)
     if (!(b->flags & (BF_INLINE_LEVEL | BF_FLOAT | BF_ABS)) && forced_w < 0) {
         int aml = s->margin[3].t == WL_AUTO, amr = s->margin[1].t == WL_AUTO;
+        // legacy <center> / align=center: -webkit-center on the parent
+        if (!aml && !amr && b->parent >= 0 && L->b[b->parent].st &&
+            L->b[b->parent].st->text_align == TA_WEBKIT_CENTER && b->m[1] == 0 && b->m[3] == 0)
+            aml = amr = 1;
         int32_t free = avail - W - b->m[1] - b->m[3];
         if (aml && amr) { if (free > 0) { b->m[3] = free / 2; b->m[1] = free - free / 2; } }
         else if (aml) { if (free > 0) b->m[3] = free; }

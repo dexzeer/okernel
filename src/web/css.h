@@ -56,7 +56,8 @@ enum { CLR_NONE, CLR_LEFT, CLR_RIGHT, CLR_BOTH };
 enum { OV_VISIBLE, OV_HIDDEN, OV_SCROLL, OV_AUTO, OV_CLIP };
 enum { BS_NONE, BS_HIDDEN, BS_SOLID, BS_DASHED, BS_DOTTED, BS_DOUBLE, BS_GROOVE, BS_RIDGE,
        BS_INSET, BS_OUTSET };
-enum { TA_START, TA_LEFT, TA_RIGHT, TA_CENTER, TA_JUSTIFY, TA_END };
+enum { TA_START, TA_LEFT, TA_RIGHT, TA_CENTER, TA_JUSTIFY, TA_END,
+       TA_WEBKIT_CENTER };   // -webkit-center: also centers block-level children
 enum { TT_NONE, TT_UPPER, TT_LOWER, TT_CAPITALIZE };
 enum { WS_NORMAL, WS_NOWRAP, WS_PRE, WS_PRE_WRAP, WS_PRE_LINE, WS_BREAK_SPACES };
 enum { VA_BASELINE, VA_TOP, VA_MIDDLE, VA_BOTTOM, VA_SUB, VA_SUPER, VA_TEXT_TOP,
@@ -160,6 +161,7 @@ struct wstyle {
     uint8_t fs_default;        // font-size is the inherited UA default ("medium")
     uint8_t overflow_wrap;     // 1 = break-word / anywhere
     uint8_t list_value_set;    // <li value> present (ordinal in list_value)
+    uint8_t has_mask;          // mask-image set (unsupported: background not painted)
     int32_t list_value;
     uint32_t deco_inh_color;
     // custom properties (inherited)
