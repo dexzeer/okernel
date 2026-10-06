@@ -1,4 +1,5 @@
 #include "e1000.h"
+#include "../idt.h"
 #include "pci.h"
 #include "../io.h"
 #include "../memory.h"

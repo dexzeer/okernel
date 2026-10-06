@@ -5,6 +5,7 @@
 // Stateful multiplication has TWO carry passes (pre-mul, post-mul) so that
 // each h*r product fits in a uint64_t without any overflow risk.
 #include "poly1305.h"
+#include "memwipe.h"
 
 static void poly1305_block(poly1305_stream* ctx, const uint8_t block[16], int final) {
     // Decompose the 16-byte block into 5 × 26-bit limbs.
@@ -57,6 +58,13 @@ static void poly1305_block(poly1305_stream* ctx, const uint8_t block[16], int fi
     c = (uint32_t)(d[2] >> 26); ctx->h[2] = (uint32_t)(d[2] & 0x3FFFFFF); d[3] += c;
     c = (uint32_t)(d[3] >> 26); ctx->h[3] = (uint32_t)(d[3] & 0x3FFFFFF); d[4] += c;
     c = (uint32_t)(d[4] >> 26); ctx->h[4] = (uint32_t)(d[4] & 0x3FFFFFF); ctx->h[0] += 5 * c;
+}
+
+void poly1305_stream_wipe(poly1305_stream* st) {
+    // Terminal wipe for key material (r/s) and accumulator state.
+    // Safe to call after final; the struct must not be reused without init.
+    if (!st) return;
+    secure_zero(st, sizeof(*st));
 }
 
 void poly1305_stream_init(poly1305_stream* st, const uint8_t key[32]) {
@@ -118,6 +126,7 @@ void poly1305_stream_final(poly1305_stream* st, uint8_t tag[16]) {
         for (uint32_t i = 0; i < st->buf_n; i++) pad[i] = st->buf[i];
         pad[st->buf_n] = 1;
         poly1305_block(st, pad, 1);
+        secure_zero(pad, sizeof(pad));
     }
 
     // Finalize: fully carry h into proper 26-bit limbs first. The last
@@ -172,6 +181,7 @@ void poly1305_auth(const uint8_t key[32], const uint8_t* msg, uint32_t len,
     poly1305_stream_init(&st, key);
     poly1305_stream_update(&st, msg, len);
     poly1305_stream_final(&st, tag);
+    poly1305_stream_wipe(&st);
 }
 
 static void put_le64(uint8_t* p, uint64_t v) {
@@ -196,4 +206,6 @@ void poly1305_auth_pieces(const uint8_t key[32],
     put_le64(lens + 8, ct_len);
     poly1305_stream_update(&st, lens, 16);
     poly1305_stream_final(&st, tag);
+    poly1305_stream_wipe(&st);
+    secure_zero(lens, sizeof(lens));
 }

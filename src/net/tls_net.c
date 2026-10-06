@@ -36,7 +36,7 @@ static uint32_t tls_rx_len;      // bytes available
 // to 1 MiB so larger HTTPS pages (e.g. real homepages, which are often 200-400
 // KiB uncompressed) are captured whole. tls_state_init() is handed
 // sizeof(tls_response)-1 as the cap, so this is the only change needed.
-static char     tls_response[1048576];
+static char     tls_response[2097152]; // 2MB cap: pages above render truncated
 static uint32_t tls_response_len;
 static int      tls_response_overflow = 0; // set once when a response exceeds the buffer
 
@@ -66,6 +66,10 @@ static int tls_fail_reason = 0;
 // Certificate-failure detail (CV_ERR_* or 0): lets the browser print WHY
 // (expired? hostname? pin change?) instead of a generic warning.
 static int tls_fail_detail = 0;
+// PSK was offered but never accepted before the last failure (server hung
+// up on resumption instead of negotiating). Refreshed on every ERR so it
+// never goes stale; the browser uses it for the full-handshake retry.
+static int tls_last_unaccepted = 0;
 // TCP connection attempts for the current fetch. Bounded so an unreachable host
 // gives up instead of re-tcp_connect() forever (which would wedge the okai
 // single-owner fetch model).
@@ -139,6 +143,7 @@ void https_get_port(const char* host, const char* path, uint16_t port) {
     tls_response[0] = 0;
     tls_fail_reason = 0;
     tls_fail_detail = 0;
+    tls_last_unaccepted = 0;
     tls_active = 1;
     tls_phase = HP_DNS;
     tls_done = 0;
@@ -282,8 +287,13 @@ void https_get_poll(void) {
         } else if (r == TLS_STEP_ERR) {
             tls_fail_reason = tls_s.fail_reason;
             tls_fail_detail = tls_s.cert_detail;
-            serial_printf("[tls-net] handshake/download FAILED (reason=%d detail=%d)\n",
-                          tls_fail_reason, tls_fail_detail);
+            // Resumption-fallback signal: PSK offered but never accepted
+            // before the abort (server hung up on resumption instead of
+            // negotiating). Read BEFORE the wipe; refreshed on every
+            // failure so it never goes stale.
+            tls_last_unaccepted = tls_s.offer_psk && !tls_s.psk_accepted;
+            serial_printf("[tls-net] handshake/download FAILED (reason=%d detail=%d phase=%d)\n",
+                          tls_fail_reason, tls_fail_detail, tls_s.phase);
             tls_response_len = 0;
             tls_response[0] = 0;
             tls_done = 0;
@@ -312,6 +322,11 @@ int tls_get_response_len(void) {
     return (int)tls_response_len;
 }
 
+int tls_get_progress_len(void) {
+    if (tls_active) return (int)tls_s.out_len;
+    return (int)tls_response_len;
+}
+
 int tls_is_done(void) {
     return tls_done;
 }
@@ -326,6 +341,10 @@ void tls_connection_closed(void) {
 
 int tls_get_fail_reason(void) {
     return tls_fail_reason;
+}
+
+int tls_last_offer_unaccepted(void) {
+    return tls_last_unaccepted;
 }
 
 int tls_get_fail_detail(void) {

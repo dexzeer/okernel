@@ -47,6 +47,7 @@ static const char scancode_shift[128] = {
 static keyboard_callback_t callback = 0;
 static int shift_pressed = 0;
 static int ctrl_pressed = 0; // 1 = Ctrl held (0x1D)
+static int alt_pressed = 0;  // 1 = Alt held (0x38, or 0xE0 0x38 right Alt)
 static int extended = 0; // 1 = received 0xE0 prefix
 
 static void keyboard_irq(void) {
@@ -77,6 +78,8 @@ static void keyboard_irq(void) {
     // Extended key (arrow keys, etc.)
     if (extended) {
         extended = 0;
+        if (scancode == 0x38) { alt_pressed = 1; return; }  // right Alt press
+        if (scancode == 0xB8) { alt_pressed = 0; return; }  // right Alt release
         if (scancode & 0x80) return; // key release, ignore
 
         switch (scancode) {
@@ -99,12 +102,21 @@ static void keyboard_irq(void) {
         if (released == 0x1D) {
             ctrl_pressed = 0;
         }
+        if (released == 0x38) {
+            alt_pressed = 0;
+        }
         return;
     }
 
     // Ctrl press (0x1D) — tracked, not typed.
     if (scancode == 0x1D) {
         ctrl_pressed = 1;
+        return;
+    }
+
+    // Alt press (0x38) — tracked, not typed (enables Ctrl+Alt+T).
+    if (scancode == 0x38) {
+        alt_pressed = 1;
         return;
     }
 
@@ -117,6 +129,12 @@ static void keyboard_irq(void) {
     // Backspace
     if (scancode == 0x0E) {
         if (callback) callback('\b');
+        return;
+    }
+
+    // Tab (form-field focus cycling in okai; harmless elsewhere)
+    if (scancode == 0x0F) {
+        if (callback) callback('\t');
         return;
     }
 
@@ -150,9 +168,12 @@ void keyboard_init(void) {
     callback = 0;
     shift_pressed = 0;
     ctrl_pressed = 0;
+    alt_pressed = 0;
     extended = 0;
     irq_register_handler(1, keyboard_irq);
 }
+
+int keyboard_alt_held(void) { return alt_pressed; }
 
 void keyboard_set_callback(keyboard_callback_t cb) {
     callback = cb;

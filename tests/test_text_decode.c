@@ -19,11 +19,12 @@ static const char* tok_text(struct html_token* t, int n, int type, int k) {
 
 int main(void) {
     // UTF-8 Cyrillic: "Привет мир" = П(0x417) р(0x440) и(0x438) в(0x432) е(0x435) т(0x442)
+    // (<p> body text emits HTML_PARA, not HTML_TEXT.)
     {
         const char* html = "<html><body><p>\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2\xD0\xB5\xD1\x82 \xD0\xBC\xD0\xB8\xD1\x80</p></body></html>";
         struct html_token t[8];
         int n = html_parse(html, strlen(html), t, 8);
-        const char* txt = tok_text(t, n, HTML_TEXT, 0);
+        const char* txt = tok_text(t, n, HTML_PARA, 0);
         CHECK(txt && (unsigned char)txt[0] == 0x8F && (unsigned char)txt[1] == 0xB0,
               "UTF-8 'П' decodes to slot 0x8F");
         // П = U+041F -> 0x80 + 0xF = 0x8F
@@ -55,7 +56,7 @@ int main(void) {
                            "<html><body><p>\xCF\xF0\xE8\xE2\xE5\xF2</p></body></html>";
         struct html_token t[8];
         int n = html_parse(html, strlen(html), t, 8);
-        const char* txt = tok_text(t, n, HTML_TEXT, 0);
+        const char* txt = tok_text(t, n, HTML_PARA, 0);
         // \xCF = П (0xC0 base) -> slot 0x8F; \xE5 = е -> U+0435 -> 0x95
         CHECK(txt && (unsigned char)txt[0] == 0x8F, "CP1251 П -> slot 0x8F");
         CHECK(txt && (unsigned char)txt[4] == 0xA5, "CP1251 е -> slot 0xA5");
@@ -66,7 +67,7 @@ int main(void) {
         const char* html = "<html><body><p>\xD0\xAD</p></body></html>"; // Э
         struct html_token t[8];
         int n = html_parse(html, strlen(html), t, 8);
-        const char* txt = tok_text(t, n, HTML_TEXT, 0);
+        const char* txt = tok_text(t, n, HTML_PARA, 0);
         CHECK(txt && (unsigned char)txt[0] == 0x9D, "UTF-8 Э -> slot 0x9D (no charset decl)");
     }
 
@@ -128,6 +129,83 @@ int main(void) {
         }
         CHECK(hr == 1, "hr -> HTML_BLOCK");
         CHECK(brk >= 1, "blockquote -> LINE_BREAK");
+    }
+
+    // Portuguese UTF-8: "português coração" — ê/ç/ã must decode to Latin
+    // slots (0xDA/0xD7/0xD3), never '?'. This was the reported bug.
+    {
+        const char* html = "<html><body><p>portugu\xC3\xAAs cora\xC3\xA7\xC3\xA3o</p></body></html>";
+        struct html_token t[8];
+        int n = html_parse(html, strlen(html), t, 8);
+        const char* txt = tok_text(t, n, HTML_PARA, 0);
+        const char want[] = { 'p','o','r','t','u','g','u', (char)0xDA, 's',
+                              ' ','c','o','r','a', (char)0xD7, (char)0xD3, 'o', 0 };
+        CHECK(txt && !strcmp(txt, want), "PT 'português coração' decodes, no '?'");
+    }
+
+    // Portuguese named entities (lower + upper)
+    {
+        char s[] = "&atilde;&ccedil;&otilde;&eacute;&ecirc; &Atilde;&Ccedil;&Otilde;";
+        html_decode_entities(s);
+        CHECK((unsigned char)s[0] == 0xD3 && (unsigned char)s[1] == 0xD7 &&
+              (unsigned char)s[2] == 0xE5 && (unsigned char)s[3] == 0xD9 &&
+              (unsigned char)s[4] == 0xDA,
+              "&atilde;&ccedil;&otilde;&eacute;&ecirc; -> latin slots");
+        CHECK(s[5] == ' ' &&
+              (unsigned char)s[6] == 0xF2 && (unsigned char)s[7] == 0xF4 &&
+              (unsigned char)s[8] == 0xFC,
+              "&Atilde;&Ccedil;&Otilde; -> capital slots");
+    }
+
+    // Portuguese numeric entities (decimal + hex)
+    {
+        char s[] = "&#227;&#231;&#245; &#xE9;&#xC3;";
+        html_decode_entities(s);
+        CHECK((unsigned char)s[0] == 0xD3 && (unsigned char)s[1] == 0xD7 &&
+              (unsigned char)s[2] == 0xE5,
+              "&#227;&#231;&#245; -> ã ç õ slots");
+        CHECK((unsigned char)s[4] == 0xD9 && (unsigned char)s[5] == 0xF2,
+              "&#xE9;&#xC3; -> é Ã slots");
+    }
+
+    // Transliteration fallback: letters without slots become ASCII base
+    {
+        char s[] = "&#223;&#221;&szlig;&Yacute;&Aring;&Oslash;";
+        html_decode_entities(s);
+        CHECK(s[0] == 's' && s[1] == 'Y' && s[2] == 's' && s[3] == 'Y' &&
+              s[4] == 'A' && s[5] == 'O',
+              "ßÝ transliterate to sY (never '?')");
+    }
+
+    // Smart quotes (UTF-8 + entities) -> ASCII quotes
+    {
+        char s[] = "\xE2\x80\x9Coi\xE2\x80\x9D &ldquo;x&rdquo; &lsquo;y&rsquo;";
+        html_decode_entities(s);
+        CHECK(s[0] == '"' && s[3] == '"' && s[5] == '"' && s[7] == '"' &&
+              s[9] == '\'' && s[11] == '\'',
+              "curly quotes -> ASCII quotes");
+    }
+
+    // windows-1252 page (declared): raw 0xE3/0xE7 ARE ã/ç, not UTF-8
+    {
+        const char* html = "Content-Type: text/html; charset=windows-1252\r\n\r\n"
+                           "<html><body><p>\xE3\xE7</p></body></html>";
+        struct html_token t[8];
+        int n = html_parse(html, strlen(html), t, 8);
+        const char* txt = tok_text(t, n, HTML_PARA, 0);
+        CHECK(txt && (unsigned char)txt[0] == 0xD3 && (unsigned char)txt[1] == 0xD7,
+              "windows-1252 raw bytes -> ã ç slots");
+    }
+
+    // iso-8859-1 via <meta charset> (same byte mapping as 1252 here)
+    {
+        const char* html = "<html><head><meta charset=\"iso-8859-1\"></head>"
+                           "<body><p>\xF5\xE9</p></body></html>";
+        struct html_token t[8];
+        int n = html_parse(html, strlen(html), t, 8);
+        const char* txt = tok_text(t, n, HTML_PARA, 0);
+        CHECK(txt && (unsigned char)txt[0] == 0xE5 && (unsigned char)txt[1] == 0xD9,
+              "meta iso-8859-1 raw bytes -> õ é slots");
     }
 
     printf(fails ? "TEXT_DECODE FAIL (%d)\n" : "TEXT_DECODE PASS\n", fails);

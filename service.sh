@@ -1,1 +1,1 @@
-qemu-system-i386 -cdrom okernel.iso -boot d
+qemu-system-i386 -cdrom kanarchy-text.iso -boot d

@@ -53,6 +53,11 @@ int strncmp(const char* a, const char* b, unsigned int n) {
     return 0;
 }
 
+int strcmp(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return (int)(unsigned char)*a - (int)(unsigned char)*b;
+}
+
 char* strchr(const char* s, int c) {
     while (*s) {
         if (*s == (char)c) return (char*)s;

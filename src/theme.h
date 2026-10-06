@@ -50,6 +50,8 @@
 #define TBTN_CLOSE_BG     0x00C04040 // muted red close
 #define TBTN_NEUTRAL_BG   0x00444B57 // slate minimize
 #define TBTN_FG           0x00FFFFFF
+#define CHROME_RED        0x00CC2222 // anarchy red: flat terminal title/border
+#define CHROME_BTN_BG     0x00000000 // black square chrome buttons (white glyph)
 #define TASKBAR_TOP       0x00263F6B
 #define TASKBAR_BOT       0x00172841
 #define TASK_BTN_INACT    0x003A5C95

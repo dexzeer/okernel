@@ -15,7 +15,10 @@ int sys_proc_write_fd(int fd, const char *buf, uint32_t len);
 int sys_proc_read_fd(int fd, char *buf, uint32_t len);
 
 // Keyboard line queue: shell offers completed lines, sys_read fd 0 drains.
-void sys_proc_kbd_offer(const char *line, uint32_t len);
+// Returns 1 when the line was queued, 0 when dropped (null/empty, no live
+// reader yet, or queue full) — the caller arms the offer-wake ONLY on 1,
+// so a dropped bootstrap line can't cause a stale wake later.
+int sys_proc_kbd_offer(const char *line, uint32_t len);
 int sys_proc_kbd_read(char *buf, uint32_t len);
 // 1 when the kbd queue holds an unread line (drain wake rule for parked
 // readers — the line they wait for is already there; no sibling needed).

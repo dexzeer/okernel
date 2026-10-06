@@ -7,6 +7,7 @@
 // fe_invert's bit-test, which indexes a PUBLIC constant (p-2): identical
 // pattern every execution, no secret dependence.
 #include "x25519.h"
+#include "memwipe.h"
 
 typedef int32_t fe16[16]; // signed 16-bit limbs in 32-bit holders
 
@@ -204,6 +205,9 @@ void x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t u[32]) {
     z3[0] = 1; for (int i = 1; i < 16; i++) z3[i] = 0;
 
     int swap = 0;
+    // Ladder temporaries hoisted so they can be wiped after the loop
+    // (they hold DH intermediates derived from the private scalar).
+    fe16 a, aa, b, bb, e, c, d, da, cb, tsum, tdif, a24e;
     for (int pos = 254; pos >= 0; pos--) {
         int k_t = (k[pos >> 3] >> (pos & 7)) & 1;
         swap ^= k_t;
@@ -211,7 +215,6 @@ void x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t u[32]) {
         fe_cswap(z2, z3, swap);
         swap = k_t;
 
-        fe16 a, aa, b, bb, e, c, d, da, cb;
         fe_add(a, x2, z2);
         fe_sq(aa, a);
         fe_sub(b, x2, z2);
@@ -222,7 +225,6 @@ void x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t u[32]) {
         fe_mul(da, d, a);
         fe_mul(cb, c, b);
 
-        fe16 tsum, tdif;
         fe_add(tsum, da, cb);
         fe_sq(x3, tsum);
         fe_sub(tdif, da, cb);
@@ -230,7 +232,6 @@ void x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t u[32]) {
         fe_mul(z3, x1, t0);
 
         fe_mul(x2, aa, bb);
-        fe16 a24e;
         fe_mul121665(a24e, e);
         fe_add(t1, aa, a24e);
         fe_mul(z2, e, t1);
@@ -243,6 +244,31 @@ void x25519(uint8_t out[32], const uint8_t scalar[32], const uint8_t u[32]) {
     fe16 res;
     fe_mul(res, x2, zinv);
     fe_tobytes(out, res);
+    // The clamped scalar copy and all ladder intermediates are secret-
+    // adjacent: wipe before returning. `out` (the shared/public value,
+    // caller-owned) is preserved.
+    secure_zero(k, sizeof(k));
+    secure_zero(a, sizeof(a));
+    secure_zero(aa, sizeof(aa));
+    secure_zero(b, sizeof(b));
+    secure_zero(bb, sizeof(bb));
+    secure_zero(e, sizeof(e));
+    secure_zero(c, sizeof(c));
+    secure_zero(d, sizeof(d));
+    secure_zero(da, sizeof(da));
+    secure_zero(cb, sizeof(cb));
+    secure_zero(tsum, sizeof(tsum));
+    secure_zero(tdif, sizeof(tdif));
+    secure_zero(a24e, sizeof(a24e));
+    secure_zero(x1, sizeof(x1));
+    secure_zero(x2, sizeof(x2));
+    secure_zero(z2, sizeof(z2));
+    secure_zero(x3, sizeof(x3));
+    secure_zero(z3, sizeof(z3));
+    secure_zero(t0, sizeof(t0));
+    secure_zero(t1, sizeof(t1));
+    secure_zero(zinv, sizeof(zinv));
+    secure_zero(res, sizeof(res));
 }
 
 void x25519_public_key(uint8_t pub[32], const uint8_t priv[32]) {

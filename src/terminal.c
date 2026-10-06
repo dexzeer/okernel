@@ -76,8 +76,8 @@ static void draw_status_bar(void) {
         VGA_BUFFER[STATUS_ROW * TERM_WIDTH + i] = make_entry(' ', color);
     }
 
-    // Left: "okernel"
-    const char* title = " okernel ";
+    // Left: "KAnarchy"
+    const char* title = " KAnarchy ";
     int pos = 0;
     while (*title && pos < TERM_WIDTH) {
         VGA_BUFFER[STATUS_ROW * TERM_WIDTH + pos] = make_entry(*title, color);

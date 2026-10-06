@@ -1,9 +1,10 @@
 #include "tls_keysched.h"
 #include "hkdf.h"
 #include "sha256.h"
+#include "memwipe.h"
 #include <string.h>
 
-void tls_hkdf_expand_label(const uint8_t secret[32],
+int tls_hkdf_expand_label(const uint8_t secret[32],
                            const char* label,
                            const uint8_t* context, uint32_t context_len,
                            uint8_t* out, uint32_t out_len) {
@@ -14,13 +15,16 @@ void tls_hkdf_expand_label(const uint8_t secret[32],
     // BYTE while writing fewer bytes (lying prefix) and memcpy'd a full
     // uint32_t context_len into info[256] (stack smash past ~240B). Refuse
     // loudly instead: zero the output so no caller proceeds on garbage.
+    // FALLIBLE (fix): returns 0/-1 — callers MUST abort on -1, never use
+    // the zeroed output as key material.
     uint8_t info[256];
     uint32_t label_len = strlen(label);
     if (6 + label_len > 255 || context_len > 255 ||
         2 + 1 + 6 + label_len + 1 + context_len > sizeof(info) ||
         out_len > 255 * 32) {
         for (uint32_t i = 0; i < out_len; i++) out[i] = 0;
-        return;
+        secure_zero(info, sizeof(info));
+        return -1;
     }
     uint32_t p = 0;
     info[p++] = (uint8_t)(out_len >> 8);
@@ -32,21 +36,30 @@ void tls_hkdf_expand_label(const uint8_t secret[32],
     info[p++] = (uint8_t)context_len;
     if (context_len > 0) memcpy(info + p, context, context_len);
     p += context_len;
-    hkdf_expand(secret, info, p, out, out_len);
+    int rc = hkdf_expand(secret, info, p, out, out_len);
+    secure_zero(info, sizeof(info));
+    if (rc != 0) {
+        for (uint32_t i = 0; i < out_len; i++) out[i] = 0;
+        return -1;
+    }
+    return 0;
 }
 
 void tls_early_secret(const uint8_t* ikm, uint32_t ikm_len, uint8_t out[32]) {
-    // salt = 32 zero bytes (no PSK)
+    // salt = 32 zero bytes (no PSK). Infallible (HMAC-only).
     uint8_t zeros[32] = {0};
-    if (ikm == NULL) ikm = zeros, ikm_len = 32;
+    if (ikm == NULL) { ikm = zeros; ikm_len = 32; }
     hkdf_extract(zeros, 32, ikm, ikm_len, out);
+    secure_zero(zeros, sizeof(zeros));
 }
 
-void tls_derive_secret(const uint8_t secret[32], uint8_t out[32]) {
+int tls_derive_secret(const uint8_t secret[32], uint8_t out[32]) {
     // context = SHA-256("") = e3b0c4... (empty hash, well-known constant)
     uint8_t empty_hash[32];
     sha256(NULL, 0, empty_hash);
-    tls_hkdf_expand_label(secret, "derived", empty_hash, 32, out, 32);
+    int rc = tls_hkdf_expand_label(secret, "derived", empty_hash, 32, out, 32);
+    secure_zero(empty_hash, sizeof(empty_hash));
+    return rc;
 }
 
 void tls_handshake_secret(const uint8_t derived[32],
@@ -58,23 +71,25 @@ void tls_handshake_secret(const uint8_t derived[32],
 void tls_master_secret(const uint8_t derived2[32], uint8_t out[32]) {
     uint8_t zeros[32] = {0};
     hkdf_extract(derived2, 32, zeros, 32, out);
+    secure_zero(zeros, sizeof(zeros));
 }
 
-void tls_traffic_secret(const uint8_t base_secret[32],
+int tls_traffic_secret(const uint8_t base_secret[32],
                         const char* label,
                         const uint8_t* transcript_hash,
                         uint8_t out[32]) {
-    tls_hkdf_expand_label(base_secret, label, transcript_hash, 32, out, 32);
+    return tls_hkdf_expand_label(base_secret, label, transcript_hash, 32,
+                                 out, 32);
 }
 
-void tls_finished_key(const uint8_t traffic_secret[32], uint8_t out[32]) {
-    tls_hkdf_expand_label(traffic_secret, "finished", NULL, 0, out, 32);
+int tls_finished_key(const uint8_t traffic_secret[32], uint8_t out[32]) {
+    return tls_hkdf_expand_label(traffic_secret, "finished", NULL, 0, out, 32);
 }
 
-void tls_record_key(const uint8_t traffic_secret[32], uint8_t out[32]) {
-    tls_hkdf_expand_label(traffic_secret, "key", NULL, 0, out, 32);
+int tls_record_key(const uint8_t traffic_secret[32], uint8_t out[32]) {
+    return tls_hkdf_expand_label(traffic_secret, "key", NULL, 0, out, 32);
 }
 
-void tls_record_iv(const uint8_t traffic_secret[32], uint8_t out[12]) {
-    tls_hkdf_expand_label(traffic_secret, "iv", NULL, 0, out, 12);
+int tls_record_iv(const uint8_t traffic_secret[32], uint8_t out[12]) {
+    return tls_hkdf_expand_label(traffic_secret, "iv", NULL, 0, out, 12);
 }

@@ -22,6 +22,7 @@
 #include "js/js_dom.h"
 #include "theme.h"
 #include "crypto/rand.h"
+#include "string.h"
 #include "crypto/ec.h" // ec_init() eager curve build (see ec.h)
 #include "process.h"
 #include "sched.h"
@@ -85,18 +86,27 @@ static int info_win = -1;
 uint32_t tick_count = 0;
 int needs_redraw = 1; // Global flag: wallpaper + windows need full redraw
 
+// Scratch for inline <style> extraction (both fetch paths share it;
+// only live during parse).
+static char inline_css_scratch[INLINE_CSS_SCRATCH];
 // FPS tracking
 static uint32_t frame_count = 0;
 static uint32_t fps = 0;
 static uint32_t last_fps_tick = 0;
 
-// Desktop icon system
-#define ICON_SIZE 48
+// Desktop icon system (compact 32px boxes so the wallpaper shows through
+// and icon repairs stay cheap)
+#define ICON_SIZE 32
 #define ICON_LABEL_H (CHAR_H + 4) // one text row + margin
 #define ICON_SPACING 12
 #define ICONS_PER_ROW 10
 #define ICON_START_X 16
 #define ICON_START_Y 16
+// Label column pitch: 128px = 8 glyphs at 16px. Long names (e.g. readme.txt)
+// truncate with '~' — the price of compact icons.
+// 10 columns x 128px + 16px margin = 1296px < 1920px screen width.
+#define ICON_CELL_W 128
+#define ICON_LABEL_CHARS (ICON_CELL_W / CHAR_W)
 
 // 16x16 .txt file icon bitmap (1=white, 0=transparent)
 // A document with folded corner and horizontal lines
@@ -123,8 +133,8 @@ static void draw_txt_icon(int x, int y) {
     rect_fill(x, y, ICON_SIZE, ICON_SIZE, 0x00AAAAAA);
     rect_outline(x, y, ICON_SIZE, ICON_SIZE, 0x00555555, 2);
 
-    int ox = x + 16;
-    int oy = y + 8;
+    int ox = x + 8;
+    int oy = y + 4;
     for (int row = 0; row < 16; row++) {
         for (int col = 0; col < 16; col++) {
             int byte_idx = col / 8;
@@ -136,55 +146,128 @@ static void draw_txt_icon(int x, int y) {
     }
 }
 
+// Binary/program icon: same document silhouette, but dark-blue box + white
+// glyph so ELF files are visibly distinct from .txt files BEFORE opening.
+// Without this every icon looked like a text document and the read-only
+// view on open felt like a bug.
+static void draw_bin_icon(int x, int y) {
+    rect_fill(x, y, ICON_SIZE, ICON_SIZE, 0x00204080);
+    rect_outline(x, y, ICON_SIZE, ICON_SIZE, 0x0090C0FF, 2);
+
+    int ox = x + 8;
+    int oy = y + 2;
+    for (int row = 0; row < 16; row++) {
+        for (int col = 0; col < 16; col++) {
+            int byte_idx = col / 8;
+            int bit_idx = 7 - (col % 8);
+            if (txt_icon[row][byte_idx] & (1 << bit_idx)) {
+                putpixel(ox + col, oy + row, 0x00FFFFFF);
+            }
+        }
+    }
+    // No ">_" prompt marker: at 16x32 1x glyphs it no longer fits inside a
+    // 32px box (it would paint over the label). The blue box + white glyph
+    // already reads as executable.
+}
+
+// Mirrors editor.c's binary sniff (NUL => binary, >5% C0 controls/DEL =>
+// binary) so the icon predicts the actual open mode: text icon => editable
+// text view, blue icon => read-only text view. Peek is capped at 256 bytes
+// (enough to hit ELF headers) to keep region repairs cheap.
+static int icon_is_binary(const char* name) {
+    int sz = fs_get_size(name);
+    if (sz <= 0) return 0; // empty/missing opens as text
+    uint8_t peek[256];
+    int n = sz < 256 ? sz : 256;
+    int r = fs_read(name, peek, n);
+    if (r <= 0) return 0;
+    int ctrl = 0;
+    for (int i = 0; i < r; i++) {
+        if (peek[i] == 0) return 1;
+        if ((peek[i] < 32 && peek[i] != '\t' && peek[i] != '\n' && peek[i] != '\r') || peek[i] == 127)
+            ctrl++;
+    }
+    return (ctrl * 20 > r);
+}
+
+// Cached binary sniff per fs index: icon_is_binary() does an fs_read per
+// icon, and region repairs (cursor erase, drags) run constantly — without a
+// cache every mouse move re-reads every file. Validated by name pointer +
+// size (slots are stable; delete compacts indices so the ptr mismatches and
+// the entry recomputes; writes change size).
+static struct { const char* name; int size; int is_bin; } icon_bin_cache[16];
+static int icon_bin_cache_init = 0;
+
+static int icon_is_binary_cached(int fs_idx, const char* name) {
+    if (!icon_bin_cache_init) {
+        for (int i = 0; i < 16; i++) icon_bin_cache[i].name = 0;
+        icon_bin_cache_init = 1;
+    }
+    int sz = fs_get_size(name);
+    if (fs_idx >= 0 && fs_idx < 16 &&
+        icon_bin_cache[fs_idx].name == name &&
+        icon_bin_cache[fs_idx].size == sz)
+        return icon_bin_cache[fs_idx].is_bin;
+    int r = icon_is_binary(name);
+    if (fs_idx >= 0 && fs_idx < 16) {
+        icon_bin_cache[fs_idx].name = name;
+        icon_bin_cache[fs_idx].size = sz;
+        icon_bin_cache[fs_idx].is_bin = r;
+    }
+    return r;
+}
 // Draw desktop icons, optionally limited to those intersecting a repair rect
 // (pass 0,0,SCREEN_W,SCREEN_H to draw everything)
+static const char* icon_basename(const char* name);
+static int icon_file_hidden(const char* name);
+static int icon_slot_of(int fs_idx);
 static void draw_desktop_icons_in(int rx, int ry, int rw, int rh) {
     int count = fs_get_count();
     for (int i = 0; i < count; i++) {
         const char* name = fs_get_name(i);
         if (!name) continue;
+        int slot = icon_slot_of(i);
+        if (slot < 0) continue; // hidden (dotfiles) — no icon, no click target
 
-        int row = i / ICONS_PER_ROW;
-        int col = i % ICONS_PER_ROW;
-        int ix = ICON_START_X + col * (ICON_SIZE + ICON_SPACING);
+        int row = slot / ICONS_PER_ROW;
+        int col = slot % ICONS_PER_ROW;
+        int ix = ICON_START_X + col * ICON_CELL_W;
         int iy = ICON_START_Y + row * (ICON_SIZE + ICON_LABEL_H + ICON_SPACING);
+        int bx = ix + (ICON_CELL_W - ICON_SIZE) / 2; // box centered in cell
 
         // Icon + label footprint (label sits at iy+ICON_SIZE+4, 32px tall)
-        if (ix >= rx + rw || ix + ICON_SIZE <= rx ||
+        if (ix >= rx + rw || ix + ICON_CELL_W <= rx ||
             iy >= ry + rh || iy + ICON_SIZE + ICON_LABEL_H <= ry) {
             continue;
         }
 
-        draw_txt_icon(ix, iy);
+        if (icon_is_binary_cached(i, name)) draw_bin_icon(bx, iy);
+        else draw_txt_icon(bx, iy);
 
-        // Draw filename label centered below icon
+        // Draw the BASENAME centered in the cell ("/bin/hello" -> "hello":
+        // full paths all share a prefix, which is what made every label an
+        // identical "/b~" at 3-char budgets).
+        const char* base = icon_basename(name);
         int name_len = 0;
-        while (name[name_len]) name_len++;
+        while (base[name_len]) name_len++;
 
-        int label_x = ix + (ICON_SIZE - name_len * CHAR_W) / 2;
-        if (label_x < ix) label_x = ix;
-
-        // Truncate name to fit (max ~5 chars for 32px icon)
-        int max_chars = ICON_SIZE / CHAR_W;
-        if (max_chars > 6) max_chars = 6;
-
-        char label[8];
+        int max_chars = ICON_LABEL_CHARS;
+        char label[32];
+        if (max_chars > 31) max_chars = 31;
         int li = 0;
-        while (li < max_chars && name[li]) {
-            label[li] = name[li];
+        while (li < max_chars && base[li]) {
+            label[li] = base[li];
             li++;
         }
         label[li] = 0;
-        if (name_len > max_chars) {
+        if (name_len > max_chars && li > 0) {
             label[li - 1] = '~';
         }
+        int label_x = ix + (ICON_CELL_W - li * CHAR_W) / 2;
+        if (label_x < ix) label_x = ix;
 
-        draw_string(ix + 2, iy + ICON_SIZE + 4, label, 0x00FFFFFF, 0x00000000);
+        draw_string(label_x, iy + ICON_SIZE + 4, label, 0x00FFFFFF, 0x00000000);
     }
-}
-
-static void draw_desktop_icons(void) {
-    draw_desktop_icons_in(0, 0, SCREEN_W, SCREEN_H);
 }
 
 // Recomposite a screen region purely from the scene model:
@@ -256,16 +339,53 @@ static int cursor_py = 0;
 static int g_last_mouse_x = -1;
 static int g_last_mouse_y = -1;
 
+// Icon visibility: dotfiles (/.pins, /.rngseed, ...) are system state, not
+// user documents — they get no desktop icon (and no click target). Without
+// this every boot/browsing session pops a new cryptic icon onto the desktop.
+static const char* icon_basename(const char* name) {
+    int last = 0;
+    for (int i = 0; name[i]; i++) if (name[i] == '/') last = i + 1;
+    return name + last;
+}
+
+static int icon_file_hidden(const char* name) {
+    if (!name || !name[0]) return 1;
+    if (icon_basename(name)[0] == '.') return 1; // dotfiles
+    // Seeded system files live in /bin and /sbin (shell, init, test ELFs)
+    // and /readme.txt: needed on disk, but an eyesore as desktop icons.
+    // User documents elsewhere still get icons.
+    if (!strncmp(name, "/bin/", 5) || !strncmp(name, "/sbin/", 6)) return 1;
+    if (!strcmp(name, "/readme.txt")) return 1;
+    return 0;
+}
+
+// Visible-slot index of fs_idx (grid positions derive from it). Draw and
+// hit-test MUST share this mapping or clicks land on the wrong files.
+static int icon_slot_of(int fs_idx) {
+    int count = fs_get_count();
+    if (fs_idx < 0 || fs_idx >= count) return -1;
+    int slot = 0;
+    for (int i = 0; i < fs_idx; i++) {
+        const char* nm = fs_get_name(i);
+        if (nm && !icon_file_hidden(nm)) slot++;
+    }
+    const char* self = fs_get_name(fs_idx);
+    if (!self || icon_file_hidden(self)) return -1;
+    return slot;
+}
+
 // Returns file index if icon clicked, -1 otherwise
 static int check_icon_click(int mx, int my) {
     int count = fs_get_count();
     for (int i = 0; i < count; i++) {
-        int row = i / ICONS_PER_ROW;
-        int col = i % ICONS_PER_ROW;
-        int ix = ICON_START_X + col * (ICON_SIZE + ICON_SPACING);
+        int slot = icon_slot_of(i);
+        if (slot < 0) continue;
+        int row = slot / ICONS_PER_ROW;
+        int col = slot % ICONS_PER_ROW;
+        int ix = ICON_START_X + col * ICON_CELL_W;
         int iy = ICON_START_Y + row * (ICON_SIZE + ICON_LABEL_H + ICON_SPACING);
 
-        if (mx >= ix && mx < ix + ICON_SIZE &&
+        if (mx >= ix && mx < ix + ICON_CELL_W &&
             my >= iy && my < iy + ICON_SIZE + ICON_LABEL_H) {
             return i;
         }
@@ -487,10 +607,10 @@ static void open_sysinfo(void) {
     info_win = window_create("System Info", 600, 80, 700, 500);
     window_set_close_button(info_win, 1);
     window_set_minimize_button(info_win, 1);
-    window_puts(info_win, "okernel v0.7\n");
+    window_puts(info_win, "KAnarchy OS v0.8\n");
     window_puts(info_win, "Desktop Edition\n\n");
     window_puts(info_win, "Resolution: 1920x1080\n");
-    window_puts(info_win, "Shell: okernel sh\n");
+    window_puts(info_win, "Shell: kanarchy sh\n");
     window_puts(info_win, "Commands: help, clear,\n");
     window_puts(info_win, "echo, mem, uptime,\n");
     window_puts(info_win, "about, neofetch,\n");
@@ -513,6 +633,7 @@ static int create_terminal(void) {
     int win_id = window_create("Terminal", x, y, 900, 650);
     window_set_close_button(win_id, 1);
     window_set_minimize_button(win_id, 1);
+    window_set_red_chrome(win_id, 1);
     term_wins[term_count] = win_id;
     term_lens[term_count] = 0;
     term_bufs[term_count][0] = 0;
@@ -521,8 +642,8 @@ static int create_terminal(void) {
 }
 
 static void shell_prompt(int win_id) {
-    window_set_text_color(win_id, 10, 0); // Green on black
-    window_puts(win_id, "okernel> ");
+    window_set_text_color(win_id, 12, 0); // Anarchy red on black
+    window_puts(win_id, "kanarchy> ");
     window_set_text_color(win_id, 15, 0); // Back to white on black
 }
 
@@ -535,8 +656,9 @@ static int find_term_idx(int win_id) {
 
 static void destroy_terminal(int idx) {
     if (idx < 0 || idx >= term_count) return;
-    // Can't close the main terminal (idx 0)
-    if (idx == 0) return;
+    // Any terminal can close, including idx 0 (closing the last one leaves
+    // a bare desktop — Ctrl+Alt+T reopens from anywhere). Callers refocus
+    // only when terminals remain (see exit + title-X paths).
 
     window_destroy(term_wins[idx]);
 
@@ -571,32 +693,39 @@ static void shell_execute(int win_id, const char* input) {
     while (*args == ' ') args++;
 
     if (str_eq(cmd_buf, "help")) {
-        window_puts(win_id, "Commands:\n");
+        // Everyday commands only; networking utils and half-done tools
+        // live behind `help --a` so a casual user isn't offered them.
+        int adv = str_eq(args, "--a") || str_eq(args, "-a");
+        window_puts(win_id, adv ? "Commands (advanced):\n" : "Commands:\n");
         window_puts(win_id, "  help      - show this\n");
         window_puts(win_id, "  clear     - clear terminal\n");
         window_puts(win_id, "  echo      - print text\n");
         window_puts(win_id, "  mem       - memory info\n");
         window_puts(win_id, "  uptime    - system uptime\n");
-        window_puts(win_id, "  about     - about okernel\n");
+        window_puts(win_id, "  about     - about KAnarchy\n");
         window_puts(win_id, "  neofetch  - system info\n");
         window_puts(win_id, "  sysinfo   - open info window\n");
         window_puts(win_id, "  terminal  - open new terminal\n");
         window_puts(win_id, "  exit      - close this terminal\n");
-        window_puts(win_id, "  ping      - ping gateway\n");
-        window_puts(win_id, "  ip        - show IP address\n");
-        window_puts(win_id, "  netdrop N - drop 1-in-N TCP pkts (test)\n");
-        window_puts(win_id, "  resolve   - DNS lookup\n");
         window_puts(win_id, "  okai   - open web okai\n");
-        window_puts(win_id, "  edit      - open text editor\n");
         window_puts(win_id, "  ls        - list files\n");
-        window_puts(win_id, "  open      - open file in editor\n");
-        window_puts(win_id, "  disk      - disk + persistent FS status\n");
         window_puts(win_id, "  save      - force one file to disk\n");
-        window_puts(win_id, "  locktest  - spinlock/mutex selftest\n");
         window_puts(win_id, "  ps        - list processes\n");
         window_puts(win_id, "  run       - run ELF program (/bin/*) [&]\n");
         window_puts(win_id, "  reboot    - reboot system\n");
         window_puts(win_id, "  shutdown  - power off\n");
+        if (adv) {
+            window_puts(win_id, "  ping      - ping gateway\n");
+            window_puts(win_id, "  ip        - show IP address\n");
+            window_puts(win_id, "  netdrop N - drop 1-in-N TCP pkts (test)\n");
+            window_puts(win_id, "  resolve   - DNS lookup\n");
+            window_puts(win_id, "  edit      - open text editor\n");
+            window_puts(win_id, "  open      - open file in editor\n");
+            window_puts(win_id, "  disk      - disk + persistent FS status\n");
+            window_puts(win_id, "  locktest  - spinlock/mutex selftest\n");
+        } else {
+            window_puts(win_id, "  help --a  - show advanced commands\n");
+        }
     }
     else if (str_eq(cmd_buf, "ping")) {
         uint8_t* gw = net_get_gateway();
@@ -806,21 +935,22 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "s\n");
     }
     else if (str_eq(cmd_buf, "about")) {
-        window_set_text_color(win_id, 11, 0); // Cyan
-        window_puts(win_id, "        _                        _ \n");
-        window_puts(win_id, "       | |                      | |\n");
-        window_puts(win_id, "   ___ | | _____ _ __ _ __   ___| |\n");
-        window_puts(win_id, "  / _ \\| |/ / _ \\ '__| '_ \\ / _ \\ |\n");
-        window_puts(win_id, " | (_) |   <  __/ |  | | | |  __/ |\n");
-        window_puts(win_id, "  \\___/|_|\\_\\___|_|  |_| |_|\\___|_|\n\n");
+        window_set_text_color(win_id, 12, 0); // Anarchy red
+        window_puts(win_id, "  _  __      _                                      _\n");
+        window_puts(win_id, " | |/ /     / \\     _ __     __ _    _ __    ___   | |__     _   _\n");
+        window_puts(win_id, " | ' /     / _ \\   | '_ \\   / _` |  | '__|  / __|  | '_ \\   | | | |\n");
+        window_puts(win_id, " | . \\    / ___ \\  | | | | | (_| |  | |    | (__   | | | |  | |_| |\n");
+        window_puts(win_id, " |_|\\_\\  /_/   \\_\\ |_| |_|  \\__,_|  |_|     \\___|  |_| |_|   \\__, |\n");
+        window_puts(win_id, "                            |___/                            |___/\n\n");
         window_set_text_color(win_id, 15, 0); // White
-        window_puts(win_id, "okernel v0.7 - Desktop Edition\n");
+        window_puts(win_id, "KAnarchy OS v0.8 - Desktop Edition\n");
         window_puts(win_id, "Built from scratch in C and x86 assembly\n");
     }
     else if (str_eq(cmd_buf, "neofetch") || str_eq(cmd_buf, "sysinfo")) {
-        window_puts(win_id, "okernel v0.7\n");
+        window_puts(win_id, "KAnarchy OS v0.8\n");
+        window_puts(win_id, "Kernel: okernel v0.8\n");
         window_puts(win_id, "Resolution: 1920x1080 (2x scale)\n");
-        window_puts(win_id, "Shell: okernel sh\n");
+        window_puts(win_id, "Shell: kanarchy sh\n");
         window_puts(win_id, "Memory: ");
         uint32_t total = pmm_get_total_pages() * 4 / 1024;
         uint32_t used = pmm_get_used_pages() * 4 / 1024;
@@ -845,13 +975,14 @@ static void shell_execute(int win_id, const char* input) {
     }
     else if (str_eq(cmd_buf, "exit")) {
         int idx = find_term_idx(win_id);
-        if (idx == 0) {
-            window_puts(win_id, "Cannot close main terminal.\n");
-        } else {
+        if (idx >= 0) {
             destroy_terminal(idx);
-            // Focus the main terminal
-            active_term_idx = 0;
-            window_set_focus(term_wins[0]);
+            // Focus the newest live terminal, if any (closing the last one
+            // leaves a bare desktop — Ctrl+Alt+T reopens from anywhere).
+            if (term_count > 0) {
+                active_term_idx = term_count - 1;
+                window_set_focus(term_wins[active_term_idx]);
+            }
         }
     }
     else if (str_eq(cmd_buf, "reboot")) {
@@ -932,8 +1063,35 @@ static void shell_execute(int win_id, const char* input) {
 }
 
 static void on_keypress(char c) {
+    // Global hotkey: Ctrl+Alt+T opens a terminal from anywhere — editor,
+    // browser, bare desktop with zero terminals. Ctrl+T arrives as 0x14
+    // (driver control-code mapping); Alt is driver-tracked. Checked before
+    // focus routing so the shell is never more than a chord away.
+    if (c == 0x14 && keyboard_alt_held()) {
+        int id = create_terminal();
+        if (id >= 0) {
+            window_set_focus(id);
+            active_term_idx = term_count - 1;
+            shell_prompt(id);
+        }
+        return;
+    }
     int win_id = window_get_focused();
-    if (win_id < 0) return;
+    struct window* fw = win_id >= 0 ? window_get(win_id) : 0;
+    if (!fw || !fw->visible) {
+        // Focus died with its window (editor Ctrl+X close, closed okai
+        // tab/window, ...): fall back to the first live terminal so keyboard
+        // input never goes nowhere. Mouse users recover with one click;
+        // keyboard-only input would be stuck forever otherwise.
+        if (term_wins[0] >= 0) {
+            struct window* tw = window_get(term_wins[0]);
+            if (tw && tw->visible) {
+                window_set_focus(term_wins[0]);
+                active_term_idx = 0;
+                win_id = term_wins[0];
+            } else return;
+        } else return;
+    }
 
     // Check if this is an editor window
     int ed_id = editor_find_by_win(win_id);
@@ -968,8 +1126,14 @@ static void on_keypress(char c) {
         term_bufs[tidx][term_lens[tidx]] = 0;
         // Offer the completed line to any ring-3 reader on fd 0 (keyboard
         // line queue — sys_read(0) drains; non-blocking, drops when full).
-        sys_proc_kbd_offer(term_bufs[tidx], term_lens[tidx]);
-        // OFFER-WAKE, DEFERRED (2026-09-09: waking the reader INLINE (IRET
+        // Arm the offer-wake ONLY when the line was actually queued: arming
+        // on a dropped bootstrap line left a stale flag that later woke the
+        // wrong process (wait-parked init stole sh's input — the offer scan
+        // takes the oldest BLOCKED slot, so a stale arm fired it with no
+        // fresh line behind it).
+        if (sys_proc_kbd_offer(term_bufs[tidx], term_lens[tidx]))
+            kbd_wake_armed = 1;
+        // OFFER-WAKE SHAPE (2026-09-09: waking the reader INLINE (IRET
         // from inside the keyboard IRQ) faulted — #PF err=4 at the resume EIP
         // with pid=0 live: the IRQ trap frame (keyboard IRQ entered via
         // irq_common_stub on the CURRENT trap stack) is buried under our IRET
@@ -982,7 +1146,6 @@ static void on_keypress(char c) {
         // flag; the MAIN LOOP (plain thread context, next iteration) performs
         // the wake-enter. One flag word (kbd_wake_armed): set here, consumed
         // + cleared by the loop before its poll/draw tail.
-        kbd_wake_armed = 1;
         // FOREGROUND GATE (2026-09-08: sh read the STALE `run /bin/sh` line
         // because the kernel shell consumes every line even while a userland
         // foreground process owns the terminal — fresh keystrokes then race
@@ -1260,24 +1423,27 @@ void kernel_main(uint32_t mboot_phys) {
     outb(0x40, 0x9C);            // divisor lo  (1193182 / 100 = 11932 = 0x2E9C)
     outb(0x40, 0x2E);            // divisor hi
 
-    // Create main terminal — large, centered
-    term_wins[0] = window_create("Terminal", 40, 30, 900, 650);
+    // Create main terminal — extra-wide: the KAnarchy block logo is 109
+    // columns and must never wrap ((1400-2*WIN_BORDER)/12 = 116 cols).
+    term_wins[0] = window_create("Terminal", 260, 30, 1400, 650);
     window_set_close_button(term_wins[0], 1);
     window_set_minimize_button(term_wins[0], 1);
+    window_set_red_chrome(term_wins[0], 1);
     term_count = 1;
     active_term_idx = 0;
     window_set_focus(term_wins[0]);
 
-    window_set_text_color(term_wins[0], 11, 0);
-    window_puts(term_wins[0], "        _                        _ \n");
-    window_puts(term_wins[0], "       | |                      | |\n");
-    window_puts(term_wins[0], "   ___ | | _____ _ __ _ __   ___| |\n");
-    window_puts(term_wins[0], "  / _ \\| |/ / _ \\ '__| '_ \\ / _ \\ |\n");
-    window_puts(term_wins[0], " | (_) |   <  __/ |  | | | |  __/ |\n");
-    window_puts(term_wins[0], "  \\___/|_|\\_\\___|_|  |_| |_|\\___|_|\n\n");
+    window_set_text_color(term_wins[0], 12, 0);
+    window_puts(term_wins[0], " \x01\x01\x01\x01\x01   \x01\x01\x01\x01   \x01\x01\x01\x01\x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01     \x01\x01\x01\x01\x01\x01\x01\x01\x01  \x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01 \x01\x01\x01\x01\x01 \x01\x01\x01\x01\x01\n");
+    window_puts(term_wins[0], "\x02\x02\x01\x01\x01   \x01\x01\x01\x02   \x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01 \x02\x02\x01\x01\x01\x01\x01\x01 \x02\x02\x01\x01\x01   \x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01 \x02\x02\x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01   \x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01\x02\x02\x01\x01\x01   \x02\x02\x01\x01\x01 \x02\x02\x01\x01\x01 \x02\x02\x01\x01\x01 \n");
+    window_puts(term_wins[0], " \x02\x01\x01\x01  \x01\x01\x01    \x02\x01\x01\x01    \x02\x01\x01\x01  \x02\x01\x01\x01\x02\x01\x01\x01 \x02\x01\x01\x01  \x02\x01\x01\x01    \x02\x01\x01\x01  \x02\x01\x01\x01    \x02\x01\x01\x01  \x01\x01\x01     \x02\x02\x02  \x02\x01\x01\x01    \x02\x01\x01\x01  \x02\x02\x01\x01\x01 \x01\x01\x01  \n");
+    window_puts(term_wins[0], " \x02\x01\x01\x01\x01\x01\x01\x01     \x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01  \x02\x01\x01\x01\x02\x02\x01\x01\x01\x02\x01\x01\x01  \x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01  \x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01  \x02\x01\x01\x01          \x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01   \x02\x02\x01\x01\x01\x01\x01   \n");
+    window_puts(term_wins[0], " \x02\x01\x01\x01\x02\x02\x01\x01\x01    \x02\x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01  \x02\x01\x01\x01 \x02\x02\x01\x01\x01\x01\x01\x01  \x02\x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01  \x02\x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01 \x02\x01\x01\x01          \x02\x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01    \x02\x02\x01\x01\x01    \n");
+    window_puts(term_wins[0], " \x02\x01\x01\x01 \x02\x02\x01\x01\x01   \x02\x01\x01\x01    \x02\x01\x01\x01  \x02\x01\x01\x01  \x02\x02\x01\x01\x01\x01\x01  \x02\x01\x01\x01    \x02\x01\x01\x01  \x02\x01\x01\x01    \x02\x01\x01\x01 \x02\x02\x01\x01\x01     \x01\x01\x01 \x02\x01\x01\x01    \x02\x01\x01\x01     \x02\x01\x01\x01    \n");
+    window_puts(term_wins[0], " \x01\x01\x01\x01\x01 \x02\x02\x01\x01\x01\x01 \x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01 \x01\x01\x01\x01\x01  \x02\x02\x01\x01\x01\x01\x01 \x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01 \x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01 \x02\x02\x01\x01\x01\x01\x01\x01\x01\x01\x01  \x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01    \x01\x01\x01\x01\x01   \n");
+    window_puts(term_wins[0], "\x02\x02\x02\x02\x02   \x02\x02\x02\x02 \x02\x02\x02\x02\x02   \x02\x02\x02\x02\x02 \x02\x02\x02\x02\x02    \x02\x02\x02\x02\x02 \x02\x02\x02\x02\x02   \x02\x02\x02\x02\x02 \x02\x02\x02\x02\x02   \x02\x02\x02\x02\x02   \x02\x02\x02\x02\x02\x02\x02\x02\x02  \x02\x02\x02\x02\x02   \x02\x02\x02\x02\x02    \x02\x02\x02\x02\x02    \n");
     window_set_text_color(term_wins[0], 15, 0);
-    window_puts(term_wins[0], "Welcome to okernel v0.7\n");
-    window_puts(term_wins[0], "A minimalistic operating system.\n\n");
+    window_puts(term_wins[0], "Welcome to KAnarchy OS v0.8\n\n");
     window_set_text_color(term_wins[0], 8, 0);
     window_puts(term_wins[0], "Type 'help' for commands.\n");
     window_puts(term_wins[0], "Type 'terminal' for new window.\n");
@@ -1740,6 +1906,17 @@ void kernel_main(uint32_t mboot_phys) {
                 uint32_t reip = 0, resp = 0, rret = 0;
                 if (!sched_park_resume((uint32_t)rp->pid, &reip, &resp)) continue;
                 sched_park_take((uint32_t)rp->pid, &rret);
+                if (rret == (uint32_t)-2) {
+                    // WAIT-park, not a reader: a keyboard line is never
+                    // actionable for a waiter (it only wakes on zombie
+                    // children). Re-stage untouched and keep scanning —
+                    // taking the oldest BLOCKED slot unconditionally let
+                    // wait-parked init steal every line sh was parked on
+                    // (slot 1 always beat slot 2: deterministic starvation).
+                    extern void sched_park_stage(uint32_t, uint32_t, uint32_t, uint32_t);
+                    sched_park_stage((uint32_t)rp->pid, reip, resp, rret);
+                    continue;
+                }
                 serial_printf("[kbd-wake] pid=%d eip=%x esp=%x\n",
                               rp->pid, reip, resp);
                 {
@@ -1884,8 +2061,12 @@ void kernel_main(uint32_t mboot_phys) {
                 }
             }
 
-            // Check desktop icon clicks
-            if (!clicked) {
+            // Check desktop icon clicks. Windows (and their chrome) always
+            // win over icons: the icon grid sits at the top-left UNDER the
+            // default terminal, so an unchecked icon test steals clicks
+            // meant for windows (opening the editor on background files).
+            // Icons live on bare desktop — only test when no window is hit.
+            if (!clicked && window_from_point(mx, my) < 0) {
                 int icon_idx = check_icon_click(mx, my);
                 if (icon_idx >= 0) {
                     const char* name = fs_get_name(icon_idx);
@@ -1972,11 +2153,12 @@ void kernel_main(uint32_t mboot_phys) {
                                 // click inside the window dismisses it first.
                                 if (okai_lock_hit(br_id, mx, my)) {
                                     ok->show_security = !ok->show_security;
+                                    ok->chrome_dirty = 1;
                                     needs_redraw = 1;
                                     clicked = 1;
                                     break;
                                 }
-                                if (ok->show_security) { ok->show_security = 0; needs_redraw = 1; }
+                                if (ok->show_security) { ok->show_security = 0; ok->chrome_dirty = 1; needs_redraw = 1; }
                                 int on_close = 0;
                                 int ti = okai_tab_hit(br_id, mx, my, &on_close);
                                 if (ti >= 0) {
@@ -2049,9 +2231,18 @@ void kernel_main(uint32_t mboot_phys) {
                                     serial_printf("[okai] click row=%d col=%d (mx=%d my=%d) links=%d\n",
                                                   row, col, mx, my, T->link_count);
                                     for (int li = 0; li < T->link_count; li++) {
-                                        if (T->links[li].row == row &&
-                                            col >= T->links[li].col0 &&
-                                            col <= T->links[li].col1) {
+                                        // Multi-row spans (wrapped links):
+                                        // first row from col0, last row to
+                                        // col1, middle rows full width.
+                                        int r0 = T->links[li].row;
+                                        int r1 = T->links[li].end_row;
+                                        if (r1 < r0) r1 = r0;
+                                        if (row < r0 || row > r1) continue;
+                                        if (row == r0 && col < T->links[li].col0)
+                                            continue;
+                                        if (row == r1 && col > T->links[li].col1)
+                                            continue;
+                                        {
                                             serial_printf("[okai] LINK HIT li=%d -> %s\n",
                                                           li, T->links[li].href);
                                             // Links navigate the CURRENT tab
@@ -2076,6 +2267,13 @@ void kernel_main(uint32_t mboot_phys) {
 
         if (!mb) {
             if (drag_win >= 0 || resize_win >= 0) needs_redraw = 1; // settle on release
+            // A resize changes the content-grid geometry: re-lay-out browser
+            // pages now (the old layout plus blank fill would otherwise stay
+            // as black dead area). Terminals/editors keep their grids.
+            if (resize_win >= 0) {
+                int br_id = okai_find_by_win(resize_win);
+                if (br_id >= 0) okai_render_content(br_id);
+            }
             mouse_down = 0; drag_win = -1; resize_win = -1;
         }
         else { mouse_down = 1; }
@@ -2096,7 +2294,7 @@ void kernel_main(uint32_t mboot_phys) {
             struct okai_tab* T = ok ? okai_tab_of(ok) : 0;
             if (!ok) {
                 okai_fetch_owner = -1;
-        } else if (T->sub_res_phase > 0) {
+            } else if (T->sub_res_phase > 0) {
             // Sub-resource fetch in progress
             if (T->is_https) {
                 if (tls_is_done()) {
@@ -2116,13 +2314,22 @@ void kernel_main(uint32_t mboot_phys) {
                         }
                     }
                     if (okai_start_sub_res_fetch(bi) != 0) {
-                        okai_render_content(bi);
+                        // Queue drained: re-render only if a stylesheet
+                        // landed (JS-only completions change nothing and the
+                        // main render already painted).
+                        if (T->sub_res_css_changed) {
+                            T->sub_res_css_changed = 0;
+                            okai_render_content(bi);
+                        }
                         okai_fetch_owner = -1;
                     }
                 } else if (!tls_is_active() && !tls_is_done()) {
                     T->sub_res_idx++;
                     if (okai_start_sub_res_fetch(bi) != 0) {
-                        okai_render_content(bi);
+                        if (T->sub_res_css_changed) {
+                            T->sub_res_css_changed = 0;
+                            okai_render_content(bi);
+                        }
                         okai_fetch_owner = -1;
                     }
                 }
@@ -2133,13 +2340,19 @@ void kernel_main(uint32_t mboot_phys) {
                     char* resp = http_get_response();
                     if (resp) okai_sub_res_done(bi, resp, resp_len);
                     if (okai_start_sub_res_fetch(bi) != 0) {
-                        okai_render_content(bi);
+                        if (T->sub_res_css_changed) {
+                            T->sub_res_css_changed = 0;
+                            okai_render_content(bi);
+                        }
                         okai_fetch_owner = -1;
                     }
                 } else if (!http_is_pending() && !http_is_retry_pending() && !http_is_done()) {
                     T->sub_res_idx++;
                     if (okai_start_sub_res_fetch(bi) != 0) {
-                        okai_render_content(bi);
+                        if (T->sub_res_css_changed) {
+                            T->sub_res_css_changed = 0;
+                            okai_render_content(bi);
+                        }
                         okai_fetch_owner = -1;
                     }
                 }
@@ -2171,39 +2384,68 @@ void kernel_main(uint32_t mboot_phys) {
                         } else {
                             resp_len = http_dechunk(resp, resp_len);
                             int css_len = html_extract_css(resp, resp_len,
-                                                           T->css_text, OKAI_CSS_TEXT);
-                            T->css_n = css_parse(T->css_text, css_len,
+                                                           inline_css_scratch, INLINE_CSS_SCRATCH);
+                            T->css_n = css_parse(inline_css_scratch, css_len,
                                                   T->css_rules, CSS_MAX_RULES);
                             serial_printf("[br] css rules=%d\n", T->css_n);
                             serial_puts("[br] css text (first 200): ");
-                            for (int ci = 0; ci < 200 && T->css_text[ci]; ci++)
-                                serial_putchar(T->css_text[ci]);
+                            for (int ci = 0; ci < 200 && inline_css_scratch[ci]; ci++)
+                                serial_putchar(inline_css_scratch[ci]);
                             serial_putchar('\n');
                             int count = html_parse(resp, resp_len,
                                                   T->tokens, OKAI_TAB_TOKENS);
-                            serial_printf("[br] https parse: count=%d len=%d\n",
-                                          count, resp_len);
+                            dom_build(&T->dom, resp, resp_len);
+                            serial_printf("[br] https parse: count=%d len=%d dom_nodes=%d\n",
+                                          count, resp_len, T->dom.node_count);
                             T->token_count = count > 0 ? count : -1;
                             html_get_title(resp, resp_len, T->title, 64);
                             T->last_resp_len = resp_len;
+                            // Queue external <link rel=stylesheet>/<script src>
+                            // so the page completes with its real styling (the
+                            // desktop loop fetches them sequentially and
+                            // re-renders after each external CSS).
+                            okai_queue_sub_resources(bi, resp, resp_len);
                             okai_render_content(bi);
                             window_set_title(ok->win_id,
                                              T->title[0] ? T->title : "okai");
-                            okai_fetch_owner = -1;
+                            // Keep ownership when external resources were
+                            // queued: the sub_res_phase branch below only runs
+                            // while okai_fetch_owner >= 0, so clearing it here
+                            // would strand the queued stylesheets forever.
+                            // Kick the FIRST sub-resource fetch now:
+                            // start_sub_res_fetch resets the HTTP/TLS response
+                            // state, so without this kick the sub_res branch
+                            // below fires immediately on the STALE main-page
+                            // done/length and eats the first queued entry.
+                            if (T->sub_res_phase > 0) {
+                                okai_fetch_owner = bi;
+                                if (okai_start_sub_res_fetch(bi) != 0) {
+                                    okai_render_content(bi);
+                                    okai_fetch_owner = -1;
+                                }
+                            } else {
+                                okai_fetch_owner = -1;
+                            }
                         }
                     }
                 } else if (!tls_is_active() && !tls_is_done()) {
-                    // Fetch gave up. Classify: certificate/protocol failures
-                    // MUST NOT fall back to plain HTTP — a MITM can force that
-                    // downgrade by killing the TLS handshake. Only transport
-                    // failures (timeout / unreachable / no A record) downgrade.
+                    // Fetch gave up. Classify: certificate failures AND
+                    // secure-channel failures MUST NOT fall back to plain
+                    // HTTP — a MITM can force that downgrade by killing the
+                    // handshake. Only transport failures (timeout /
+                    // unreachable / no A record) downgrade. Cert problems
+                    // render the SECURITY WARNING; everything else (protocol
+                    // error, oversized page) renders a connection error —
+                    // never the cert warning (mislabeling trains users to
+                    // click through real warnings).
                     int fr = tls_get_fail_reason();
                     int cert_fail = (fr == TLS_FAIL_CERT ||
-                                     fr == TLS_FAIL_HOSTNAME ||
-                                     fr == TLS_FAIL_PROTO ||
+                                     fr == TLS_FAIL_HOSTNAME);
+                    int conn_fail = (fr == TLS_FAIL_PROTO ||
                                      fr == TLS_FAIL_MAC ||
                                      fr == TLS_FAIL_ALERT ||
-                                     fr == TLS_FAIL_RNG);
+                                     fr == TLS_FAIL_RNG ||
+                                     fr == TLS_FAIL_OVERFLOW);
                     if (cert_fail) {
                         serial_printf("[okai] TLS cert failure (reason=%d), no HTTP fallback for %s\n",
                                       fr, T->url);
@@ -2213,6 +2455,25 @@ void kernel_main(uint32_t mboot_phys) {
                         T->token_count = -1;
                         T->last_resp_len = 0;
                         okai_render_content(bi); // show SECURITY WARNING page
+                    } else if (conn_fail) {
+                        // Resumption fallback first: if the server aborted
+                        // our PSK resumption, retry once with a full
+                        // handshake (same origin, not a downgrade). Only
+                        // when that also fails do we show the error page.
+                        if (okai_resumption_fallback(bi, fr) == 0) {
+                            serial_printf("[okai] resumption retry in flight for %s\n", T->url);
+                        } else {
+                            serial_printf("[okai] TLS connection failure (reason=%d), no HTTP fallback for %s\n",
+                                          fr, T->url);
+                            T->conn_failed = 1;
+                            T->conn_kind = (fr == TLS_FAIL_OVERFLOW)
+                                               ? OKAI_CONN_TOOLARGE
+                                               : OKAI_CONN_PROTO;
+                            okai_fetch_owner = -1;
+                            T->token_count = -1;
+                            T->last_resp_len = 0;
+                            okai_render_content(bi); // show CONNECTION ERROR page
+                        }
                     } else if (okai_fallback_http(bi) == 0) {
                         serial_printf("[okai] http fallback in flight for %s\n", T->url);
                     } else {
@@ -2232,27 +2493,42 @@ void kernel_main(uint32_t mboot_phys) {
                     } else if (resp) {
                         resp_len = http_dechunk(resp, resp_len);
                         int css_len = html_extract_css(resp, resp_len,
-                                                       T->css_text, OKAI_CSS_TEXT);
-                        T->css_n = css_parse(T->css_text, css_len,
+                                                       inline_css_scratch, INLINE_CSS_SCRATCH);
+                        T->css_n = css_parse(inline_css_scratch, css_len,
                                               T->css_rules, CSS_MAX_RULES);
                         serial_printf("[br] css rules=%d\n", T->css_n);
                         serial_puts("[br] css text (first 200): ");
-                        for (int ci = 0; ci < 200 && T->css_text[ci]; ci++)
-                            serial_putchar(T->css_text[ci]);
+                        for (int ci = 0; ci < 200 && inline_css_scratch[ci]; ci++)
+                            serial_putchar(inline_css_scratch[ci]);
                         serial_putchar('\n');
                         int count = html_parse(resp, resp_len,
                                                T->tokens, OKAI_TAB_TOKENS);
-                        serial_printf("[br] parse: count=%d len=%d\n",
-                                      count, resp_len);
+                        dom_build(&T->dom, resp, resp_len);
+                        serial_printf("[br] parse: count=%d len=%d dom_nodes=%d\n",
+                                      count, resp_len, T->dom.node_count);
                         // -1 sentinel: "parsed, nothing renderable" — keeps this
                         // block from re-parsing every frame on empty pages
                         T->token_count = count > 0 ? count : -1;
                         html_get_title(resp, resp_len, T->title, 64);
                         T->last_resp_len = resp_len;
+                        // Queue external stylesheets/scripts (same as the
+                        // HTTPS path) so http pages get their real styling.
+                        okai_queue_sub_resources(bi, resp, resp_len);
                         okai_render_content(bi);
                         window_set_title(ok->win_id,
                                          T->title[0] ? T->title : "okai");
-                        okai_fetch_owner = -1;
+                        // Same kick as the HTTPS path above: fire the first
+                        // sub-resource fetch now (resets response state; a
+                        // stale done/length would otherwise eat queue entry 0).
+                        if (T->sub_res_phase > 0) {
+                            okai_fetch_owner = bi;
+                            if (okai_start_sub_res_fetch(bi) != 0) {
+                                okai_render_content(bi);
+                                okai_fetch_owner = -1;
+                            }
+                        } else {
+                            okai_fetch_owner = -1;
+                        }
                     }
                 } else if (!http_is_pending() && !http_is_retry_pending() && !http_is_done()) {
                     // Fetch gave up (connection closed with no data / unreachable)
@@ -2272,6 +2548,41 @@ void kernel_main(uint32_t mboot_phys) {
                         okai_fetch_owner = bi; // only claim ownership if a fetch fired
                     break;
                 }
+            }
+        }
+
+        // Fetch-status erase hook (companion to okai_draw_fetch_status):
+        // the progress pill is a pixel overlay, so when a fetch ends
+        // WITHOUT a repaint (JS-only subres drain, error pages drawn with
+        // window_puts), one content blit wipes its pixels. Successful
+        // fetches re-render anyway; the extra blit there is harmless.
+        {
+            static int st_active = 0;
+            static int st_bi = -1;
+            int cur_bi = -1;
+            long cur_rx = -1;
+            if (okai_fetch_owner >= 0) {
+                struct okai* sok = okai_get(okai_fetch_owner);
+                struct okai_tab* ST = sok ? okai_tab_of(sok) : 0;
+                if (sok && ST) {
+                    if (ST->is_https) {
+                        if (tls_is_active() && !tls_is_done()) {
+                            cur_bi = okai_fetch_owner;
+                            cur_rx = tls_get_progress_len();
+                        }
+                    } else if (!http_is_done() &&
+                               (http_is_pending() || http_is_retry_pending())) {
+                        cur_bi = okai_fetch_owner;
+                        cur_rx = http_get_response_len();
+                    }
+                }
+            }
+            if (cur_rx >= 0) { st_active = 1; st_bi = cur_bi; }
+            else if (st_active) {
+                st_active = 0;
+                int pb = st_bi; st_bi = -1;
+                struct okai* pok = (pb >= 0) ? okai_get(pb) : 0;
+                if (pok) okai_blit_content(pb);
             }
         }
 
@@ -2420,6 +2731,7 @@ void kernel_main(uint32_t mboot_phys) {
         // one per timer tick (100 Hz after the PIT bump), plus a 1-second idle
         // throttle so animations (cursor blink, clock) still advance.
         static uint32_t last_redraw_tick = 0;
+        static uint32_t chrome_last_paint = 0; // okai overlay throttle (~33Hz)
         int composed = (needs_redraw || (tick_count - last_redraw_tick >= 100));
         if (composed) {
             // The wallpaper and desktop icons already live in the persistent
@@ -2427,7 +2739,32 @@ void kernel_main(uint32_t mboot_phys) {
             // close/move). We no longer repaint the whole screen every frame,
             // and windows only repaint when they flagged themselves dirty
             // (keystroke, scroll, network data, cursor blink) — see window_draw.
-            draw_desktop_icons();
+            // Icons are the exception that proves the rule: repainting them
+            // on every composed frame draws them OVER clean windows (whose
+            // repaint is skipped), so icon boxes bled through terminal title
+            // bars. Repaint only when the SET changes (create/delete alters
+            // the count; writes never affect icons) — and repair through
+            // desktop_paint_rect, not draw_desktop_icons directly: a bare
+            // icon repaint would itself cover windows (the /.rngseed write
+            // lands mid-session with terminal windows already up). The
+            // region repair recomposites wallpaper -> icons -> windows in
+            // z-order, so occluded icons stay occluded.
+            {
+                static int last_icon_count = -1;
+                int nc = fs_get_count();
+                if (nc != last_icon_count) {
+                    int slots = 0;
+                    for (int i = 0; i < nc; i++) {
+                        const char* nm = fs_get_name(i);
+                        if (nm && !icon_file_hidden(nm)) slots++;
+                    }
+                    int rows = (slots + ICONS_PER_ROW - 1) / ICONS_PER_ROW;
+                    if (rows < 1) rows = 1;
+                    desktop_paint_rect(0, 0, SCREEN_W,
+                        ICON_START_Y + rows * (ICON_SIZE + ICON_LABEL_H + ICON_SPACING));
+                    last_icon_count = nc;
+                }
+            }
             needs_redraw = 0;
             last_redraw_tick = tick_count;
         }
@@ -2453,7 +2790,7 @@ void kernel_main(uint32_t mboot_phys) {
             for (int a = 0; a < nv; a++) {
                 int id = vis[a];
                 struct window* w = window_get(id);
-                window_draw(id);
+                int painted = window_draw(id);
                 int ob = okai_find_by_win(id);
                 if (ob >= 0) {
                     // Clip okai's overlay to the part of its window NOT covered
@@ -2463,40 +2800,84 @@ void kernel_main(uint32_t mboot_phys) {
                     // okai). The covering window is drawn later (higher z) and
                     // already occludes okai's content; okai's overlay only shows
                     // in the uncovered region.
-                    int rects[64][4], nr = 1;
-                    rects[0][0] = w->x; rects[0][1] = w->y;
-                    rects[0][2] = w->w; rects[0][3] = w->h;
-                    for (int c = a + 1; c < nv; c++) {
-                        struct window* hw = window_get(vis[c]);
-                        int hx0 = hw->x, hy0 = hw->y,
-                            hx1 = hw->x + hw->w, hy1 = hw->y + hw->h;
-                        int nr2 = 0, r2[64][4];
-                        for (int i = 0; i < nr; i++) {
-                            int rx = rects[i][0], ry = rects[i][1],
-                                rw = rects[i][2], rh = rects[i][3];
-                            int rx1 = rx + rw, ry1 = ry + rh;
-                            if (hx0 >= rx1 || hx1 <= rx || hy0 >= ry1 || hy1 <= ry) {
-                                r2[nr2][0]=rx; r2[nr2][1]=ry; r2[nr2][2]=rw; r2[nr2][3]=rh; nr2++;
-                                continue;
+                    //
+                    // Throttle: the overlay (tab strip + toolbar + headings)
+                    // repaints only when it can visibly change — its window
+                    // repainted (scroll/content, which blanks chrome rows),
+                    // chrome state changed (addr typing, popup, tabs), a tab
+                    // animation runs — plus a ~1Hz safety net so a missed
+                    // dirty flag self-heals instead of going stale forever.
+                    // (No blinking chrome exists; all inputs are state-driven.)
+                    struct okai* okw = okai_get(ob);
+                    int want = painted ||
+                        (okw && okw->chrome_dirty) ||
+                        okai_is_animating(ob) ||
+                        (tick_count - chrome_last_paint >= 120);
+                    if (want) {
+                        int rects[64][4], nr = 1;
+                        rects[0][0] = w->x; rects[0][1] = w->y;
+                        rects[0][2] = w->w; rects[0][3] = w->h;
+                        for (int c = a + 1; c < nv; c++) {
+                            struct window* hw = window_get(vis[c]);
+                            int hx0 = hw->x, hy0 = hw->y,
+                                hx1 = hw->x + hw->w, hy1 = hw->y + hw->h;
+                            int nr2 = 0, r2[64][4];
+                            for (int i = 0; i < nr; i++) {
+                                int rx = rects[i][0], ry = rects[i][1],
+                                    rw = rects[i][2], rh = rects[i][3];
+                                int rx1 = rx + rw, ry1 = ry + rh;
+                                if (hx0 >= rx1 || hx1 <= rx || hy0 >= ry1 || hy1 <= ry) {
+                                    r2[nr2][0]=rx; r2[nr2][1]=ry; r2[nr2][2]=rw; r2[nr2][3]=rh; nr2++;
+                                    continue;
+                                }
+                                if (rx < hx0) { r2[nr2][0]=rx; r2[nr2][1]=ry; r2[nr2][2]=hx0-rx; r2[nr2][3]=rh; nr2++; }
+                                if (rx1 > hx1) { r2[nr2][0]=hx1; r2[nr2][1]=ry; r2[nr2][2]=rx1-hx1; r2[nr2][3]=rh; nr2++; }
+                                int lx = rx > hx0 ? rx : hx0, rxr = rx1 < hx1 ? rx1 : hx1;
+                                if (ry < hy0) { r2[nr2][0]=lx; r2[nr2][1]=ry; r2[nr2][2]=rxr-lx; r2[nr2][3]=hy0-ry; nr2++; }
+                                if (ry1 > hy1) { r2[nr2][0]=lx; r2[nr2][1]=hy1; r2[nr2][2]=rxr-lx; r2[nr2][3]=ry1-hy1; nr2++; }
                             }
-                            if (rx < hx0) { r2[nr2][0]=rx; r2[nr2][1]=ry; r2[nr2][2]=hx0-rx; r2[nr2][3]=rh; nr2++; }
-                            if (rx1 > hx1) { r2[nr2][0]=hx1; r2[nr2][1]=ry; r2[nr2][2]=rx1-hx1; r2[nr2][3]=rh; nr2++; }
-                            int lx = rx > hx0 ? rx : hx0, rxr = rx1 < hx1 ? rx1 : hx1;
-                            if (ry < hy0) { r2[nr2][0]=lx; r2[nr2][1]=ry; r2[nr2][2]=rxr-lx; r2[nr2][3]=hy0-ry; nr2++; }
-                            if (ry1 > hy1) { r2[nr2][0]=lx; r2[nr2][1]=hy1; r2[nr2][2]=rxr-lx; r2[nr2][3]=ry1-hy1; nr2++; }
+                            if (nr2 > 64) nr2 = 64;
+                            nr = nr2;
+                            for (int i = 0; i < nr; i++) {
+                                rects[i][0]=r2[i][0]; rects[i][1]=r2[i][1];
+                                rects[i][2]=r2[i][2]; rects[i][3]=r2[i][3];
+                            }
                         }
-                        if (nr2 > 64) nr2 = 64;
-                        nr = nr2;
-                        for (int i = 0; i < nr; i++) {
-                            rects[i][0]=r2[i][0]; rects[i][1]=r2[i][1];
-                            rects[i][2]=r2[i][2]; rects[i][3]=r2[i][3];
+                        okai_paint_overlays_rects(ob, rects, nr);
+                        // Clear chrome-dirty only once the paint was visible:
+                        // a fully-covered window (nr==0) keeps it until the
+                        // repair path repaints the overlay on uncover.
+                        if (nr > 0) {
+                            if (okw) okw->chrome_dirty = 0;
+                            chrome_last_paint = tick_count;
                         }
                     }
-                    okai_paint_overlays_rects(ob, rects, nr);
                 }
             }
         }
-        window_draw_taskbar();
+        // Taskbar: state-gated, not per-frame. It has no clock/animation —
+        // only the window set (count/focus/minimize/titles) changes it, and
+        // region repairs (cursor erase, drags) repaint it when overlapped.
+        // The old code gradient-filled 1920px + bilinear title strings every
+        // main-loop spin.
+        {
+            static uint32_t last_taskbar_sig = 0xFFFFFFFF;
+            uint32_t sig = 0;
+            for (int i = 0; i < MAX_WINDOWS; i++) {
+                struct window* tw = window_get(i);
+                if (tw && tw->visible) {
+                    sig = sig * 33 + (uint32_t)(i + 1);
+                    sig = sig * 33 + (uint32_t)(tw->focused ? 7 : 1);
+                    sig = sig * 33 + (uint32_t)(tw->minimized ? 3 : 5);
+                    for (int k = 0; tw->title[k]; k++)
+                        sig = sig * 33 + (uint32_t)(unsigned char)tw->title[k];
+                }
+            }
+            if (sig != last_taskbar_sig) {
+                window_draw_taskbar();
+                last_taskbar_sig = sig;
+            }
+        }
 
         // FPS counter (drawn before the cursor so the sprite sits on top)
         static int g_show_fps = 1; // debug HUD; set 0 to leave the desktop clean
@@ -2504,6 +2885,7 @@ void kernel_main(uint32_t mboot_phys) {
             fps = frame_count;
             frame_count = 0;
             last_fps_tick = tick_count;
+            serial_printf("[fps] %u\n", fps); // 1Hz, headless perf ground truth
         }
         if (g_show_fps) {
             // FPS counter — box sized from glyph metrics ("FPS: 9999" = 9 cells)

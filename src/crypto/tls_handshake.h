@@ -157,12 +157,14 @@ int tls_parse_sh_psk(const uint8_t* sh_body, uint32_t sh_len);
 
 // ---- PSK key material (RFC 8446 §4.2.11 / §7.1) ----
 // PSK = HKDF-Expand-Label(resumption_master, "resumption", ticket_nonce, 32).
-void tls_resumption_psk(const uint8_t res_master[32],
+// Returns 0/-1 (bounds: nonce comes from the server ticket, capped at store).
+int tls_resumption_psk(const uint8_t res_master[32],
                         const uint8_t* nonce, uint32_t nonce_len,
                         uint8_t out_psk[32]);
 // binder key = HKDF-Expand-Label(early_secret, "res binder", "", 32)
 // (resumption PSKs always use the "res binder" label, never "ext binder").
-void tls_psk_binder_key(const uint8_t early_secret[32], uint8_t out[32]);
+// Returns 0/-1.
+int tls_psk_binder_key(const uint8_t early_secret[32], uint8_t out[32]);
 
 // Builds a ClientHello identical to tls_build_client_hello plus a trailing
 // pre_shared_key extension (single identity + 32B binder). `binder` is

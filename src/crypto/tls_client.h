@@ -63,6 +63,9 @@ struct tls_client_io {
 #define TLS_FAIL_HOSTNAME    5  // hostname does not match certificate
 #define TLS_FAIL_PROTO       6  // protocol violation
 #define TLS_FAIL_RNG         7  // entropy source unavailable (never synthesize keys)
+#define TLS_FAIL_OVERFLOW    8  // response exceeded caller buffer (page too
+                                // large — distinct from PROTO so the UI can
+                                // say so instead of crying certificate)
 
 enum tls_phase {
     TLS_PH_SEND_CH = 0,  // build + send ClientHello
@@ -179,9 +182,11 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io);
 
 // Wipe all ephemeral key material in a finished/failed state (review #30):
 // ECDHE private, handshake/app secrets + keys/ivs, master + resumption
-// master, PSK offer state, transcript + record + reassembly buffers.
-// Preserves: out/out_len/out_cap (caller response), fail codes + detail,
-// phase, host pointers, saw_close. Ticket/pin stores are
+// master, PSK offer state, transcript + record + reassembly buffers, plus
+// the static AEAD/decrypt scratch (send_inner/send_ct/dec_pt — wiped here
+// because they live outside the struct under the single-connection
+// contract). Preserves: out/out_len/out_cap (caller response), fail codes
+// + detail, phase, host pointers, saw_close. Ticket/pin stores are
 // connection-independent and intentionally survive (documented lifetimes,
 // not per-connection state).
 void tls_state_wipe(struct tls_state* st);
@@ -235,6 +240,7 @@ int tls_ticket_have(const char* host, uint64_t now_ms); // 1 if an unexpired
     // ticket is cached AS OF now_ms (explicit trusted time, ms — pass the
     // same clock given to tls_state_set_now_ms; 0/unknown is NOT fresh).
 void tls_ticket_clear(void);           // drop all (tests, memory hygiene)
+void tls_ticket_drop(const char* host); // drop one host (resumption fallback)
 
 // ---- HTTP response completeness over a TLS stream (cryptoholes #1) ----
 // A clean EOF (or missing close_notify) ends the STREAM, not provably the

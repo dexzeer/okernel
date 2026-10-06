@@ -1,6 +1,7 @@
 #include "aead.h"
 #include "chacha20.h"
 #include "poly1305.h"
+#include "memwipe.h"
 
 // RFC 8439 §2.8: one-time Poly1305 key = first 32 bytes of the ChaCha20
 // keystream at counter 0; payload encrypted at counter 1. MAC input is
@@ -38,8 +39,10 @@ int aead_chacha20_poly1305_encrypt(const uint8_t key[32], const uint8_t nonce[12
         // Refuse to emit an unauthenticated ciphertext: wipe the output so
         // a caller that ignores the return code sends zeros, not plaintext.
         for (uint32_t i = 0; i < in_len; i++) out[i] = 0;
+        secure_zero(poly_key_block, sizeof(poly_key_block));
         return -1;
     }
+    secure_zero(poly_key_block, sizeof(poly_key_block));
     return 0;
 }
 
@@ -59,10 +62,19 @@ int aead_chacha20_poly1305_decrypt(const uint8_t key[32], const uint8_t nonce[12
     chacha20_encrypt(key, nonce, 0, poly_key_block, poly_key_block, 64);
 
     uint8_t mac[16];
-    if (mac_poly1305(poly_key_block, aad, aad_len, in, in_len, mac) != 0)
+    if (mac_poly1305(poly_key_block, aad, aad_len, in, in_len, mac) != 0) {
+        secure_zero(poly_key_block, sizeof(poly_key_block));
+        secure_zero(mac, sizeof(mac));
         return -1; // oversize: refuse (never compare an unwritten MAC)
-    if (!ct_eq16(mac, tag)) return -1;
+    }
+    if (!ct_eq16(mac, tag)) {
+        secure_zero(poly_key_block, sizeof(poly_key_block));
+        secure_zero(mac, sizeof(mac));
+        return -1;
+    }
+    secure_zero(mac, sizeof(mac));
 
     chacha20_encrypt(key, nonce, 1, in, out, in_len);
+    secure_zero(poly_key_block, sizeof(poly_key_block));
     return 0;
 }

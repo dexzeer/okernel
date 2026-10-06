@@ -105,6 +105,8 @@ int main(void) {
         CHECK(x509_hostname_match(&leaf, "bad.example.com.attacker.io") != 0, "reject suffix spoof");
         CHECK(x509_hostname_match(&leaf, "evIl-example.com") != 0, "reject partial label");
         CHECK(x509_hostname_match(&leaf, "deep.a.example.com") != 0, "reject multi-label wildcard");
+        CHECK(x509_hostname_match(&leaf, "example.com.") == 0, "match FQDN trailing dot");
+        CHECK(x509_hostname_match(&leaf, "a.example.com.") == 0, "match FQDN wildcard");
 
         printf("== validity window ==\n");
         x509_time mid = { 2026, 9, 9, 12, 0, 0 };

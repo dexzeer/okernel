@@ -171,6 +171,21 @@ void tls_ticket_clear(void) {
         ((uint8_t*)ticket_slots)[i] = 0;
 }
 
+// Drop one host's ticket (resumption fallback: a backend that aborts our
+// PSK resumption would abort the identical retry forever — forget the
+// ticket so the next connection fully handshakes). Other hosts keep theirs.
+void tls_ticket_drop(const char* host) {
+    if (!host || !host[0]) return;
+    char chost[64];
+    if (tls_canon_host(chost, host) != 0) return;
+    for (int i = 0; i < TLS_TICKET_SLOTS; i++)
+        if (ticket_slots[i].used &&
+            ticket_host_eq(ticket_slots[i].host, chost)) {
+            for (uint32_t k = 0; k < sizeof(ticket_slots[i]); k++)
+                ((uint8_t*)&ticket_slots[i])[k] = 0;
+        }
+}
+
 // ---- HTTP framing parser (cryptoholes round 4, P1) ----
 // Line-oriented header analysis SHARED by the completeness gate
 // (tls_response_complete below) and the body consumer (http_dechunk in
@@ -664,31 +679,51 @@ static void make_nonce(uint8_t nonce[12], const uint8_t iv[12], uint64_t seq) {
 
 static int send_record(uint8_t type, const uint8_t* payload, uint32_t plen,
                        const struct tls_client_io* io) {
-    uint8_t buf[5 + 18432];
+    // Static scratch (stack-exhaustion fix): this was an 18KB stack frame
+    // on top of a state machine that already holds 16KB+ of reassembly.
+    // Single-connection contract (tls_client.h) makes static safe: one
+    // fetch at a time, main-loop only, no IRQ entry. Wiped after use
+    // (may carry the HTTP request).
+    static uint8_t buf[5 + 18432];
     uint32_t total = tls_record_build(type, payload, plen, buf);
-    if (total == 0) return -1;
-    return io->send(buf, total, io->user);
+    if (total == 0) { secure_zero(buf, sizeof(buf)); return -1; }
+    int rc = io->send(buf, total, io->user);
+    secure_zero(buf, sizeof(buf));
+    return rc;
 }
+
+// Static AEAD scratch (same stack-exhaustion rationale as send_record:
+// ~36KB of stack became static). Single-connection contract applies.
+// Both buffers are wiped on every exit (inner carries plaintext).
+static uint8_t send_inner[18432 + 1];
+static uint8_t send_ct[18432 + 16 + 1];
+// Static decrypt scratch shared by the RECV_HS / RECV_BODY phases (never
+// concurrent: the state machine is in exactly one phase). Wiped after each
+// record is consumed.
+static uint8_t dec_pt[TLS_RECORD_MAX_PAYLOAD];
 
 static int send_aead(uint8_t key[32], const uint8_t iv[12], uint64_t* seq,
                      uint8_t ct_type, const uint8_t* pt, uint32_t pt_len,
                      const struct tls_client_io* io) {
-    uint8_t inner[18432 + 1];
+    uint8_t* inner = send_inner;
     // Overflow discipline (review 2026-09-10 #2): NEVER add before
     // checking. `pt_len + 1 > sizeof` wraps at UINT32_MAX (→0, check
     // passes, 4GB memcpy). Bound pt_len itself; every sum below is then
     // safe by construction (pt_len ≤ 18432 → ct_len ≤ 18449).
-    if (pt_len >= sizeof(inner)) return -1;
+    if (pt_len >= sizeof(send_inner)) return -1;
     memcpy(inner, pt, pt_len);
     inner[pt_len] = ct_type;
 
     uint8_t nonce[12];
     // Sequence exhaustion (review #8/#29): TLS 1.3 forbids nonce reuse —
     // terminate before 2^64 wraps (practically unreachable; encoded anyway).
-    if (*seq == (uint64_t)0xFFFFFFFFFFFFFFFFull) return -1;
+    if (*seq == (uint64_t)0xFFFFFFFFFFFFFFFFull) {
+        secure_zero(inner, sizeof(send_inner));
+        return -1;
+    }
     make_nonce(nonce, iv, *seq); (*seq)++;
 
-    uint8_t ct[18432 + 16 + 1];
+    uint8_t* ct = send_ct;
     uint8_t tag[16];
     uint8_t aad[5];
     uint32_t ct_len = pt_len + 1 + 16;
@@ -697,15 +732,36 @@ static int send_aead(uint8_t key[32], const uint8_t iv[12], uint64_t* seq,
     // AEAD refusal (oversize) aborts the connection — never emit untagged
     // records (review 2026-09-10 #1).
     if (aead_chacha20_poly1305_encrypt(key, nonce, aad, 5,
-                                       inner, pt_len + 1, ct, tag) != 0)
+                                       inner, pt_len + 1, ct, tag) != 0) {
+        secure_zero(inner, sizeof(send_inner));
+        secure_zero(ct, sizeof(send_ct));
+        secure_zero(tag, sizeof(tag));
+        secure_zero(nonce, sizeof(nonce));
         return -1;
+    }
     memcpy(ct + pt_len + 1, tag, 16);
 
     uint8_t hdr[5];
     hdr[0] = TLS_CT_APPDATA; hdr[1] = 0x03; hdr[2] = 0x03;
     hdr[3] = (uint8_t)(ct_len >> 8); hdr[4] = (uint8_t)(ct_len & 0xff);
-    if (io->send(hdr, 5, io->user) != 0) return -1;
-    if (io->send(ct, ct_len, io->user) != 0) return -1;
+    if (io->send(hdr, 5, io->user) != 0) {
+        secure_zero(inner, sizeof(send_inner));
+        secure_zero(ct, sizeof(send_ct));
+        secure_zero(tag, sizeof(tag));
+        secure_zero(nonce, sizeof(nonce));
+        return -1;
+    }
+    if (io->send(ct, ct_len, io->user) != 0) {
+        secure_zero(inner, sizeof(send_inner));
+        secure_zero(ct, sizeof(send_ct));
+        secure_zero(tag, sizeof(tag));
+        secure_zero(nonce, sizeof(nonce));
+        return -1;
+    }
+    secure_zero(inner, sizeof(send_inner));
+    secure_zero(ct, sizeof(send_ct));
+    secure_zero(tag, sizeof(tag));
+    secure_zero(nonce, sizeof(nonce));
     return 0;
 }
 
@@ -796,8 +852,9 @@ static int tls_recv_record_st(struct tls_state* st, const struct tls_client_io* 
 
 // Decrypt the single fully-buffered record (st->rec_buf) under the given keys.
 // Returns inner plaintext length (minus trailing content-type byte) on success,
-// 0 for a ChangeCipherSpec (caller skips), -2 for an alert record (description
-// recorded in st->alert_desc), -1 on any other error (including MAC failure).
+// 0 for a ChangeCipherSpec (caller skips), -2 for a plaintext protocol
+// violation (alert record, or malformed CCS shape — recorded in
+// st->alert_desc for alerts), -1 on any other error (including MAC failure).
 static int tls_decrypt_one(struct tls_state* st, uint8_t key[32], uint8_t iv[12],
                            uint64_t* seq, uint8_t* pt, uint32_t ptcap,
                            uint8_t* ctype) {
@@ -807,7 +864,10 @@ static int tls_decrypt_one(struct tls_state* st, uint8_t key[32], uint8_t iv[12]
     if (v.type == TLS_CT_CHANGE_CIPHER_SPEC) {
         // Middlebox-compat CCS is exactly one 0x01 byte (review #25): any
         // other shape is a protocol violation, not something to skip over.
-        if (rec_pl != 1 || st->rec_buf[5] != 0x01) return -1;
+        // Mapped to -2 (plaintext protocol violation, like plaintext
+        // alerts below) so callers file it as PROTO, not MAC: no AEAD was
+        // involved, so "MAC failure" would mislead.
+        if (rec_pl != 1 || st->rec_buf[5] != 0x01) return -2;
         *ctype = TLS_CT_CHANGE_CIPHER_SPEC; return 0;
     }
     if (v.type == TLS_CT_ALERT) {
@@ -957,10 +1017,22 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                     ticket_slots[i].ticket_len <= 512) { tslot = &ticket_slots[i]; break; }
             if (tslot) {
                 uint8_t psk[32], early[32], bkey[32];
-                tls_resumption_psk(tslot->res_master, tslot->nonce,
-                                   tslot->nonce_len, psk);
+                // Key-schedule failures fail closed to a plain handshake:
+                // never offer a PSK derived from zeroed material.
+                if (tls_resumption_psk(tslot->res_master, tslot->nonce,
+                                       tslot->nonce_len, psk) != 0) {
+                    secure_zero(psk, sizeof(psk));
+                    secure_zero(early, sizeof(early));
+                    secure_zero(bkey, sizeof(bkey));
+                    goto no_psk;
+                }
                 tls_early_secret(psk, 32, early);
-                tls_psk_binder_key(early, bkey);
+                if (tls_psk_binder_key(early, bkey) != 0) {
+                    secure_zero(psk, sizeof(psk));
+                    secure_zero(early, sizeof(early));
+                    secure_zero(bkey, sizeof(bkey));
+                    goto no_psk;
+                }
                 uint32_t age_obf;
                 if (st->now_ms != 0 && st->now_ms >= tslot->received_ms)
                     age_obf = (uint32_t)(((st->now_ms - tslot->received_ms) +
@@ -973,46 +1045,75 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                     st->ch, sizeof(st->ch), st->random, st->session_id,
                     st->pub, st->host, tslot->ticket, tslot->ticket_len,
                     age_obf, zero_binder, &binder_off);
-                if (psk_len != 0 && binder_off + 32 == psk_len) {
-                    // Truncated transcript: type(1) || len(3, truncated) ||
-                    // body[0..truncated), truncated right AFTER the u16
-                    // binders-length field (binder entry prefix + values
-                    // excluded). This is ClientHello1 (RFC §4.2.11.2) — the
-                    // server reconstructs the identical prefix to check the
-                    // binder. binder_off points at the binder VALUES (msg
-                    // units, incl 4B HS header); the u16 field starts 3B
-                    // earlier (u16 len + u8 entry len), and body units drop
-                    // the 4B header: trunc_body = binder_off - 3 + 2 - 4.
-                    // (An earlier revision used -4, then -7 — both wrong by
-                    // up to 2B; caught because real servers *and* the mock
-                    // disagreed with us. The mock's parse-driven trunc
-                    // body_len-33 was right all along.)
-                    uint32_t trunc_body = binder_off - 5;
+                if (psk_len != 0 && binder_off + 32 == psk_len &&
+                    psk_len > 35 + 4) {
+                    // Truncated transcript (RFC 8446 §4.2.11.2, verified
+                    // against RFC 8448 §4 vectors): ClientHello1 is the full
+                    // handshake message MINUS the trailing binders field
+                    // (u16 binders-length + u8 entry-length + binder values
+                    // = 35 bytes for our single 32B binder), hashed VERBATIM
+                    // with the ORIGINAL 4-byte header — the header length is
+                    // NOT adjusted (RFC 8448's 477-octet prefix keeps
+                    // `01 00 01 fc` while hashing only 473 body bytes).
+                    // (Two earlier revisions hashed an adjusted header and
+                    // dropped only 33 bytes; OpenSSL answered
+                    // "binder does not verify" — the mock and the Python
+                    // evil server shared the same wrong math, so all three
+                    // agreed with each other and none with the RFC.)
+                    // Shape check: the 3 bytes before the binder values must
+                    // be the binders vector framing we emitted (u16 len 33,
+                    // u8 entry len 32); anything else falls back to a plain
+                    // handshake rather than offering a broken binder.
+                    if (!(st->ch[binder_off - 3] == 0x00 &&
+                          st->ch[binder_off - 2] == 33 &&
+                          st->ch[binder_off - 1] == 32)) {
+                        secure_zero(psk, sizeof(psk));
+                        secure_zero(early, sizeof(early));
+                        secure_zero(bkey, sizeof(bkey));
+                        goto no_psk;
+                    }
+                    uint32_t trunc_hash_len = psk_len - 35;
                     tls_transcript bt;
                     tls_transcript_init(&bt);
-                    {
-                        uint8_t hdr[4];
-                        hdr[0] = TLS_HS_CLIENT_HELLO;
-                        hdr[1] = (uint8_t)((trunc_body >> 16) & 0xff);
-                        hdr[2] = (uint8_t)((trunc_body >> 8) & 0xff);
-                        hdr[3] = (uint8_t)(trunc_body & 0xff);
-                        tls_transcript_update(&bt, hdr, 4);
-                        tls_transcript_update(&bt, st->ch + 4, trunc_body);
-                    }
+                    tls_transcript_update(&bt, st->ch, trunc_hash_len);
                     uint8_t th[32];
                     tls_transcript_final(&bt, th);
+                    // Binder = the FULL Finished construction with BaseKey
+                    // := binder_key (RFC 8446 §4.2.11.2 "computed in the same
+                    // way as the Finished message"): one more Expand-Label
+                    // ("finished") before the HMAC — NOT HMAC(bkey) direct
+                    // (proven against RFC 8448 §4 vectors: binder_key 69fe
+                    // -> expand "finished" -> 5588 -> HMAC -> wire binder).
                     uint8_t binder[32];
-                    hmac_sha256(bkey, 32, th, 32, binder);
+                    uint8_t fin_key[32];
+                    if (tls_finished_key(bkey, fin_key) != 0) {
+                        secure_zero(psk, sizeof(psk));
+                        secure_zero(early, sizeof(early));
+                        secure_zero(bkey, sizeof(bkey));
+                        secure_zero(fin_key, sizeof(fin_key));
+                        secure_zero(th, sizeof(th));
+                        secure_zero(&bt, sizeof(bt));
+                        goto no_psk;
+                    }
+                    hmac_sha256(fin_key, 32, th, 32, binder);
                     memcpy(st->ch + binder_off, binder, 32);
                     st->ch_len = psk_len;
                     memcpy(st->psk_early, early, 32);
                     st->offer_psk = 1;
                     tls_dbg("[tls] offering PSK for %s (ticket %uB)\n",
                             st->host, tslot->ticket_len);
+                    secure_zero(binder, sizeof(binder));
+                    secure_zero(fin_key, sizeof(fin_key));
+                    secure_zero(th, sizeof(th));
+                    secure_zero(&bt, sizeof(bt));
                 }
                 // else: builder overflow (absurd) — fall through to the
                 // plain CH already built above (offer_psk stays 0).
+                secure_zero(psk, sizeof(psk));
+                secure_zero(early, sizeof(early));
+                secure_zero(bkey, sizeof(bkey));
             }
+        no_psk:;
         }
         if (send_record(TLS_CT_HANDSHAKE, st->ch, st->ch_len, io) != 0) {
             st->fail_reason = TLS_FAIL_PROTO;
@@ -1027,7 +1128,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
     case TLS_PH_RECV_SH: {
         int r = tls_recv_record_st(st, io);
         if (r == 0) return TLS_STEP_AGAIN;
-        if (r < 0) return TLS_STEP_ERR;
+        if (r < 0) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
 
         tls_record rec_v;
         if (tls_record_parse_header(st->rec_buf, 5 + st->rec_pl, &rec_v) != 5) {
@@ -1150,16 +1251,39 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         else
             tls_early_secret(NULL, 0, early_secret);
         uint8_t derived[32];
-        tls_derive_secret(early_secret, derived);
+        // Every expand_label derivation is fallible: abort before any key
+        // use, and wipe the ECDHE shared secret + intermediates (they must
+        // not linger on the stack past the handshake).
+        if (tls_derive_secret(early_secret, derived) != 0) {
+            st->fail_reason = TLS_FAIL_PROTO;
+            secure_zero(early_secret, sizeof(early_secret));
+            secure_zero(derived, sizeof(derived));
+            secure_zero(shared, sizeof(shared));
+            secure_zero(transcript_after_sh, sizeof(transcript_after_sh));
+            return TLS_STEP_ERR;
+        }
         tls_handshake_secret(derived, shared, st->hs_secret);
         uint8_t s_hs[32];
-        tls_traffic_secret(st->hs_secret, "c hs traffic", transcript_after_sh, st->c_hs_secret);
-        tls_traffic_secret(st->hs_secret, "s hs traffic", transcript_after_sh, s_hs);
-        tls_record_key(st->c_hs_secret, st->c_hs_key);
-        tls_record_iv(st->c_hs_secret, st->c_hs_iv);
-        tls_record_key(s_hs, st->s_hs_key);
-        tls_record_iv(s_hs, st->s_hs_iv);
-        tls_finished_key(s_hs, st->s_fin_key);
+        if (tls_traffic_secret(st->hs_secret, "c hs traffic", transcript_after_sh, st->c_hs_secret) != 0 ||
+            tls_traffic_secret(st->hs_secret, "s hs traffic", transcript_after_sh, s_hs) != 0 ||
+            tls_record_key(st->c_hs_secret, st->c_hs_key) != 0 ||
+            tls_record_iv(st->c_hs_secret, st->c_hs_iv) != 0 ||
+            tls_record_key(s_hs, st->s_hs_key) != 0 ||
+            tls_record_iv(s_hs, st->s_hs_iv) != 0 ||
+            tls_finished_key(s_hs, st->s_fin_key) != 0) {
+            st->fail_reason = TLS_FAIL_PROTO;
+            secure_zero(early_secret, sizeof(early_secret));
+            secure_zero(derived, sizeof(derived));
+            secure_zero(shared, sizeof(shared));
+            secure_zero(s_hs, sizeof(s_hs));
+            secure_zero(transcript_after_sh, sizeof(transcript_after_sh));
+            return TLS_STEP_ERR;
+        }
+        secure_zero(early_secret, sizeof(early_secret));
+        secure_zero(derived, sizeof(derived));
+        secure_zero(shared, sizeof(shared));
+        secure_zero(s_hs, sizeof(s_hs));
+        secure_zero(transcript_after_sh, sizeof(transcript_after_sh));
 
         st->phase = TLS_PH_RECV_HS;
         st->rec_have = 0;
@@ -1170,12 +1294,12 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
     case TLS_PH_RECV_HS: {
         int r = tls_recv_record_st(st, io);
         if (r == 0) return TLS_STEP_AGAIN;
-        if (r < 0) return TLS_STEP_ERR;
+        if (r < 0) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
 
-        uint8_t pt[TLS_RECORD_MAX_PAYLOAD];
+        uint8_t* pt = dec_pt;
         uint8_t ctype;
         int pl = tls_decrypt_one(st, st->s_hs_key, st->s_hs_iv,
-                                 &st->s_seq, pt, sizeof(pt), &ctype);
+                                 &st->s_seq, pt, TLS_RECORD_MAX_PAYLOAD, &ctype);
         if (pl < 0) {
             // -2 = PLAINTEXT alert record (outer type ALERT, unencrypted).
             // Post-ServerHello every legitimate record is encrypted: a
@@ -1189,16 +1313,26 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             } else {
                 st->fail_reason = TLS_FAIL_MAC;
             }
+            secure_zero(dec_pt, sizeof(dec_pt));
             return TLS_STEP_ERR;
         }
-        if (ctype == TLS_CT_CHANGE_CIPHER_SPEC) { st->rec_have = 0; return TLS_STEP_AGAIN; }
+        if (ctype == TLS_CT_CHANGE_CIPHER_SPEC) {
+            st->rec_have = 0;
+            secure_zero(dec_pt, sizeof(dec_pt));
+            return TLS_STEP_AGAIN;
+        }
         if (ctype == TLS_CT_ALERT) {
             // Encrypted alert mid-handshake: body = level(1) + description(1).
             if (pl == 2) { st->alert_desc = pt[1]; st->fail_reason = TLS_FAIL_ALERT; }
             else st->fail_reason = TLS_FAIL_PROTO;
+            secure_zero(dec_pt, sizeof(dec_pt));
             return TLS_STEP_ERR;
         }
-        if (ctype != TLS_CT_HANDSHAKE) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
+        if (ctype != TLS_CT_HANDSHAKE) {
+            st->fail_reason = TLS_FAIL_PROTO;
+            secure_zero(dec_pt, sizeof(dec_pt));
+            return TLS_STEP_ERR;
+        }
 
         // Handshake-message reassembly (review #9 — RFC 8446 §5.1 permits
         // fragmenting handshake messages across records; servers do it for
@@ -1210,10 +1344,13 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         uint32_t upl = (uint32_t)pl;
         if (st->hs_have + upl > sizeof(st->hs_buf)) {
             tls_dbg("[tls] flight exceeds reassembly cap\n");
-            st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR;
+            st->fail_reason = TLS_FAIL_PROTO;
+            secure_zero(dec_pt, sizeof(dec_pt));
+            return TLS_STEP_ERR;
         }
         for (uint32_t i = 0; i < upl; i++) st->hs_buf[st->hs_have + i] = pt[i];
         st->hs_have += upl;
+        secure_zero(dec_pt, sizeof(dec_pt));
 
         uint32_t p = 0;
         while (p + 4 <= st->hs_have) {
@@ -1519,21 +1656,37 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             // transport error — flag it so the caller can distinguish it.
             tls_dbg("[tls] server Finished INVALID\n");
             st->fail_reason = TLS_FAIL_MAC;
+            secure_zero(tx_pre_sfin, sizeof(tx_pre_sfin));
             return TLS_STEP_ERR;
         }
+        secure_zero(tx_pre_sfin, sizeof(tx_pre_sfin));
 
         uint8_t tx_through_sfin[32];
         transcript_st(st, 1, NULL, tx_through_sfin);
 
         uint8_t derived2[32], master[32];
-        tls_derive_secret(st->hs_secret, derived2);
+        if (tls_derive_secret(st->hs_secret, derived2) != 0) {
+            st->fail_reason = TLS_FAIL_PROTO;
+            secure_zero(derived2, sizeof(derived2));
+            secure_zero(master, sizeof(master));
+            secure_zero(tx_through_sfin, sizeof(tx_through_sfin));
+            return TLS_STEP_ERR;
+        }
         tls_master_secret(derived2, master);
         uint8_t c_ap[32], s_ap[32];
-        tls_traffic_secret(master, "c ap traffic", tx_through_sfin, c_ap);
-        tls_traffic_secret(master, "s ap traffic", tx_through_sfin, s_ap);
-        tls_record_key(c_ap, st->c_ap_key); tls_record_iv(c_ap, st->c_ap_iv);
-        tls_record_key(s_ap, st->s_ap_key); tls_record_iv(s_ap, st->s_ap_iv);
-        tls_finished_key(st->c_hs_secret, st->c_fin_key);
+        if (tls_traffic_secret(master, "c ap traffic", tx_through_sfin, c_ap) != 0 ||
+            tls_traffic_secret(master, "s ap traffic", tx_through_sfin, s_ap) != 0 ||
+            tls_record_key(c_ap, st->c_ap_key) != 0 || tls_record_iv(c_ap, st->c_ap_iv) != 0 ||
+            tls_record_key(s_ap, st->s_ap_key) != 0 || tls_record_iv(s_ap, st->s_ap_iv) != 0 ||
+            tls_finished_key(st->c_hs_secret, st->c_fin_key) != 0) {
+            st->fail_reason = TLS_FAIL_PROTO;
+            secure_zero(derived2, sizeof(derived2));
+            secure_zero(master, sizeof(master));
+            secure_zero(c_ap, sizeof(c_ap));
+            secure_zero(s_ap, sizeof(s_ap));
+            secure_zero(tx_through_sfin, sizeof(tx_through_sfin));
+            return TLS_STEP_ERR;
+        }
 
         uint8_t our_fin[32];
         tls_build_finished(st->c_fin_key, tx_through_sfin, our_fin);
@@ -1547,9 +1700,25 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             uint8_t tx_both[32];
             transcript_st(st, 1, our_fin, tx_both);
             memcpy(st->master, master, 32); st->have_master = 1;
-            tls_traffic_secret(master, "res master", tx_both, st->res_master);
+            if (tls_traffic_secret(master, "res master", tx_both, st->res_master) != 0) {
+                st->fail_reason = TLS_FAIL_PROTO;
+                secure_zero(tx_both, sizeof(tx_both));
+                secure_zero(derived2, sizeof(derived2));
+                secure_zero(master, sizeof(master));
+                secure_zero(c_ap, sizeof(c_ap));
+                secure_zero(s_ap, sizeof(s_ap));
+                secure_zero(our_fin, sizeof(our_fin));
+                secure_zero(tx_through_sfin, sizeof(tx_through_sfin));
+                return TLS_STEP_ERR;
+            }
             st->have_res = 1;
+            secure_zero(tx_both, sizeof(tx_both));
         }
+        secure_zero(derived2, sizeof(derived2));
+        secure_zero(master, sizeof(master));
+        secure_zero(c_ap, sizeof(c_ap));
+        secure_zero(s_ap, sizeof(s_ap));
+        secure_zero(tx_through_sfin, sizeof(tx_through_sfin));
 
         uint8_t ccs[6] = { TLS_CT_CHANGE_CIPHER_SPEC, 0x03, 0x03, 0x00, 0x01, 0x01 };
         if (io->send(ccs, 6, io->user) != 0) return TLS_STEP_ERR;
@@ -1557,7 +1726,13 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         fin_msg[0] = TLS_HS_FINISHED; fin_msg[1] = 0; fin_msg[2] = 0; fin_msg[3] = 32;
         memcpy(fin_msg + 4, our_fin, 32);
         if (send_aead(st->c_hs_key, st->c_hs_iv, &st->c_seq,
-                      TLS_CT_HANDSHAKE, fin_msg, 36, io) != 0) return TLS_STEP_ERR;
+                      TLS_CT_HANDSHAKE, fin_msg, 36, io) != 0) {
+            secure_zero(our_fin, sizeof(our_fin));
+            secure_zero(fin_msg, sizeof(fin_msg));
+            return TLS_STEP_ERR;
+        }
+        secure_zero(our_fin, sizeof(our_fin));
+        secure_zero(fin_msg, sizeof(fin_msg));
 
         st->c_ap_seq = 0; st->s_ap_seq = 0;
         if (send_aead(st->c_ap_key, st->c_ap_iv, &st->c_ap_seq,
@@ -1593,10 +1768,10 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             return TLS_STEP_DONE;
         }
 
-        uint8_t pt[TLS_RECORD_MAX_PAYLOAD];
+        uint8_t* pt = dec_pt;
         uint8_t ctype;
         int pl = tls_decrypt_one(st, st->s_ap_key, st->s_ap_iv,
-                                 &st->s_ap_seq, pt, sizeof(pt), &ctype);
+                                 &st->s_ap_seq, pt, TLS_RECORD_MAX_PAYLOAD, &ctype);
         if (pl < 0) {
             // -2 = PLAINTEXT alert record (outer type ALERT, unencrypted).
             // Post-handshake everything legitimate arrives AEAD-sealed: a
@@ -1609,12 +1784,18 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             // the stream — never deliver partial plaintext as if clean.
             if (pl == -2) {
                 st->fail_reason = TLS_FAIL_PROTO;
+                secure_zero(dec_pt, sizeof(dec_pt));
                 return TLS_STEP_ERR;
             }
             st->fail_reason = TLS_FAIL_MAC;
+            secure_zero(dec_pt, sizeof(dec_pt));
             return TLS_STEP_ERR;
         }
-        if (ctype == TLS_CT_CHANGE_CIPHER_SPEC) { st->rec_have = 0; return TLS_STEP_AGAIN; }
+        if (ctype == TLS_CT_CHANGE_CIPHER_SPEC) {
+            st->rec_have = 0;
+            secure_zero(dec_pt, sizeof(dec_pt));
+            return TLS_STEP_AGAIN;
+        }
         if (ctype == TLS_CT_HANDSHAKE) {
             // Post-handshake handshake message: the only legal one here is
             // NewSessionTicket (RFC 8446 §4.6.1). Servers (Cloudflare et al.)
@@ -1641,12 +1822,14 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                 if (c == 0 || t != TLS_HS_NEW_SESSION_TICKET) {
                     tls_dbg("[tls] post-handshake msg type %u rejected\n", t);
                     st->fail_reason = TLS_FAIL_PROTO;
+                    secure_zero(dec_pt, sizeof(dec_pt));
                     return TLS_STEP_ERR;
                 }
                 struct tls_nst nst;
                 if (tls_parse_nst(pt + hp + 4, bl, &nst) != 0) {
                     tls_dbg("[tls] malformed ticket rejected\n");
                     st->fail_reason = TLS_FAIL_PROTO;
+                    secure_zero(dec_pt, sizeof(dec_pt));
                     return TLS_STEP_ERR;
                 }
                 if (st->have_res)
@@ -1658,8 +1841,13 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                 saw_nst = 1;
                 hp += c;
             }
-            if (!saw_nst) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
+            if (!saw_nst) {
+                st->fail_reason = TLS_FAIL_PROTO;
+                secure_zero(dec_pt, sizeof(dec_pt));
+                return TLS_STEP_ERR;
+            }
             st->rec_have = 0;
+            secure_zero(dec_pt, sizeof(dec_pt));
             return TLS_STEP_AGAIN;
         }
         if (ctype == TLS_CT_ALERT) {
@@ -1668,6 +1856,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                     st->fail_reason = TLS_FAIL_ALERT_CLOSE;
                     st->saw_close = 1; // authenticated stream end (see above)
                     st->phase = TLS_PH_DONE;
+                    secure_zero(dec_pt, sizeof(dec_pt));
                     return TLS_STEP_DONE;
                 }
                 st->alert_desc = pt[1];
@@ -1675,6 +1864,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             } else {
                 st->fail_reason = TLS_FAIL_PROTO;
             }
+            secure_zero(dec_pt, sizeof(dec_pt));
             return TLS_STEP_ERR;
         }
         if (ctype == TLS_CT_APPDATA) {
@@ -1686,14 +1876,24 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             // above; convert once, use unsigned below.
             uint32_t upl = (uint32_t)pl;
             if (st->out_len > st->out_cap ||
-                upl > st->out_cap - st->out_len) { st->fail_reason = TLS_FAIL_PROTO; st->phase = TLS_PH_DONE; return TLS_STEP_ERR; }
+                upl > st->out_cap - st->out_len) {
+                // Page too large for the caller buffer (distinct code, not
+                // PROTO: the stream is healthy, the page just doesn't fit —
+                // the UI must say "too large", never "certificate").
+                st->fail_reason = TLS_FAIL_OVERFLOW;
+                st->phase = TLS_PH_DONE;
+                secure_zero(dec_pt, sizeof(dec_pt));
+                return TLS_STEP_ERR;
+            }
             memcpy(st->out + st->out_len, pt, upl);
             st->out_len += upl;
         } else {
             st->fail_reason = TLS_FAIL_PROTO;
+            secure_zero(dec_pt, sizeof(dec_pt));
             return TLS_STEP_ERR;
         }
         st->rec_have = 0;
+        secure_zero(dec_pt, sizeof(dec_pt));
         return TLS_STEP_AGAIN;
     }
 
@@ -1738,6 +1938,11 @@ void tls_state_wipe(struct tls_state* st) {
     secure_zero(st->psk_early, sizeof(st->psk_early));
     secure_zero(st->rec_buf, sizeof(st->rec_buf));
     secure_zero(st->hs_buf, sizeof(st->hs_buf));
+    // Static scratch (single-connection contract): may hold plaintext,
+    // flight data, or request bytes from the just-finished connection.
+    secure_zero(dec_pt, sizeof(dec_pt));
+    secure_zero(send_inner, sizeof(send_inner));
+    secure_zero(send_ct, sizeof(send_ct));
     st->have_master = st->have_res = 0;
     st->offer_psk = st->psk_accepted = 0;
     st->c_ap_seq = st->s_ap_seq = st->c_seq = st->s_seq = 0;

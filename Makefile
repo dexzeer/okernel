@@ -30,6 +30,13 @@ COMMON_OBJ = src/gdt.o src/idt.o src/memory.o src/serial.o src/keyboard.o src/mo
 # Text mode objects
 TEXT_OBJ = src/vga.o src/shell.o src/terminal.o
 
+# Text boot keeps VGA text mode: start.asm built WITHOUT the multiboot
+# video request (desktop start.o asks GRUB for 1920x1080x32, which would
+# leave the text kernel writing an invisible 0xB8000).
+TEXT_ASM_OBJ = boot/start_text.o boot/isr.o
+boot/start_text.o: boot/start.asm
+	$(AS) $(ASFLAGS) -DTEXTMODE $< -o $@
+
 # Desktop mode objects
 # NOTE: -DKERNEL is set in CFLAGS below so the shared crypto/TLS source can
 # switch its stdio logging to serial_printf and its RNG to the kernel CPRNG.
@@ -39,7 +46,7 @@ TEXT_OBJ = src/vga.o src/shell.o src/terminal.o
 # fresh forktest never reached the ISO).
 USERLAND_GEN = $(wildcard userland/gen_*.h)
 src/userland_seed.o: $(USERLAND_GEN)
-DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/html.o src/css.o \
+DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/html.o src/css.o src/dom.o src/layout.o src/cjk.o \
               src/font_data.o \
               src/js/js_os.o src/js/js_var.o src/js/js_lex.o src/js/js_parse.o src/js/js_funcs.o src/js/js_math.o src/js/js_dom.o \
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
@@ -56,8 +63,8 @@ DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o
 # ---- Host tests (no QEMU; run from repo root — suites load tests/fixtures/*) ----
 # Offline must-pass: tls_crypto, css, subres, pki, adversarial (fast -O2 build;
 # the ASan build is 2-3x slower — see the commented line in the recipe).
-# Informational (never gates): text_decode (5 pre-existing Cyrillic FAILs) and
-# the live-network tls_client_test (needs internet to example.com:443).
+# Informational (never gates): text_decode (charset/entity/slot coverage)
+# and the live-network tls_client_test (needs internet to example.com:443).
 HOST_CRYPTO_SRC = src/crypto/tls_client.c src/crypto/tls_record.c src/crypto/tls_handshake.c \
               src/crypto/tls_keysched.c src/crypto/sha256.c src/crypto/sha1.c src/crypto/ocsp.c src/crypto/sha512.c \
               src/crypto/hmac.c src/crypto/hkdf.c src/crypto/aead.c \
@@ -72,9 +79,13 @@ host-tests:
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_strict tests/test_crypto_strict.c $(HOST_CRYPTO_SRC) && ./build-host/t_strict | tail -n 2
 	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_css tests/test_css.c src/css.c src/html.c && ./build-host/t_css | tail -n 2
 	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_subres tests/test_subres.c src/html.c src/css.c && ./build-host/t_subres | tail -n 2
+	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_render tests/test_render_pages.c src/html.c && ./build-host/t_render | tail -n 2
+	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_dom tests/test_dom.c src/dom.c src/html.c && ./build-host/t_dom | tail -n 2
+	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_layout tests/test_layout.c src/dom.c src/html.c src/css.c src/layout.c && ./build-host/t_layout | tail -n 2
+	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_edtext tests/test_editor_text.c src/editor.c src/html.c && ./build-host/t_edtext | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_pki tests/test_pki.c $(HOST_CRYPTO_SRC) && ./build-host/t_pki | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_adv tests/test_adversarial.c $(HOST_CRYPTO_SRC) && timeout 300 ./build-host/t_adv | tail -n 3
-	-gcc -m32 -DKERNEL=0 -Isrc -o build-host/t_td tests/test_text_decode.c src/html.c && ./build-host/t_td | tail -n 2; echo "(text_decode: 5 pre-existing Cyrillic FAILs expected)"
+	-gcc -m32 -DKERNEL=0 -Isrc -o build-host/t_td tests/test_text_decode.c src/html.c && ./build-host/t_td | tail -n 2; echo "(text_decode: informational)"
 	-gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tls_live tests/test_tls_client.c $(HOST_CRYPTO_SRC) && timeout 60 ./build-host/t_tls_live | tail -n 3; echo "(tls_client_test: needs internet; SKIP if unreachable)"
 
 # Sanitizer run of the adversarial suite (review P0 infra): every parser,
@@ -121,39 +132,40 @@ tls-interop:
 all: text
 
 # ---- Text mode build ----
-text: okernel-text.iso
+text: kanarchy-text.iso
 
-okernel-text.bin: $(ASM_OBJ) $(COMMON_OBJ) $(TEXT_OBJ) src/kernel.o
+kanarchy-text.bin: $(TEXT_ASM_OBJ) $(COMMON_OBJ) $(TEXT_OBJ) src/kernel.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
-okernel-text.iso: okernel-text.bin
+kanarchy-text.iso: kanarchy-text.bin
 	mkdir -p isodir/boot/grub
-	cp okernel-text.bin isodir/boot/okernel.bin
+	cp kanarchy-text.bin isodir/boot/kanarchy.bin
 	echo 'set timeout=0' > isodir/boot/grub/grub.cfg
 	echo 'set default=0' >> isodir/boot/grub/grub.cfg
 	echo '' >> isodir/boot/grub/grub.cfg
-	echo 'menuentry "okernel text" {' >> isodir/boot/grub/grub.cfg
-	echo '    multiboot /boot/okernel.bin' >> isodir/boot/grub/grub.cfg
+	echo 'menuentry "KAnarchy OS (text)" {' >> isodir/boot/grub/grub.cfg
+	echo '    set gfxpayload=text' >> isodir/boot/grub/grub.cfg
+	echo '    multiboot /boot/kanarchy.bin' >> isodir/boot/grub/grub.cfg
 	echo '    boot' >> isodir/boot/grub/grub.cfg
 	echo '}' >> isodir/boot/grub/grub.cfg
 	grub-mkrescue -o $@ isodir 2>/dev/null
 
 # ---- Desktop mode build ----
-desktop: okernel-desktop.iso
+desktop: kanarchy-desktop.iso
 
-okernel-desktop.bin: $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o linker-high.ld
+kanarchy-desktop.bin: $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o linker-high.ld
 	$(LD) $(LDFLAGS_HIGH) -o $@ $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o
 
-okernel-desktop.iso: okernel-desktop.bin
+kanarchy-desktop.iso: kanarchy-desktop.bin
 	rm -rf isodir
 	mkdir -p isodir/boot/grub
-	cp okernel-desktop.bin isodir/boot/okernel.bin
+	cp kanarchy-desktop.bin isodir/boot/kanarchy.bin
 	echo 'set timeout=0' > isodir/boot/grub/grub.cfg
 	echo 'set default=0' >> isodir/boot/grub/grub.cfg
 	echo '' >> isodir/boot/grub/grub.cfg
-	echo 'menuentry "okernel desktop" {' >> isodir/boot/grub/grub.cfg
+	echo 'menuentry "KAnarchy OS" {' >> isodir/boot/grub/grub.cfg
 	echo '    set gfxpayload=1920x1080x32' >> isodir/boot/grub/grub.cfg
-	echo '    multiboot /boot/okernel.bin' >> isodir/boot/grub/grub.cfg
+	echo '    multiboot /boot/kanarchy.bin' >> isodir/boot/grub/grub.cfg
 	echo '    boot' >> isodir/boot/grub/grub.cfg
 	echo '}' >> isodir/boot/grub/grub.cfg
 	grub-mkrescue -o $@ isodir 2>/dev/null
@@ -175,15 +187,15 @@ src/js/%.o: src/js/%.c $(HEADERS)
 
 # ---- Run ----
 run: text
-	qemu-system-i386 -cdrom okernel-text.iso -boot d
+	qemu-system-i386 -cdrom kanarchy-text.iso -boot d
 
 run-desktop: desktop
-	qemu-system-i386 -cdrom okernel-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0 -fullscreen
+	qemu-system-i386 -cdrom kanarchy-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0 -fullscreen
 
 debug: text
-	qemu-system-i386 -cdrom okernel-text.iso -boot d -serial stdio
+	qemu-system-i386 -cdrom kanarchy-text.iso -boot d -serial stdio
 
 clean:
-	rm -f $(ASM_OBJ) $(COMMON_OBJ) $(TEXT_OBJ) $(DESKTOP_OBJ) src/kernel.o src/desktop.o
-	rm -f okernel-text.bin okernel-text.iso okernel-desktop.bin okernel-desktop.iso
+	rm -f $(ASM_OBJ) boot/start_text.o $(COMMON_OBJ) $(TEXT_OBJ) $(DESKTOP_OBJ) src/kernel.o src/desktop.o
+	rm -f kanarchy-text.bin kanarchy-text.iso kanarchy-desktop.bin kanarchy-desktop.iso
 	rm -rf isodir

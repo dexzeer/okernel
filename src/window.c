@@ -1,6 +1,7 @@
 #include "window.h"
 #include "graphics.h"
 #include "theme.h"
+#include "cjk.h"
 #include "memory.h"
 #include "idt.h"
 #include "io.h"
@@ -9,6 +10,7 @@
 
 extern int needs_redraw;
 extern void desktop_paint_rect_pub(int x, int y, int w, int h);
+int window_rgb_is_light(uint32_t c); // defined below; used early by the blit path
 
 // VGA palette lookup for content rendering (non-static: okai reads it too so
 // headings drawn as raw pixels match the body text's color exactly)
@@ -207,6 +209,34 @@ static void cell_blank(struct window* w, int idx) {
     w->content[idx] = (uint16_t)((uint16_t)color << 8) | ' ';
     w->cell_fg[idx] = w->text_fg_rgb;
     w->cell_bg[idx] = w->text_bg_rgb;
+    if (w->cell_attr) w->cell_attr[idx] = 0;
+}
+
+// Partial-dirty tracking: narrow repaints to the cells that actually changed.
+// window_mark_all = full repaint (structural changes). window_mark_cell =
+// union one cell into the pending range. Callers must still set w->dirty=1
+// (all writers below do). Invariant: backbuffer == model everywhere outside
+// overlay/cursor pixels, so skipping unchanged cells is pixel-identical.
+static void window_mark_all(struct window* w) { w->pr_valid = 0; }
+static void window_mark_cell(struct window* w, int row, int col) {
+    if (!w || row < 0 || col < 0 || row >= w->content_h || col >= w->content_w)
+        return;
+    // A full repaint is already pending (dirty set, no range): a structural
+    // change (clear/scroll/resize) blanked or shifted the whole grid, so a
+    // later single-cell mark must NOT narrow it back to partial — the cells
+    // outside the range still differ from the backbuffer. Writers therefore
+    // mark BEFORE setting dirty (see window_put_char).
+    if (w->dirty && !w->pr_valid) return;
+    if (!w->pr_valid) {
+        w->pr_c0 = w->pr_c1 = col;
+        w->pr_r0 = w->pr_r1 = row;
+        w->pr_valid = 1;
+    } else {
+        if (col < w->pr_c0) w->pr_c0 = col;
+        if (col > w->pr_c1) w->pr_c1 = col;
+        if (row < w->pr_r0) w->pr_r0 = row;
+        if (row > w->pr_r1) w->pr_r1 = row;
+    }
 }
 
 static void window_apply_metrics(struct window* w) {
@@ -223,7 +253,7 @@ static void window_apply_metrics(struct window* w) {
     }
     w->cursor_x = 0; w->cursor_y = 0;
     w->scroll_off = 0; // resize reflows the grid — re-anchor at the live tail
-    w->dirty = 1; needs_redraw = 1;
+    w->dirty = 1; w->pr_valid = 0; needs_redraw = 1; // full repaint
 }
 
 int window_create(const char* title, int x, int y, int w, int h) {
@@ -233,11 +263,12 @@ int window_create(const char* title, int x, int y, int w, int h) {
             windows[i].visible = 1; windows[i].focused = 0; windows[i].font_scale = 1;
             windows[i].z = i;
             windows[i].no_titlebar = 0;
+            windows[i].red_chrome = 0; // reset: slot reuse must not leak themes
             windows[i].text_fg = 15; windows[i].text_bg = 0;
             windows[i].text_fg_rgb = vga_to_rgb[15]; windows[i].text_bg_rgb = vga_to_rgb[0];
             windows[i].content_bg = WIN_BG;
             windows[i].content_bg_rgb = WIN_BG_RGB;
-            windows[i].dirty = 1; needs_redraw = 1;
+            windows[i].dirty = 1; windows[i].pr_valid = 0; needs_redraw = 1; // full (slot reuse)
             sb_count[i] = 0; sb_next[i] = 0; windows[i].scroll_off = 0;
             int j = 0;
             while (title[j] && j < 31) { windows[i].title[j] = title[j]; j++; }
@@ -245,6 +276,7 @@ int window_create(const char* title, int x, int y, int w, int h) {
             windows[i].content = (uint16_t*)kmalloc(CONTENT_CELLS_MAX * sizeof(uint16_t));
             windows[i].cell_fg = (uint32_t*)kmalloc(CONTENT_CELLS_MAX * sizeof(uint32_t));
             windows[i].cell_bg = (uint32_t*)kmalloc(CONTENT_CELLS_MAX * sizeof(uint32_t));
+            windows[i].cell_attr = (uint8_t*)kmalloc(CONTENT_CELLS_MAX * sizeof(uint8_t));
             window_apply_metrics(&windows[i]); // sets content_w/h and blanks the buffer
             return i;
         }
@@ -264,6 +296,7 @@ void window_destroy(int id) {
     if (windows[id].content) { kfree(windows[id].content); windows[id].content = 0; }
     if (windows[id].cell_fg) { kfree(windows[id].cell_fg); windows[id].cell_fg = 0; }
     if (windows[id].cell_bg) { kfree(windows[id].cell_bg); windows[id].cell_bg = 0; }
+    if (windows[id].cell_attr) { kfree(windows[id].cell_attr); windows[id].cell_attr = 0; }
     windows[id].visible = 0;
     // Backbuffer is persistent now: repair the freed region (wallpaper + icons +
     // any window behind) instead of relying on a full per-frame repaint.
@@ -280,7 +313,18 @@ void window_raise(int id) {
 }
 
 void window_set_focus(int id) {
-    for (int i = 0; i < MAX_WINDOWS; i++) windows[i].focused = (i == id);
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        int was = windows[i].focused;
+        windows[i].focused = (i == id);
+        // Title-bar color follows focus: repaint both sides of the change.
+        // Without this the loser keeps its blue title until an unrelated
+        // repair (e.g. a drag passing over it) repaints it grey.
+        if (was != windows[i].focused) {
+            windows[i].dirty = 1;
+            window_mark_all(&windows[i]);
+            needs_redraw = 1;
+        }
+    }
     window_raise(id);   // focused window is always topmost
 }
 
@@ -290,6 +334,13 @@ void window_set_close_button(int id, int has_close) {
 
 void window_set_minimize_button(int id, int has_min) {
     if (id >= 0 && id < MAX_WINDOWS) windows[id].has_minimize_button = has_min;
+}
+
+void window_set_red_chrome(int id, int flag) {
+    if (id < 0 || id >= MAX_WINDOWS) return;
+    windows[id].red_chrome = flag ? 1 : 0;
+    windows[id].dirty = 1;
+    window_mark_all(&windows[id]);
 }
 
 void window_set_no_titlebar(int id, int flag) {
@@ -304,6 +355,7 @@ void window_set_hide_cursor(int id, int flag) {
     if (id < 0 || id >= MAX_WINDOWS) return;
     windows[id].hide_cursor = flag;
     windows[id].dirty = 1;
+    window_mark_all(&windows[id]);
 }
 
 int window_check_close_click(int id, int mx, int my) {
@@ -334,7 +386,7 @@ void window_minimize(int id) {
 }
 
 void window_restore(int id) {
-    if (id >= 0 && id < MAX_WINDOWS) { windows[id].minimized = 0; windows[id].dirty = 1; needs_redraw = 1; }
+    if (id >= 0 && id < MAX_WINDOWS) { windows[id].minimized = 0; windows[id].dirty = 1; window_mark_all(&windows[id]); needs_redraw = 1; }
 }
 
 void window_resize(int id, int new_w, int new_h) {
@@ -360,8 +412,15 @@ void window_resize(int id, int new_w, int new_h) {
     uint16_t blank = (uint16_t)color << 8 | ' ';
     for (int r = 0; r < nch; r++) {
         int from = (r < w->content_h) ? w->content_w : 0;
-        for (int c = from; c < ncw; c++)
-            w->content[r * CONTENT_COLS_MAX + c] = blank;
+        for (int c = from; c < ncw; c++) {
+            int k = r * CONTENT_COLS_MAX + c;
+            w->content[k] = blank;
+            // Fresh cells must not inherit stale plane data (same intent as
+            // the blank VGA byte above; previously only content was reset).
+            w->cell_fg[k] = w->text_fg_rgb;
+            w->cell_bg[k] = w->text_bg_rgb;
+            if (w->cell_attr) w->cell_attr[k] = 0;
+        }
     }
 
     w->content_w = ncw; w->content_h = nch;
@@ -424,26 +483,39 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
     int title_bottom = w->y + WIN_BORDER + title_off;
     // Border frame — drawn whenever the clip rect overlaps the window at all.
     if (rx < w->x + w->w && rx + rw > w->x && ry < w->y + w->h && ry + rh > w->y) {
-        uint32_t bc = w->focused ? BORDER_ACTIVE : BORDER_INACTIVE;
+        uint32_t bc = w->red_chrome ? CHROME_RED :
+                      (w->focused ? BORDER_ACTIVE : BORDER_INACTIVE);
         rect_outline(w->x, w->y, w->w, w->h, bc, WIN_BORDER);
     }
     // Title bar (skipped for title-bar-less windows; the client draws its own top).
     // Same blue gradient family as the browser toolbar (theme.h) so the OS
-    // chrome and the browser chrome read as one system.
+    // chrome and the browser chrome read as one system. Red-chrome (terminal)
+    // windows instead get a FLAT red bar: no gradient, no divider stroke.
     if (!w->no_titlebar &&
         rx < w->x + w->w && rx + rw > w->x && ry < title_bottom && ry + rh > w->y) {
         int tx = w->x + WIN_BORDER, ty = w->y + WIN_BORDER;
         int tw = w->w - 2 * WIN_BORDER;
-        if (w->focused)
+        if (w->red_chrome)
+            rect_fill(tx, ty, tw, WIN_TITLE_H, CHROME_RED);
+        else if (w->focused)
             gradient_fill(tx, ty, tw, WIN_TITLE_H, CHROME_TOOL_TOP, CHROME_TOOL_BOT, 1);
         else
             gradient_fill(tx, ty, tw, WIN_TITLE_H, TITLE_GRAD_U_TOP, TITLE_GRAD_U_BOT, 1);
-        hline(tx, ty + WIN_TITLE_H - 1, tw, TITLE_DIVIDER);
-        draw_string_fg(tx + 4, ty + 4, w->title,
+        if (!w->red_chrome) hline(tx, ty + WIN_TITLE_H - 1, tw, TITLE_DIVIDER);
+        // Title text: centered on red-chrome windows, left-aligned classic.
+        int txx = tx + 4;
+        if (w->red_chrome) {
+            int tlen = 0;
+            while (w->title[tlen] && tlen < 31) tlen++;
+            txx = tx + (tw - tlen * CHAR_W) / 2;
+            if (txx < tx + 4) txx = tx + 4;
+        }
+        draw_string_fg(txx, ty + 4, w->title,
                        w->focused ? TITLE_TEXT_F : TITLE_TEXT_U);
         if (w->has_close_button) {
             int bx = w->x + w->w - WIN_BORDER - 4 - WIN_BTN_W, by = w->y + WIN_BORDER;
-            round_rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, TBTN_CLOSE_BG, 4);
+            if (w->red_chrome) rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, CHROME_BTN_BG);
+            else round_rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, TBTN_CLOSE_BG, 4);
             int cx = bx + WIN_BTN_W / 2, cy = by + WIN_BTN_H / 2, d = 5;
             line(cx - d, cy - d, cx + d, cy + d, TBTN_FG);
             line(cx - d + 1, cy - d, cx + d + 1, cy + d, TBTN_FG);
@@ -452,7 +524,8 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
         }
         if (w->has_minimize_button) {
             int bx = w->x + w->w - WIN_BORDER - 8 - 2 * WIN_BTN_W, by = w->y + WIN_BORDER;
-            round_rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, TBTN_NEUTRAL_BG, 4);
+            if (w->red_chrome) rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, CHROME_BTN_BG);
+            else round_rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, TBTN_NEUTRAL_BG, 4);
             int cy = by + WIN_BTN_H / 2 + 4, d = 5;
             hline(bx + WIN_BTN_W / 2 - d, cy, 2 * d + 1, TBTN_FG);
             hline(bx + WIN_BTN_W / 2 - d, cy + 1, 2 * d + 1, TBTN_FG);
@@ -490,6 +563,7 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
                 // the exact-color RGB planes.
                 const uint16_t* src;
                 const uint32_t *sfg = 0, *sbg = 0; // RGB planes (live rows)
+                const uint8_t *sat = 0;           // attr plane (live rows)
                 if (w->scroll_off > 0 && row < w->scroll_off) {
                     int h = sb_count[wid] - w->scroll_off + row; // history line
                     int idx = ((sb_next[wid] - sb_count[wid] + h) % SB_ROWS
@@ -500,19 +574,39 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
                     src = w->content + lrow * CONTENT_COLS_MAX;
                     sfg = w->cell_fg + lrow * CONTENT_COLS_MAX;
                     sbg = w->cell_bg + lrow * CONTENT_COLS_MAX;
+                    if (w->cell_attr) sat = w->cell_attr + lrow * CONTENT_COLS_MAX;
                 }
                 for (int col = col_start; col < col_end; col++) {
                     int px = cx + col * char_w;
                     uint16_t entry = src[col];
                     char c = entry & 0xFF;
                     uint32_t fg, bg;
-                    if (sfg) { fg = sfg[col]; bg = sbg[col]; }
+                    uint8_t attr = 0;
+                    if (sfg) { fg = sfg[col]; bg = sbg[col]; if (sat) attr = sat[col]; }
                     else {
                         uint8_t color = (entry >> 8) & 0xFF;
                         fg = vga_to_rgb[color & 0x0F];
                         bg = vga_to_rgb[(color >> 4) & 0x0F];
                     }
-                    draw_char_sized(px, py, c, fg, bg, char_w, char_h);
+                    if (sat && (attr & 0x80)) {
+                        // CJK model cell (see window_write_cjk_cell): decode
+                        // the packed codepoint and draw from the bitmap table.
+                        // Glyph box is cell-wide, vertically centered.
+                        uint32_t cjk = ((fg >> 24) << 13) |
+                                       (((bg >> 24) & 0xFFu) << 5) |
+                                       (((uint32_t)attr >> 2) & 0x1Fu);
+                        const uint8_t* g = cjk_glyph_for(cjk);
+                        int side = char_w, yoff = (char_h - char_w) / 2;
+                        if (yoff < 0) { side = char_h; yoff = 0; }
+                        if (g) draw_cjk_box(px, py + yoff, g,
+                                            fg & 0xFFFFFFu, bg & 0xFFFFFFu,
+                                            side, side);
+                        else draw_char_cell(px, py, '?', fg & 0xFFFFFFu,
+                                            bg & 0xFFFFFFu, char_w, char_h,
+                                            attr & 3);
+                        continue;
+                    }
+                    draw_char_cell(px, py, c, fg, bg, char_w, char_h, attr);
                 }
             }
         }
@@ -539,22 +633,139 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
             } else {
                 int idx = w->cursor_y * CONTENT_COLS_MAX + w->cursor_x;
                 if (idx >= 0 && idx < CONTENT_CELLS_MAX) {
-                    draw_char_sized(bx, by, w->content[idx] & 0xFF,
-                        w->cell_fg[idx], w->cell_bg[idx], char_w, char_h);
+                    uint8_t attr = (w->cell_attr) ? w->cell_attr[idx] : 0;
+                    draw_char_cell(bx, by, w->content[idx] & 0xFF,
+                        w->cell_fg[idx], w->cell_bg[idx], char_w, char_h, attr);
                 }
             }
         }
     }
 }
 
-void window_draw(int id) {
+// Paint (px,py,pw,ph) of window id clipped to the parts NOT covered by
+// higher-z windows. A dirty lower window must never draw over a clean higher
+// one — the higher window won't repaint to cover it back, so background
+// terminal output would bleed straight through a fullscreen browser.
+// Falls back to an unclipped full paint if fragmentation overflows (a
+// transient overpaint self-heals; an unpainted hole would persist).
+#define OCCLUDE_MAX 24
+static void window_paint_uncovered(int id, int px, int py, int pw, int ph) {
     struct window* w = &windows[id];
-    if (!w->visible || w->minimized) return;
-    int blink = window_blink_on();
-    if (w->dirty || (w->focused && !w->hide_cursor && blink != w->last_cursor_visible)) {
-        window_paint_region(id, 0, 0, SCREEN_W, SCREEN_H);
-        w->dirty = 0; w->last_cursor_visible = blink;
+    int rects[OCCLUDE_MAX][4], nr = 1;
+    rects[0][0] = px; rects[0][1] = py; rects[0][2] = pw; rects[0][3] = ph;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        struct window* hw = &windows[i];
+        if (i == id || !hw->visible || hw->minimized || hw->z < w->z) continue;
+        if (hw->z == w->z) continue; // unique in practice; paint order covers ties
+        int hx0 = hw->x, hy0 = hw->y,
+            hx1 = hw->x + hw->w, hy1 = hw->y + hw->h;
+        int nr2 = 0, r2[OCCLUDE_MAX][4];
+        for (int k = 0; k < nr; k++) {
+            int rx = rects[k][0], ry = rects[k][1],
+                rw = rects[k][2], rh = rects[k][3];
+            int rx1 = rx + rw, ry1 = ry + rh;
+            if (hx0 >= rx1 || hx1 <= rx || hy0 >= ry1 || hy1 <= ry) {
+                if (nr2 < OCCLUDE_MAX) {
+                    r2[nr2][0]=rx; r2[nr2][1]=ry; r2[nr2][2]=rw; r2[nr2][3]=rh; nr2++;
+                } else goto fallback;
+                continue;
+            }
+            if (rx < hx0) {
+                if (nr2 >= OCCLUDE_MAX) goto fallback;
+                r2[nr2][0]=rx; r2[nr2][1]=ry; r2[nr2][2]=hx0-rx; r2[nr2][3]=rh; nr2++;
+            }
+            if (rx1 > hx1) {
+                if (nr2 >= OCCLUDE_MAX) goto fallback;
+                r2[nr2][0]=hx1; r2[nr2][1]=ry; r2[nr2][2]=rx1-hx1; r2[nr2][3]=rh; nr2++;
+            }
+            {
+                int lx = rx > hx0 ? rx : hx0, rxr = rx1 < hx1 ? rx1 : hx1;
+                if (ry < hy0) {
+                    if (nr2 >= OCCLUDE_MAX) goto fallback;
+                    r2[nr2][0]=lx; r2[nr2][1]=ry; r2[nr2][2]=rxr-lx; r2[nr2][3]=hy0-ry; nr2++;
+                }
+                if (ry1 > hy1) {
+                    if (nr2 >= OCCLUDE_MAX) goto fallback;
+                    r2[nr2][0]=lx; r2[nr2][1]=hy1; r2[nr2][2]=rxr-lx; r2[nr2][3]=ry1-hy1; nr2++;
+                }
+            }
+        }
+        nr = nr2;
+        for (int k = 0; k < nr; k++) {
+            rects[k][0]=r2[k][0]; rects[k][1]=r2[k][1];
+            rects[k][2]=r2[k][2]; rects[k][3]=r2[k][3];
+        }
+        if (nr == 0) { graphics_clip_reset(); return; }
     }
+    for (int k = 0; k < nr; k++) {
+        if (rects[k][2] <= 0 || rects[k][3] <= 0) continue;
+        graphics_set_clip(rects[k][0], rects[k][1], rects[k][2], rects[k][3]);
+        window_paint_region(id, rects[k][0], rects[k][1], rects[k][2], rects[k][3]);
+    }
+    graphics_clip_reset();
+    return;
+fallback:
+    graphics_clip_reset();
+    window_paint_region(id, px, py, pw, ph);
+}
+
+int window_draw(int id) {
+    struct window* w = &windows[id];
+    if (!w->visible || w->minimized) return 0;
+    int blink = window_blink_on();
+    int cursor_live = (w->focused && w->content && !w->hide_cursor);
+    int blink_changed = (cursor_live && blink != w->last_cursor_visible);
+    if (!w->dirty && !blink_changed) return 0;
+    if (w->dirty && w->pr_valid && !w->scroll_off && w->content) {
+        // Partial repaint: only the marked cells + the cursor cell. Typing a
+        // key repaints 1-3 cells instead of ~2000 — same pixels, ~1000x less.
+        // scroll_off>0 falls through to full (marks are buffer coords, the
+        // view shows history rows then).
+        int scale = w->font_scale;
+        int char_w = CONTENT_GW * scale, char_h = CONTENT_GH * scale;
+        int title_off = w->no_titlebar ? 0 : WIN_TITLE_H;
+        int cx = w->x + WIN_BORDER, cy = w->y + WIN_BORDER + title_off;
+        int c0 = w->pr_c0, c1 = w->pr_c1, r0 = w->pr_r0, r1 = w->pr_r1;
+        if (cursor_live) { // cursor cell must be in the clip (blink on/off)
+            if (w->cursor_x < c0) c0 = w->cursor_x;
+            if (w->cursor_x > c1) c1 = w->cursor_x;
+            if (w->cursor_y < r0) r0 = w->cursor_y;
+            if (w->cursor_y > r1) r1 = w->cursor_y;
+        }
+        if (c0 < 0) c0 = 0;
+        if (r0 < 0) r0 = 0;
+        if (c1 >= w->content_w) c1 = w->content_w - 1;
+        if (r1 >= w->content_h) r1 = w->content_h - 1;
+        if (c1 >= c0 && r1 >= r0) {
+            int px = cx + c0 * char_w, py = cy + r0 * char_h;
+            int pw = (c1 - c0 + 1) * char_w, ph = (r1 - r0 + 1) * char_h;
+            // Occlusion-clipped: never draw over a clean higher window.
+            window_paint_uncovered(id, px, py, pw, ph);
+        }
+        w->dirty = 0; w->pr_valid = 0; w->last_cursor_visible = blink;
+        return 1;
+    }
+    if (!w->dirty && w->scroll_off) {
+        // Blink toggled while scrolled back: the cursor belongs to the live
+        // tail (not painted in history view), so a repaint would be pure
+        // waste — just track the state. (Old code repainted the full window.)
+        w->last_cursor_visible = blink;
+        return 0;
+    }
+    if (!w->dirty) {
+        // Blink-only change: repaint just the cursor cell (uncovered only).
+        int scale = w->font_scale;
+        int char_w = CONTENT_GW * scale, char_h = CONTENT_GH * scale;
+        int title_off = w->no_titlebar ? 0 : WIN_TITLE_H;
+        int bx = w->x + WIN_BORDER + w->cursor_x * char_w;
+        int by = w->y + WIN_BORDER + title_off + w->cursor_y * char_h;
+        window_paint_uncovered(id, bx, by, char_w, char_h);
+        w->last_cursor_visible = blink;
+        return 1;
+    }
+    window_paint_uncovered(id, w->x, w->y, w->w, w->h);
+    w->dirty = 0; w->pr_valid = 0; w->last_cursor_visible = blink;
+    return 1;
 }
 
 void window_draw_all(void) {
@@ -566,7 +777,10 @@ void window_draw_all(void) {
 }
 
 void window_set_dirty(int id) {
-    if (id >= 0 && id < MAX_WINDOWS) windows[id].dirty = 1;
+    if (id >= 0 && id < MAX_WINDOWS) {
+        windows[id].dirty = 1;
+        window_mark_all(&windows[id]); // legacy callers mean full repaint
+    }
 }
 
 static void scroll_content(struct window* w) {
@@ -586,11 +800,13 @@ static void scroll_content(struct window* w) {
                 w->content[dst] = w->content[src];
                 w->cell_fg[dst] = w->cell_fg[src];
                 w->cell_bg[dst] = w->cell_bg[src];
+                if (w->cell_attr) w->cell_attr[dst] = w->cell_attr[src];
             }
         }
         int last = (w->content_h - 1) * CONTENT_COLS_MAX;
         for (int col = 0; col < w->content_w; col++) cell_blank(w, last + col);
         w->cursor_y = w->content_h - 1;
+        window_mark_all(w); // grid shifted — every row changed
     }
 }
 
@@ -606,7 +822,7 @@ void window_scroll_view(int id, int notches) {
     if (off < 0) off = 0;
     if (off != w->scroll_off) {
         w->scroll_off = off;
-        w->dirty = 1; needs_redraw = 1;
+        w->dirty = 1; window_mark_all(w); needs_redraw = 1;
         serial_printf("[scr] win=%d off=%d hist=%d\n", id, off, sb_count[id]);
     }
 }
@@ -614,6 +830,7 @@ void window_scroll_view(int id, int notches) {
 void window_put_char(int id, char c) {
     struct window* w = &windows[id];
     if (!w->visible || !w->content) return;
+    int ocx = w->cursor_x, ocy = w->cursor_y; // old cursor cell (blink erase)
     uint8_t color = (w->text_bg << 4) | w->text_fg;
     uint32_t idx = (uint32_t)w->cursor_y * CONTENT_COLS_MAX + w->cursor_x;
     if (c == '\n') { w->cursor_x = 0; w->cursor_y++; }
@@ -625,11 +842,19 @@ void window_put_char(int id, char c) {
             w->content[idx] = (uint16_t)((uint16_t)color << 8) | (uint16_t)(uint8_t)c;
             w->cell_fg[idx] = w->text_fg_rgb;
             w->cell_bg[idx] = w->text_bg_rgb;
+            if (w->cell_attr) w->cell_attr[idx] = 0; // terminal text is plain
             w->cursor_x++;
         }
     }
     if (w->cursor_x >= w->content_w) { w->cursor_x = 0; w->cursor_y++; }
-    scroll_content(w);
+    if (w->cursor_y >= w->content_h) {
+        scroll_content(w); // marks all internally
+    } else {
+        scroll_content(w);
+        // Typing touches at most the written cell + old/new cursor cells.
+        window_mark_cell(w, ocy, ocx);
+        window_mark_cell(w, w->cursor_y, w->cursor_x);
+    }
     w->dirty = 1;
 }
 
@@ -658,6 +883,8 @@ void window_write_cell(int id, int row, int col, char c, uint8_t fg, uint8_t bg)
     w->content[idx] = (uint16_t)((uint16_t)color << 8) | (uint8_t)c;
     w->cell_fg[idx] = vga_to_rgb[fg & 0x0F];
     w->cell_bg[idx] = vga_to_rgb[(bg >> 4) & 0x0F];
+    if (w->cell_attr) w->cell_attr[idx] = 0;
+    window_mark_cell(w, row, col);
     w->dirty = 1;
 }
 
@@ -666,10 +893,50 @@ void window_write_cell_rgb(int id, int row, int col, char c, uint32_t fg, uint32
     if (!w->visible || !w->content) return;
     if (row < 0 || row >= w->content_h || col < 0 || col >= w->content_w) return;
     uint32_t idx = (uint32_t)row * CONTENT_COLS_MAX + col;
-    uint8_t fgi = rgb_to_vga(fg), bgi = rgb_to_vga(bg);
+    // Legacy VGA byte: live okai rows paint from the RGB planes (never from
+    // this byte) and okai never enters the scrollback ring, so a full
+    // rgb_to_vga Euclidean match (16 entries x mults) per cell is pure waste
+    // on the hottest blit path. Luminance threshold keeps it plausible.
+    uint8_t fgi = window_rgb_is_light(fg) ? 15 : 0;
+    uint8_t bgi = window_rgb_is_light(bg) ? 15 : 0;
     w->content[idx] = (uint16_t)((uint16_t)(((bgi << 4) | fgi) << 8)) | (uint8_t)(uint8_t)c;
     w->cell_fg[idx] = fg;
     w->cell_bg[idx] = bg;
+    if (w->cell_attr) w->cell_attr[idx] = 0; // styling follows via window_write_cell_attr
+    window_mark_cell(w, row, col);
+    w->dirty = 1;
+}
+
+void window_write_cell_attr(int id, int row, int col, uint8_t attr) {
+    struct window* w = window_get(id);
+    if (!w || !w->visible || !w->content || !w->cell_attr) return;
+    if (row < 0 || row >= w->content_h || col < 0 || col >= w->content_w) return;
+    w->cell_attr[(uint32_t)row * CONTENT_COLS_MAX + col] = attr;
+    window_mark_cell(w, row, col);
+    w->dirty = 1;
+}
+
+// CJK model cell. The single-byte model cannot hold a 21-bit codepoint, so
+// it is bit-packed into the otherwise-unused high bytes: fg[31:24] holds
+// cp[20:13], bg[31:24] holds cp[12:5], and attr carries 0x80 (CJK flag) +
+// cp[4:0] in bits 6:2 with the styling bits (BOLD/UL) in 1:0. Repair
+// repaints decode the exact glyph from the model (branch below) — drags and
+// focus changes never degrade CJK to tofu. Block-slot cells (0x01/0x02
+// bytes) never set bit 7, so the two never collide.
+void window_write_cjk_cell(int id, int row, int col, uint32_t cp,
+                           uint32_t fg, uint32_t bg, uint8_t style) {
+    struct window* w = window_get(id);
+    if (!w || !w->visible || !w->content) return;
+    if (row < 0 || row >= w->content_h || col < 0 || col >= w->content_w) return;
+    uint32_t idx = (uint32_t)row * CONTENT_COLS_MAX + col;
+    uint8_t fgi = window_rgb_is_light(fg) ? 15 : 0;
+    uint8_t bgi = window_rgb_is_light(bg) ? 15 : 0;
+    w->content[idx] = (uint16_t)(((uint16_t)(((bgi << 4) | fgi) << 8)) | (uint8_t)' ');
+    w->cell_fg[idx] = (fg & 0xFFFFFFu) | (((cp >> 13) & 0xFFu) << 24);
+    w->cell_bg[idx] = (bg & 0xFFFFFFu) | (((cp >> 5) & 0xFFu) << 24);
+    if (w->cell_attr)
+        w->cell_attr[idx] = (uint8_t)(0x80 | (((cp & 0x1Fu) << 2) & 0xFFu) | (style & 3));
+    window_mark_cell(w, row, col);
     w->dirty = 1;
 }
 
@@ -692,6 +959,7 @@ void window_clear(int id) {
         for (int c = 0; c < w->content_w; c++)
             cell_blank(w, r * CONTENT_COLS_MAX + c);
     w->cursor_x = 0; w->cursor_y = 0; w->dirty = 1;
+    window_mark_all(w);
     sb_count[id] = 0; sb_next[id] = 0; w->scroll_off = 0; // wipe history too
 }
 
@@ -719,7 +987,7 @@ void window_set_content_bg(int id, uint8_t bg) {
         if (w->content_bg != bg || w->content_bg_rgb != vga_to_rgb[bg]) {
             w->content_bg = bg;
             w->content_bg_rgb = vga_to_rgb[bg];
-            w->dirty = 1; needs_redraw = 1;
+            w->dirty = 1; window_mark_all(w); needs_redraw = 1;
         }
     }
 }
@@ -732,7 +1000,7 @@ void window_set_content_bg_rgb(int id, uint32_t bg) {
             w->content_bg = rgb_to_vga(bg);
             w->text_bg = rgb_to_vga(bg);
             w->text_bg_rgb = bg;
-            w->dirty = 1; needs_redraw = 1;
+            w->dirty = 1; window_mark_all(w); needs_redraw = 1;
         }
     }
 }
@@ -754,6 +1022,7 @@ void window_set_title(int id, const char* title) {
     if (id < 0 || id >= MAX_WINDOWS) return;
     int j = 0; while (title[j] && j < 31) { windows[id].title[j] = title[j]; j++; }
     windows[id].title[j] = 0; windows[id].dirty = 1;
+    window_mark_all(&windows[id]);
 }
 
 void window_draw_taskbar(void) {

@@ -17,8 +17,8 @@ extern const uint32_t vga_to_rgb[16];
 #define WIN_TITLE_H (CHAR_H + 8)
 #define WIN_BORDER 2
 #define TASKBAR_H (CHAR_H + 12)
-#define WIN_BTN_W (CHAR_W + 8)
-#define WIN_BTN_H (CHAR_H + 4)
+#define WIN_BTN_W 30
+#define WIN_BTN_H 30   // square chrome buttons (hit-test uses these too)
 #define MIN_WIN_W 120
 #define MIN_WIN_H 80
 #define RESIZE_GRIP 16   // clickable corner zone
@@ -54,6 +54,11 @@ struct window {
     // are VGA-indexed (terminals only — okai never scrolls the window grid).
     uint32_t* cell_fg;
     uint32_t* cell_bg;
+    // Per-cell attribute bits (CELL_BOLD/CELL_UL from graphics.h), parallel
+    // to content/cell_fg/cell_bg. Zero for plain cells. NOT carried into the
+    // scrollback ring (history is VGA-indexed): scrolled-back bold/underline
+    // repaints plain — terminals only, okai re-blits live rows on scroll.
+    uint8_t* cell_attr;
     int cursor_x, cursor_y;
     int content_w, content_h;
     int font_scale;
@@ -64,6 +69,16 @@ struct window {
     uint32_t content_bg_rgb;             // page background as 0xRRGGBB
     int scroll_off;      // scrollback view offset (0 = live tail; see window.c)
     int hide_cursor;     // no blinking text cursor (browser windows)
+    // Partial-dirty cell range (inclusive). When dirty==1 and pr_valid==1,
+    // only this cell range (+ cursor cell) is repainted instead of the whole
+    // window — a keystroke repaints 1-2 cells, not ~2000. pr_valid==0 means
+    // full repaint (create/resize/clear/focus-affecting changes). New fields
+    // go at the TAIL (PCB-offset rule applies to struct process, same habit).
+    int pr_valid;
+    int pr_c0, pr_r0, pr_c1, pr_r1;
+    int red_chrome;  // anarchy terminal chrome: flat red title bar + border,
+                     // centered title, square black buttons. Set explicitly
+                     // per window (reset in window_create against slot reuse).
 };
 
 void window_init(void);
@@ -72,7 +87,7 @@ void window_destroy(int id);
 void window_set_focus(int id);
 void window_raise(int id);   // bump a window to the top of the z-stack
 int window_get_focused(void);
-void window_draw(int id);
+int window_draw(int id); // returns 1 if anything was painted (drives okai overlay throttle)
 void window_draw_all(void);
 void window_set_dirty(int id); // mark a window for re-render (used by animating chrome)
 void window_paint_region(int id, int rx, int ry, int rw, int rh);
@@ -83,10 +98,18 @@ void window_puts(int id, const char* str);
 void window_write_cell(int id, int row, int col, char c, uint8_t fg, uint8_t bg);
 // Same, with exact 0xRRGGBB colors (true-color blit path).
 void window_write_cell_rgb(int id, int row, int col, char c, uint32_t fg, uint32_t bg);
+// Set a blitted cell's attribute bits (CELL_BOLD/CELL_UL) after
+// window_write_cell_rgb (which zeroes them). Used by the okai blit.
+void window_write_cell_attr(int id, int row, int col, uint8_t attr);
+// CJK model cell for the okai blit (bit-packs the codepoint; see window.c).
+// style carries CELL_BOLD/CELL_UL only (bits 1:0).
+void window_write_cjk_cell(int id, int row, int col, uint32_t cp,
+                           uint32_t fg, uint32_t bg, uint8_t style);
 void window_clear(int id);
 void window_set_font_scale(int id, int scale);
 void window_set_close_button(int id, int has_close);
 void window_set_minimize_button(int id, int has_min);
+void window_set_red_chrome(int id, int flag); // flat-red anarchy terminal chrome
 void window_set_no_titlebar(int id, int flag);
 void window_set_hide_cursor(int id, int flag);
 int window_check_close_click(int id, int mx, int my);
