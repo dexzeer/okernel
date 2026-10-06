@@ -51,19 +51,18 @@ void kernel_main(uint32_t mboot_addr) {
     memory_init(mboot_addr);
     terminal_init();
 
-    terminal_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
-    terminal_puts("        _                        _ \n");
-    terminal_puts("       | |                      | |\n");
-    terminal_puts("   ___ | | _____ _ __ _ __   ___| |\n");
-    terminal_puts("  / _ \\| |/ / _ \\ '__| '_ \\ / _ \\ |\n");
-    terminal_puts(" | (_) |   <  __/ |  | | | |  __/ |\n");
-    terminal_puts("  \\___/|_|\\_\\___|_|  |_| |_|\\___|_|\n");
+    terminal_set_color(VGA_LIGHT_RED, VGA_BLACK);
+    terminal_puts("  _  __      _                                      _\n");
+    terminal_puts(" | |/ /     / \\     _ __     __ _    _ __    ___   | |__     _   _\n");
+    terminal_puts(" | ' /     / _ \\   | '_ \\   / _` |  | '__|  / __|  | '_ \\   | | | |\n");
+    terminal_puts(" | . \\    / ___ \\  | | | | | (_| |  | |    | (__   | | | |  | |_| |\n");
+    terminal_puts(" |_|\\_\\  /_/   \\_\\ |_| |_|  \\__,_|  |_|     \\___|  |_| |_|   \\__, |\n");
+    terminal_puts("                            |___/                            |___/\n");
     terminal_puts("                                    \n");
     terminal_puts("                                    \n\n");
 
     terminal_set_color(VGA_WHITE, VGA_BLACK);
-    terminal_puts("Welcome to okernel v0.1\n");
-    terminal_puts("A minimalistic operating system.\n\n");
+    terminal_puts("Welcome to KAnarchy OS v0.1 (text)\n\n");
     terminal_set_color(VGA_LIGHT_GREY, VGA_BLACK);
     terminal_puts("Type 'help' for available commands.\n");
     terminal_puts("Type 'terminal' to open a new terminal.\n");

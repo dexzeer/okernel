@@ -758,8 +758,8 @@ static int mock_check_psk_offer(void) {
             id = body + q; id_len = ilen; q += ilen + 4; // skip age
             if (q + 2 > p + l) return 0;
             uint32_t blen = (body[q] << 8) | body[q+1]; q += 2;
-            // RFC 8446 §4.2.11.2: binders<33..> with a u8-prefixed
-            // PskBinderEntry — 33B total, entry len byte must be 32.
+            // Binders field (RFC 8448 §4 bytes): u16 vector length (33)
+            // + u8 entry length (32) + 32B binder = 35B total.
             if (blen != 33 || q + 33 > p + l) return 0;
             if (body[q] != 32) return 0;
             binder = body + q + 1;
@@ -770,27 +770,29 @@ static int mock_check_psk_offer(void) {
     if (!modes_ok) return 0; // no common kex mode: server must ignore PSK
     for (uint32_t i = 0; i < id_len; i++)
         if (id[i] != psv_ticket[i]) return 0;
-    // Independent binder recompute: ClientHello1 = type || len(trunc) ||
-    // body[:trunc], trunc right after the u16 binders-length field (the
-    // binder entry prefix + 32B value are the last 33B of the body).
-    uint32_t trunc = body_len - 33;
-    uint8_t psk[32], early[32], bkey[32], th[32], want[32];
+    // Independent binder recompute (RFC 8446 §4.2.11.2, verified against
+    // RFC 8448 §4 vectors): ClientHello1 is the full handshake message
+    // MINUS the trailing 35-byte binders field (u16 length + u8 entry
+    // length + 32B value), hashed VERBATIM with the original header —
+    // the header length is NOT adjusted. (An earlier revision hashed an
+    // adjusted header over body[:len-33]; OpenSSL's "binder does not
+    // verify" proved that wrong — client, mock, and Python harness all
+    // shared it.)
+    uint32_t msg_len = 4 + body_len;
+    if (msg_len < 35 + 4) return 0;
+    uint32_t trunc_hash_len = msg_len - 35;
+    uint8_t psk[32], early[32], bkey[32], fin_key[32], th[32], want[32];
     tls_resumption_psk(psv_res_master, psv_nonce, psv_nonce_len, psk);
     tls_early_secret(psk, 32, early);
     tls_psk_binder_key(early, bkey);
+    if (tls_finished_key(bkey, fin_key) != 0) return 0;
     {
         tls_transcript t;
         tls_transcript_init(&t);
-        uint8_t hdr[4];
-        hdr[0] = TLS_HS_CLIENT_HELLO;
-        hdr[1] = (uint8_t)((trunc >> 16) & 0xff);
-        hdr[2] = (uint8_t)((trunc >> 8) & 0xff);
-        hdr[3] = (uint8_t)(trunc & 0xff);
-        tls_transcript_update(&t, hdr, 4);
-        tls_transcript_update(&t, body, trunc);
+        tls_transcript_update(&t, c_buf + 5, trunc_hash_len);
         tls_transcript_final(&t, th);
     }
-    hmac_sha256(bkey, 32, th, 32, want);
+    hmac_sha256(fin_key, 32, th, 32, want);
     for (int i = 0; i < 32; i++)
         if (want[i] != binder[i]) return 0;
     return 1;
@@ -1535,6 +1537,16 @@ static void mock_section(void) {
           "ticket found via FQDN-dot spelling");
     CHECK(!tls_ticket_have("evil.example.com..", 1000000),
           "double-dot spelling is invalid (no false hit)");
+    tls_ticket_drop("other.example.com");
+    CHECK(tls_ticket_have("evil.example.com", 1000000),
+          "drop of absent host leaves cache intact");
+    tls_ticket_drop("EVIL.EXAMPLE.COM");
+    CHECK(!tls_ticket_have("evil.example.com", 1000000),
+          "per-host drop forgets the ticket (resumption fallback)");
+    // Re-cache for the PSK trio below (which needs NST's ticket).
+    mock_run(MOCK_NST, &res);
+    CHECK(res.r == TLS_STEP_DONE,
+          "re-cache ticket after drop test");
     mock_run(MOCK_NST_BAD, &res);
     CHECK(res.r == TLS_STEP_ERR,
           "corrupt ticket rejected (no silent keep)");
@@ -2194,9 +2206,24 @@ static void name_section(void) {
                                "tests/adversarial/at_root.der" };
         uint32_t fl = build_cert_msg(flight, sizeof(flight), soc, 3);
         CHECK(fl > 0, "san-overflow flight builds");
+        // 17 SANs fits the 128-entry table (CDN mega-certs legitimately
+        // carry 100+ names — the old 16-cap failed real chains closed).
         if (fl > 0)
-            CHECK(cert_verify(flight, fl, "h0.example.com") == CV_ERR_PARSE,
-                  "17-SAN leaf (cap 16) fails closed, not truncated");
+            CHECK(cert_verify(flight, fl, "h0.example.com") == CV_OK,
+                  "17-SAN leaf verifies (cap fits real chains)");
+    }
+    {
+        // 129 SANs overflows the 128-entry table: fail closed, never
+        // truncate (a dropped name could erase a hostname match or hide a
+        // NameConstraints violation).
+        static uint8_t oder[8192];
+        int on = load("tests/adversarial/at_san_over129.der", oder, sizeof(oder));
+        CHECK(on > 0, "129-SAN fixture loads");
+        if (on > 0) {
+            x509_cert oc;
+            CHECK(x509_parse(oder, (uint32_t)on, &oc) != 0,
+                  "129-SAN leaf fails closed, not truncated");
+        }
     }
     // Serial blocklist (cryptoholes follow-up — CRLSet-nano): list the
     // leaf's (issuer, serial), verify fails REVOKED; clear restores OK;

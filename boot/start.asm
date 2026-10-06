@@ -2,7 +2,11 @@
 MBALIGN  equ 1 << 0            ; align loaded modules on page boundaries
 MEMINFO  equ 1 << 1            ; provide memory map
 VIDEO    equ 1 << 2            ; provide video mode info
+%ifdef TEXTMODE
+FLAGS    equ MBALIGN | MEMINFO ; text build: stay in VGA text mode
+%else
 FLAGS    equ MBALIGN | MEMINFO | VIDEO
+%endif
 MAGIC    equ 0x1BADB002        ; multiboot magic number
 CHECKSUM equ -(MAGIC + FLAGS)
 
@@ -18,6 +22,7 @@ align 4
     dd MAGIC
     dd FLAGS
     dd CHECKSUM
+%ifndef TEXTMODE
     dd 0    ; unused
     dd 0    ; unused
     dd 0    ; unused
@@ -28,6 +33,7 @@ align 4
     dd 1920 ; width
     dd 1080 ; height
     dd 32   ; bpp
+%endif
 
 ; Minimal boot GDT (phys addresses, loaded pre-paging): null + flat 4G code
 ; (0x08: exec/read, DPL0) + flat 4G data (0x10: read/write, DPL0). The ljmp
@@ -158,6 +164,11 @@ _start_high:
     ; Now running HIGH: fix ESP to the high stack_top, call kernel_main.
     ; NASM resolves stack_top/kernel_main to high linked addrs — correct now.
     ; The phys stack page is the same (boot_pt_low + boot_pt_high alias it).
+    ; edi = multiboot pointer: the LOW trampoline sets it from ebx before the
+    ; far jump, but the TEXT build enters here DIRECTLY from GRUB (ENTRY
+    ; _start_high — the trampoline's phys math is high-link-only), so take it
+    ; from ebx fresh. Harmless no-op on the desktop path (edi == ebx there).
+    mov edi, ebx
     mov esp, stack_top
     push eax                ; multiboot magic (1st push = [esp+8], unused)
     push edi                ; phys multiboot pointer (2nd push = [esp+4])

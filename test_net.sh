@@ -2,9 +2,9 @@
 # Headless test script for okernel networking
 # Boots QEMU, sends keystrokes via monitor, captures serial output
 
-SERIAL_LOG="/tmp/okernel-serial.log"
-MONITOR_SOCK="/tmp/okernel-monitor.sock"
-ISO="okernel-desktop.iso"
+SERIAL_LOG="/tmp/kanarchy-serial.log"
+MONITOR_SOCK="/tmp/kanarchy-monitor.sock"
+ISO="kanarchy-desktop.iso"
 TIMEOUT=30
 
 # Cleanup

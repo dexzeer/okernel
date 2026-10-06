@@ -54,6 +54,11 @@ int main(int argc, char** argv) {
             case HTML_SPAN: tn = "SPAN"; break;
             case HTML_BLOCK: tn = "BLOCK"; break;
             case HTML_END_PARA: tn = "ENDP"; break;
+            case HTML_DT: tn = "DT"; break;
+            case HTML_DD: tn = "DD"; break;
+            case HTML_BOLD: tn = "BOLD"; break;
+            case HTML_ITALIC: tn = "ITALIC"; break;
+            case HTML_SPAN: tn = "SPAN"; break;
         }
         // show control chars as . and high-bit chars as ~ to spot garbage
         char clean[HTML_MAX_TEXT + 1];

@@ -5,30 +5,7 @@
 // Build: gcc -m32 -nostdlib -static -e _start -o hello hello.c (host gcc
 // with multilib emits a valid ET_EXEC i386; the kernel validates).
 
-static int sys_print(const char *msg) {
-    int r;
-    __asm__ volatile("int $0x80" : "=a"(r) : "a"(0), "b"(msg) : "memory", "ecx", "edx");
-    return r;
-}
-
-static int sys_write(int fd, const char *buf, unsigned len) {
-    int r;
-    __asm__ volatile("int $0x80"
-                     : "=a"(r) : "a"(2), "b"(fd), "c"(buf), "d"(len)
-                     : "memory");
-    return r;
-}
-
-static int sys_getpid(void) {
-    int r;
-    __asm__ volatile("int $0x80" : "=a"(r) : "a"(3) : "memory", "ecx", "edx");
-    return r;
-}
-
-static void sys_exit(int code) {
-    __asm__ volatile("int $0x80" : : "a"(1), "b"(code) : "memory");
-    while (1) { }
-}
+#include "usys.h"
 
 void _start(void) {
     // Read argc/argv from the kernel-built stack. NOTE: this prologue
@@ -40,10 +17,10 @@ void _start(void) {
     char **argv;
     __asm__ volatile("mov %%ebp, %%eax; mov (%%eax), %%ecx; mov 4(%%eax), %%edx"
                      : "=c"(argc), "=d"(argv) : : "eax", "memory");
-    sys_print("hello from userland");
+    usys_print("hello from userland");
     {
         // write(1, "pid=", ...) — tiny itoa inline (no libc).
-        int pid = sys_getpid();
+        int pid = usys_getpid();
         char buf[32];
         int n = 0;
         buf[n++] = 'p'; buf[n++] = 'i'; buf[n++] = 'd'; buf[n++] = '=';
@@ -52,7 +29,7 @@ void _start(void) {
         while (pid > 0 && ri < 11) { rev[ri++] = '0' + (pid % 10); pid /= 10; }
         while (ri > 0) buf[n++] = rev[--ri];
         buf[n++] = '\n';
-        sys_write(1, buf, n);
+        usys_write(1, buf, n);
     }
     {
         // echo argv[1..] back (proves argc/argv stack build).
@@ -60,9 +37,9 @@ void _start(void) {
             const char *s = argv[i];
             unsigned len = 0;
             while (s[len]) len++;
-            sys_write(1, s, len);
-            sys_write(1, "\n", 1);
+            usys_write(1, s, len);
+            usys_write(1, "\n", 1);
         }
     }
-    sys_exit(0);
+    usys_exit(0);
 }

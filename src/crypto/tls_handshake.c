@@ -2,6 +2,7 @@
 #include "tls_keysched.h"
 #include "sha256.h"
 #include "hmac.h"
+#include "memwipe.h"
 #include <string.h>
 
 // ---- big-endian helpers ----
@@ -354,13 +355,21 @@ int tls_parse_server_hello(const uint8_t* sh, uint32_t sh_len,
         uint16_t etype = get_u16(sh + p); p += 2;
         uint16_t elen  = get_u16(sh + p); p += 2;
         if (p + elen > eend) return -1;
-        for (uint32_t i = 0; i < nseen && i < 16; i++)
+        for (uint32_t i = 0; i < nseen; i++)
             if (seen[i] == etype) return -1;
-        if (nseen < 16) seen[nseen++] = etype;
+        // Extension-count cap (exactness fix): past 16 tracked types stop
+        // tracking and start missing duplicates — reject instead, never go
+        // blind. Real ServerHellos carry 2-3 extensions.
+        if (nseen >= 16) return -1;
+        seen[nseen++] = etype;
         if (etype == TLS_EXT_SUPPORTED_VERSIONS && elen == 2) {
             if (get_u16(sh + p) != TLS_VERSION_TLS13) return -1;
             have_sv = 1;
-        } else if (etype == TLS_EXT_KEY_SHARE && elen >= 4) {
+        } else if (etype == TLS_EXT_KEY_SHARE) {
+            // Exact shape (exactness fix): group(2) + len(2) + 32B key and
+            // nothing else. Trailing bytes inside the extension used to be
+            // skipped over — malformed must fail, not parse.
+            if (elen != 36) return -1;
             out->named_group = get_u16(sh + p);
             uint32_t klen = get_u16(sh + p + 2);
             if (klen != 32) return -1;
@@ -379,14 +388,24 @@ int tls_parse_server_hello(const uint8_t* sh, uint32_t sh_len,
 
 int tls_parse_ee_alpn(const uint8_t* ee, uint32_t ee_len,
                       const uint8_t** alpn_out, uint32_t* alpn_len) {
+    // Exactness fix: same framing discipline as tls_parse_ee_validate
+    // (exact block, no duplicates, no trailing bytes). This helper stays
+    // lenient about UNKNOWN extensions (forward compat) but strict about
+    // framing — a malformed EE must fail, never partially parse.
     if (ee_len < 2) return -1;
     uint32_t ext_len = get_u16(ee);
-    if (ee_len < 2 + ext_len) return -1;
+    if (ee_len != 2 + ext_len) return -1;
     uint32_t p = 2, eend = 2 + ext_len;
+    uint16_t seen[32];
+    uint32_t nseen = 0;
     while (p + 4 <= eend) {
         uint16_t etype = get_u16(ee + p); p += 2;
         uint16_t elen  = get_u16(ee + p); p += 2;
         if (p + elen > eend) return -1;
+        for (uint32_t i = 0; i < nseen; i++)
+            if (seen[i] == etype) return -1;
+        if (nseen >= 32) return -1;
+        seen[nseen++] = etype;
         if (etype == TLS_EXT_APPLICATION_LAYER_PROTOCOL && alpn_out) {
             // body: list_len(2) | list_bytes where list_bytes fits in list_len
             //       list_bytes = { proto_len(1) | proto }
@@ -401,6 +420,7 @@ int tls_parse_ee_alpn(const uint8_t* ee, uint32_t ee_len,
         }
         p += elen;
     }
+    if (p != eend) return -1;
     return 0;
 }
 
@@ -447,7 +467,10 @@ int tls_parse_certificate_verify(const uint8_t* cv, uint32_t cv_len) {
     if (cv_len < 4) return -1;
     uint16_t alg = get_u16(cv);
     uint32_t sig_len = get_u16(cv + 2);
-    if (cv_len < 4 + sig_len) return -1;
+    // Exact framing (exactness fix): trailing bytes after the signature are
+    // malformed, not ignorable (differential-parsing class, same discipline
+    // as the Certificate/SH parsers).
+    if (cv_len != 4 + sig_len) return -1;
     if (sig_len == 0) return -1;
     // Only algorithms this client can actually verify. NOTE (review
     // 2026-09-10 #4): RSA PKCS#1 v1.5 (0x0401) is FORBIDDEN here by RFC 8446
@@ -464,7 +487,10 @@ int tls_parse_cv_sig(const uint8_t* cv, uint32_t cv_len, uint16_t* alg,
     if (cv_len < 4) return -1;
     *alg = get_u16(cv);
     *sig_len = get_u16(cv + 2);
-    if (cv_len < 4 + *sig_len) return -1;
+    // Exact framing (same fix as above): the caller passes the exact
+    // message body, so anything past the signature is trailing garbage.
+    if (cv_len != 4 + *sig_len) return -1;
+    if (*sig_len == 0) return -1;
     *sig = cv + 4;
     return 0;
 }
@@ -510,9 +536,11 @@ int tls_parse_nst(const uint8_t* body, uint32_t bl, struct tls_nst* out) {
     if (p + 2 > bl) return -1;
     {
         uint32_t ext_len = get_u16(body + p); p += 2;
-        if (p + ext_len > bl) return -1;
-        // Extensions (e.g. early-data indication) are bounds-checked above
-        // and otherwise ignored — we never send early data.
+        if (p + ext_len != bl) return -1;
+        // Exact framing (exactness fix): trailing bytes after the extensions
+        // are malformed, not ignorable. Extensions themselves (e.g.
+        // early-data indication) are bounds-checked above and otherwise
+        // ignored — we never send early data.
     }
     return 0;
 }
@@ -545,15 +573,25 @@ int tls_parse_sh_psk(const uint8_t* sh_body, uint32_t sh_len) {
     return -1;
 }
 
-void tls_resumption_psk(const uint8_t res_master[32],
+int tls_resumption_psk(const uint8_t res_master[32],
                         const uint8_t* nonce, uint32_t nonce_len,
                         uint8_t out_psk[32]) {
-    tls_hkdf_expand_label(res_master, "resumption", nonce, nonce_len,
-                          out_psk, 32);
+    return tls_hkdf_expand_label(res_master, "resumption", nonce, nonce_len,
+                                 out_psk, 32);
 }
 
-void tls_psk_binder_key(const uint8_t early_secret[32], uint8_t out[32]) {
-    tls_hkdf_expand_label(early_secret, "res binder", NULL, 0, out, 32);
+int tls_psk_binder_key(const uint8_t early_secret[32], uint8_t out[32]) {
+    // Derive-Secret form (RFC 8446 §7.1 key schedule): the context is the
+    // 32-byte empty hash, NOT zero-length. (An earlier revision passed an
+    // empty context — same shape as the finished/key/iv derivations, which
+    // ARE direct Expand-Labels — and every implementation agreed with
+    // itself while OpenSSL said "binder does not verify".)
+    uint8_t empty_hash[32];
+    sha256(NULL, 0, empty_hash);
+    int rc = tls_hkdf_expand_label(early_secret, "res binder", empty_hash, 32,
+                                   out, 32);
+    secure_zero(empty_hash, sizeof(empty_hash));
+    return rc;
 }
 
 // ---- ClientHello + pre_shared_key offer (RFC 8446 §4.2.11) ----
@@ -676,7 +714,9 @@ int tls_cert_has_staple(const uint8_t* cert, uint32_t cert_len,
     uint32_t list_len = ((uint32_t)cert[p] << 16) |
                         ((uint32_t)cert[p+1] << 8) | cert[p+2];
     p += 3;
-    if (cert_len < p + list_len) return -1;
+    // Exact framing (exactness fix): the list must END the message, same as
+    // tls_parse_certificate — trailing bytes are malformed, not ignorable.
+    if (cert_len != p + list_len) return -1;
     uint32_t eend = p + list_len;
     int saw_one = 0;
     while (p + 3 <= eend) {
@@ -712,8 +752,10 @@ int tls_cert_has_staple(const uint8_t* cert, uint32_t cert_len,
             }
             q += el;
         }
+        if (q != qend) return -1; // trailing bytes in entry extensions
         p += ext_len;
     }
+    if (p != eend) return -1; // trailing bytes in the list
     return saw_one ? 0 : -1;
 }
 
@@ -736,9 +778,10 @@ int tls_parse_ee_validate(const uint8_t* ee, uint32_t ee_len) {
         uint16_t etype = get_u16(ee + p); p += 2;
         uint16_t elen = get_u16(ee + p); p += 2;
         if (p + elen > eend) return -1;
-        for (uint32_t i = 0; i < nseen && i < 32; i++)
+        for (uint32_t i = 0; i < nseen; i++)
             if (seen[i] == etype) return -1; // duplicates forbidden
-        if (nseen < 32) seen[nseen++] = etype;
+        if (nseen >= 32) return -1; // absurd count: fail, never go blind
+        seen[nseen++] = etype;
         if (etype == TLS_EXT_APPLICATION_LAYER_PROTOCOL) {
             // ALPN body: list_len(2) || proto_len(1) || proto. Exactly one
             // protocol, exactly "http/1.1" (8 bytes) — the only thing we

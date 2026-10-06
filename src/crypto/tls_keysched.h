@@ -32,7 +32,9 @@
 //   H = HKDF-Expand(secret, "tls13 " + label + " " || context_len(1) || context, len)
 // but the wire framing for the info buffer is:
 //   info = out_len(2) || "tls13 " || label || context_len(1) || context
-void tls_hkdf_expand_label(const uint8_t secret[32],
+// Returns 0 on success, -1 on bounds failure (output zeroed — caller MUST
+// abort, never use it as key material).
+int tls_hkdf_expand_label(const uint8_t secret[32],
                            const char* label,
                            const uint8_t* context, uint32_t context_len,
                            uint8_t* out, uint32_t out_len);
@@ -41,7 +43,8 @@ void tls_hkdf_expand_label(const uint8_t secret[32],
 void tls_early_secret(const uint8_t* ikm, uint32_t ikm_len, uint8_t out[32]);
 
 // Compute derived = HKDF-Expand-Label(secret, "derived", SHA256(""), 32).
-void tls_derive_secret(const uint8_t secret[32], uint8_t out[32]);
+// Returns 0/-1 (see above).
+int tls_derive_secret(const uint8_t secret[32], uint8_t out[32]);
 
 // Compute handshake_secret = HKDF-Extract(salt=derived, IKM=x25519_shared).
 void tls_handshake_secret(const uint8_t derived[32],
@@ -53,20 +56,23 @@ void tls_master_secret(const uint8_t derived2[32], uint8_t out[32]);
 
 // Derive a traffic secret from the handshake_secret (or master_secret).
 // label examples: "c hs traffic", "s hs traffic", "c ap traffic",
-//                 "s ap traffic".
-void tls_traffic_secret(const uint8_t base_secret[32],
+//                 "s ap traffic". Returns 0/-1 (see above).
+int tls_traffic_secret(const uint8_t base_secret[32],
                         const char* label,
                         const uint8_t* transcript_hash,
                         uint8_t out[32]);
 
 // Derive the "finished" key:
 //   finished_key = HKDF-Expand-Label(traffic_secret, "finished", "", 32)
-void tls_finished_key(const uint8_t traffic_secret[32], uint8_t out[32]);
+// Returns 0/-1 (see above).
+int tls_finished_key(const uint8_t traffic_secret[32], uint8_t out[32]);
 
 // Derive the record-protection key (32 bytes for ChaCha20-Poly1305).
-void tls_record_key(const uint8_t traffic_secret[32], uint8_t out[32]);
+// Returns 0/-1 (see above).
+int tls_record_key(const uint8_t traffic_secret[32], uint8_t out[32]);
 
 // Derive the record IV (12 bytes for ChaCha20-Poly1305).
-void tls_record_iv(const uint8_t traffic_secret[32], uint8_t out[12]);
+// Returns 0/-1 (see above).
+int tls_record_iv(const uint8_t traffic_secret[32], uint8_t out[12]);
 
 #endif

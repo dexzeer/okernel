@@ -1,4 +1,4 @@
-# okernel Headless Testing Guide
+# KAnarchy Headless Testing Guide
 
 The complete playbook for testing this OS (GUI, mouse, networking, okai browser) with zero human interaction, written for an agent following in these footsteps. Everything here was actually used to find and fix real bugs (HANDOFF.md bugs #21–#24).
 
@@ -32,7 +32,7 @@ If the serial log doesn't tell you what you need — **add instrumentation**. Th
 Boot the desktop ISO headless with serial-to-file and a monitor socket:
 
 ```
-qemu-system-i386 -cdrom okernel-desktop.iso -boot d -vga std \
+qemu-system-i386 -cdrom kanarchy-desktop.iso -boot d -vga std \
   -device e1000,netdev=net0 -netdev user,id=net0 \
   -serial file:/tmp/ok/<tag>_serial.log \
   -display none \

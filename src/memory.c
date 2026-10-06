@@ -202,7 +202,14 @@ void* kmalloc(uint32_t size) {
 
     // Reject before advancing — a failed alloc must not push heap_ptr past
     // the end and starve every later kmalloc
-    if (heap_ptr + size > heap_start + HEAP_SIZE) return 0;
+    if (heap_ptr + size > heap_start + HEAP_SIZE) {
+        // Fail loud, not silent: a NULL kmalloc used to surface pages later
+        // as a blank window / missing wallpaper with no trace. This line
+        // costs nothing unless the heap is actually exhausted.
+        serial_printf("[diag] kmalloc FAIL size=%u used=%u\n",
+                      size, (unsigned)(heap_ptr - heap_start));
+        return 0;
+    }
 
     uint32_t addr = heap_ptr;
     heap_ptr += size;

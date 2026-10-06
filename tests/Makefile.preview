@@ -4,8 +4,8 @@
 CC      = gcc
 CFLAGS  = -DKERNEL=0 -DHOST_PREVIEW -I../src -include string.h -O2
 
-okai_preview: okai_preview.c ../src/okai.c ../src/html.c ../src/css.c font_data.h
-	$(CC) $(CFLAGS) okai_preview.c ../src/okai.c ../src/html.c ../src/css.c -lz -o $@
+okai_preview: okai_preview.c ../src/okai.c ../src/html.c ../src/css.c ../src/dom.c ../src/layout.c ../src/cjk.c ../src/font_data.c font_data.h
+	$(CC) $(CFLAGS) okai_preview.c ../src/okai.c ../src/html.c ../src/css.c ../src/dom.c ../src/layout.c ../src/cjk.c ../src/font_data.c -lz -o $@
 
 # regenerate font_data.h from the kernel font tables (run after font changes)
 font_data.h: ../src/graphics.c gen_font.py

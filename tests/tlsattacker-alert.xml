@@ -1,0 +1,36 @@
+<workflowTrace>
+    <InboundConnection>
+        <alias>server</alias>
+        <ip>localhost</ip>
+        <port>4443</port>
+        <hostname>localhost</hostname>
+        <timeout>1000</timeout>
+        <connectionTimeout>8000</connectionTimeout>
+        <transportHandlerType>TCP</transportHandlerType>
+        <useIpv6>false</useIpv6>
+    </InboundConnection>
+    <Receive>
+        <connectionAlias>server</connectionAlias>
+        <expectedMessages>
+            <ClientHello/>
+        </expectedMessages>
+    </Receive>
+    <Send>
+        <connectionAlias>server</connectionAlias>
+        <configuredMessages>
+            <ServerHello>
+                <extensions>
+                    <SupportedVersions/>
+                    <KeyShareExtension/>
+                </extensions>
+            </ServerHello>
+            <ChangeCipherSpec/>
+        </configuredMessages>
+    </Send>
+    <Send>
+        <connectionAlias>server</connectionAlias>
+        <configuredMessages>
+            <Alert/>
+        </configuredMessages>
+    </Send>
+</workflowTrace>

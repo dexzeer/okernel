@@ -241,16 +241,28 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
     const uint8_t* tb = tbs.content;
     uint32_t tl = tbs.content_len;
 
-    // [0] EXPLICIT version — optional (default v1). X.509 server certs are v3.
+    // [0] EXPLICIT version — REQUIRED to be present and v3 (exactness fix).
+    // The old code accepted version-absent (v1) certificates: they always
+    // failed closed downstream (no SAN to match, is_ca==0), but an absent
+    // version must never depend on later checks to save it — a future
+    // relaxation (CN fallback, v1-CA allowance) would silently promote v1
+    // certs to trusted. Malformed here, not later.
     der_node inner;
     if (t < tl && tb[t] == 0xA0) {
         uint32_t save = t;
         if (der_expect(tb, tl, &t, 0xA0, &inner) != 0) return -1;
         (void)save;
+        // Capture the wrapper length BEFORE the next der_expect clobbers
+        // `inner` with the INTEGER node (the second call reuses `inner`
+        // as its output).
+        uint32_t wrap_len = inner.content_len;
         uint32_t vp = 0;
         if (der_expect(inner.content, inner.content_len, &vp,
                        DER_TAG_INTEGER, &inner) != 0) return -1;
+        if (vp != wrap_len) return -1; // exact version wrapper
         if (inner.content_len != 1 || inner.content[0] != 2) return -1; // v3
+    } else {
+        return -1; // version absent (v1/v2): not a TLS-server cert, reject
     }
 
     // serialNumber: positive INTEGER (strict — a negative/zero serial is
@@ -375,11 +387,16 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
             // Strict key integers (review #17) + tight bounds (e fits the
             // rsa_pub 32-bit-exponent rule; n bounds are sanity, strength
             // is enforced exact in rsa_pub_from_x509 + certverify).
+            // Upper bound (exactness fix): 512B = 4096 bits, matching
+            // RSA_MAX_LIMBS (132 limbs = 528B). The old 1024B cap admitted
+            // keys rsa_pub_from_x509 can never use (be_to_limbs fails) —
+            // pointless parse-then-reject and wasted reassembly on absurd
+            // flights. 4096-bit chains still fit the 16KB flight cap.
             if (int_bytes_strict(&nn, &out->rsa_n, &out->rsa_n_len, 0) != 0)
                 return -1;
             if (int_bytes_strict(&ee, &out->rsa_e, &out->rsa_e_len, 0) != 0)
                 return -1;
-            if (out->rsa_n_len < 128 || out->rsa_n_len > 1024) return -1;
+            if (out->rsa_n_len < 128 || out->rsa_n_len > 512) return -1;
             if (out->rsa_e_len < 1 || out->rsa_e_len > 4) return -1;
             out->key_type = X509_KEY_RSA;
         } else if (oid_is(&alg_oid, OID_EC_PUBLIC_KEY, sizeof(OID_EC_PUBLIC_KEY))) {
@@ -469,7 +486,7 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                         if (der_expect(names.content, names.content_len,
                                        &nn, 0x87, &ip) != 0) return -1;
                         if (ip.content_len == 4) {
-                            if (out->ip_san_count >= 4) return -1;
+                            if (out->ip_san_count >= 16) return -1;
                             for (int b = 0; b < 4; b++)
                                 out->ip_san[out->ip_san_count][b] =
                                     ip.content[b];
@@ -542,7 +559,24 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                     der_node ku;
                     if (der_expect(val.content, val.content_len, &v,
                                    DER_TAG_BIT_STRING, &ku) != 0) return -1;
+                    if (v != val.content_len) return -1; // exact ext value
                     if (ku.content_len < 2) return -1; // unused-bits + ≥1 byte
+                    // BIT STRING discipline (exactness fix): unused-bits in
+                    // 0..7, at most 2 key bytes (KeyUsage is 9 bits), and
+                    // the padding bits in the last byte are zero. The old
+                    // code read ku.content[1] as a full byte regardless —
+                    // a crafted unused-bits count shifted every flag bit.
+                    if (ku.content_len > 3) return -1;
+                    {
+                        uint8_t unused = ku.content[0];
+                        if (unused > 7) return -1;
+                        if (unused != 0) {
+                            uint8_t last =
+                                ku.content[ku.content_len - 1];
+                            if ((last & (uint8_t)((1u << unused) - 1u)) != 0)
+                                return -1;
+                        }
+                    }
                     out->has_key_usage = 1;
                     out->ku[0] = ku.content[1];
                     out->ku[1] = ku.content_len > 2 ? ku.content[2] : 0;
@@ -850,12 +884,14 @@ int x509_hostname_match(const x509_cert* cert, const char* host) {
     // than compared byte-wise against attacker-influenced SANs.
     for (uint32_t i = 0; host[i]; i++)
         if ((unsigned char)host[i] >= 128) return -1;
-    // Strip one trailing dot (FQDN form).
+    // Strip one trailing dot (FQDN form). Decrement hl too: every length
+    // below (sl == hl, wildcard rest arithmetic) must use the STRIPPED
+    // length, or FQDN-form hosts never match.
     char h[256];
     uint32_t hl = 0;
     while (host[hl] && hl < sizeof(h) - 1) { h[hl] = host[hl]; hl++; }
     h[hl] = 0;
-    if (hl && h[hl - 1] == '.') h[hl - 1] = 0;
+    if (hl && h[hl - 1] == '.') { hl--; h[hl] = 0; }
 
     // IP-literal hosts (review #37) match ONLY iPAddress SANs, byte-wise.
     // dNSName entries — even IP-looking ones — never match an IP host

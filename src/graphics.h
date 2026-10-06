@@ -64,6 +64,21 @@ void draw_char(int x, int y, char c, uint32_t fg, uint32_t bg);
 // content text at CONTENT_GW x CONTENT_GH (12x24).
 void draw_char_sized(int x, int y, char c, uint32_t fg, uint32_t bg, int tw, int th);
 
+// Cell attribute bits (bold/underline) for draw_char_cell below. The painter
+// interprets them; window content cells and the okai doc-bit planes store them.
+#define CELL_BOLD 1
+#define CELL_UL   2
+// draw_char_sized + per-cell attrs: bold emboldens by OR-ing coverage
+// sampled one source pixel left (stays inside this cell); underline draws
+// an fg rule near the cell bottom. attr==0 is exactly draw_char_sized.
+void draw_char_cell(int x, int y, char c, uint32_t fg, uint32_t bg,
+                    int tw, int th, uint8_t attr);
+
+// CJK ideograph blit: 16x16 MSB-first bitmap (cjk_font.h) into a tw×th box.
+// Used for LAYOUT_FLAG_CJK runs (the slot table has no CJK).
+void draw_cjk_box(int x, int y, const uint8_t* bits, uint32_t fg, uint32_t bg,
+                  int tw, int th);
+
 // Draw a character with extra scaling
 void draw_char_scaled(int x, int y, char c, uint32_t fg, uint32_t bg, int scale);
 

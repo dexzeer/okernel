@@ -13,9 +13,10 @@ struct editor {
     char text[EDITOR_MAX_TEXT];
     int text_len;
     int cursor_pos;
-    int scroll_y;
+    int scroll_y;   // text mode: first visible \n-line; hex mode: first visible row
     int dirty;
     int modified;
+    int read_only;  // 1 = binary content: textified read-only view (no hex)
 };
 
 void editor_init(void);

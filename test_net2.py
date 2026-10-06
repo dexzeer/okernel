@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Headless test for okernel networking — tests with google.com."""
+"""Headless test for KAnarchy networking — tests with google.com."""
 import subprocess, time, os, sys, signal
 
-SERIAL_LOG = "/tmp/okernel-serial.log"
-MONITOR_SOCK = "/tmp/okernel-monitor.sock"
-ISO = "okernel-desktop.iso"
+SERIAL_LOG = "/tmp/kanarchy-serial.log"
+MONITOR_SOCK = "/tmp/kanarchy-monitor.sock"
+ISO = "kanarchy-desktop.iso"
 
 def cleanup():
     for f in [SERIAL_LOG, MONITOR_SOCK]:
@@ -100,9 +100,9 @@ for line in log.strip().split('\n'):
         print(f"  {line}")
 
 # Save full log
-with open("/tmp/okernel-full2.log", "w") as f:
+with open("/tmp/kanarchy-full2.log", "w") as f:
     f.write(log)
-print(f"\nFull log: {len(log)} bytes -> /tmp/okernel-full2.log")
+print(f"\nFull log: {len(log)} bytes -> /tmp/kanarchy-full2.log")
 
 qemu.send_signal(signal.SIGTERM)
 try: qemu.wait(timeout=5)

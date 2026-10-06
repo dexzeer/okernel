@@ -1,4 +1,5 @@
 #include "hmac.h"
+#include "memwipe.h"
 
 // HMAC-SHA256, RFC 2104: H(K' ^ opad || H(K' ^ ipad || m))
 // K' is the key zero-padded (or hashed if longer) to one block.
@@ -28,6 +29,10 @@ void hmac_sha256_init(hmac_sha256_ctx* ctx, const uint8_t* key, uint32_t key_len
 
     sha256_init(&ctx->inner);
     sha256_update(&ctx->inner, ipad, SHA256_BLOCK_SIZE);
+    // block/ipad held the (possibly hashed) key: wipe stack copies now.
+    // ctx->opad must survive until final (it is wiped there).
+    secure_zero(block, sizeof(block));
+    secure_zero(ipad, sizeof(ipad));
 }
 
 void hmac_sha256_update(hmac_sha256_ctx* ctx, const uint8_t* msg, uint32_t len) {
@@ -43,6 +48,11 @@ void hmac_sha256_final(hmac_sha256_ctx* ctx, uint8_t out[32]) {
     sha256_update(&outer, ctx->opad, SHA256_BLOCK_SIZE);
     sha256_update(&outer, ihash, 32);
     sha256_final(&outer, out);
+    // Terminal wipe: ihash is key-derived, opad IS the key, inner holds
+    // key-derived state. The ctx must be re-initialized before reuse.
+    secure_zero(ihash, sizeof(ihash));
+    secure_zero(&outer, sizeof(outer));
+    secure_zero(ctx, sizeof(*ctx));
 }
 
 void hmac_sha256(const uint8_t* key, uint32_t key_len,

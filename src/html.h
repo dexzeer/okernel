@@ -30,6 +30,8 @@
 #define HTML_FORM       20 // <form action method>
 #define HTML_INPUT      21 // <input name value placeholder type>
 #define HTML_BUTTON     22 // <button> / <input type=submit>
+#define HTML_DT         23 // <dt> definition term
+#define HTML_DD         24 // <dd> definition description
 
 struct html_token {
     uint8_t type;
@@ -50,12 +52,20 @@ struct html_token {
 
 int html_parse(const char* html, int html_len, struct html_token* tokens, int max_tokens);
 int html_get_title(const char* html, int html_len, char* title, int max_len);
+// Sniff "charset=..." (Content-Type header or <meta>) in the first 2KB and
+// select the byte decoder used by html_decode_entities: UTF-8 (default),
+// windows-1251 or windows-1252/iso-8859-1. Called by dom_build before any
+// text/attribute decoding.
+void html_sniff_charset(const char* html, int html_len);
 // Make raw page text renderable, in place: decodes the page charset
 // (UTF-8 multibyte / windows-1251 → one-byte font slots, Cyrillic included)
 // and then HTML entities (&#NNN; and the common named ones). Unmapped
 // codepoints become '?'.
 void html_decode_entities(char* s);
 
+// Codepoint to render slot for non-HTML text (editor display decoding).
+// Same table the browser uses; see html_map_cp in html.c.
+char html_slot_for_codepoint(int cp);
 // Concatenate the text of every <style>...</style> block into `out` (for CSS).
 // Returns total bytes written (capped at cap-1).
 int html_extract_css(const char* html, int html_len, char* out, int cap);

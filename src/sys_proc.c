@@ -40,8 +40,8 @@ static uint32_t kbd_lens[KBD_QUEUE_LEN];
 static int kbd_head = 0, kbd_tail = 0, kbd_count = 0;
 static spinlock_t kbd_lock = SPINLOCK_INIT;
 
-void sys_proc_kbd_offer(const char *line, uint32_t len) {
-    if (!line || len == 0) return;
+int sys_proc_kbd_offer(const char *line, uint32_t len) {
+    if (!line || len == 0) return 0;
     // STALE-BACKLOG GUARD (2026-09-08: sh's first read ate the `run /bin/sh`
     // kernel-shell line offered BEFORE sh existed — then every fresh command
     // lagged one line behind, execing the PREVIOUS line forever. The queue is
@@ -58,11 +58,13 @@ void sys_proc_kbd_offer(const char *line, uint32_t len) {
             live = 1;
             break;
         }
-        if (!live) return; // kernel-shell bootstrap line — nobody can read it
+        if (!live) return 0; // kernel-shell bootstrap line — nobody can read it
     }
     if (len >= KBD_LINE_LEN) len = KBD_LINE_LEN - 1;
     uint32_t ef = spin_lock_irq(&kbd_lock);
+    int queued = 0;
     if (kbd_count < KBD_QUEUE_LEN) {
+        queued = 1;
         for (uint32_t i = 0; i < len; i++) kbd_lines[kbd_tail][i] = line[i];
         kbd_lines[kbd_tail][len] = 0;
         kbd_lens[kbd_tail] = len;
@@ -90,6 +92,7 @@ void sys_proc_kbd_offer(const char *line, uint32_t len) {
         serial_putchar('\n');
     }
     spin_unlock_irq(&kbd_lock, ef);
+    return queued;
 }
 
 int sys_proc_kbd_read(char *buf, uint32_t len) {

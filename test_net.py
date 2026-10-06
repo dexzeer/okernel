@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Headless test for okernel networking via QEMU monitor + serial log."""
+"""Headless test for KAnarchy networking via QEMU monitor + serial log."""
 import subprocess, time, os, sys, signal
 
-SERIAL_LOG = "/tmp/okernel-serial.log"
-MONITOR_SOCK = "/tmp/okernel-monitor.sock"
-ISO = "okernel-desktop.iso"
+SERIAL_LOG = "/tmp/kanarchy-serial.log"
+MONITOR_SOCK = "/tmp/kanarchy-monitor.sock"
+ISO = "kanarchy-desktop.iso"
 
 def cleanup():
     for f in [SERIAL_LOG, MONITOR_SOCK]:
@@ -119,9 +119,9 @@ for line in log.strip().split('\n'):
         print(f"  {line}")
 
 # Save full log
-with open("/tmp/okernel-full.log", "w") as f:
+with open("/tmp/kanarchy-full.log", "w") as f:
     f.write(log)
-print(f"\nFull log saved to /tmp/okernel-full.log ({len(log)} bytes)")
+print(f"\nFull log saved to /tmp/kanarchy-full.log ({len(log)} bytes)")
 
 # Cleanup
 print("\n=== Killing QEMU ===")

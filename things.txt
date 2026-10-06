@@ -1,0 +1,4 @@
+1. make the bar on the terminal window FLAT RED with no inner stroke or like dark 3-d style and make the border red too, center the "Terminal" text and make the close button a white x on a black square and the same for the minimize window, make sure its a square
+2. remove corny text like "Anarchy edition. No hand-holding" like mate who the fuck wants to see that 😭️
+3. make the main terminal actually close-able and then mm make it so that you can open a terminal by pressing ctrl + alt + t
+4. bonus task: implement whatever to make wikipedia no longer render ANYTHING with a "????" (verify via okvm) i think we need split paging or smth whatever basically just make it work and since ima be away dont ask me anything just execute on your judgement

@@ -27,7 +27,34 @@ static void seed_one(const char *name, const unsigned char *img,
     serial_putchar('\n');
 }
 
+// Plain-text seed so the desktop shows at least one editable file.
+// Binaries open read-only (printable text with dots for binary bytes,
+// never editable, never hex).
+static void seed_text(const char *name, const char *text) {
+    if (fs_exists(name)) return; // disk copy wins (user edits preserved)
+    unsigned int len = 0;
+    while (text[len]) len++;
+    fs_write(name, (const unsigned char *)text, (int)len);
+    serial_puts("[seed] /");
+    serial_puts(name);
+    serial_putchar('\n');
+}
+
 void userland_seed(void) {
+    seed_text("/readme.txt",
+        "Welcome to KAnarchy OS!\n"
+        "\n"
+        "This is a plain text file.\n"
+        "It opens in the editor's TEXT mode\n"
+        "(editable, Ctrl+S saves, Ctrl+X closes).\n"
+        "\n"
+        "Files under /bin are ELF programs.\n"
+        "They open read-only (printable\n"
+        "text with dots for binary bytes).\n"
+        "\n"
+        "Try:\n"
+        "  open /readme.txt   (editable)\n"
+        "  open /bin/hello    (read-only)\n");
     seed_one("/bin/hello", hello, hello_len);
     seed_one("/bin/forktest", forktest, forktest_len);
     seed_one("/bin/pipetest", pipetest, pipetest_len);

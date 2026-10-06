@@ -2,6 +2,7 @@
 #include "rand.h"
 #include "chacha20.h"
 #include "sha256.h"
+#include "memwipe.h"
 #include <string.h>
 
 #ifdef KERNEL
@@ -46,7 +47,8 @@ static void rng_rekey(void) {
     for (int i = 0; i < 32; i++) rng_key[i] ^= block[i];
 
     // Overwrite the block; we only needed the first 32 bytes.
-    memset(block, 0, sizeof(block));
+    // secure_zero: keystream-adjacent, must not be elided.
+    secure_zero(block, sizeof(block));
 }
 
 // Compress `n` pool slots through SHA-256 into out32. The hash is the
@@ -67,8 +69,9 @@ static void pools_wipe(void) {
     // wiping it per-window deadlocks readiness whenever classes arrive in
     // segregated batches — e.g. 16 BOOT stirs, reseed, then TIMER only).
     // The per-class WINDOW bytes reset (freshness is per-window by design).
-    memset(pool0, 0, sizeof(pool0));
-    memset(pool1, 0, sizeof(pool1));
+    // secure_zero: pool contents are entropy samples, must not linger.
+    secure_zero(pool0, sizeof(pool0));
+    secure_zero(pool1, sizeof(pool1));
     pool0_n = pool1_n = 0;
     memset(pool_cls_win, 0, sizeof(pool_cls_win));
 }
@@ -88,7 +91,7 @@ static void rng_reseed(void) {
         pool_compress(pool1, pool1_n, digest);
         for (int i = 0; i < 32; i++) rng_key[i] ^= digest[i];
     }
-    memset(digest, 0, sizeof(digest));
+    secure_zero(digest, sizeof(digest));
     rng_rekey();
     rng_counter++; // domain-separate post-reseed stream
     if (!rng_ready_flag) {
@@ -194,9 +197,25 @@ static int hw_bytes(int cls, int (*pull)(uint32_t*)) {
     uint8_t hw[32];
     for (int i = 0; i < 8; i++) {
         uint32_t w = 0;
-        if (!pull(&w)) { memset(hw, 0, sizeof(hw)); return 0; }
+        if (!pull(&w)) { secure_zero(hw, sizeof(hw)); return 0; }
         hw[4*i] = (uint8_t)(w & 0xff); hw[4*i+1] = (uint8_t)((w >> 8) & 0xff);
         hw[4*i+2] = (uint8_t)((w >> 16) & 0xff); hw[4*i+3] = (uint8_t)(w >> 24);
+    }
+    // Continuous health test (stuck-at / hostile-hypervisor gate): a 32B
+    // hardware pull that is all-zero, all-one, or two repeated 16B halves
+    // is rejected outright — it carries no entropy and must never satisfy
+    // the hardware tier. Deterministic constants from a broken or emulated
+    // RNG fail closed here instead of declaring readiness.
+    {
+        uint8_t any = 0, all = 0xFF;
+        for (int i = 0; i < 32; i++) { any |= hw[i]; all &= hw[i]; }
+        int halves_eq = 1;
+        for (int i = 0; i < 16; i++)
+            if (hw[i] != hw[16 + i]) { halves_eq = 0; break; }
+        if (any == 0 || all == 0xFF || halves_eq) {
+            secure_zero(hw, sizeof(hw));
+            return 0;
+        }
     }
     // Presence is established by successfully pulled bytes, and it is
     // recorded BEFORE those bytes can trigger a reseed (cryptoholes
@@ -209,7 +228,7 @@ static int hw_bytes(int cls, int (*pull)(uint32_t*)) {
     // path above — partial hardware bytes must not linger.)
     hw_present = 1; // hardware bytes actually mixed (not just CPUID claims)
     rand_stir_src(hw, cls);
-    memset(hw, 0, sizeof(hw));
+    secure_zero(hw, sizeof(hw));
     return 1;
 }
 
@@ -232,14 +251,23 @@ int rand_hw_init(void) {
 }
 
 int rand_bytes(uint8_t* out, uint32_t len) {
-    int rc = 0;
+    // Per-block cli discipline (interrupt-latency fix): the old code held
+    // cli across the WHOLE call, so a large `len` stalled the timer ISR
+    // (our jitter source + scheduler) for milliseconds. Now cli covers one
+    // 64B block at a time; between blocks interrupts run and the timer may
+    // stir (reseed) — safe and desirable. Counter exhaustion is reserved up
+    // front so a call never partially succeeds then fails mid-stream.
+    uint32_t nblocks = (len + 63u) / 64u;
     RNG_CLI();
-    if (!rng_ready_flag) goto out;
+    if (!rng_ready_flag) { RNG_STI(); return 0; }
     // Counter-exhaustion guard (cryptoholes #9 — same discipline as the
     // TLS sequence guards): 2^32 blocks is unreachable in practice, but
     // a wrapped (key, nonce, counter) triple would repeat keystream, so
     // fail closed with wide margin rather than reason about it.
-    if (rng_counter >= 0xFFFFFFF0u) goto out;
+    if ((uint64_t)rng_counter + nblocks >= 0xFFFFFFF0ull) {
+        RNG_STI();
+        return 0;
+    }
     // Snapshot divergence: fresh RDTSC folded into the nonce per call, so
     // two boots/snapshots with identical pools still diverge immediately.
     {
@@ -248,30 +276,30 @@ int rand_bytes(uint8_t* out, uint32_t len) {
         for (int i = 0; i < 8; i++)
             rng_nonce[i] ^= (uint8_t)((t >> (8 * i)) & 0xFF);
     }
+    RNG_STI();
     while (len > 0) {
         // Generate 64 bytes of keystream, use them, then rekey. Input
         // zeroed first (same cryptoholes #9 reason as rng_rekey: pure
         // keystream out, no stack-garbage mixing, MSan-clean).
         uint8_t block[64];
         memset(block, 0, sizeof(block));
+        RNG_CLI();
         chacha20_encrypt(rng_key, rng_nonce, rng_counter, block, block, 64);
         rng_counter++;
 
         uint32_t take = len < 64 ? len : 64;
         memcpy(out, block, take);
-        out += take;
-        len -= take;
 
         // Forward secrecy: mix used keystream into key.
         for (uint32_t i = 0; i < 32; i++) rng_key[i] ^= block[i];
 
-        memset(block, 0, sizeof(block));
+        secure_zero(block, sizeof(block));
         rng_rekey();
+        RNG_STI();
+        out += take;
+        len -= take;
     }
-    rc = 1;
-out:
-    RNG_STI();
-    return rc;
+    return 1;
 }
 
 int rand_ready(void) {

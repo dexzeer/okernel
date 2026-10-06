@@ -25,6 +25,9 @@ void poly1305_stream_init(poly1305_stream* st, const uint8_t key[32]);
 void poly1305_stream_update(poly1305_stream* st,
                             const uint8_t* msg, uint32_t len);
 void poly1305_stream_final(poly1305_stream* st, uint8_t tag[16]);
+// Terminal wipe for key material + accumulator (call after final; the
+// struct must be re-initialized before reuse).
+void poly1305_stream_wipe(poly1305_stream* st);
 
 // RFC 8439 §2.8 AEAD MAC input shape (aad || pad16 || ct || pad16 ||
 // le64 lens) fed piecewise — byte-identical to the concatenated one-shot.

@@ -21,7 +21,7 @@
 #define X509_SIG_ECDSA_SHA256 4 // ecdsa-with-SHA256        1.2.840.10045.4.3.2
 #define X509_SIG_ECDSA_SHA384 5 // ecdsa-with-SHA384        1.2.840.10045.4.3.3
 
-#define X509_MAX_SAN 16
+#define X509_MAX_SAN 128
 
 typedef struct {
     int year, month, day, hour, minute, second;
@@ -69,11 +69,16 @@ typedef struct {
     const uint8_t* ec_point; uint32_t ec_point_len;
 
     // subjectAltName dNSName entries (views into the source DER).
+    // Cap is 128 (CDN mega-certs legitimately carry 100+ names; the old
+    // 16-cap failed real chains closed, e.g. a 100-SAN Sectigo leaf).
+    // Overflow still fails the parse rather than truncating: dropping the
+    // 129th SAN could erase a matchable name (hostname) or hide a
+    // violating name (NameConstraints), so truncation is unsound.
     struct { const uint8_t* p; uint32_t len; } san[X509_MAX_SAN];
     int san_count;
     // subjectAltName iPAddress entries (IPv4 only, 4 bytes each; IPv6
     // entries are ignored — no v6 stack exists to speak to).
-    uint8_t ip_san[4][4];
+    uint8_t ip_san[16][4];
     int ip_san_count;
     // AuthorityKeyIdentifier keyIdentifier [0] + SubjectKeyIdentifier bytes
     // (views). has_aki/has_ski gate matching in certverify.c: when BOTH are

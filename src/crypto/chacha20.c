@@ -1,4 +1,5 @@
 #include "chacha20.h"
+#include "memwipe.h"
 
 // RFC 8439 §2.2: quarter round on four 32-bit words
 #define QR(a,b,c,d) do {                     \
@@ -62,6 +63,9 @@ void chacha20_encrypt(const uint8_t key[32], const uint8_t nonce[12],
         chacha20_block(key_words, nonce_words, counter++, stream);
         for (uint32_t i = 0; i < 64 && offset + i < len; i++)
             ciphertext[offset + i] = plaintext[offset + i] ^ stream[i];
+        secure_zero(stream, sizeof(stream));
         offset += 64;
     }
+    secure_zero(key_words, sizeof(key_words));
+    secure_zero(nonce_words, sizeof(nonce_words));
 }

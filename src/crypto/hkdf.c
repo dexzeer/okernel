@@ -1,5 +1,6 @@
 #include "hkdf.h"
 #include "hmac.h"
+#include "memwipe.h"
 #include <string.h>
 
 // RFC 5869. PRK = HMAC-Hash(salt, IKM); T(i) = HMAC-Hash(PRK, T(i-1) || info || i)
@@ -36,6 +37,9 @@ int hkdf_expand(const uint8_t prk[32], const uint8_t* info, uint32_t info_len,
         t_len = 32;
         counter++;
     }
+    // T(i) chain values are key material: wipe before returning.
+    // (Early return above happens before any T is computed.)
+    secure_zero(t, sizeof(t));
     return 0;
 }
 
@@ -46,6 +50,6 @@ int hkdf(const uint8_t* salt, uint32_t salt_len,
     uint8_t prk[32];
     hkdf_extract(salt, salt_len, ikm, ikm_len, prk);
     int rc = hkdf_expand(prk, info, info_len, okm, okm_len);
-    memset(prk, 0, sizeof(prk));
+    secure_zero(prk, sizeof(prk));
     return rc;
 }

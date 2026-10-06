@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""okvm.py — base library for driving okernel headlessly in QEMU.
+"""okvm.py — base library for driving KAnarchy headlessly in QEMU.
 
 Boots the desktop ISO with a serial-file log and a UNIX-socket QEMU monitor,
 and provides: keystroke injection, screendump loading, empirical mouse
@@ -26,7 +26,7 @@ import subprocess, time, os, signal, socket, re
 # Resolve the project/ISO relative to this file so the driver works from any cwd.
 HERE     = os.path.dirname(os.path.abspath(__file__))
 PROJECT  = os.path.dirname(os.path.dirname(HERE))
-ISO      = os.path.join(PROJECT, "okernel-desktop.iso")
+ISO      = os.path.join(PROJECT, "kanarchy-desktop.iso")
 # Durable output dir — /tmp gets aggressively cleaned on this host and wiped
 # logs mid-run, killing tests (QEMU keeps writing to the deleted inode).
 OUTDIR   = os.path.expanduser("~/okvm")

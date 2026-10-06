@@ -40,10 +40,16 @@ int tls_is_done(void);
 int tls_saw_close_notify(void);
 int tls_get_fail_reason(void); // TLS_FAIL_* of the last failed fetch (0 = none/success)
 int tls_get_fail_detail(void); // CV_ERR_* detail when reason is CERT class (0 = none)
+// 1 if the last failed connection offered PSK resumption that was never
+// accepted (server aborted instead of negotiating) — retry full handshake.
+int tls_last_offer_unaccepted(void);
 
 // Get the TLS response (same interface as http_get_response).
 char* tls_get_response(void);
 int tls_get_response_len(void);
+// Live output size for progress display: current decrypted length while a
+// fetch is active, final length once done.
+int tls_get_progress_len(void);
 
 // Called by tcp_handle_packet when tls_session_active is set.
 // Appends raw TCP payload into the TLS receive buffer.

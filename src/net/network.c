@@ -1,4 +1,5 @@
 #include "network.h"
+#include "../string.h"
 #include "../crypto/tls_client.h" // http_parse_framing (shared framing)
 #include "e1000.h"
 #include "../io.h"
@@ -124,6 +125,10 @@ struct tcp_conn {
     // caps our sends (never send past SND.UNA + peer_win). 0 = persist
     // (send 1-byte probes on rtx timer instead of stalling forever).
     uint32_t peer_win;       // last advertised peer window (bytes)
+    uint32_t persist_since;  // tick when peer_win went 0 (0 = not persisting).
+                             // Bounds zero-window probing (see tcp_poll) so a
+                             // dead peer fails the fetch instead of probing
+                             // forever with no timeout.
     // Fast retransmit: count DUP acks (same ack_num, no progress). At 3,
     // resend the head of the flight immediately (no RTO wait) — classic
     // Tahoe fast-retransmit (no fast-recovery/cwnd inflation: congestion
@@ -138,6 +143,15 @@ struct tcp_conn {
     uint32_t rttvar;         // variance (ticks << 2)
     uint32_t rtt_seq;        // seq being timed (0 = none in flight)
     uint32_t rtt_tick;       // tick when rtt_seq was first sent
+    // Early FIN: the peer's FIN arrived while a receive hole was still
+    // open (seq + len != RCV.NXT — reordered tail). Acting on it then
+    // jumps RCV.NXT over unreceived bytes (data loss → TLS decrypts
+    // garbage → bogus PROTO failure). Instead stash the FIN's own seq
+    // and complete the close when the drain catches up (see
+    // tcp_deliver_in_order tail). fin_seq = FIN seq number itself
+    // (first byte AFTER the FIN-carrying segment's data).
+    uint8_t  fin_pending;    // 1 = early FIN stashed, close not yet run
+    uint32_t fin_seq;        // expected RCV.NXT at which the FIN completes
 };
 
 static struct tcp_conn tcp_conn;
@@ -159,6 +173,11 @@ static uint8_t tcp_rtx_buf[TCP_RTX_BUF_SIZE];
 // RTO in 18Hz ticks (~55ms each): 4 ticks ~= 220ms initial, doubling
 #define TCP_RTO_TICKS 4
 #define TCP_MAX_RTX 6
+// Zero-window persist ceiling (~66s at 18Hz): a shut window with unacked
+// flight probes forever by design (RFC 793 has no persist give-up), but a
+// browser cannot wedge a fetch indefinitely — dead peers, blackholed probes
+// and never-updating windows must fail the fetch so the UI shows an error.
+#define TCP_PERSIST_TIMEOUT 1200
 
 extern uint32_t tick_count;
 
@@ -185,7 +204,7 @@ static int http_done = 0; // Set when connection closes with data
 // instead of being truncated mid-stream. Raising this array is the only change
 // needed: the clamp in tcp_handle_packet keys off sizeof(http_response), and
 // html_parse / dechunk read http_response_len, not a fixed size.
-static char http_response[1048576];
+static char http_response[2097152]; // 2MB cap: pages above render truncated
 static int  http_response_len = 0;
 static int  http_response_overflow = 0; // set once when a response exceeds the buffer
 
@@ -442,13 +461,21 @@ static int dns_encode_name(const char* name, uint8_t* out) {
 }
 
 // Parse DNS name from packet (handles compression pointers)
-static int dns_decode_name(uint8_t* packet, int offset, char* out, int max_len) {
+static int dns_decode_name(uint8_t* packet, int packet_len, int offset,
+                           char* out, int max_len) {
+    // Fully bounds-checked (every byte verified against packet_len):
+    // a malicious/truncated response can neither over-read the packet
+    // nor overflow `out`. Returns the offset past the name (or past the
+    // 2-byte pointer) or -1 on any malformed input. Compression chains
+    // and label counts are capped; output is always NUL-terminated.
     int out_idx = 0;
     int jumped = 0;
     int original_offset = offset;
     int jump_count = 0;
-
+    if (max_len <= 0) return -1;
+    out[0] = 0;
     while (jump_count < 128) {
+        if (offset < 0 || offset >= packet_len) return -1;
         uint8_t len = packet[offset];
         if (len == 0) {
             if (!jumped) original_offset = offset + 1;
@@ -456,19 +483,31 @@ static int dns_decode_name(uint8_t* packet, int offset, char* out, int max_len) 
         }
         if ((len & 0xC0) == 0xC0) {
             // Compression pointer
+            if (offset + 1 >= packet_len) return -1;
+            int target = ((len & 0x3F) << 8) | packet[offset + 1];
+            if (target < 0 || target >= packet_len) return -1;
             if (!jumped) original_offset = offset + 2;
-            offset = ((len & 0x3F) << 8) | packet[offset + 1];
+            offset = target;
             jumped = 1;
             jump_count++;
             continue;
         }
+        if (len & 0xC0) return -1; // reserved label bits (RFC 1035)
         offset++;
+        if ((uint32_t)len > (uint32_t)(packet_len - offset)) return -1;
         for (int i = 0; i < len && out_idx < max_len - 1; i++) {
-            out[out_idx++] = packet[offset++];
+            out[out_idx++] = (char)packet[offset++];
+        }
+        // Separator — or fail closed when the name doesn't fit the output
+        // (the old code kept writing past `out` here: stack smash).
+        if (out_idx >= max_len - 1) {
+            if (max_len > 0) out[max_len - 1] = 0;
+            return -1;
         }
         out[out_idx++] = '.';
         jump_count++;
     }
+    if (jump_count >= 128) return -1; // pointer/label loop
     out[out_idx > 0 ? out_idx - 1 : 0] = 0;
     if (!jumped) original_offset = offset + 1;
     return original_offset;
@@ -541,27 +580,34 @@ static void handle_dns_response(uint8_t* data, uint16_t len) {
 
     // Skip question section
     int offset = 12;
+    int pkt_len = (int)len;
     uint16_t qd_count = ((data[4] << 8) | data[5]);
     for (int i = 0; i < qd_count; i++) {
         char name[256];
-        offset = dns_decode_name(data, offset, name, 256);
+        offset = dns_decode_name(data, pkt_len, offset, name, 256);
+        if (offset < 0 || offset + 4 > pkt_len) return; // malformed question
         offset += 4; // Skip QTYPE + QCLASS
     }
 
     // Parse answer section
-    for (int i = 0; i < an_count && offset < len; i++) {
+    for (int i = 0; i < an_count && offset < pkt_len; i++) {
         char name[256];
-        offset = dns_decode_name(data, offset, name, 256);
+        offset = dns_decode_name(data, pkt_len, offset, name, 256);
+        if (offset < 0 || offset + 4 > pkt_len) return;
         uint16_t atype = ((data[offset] << 8) | data[offset + 1]);
         uint16_t aclass = ((data[offset + 2] << 8) | data[offset + 3]);
         offset += 4;
+        if (offset + 4 > pkt_len) return;
         uint32_t ttl = ((uint32_t)data[offset] << 24) | ((uint32_t)data[offset + 1] << 16) |
                         ((uint32_t)data[offset + 2] << 8) | data[offset + 3];
+        (void)ttl;
         offset += 4;
+        if (offset + 2 > pkt_len) return;
         uint16_t rdlength = ((data[offset] << 8) | data[offset + 1]);
         offset += 2;
 
         if (atype == 1 && aclass == 1 && rdlength == 4) { // A record, IN class
+            if (offset + 4 > pkt_len) return;
             dns_resolved_ip = ((uint32_t)data[offset] << 24) | ((uint32_t)data[offset + 1] << 16) |
                                ((uint32_t)data[offset + 2] << 8) | data[offset + 3];
             dns_resolved = 1;
@@ -756,12 +802,15 @@ void tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
     // Estimator + window state reset per connection (stale SRTT from a LAN
     // peer would mis-time a WAN peer and vice versa).
     tcp_conn.peer_win = 65535; // assume open until the first segment says so
+    tcp_conn.persist_since = 0; // not in zero-window persistence
     tcp_conn.dup_acks = 0;
     tcp_conn.last_ack_num = 0;
     tcp_conn.srtt = 0;
     tcp_conn.rttvar = 0;
     tcp_conn.rtt_seq = 0;
     tcp_conn.rtt_tick = 0;
+    tcp_conn.fin_pending = 0;
+    tcp_conn.fin_seq = 0;
     // Reorder buffer is per-connection: a stale gap from the previous
     // connection would deliver garbage into the new stream on seq overlap.
     for (int ri = 0; ri < TCP_REORDER_SLOTS; ri++) tcp_reorder_used[ri] = 0;
@@ -1107,8 +1156,26 @@ void tcp_poll(void) {
     // Zero-window persist: probe with 1 byte (never the full flight — the
     // peer advertised zero and would drop it). Does NOT count toward give-up
     // (a shut window is not packet loss) and does NOT double the RTO.
+    // Bounded by TCP_PERSIST_TIMEOUT instead: a window that never reopens
+    // (dead peer, blackholed probes) fails the fetch instead of probing
+    // forever with no error and no UI update.
     if (tcp_conn.peer_win == 0 && tcp_conn.rtx_len > 0 &&
         !tcp_conn.rtx_has_syn && tcp_conn.state == TCP_STATE_ESTABLISHED) {
+        if (!tcp_conn.persist_since) tcp_conn.persist_since = tick_count;
+        if ((uint32_t)(tick_count - tcp_conn.persist_since) > TCP_PERSIST_TIMEOUT) {
+            serial_puts("[tcp] persist give-up (window shut), closing\n");
+            tcp_conn.state = TCP_STATE_CLOSED;
+            tcp_conn.rtx_len = 0;
+            tcp_conn.rtx_has_syn = 0;
+            tcp_conn.rtx_has_fin = 0;
+            tcp_conn.persist_since = 0;
+            http_retry_pending = 0;
+            if (http_pending) {
+                http_pending = 0;
+                http_done = 0;
+            }
+            return;
+        }
         serial_puts("[tcp] persist probe (peer win 0)\n");
         tcp_send_raw(tcp_conn.snd_una, tcp_conn.ack, 0x10,
                      tcp_rtx_buf, 1);
@@ -1165,10 +1232,34 @@ static int tcp_reorder_store(uint32_t seq, const uint8_t *payload, uint16_t plen
 static void tcp_deliver_in_order(uint32_t seq, const uint8_t *payload,
                                  uint16_t plen, int is_tls);
 
+// Complete a peer FIN: RCV.NXT has reached the FIN's own seq (all data
+// received). Shared by the in-order FIN path and the early-FIN drain path
+// below — one close sequence, never two (fin_pending cleared first so a
+// duplicate FIN during the sends can't re-enter).
+static void tcp_complete_fin(void) {
+    tcp_conn.fin_pending = 0;
+    tcp_conn.ack++; // FIN consumes one sequence number
+    tcp_send_packet(0x10, 0, 0); // ACK their FIN
+    tcp_send_packet(0x11, 0, 0); // FIN+ACK (our side closes too)
+    tcp_conn.rtx_has_fin = 1;    // track it until ACKed
+    tcp_conn.rtx_tries = 0;
+    tcp_conn.rtx_timeout = TCP_RTO_TICKS;
+    tcp_rtx_arm();
+    tcp_conn.seq++;
+    tcp_conn.state = TCP_STATE_FIN_WAIT;
+    if (tls_is_active()) tls_connection_closed();
+    serial_puts("[tcp] FIN_WAIT (server FIN)\n");
+}
+
 void tcp_handle_packet(uint8_t* data, uint32_t len) {
     if (len < 20) return;
     uint16_t src_port = ((data[0] << 8) | data[1]);
     uint16_t dst_port = ((data[2] << 8) | data[3]);
+    // 4-tuple check: ignore segments for any other connection. Without
+    // this, stray segments poison peer_win and the reorder state — observed:
+    // phantom win-0 locked a fetch in a persist-probe storm under 23K stray
+    // RSTs that belonged to no live connection.
+    if (src_port != tcp_conn.dst_port || dst_port != tcp_conn.src_port) return;
     uint32_t seq_num = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
                         ((uint32_t)data[6] << 8) | data[7];
     uint32_t ack_num = ((uint32_t)data[8] << 24) | ((uint32_t)data[9] << 16) |
@@ -1179,6 +1270,7 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
     // Cache the peer's advertised window on EVERY segment (window updates
     // ride on pure ACKs too, not just data). Zero is meaningful (persist).
     tcp_conn.peer_win = ((uint32_t)data[14] << 8) | data[15];
+    if (tcp_conn.peer_win != 0) tcp_conn.persist_since = 0;
 
     serial_puts("[tcp] pkt src=");
     serial_putchar(hex[(src_port >> 8) & 0xF]);
@@ -1218,6 +1310,28 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
         return;
     }
 
+    // RST: peer aborted — tear down immediately (RFC 793). Without this a
+    // reset connection sits in ESTABLISHED forever, retransmitting/probing
+    // into the void (observed: infinite persist storm, wedged fetch, dead
+    // UI). Ports already verified above; seq is intentionally not checked
+    // (same trust level as our FIN handling — a MITM that can spoof RSTs
+    // can deny service by dropping packets anyway).
+    if (flags & 0x04) {
+        serial_puts("[tcp] RST, aborting connection\n");
+        tcp_conn.state = TCP_STATE_CLOSED;
+        tcp_conn.rtx_len = 0;
+        tcp_conn.rtx_has_syn = 0;
+        tcp_conn.rtx_has_fin = 0;
+        tcp_conn.fin_pending = 0;
+        tcp_conn.persist_since = 0;
+        if (tls_is_active()) tls_connection_closed();
+        if (http_pending) {
+            http_pending = 0;
+            if (http_response_len > 0) http_done = 1;
+        }
+        return;
+    }
+
     if (tcp_conn.state == TCP_STATE_SYN_SENT) {
         if (flags & 0x12) { // SYN+ACK
             tcp_conn.ack = seq_num + 1;
@@ -1246,6 +1360,9 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
         // segments / 12KB) instead of dropping it; tcp_reorder_drain()
         // delivers it in order once the hole fills. Beyond capacity: drop +
         // re-ACK (classic behavior, sender retransmits).
+        // seg_dlen preserves the segment's original data length for the FIN
+        // branch below (payload_len is zeroed when gap-stashed/duped).
+        uint16_t seg_dlen = payload_len;
         if (payload_len > 0 && seq_num != tcp_conn.ack) {
             if (seq_lt(seq_num, tcp_conn.ack)) {
                 serial_puts("[tcp] dup seq, re-ACKing\n");
@@ -1281,17 +1398,26 @@ void tcp_handle_packet(uint8_t* data, uint32_t len) {
             }
         }
         if (flags & 0x01) { // FIN
-            tcp_conn.ack = seq_num + payload_len + 1;
-            tcp_send_packet(0x10, 0, 0); // ACK their FIN
-            tcp_send_packet(0x11, 0, 0); // FIN+ACK (our side closes too)
-            tcp_conn.rtx_has_fin = 1;    // track it until ACKed
-            tcp_conn.rtx_tries = 0;
-            tcp_conn.rtx_timeout = TCP_RTO_TICKS;
-            tcp_rtx_arm();
-            tcp_conn.seq++;
-            tcp_conn.state = TCP_STATE_FIN_WAIT;
-            if (tls_is_active()) tls_connection_closed();
-            serial_puts("[tcp] FIN_WAIT (server FIN)\n");
+            // The FIN consumes the seq number right after this segment's
+            // data. If a receive hole is still open (FIN seq ahead of
+            // RCV.NXT), the FIN arrived ahead of missing data: advancing
+            // RCV.NXT to it would ACK bytes never received (data loss →
+            // TLS decrypts garbage → bogus PROTO failure, observed on
+            // bursty senders). Stash it and re-ACK; the drain path
+            // completes the close once retransmits fill the hole (same
+            // helper, single close). A FIN at/behind the edge is already
+            // fully received → complete (also covers duplicate FINs).
+            // NOTE: payload_len was zeroed above when gap-stashed, so use
+            // the segment's original data length here.
+            uint32_t fin_seq = seq_num + seg_dlen;
+            if (fin_seq != tcp_conn.ack && seq_lt(tcp_conn.ack, fin_seq)) {
+                tcp_conn.fin_pending = 1;
+                tcp_conn.fin_seq = fin_seq;
+                tcp_send_packet(0x10, 0, 0); // re-ACK the hole edge
+                serial_puts("[tcp] FIN early (hole open), queued\n");
+                return;
+            }
+            tcp_complete_fin();
             return;
         }
     } else if (tcp_conn.state == TCP_STATE_FIN_WAIT) {
@@ -1408,6 +1534,12 @@ static void tcp_deliver_in_order(uint32_t seq, const uint8_t *payload,
         tcp_sink_payload(tcp_reorder_data[found], flen, is_tls);
         tcp_reorder_used[found] = 0;
         serial_puts("[tcp] reorder drain: delivered buffered segment\n");
+    }
+    // A FIN stashed while the hole was open completes here: RCV.NXT has
+    // caught up to the FIN's seq, so every byte is received exactly once.
+    if (tcp_conn.fin_pending && tcp_conn.fin_seq == tcp_conn.ack) {
+        serial_puts("[tcp] drained to queued FIN, closing\n");
+        tcp_complete_fin();
     }
 }
 
