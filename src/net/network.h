@@ -82,67 +82,55 @@ void net_set_ip(uint8_t ip0, uint8_t ip1, uint8_t ip2, uint8_t ip3);
 // Resolve IP to MAC (returns 1 if resolved, 0 if pending)
 int arp_resolve(uint8_t* ip, uint8_t* mac);
 
-// DNS resolution (returns 0 on success, -1 if waiting for ARP)
+// ---- DNS: multi-entry cache, concurrent queries (QEMU SLIRP 10.0.2.3) ----
+// 1 = resolved (*ip set, host byte order), 0 = query in flight (call again),
+// -1 = definitive failure (NXDOMAIN / no A record / no answer after
+// retries; negative-cached briefly). Numeric hosts resolve immediately.
+int dns_lookup(const char* host, uint32_t* ip);
+// Shell `resolve`: look up and post "Resolved: a.b.c.d" as a net event.
 int dns_resolve(const char* hostname);
-int dns_is_resolved(uint32_t* ip, const char* host);
-// Seed the DNS cache with a literal address (numeric-IP URLs skip DNS).
-void dns_seed(const char* host, uint32_t ip);
 int net_parse_ip(const char* s, uint32_t* out); // "a.b.c.d" -> host-order IP (0 = fail)
-int dns_is_pending(void);
-int dns_is_pending_for(const char* host);  // a query for THIS host is in flight
-int dns_last_query_for(const char* host);  // last query sent/seeded was this host
 
-// TCP connection
-void tcp_connect(uint32_t dst_ip, uint16_t dst_port);
-void tcp_send_data(uint8_t* data, uint16_t len);
-void tcp_close(void);
-
-// TCP connection states (shared with the TLS integration in tls_net.c)
+// ---- TCP sockets ----
+// A small socket table: several connections at once (the browser fetches
+// in parallel). Every socket owns its retransmit flight, reorder buffer
+// and a receive ring; the advertised window is the ring's free space, so
+// bytes we ACK are always bytes we kept.
+#define TCP_MAX_SOCKS 16
 #define TCP_STATE_CLOSED      0
-#define TCP_STATE_SYN_SENT   1
+#define TCP_STATE_SYN_SENT    1
 #define TCP_STATE_ESTABLISHED 2
-#define TCP_STATE_FIN_WAIT   3
+#define TCP_STATE_FIN_WAIT    3
+int  tcp_open(uint32_t dst_ip, uint16_t dst_port);   // socket id (SYN sent) or -1
+int  tcp_state(int s);                               // TCP_STATE_*
+// Queue + send (retransmitted until ACKed). 0 ok, -1 not established /
+// flight buffer full.
+int  tcp_send(int s, const uint8_t* data, uint32_t len);
+// >0 bytes copied, 0 nothing buffered yet, -1 end of stream (peer FIN,
+// reset or give-up) once every buffered byte has been read.
+int  tcp_recv(int s, uint8_t* buf, uint32_t cap);
+int  tcp_rx_avail(int s);
+int  tcp_failed(int s);       // 1 after RST / retransmit give-up
+// Graceful close (FIN; the slot frees itself once closed) / abort (RST,
+// slot free immediately). The id is invalid after either call.
+void tcp_close(int s);
+void tcp_abort(int s);
 
-// TCP state probes for the TLS integration
-int tcp_is_established(void);
-int tcp_is_closed(void);
-int tcp_conn_state(void);
-
-// Poll for pending operations (call from main loop)
+// Poll timers, DNS retries and delayed ACKs (call from the main loop,
+// right after e1000_poll).
 void net_poll(void);
 
 // Set callback for network events (ping replies, etc.)
 void net_set_event_callback(void (*cb)(const char* msg));
 
-// HTTP client
-void http_get(const char* host, const char* path);
-// Port-aware GET (0 = 80). Handles numeric-IP hosts without DNS.
-void http_get_port(const char* host, const char* path, uint16_t port);
-void http_poll(void);
-char* http_get_response(void);
-int http_get_response_len(void);
-int http_is_pending(void);
-int http_is_done(void);
-int http_is_retry_pending(void);
-void http_reset_conn_attempts(void);
-// Accept-Encoding: gzip opt-in, latched per request (okai decodes bodies;
-// raw saves leave it 0 so files land uncompressed).
-extern int net_accept_gzip;
-// Top-level navigation: send a browser's HTML-first Accept instead of */*
-// (latched like the gzip opt-in). Some sites route on it — crates.io
-// answers "Accept: */*" with an empty 404 (its API), text/html with the app.
+// Top-level navigation: send a browser's HTML-first Accept instead of */*.
+// Some sites route on it — crates.io answers "Accept: */*" with an empty
+// 404 (its API), text/html with the app.
 #define NET_ACCEPT_HTML "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
-extern int net_accept_html;
-// Extra request header lines ("Cookie: ...\r\n"), latched per request like
-// the gzip opt-in (okai sets it around a fetch; NULL = none). <= 4KB.
+// Extra request header lines ("Cookie: ...\r\n"), <= 4KB.
 #define NET_EXTRA_MAX 4096
-extern const char* net_extra_headers;
+// Decode a raw HTTP response in place to its body (headers dropped,
+// chunked transfer encoding undone). Returns the body length.
 int http_dechunk(char* buf, int len);
-
-// TCP retransmission timer — called from net_poll, exported for tests
-void tcp_poll(void);
-
-// Browse file save
-void net_set_browse_save(const char* filename);
 
 #endif

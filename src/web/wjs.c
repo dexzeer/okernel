@@ -33,8 +33,8 @@ void qjs_abort_jmp_set(void** jb);
 #define ABORT_TRAP_SET(j) ((void)(j))
 #endif
 
-#define SCRIPT_BUDGET_MS 8000   // one script evaluation
-#define TASK_BUDGET_MS   1500   // one timer / event / callback
+#define SCRIPT_BUDGET_MS 4000   // one script evaluation (the whole OS waits: keep it short)
+#define TASK_BUDGET_MS   1000   // one timer / event / callback
 #define JS_MEM_LIMIT     (96u << 20)
 #define JS_STACK_MAX     (900u << 10)
 #define MAX_SCRIPTS      256

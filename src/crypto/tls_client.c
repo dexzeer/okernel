@@ -936,6 +936,29 @@ void tls_state_set_now_ms(struct tls_state* st, uint64_t now_ms) {
     if (st) st->now_ms = now_ms;
 }
 
+int tls_state_reuse(struct tls_state* st, const struct tls_client_io* io,
+                    const uint8_t* request, uint32_t request_len,
+                    uint8_t* out, uint32_t out_cap) {
+    // Only a healthy, authenticated session whose last response completed:
+    // still in the application phase, no failure, no close_notify seen,
+    // and no half-read record pending.
+    if (!st || st->phase != TLS_PH_RECV_BODY || st->fail_reason != TLS_FAIL_NONE ||
+        st->saw_close || st->rec_have != 0)
+        return -1;
+    if (request_len == 0 || request_len > TLS_RECORD_MAX_PAYLOAD - 256) return -1;
+    st->request = request;
+    st->request_len = request_len;
+    st->out = out;
+    st->out_cap = out_cap;
+    st->out_len = 0;
+    if (send_aead(st->suite, st->c_ap_key, st->c_ap_iv, &st->c_ap_seq,
+                  TLS_CT_APPDATA, request, request_len, io) != 0) {
+        st->fail_reason = TLS_FAIL_PROTO;
+        return -1;
+    }
+    return 0;
+}
+
 void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
                     const uint8_t* request, uint32_t request_len,
                     uint8_t* out, uint32_t out_cap) {
