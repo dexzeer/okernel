@@ -28,14 +28,16 @@ static int attr_match(const struct wdom* d, const struct wsheet* sh, const struc
     int wl = p->b;
     #define EQN(a, b, n) (p->ci ? w_ieq_n((a), (b), (n)) : !memcmp((a), (b), (n)))
     switch (p->op) {
-    case AO_EQ: return vl == wl && EQN(v, want, wl);
+    case AO_EQ: return vl == wl && (wl == 0 || EQN(v, want, wl));
     case AO_PREFIX: return wl > 0 && vl >= wl && EQN(v, want, wl);
     case AO_SUFFIX: return wl > 0 && vl >= wl && EQN(v + vl - wl, want, wl);
     case AO_SUBSTR:
         if (wl <= 0) return 0;
         for (int i = 0; i + wl <= vl; i++) if (EQN(v + i, want, wl)) return 1;
         return 0;
-    case AO_DASH: return (vl == wl && EQN(v, want, wl)) || (vl > wl && EQN(v, want, wl) && v[wl] == '-');
+    case AO_DASH:
+        if (wl == 0) return vl == 0 || v[0] == '-';
+        return (vl == wl && EQN(v, want, wl)) || (vl > wl && EQN(v, want, wl) && v[wl] == '-');
     case AO_INCLUDES:
         if (wl <= 0) return 0;
         for (int i = 0; i < vl;) {

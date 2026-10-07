@@ -1,0 +1,22 @@
+<!doctype html><title>intl</title><script>
+var r = [];
+function eq(a, b, m) { r.push((a === b ? 'PASS ' : 'FAIL ') + m + ' => ' + JSON.stringify(a) + (a === b ? '' : ' (want ' + JSON.stringify(b) + ')')); }
+var d = new Date(Date.UTC(2026, 9, 7, 15, 4, 5));
+eq(new Intl.DateTimeFormat('en-US').format(d), '10/7/2026', 'dtf default');
+eq(new Intl.DateTimeFormat('en-US', { year: 'numeric', month: 'short', day: 'numeric' }).format(d), 'Oct 7, 2026', 'dtf medium');
+eq(new Intl.DateTimeFormat('en-US', { dateStyle: 'full' }).format(d), 'Wednesday, October 7, 2026', 'dtf full');
+eq(new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit' }).format(d), '3:04 PM', 'dtf time');
+eq(new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }).format(d), 'Oct 7, 3:04 PM', 'dtf mixed');
+eq(new Intl.RelativeTimeFormat('en', { numeric: 'auto' }).format(-1, 'day'), 'yesterday', 'rtf yesterday');
+eq(new Intl.RelativeTimeFormat('en').format(-4, 'days'), '4 days ago', 'rtf ago');
+eq(new Intl.RelativeTimeFormat('en').format(3, 'hour'), 'in 3 hours', 'rtf in');
+eq(new Intl.NumberFormat('en-US').format(1234567.891), '1,234,567.891', 'nf');
+eq(new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(1234.5), '$1,234.50', 'nf currency');
+eq(new Intl.NumberFormat('en', { notation: 'compact' }).format(67123), '67K', 'nf compact');
+eq((0.256).toLocaleString('en-US', { style: 'percent' }), '26%', 'percent');
+eq(new Intl.PluralRules('en', { type: 'ordinal' }).select(22), 'two', 'ordinal');
+eq(new Intl.ListFormat('en').format(['a', 'b', 'c']), 'a, b, and c', 'list');
+eq((1234.5).toLocaleString(), '1,234.5', 'toLocaleString');
+console.log(r.join('\n'));
+console.log('RESULT ' + (r.join().indexOf('FAIL') < 0 ? 'ALLPASS' : 'SOMEFAIL') + ' ' + r.length);
+</script>

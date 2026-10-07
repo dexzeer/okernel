@@ -128,6 +128,9 @@ class OkVM:
         for line in self.serial().splitlines():
             if "[okai] render tab=" in line and "page origin" in line:
                 out = []
+            # a listing restarts at index 0 (scripts moved content: re-logged)
+            if re.search(r"\[okai\] (link|field)\[0\] ", line):
+                out = []
             m = re.search(r"\[okai\] link\[(\d+)\] x=(-?\d+) y=(-?\d+) w=(\d+) h=(\d+) href=(\S*)", line)
             if m:
                 out.append((int(m.group(1)), int(m.group(2)), int(m.group(3)),

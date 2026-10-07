@@ -8,19 +8,27 @@
 #include "wurl.h"
 #include "wcommon.h"
 #include "css_int.h"
+#include "wdoc_int.h"
+#include "wjs.h"
 
-enum { RES_CSS, RES_IMG };
+enum { RES_CSS = WDOC_RK_CSS, RES_IMG = WDOC_RK_IMG, RES_SCRIPT = WDOC_RK_SCRIPT, RES_REQ = WDOC_RK_REQ };
 enum { RS_PENDING, RS_INFLIGHT, RS_DONE, RS_FAILED };
 
 #define MAX_IMAGES 160
 #define MAX_IMG_DIM 2048
 
 struct wres {
-    char url[512];
+    char* url;              // absolute (heap)
     uint8_t kind, state;
     int32_t order;          // CSS cascade order key
     char media[96];
     int img;                // RES_IMG: image slot
+    char* text;             // RES_CSS: sheet text kept for stylesheet rebuilds
+    int tlen;
+    char method[8];         // RES_REQ
+    char* headers;          // RES_REQ: "Name: value\r\n..." request headers
+    char* body;             // RES_REQ: request body (or NULL)
+    int blen;
 };
 
 struct wdimg {
@@ -33,8 +41,9 @@ struct wdimg {
 };
 
 struct wdoc {
-    char url[512];
-    char base[512];
+    char url[2048];
+    char base[2048];
+    int has_base_el;        // <base href> present (pushState keeps it)
     struct wdom* d;
     struct wstyleset* ss;
     struct wlayout* L;
@@ -47,8 +56,18 @@ struct wdoc {
     int32_t* sheet_order;   // order keys of the sheets in ss (same order)
     int nsheet, capsheet;
     int32_t* node_img;      // DOM node -> image slot (-1)
+    int node_img_cap;
     struct wlay_images li;
     struct wpaint_env env;
+    // scripting
+    int scripting;          // run page scripts (set before wdoc_load)
+    struct wjs* js;
+    int scroll_y;           // last painted scroll (window.scrollY)
+    int focus;              // focused control (document.activeElement), -1
+    int styles_dirty;       // <style>/<link> set changed: rebuild the sheets
+    int images_dirty;       // image sources changed: rescan
+    int last_forced_ms;     // layout forced by a script (throttle)
+    int last_layout_ms;     // cost of the last layout pass
 };
 
 // ---- data: URLs --------------------------------------------------------------------
@@ -115,7 +134,7 @@ char* wdoc_data_url(const char* url, int len, int* out_len, char* mime, int mime
 
 static int res_add(struct wdoc* d, const char* url, int kind, int32_t order, const char* media, int mlen) {
     for (int i = 0; i < d->nres; i++)
-        if (d->res[i].kind == kind && kind == RES_IMG && !strcmp(d->res[i].url, url)) return i;
+        if (d->res[i].kind == kind && kind == RES_IMG && d->res[i].url && !strcmp(d->res[i].url, url)) return i;
     if (d->nres >= d->capres) {
         int nc = d->capres ? d->capres * 2 : 32;
         struct wres* n = (struct wres*)w_realloc(d->res, nc * sizeof(struct wres));
@@ -126,9 +145,9 @@ static int res_add(struct wdoc* d, const char* url, int kind, int32_t order, con
     struct wres* r = &d->res[d->nres];
     memset(r, 0, sizeof *r);
     int n = (int)strlen(url);
-    if (n > 511) n = 511;
-    memcpy(r->url, url, n);
-    r->url[n] = 0;
+    r->url = (char*)w_malloc(n + 1);
+    if (!r->url) return -1;
+    memcpy(r->url, url, n + 1);
     r->kind = (uint8_t)kind;
     r->order = order;
     r->img = -1;
@@ -336,7 +355,7 @@ static int pick_img_url(struct wdoc* d, int el, char* out, int cap) {
 static int lay_img_node(void* ctx, int node, int* w, int* h) {
     struct wdoc* d = (struct wdoc*)ctx;
     *w = *h = 0;
-    if (node < 0 || node >= d->d->nn || !d->node_img) return -1;
+    if (node < 0 || node >= d->d->nn || node >= d->node_img_cap || !d->node_img) return -1;
     int slot = d->node_img[node];
     if (slot < 0) return -1;
     if (d->img[slot].state == 1) {
@@ -377,6 +396,7 @@ struct wdoc* wdoc_new(void) {
     if (!d) return 0;
     d->vw = 1024;
     d->vh = 768;
+    d->focus = -1;
     d->li.ctx = d;
     d->li.for_node = lay_img_node;
     d->li.for_url = lay_img_url;
@@ -384,16 +404,47 @@ struct wdoc* wdoc_new(void) {
 }
 
 static void doc_clear(struct wdoc* d) {
+    if (d->js) wjs_free(d->js);   // first: it holds references into the DOM
+    d->js = 0;
     if (d->L) wlay_free(d->L);
     if (d->ss) css_set_free(d->ss);
     if (d->d) wdom_free(d->d);
     for (int i = 0; i < d->nimg; i++) w_free(d->img[i].px);
     w_free(d->img);
+    for (int i = 0; i < d->nres; i++) {
+        w_free(d->res[i].url);
+        w_free(d->res[i].text);
+        w_free(d->res[i].headers);
+        w_free(d->res[i].body);
+    }
     w_free(d->res);
     w_free(d->sheet_order);
     w_free(d->node_img);
     d->L = 0; d->ss = 0; d->d = 0; d->img = 0; d->res = 0; d->sheet_order = 0; d->node_img = 0;
-    d->nimg = d->capimg = d->nres = d->capres = d->nsheet = d->capsheet = 0;
+    d->nimg = d->capimg = d->nres = d->capres = d->nsheet = d->capsheet = d->node_img_cap = 0;
+    d->styles_dirty = d->images_dirty = 0;
+    d->focus = -1;
+}
+
+// CSS request: reuse a fetched sheet (stylesheet rebuilds), retarget a
+// pending one, or queue a new fetch.
+static void add_sheet_ordered(struct wdoc* d, const char* text, int len, const char* base, int32_t order,
+                              const char* media, int mlen);
+static void css_request(struct wdoc* d, const char* url, int32_t order, const char* media, int mlen) {
+    for (int i = 0; i < d->nres; i++) {
+        struct wres* r = &d->res[i];
+        if (r->kind != RES_CSS || strcmp(r->url, url)) continue;
+        if (r->state == RS_DONE) {
+            if (r->text) add_sheet_ordered(d, r->text, r->tlen, r->url, order, media, mlen);
+        } else if (r->state <= RS_INFLIGHT) {
+            r->order = order;
+            int m = mlen < 95 ? mlen : 95;
+            if (media && m > 0) memcpy(r->media, media, m);
+            r->media[m > 0 ? m : 0] = 0;
+        }
+        return;
+    }
+    res_add(d, url, RES_CSS, order, media, mlen);
 }
 
 void wdoc_free(struct wdoc* d) {
@@ -426,7 +477,7 @@ static void add_sheet_ordered(struct wdoc* d, const char* text, int len, const c
     for (int k = 0; k < n; k++) {
         css_set_mark_import_done(d->ss, urls[k]);
         int32_t o = d->sheet_order[before[k] < d->nsheet ? before[k] : d->nsheet - 1] - 256 + k;
-        res_add(d, urls[k], RES_CSS, o, 0, 0);
+        css_request(d, urls[k], o, 0, 0);
     }
 }
 
@@ -439,35 +490,19 @@ static int rel_has(const char* rel, int rl, const char* word) {
     return 0;
 }
 
-int wdoc_load(struct wdoc* d, const char* url, const char* html, int len, const char* charset) {
-    doc_clear(d);
-    int n = (int)strlen(url);
-    if (n > 511) n = 511;
-    memcpy(d->url, url, n);
-    d->url[n] = 0;
-    memcpy(d->base, d->url, n + 1);
-    d->d = whtml_parse(html, len, charset);
-    if (!d->d) return -1;
+// Stylesheets of the document in tree order: <style> text and
+// <link rel=stylesheet> (fetched, or queued). Used at load and whenever
+// scripts add/remove/edit style elements (the set is rebuilt from scratch).
+static void collect_styles(struct wdoc* d) {
     struct wdom* dom = d->d;
-    // <base href>
-    int be = wdom_first_tag(dom, T_base);
-    if (be >= 0) {
-        int hl;
-        const char* h = wdom_attr(dom, be, A_href, &hl);
-        if (h) wurl_resolve(d->url, h, hl, d->base, sizeof d->base);
-    }
-    d->ss = css_set_new(dom);
-    if (!d->ss) return -1;
-    css_set_doc_base(d->ss, d->base);
-    d->node_img = (int32_t*)w_malloc((dom->nn + 1) * sizeof(int32_t));
-    if (d->node_img) for (int i = 0; i <= dom->nn; i++) d->node_img[i] = -1;
     int32_t idx = 0;
-    char abs[1024];
+    char abs[2048];
     for (int el = dom->n[0].first; el >= 0; el = wdom_next(dom, el, 0)) {
         if (dom->n[el].type != WN_ELEM || dom->n[el].ns != NS_HTML) continue;
         int tag = dom->n[el].tag;
         idx++;
         if (tag == T_style) {
+            if (wdom_has_attr(dom, el, A_disabled)) continue;
             int tl = 0;
             for (int c = dom->n[el].first; c >= 0; c = dom->n[c].next) if (dom->n[c].type == WN_TEXT) tl += (int)dom->n[c].tlen;
             char* buf = (char*)w_malloc(tl + 1);
@@ -487,33 +522,112 @@ int wdoc_load(struct wdoc* d, const char* url, const char* html, int len, const 
             int ml;
             const char* media = wdom_attr(dom, el, A_media, &ml);
             if (media && (w_ieq(media, ml, "print") || w_ieq(media, ml, "speech"))) continue;
-            res_add(d, abs, RES_CSS, idx * 1024, media, media ? ml : 0);
-        } else if (tag == T_img || (tag == T_input && wdom_attr(dom, el, A_type, &(int){0}) &&
-                                    w_ieq(wdom_attr(dom, el, A_type, &(int){0}), 5, "image"))) {
-            if (pick_img_url(d, el, abs, sizeof abs) > 0) {
-                int slot = img_slot(d, abs);
-                if (d->node_img && slot >= 0) d->node_img[el] = slot;
-            }
+            css_request(d, abs, idx * 1024, media, media ? ml : 0);
+        }
+    }
+}
+
+static int node_img_grow(struct wdoc* d) {
+    int need = d->d->nn + 1;
+    if (need <= d->node_img_cap && d->node_img) return 1;
+    int nc = need + 512;
+    int32_t* n = (int32_t*)w_realloc(d->node_img, nc * sizeof(int32_t));
+    if (!n) return 0;
+    for (int i = d->node_img ? d->node_img_cap : 0; i < nc; i++) n[i] = -1;
+    d->node_img = n;
+    d->node_img_cap = nc;
+    return 1;
+}
+
+// <img>/<input type=image>/<video poster> -> image slots (re-run when
+// scripts change sources: lazy loaders swap data-src into src)
+static void collect_images(struct wdoc* d) {
+    struct wdom* dom = d->d;
+    if (!node_img_grow(d)) return;
+    char abs[1024];
+    for (int el = dom->n[0].first; el >= 0; el = wdom_next(dom, el, 0)) {
+        if (dom->n[el].type != WN_ELEM || dom->n[el].ns != NS_HTML) continue;
+        int tag = dom->n[el].tag;
+        int slot = -2;
+        if (tag == T_img || (tag == T_input && wdom_attr(dom, el, A_type, &(int){0}) &&
+                             w_ieq(wdom_attr(dom, el, A_type, &(int){0}), 5, "image"))) {
+            slot = pick_img_url(d, el, abs, sizeof abs) > 0 ? img_slot(d, abs) : -1;
         } else if (tag == T_video) {
             int pl;
             const char* poster = wdom_attr_s(dom, el, "poster", &pl);
-            if (poster && wurl_resolve(d->base, poster, pl, abs, sizeof abs) > 0) {
-                int slot = img_slot(d, abs);
-                if (d->node_img && slot >= 0) d->node_img[el] = slot;
-            }
+            slot = (poster && wurl_resolve(d->base, poster, pl, abs, sizeof abs) > 0) ? img_slot(d, abs) : -1;
+        }
+        if (slot != -2) d->node_img[el] = slot;
+    }
+}
+
+// Does the document need a script realm? (<script> elements or inline
+// on* handlers.) Pages without either never pay for a QuickJS context.
+static int doc_wants_scripts(struct wdoc* d) {
+    struct wdom* dom = d->d;
+    for (int el = dom->n[0].first; el >= 0; el = wdom_next(dom, el, 0)) {
+        if (dom->n[el].type != WN_ELEM) continue;
+        if (wdom_is(dom, el, T_script)) return 1;
+        for (int a = dom->n[el].attr; a >= 0; a = dom->a[a].next) {
+            int nl;
+            const char* nm = watom_name(&dom->atoms, dom->a[a].name, &nl);
+            if (nl > 2 && nm[0] == 'o' && nm[1] == 'n') return 1;
         }
     }
+    return 0;
+}
+
+static void rebuild_styles(struct wdoc* d) {
+    if (d->ss) css_set_free(d->ss);
+    d->ss = css_set_new(d->d);
+    d->nsheet = 0;
+    if (!d->ss) return;
+    css_set_doc_base(d->ss, d->base);
+    collect_styles(d);
     d->style_dirty = 1;
     d->layout_dirty = 1;
+}
+
+int wdoc_load(struct wdoc* d, const char* url, const char* html, int len, const char* charset) {
+    doc_clear(d);
+    int n = (int)strlen(url);
+    if (n > (int)sizeof d->url - 1) n = (int)sizeof d->url - 1;
+    memcpy(d->url, url, n);
+    d->url[n] = 0;
+    memcpy(d->base, d->url, n + 1);
+    d->d = whtml_parse_ex(html, len, charset, d->scripting);
+    if (!d->d) return -1;
+    struct wdom* dom = d->d;
+    // <base href>
+    int be = wdom_first_tag(dom, T_base);
+    d->has_base_el = 0;
+    if (be >= 0) {
+        int hl;
+        const char* h = wdom_attr(dom, be, A_href, &hl);
+        if (h && wurl_resolve(d->url, h, hl, d->base, sizeof d->base) > 0) d->has_base_el = 1;
+    }
+    d->ss = css_set_new(dom);
+    if (!d->ss) return -1;
+    css_set_doc_base(d->ss, d->base);
+    collect_styles(d);
+    collect_images(d);
+    d->style_dirty = 1;
+    d->layout_dirty = 1;
+    if (d->scripting && doc_wants_scripts(d)) {
+        d->js = wjs_new(d);
+        if (d->js) wjs_scan_scripts(d->js);
+    }
     return 0;
 }
 
 int wdoc_next_fetch(struct wdoc* d, char* url, int cap) {
-    // stylesheets first (they gate the first meaningful paint), then images
-    for (int pass = 0; pass < 2; pass++)
+    // stylesheets first (they gate the first meaningful paint), then
+    // scripts and script requests (in request order), then images
+    for (int pass = 0; pass < 3; pass++)
         for (int i = 0; i < d->nres; i++) {
             struct wres* r = &d->res[i];
-            if (r->state != RS_PENDING || (pass == 0) != (r->kind == RES_CSS)) continue;
+            int p = r->kind == RES_CSS ? 0 : r->kind == RES_IMG ? 2 : 1;
+            if (r->state != RS_PENDING || p != pass) continue;
             r->state = RS_INFLIGHT;
             int n = (int)strlen(r->url);
             if (n > cap - 1) n = cap - 1;
@@ -525,6 +639,17 @@ int wdoc_next_fetch(struct wdoc* d, char* url, int cap) {
 }
 
 int wdoc_is_css(struct wdoc* d, int id) { return id >= 0 && id < d->nres && d->res[id].kind == RES_CSS; }
+int wdoc_res_kind(struct wdoc* d, int id) { return id >= 0 && id < d->nres ? d->res[id].kind : -1; }
+
+int wdoc_fetch_info(struct wdoc* d, int id, const char** method, const char** headers, const char** body, int* blen) {
+    if (id < 0 || id >= d->nres) return -1;
+    struct wres* r = &d->res[id];
+    *method = r->kind == RES_REQ && r->method[0] ? r->method : "GET";
+    *headers = r->headers;
+    *body = r->body;
+    *blen = r->blen;
+    return r->kind;
+}
 
 int wdoc_pending(struct wdoc* d) {
     int n = 0;
@@ -533,21 +658,84 @@ int wdoc_pending(struct wdoc* d) {
 }
 
 void wdoc_fetch_done(struct wdoc* d, int id, const char* bytes, int len, const char* ctype) {
+    wdoc_fetch_done2(d, id, bytes, len, ctype, (len < 0 || !bytes) ? 0 : 200, 0, 0);
+}
+
+static void origin_part(const char* u, char* out, int cap) {
+    int i = 0, slashes = 0;
+    for (; u[i] && i < cap - 1; i++) {
+        if (u[i] == '/' && ++slashes == 3) break;
+        out[i] = (char)w_lower((unsigned char)u[i]);
+    }
+    out[i] = 0;
+}
+
+// CORS for script requests: a cross-origin response is readable only with
+// Access-Control-Allow-Origin: * or the document's origin.
+static int cors_ok(struct wdoc* d, const char* url, const char* headers) {
+    char a[512], b[512];
+    origin_part(d->url, a, sizeof a);
+    origin_part(url, b, sizeof b);
+    if (!strcmp(a, b)) return 1;
+    if (!headers) return 0;
+    const char* h = headers;
+    while (*h) {
+        const char* e = h;
+        while (*e && *e != '\n') e++;
+        int ll = (int)(e - h);
+        if (w_ieq_prefix(h, ll, "access-control-allow-origin:")) {
+            const char* v = h + 28;
+            while (v < e && *v == ' ') v++;
+            int vl = (int)(e - v);
+            while (vl > 0 && (v[vl - 1] == '\r' || v[vl - 1] == ' ')) vl--;
+            if (vl == 1 && v[0] == '*') return 1;
+            if (vl == (int)strlen(a) && w_ieq_n(v, a, vl)) return 1;
+            return 0;
+        }
+        h = *e ? e + 1 : e;
+    }
+    return 0;
+}
+
+void wdoc_fetch_done2(struct wdoc* d, int id, const char* bytes, int len, const char* ctype, int status,
+                      const char* headers, const char* final_url) {
     if (id < 0 || id >= d->nres) return;
     struct wres* r = &d->res[id];
-    if (len < 0 || !bytes) {
+    int failed = len < 0 || !bytes;
+    (void)ctype;
+    if (r->kind == RES_SCRIPT || r->kind == RES_REQ) {
+        r->state = failed ? RS_FAILED : RS_DONE;
+        if (r->kind == RES_REQ && !failed && !cors_ok(d, final_url && final_url[0] ? final_url : r->url, headers)) {
+            w_log("[js] CORS: blocked cross-origin response from %s\n", r->url);
+            status = 0;
+            failed = 1;
+        }
+        if (failed && status >= 200 && status < 300) status = 0;
+        // the request body/headers are no longer needed
+        w_free(r->headers); r->headers = 0;
+        w_free(r->body); r->body = 0;
+        if (d->js) wjs_resource_done(d->js, id, failed ? 0 : status, headers, bytes, failed ? -1 : len,
+                                     final_url ? final_url : r->url);
+        return;
+    }
+    if (failed) {
         r->state = RS_FAILED;
-        if (r->kind == RES_IMG && r->img >= 0) d->img[r->img].state = 2;
+        if (r->kind == RES_IMG && r->img >= 0) {
+            d->img[r->img].state = 2;
+            if (d->js) wjs_image_done(d->js, r->img, 0);
+        }
         return;
     }
     r->state = RS_DONE;
-    (void)ctype;
     if (r->kind == RES_CSS) {
+        r->text = (char*)w_malloc(len + 1);
+        if (r->text) { memcpy(r->text, bytes, len); r->text[len] = 0; r->tlen = len; }
         add_sheet_ordered(d, bytes, len, r->url, r->order, r->media[0] ? r->media : 0, (int)strlen(r->media));
         d->layout_dirty = 1;
     } else if (r->img >= 0) {
         img_decode_into(d, r->img, bytes, len);
         d->layout_dirty = 1;
+        if (d->js) wjs_image_done(d->js, r->img, d->img[r->img].state == 1);
     }
 }
 
@@ -561,7 +749,10 @@ void wdoc_set_viewport(struct wdoc* d, int w, int h) {
 void wdoc_invalidate(struct wdoc* d) { d->style_dirty = 1; d->layout_dirty = 1; }
 
 int wdoc_update(struct wdoc* d) {
-    if (!d->d || !d->ss) return 0;
+    if (!d->d) return 0;
+    if (d->styles_dirty) { d->styles_dirty = 0; rebuild_styles(d); }
+    if (d->images_dirty) { d->images_dirty = 0; collect_images(d); }
+    if (!d->ss) return 0;
     if (!d->style_dirty && !d->layout_dirty && d->L) return 0;
     if (d->style_dirty) css_compute_all(d->ss, d->vw, d->vh);
     if (d->L) wlay_free(d->L);
@@ -579,6 +770,7 @@ const char* wdoc_url(struct wdoc* d) { return d->url; }
 struct wdom* wdoc_dom(struct wdoc* d) { return d->d; }
 
 void wdoc_paint(struct wdoc* d, struct wsurf* s, int scroll_y) {
+    d->scroll_y = scroll_y;
     wdoc_update(d);
     if (!d->L) { ws_fill_rect(s, 0, 0, s->w, s->h, 0xFFFFFFFF); return; }
     d->env.ss = d->ss;
@@ -705,4 +897,133 @@ int wdoc_hit_get(struct wdoc* d, int i, struct wdoc_region* out) {
         if (href) wurl_resolve(d->base, href, hl, out->href, sizeof out->href);
     }
     return 1;
+}
+
+// ---- scripting support ---------------------------------------------------------------
+
+void wdoc_set_scripting(struct wdoc* d, int on) { d->scripting = on; }
+struct wjs* wdoc_js(struct wdoc* d) { return d->js; }
+void wdoc_set_scroll(struct wdoc* d, int y) { d->scroll_y = y; }
+void wdoc_set_focus(struct wdoc* d, int node) { d->focus = node; }
+const char* wdoc_base(struct wdoc* d) { return d->base; }
+struct wstyleset* wdoc_styleset(struct wdoc* d) { return d->ss; }
+int wdoc_focus_node(struct wdoc* d) { return d->focus; }
+
+void wdoc_set_url(struct wdoc* d, const char* url) {
+    int n = (int)strlen(url);
+    if (n > (int)sizeof d->url - 1) n = (int)sizeof d->url - 1;
+    memcpy(d->url, url, n);
+    d->url[n] = 0;
+    if (!d->has_base_el) memcpy(d->base, d->url, n + 1);
+}
+
+void wdoc_dom_changed(struct wdoc* d, int what) {
+    if (what & WDC_STYLE) d->styles_dirty = 1;
+    if (what & WDC_IMG) d->images_dirty = 1;
+    d->style_dirty = 1;
+    d->layout_dirty = 1;
+}
+
+static int fetchable(const char* url) {
+    int n = (int)strlen(url);
+    return w_ieq_prefix(url, n, "http:") || w_ieq_prefix(url, n, "https:") || w_ieq_prefix(url, n, "data:");
+}
+
+int wdoc_res_script(struct wdoc* d, const char* url) {
+    if (!fetchable(url)) return -1;
+    return res_add(d, url, RES_SCRIPT, 0, 0, 0);
+}
+
+int wdoc_res_request(struct wdoc* d, const char* url, const char* method, const char* headers,
+                     const char* body, int blen) {
+    if (!fetchable(url)) return -1;
+    int id = res_add(d, url, RES_REQ, 0, 0, 0);
+    if (id < 0) return -1;
+    struct wres* r = &d->res[id];
+    int i = 0;
+    for (; method[i] && i < 7; i++) r->method[i] = (char)(method[i] >= 'a' && method[i] <= 'z' ? method[i] - 32 : method[i]);
+    r->method[i] = 0;
+    if (headers && headers[0]) {
+        int hl = (int)strlen(headers);
+        r->headers = (char*)w_malloc(hl + 1);
+        if (r->headers) memcpy(r->headers, headers, hl + 1);
+    }
+    if (body && blen > 0) {
+        r->body = (char*)w_malloc(blen + 1);
+        if (r->body) { memcpy(r->body, body, blen); r->body[blen] = 0; r->blen = blen; }
+    }
+    return id;
+}
+
+// Layout for a script's query: relayout when stale, but not more often than
+// ~4x the cost of a layout pass (scripts that interleave writes and reads
+// would otherwise spend all their time in layout).
+static int script_layout(struct wdoc* d) {
+    if (!d->styles_dirty && !d->images_dirty && !d->style_dirty && !d->layout_dirty && d->L) return d->L != 0;
+    int now = wjs_now();
+    int gap = d->last_layout_ms * 4;
+    if (gap < 100) gap = 100;
+    if (d->L && now - d->last_forced_ms < gap) return 1;
+    wdoc_update(d);
+    d->last_forced_ms = wjs_now();
+    d->last_layout_ms = d->last_forced_ms - now;
+    return d->L != 0;
+}
+
+int wdoc_layout_rect(struct wdoc* d, int node, int* x, int* y, int* w, int* h) {
+    if (!script_layout(d)) return 0;
+    int32_t X, Y, W, H;
+    if (!wlay_node_rect(d->L, node, &X, &Y, &W, &H)) return 0;
+    *x = LU_FLOOR(X); *y = LU_FLOOR(Y); *w = LU_ROUND(W); *h = LU_ROUND(H);
+    return 1;
+}
+
+const struct wstyle* wdoc_style_of(struct wdoc* d, int node) {
+    script_layout(d);
+    return d->ss ? css_style_of(d->ss, node) : 0;
+}
+
+void wdoc_viewport_get(struct wdoc* d, int* vw, int* vh, int* scroll, int* docw, int* doch) {
+    *vw = d->vw;
+    *vh = d->vh;
+    *scroll = d->scroll_y;
+    *docw = d->L ? wlay_doc_width(d->L) : d->vw;
+    *doch = d->L ? wlay_doc_height(d->L) : d->vh;
+}
+
+int wdoc_img_node_slot(struct wdoc* d, int node) {
+    if (node < 0 || node >= d->node_img_cap || !d->node_img) return -1;
+    return d->node_img[node];
+}
+
+int wdoc_img_info(struct wdoc* d, int node, int* w, int* h, int* state) {
+    if (d->images_dirty) { d->images_dirty = 0; collect_images(d); }
+    int slot = wdoc_img_node_slot(d, node);
+    *w = *h = *state = 0;
+    if (slot < 0 || slot >= d->nimg) return 0;
+    int sc = d->img[slot].svg_scale > 0 ? d->img[slot].svg_scale : 1;
+    *state = d->img[slot].state;
+    if (*state == 1) { *w = d->img[slot].w / sc; *h = d->img[slot].h / sc; }
+    return 1;
+}
+
+int wdoc_hit_element(struct wdoc* d, int x, int y) {
+    if (!script_layout(d)) return -1;
+    struct wdom* dom = d->d;
+    int32_t X = PX(x), Y = PX(y + d->scroll_y);
+    int best = -1;
+    for (int el = dom->n[0].first; el >= 0; el = wdom_next(dom, el, 0)) {
+        if (dom->n[el].type != WN_ELEM) continue;
+        int32_t rx, ry, rw, rh;
+        if (wlay_node_rect(d->L, el, &rx, &ry, &rw, &rh) && X >= rx && X < rx + rw && Y >= ry && Y < ry + rh)
+            best = el;
+    }
+    return best;
+}
+
+int wdoc_pending_load(struct wdoc* d) {
+    int n = 0;
+    for (int i = 0; i < d->nres; i++)
+        if ((d->res[i].kind == RES_CSS || d->res[i].kind == RES_IMG) && d->res[i].state <= RS_INFLIGHT) n++;
+    return n;
 }

@@ -87,6 +87,12 @@ struct process {
                             // reads user_eip/esp by offsetof (see below), but
                             // keeping growth at the tail minimizes churn for
                             // any future raw-offset readers.
+    // x87 context across PREEMPTIVE switches (process_switch_to): QuickJS
+    // (okai page scripts) uses the FPU on the main thread, which the timer
+    // can preempt mid-script. FNSAVE image (108 bytes) + validity flag;
+    // a thread with no saved image starts from FNINIT.
+    uint8_t fpu_state[108];
+    uint32_t fpu_valid;
 };
 
 // Initialize the process table

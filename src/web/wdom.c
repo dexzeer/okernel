@@ -523,3 +523,140 @@ void wdom_remove_attr(struct wdom* d, int el, int name) {
         return;
     }
 }
+
+// ---- script support: text data, clone, serialization ------------------------
+
+void wdom_set_data(struct wdom* d, int node, const char* s, int len) {
+    if (node < 0 || node >= d->nn || d->n[node].type == WN_ELEM) return;
+    uint32_t off;
+    if (!text_put(d, s, len, &off)) return;
+    d->n[node].text = off;
+    d->n[node].tlen = (uint32_t)len;
+    if (d->n[node].type == WN_TEXT) {
+        if (is_ws_run(s, len)) d->n[node].flags |= WNF_WS;
+        else d->n[node].flags &= ~WNF_WS;
+    }
+}
+
+int wdom_is_connected(const struct wdom* d, int node) {
+    for (int i = 0; node >= 0 && i < 100000; i++) {
+        if (node == 0) return 1;
+        node = d->n[node].parent;
+    }
+    return 0;
+}
+
+int wdom_clone(struct wdom* d, int node, int deep) {
+    if (node < 0 || node >= d->nn) return -1;
+    int type = d->n[node].type;
+    int c;
+    if (type == WN_ELEM) {
+        c = wdom_create_element(d, d->n[node].ns, d->n[node].tag);
+        if (c < 0) return -1;
+        for (int a = d->n[node].attr; a >= 0; a = d->a[a].next) {
+            int vl = (int)d->a[a].vlen;
+            char* tmp = (char*)w_malloc(vl + 1);
+            if (!tmp) break;
+            memcpy(tmp, d->text + d->a[a].val, vl);   // the set below may move the arena
+            int name = d->a[a].name;
+            wdom_set_attr(d, c, name, tmp, vl);
+            w_free(tmp);
+        }
+        wdom_index_attrs(d, c);
+    } else if (type == WN_TEXT || type == WN_COMMENT) {
+        int l = (int)d->n[node].tlen;
+        char* tmp = (char*)w_malloc(l + 1);
+        if (!tmp) return -1;
+        memcpy(tmp, d->text + d->n[node].text, l);
+        c = type == WN_TEXT ? wdom_create_text(d, tmp, l) : wdom_create_comment(d, tmp, l);
+        w_free(tmp);
+        return c;
+    } else {
+        return -1;
+    }
+    if (deep)
+        for (int ch = d->n[node].first; ch >= 0; ch = d->n[ch].next) {
+            int cc = wdom_clone(d, ch, 1);
+            if (cc >= 0) wdom_append(d, c, cc);
+        }
+    return c;
+}
+
+static int ser_void(int tag) {
+    static const int V[] = { T_area, T_base, T_br, T_col, T_embed, T_hr, T_img, T_input, T_link,
+                             T_meta, T_source, T_track, T_wbr, T_basefont, T_bgsound, T_frame,
+                             T_keygen, T_param, 0 };
+    for (int i = 0; V[i]; i++) if (V[i] == tag) return 1;
+    return 0;
+}
+
+static int ser_raw(const struct wdom* d, int el) {
+    if (el < 0 || d->n[el].type != WN_ELEM || d->n[el].ns != NS_HTML) return 0;
+    int t = d->n[el].tag;
+    return t == T_style || t == T_script || t == T_xmp || t == T_iframe || t == T_noembed ||
+           t == T_noframes || t == T_plaintext || (t == T_noscript && d->scripting);
+}
+
+static void ser_escape(struct wbuf* b, const char* s, int n, int attr) {
+    int run = 0;
+    for (int i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        const char* rep = 0;
+        int skip = 0;
+        if (c == '&') rep = "&amp;";
+        else if (c == 0xC2 && i + 1 < n && (unsigned char)s[i + 1] == 0xA0) { rep = "&nbsp;"; skip = 1; }
+        else if (attr && c == '"') rep = "&quot;";
+        else if (c == '<') rep = "&lt;";
+        else if (c == '>') rep = "&gt;";
+        if (!rep) continue;
+        wbuf_put(b, s + run, i - run);
+        wbuf_put(b, rep, (int)strlen(rep));
+        i += skip;
+        run = i + 1;
+    }
+    wbuf_put(b, s + run, n - run);
+}
+
+static void ser_node(const struct wdom* d, int node, struct wbuf* b, int depth) {
+    const struct wnode* n = &d->n[node];
+    if (n->type == WN_TEXT) {
+        if (ser_raw(d, n->parent)) wbuf_put(b, d->text + n->text, (int)n->tlen);
+        else ser_escape(b, d->text + n->text, (int)n->tlen, 0);
+        return;
+    }
+    if (n->type == WN_COMMENT) {
+        wbuf_put(b, "<!--", 4);
+        wbuf_put(b, d->text + n->text, (int)n->tlen);
+        wbuf_put(b, "-->", 3);
+        return;
+    }
+    if (n->type != WN_ELEM) return;
+    int tl;
+    const char* tn = watom_name(&d->atoms, n->tag, &tl);
+    wbuf_putc(b, '<');
+    wbuf_put(b, tn, tl);
+    for (int a = n->attr; a >= 0; a = d->a[a].next) {
+        int al;
+        const char* an = watom_name(&d->atoms, d->a[a].name, &al);
+        wbuf_putc(b, ' ');
+        wbuf_put(b, an, al);
+        wbuf_put(b, "=\"", 2);
+        ser_escape(b, d->text + d->a[a].val, (int)d->a[a].vlen, 1);
+        wbuf_putc(b, '"');
+    }
+    wbuf_putc(b, '>');
+    if (n->ns == NS_HTML && ser_void(n->tag)) return;
+    if (depth < 2000)
+        for (int c = n->first; c >= 0; c = d->n[c].next) ser_node(d, c, b, depth + 1);
+    wbuf_put(b, "</", 2);
+    wbuf_put(b, tn, tl);
+    wbuf_putc(b, '>');
+}
+
+void wdom_serialize(const struct wdom* d, int node, int outer, struct wbuf* b) {
+    if (node < 0 || node >= d->nn) return;
+    if (outer && node != 0) { ser_node(d, node, b, 0); return; }
+    for (int c = d->n[node].first; c >= 0; c = d->n[c].next) ser_node(d, c, b, 1);
+}
+
+int wdom_create_fragment(struct wdom* d) { return new_node(d, WN_FRAG); }

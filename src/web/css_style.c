@@ -538,6 +538,8 @@ static int mq_len_px(const char* s, int len, int32_t* px_milli) {
     return 1;
 }
 
+static int mq_scripting;   // document scripting flag for the pass being evaluated
+
 static int mq_feature(const char* s, int len, int vw, int vh) {
     cv_trim(&s, &len);
     if (len >= 2 && s[0] == '(' && s[len - 1] == ')') { s++; len -= 2; cv_trim(&s, &len); }
@@ -605,7 +607,8 @@ static int mq_feature(const char* s, int len, int vw, int vh) {
     if (w_ieq(name, nl, "color")) return 1;
     if (w_ieq(name, nl, "min-color")) return 1;
     if (w_ieq(name, nl, "monochrome") || w_ieq(name, nl, "grid")) return val && w_ieq(val, vl, "0");
-    if (w_ieq(name, nl, "scripting")) return val && w_ieq(val, vl, "none");
+    if (w_ieq(name, nl, "scripting"))
+        return mq_scripting ? (!val || w_ieq(val, vl, "enabled")) : (val && w_ieq(val, vl, "none"));
     if (w_ieq(name, nl, "display-mode")) return val && w_ieq(val, vl, "browser");
     if (w_ieq(name, nl, "update")) return val && w_ieq(val, vl, "fast");
     if (w_ieq(name, nl, "-webkit-min-device-pixel-ratio") || w_ieq(name, nl, "min-resolution") ||
@@ -706,7 +709,16 @@ static int mq_eval(const char* s, int len, int vw, int vh) {
     return count ? any : 1;
 }
 
+int css_media_eval(const char* q, int len, int vw, int vh, int scripting) {
+    int saved = mq_scripting;
+    mq_scripting = scripting;
+    int r = mq_eval(q, len, vw, vh);
+    mq_scripting = saved;
+    return r;
+}
+
 static void eval_mqs(struct wstyleset* ss) {
+    mq_scripting = ss->d->scripting;
     for (int i = 0; i < ss->nsheets + 2; i++) {
         int m;
         const struct wsheet* sh = sheet_at(ss, i, &m);
@@ -1705,6 +1717,8 @@ static void gen_hints(struct wstyleset* ss, int el, int* first, int* count) {
     int vl;
     const char* v;
     char b[64];
+    // scripting on: <noscript> holds raw text and is never rendered
+    if (t == T_noscript && d->scripting) hint(ss, "display", "none", 4);
     if ((v = wdom_attr(d, el, A_bgcolor, &vl)) && (t == T_body || t == T_table || t == T_td ||
         t == T_th || t == T_tr || t == T_tbody || t == T_thead || t == T_tfoot)) {
         uint32_t col; int cur;
@@ -2518,7 +2532,8 @@ void css_compute_all(struct wstyleset* ss, int vw, int vh) {
     for (int i = 0; i < ss->nvb; i++) w_free(ss->vblocks[i]);
     ss->nvb = 0;
     ss->ngrad = 0;
-    for (int i = 0; i < d->nn; i++) {
+    // whole capacity: nodes created by scripts after this pass must read "no style"
+    for (int i = 0; i < ss->node_cap; i++) {
         ss->node_style[i] = -1;
         ss->node_pseudo[i * 3] = ss->node_pseudo[i * 3 + 1] = ss->node_pseudo[i * 3 + 2] = -1;
     }

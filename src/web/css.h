@@ -220,4 +220,14 @@ void css_anon_style(const struct wstyle* parent, int display, struct wstyle* out
 // Parse a CSS color string; returns 1 and ARGB on success.
 int  css_parse_color(const char* s, int len, uint32_t* argb);
 
+// Selector queries for the DOM API (querySelector/matches/closest): compile
+// a selector list once (NULL = syntax error), match it against elements.
+struct wselq;
+struct wselq* css_selq_compile(struct wdom* d, const char* s, int len);
+int  css_selq_match(const struct wselq* q, const struct wdom* d, int el);
+void css_selq_free(struct wselq* q);
+// CSS.supports(condition) / matchMedia(query).
+int  css_supports(struct wdom* d, const char* cond, int len);
+int  css_media_eval(const char* q, int len, int vw, int vh, int scripting);
+
 #endif

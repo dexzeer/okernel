@@ -1190,7 +1190,7 @@ static void in_body(struct hp* p, struct tok* t) {
             return;
         }
         if (tg == T_iframe) { p->frameset_ok = 0; start_raw(p, t, TS_RAWTEXT); return; }
-        if (tg == T_noembed) { start_raw(p, t, TS_RAWTEXT); return; }
+        if (tg == T_noembed || (tg == T_noscript && D->scripting)) { start_raw(p, t, TS_RAWTEXT); return; }
         if (tg == T_select) {
             reconstruct_afe(p);
             insert_element(p, t, NS_HTML);
@@ -1324,7 +1324,10 @@ static void in_head(struct hp* p, struct tok* t) {
             return;
         }
         if (tg == T_title) { start_raw(p, t, TS_RCDATA); return; }
-        if (tg == T_noframes || tg == T_style) { start_raw(p, t, TS_RAWTEXT); return; }
+        if (tg == T_noframes || tg == T_style || (tg == T_noscript && D->scripting)) {
+            start_raw(p, t, TS_RAWTEXT);
+            return;
+        }
         if (tg == T_noscript) { insert_element(p, t, NS_HTML); p->mode = M_IN_HEAD_NOSCRIPT; return; }
         if (tg == T_script) { start_raw(p, t, TS_SCRIPT); return; }
         if (tg == T_template) {
@@ -2060,8 +2063,13 @@ static void extract_title(struct wdom* d) {
 }
 
 struct wdom* whtml_parse(const char* bytes, int len, const char* charset_hint) {
+    return whtml_parse_ex(bytes, len, charset_hint, 0);
+}
+
+struct wdom* whtml_parse_ex(const char* bytes, int len, const char* charset_hint, int scripting) {
     struct wdom* d = wdom_new();
     if (!d) return 0;
+    d->scripting = scripting;
     char sniffed[32];
     const char* label = charset_hint;
     if (!label || !label[0]) {
@@ -2087,13 +2095,33 @@ struct wdom* whtml_parse(const char* bytes, int len, const char* charset_hint) {
 }
 
 void whtml_parse_fragment(struct wdom* d, int parent, const char* utf8, int len) {
+    whtml_parse_fragment_ctx(d, parent, T_body, utf8, len);
+}
+
+void whtml_parse_fragment_ctx(struct wdom* d, int parent, int ctx_tag, const char* utf8, int len) {
     struct hp* p = (struct hp*)w_malloc(sizeof(struct hp));
     if (!p) return;
     hp_init(p, d, utf8, len);
     int ctx = wdom_create_element(d, NS_HTML, T_html);
     if (ctx < 0) { w_free(p); return; }
     push(p, ctx);
-    p->mode = M_IN_BODY;
+    // "reset the insertion mode appropriately" for the context element
+    switch (ctx_tag) {
+    case T_table: p->mode = M_IN_TABLE; break;
+    case T_tbody: case T_thead: case T_tfoot: p->mode = M_IN_TBODY; break;
+    case T_tr: p->mode = M_IN_ROW; break;
+    case T_td: case T_th: p->mode = M_IN_CELL; break;
+    case T_select: p->mode = M_IN_SELECT; break;
+    case T_colgroup: p->mode = M_IN_COLGROUP; break;
+    case T_caption: p->mode = M_IN_CAPTION; break;
+    default: p->mode = M_IN_BODY; break;
+    }
+    if (ctx_tag == T_title || ctx_tag == T_textarea) { p->tstate = TS_RCDATA; p->raw_tag = ctx_tag; }
+    else if (ctx_tag == T_style || ctx_tag == T_xmp || ctx_tag == T_iframe || ctx_tag == T_noembed ||
+             ctx_tag == T_noframes || (ctx_tag == T_noscript && d->scripting)) {
+        p->tstate = TS_RAWTEXT; p->raw_tag = ctx_tag;
+    } else if (ctx_tag == T_script) { p->tstate = TS_SCRIPT; p->raw_tag = ctx_tag; }
+    else if (ctx_tag == T_plaintext) p->tstate = TS_PLAINTEXT;
     p->head = -2; // "head" already seen
     p->frameset_ok = 0;
     run(p);

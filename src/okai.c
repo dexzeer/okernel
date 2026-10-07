@@ -11,8 +11,15 @@
 // viewport into a per-window pixel surface that the window system blits
 // (window_set_pixels); okai paints only its chrome as an overlay.
 //
+// Page scripts (QuickJS, src/web/wjs*.c) run inside the document: okai
+// fetches their sources and fetch()/XHR requests through the same queue,
+// pumps the realm (wjs_run: scripts, timers, frames, lifecycle events) from
+// okai_poll, dispatches DOM events for clicks/keys/forms/scroll before
+// applying default actions, and honors script navigation/scroll/focus.
+//
 // All engine work runs on a dedicated 2MB stack (call_on_stack): real pages
-// nest deeper than the 256KB boot stack allows.
+// nest deeper than the 256KB boot stack allows, and QuickJS recursion is
+// capped at 900KB of it.
 #include "okai.h"
 #include "window.h"
 #include "graphics.h"
@@ -24,8 +31,12 @@
 #include "net/tls_net.h"
 #include "crypto/certverify.h" // CV_ERR_* for the warning-page reason line
 #include "crypto/tls_client.h" // TLS_FAIL_*, tls_ticket_drop(), tls_response_complete()
-#include "js/js_dom.h"
+#include "crypto/rand.h"
 #include "web/wdoc.h"
+#include "web/wdoc_int.h"
+#include "web/wjs.h"
+#include "web/wcookie.h"
+#include "web/wcommon.h"
 #include "web/wdom.h"
 #include "web/wurl.h"
 #include "web/image.h"
@@ -59,6 +70,7 @@ static int okai_count = 0;
 // the tab inside it (tabs can switch while a fetch is in flight).
 int okai_fetch_owner = -1;
 static int fetch_tab = -1;
+int okai_scripts_on = 1;
 
 static void okai_tab_reset(struct okai_tab* T);
 static void load_home(int id, int tab);
@@ -88,12 +100,13 @@ static int url_is_http(const char* u) { return iprefix(u, "http:") || iprefix(u,
 
 extern void call_on_stack(void (*fn)(void*), void* arg, void* stack_top);
 
-#define ENGINE_STACK (1u << 20) // Wikipedia peaks ~20KB; deep DOMs recurse more
+#define ENGINE_STACK (2u << 20) // layout peaks ~20KB; QuickJS may use up to 900KB
 #define STACK_FILL 0x5AC4F00Du
 static uint8_t* engine_stack;
 static int in_engine;
 
-enum { JOB_LOAD, JOB_FETCH_DONE, JOB_PAINT, JOB_HIT, JOB_RECT, JOB_ANCHOR, JOB_INFLATE, JOB_LINKS };
+enum { JOB_LOAD, JOB_FETCH_DONE, JOB_PAINT, JOB_HIT, JOB_RECT, JOB_ANCHOR, JOB_INFLATE, JOB_LINKS,
+       JOB_JS_RUN, JOB_JS_EVENT, JOB_ELEM_AT, JOB_FREE };
 
 struct job {
     int op;
@@ -111,6 +124,11 @@ struct job {
     uint8_t* out;
     int out_len;
     int result;
+    int status;               // JOB_FETCH_DONE: HTTP status (0 = derive)
+    const char* headers;      // JOB_FETCH_DONE: raw response headers
+    const char* final_url;    // JOB_FETCH_DONE: URL after redirects
+    const char* type;         // JOB_JS_EVENT: event type
+    int button, key;          // JOB_JS_EVENT
 };
 
 static void job_entry(void* p) {
@@ -119,8 +137,28 @@ static void job_entry(void* p) {
     case JOB_LOAD:
         j->result = wdoc_load(j->doc, j->url, j->bytes, j->len, j->charset);
         break;
-    case JOB_FETCH_DONE:
-        wdoc_fetch_done(j->doc, j->id, j->bytes, j->len, j->charset);
+    case JOB_FETCH_DONE: {
+        int st = j->status ? j->status : ((j->len >= 0 && j->bytes) ? 200 : 0);
+        wdoc_fetch_done2(j->doc, j->id, j->bytes, j->len, j->charset, st, j->headers, j->final_url);
+        break;
+    }
+    case JOB_JS_RUN: {
+        struct wjs* js = wdoc_js(j->doc);
+        j->result = js ? wjs_run(js, j->len) : 0;
+        break;
+    }
+    case JOB_JS_EVENT: {
+        struct wjs* js = wdoc_js(j->doc);
+        int prevented = 0;
+        j->result = js ? wjs_event(js, j->id, j->type, j->x, j->y, j->button, j->key, &prevented) : 0;
+        j->h = prevented;
+        break;
+    }
+    case JOB_ELEM_AT:
+        j->result = wdoc_hit_element(j->doc, j->x, j->y);
+        break;
+    case JOB_FREE:
+        wdoc_free(j->doc);
         break;
     case JOB_PAINT:
         // vw/vh > 0: full paint (viewport may have changed); else a band
@@ -151,9 +189,21 @@ static void job_entry(void* p) {
     case JOB_LINKS: {
         // Log the link/control regions in the viewport (headless tests aim
         // clicks with these; page px relative to the page origin).
+        // j->x = 1: only when they changed since hash j->result (scripts
+        // move content around); the new hash is returned in j->result.
         int n = wdoc_hit_count(j->doc), shown = 0;
         static struct wdoc_region r;
         int seen[48];
+        uint32_t hash = 2166136261u;
+        for (int i = 0; i < n; i++) {
+            if (!wdoc_hit_get(j->doc, i, &r)) continue;
+            int y = r.fixed ? r.y : r.y - j->scroll;
+            if (y + r.h <= 0 || y >= j->vh || r.w <= 0 || r.h <= 0) continue;
+            int v[6] = { r.kind, r.x, y, r.w, r.h, r.node };
+            for (int k = 0; k < 6; k++) { hash ^= (uint32_t)v[k]; hash *= 16777619u; }
+        }
+        if (j->x && (uint32_t)j->result == hash) break;
+        j->result = (int)hash;
         for (int i = 0; i < n && shown < 48; i++) {
             if (!wdoc_hit_get(j->doc, i, &r)) continue;
             int y = r.fixed ? r.y : r.y - j->scroll;
@@ -187,6 +237,16 @@ static void run_job(struct job* j) {
     in_engine = 1;
     call_on_stack(job_entry, j, engine_stack + ENGINE_STACK);
     in_engine = 0;
+}
+
+// Free a document on the engine stack (its script realm tears down there).
+static void doc_free(struct wdoc* d) {
+    if (!d) return;
+    struct job j;
+    memset(&j, 0, sizeof j);
+    j.op = JOB_FREE;
+    j.doc = d;
+    run_job(&j);
 }
 
 // Deepest engine stack use so far (KB), from the fill pattern.
@@ -306,18 +366,54 @@ static char* resp_body(char* resp, int len, const struct resp_info* ri, int* ble
 
 // Issue a GET for an absolute http(s) URL on the single connection.
 // Returns 0 if a request was started, -1 if the URL has no host.
-static int net_get(const char* url) {
-    char host[128], path[OKAI_URL_LEN];
+// GET url. top: the page a sub-resource belongs to (cookie SameSite
+// context), NULL for a top-level navigation. Carries the jar's cookies.
+static int net_get_ex(const char* url, const char* top) {
+    char host[128];
+    static char path[OKAI_URL_LEN];
+    static char cookie_hdr[NET_EXTRA_MAX];
     if (wurl_host(url, host, sizeof host) <= 0) return -1;
     if (wurl_path(url, path, sizeof path) <= 0) { path[0] = '/'; path[1] = 0; }
     int port = wurl_port(url);
     if (port < 0) port = 0;
+    memcpy(cookie_hdr, "Cookie: ", 8);
+    int cl = wcookie_header(url, top, cookie_hdr + 8, NET_EXTRA_MAX - 12);
+    if (cl > 0) {
+        cookie_hdr[8 + cl] = '\r';
+        cookie_hdr[9 + cl] = '\n';
+        cookie_hdr[10 + cl] = 0;
+        net_extra_headers = cookie_hdr;
+    }
     net_accept_gzip = 1;
     if (url_is_https(url)) https_get_port(host, path, (uint16_t)port);
     else { http_reset_conn_attempts(); http_get_port(host, path, (uint16_t)port); }
     net_accept_gzip = 0;
+    net_extra_headers = 0;
     return 0;
 }
+static int net_get(const char* url) { return net_get_ex(url, 0); }
+
+// Every Set-Cookie of a response (redirect hops included) into the jar.
+static void store_cookies(const char* url, const char* r, int len) {
+    int he = header_end(r, len);
+    int i = 0;
+    while (i < he) {
+        int e = i;
+        while (e < he && r[e] != '\n') e++;
+        int ll = e - i;
+        if (ll > 11 && (r[i] | 32) == 's' && w_ieq_n(r + i, "set-cookie:", 11)) {
+            const char* v = r + i + 11;
+            int vl = ll - 11;
+            while (vl > 0 && (v[vl - 1] == '\r' || v[vl - 1] == ' ')) vl--;
+            while (vl > 0 && *v == ' ') { v++; vl--; }
+            wcookie_set_http(url, v, vl);
+        }
+        i = e + 1;
+    }
+}
+
+extern long long time(long long* t);   // qjs_libc: RTC + ticks
+static long long okai_epoch(void) { return time(0); }
 
 // Default a web URL to HTTPS unless the user typed an explicit scheme.
 // An explicit `https://` is kept; an explicit `http://` is RESPECTED as plain
@@ -369,7 +465,27 @@ int okai_is_home(const char* url) { return strcmp(url, OKAI_HOME_URL) == 0; }
 
 // ---- init / tabs -----------------------------------------------------------------
 
+// ---- script realm host services --------------------------------------------------
+
+static int okai_now_ms(void) { return (int)(tick_count * 10); }
+
+static void okai_js_random(uint8_t* out, int n) {
+    if (rand_bytes(out, (uint32_t)n)) return;
+    // CPRNG not seeded yet (very early): never hand out zeros
+    static uint32_t x = 0x6A09E667u;
+    uint32_t t;
+    __asm__ volatile("rdtsc" : "=a"(t) :: "edx");
+    x ^= t;
+    for (int i = 0; i < n; i++) { x ^= x << 13; x ^= x >> 17; x ^= x << 5; out[i] = (uint8_t)x; }
+}
+
+static void okai_js_log(const char* s) { serial_puts(s); }
+
 void okai_init(void) {
+    wjs_host.now_ms = okai_now_ms;
+    wjs_host.random = okai_js_random;
+    wjs_host.log = okai_js_log;
+    wcookie_now = okai_epoch;
     for (int i = 0; i < MAX_OKAIS; i++) {
         okais[i].win_id = -1;
         okais[i].active_tab = 0;
@@ -417,7 +533,7 @@ static void tab_reset_load(struct okai_tab* T) {
 }
 
 static void okai_tab_reset(struct okai_tab* T) {
-    if (T->doc) { wdoc_free(T->doc); T->doc = 0; }
+    if (T->doc) { doc_free(T->doc); T->doc = 0; }
     T->url[0] = 0;
     T->title[0] = 0;
     T->scroll_y = 0;
@@ -435,7 +551,7 @@ static void okai_tab_reset(struct okai_tab* T) {
 // A tab leaves the array (close animation finished / window closed).
 static void tab_dispose(int id, int tab) {
     struct okai_tab* T = &okais[id].tabs[tab];
-    if (T->doc) { wdoc_free(T->doc); T->doc = 0; }
+    if (T->doc) { doc_free(T->doc); T->doc = 0; }
     if (okai_fetch_owner == id) {
         if (fetch_tab == tab) { okai_fetch_owner = -1; fetch_tab = -1; }
         else if (fetch_tab > tab) fetch_tab--;
@@ -554,10 +670,15 @@ static int html_put(char* out, int at, int cap, const char* s) {
     return at;
 }
 
-static void tab_load_html(int id, int tab, const char* html, int len, const char* charset) {
+// scripts: run page JavaScript (internal and error pages never do)
+static void tab_load_html(int id, int tab, const char* html, int len, const char* charset, int scripts) {
     struct okai_tab* T = &okais[id].tabs[tab];
     if (!T->doc) T->doc = wdoc_new();
     if (!T->doc) { serial_puts("[okai] out of memory (wdoc_new)\n"); return; }
+    wdoc_set_scripting(T->doc, scripts);
+    T->js_next_tick = 0;
+    T->js_scroll_evt = 0;
+    T->sub_js = T->sub_req = 0;
     struct job j;
     memset(&j, 0, sizeof j);
     j.op = JOB_LOAD;
@@ -584,7 +705,7 @@ static void load_home(int id, int tab) {
     scopy(T->url, OKAI_HOME_URL, OKAI_URL_LEN);
     tab_reset_load(T);
     T->is_https = 0;
-    tab_load_html(id, tab, OKAI_HOME_HTML, (int)sizeof(OKAI_HOME_HTML) - 1, "utf-8");
+    tab_load_html(id, tab, OKAI_HOME_HTML, (int)sizeof(OKAI_HOME_HTML) - 1, "utf-8", 0);
     T->load_state = 1;
     request_render(T, 0);
     if (okais[id].active_tab == tab) okai_render_content(id);
@@ -664,7 +785,7 @@ static void show_error(int id, int tab) {
     n = html_esc(h, n, sizeof h, T->url);
     n = html_put(h, n, sizeof h, "\">Try again</a> &nbsp;&middot;&nbsp; <a href=\"okai:home\">Home</a></p></div></body></html>");
     serial_printf("[okai] error page: %s for %s\n", title, T->url);
-    tab_load_html(id, tab, h, n, "utf-8");
+    tab_load_html(id, tab, h, n, "utf-8", 0);
     T->load_state = -1;
     T->title[0] = 0;
     scopy(T->title, title, sizeof T->title);
@@ -783,9 +904,22 @@ void okai_render_content(int id) {
         j.scroll = T->scroll_y;
         j.vh = ph;
         run_job(&j);
+        T->links_hash = (uint32_t)j.result;
     } else {
         serial_printf("[okai] render tab=%d doc_h=%d scroll=%d in %dms\n", b->active_tab,
                       T->content_height, T->scroll_y, (int)(tick_count - t0) * 10);
+        if (wdoc_js(T->doc)) {
+            // scripts move content: re-log the regions when they changed
+            memset(&j, 0, sizeof j);
+            j.op = JOB_LINKS;
+            j.doc = T->doc;
+            j.scroll = T->scroll_y;
+            j.vh = ph;
+            j.x = 1;
+            j.result = (int)T->links_hash;
+            run_job(&j);
+            T->links_hash = (uint32_t)j.result;
+        }
     }
 }
 
@@ -809,6 +943,7 @@ static void scroll_to(int id, int ny) {
     int dy = ny - T->scroll_y;
     if (!dy) return;
     int ady = dy < 0 ? -dy : dy;
+    T->js_scroll_evt = 1;
     if (T->has_fixed || ady >= ph * 3 / 4 || T->render_pending) {
         T->scroll_y = ny;
         okai_render_content(id);
@@ -859,6 +994,22 @@ static int start_main_fetch(int id, int tab) {
     return 0;
 }
 
+static const char* kind_name(int kind) {
+    return kind == WDOC_RK_CSS ? "CSS" : kind == WDOC_RK_IMG ? "IMG" : kind == WDOC_RK_SCRIPT ? "JS" : "XHR";
+}
+
+// Deliver a failure for resource id (scripts/requests get their error events).
+static void sub_fail(struct okai_tab* T, int id, const char* url) {
+    struct job j;
+    memset(&j, 0, sizeof j);
+    j.op = JOB_FETCH_DONE;
+    j.doc = T->doc;
+    j.id = id;
+    j.len = -1;
+    j.final_url = url;
+    run_job(&j);
+}
+
 // Next sub-resource of the tab's document. Returns 1 if a request is in
 // flight, 0 when the queue is drained.
 static int start_next_sub(struct okai_tab* T) {
@@ -867,9 +1018,19 @@ static int start_next_sub(struct okai_tab* T) {
     for (;;) {
         int id = wdoc_next_fetch(T->doc, url, sizeof url);
         if (id < 0) return 0;
-        int css = wdoc_is_css(T->doc, id);
-        if ((css && T->sub_css >= OKAI_MAX_CSS_FETCH) || (!css && T->sub_img >= OKAI_MAX_IMG_FETCH)) {
-            wdoc_fetch_done(T->doc, id, 0, -1, 0);
+        int kind = wdoc_res_kind(T->doc, id);
+        const char *method = "GET", *hdrs = 0, *body = 0;
+        int blen = 0;
+        wdoc_fetch_info(T->doc, id, &method, &hdrs, &body, &blen);
+        int capped = (kind == WDOC_RK_CSS && T->sub_css >= OKAI_MAX_CSS_FETCH) ||
+                     (kind == WDOC_RK_IMG && T->sub_img >= OKAI_MAX_IMG_FETCH) ||
+                     (kind == WDOC_RK_SCRIPT && T->sub_js >= OKAI_MAX_JS_FETCH) ||
+                     (kind == WDOC_RK_REQ && T->sub_req >= OKAI_MAX_REQ_FETCH);
+        // the network layer speaks GET only (POST bodies are not sent yet)
+        int unsupported = kind == WDOC_RK_REQ && strcmp(method, "GET") && strcmp(method, "HEAD");
+        if (capped || unsupported) {
+            if (unsupported) serial_printf("[okai] %s request not supported: %s\n", method, url);
+            sub_fail(T, id, url);
             continue;
         }
         if (iprefix(url, "data:")) {
@@ -884,22 +1045,27 @@ static int start_next_sub(struct okai_tab* T) {
             j.bytes = bytes;
             j.len = bytes ? bl : -1;
             j.charset = mime;
+            j.status = bytes ? 200 : 0;
+            j.final_url = url;
             run_job(&j);
             if (bytes) kfree(bytes);
+            T->js_next_tick = 0;
             continue;
         }
-        if (!url_is_http(url)) { wdoc_fetch_done(T->doc, id, 0, -1, 0); continue; }
-        if (css) T->sub_css++;
-        else T->sub_img++;
+        if (!url_is_http(url)) { sub_fail(T, id, url); continue; }
+        if (kind == WDOC_RK_CSS) T->sub_css++;
+        else if (kind == WDOC_RK_IMG) T->sub_img++;
+        else if (kind == WDOC_RK_SCRIPT) T->sub_js++;
+        else T->sub_req++;
         T->sub_id = id;
         T->sub_https = url_is_https(url);
         T->sub_redirects = 0;
         T->sub_retried = 0;
         scopy(T->sub_url, url, sizeof T->sub_url);
-        serial_printf("[okai] sub-res fetch: %s %s\n", css ? "CSS" : "IMG", url);
-        if (net_get(url) < 0) {
+        serial_printf("[okai] sub-res fetch: %s %s\n", kind_name(kind), url);
+        if (net_get_ex(url, T->url) < 0) {
             T->sub_id = -1;
-            wdoc_fetch_done(T->doc, id, 0, -1, 0);
+            sub_fail(T, id, url);
             continue;
         }
         return 1;
@@ -960,11 +1126,12 @@ static void main_loaded(int id, int tab, char* resp, int len) {
             page_heap = 1;
         }
     }
-    tab_load_html(id, tab, page, plen, ri.charset[0] ? ri.charset : 0);
+    tab_load_html(id, tab, page, plen, ri.charset[0] ? ri.charset : 0, okai_scripts_on);
     struct wdom* dom = T->doc ? wdoc_dom(T->doc) : 0;
-    serial_printf("[br] %sparse: count=%d len=%d dom_nodes=%d status=%d%s ctype=%s\n",
+    serial_printf("[br] %sparse: count=%d len=%d dom_nodes=%d status=%d%s ctype=%s%s\n",
                   T->is_https ? "https " : "", dom ? dom->nn : 0, blen, dom ? dom->nn : 0,
-                  ri.status, heap ? " gzip" : "", ri.ctype[0] ? ri.ctype : "-");
+                  ri.status, heap ? " gzip" : "", ri.ctype[0] ? ri.ctype : "-",
+                  (T->doc && wdoc_js(T->doc)) ? " js" : "");
     if (page_heap) kfree(page);
     if (heap) kfree(body);
     T->load_state = dom ? 1 : -1;
@@ -984,19 +1151,37 @@ static void main_loaded(int id, int tab, char* resp, int len) {
 // resource is still in flight (redirect / one-shot retry), else 0.
 static int sub_done(int id, struct okai_tab* T, int st, char* resp, int len) {
     int rid = T->sub_id;
-    int css = wdoc_is_css(T->doc, rid);
+    int kind = wdoc_res_kind(T->doc, rid);
+    int css = kind == WDOC_RK_CSS;
     struct job j;
     memset(&j, 0, sizeof j);
     j.op = JOB_FETCH_DONE;
     j.doc = T->doc;
     j.id = rid;
     j.len = -1;
+    j.final_url = T->sub_url;
     int status = 0, blen = 0, heap = 0;
     char* body = 0;
+    static char hdrs[8192];
+    hdrs[0] = 0;
     if (st == 1 && resp && len > 0) {
         struct resp_info ri;
         parse_resp(resp, len, &ri);
         status = ri.status;
+        store_cookies(T->sub_url, resp, len);
+        // raw header lines (after the status line) for scripts (XHR
+        // getResponseHeader, CORS)
+        if (kind == WDOC_RK_REQ || kind == WDOC_RK_SCRIPT) {
+            int he = header_end(resp, len);
+            int s0 = 0;
+            while (s0 < he && resp[s0] != '\n') s0++;
+            s0++;
+            int n = he > s0 ? he - s0 : 0;
+            if (n > (int)sizeof hdrs - 1) n = (int)sizeof hdrs - 1;
+            if (n > 0) memcpy(hdrs, resp + s0, n);
+            hdrs[n > 0 ? n : 0] = 0;
+            j.headers = hdrs;
+        }
         if (status >= 300 && status <= 399 && ri.location[0] && T->sub_redirects < 4) {
             char abs[OKAI_URL_LEN];
             if (wurl_resolve(T->sub_url, ri.location, (int)strlen(ri.location), abs, sizeof abs) > 0 &&
@@ -1005,34 +1190,161 @@ static int sub_done(int id, struct okai_tab* T, int st, char* resp, int len) {
                 scopy(T->sub_url, abs, sizeof T->sub_url);
                 T->sub_https = url_is_https(abs);
                 serial_printf("[okai] sub-res redirect -> %s\n", abs);
-                if (net_get(abs) == 0) return 1; // same resource, new request
+                if (net_get_ex(abs, T->url) == 0) return 1; // same resource, new request
             }
-        } else if (status >= 200 && status <= 299) {
+        } else if ((status >= 200 && status <= 299) || (kind == WDOC_RK_REQ && status >= 200)) {
+            // requests see error statuses too (XHR status 404 + body)
             body = resp_body(resp, len, &ri, &blen, &heap);
             j.bytes = body;
             j.len = blen;
             j.charset = ri.ctype;
+            j.status = status;
         }
     }
     if (status == 0 && !T->sub_retried) {
         // transport blip (DNS miss on a host switch, reset): retry once
         T->sub_retried = 1;
         serial_printf("[okai] sub-res retry %s\n", T->sub_url);
-        if (net_get(T->sub_url) == 0) return 1;
+        if (net_get_ex(T->sub_url, T->url) == 0) return 1;
     }
     run_job(&j);
     if (heap) kfree(body);
-    serial_printf("[okai] sub-res %s: status=%d %d bytes%s\n", css ? "CSS" : "IMG", status,
+    serial_printf("[okai] sub-res %s: status=%d %d bytes%s\n", kind_name(kind), status,
                   j.len, j.len < 0 ? " (failed)" : "");
     T->sub_id = -1;
     T->sub_landed++;
     if (css) {
         if (wdoc_pending_css(T->doc) == 0) request_render(T, 0);
-    } else if (T->first_paint || wdoc_pending_css(T->doc) == 0) {
-        request_render(T, IMG_RENDER_TICKS);
+    } else if (kind == WDOC_RK_IMG) {
+        if (T->first_paint || wdoc_pending_css(T->doc) == 0) request_render(T, IMG_RENDER_TICKS);
+    } else {
+        T->js_next_tick = 0;   // a script/response arrived: pump the realm now
     }
     (void)id;
     return 0;
+}
+
+// ---- page scripts ------------------------------------------------------------------
+
+static void set_focus(int id, struct okai_tab* T, int node);
+static void submit_form_node(int id, struct okai_tab* T, int form, int submitter, int fire_event);
+static void navigate_ex(int id, const char* url, int push);
+
+// Apply what a realm entry asked for (WJS_* flags).
+static void js_apply(int id, int tab, int flags) {
+    struct okai* b = &okais[id];
+    struct okai_tab* T = &b->tabs[tab];
+    if (!T->doc) return;
+    struct wjs* js = wdoc_js(T->doc);
+    if (!js) return;
+    int active = tab == b->active_tab;
+    if (flags & WJS_TITLE) {
+        const char* t = wdoc_title(T->doc);
+        scopy(T->title, t && t[0] ? t : T->url, sizeof T->title);
+        if (active) window_set_title(b->win_id, T->title);
+        b->chrome_dirty = 1;
+    }
+    if (flags & WJS_URL) {
+        scopy(T->url, wdoc_url(T->doc), OKAI_URL_LEN);
+        if (T->history_count > 0) scopy(T->history[T->history_pos], T->url, OKAI_URL_LEN);
+        b->chrome_dirty = 1;
+        serial_printf("[okai] script URL -> %s\n", T->url);
+    }
+    if (flags & WJS_FOCUS) {
+        int node;
+        if (wjs_take_focus(js, &node) && active) set_focus(id, T, node);
+    }
+    if (flags & WJS_SCROLL) {
+        int y;
+        if (wjs_take_scroll(js, &y)) {
+            if (active && T->first_paint) scroll_to(id, y);
+            else T->scroll_y = y;
+        }
+    }
+    if (flags & WJS_DIRTY) {
+        if (T->first_paint) request_render(T, 15);
+        else if (wdoc_pending_css(T->doc) == 0) request_render(T, 0);
+    }
+    if (flags & WJS_NAV) {
+        static char u[OKAI_URL_LEN];
+        int rep = 0;
+        if (wjs_take_nav(js, u, sizeof u, &rep) && active && T->load_state == 1) {
+            if (!strncmp(u, "#submit:", 8)) {
+                int f = 0, btn = 0, neg = 0, k = 8;
+                while (u[k] >= '0' && u[k] <= '9') f = f * 10 + (u[k++] - '0');
+                if (u[k] == ':') k++;
+                if (u[k] == '-') { neg = 1; k++; }
+                while (u[k] >= '0' && u[k] <= '9') btn = btn * 10 + (u[k++] - '0');
+                submit_form_node(id, T, f, neg ? -1 : btn, 0);
+            } else if (!strncmp(u, "#hist:", 6)) {
+                if (u[6] == '-') okai_nav_back(id);
+                else okai_nav_fwd(id);
+            } else {
+                serial_printf("[okai] script navigation -> %s\n", u);
+                navigate_ex(id, u, !rep);
+            }
+        }
+    }
+}
+
+// Dispatch a UI event to the page (node -1 = window). Returns 1 when a
+// listener called preventDefault().
+static int js_event(int id, struct okai_tab* T, int node, const char* type, int x, int y, int button, int key) {
+    if (!T->doc || !wdoc_js(T->doc) || T->load_state != 1) return 0;
+    struct job j;
+    memset(&j, 0, sizeof j);
+    j.op = JOB_JS_EVENT;
+    j.doc = T->doc;
+    j.id = node;
+    j.type = type;
+    j.x = x;
+    j.y = y;
+    j.button = button;
+    j.key = key;
+    run_job(&j);
+    js_apply(id, (int)(T - okais[id].tabs), j.result);
+    T->js_next_tick = 0;
+    return j.h;
+}
+
+// Run due scripts/timers/frames for every loaded tab (background tabs at
+// most once a second).
+static void js_pump(void) {
+    for (int bi = 0; bi < MAX_OKAIS; bi++) {
+        struct okai* b = okai_get(bi);
+        if (!b) continue;
+        for (int ti = 0; ti < b->tab_count; ti++) {
+            struct okai_tab* T = &b->tabs[ti];
+            if (!T->doc || T->load_state != 1 || T->closing) continue;
+            struct wjs* js = wdoc_js(T->doc);
+            if (!js) continue;
+            int active = ti == b->active_tab;
+            if (T->js_next_tick && (int)(tick_count - T->js_next_tick) < 0) continue;
+            if (T->js_scroll_evt && active) {
+                T->js_scroll_evt = 0;
+                js_event(bi, T, 0, "scroll", 0, 0, 0, 0);
+            }
+            int due = wjs_next_due(js);
+            if (due < 0) { T->js_next_tick = 0; continue; }
+            if (due > 0) {
+                T->js_next_tick = tick_count + (uint32_t)((due + 9) / 10);
+                if (!active && due < 1000) T->js_next_tick = tick_count + 100;
+                continue;
+            }
+            struct job j;
+            memset(&j, 0, sizeof j);
+            j.op = JOB_JS_RUN;
+            j.doc = T->doc;
+            j.len = active ? 60 : 20;   // ms budget per pump
+            uint32_t t0 = tick_count;
+            run_job(&j);
+            if (tick_count - t0 >= 10)
+                serial_printf("[okai] js tab=%d ran %dms (stack %dKB)\n", ti, (int)(tick_count - t0) * 10,
+                              engine_stack_hwm_kb());
+            T->js_next_tick = active ? 0 : tick_count + 100;
+            js_apply(bi, ti, j.result);
+        }
+    }
 }
 
 // Is the in-flight request HTTPS? (sub-resources carry their own scheme.)
@@ -1068,7 +1380,11 @@ static void poll_fetch(void) {
 
     if (T->sub_id >= 0) {
         if (st == -2) serial_puts("[okai] TLS sub-resource truncated, skipping\n");
+        int kind = wdoc_res_kind(T->doc, T->sub_id);
         if (sub_done(bi, T, st, resp, len)) return; // redirect / retry in flight
+        // a script/response landed: let the page run first so the scripts
+        // it inserts are queued ahead of the remaining images
+        if (kind == WDOC_RK_SCRIPT || kind == WDOC_RK_REQ) js_pump();
         if (!start_next_sub(T)) {
             okai_fetch_owner = -1;
             fetch_tab = -1;
@@ -1089,6 +1405,7 @@ static void poll_fetch(void) {
     if (st == 1) {
         struct resp_info ri;
         parse_resp(resp, len, &ri);
+        store_cookies(T->url, resp, len);
         if (follow_redirect(bi, T, &ri)) return; // owner stays
         main_loaded(bi, tab, resp, len);
         if (start_next_sub(T)) return;           // owner stays for the sub-resources
@@ -1153,6 +1470,23 @@ static void poll_fetch(void) {
 
 void okai_poll(void) {
     if (okai_fetch_owner >= 0) poll_fetch();
+    // Late sub-resources: scripts insert scripts, images and requests after
+    // the page's initial queue drained.
+    if (okai_fetch_owner < 0) {
+        int started = 0;
+        for (int pass = 0; pass < 2 && !started; pass++)
+            for (int bi = 0; bi < MAX_OKAIS && !started; bi++) {
+                struct okai* b = okai_get(bi);
+                if (!b) continue;
+                for (int ti = 0; ti < b->tab_count && !started; ti++) {
+                    if ((pass == 0) != (ti == b->active_tab)) continue;
+                    struct okai_tab* T = &b->tabs[ti];
+                    if (T->load_state != 1 || !T->doc || T->closing) continue;
+                    if (start_next_sub(T)) { okai_fetch_owner = bi; fetch_tab = ti; started = 1; }
+                }
+            }
+    }
+    js_pump();
     if (okai_fetch_owner < 0) {
         // No fetch in flight: start the next tab needing one (active tabs first).
         int started = 0;
@@ -1361,21 +1695,30 @@ static int focusable(struct wdom* d, int n) {
 }
 
 static void set_focus(int id, struct okai_tab* T, int node) {
+    static int in_focus;   // focus handlers may move focus again: no recursion
     struct wdom* d = T->doc ? wdoc_dom(T->doc) : 0;
     if (!d) return;
     if (T->focused_node == node) return;
-    if (T->focused_node >= 0 && T->focused_node < d->nn) {
-        d->n[T->focused_node].flags &= ~WNF_FOCUSED;
-        for (int p = T->focused_node; p >= 0; p = d->n[p].parent) d->n[p].flags &= ~WNF_FOCUS_WITHIN;
+    if (node >= d->nn) node = -1;
+    int old = T->focused_node;
+    if (old >= 0 && old < d->nn) {
+        d->n[old].flags &= ~WNF_FOCUSED;
+        for (int p = old; p >= 0; p = d->n[p].parent) d->n[p].flags &= ~WNF_FOCUS_WITHIN;
     }
     T->focused_node = node;
     if (node >= 0) {
         d->n[node].flags |= WNF_FOCUSED;
         for (int p = node; p >= 0; p = d->n[p].parent) d->n[p].flags |= WNF_FOCUS_WITHIN;
     }
+    wdoc_set_focus(T->doc, node);
     wdoc_invalidate(T->doc);
     request_render(T, 0);
-    (void)id;
+    if (!in_focus && wdoc_js(T->doc)) {
+        in_focus = 1;
+        if (old >= 0 && old < d->nn) { js_event(id, T, old, "blur", 0, 0, 0, 0); js_event(id, T, old, "focusout", 0, 0, 0, 0); }
+        if (node >= 0) { js_event(id, T, node, "focus", 0, 0, 0, 0); js_event(id, T, node, "focusin", 0, 0, 0, 0); }
+        in_focus = 0;
+    }
 }
 
 // URL-encode s[0..n) (application/x-www-form-urlencoded) onto out.
@@ -1413,6 +1756,19 @@ static void submit_form(int id, struct okai_tab* T, int submitter) {
     int form = -1;
     for (int p = submitter; p >= 0; p = d->n[p].parent) if (is_tag(d, p, T_form)) { form = p; break; }
     if (form < 0) { serial_puts("[okai] submit: control is not in a form\n"); return; }
+    submit_form_node(id, T, form, submitter, 1);
+}
+
+// Build the GET query of `form` (submitter: the clicked button or -1) and
+// navigate. fire_event: dispatch `submit` first (a script may cancel it).
+static void submit_form_node(int id, struct okai_tab* T, int form, int submitter, int fire_event) {
+    struct wdom* d = T->doc ? wdoc_dom(T->doc) : 0;
+    if (!d || form < 0 || form >= d->nn || !is_tag(d, form, T_form)) return;
+    if (fire_event && js_event(id, T, form, "submit", 0, 0, 0, 0)) {
+        serial_puts("[okai] submit prevented by script\n");
+        return;
+    }
+    if (T->load_state != 1 || !T->doc || wdoc_dom(T->doc) != d) return;   // a handler navigated
     static char q[2048];
     static char val[1024];
     int ql = 0;
@@ -1497,6 +1853,8 @@ static void activate_control(int id, struct okai_tab* T, int node) {
         set_focus(id, T, node);
         wdoc_invalidate(T->doc);
         request_render(T, 0);
+        js_event(id, T, node, "input", 0, 0, 0, 0);
+        js_event(id, T, node, "change", 0, 0, 0, 0);
         return;
     }
     if (is_tag(d, node, T_select)) {
@@ -1515,6 +1873,8 @@ static void activate_control(int id, struct okai_tab* T, int node) {
         set_focus(id, T, node);
         wdoc_invalidate(T->doc);
         request_render(T, 0);
+        js_event(id, T, node, "input", 0, 0, 0, 0);
+        js_event(id, T, node, "change", 0, 0, 0, 0);
         return;
     }
     int submit = is_tag(d, node, T_button) ? !attr_ieq(d, node, A_type, "button") && !attr_ieq(d, node, A_type, "reset")
@@ -1577,6 +1937,33 @@ int okai_content_click(int id, int mx, int my) {
     j.hit = &hit;
     run_job(&j);
     serial_printf("[okai] click x=%d y=%d (mx=%d my=%d) hit=%d node=%d\n", x, y, mx, my, hit.kind, hit.node);
+    if (wdoc_js(T->doc) && T->load_state == 1) {
+        // scripts see the click first (the deepest element under the
+        // pointer); preventDefault() cancels the default action below
+        int target = hit.node;
+        if (target < 0) {
+            memset(&j, 0, sizeof j);
+            j.op = JOB_ELEM_AT;
+            j.doc = T->doc;
+            j.x = x;
+            j.y = y;
+            run_job(&j);
+            target = j.result;
+        }
+        if (target >= 0) {
+            struct wdoc* before = T->doc;
+            js_event(id, T, target, "pointerdown", x, y, 0, 0);
+            js_event(id, T, target, "mousedown", x, y, 0, 0);
+            js_event(id, T, target, "pointerup", x, y, 0, 0);
+            js_event(id, T, target, "mouseup", x, y, 0, 0);
+            int prevented = js_event(id, T, target, "click", x, y, 0, 0);
+            if (T->doc != before || T->load_state != 1) return 1;   // a handler navigated
+            if (prevented) {
+                serial_printf("[okai] click default prevented by script (node=%d)\n", target);
+                return 1;
+            }
+        }
+    }
     if (hit.kind == WDOC_HIT_LINK) {
         if (!hit.href[0] || iprefix(hit.href, "javascript:")) return 1;
         serial_printf("[okai] LINK HIT -> %s\n", hit.href);
@@ -1665,11 +2052,20 @@ void okai_handle_key(int id, char c) {
         if (c == '\t') { focus_next(id, T); return; }
         if (is_text_input(d, fn)) {
             if (c == '\n') {
-                if (is_tag(d, fn, T_textarea)) edit_field(T, '\n');
+                if (js_event(id, T, fn, "keydown", 0, 0, 0, 13)) return;
+                if (is_tag(d, fn, T_textarea)) { edit_field(T, '\n'); js_event(id, T, fn, "input", 0, 0, 0, 10); }
                 else submit_form(id, T, fn);
                 return;
             }
-            if (c == '\b' || (c >= 32 && c < 127)) { edit_field(T, c); return; }
+            if (c == '\b' || (c >= 32 && c < 127)) {
+                int key = c == '\b' ? 8 : (unsigned char)c;
+                if (js_event(id, T, fn, "keydown", 0, 0, 0, key)) return;
+                if (T->focused_node != fn || !T->doc) return;
+                edit_field(T, c);
+                js_event(id, T, fn, "input", 0, 0, 0, key);
+                js_event(id, T, fn, "keyup", 0, 0, 0, key);
+                return;
+            }
             // arrows fall through to scrolling
         } else if (c == '\n' || c == ' ') {
             activate_control(id, T, fn);
@@ -1681,6 +2077,10 @@ void okai_handle_key(int id, char c) {
         b->addr_bar_focused = 1;
         b->addr_input_len = 0;
         b->addr_input[0] = 0;
+    } else if (c == 'J') {
+        okai_scripts_on = !okai_scripts_on;
+        serial_printf("[okai] page scripts %s\n", okai_scripts_on ? "on" : "off");
+        okai_nav_reload(id);
     } else if (c == '\t') {
         focus_next(id, T);
     } else if (c == 'j' || c == '\n' || c == '\x10') {
@@ -1708,19 +2108,6 @@ void okai_handle_mouse_scroll(int id, int dy) {
     scroll_to(id, T->scroll_y + dy * WHEEL_STEP);
 }
 
-struct wdom* okai_active_dom(int id) {
-    struct okai* b = okai_get(id);
-    if (!b) return 0;
-    struct okai_tab* T = okai_tab_of(b);
-    return T->doc ? wdoc_dom(T->doc) : 0;
-}
-
-void okai_dom_changed(int id) {
-    struct okai* b = okai_get(id);
-    if (!b) return;
-    struct okai_tab* T = okai_tab_of(b);
-    if (T->doc) { wdoc_invalidate(T->doc); request_render(T, 0); }
-}
 
 // ---- Toolbar nav buttons ---------------------------------------------------
 // These mirror the back/forward/reload/home buttons drawn in okai_draw_chrome().

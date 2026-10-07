@@ -129,6 +129,7 @@ int process_create(void) {
     // Wraps to 0 are skipped (0 = never-used).
     p->generation++;
     if (p->generation == 0) p->generation++;
+    p->fpu_valid = 0;
 
     // Create a new page directory with kernel mappings
     p->page_dir = create_page_directory();
@@ -529,8 +530,23 @@ void process_switch_to(uint32_t pid) {
         // No serial here (timer-IRQ context: nested-tick re-entrancy into
         // the formatter + deep va_list frames on 4K stacks; spawn/reap in
         // thread context carry the story).
+        // Outgoing x87 state into its PCB (FNSAVE also re-inits the FPU,
+        // so a first-run thread sees a clean unit).
+        __asm__ volatile("fnsave %0" : "=m"(pv->fpu_state) :: "memory");
+        pv->fpu_valid = 1;
         context_switch(&pv->esp, nx->esp, next_cr3);
     switch_resume:
+        // Every thread (seeded or resumed) lands here with current_slot =
+        // itself: restore its FPU image, or start clean.
+        {
+            struct process *me = &processes[current_slot];
+            if (me->fpu_valid) {
+                __asm__ volatile("frstor %0" :: "m"(me->fpu_state) : "memory");
+                me->fpu_valid = 0;
+            } else {
+                __asm__ volatile("fninit" ::: "memory");
+            }
+        }
         // Woken thread lands here (same code path both directions):
         // clear the guard + re-enable. current_slot was set pre-switch and
         // is already correct for the woken thread. No serial (prints twice

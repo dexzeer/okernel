@@ -55,12 +55,14 @@ static char dns_query_host[128] = {0};
 static char http_pending_host[128] = {0};
 // Paths carry real-site query strings (wikipedia's load.php stylesheet URLs
 // run 300+ bytes) — the old 128-byte copy truncated them into 404s.
-#define NET_PATH_MAX 1024
+#define NET_PATH_MAX 2048   // script module batches (Wikipedia load.php) run ~1.5KB
 static char http_pending_path[NET_PATH_MAX] = {0};
 // Accept-Encoding: gzip opt-in (okai decodes; raw saves must not get gzip).
 // Latched per request in http_get_port: the GET itself is built later.
 int net_accept_gzip = 0;
 static int http_req_gzip = 0;
+const char* net_extra_headers = 0;
+static char http_req_extra[NET_EXTRA_MAX];   // latched copy (DNS retries reuse it)
 static int http_retry_pending = 0;
 static uint16_t http_pending_port = 80; // port for the parked request
 // Connection attempts for the current (in-flight) request. Bounded so an
@@ -179,7 +181,7 @@ static uint16_t tcp_ephemeral_port = 43210;
 
 // Unacked outbound data for retransmission. Our sends are a GET request
 // (<= ~512 bytes) or bare FIN, so 4KB is ample for this stack.
-#define TCP_RTX_BUF_SIZE 4096
+#define TCP_RTX_BUF_SIZE 8192   // one request flight: path + cookie headers
 static uint8_t tcp_rtx_buf[TCP_RTX_BUF_SIZE];
 
 // RTO in 18Hz ticks (~55ms each): 4 ticks ~= 220ms initial, doubling
@@ -903,9 +905,16 @@ void tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
     serial_puts("[tcp] SYN sent\n");
 }
 
-static void tcp_send_raw(uint32_t seq_num, uint32_t ack_num, uint8_t flags,
+// Largest TCP payload in one Ethernet frame (MTU 1500 - IP 20 - TCP 20).
+#define TCP_SEG_MAX (ETH_FRAME_MAX - 14 - 20 - 20)
+
+// One segment. data_len MUST be <= TCP_SEG_MAX: the frame is a 1514-byte
+// stack buffer (a 1.6KB request once overflowed it and smashed the stack —
+// requests grew past one segment with long script URLs, 2026-10-07).
+static void tcp_send_one(uint32_t seq_num, uint32_t ack_num, uint8_t flags,
                          uint8_t* data, uint16_t data_len) {
     uint8_t target_mac[6];
+    if (data_len > TCP_SEG_MAX) data_len = TCP_SEG_MAX;   // never overflow the frame
 
     // Route through gateway for external IPs (same logic as tcp_connect)
     uint8_t* arp_target = tcp_conn.dst_ip;
@@ -971,6 +980,22 @@ static void tcp_send_raw(uint32_t seq_num, uint32_t ack_num, uint8_t flags,
 
     int total = sizeof(struct eth_header) + sizeof(struct ip_header) + tcp_hdr_len + data_len;
     e1000_send(frame, total);
+}
+
+// Send data as MSS-sized segments (PSH/FIN only on the last one). Every
+// sender (first transmission, RTO and fast retransmit of the whole
+// unacked flight) goes through here.
+static void tcp_send_raw(uint32_t seq_num, uint32_t ack_num, uint8_t flags,
+                         uint8_t* data, uint16_t data_len) {
+    if (data_len <= TCP_SEG_MAX) { tcp_send_one(seq_num, ack_num, flags, data, data_len); return; }
+    uint16_t off = 0;
+    while (off < data_len) {
+        uint16_t n = (uint16_t)(data_len - off > TCP_SEG_MAX ? TCP_SEG_MAX : data_len - off);
+        uint8_t f = flags;
+        if (off + n < data_len) f &= (uint8_t)~(0x08 | 0x01);   // PSH/FIN: last segment only
+        tcp_send_one(seq_num + off, ack_num, f, data + off, n);
+        off = (uint16_t)(off + n);
+    }
 }
 
 static void tcp_send_packet(uint8_t flags, uint8_t* data, uint16_t data_len) {
@@ -1564,6 +1589,12 @@ void http_get_port(const char* host, const char* path, uint16_t port) {
     uint16_t use_port = port ? port : 80;
     http_pending_port = use_port;
     http_req_gzip = net_accept_gzip;
+    if (net_extra_headers != http_req_extra) {
+        int k = 0;
+        if (net_extra_headers)
+            for (; net_extra_headers[k] && k < NET_EXTRA_MAX - 1; k++) http_req_extra[k] = net_extra_headers[k];
+        http_req_extra[k] = 0;
+    }
 
     // Every request starts a fresh response lifecycle. Without this, a
     // second fetch (e.g. okai refresh) raced the parse block with the
@@ -1628,8 +1659,8 @@ void http_get_port(const char* host, const char* path, uint16_t port) {
         return;
     }
 
-    // Build HTTP GET request
-    uint8_t req_buf[NET_PATH_MAX + 512];
+    // Build HTTP GET request (static: path + cookies make it several KB)
+    static uint8_t req_buf[NET_PATH_MAX + 512 + NET_EXTRA_MAX];
     int req_len = 0;
 
     const char* method = "GET ";
@@ -1659,6 +1690,7 @@ void http_get_port(const char* host, const char* path, uint16_t port) {
         const char* hdr_ae = "Accept-Encoding: gzip\r\n";
         for (int i = 0; hdr_ae[i]; i++) req_buf[req_len++] = hdr_ae[i];
     }
+    for (int i = 0; http_req_extra[i]; i++) req_buf[req_len++] = (uint8_t)http_req_extra[i];
 
     const char* hdr_end = "Connection: close\r\n\r\n";
     for (int i = 0; hdr_end[i]; i++) req_buf[req_len++] = hdr_end[i];
@@ -1844,13 +1876,15 @@ void net_poll(void) {
             if (tcp_conn.state == TCP_STATE_CLOSED) {
                 http_retry_pending = 0;
                 { int sv = net_accept_gzip; net_accept_gzip = http_req_gzip; // keep the original request's opt-in
+                  const char* sx = net_extra_headers; net_extra_headers = http_req_extra;
                   http_get_port(http_pending_host, http_pending_path, http_pending_port);
-                  net_accept_gzip = sv; }
+                  net_accept_gzip = sv; net_extra_headers = sx; }
             } else if (tcp_conn.state == TCP_STATE_ESTABLISHED) {
                 http_retry_pending = 0;
                 { int sv = net_accept_gzip; net_accept_gzip = http_req_gzip; // keep the original request's opt-in
+                  const char* sx = net_extra_headers; net_extra_headers = http_req_extra;
                   http_get_port(http_pending_host, http_pending_path, http_pending_port);
-                  net_accept_gzip = sv; }
+                  net_accept_gzip = sv; net_extra_headers = sx; }
             }
         }
     }

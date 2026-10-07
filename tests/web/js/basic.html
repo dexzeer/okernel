@@ -1,0 +1,85 @@
+<!doctype html>
+<html><head><title>JS basic</title>
+<style>.hidden{display:none} #box{width:200px;height:50px;padding:10px}</style>
+<script>
+var log = [];
+function ok(c, m) { log.push((c ? 'PASS ' : 'FAIL ') + m); }
+ok(document.readyState === 'loading', 'readyState loading in head script');
+ok(document.head && document.head.nodeName === 'HEAD', 'document.head');
+document.addEventListener('DOMContentLoaded', function () { log.push('PASS DOMContentLoaded'); });
+window.addEventListener('load', function () {
+  log.push('PASS load');
+  setTimeout(function () {
+    log.push('PASS timer after load');
+    var b = document.getElementById('box');
+    var r = b.getBoundingClientRect();
+    ok(r.width === 220 && r.height === 70, 'layout rect ' + r.width + 'x' + r.height);
+    ok(getComputedStyle(b).display === 'block', 'computed display');
+    ok(getComputedStyle(document.querySelector('.hidden')).display === 'none', 'computed none');
+    console.log(log.join('\n'));
+    console.log('RESULT ' + (log.join().indexOf('FAIL') < 0 ? 'ALLPASS' : 'SOMEFAIL') + ' ' + log.length);
+  }, 10);
+});
+</script></head>
+<body>
+<div id="box" class="a b">hello <b>world</b></div>
+<p class="hidden">hidden</p>
+<ul id="list"></ul>
+<script>
+var box = document.getElementById('box');
+ok(box.textContent === 'hello world', 'textContent');
+ok(box.innerHTML === 'hello <b>world</b>', 'innerHTML get: ' + box.innerHTML);
+ok(box.classList.contains('b') && box.classList.length === 2, 'classList');
+box.classList.add('c'); box.classList.remove('a');
+ok(box.className === 'b c', 'classList mutate: ' + box.className);
+var ul = document.getElementById('list');
+for (var i = 0; i < 3; i++) { var li = document.createElement('li'); li.textContent = 'item ' + i; ul.appendChild(li); }
+ok(ul.children.length === 3 && ul.lastChild.textContent === 'item 2', 'appendChild');
+ok(document.querySelectorAll('#list li').length === 3, 'querySelectorAll');
+ok(document.querySelector('ul > li:nth-child(2)').textContent === 'item 1', 'nth-child');
+ul.firstElementChild.remove();
+ok(ul.children.length === 2, 'remove');
+ul.insertAdjacentHTML('beforeend', '<li class="x">x</li><li>y</li>');
+ok(ul.querySelector('.x') && ul.children.length === 4, 'insertAdjacentHTML');
+var d = document.createElement('div'); d.innerHTML = '<span id="s1">a</span><span>b</span>'; document.body.appendChild(d);
+ok(document.getElementById('s1').parentNode === d, 'innerHTML set + getElementById');
+ok(d.contains(document.getElementById('s1')), 'contains');
+ok(box.matches('div.b') && box.closest('body') === document.body, 'matches/closest');
+box.style.color = 'red'; box.style.marginTop = '5px';
+ok(box.getAttribute('style').indexOf('color: red') >= 0 && box.style.marginTop === '5px', 'style: ' + box.getAttribute('style'));
+box.dataset.fooBar = '1';
+ok(box.getAttribute('data-foo-bar') === '1' && box.dataset.fooBar === '1', 'dataset');
+var clicked = 0;
+box.addEventListener('click', function (e) { clicked++; e.preventDefault(); });
+box.onclick = function () { clicked++; };
+box.click();
+ok(clicked === 2, 'click listeners ' + clicked);
+var ev = new CustomEvent('foo', { detail: 42, bubbles: true }), got = 0;
+document.body.addEventListener('foo', function (e) { got = e.detail; });
+box.dispatchEvent(ev);
+ok(got === 42, 'CustomEvent bubbles');
+ok(JSON.stringify([1, 'a']) === '[1,"a"]' && Math.max(1, 3) === 3, 'builtins');
+var u = new URL('../x?a=1#h', 'https://example.com/p/q');
+ok(u.href === 'https://example.com/x?a=1#h' && u.searchParams.get('a') === '1', 'URL ' + u.href);
+localStorage.setItem('k', 'v');
+ok(localStorage.getItem('k') === 'v' && localStorage.length >= 1, 'localStorage');
+document.cookie = 'a=1'; document.cookie = 'b=2; path=/';
+ok(document.cookie.indexOf('a=1') >= 0 && document.cookie.indexOf('b=2') >= 0, 'cookie ' + document.cookie);
+ok(typeof window.fetch === 'function' && typeof XMLHttpRequest === 'function', 'fetch/xhr exist');
+ok(document.title === 'JS basic', 'title');
+document.title = 'changed';
+ok(document.title === 'changed', 'title set');
+var p = Promise.resolve(5).then(function (v) { log.push((v === 5 ? 'PASS' : 'FAIL') + ' promise'); });
+var mo = new MutationObserver(function (recs) { log.push('PASS mutation observer ' + recs.length); mo.disconnect(); });
+mo.observe(ul, { childList: true });
+ul.appendChild(document.createElement('li'));
+var t = document.createElement('template'); t.innerHTML = '<i>tpl</i>';
+ok(t.content.firstChild.nodeName === 'I', 'template content');
+ok(document.body instanceof HTMLBodyElement && box instanceof HTMLElement && box instanceof Node, 'instanceof');
+customElements.define('x-foo', class extends HTMLElement { connectedCallback() { this.textContent = 'ce!'; } });
+var xf = document.createElement('x-foo'); document.body.appendChild(xf);
+ok(xf.textContent === 'ce!', 'custom element connectedCallback');
+document.write('<p id="written">w</p>');
+ok(document.getElementById('written') !== null, 'document.write');
+</script>
+</body></html>
