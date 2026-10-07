@@ -396,6 +396,10 @@ void graphics_set_clip(int x, int y, int w, int h) {
     if (clip_y1 < clip_y0) clip_y1 = clip_y0;
 }
 
+void graphics_get_clip(int* x0, int* y0, int* x1, int* y1) {
+    *x0 = clip_x0; *y0 = clip_y0; *x1 = clip_x1; *y1 = clip_y1;
+}
+
 void graphics_clip_reset(void) {
     clip_x0 = 0; clip_y0 = 0; clip_x1 = SCREEN_W; clip_y1 = SCREEN_H;
 }
@@ -407,6 +411,11 @@ void putpixel(int x, int y, uint32_t color) {
     }
 }
 
+// n pixels of one color: rep stosl (the per-pixel loops were a hot spot).
+static inline void fill32(uint32_t* d, uint32_t v, int n) {
+    if (n > 0) __asm__ volatile("rep stosl" : "+D"(d), "+c"(n) : "a"(v) : "memory");
+}
+
 void rect_fill(int x, int y, int w, int h, uint32_t color) {
     int x0 = x < clip_x0 ? clip_x0 : x;
     int y0 = y < clip_y0 ? clip_y0 : y;
@@ -415,8 +424,7 @@ void rect_fill(int x, int y, int w, int h, uint32_t color) {
     if (x0 >= x1 || y0 >= y1) return;
     for (int j = y0; j < y1; j++) {
         dirty_rows[j] = 1;
-        uint32_t* dst = backbuffer + j * SCREEN_W;
-        for (int i = x0; i < x1; i++) dst[i] = color;
+        fill32(backbuffer + j * SCREEN_W + x0, color, x1 - x0);
     }
 }
 
@@ -452,8 +460,7 @@ void hline(int x, int y, int len, uint32_t color) {
     if (x < clip_x0) { len -= clip_x0 - x; x = clip_x0; }
     if (x + len > clip_x1) len = clip_x1 - x;
     if (len <= 0) return;
-    uint32_t* dst = backbuffer + y * SCREEN_W + x;
-    for (int i = 0; i < len; i++) dst[i] = color;
+    fill32(backbuffer + y * SCREEN_W + x, color, len);
     dirty_rows[y] = 1;
 }
 
@@ -840,19 +847,13 @@ void graphics_blit_rect(int sx, int sy, int w, int h, int dx, int dy) {
     for (int y = ystart; y >= y0 && y < y1; y += ystep) {
         int ny = y + dy;
         if (ny < 0 || ny >= SCREEN_H) continue;
-        uint32_t* src = backbuffer + y * SCREEN_W;
-        uint32_t* dst = backbuffer + ny * SCREEN_W;
-        if (dx > 0) {
-            for (int x = x1 - 1; x >= x0; x--) {
-                int nx = x + dx;
-                if (nx < SCREEN_W) dst[nx] = src[x];
-            }
-        } else {
-            for (int x = x0; x < x1; x++) {
-                int nx = x + dx;
-                if (nx >= 0) dst[nx] = src[x];
-            }
-        }
+        // clip the span so the destination stays on screen; memmove
+        // handles the same-row overlap (dx != 0, dy == 0)
+        int xs = x0 > -dx ? x0 : -dx;
+        int xe = x1 < SCREEN_W - dx ? x1 : SCREEN_W - dx;
+        if (xs < xe)
+            memmove(backbuffer + ny * SCREEN_W + xs + dx, backbuffer + y * SCREEN_W + xs,
+                    (unsigned)(xe - xs) * 4);
         dirty_rows[ny] = 1;
     }
 }
@@ -886,14 +887,19 @@ void graphics_cache_wallpaper(const unsigned char* pixels, const unsigned char* 
     wallpaper_cached = 1;
 }
 
+void graphics_set_wallpaper(uint32_t* px) {
+    for (int i = 0; i < SCREEN_W * SCREEN_H; i++) px[i] &= 0xFFFFFF;
+    if (cached_wallpaper) kfree(cached_wallpaper);
+    cached_wallpaper = px;
+    wallpaper_cached = 1;
+}
+
+const uint32_t* graphics_wallpaper(void) { return wallpaper_cached ? cached_wallpaper : 0; }
+
 void graphics_blit_wallpaper(void) {
     if (!wallpaper_cached || !cached_wallpaper) return;
-    for (int y = 0; y < SCREEN_H; y++) {
-        uint32_t* dst = backbuffer + y * SCREEN_W;
-        uint32_t* src = cached_wallpaper + y * SCREEN_W;
-        for (int x = 0; x < SCREEN_W; x++) dst[x] = src[x];
-        dirty_rows[y] = 1;
-    }
+    memcpy(backbuffer, cached_wallpaper, SCREEN_W * SCREEN_H * 4);
+    for (int y = 0; y < SCREEN_H; y++) dirty_rows[y] = 1;
 }
 
 void graphics_blit_wallpaper_rect(int x, int y, int w, int h) {
@@ -904,9 +910,8 @@ void graphics_blit_wallpaper_rect(int x, int y, int w, int h) {
     if (y + h > SCREEN_H) h = SCREEN_H - y;
     if (w <= 0 || h <= 0) return;
     for (int yy = y; yy < y + h; yy++) {
-        uint32_t* dst = backbuffer + yy * SCREEN_W;
-        uint32_t* src = cached_wallpaper + yy * SCREEN_W;
-        for (int xx = x; xx < x + w; xx++) dst[xx] = src[xx];
+        memcpy(backbuffer + yy * SCREEN_W + x, cached_wallpaper + yy * SCREEN_W + x,
+               (unsigned)w * 4);
         dirty_rows[yy] = 1;
     }
 }
@@ -923,10 +928,19 @@ void graphics_flush(void) {
     if (!framebuffer || !backbuffer) return;
     for (int y = 0; y < SCREEN_H; y++) {
         if (!dirty_rows[y]) continue;
-        uint32_t* src = backbuffer + y * SCREEN_W;
-        uint32_t* dst = (uint32_t*)(framebuffer + y * fb_pitch);
-        for (int x = 0; x < SCREEN_W; x++) dst[x] = src[x];
-        dirty_rows[y] = 0;
+        // Coalesce runs of dirty rows: one rep-movs per run when the
+        // framebuffer pitch is packed (it is with -vga std at 1920x1080).
+        int y1 = y + 1;
+        while (y1 < SCREEN_H && dirty_rows[y1]) y1++;
+        if (fb_pitch == SCREEN_W * 4) {
+            memcpy(framebuffer + y * fb_pitch, backbuffer + y * SCREEN_W,
+                   (unsigned)(y1 - y) * SCREEN_W * 4);
+        } else {
+            for (int r = y; r < y1; r++)
+                memcpy(framebuffer + r * fb_pitch, backbuffer + r * SCREEN_W, SCREEN_W * 4);
+        }
+        for (int r = y; r < y1; r++) dirty_rows[r] = 0;
+        y = y1 - 1;
     }
 }
 

@@ -162,14 +162,15 @@ So clicking becomes a feedback-control loop (`okvm.py`):
 ```
 vm.click_link("example.com")      # first link region whose href contains it
 vm.click_at(page_x, page_y, done=lambda log: ...)
-vm.click_screen(x, y, r"nav action=5")   # chrome: tabs, toolbar, lock (reads [mse] btn=1)
+vm.click_ui("newtab", r"nav action=5")  # chrome element by name ([okai] ui geometry)
+vm.click_screen(x, y, r"...")            # any screen point (reads [mse] btn=1)
 ```
 
 Each one first dead-reckons the cursor toward the target (`premove`, so the probe click never lands on whatever link sits under the cursor), then: click → parse the LAST logged position → burst-correct → repeat until the expected log line appears.
 
 Movement correction uses **bursts**: send the same delta 5× so the smoothing ring fills with it (net displacement ≈ 4.8 × delta). Correct in small steps and iterate; convergence takes 2–5 clicks.
 
-Chrome geometry (okai opens maximized at (0,0), border 2, no title bar): tab strip y 2..40 (tab i at x 6+302i, 300 wide, x-box centered at +290; '+' right after the last tab), toolbar y 40..98 (back/fwd/reload/home centers x 25/63/101/139 at y 69; address bar from x 172; lock hit box x 174..194, y 48..68), page from (2, 98).
+Chrome geometry is logged by the kernel, not hard-coded: every time the chrome layout settles okai prints `[okai] ui back=x,y,w,h fwd=.. reload=.. home=.. url=.. ident=.. newtab=.. min=.. max=.. close=..` and `[okai] ui tabs n=N tab<i>=.. tabx<i>=..` (tab i and its close box). Aim with `vm.click_ui(name, regex)` / `vm.ui_center(name)` / `vm.ui_rect(name)`; for targets next to the close button pass `anchor=(x, y)` (a harmless probe click nearby — long dead-reckoned moves drift ~50px). The chrome band is 96px (44 tab strip + 52 nav bar); the page starts right below it.
 
 ## 7. Host-side unit tests (fast, no QEMU)
 

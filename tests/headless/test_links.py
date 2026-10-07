@@ -6,9 +6,8 @@
 4. chrome never bleeds into the page area (z-order sanity)
 Ground truth: [mse] / [okai] click positions + [okai]/[br] serial lines.
 
-Chrome geometry (okai opens maximized at (0,0), border 2, no title bar):
-tab strip y 2..40, tab i at x = 6 + 302*i (300 wide), '+' box right after
-the last tab (32px), page area from y = 98.
+Chrome positions come from okai's `[okai] ui` geometry log (vm.click_ui);
+the page area starts below the 96px chrome band.
 """
 import sys, os, time, re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,14 +29,15 @@ time.sleep(2)
 
 # '+' after the single tab -> a new tab on the homepage
 homes = vm.serial().count("home rendered")
-newtab = vm.click_screen(6 + 302 + 16, 21, r"nav action=5")
+newtab = vm.click_ui("newtab", r"nav action=5")
 newtab = newtab and vm.serial().count("home rendered") > homes
 print("NEWTAB->HOME:", "PASS" if newtab else "FAIL", flush=True)
 time.sleep(1)
 
 # click tab 0 -> switch back to example.com (no refetch)
 parses = vm.serial().count("parse: count=")
-switched = vm.click_screen(6 + 120, 21, r"switch tab -> 0")
+t0 = vm.ui_rect("tab0")
+switched = vm.click_screen(t0[0] + 60, t0[1] + t0[3] // 2, r"switch tab -> 0")
 switched = switched and vm.serial().count("parse: count=") == parses
 print("TAB SWITCH:", "PASS" if switched else "FAIL", flush=True)
 time.sleep(2)

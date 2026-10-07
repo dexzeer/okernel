@@ -3,28 +3,46 @@
 // -nostdlib -ffreestanding build nothing provides them, so we do here.
 #include "string.h"
 
+// The bulk primitives are rep-string loops: the old byte loops were the
+// single hottest code in the desktop (a 7MB page-surface scroll took ~1s
+// under TCG). Inline asm also keeps GCC from turning a loop back into a
+// call to memcpy itself. The SysV ABI guarantees DF=0 on entry; memmove's
+// backward path sets it and always clears it again.
 void* memcpy(void* dst, const void* src, unsigned int n) {
-    unsigned char* d = (unsigned char*)dst;
-    const unsigned char* s = (const unsigned char*)src;
-    for (unsigned int i = 0; i < n; i++) d[i] = s[i];
+    void* d = dst; const void* s = src;
+    unsigned int dw = n >> 2, tail = n & 3;
+    __asm__ volatile("rep movsl\n\tmovl %3, %%ecx\n\trep movsb"
+                     : "+D"(d), "+S"(s), "+c"(dw)
+                     : "r"(tail) : "memory");
     return dst;
 }
 
 void* memmove(void* dst, const void* src, unsigned int n) {
     unsigned char* d = (unsigned char*)dst;
     const unsigned char* s = (const unsigned char*)src;
-    if (d < s) {
-        for (unsigned int i = 0; i < n; i++) d[i] = s[i];
-    } else {
-        for (unsigned int i = n; i > 0; i--) d[i - 1] = s[i - 1];
-    }
+    if (d == s || n == 0) return dst;
+    if (d < s || d >= s + n) return memcpy(dst, src, n);
+    // Overlapping, dst above src: copy backward. Tail bytes first (from the
+    // top), then dwords.
+    unsigned int tail = n & 3, dw = n >> 2;
+    const unsigned char* sp = s + n - 1;
+    unsigned char* dp = d + n - 1;
+    __asm__ volatile("std\n\trep movsb\n\t"
+                     "subl $3, %%esi\n\tsubl $3, %%edi\n\t"
+                     "movl %3, %%ecx\n\trep movsl\n\tcld"
+                     : "+D"(dp), "+S"(sp), "+c"(tail)
+                     : "r"(dw) : "memory", "cc");
     return dst;
 }
 
 void* memset(void* dst, int c, unsigned int n) {
-    unsigned char* d = (unsigned char*)dst;
-    unsigned char v = (unsigned char)c;
-    for (unsigned int i = 0; i < n; i++) d[i] = v;
+    void* d = dst;
+    unsigned int v = (unsigned char)c;
+    v |= v << 8; v |= v << 16;
+    unsigned int dw = n >> 2, tail = n & 3;
+    __asm__ volatile("rep stosl\n\tmovl %3, %%ecx\n\trep stosb"
+                     : "+D"(d), "+c"(dw), "+a"(v)
+                     : "r"(tail) : "memory");
     return dst;
 }
 

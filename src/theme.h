@@ -28,9 +28,30 @@
 // so labels like "okai:home" and tab titles show in full instead of being
 // clipped to their upper half. CHROME_ROWS reserves that many 32px content
 // buffer rows (CHROME_TAB_H + CHROME_TOOL_H <= CHROME_ROWS * FONT_H).
-#define CHROME_TAB_H   38
-#define CHROME_TOOL_H  58
+#define CHROME_TAB_H   44
+#define CHROME_TOOL_H  52
 #define CHROME_ROWS    3
+
+// --- okai browser chrome: Firefox "Proton" light palette (okai_ui.c) -------
+#define FX_FRAME          0x00F0F0F4 // tab strip
+#define FX_FRAME_U        0x00EBEBEF // tab strip, window unfocused
+#define FX_TAB_SEL        0x00FFFFFF // selected tab (floats over the strip)
+#define FX_TAB_HOVER      0x00E0E0E6 // hovered background tab / buttons on the strip
+#define FX_TOOLBAR        0x00F9F9FB // nav bar
+#define FX_TOOLBAR_SEP    0x00CFCFD8 // 1px line between nav bar and page
+#define FX_BTN_HOVER      0x00E0E0E6 // toolbar button hover
+#define FX_URLBAR         0x00F0F0F4 // address field
+#define FX_URLBAR_HOVER   0x00E8E8ED
+#define FX_FOCUS          0x000061E0 // focus ring / accent
+#define FX_TEXT           0x0015141A
+#define FX_TEXT_2         0x005B5B66 // secondary (URL path, placeholders)
+#define FX_ICON           0x002B2A33
+#define FX_ICON_OFF       0x00ABABB4 // disabled back/forward
+#define FX_CLOSE_HOVER    0x00E81123 // caption close hover (white glyph)
+#define FX_SECURE         0x002B2A33 // lock (Firefox keeps it neutral)
+#define FX_INSECURE       0x00E22850
+#define FX_FRAME_BORDER   0x00A0A0AB // window frame around the browser
+#define FX_FRAME_BORDER_U 0x00CFCFD8
 
 // Nav toolbar buttons: rounded dark chips on the toolbar gradient
 #define NAVBTN_BG     0x00284A78
@@ -50,10 +71,15 @@
 #define TBTN_CLOSE_BG     0x00C04040 // muted red close
 #define TBTN_NEUTRAL_BG   0x00444B57 // slate minimize
 #define TBTN_FG           0x00FFFFFF
-#define CHROME_RED        0x00CC2222 // anarchy red: flat terminal title/border
-#define CHROME_BTN_BG     0x00000000 // black square chrome buttons (white glyph)
-#define TASKBAR_TOP       0x00263F6B
-#define TASKBAR_BOT       0x00172841
-#define TASK_BTN_INACT    0x003A5C95
+// Title-bar windows (terminal, editor, sysinfo): GNOME/libadwaita dark header bar.
+#define HDR_BG            0x002E2E33
+#define HDR_BG_U          0x00242428
+#define HDR_DIVIDER       0x0018181B
+#define HDR_BORDER        0x0046464E
+#define HDR_BORDER_U      0x0030303A
+#define HDR_BTN           0x0046464E // round button disc
+#define HDR_BTN_U         0x00343439
+#define HDR_TEXT          0x00F2F2F5
+#define HDR_TEXT_U        0x008E8E98
 
 #endif

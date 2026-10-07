@@ -1,6 +1,7 @@
 #include "window.h"
 #include "graphics.h"
 #include "theme.h"
+#include "ui_draw.h"
 #include "cjk.h"
 #include "memory.h"
 #include "idt.h"
@@ -263,7 +264,8 @@ int window_create(const char* title, int x, int y, int w, int h) {
             windows[i].visible = 1; windows[i].focused = 0; windows[i].font_scale = 1;
             windows[i].z = i;
             windows[i].no_titlebar = 0;
-            windows[i].red_chrome = 0; // reset: slot reuse must not leak themes
+            windows[i].is_term = 0; // reset: slot reuse must not leak themes
+            windows[i].has_restore = 0;
             windows[i].text_fg = 15; windows[i].text_bg = 0;
             windows[i].text_fg_rgb = vga_to_rgb[15]; windows[i].text_bg_rgb = vga_to_rgb[0];
             windows[i].content_bg = WIN_BG;
@@ -337,9 +339,9 @@ void window_set_minimize_button(int id, int has_min) {
     if (id >= 0 && id < MAX_WINDOWS) windows[id].has_minimize_button = has_min;
 }
 
-void window_set_red_chrome(int id, int flag) {
+void window_set_terminal(int id, int flag) {
     if (id < 0 || id >= MAX_WINDOWS) return;
-    windows[id].red_chrome = flag ? 1 : 0;
+    windows[id].is_term = flag ? 1 : 0;
     windows[id].dirty = 1;
     window_mark_all(&windows[id]);
 }
@@ -389,24 +391,91 @@ void window_set_hide_cursor(int id, int flag) {
     window_mark_all(&windows[id]);
 }
 
+// Caption buttons of a no-titlebar window: three WIN_CTRL_W-wide cells at the
+// top-right of the content area, CHROME_TAB_H tall (min | max | close).
+int window_ctrl_rect(int id, int which, int r[4]) {
+    if (id < 0 || id >= MAX_WINDOWS) return 0;
+    struct window* w = &windows[id];
+    if (!w->visible || !w->no_titlebar) return 0;
+    if (which == WIN_CTRL_CLOSE && !w->has_close_button) return 0;
+    if (which != WIN_CTRL_CLOSE && !w->has_minimize_button) return 0;
+    r[0] = w->x + w->w - WIN_BORDER - (3 - which) * WIN_CTRL_W;
+    r[1] = w->y + WIN_BORDER;
+    r[2] = WIN_CTRL_W;
+    r[3] = CHROME_TAB_H;
+    return 1;
+}
+
+static int ctrl_hit(int id, int which, int mx, int my) {
+    int r[4];
+    if (!window_ctrl_rect(id, which, r)) return 0;
+    return mx >= r[0] && mx < r[0] + r[2] && my >= r[1] && my < r[1] + r[3];
+}
+
+// Title-bar buttons (windows WITH a title bar): close at the right edge,
+// minimize left of it, both vertically centered. Hit tests and drawing use it.
+static void title_btn_rect(const struct window* w, int minimize, int r[4]) {
+    r[0] = w->x + w->w - WIN_BORDER - 8 - WIN_BTN_W - (minimize ? WIN_BTN_W + 6 : 0);
+    r[1] = w->y + WIN_BORDER + (WIN_TITLE_H - WIN_BTN_H) / 2;
+    r[2] = WIN_BTN_W; r[3] = WIN_BTN_H;
+}
+
+static int title_btn_hit(const struct window* w, int minimize, int mx, int my) {
+    int r[4];
+    title_btn_rect(w, minimize, r);
+    return mx >= r[0] && mx < r[0] + r[2] && my >= r[1] && my < r[1] + r[3];
+}
+
 int window_check_close_click(int id, int mx, int my) {
     struct window* w = &windows[id];
     if (!w->visible || !w->has_close_button) return 0;
-    if (w->no_titlebar) {
-        int s = WIN_CTRL_BTN;
-        int bx = w->x + w->w - WIN_BORDER - 4 - s, by = w->y + WIN_BORDER;
-        return (mx >= bx && mx < bx + s && my >= by && my < by + s);
-    }
-    int bx = w->x + w->w - WIN_BORDER - 4 - WIN_BTN_W, by = w->y + WIN_BORDER;
-    return (mx >= bx && mx < bx + WIN_BTN_W && my >= by && my < by + WIN_BTN_H);
+    if (w->no_titlebar) return ctrl_hit(id, WIN_CTRL_CLOSE, mx, my);
+    return title_btn_hit(w, 0, mx, my);
 }
 
 int window_check_minimize_click(int id, int mx, int my) {
     struct window* w = &windows[id];
     if (!w->visible || !w->has_minimize_button) return 0;
-    if (w->no_titlebar) return 0; // no minimize control in title-bar-less mode
-    int bx = w->x + w->w - WIN_BORDER - 8 - 2 * WIN_BTN_W, by = w->y + WIN_BORDER;
-    return (mx >= bx && mx < bx + WIN_BTN_W && my >= by && my < by + WIN_BTN_H);
+    if (w->no_titlebar) return ctrl_hit(id, WIN_CTRL_MIN, mx, my);
+    return title_btn_hit(w, 1, mx, my);
+}
+
+int window_check_maximize_click(int id, int mx, int my) {
+    if (id < 0 || id >= MAX_WINDOWS || !windows[id].visible) return 0;
+    return ctrl_hit(id, WIN_CTRL_MAX, mx, my);
+}
+
+int window_is_maximized(int id) {
+    if (id < 0 || id >= MAX_WINDOWS) return 0;
+    struct window* w = &windows[id];
+    return w->x == 0 && w->y == 0 && w->w == SCREEN_W && w->h == SCREEN_H - TASKBAR_H;
+}
+
+// Maximize to the work area, or restore the remembered rect (a window that
+// opened maximized restores to a centered 3/4-size rect).
+void window_toggle_maximize(int id) {
+    if (id < 0 || id >= MAX_WINDOWS || !windows[id].visible) return;
+    struct window* w = &windows[id];
+    int wa_h = SCREEN_H - TASKBAR_H;
+    int ox = w->x, oy = w->y, ow = w->w, oh = w->h;
+    if (window_is_maximized(id)) {
+        int nw = SCREEN_W * 3 / 4, nh = wa_h * 3 / 4;
+        int nx = (SCREEN_W - nw) / 2, ny = (wa_h - nh) / 2;
+        if (w->has_restore && w->restore_w < SCREEN_W - 16) {
+            nx = w->restore_x; ny = w->restore_y; nw = w->restore_w; nh = w->restore_h;
+        }
+        w->x = nx; w->y = ny;
+        window_resize(id, nw, nh);
+    } else {
+        w->has_restore = 1;
+        w->restore_x = w->x; w->restore_y = w->y;
+        w->restore_w = w->w; w->restore_h = w->h;
+        w->x = 0; w->y = 0;
+        window_resize(id, SCREEN_W, wa_h);
+    }
+    w->dirty = 1; w->pr_valid = 0; w->pxd_valid = 0; needs_redraw = 1;
+    // the old footprint: wallpaper + whatever sits behind (z-order repair)
+    desktop_paint_rect_pub(ox, oy, ow, oh);
 }
 
 void window_minimize(int id) {
@@ -514,53 +583,51 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
     int title_bottom = w->y + WIN_BORDER + title_off;
     // Border frame — drawn whenever the clip rect overlaps the window at all.
     if (rx < w->x + w->w && rx + rw > w->x && ry < w->y + w->h && ry + rh > w->y) {
-        uint32_t bc = w->red_chrome ? CHROME_RED :
-                      (w->focused ? BORDER_ACTIVE : BORDER_INACTIVE);
+        uint32_t bc = w->no_titlebar ? (w->focused ? FX_FRAME_BORDER : FX_FRAME_BORDER_U) :
+                      (w->focused ? HDR_BORDER : HDR_BORDER_U);
         rect_outline(w->x, w->y, w->w, w->h, bc, WIN_BORDER);
     }
-    // Title bar (skipped for title-bar-less windows; the client draws its own top).
-    // Same blue gradient family as the browser toolbar (theme.h) so the OS
-    // chrome and the browser chrome read as one system. Red-chrome (terminal)
-    // windows instead get a FLAT red bar: no gradient, no divider stroke.
+    // Title bar (skipped for title-bar-less windows; the client draws its own
+    // top): a dark GNOME-style header bar, centered Noto title, round buttons.
     if (!w->no_titlebar &&
         rx < w->x + w->w && rx + rw > w->x && ry < title_bottom && ry + rh > w->y) {
         int tx = w->x + WIN_BORDER, ty = w->y + WIN_BORDER;
         int tw = w->w - 2 * WIN_BORDER;
-        if (w->red_chrome)
-            rect_fill(tx, ty, tw, WIN_TITLE_H, CHROME_RED);
-        else if (w->focused)
-            gradient_fill(tx, ty, tw, WIN_TITLE_H, CHROME_TOOL_TOP, CHROME_TOOL_BOT, 1);
-        else
-            gradient_fill(tx, ty, tw, WIN_TITLE_H, TITLE_GRAD_U_TOP, TITLE_GRAD_U_BOT, 1);
-        if (!w->red_chrome) hline(tx, ty + WIN_TITLE_H - 1, tw, TITLE_DIVIDER);
-        // Title text: centered on red-chrome windows, left-aligned classic.
-        int txx = tx + 4;
-        if (w->red_chrome) {
-            int tlen = 0;
-            while (w->title[tlen] && tlen < 31) tlen++;
-            txx = tx + (tw - tlen * CHAR_W) / 2;
-            if (txx < tx + 4) txx = tx + 4;
+        uint32_t hbg = w->focused ? HDR_BG : HDR_BG_U;
+        rect_fill(tx, ty, tw, WIN_TITLE_H, hbg);
+        hline(tx, ty + WIN_TITLE_H - 1, tw, HDR_DIVIDER);
+        struct wsurf s;
+        ui_screen_surf(&s);
+        int old[4], old2[4]; // (scratch surface: never popped)
+        ws_push_clip(&s, rx, ry, rx + rw, ry + rh, old);
+        ws_push_clip(&s, tx, ty, tx + tw, ty + WIN_TITLE_H - 1, old2);
+        int btns_w = (w->has_close_button ? WIN_BTN_W + 14 : 0) +
+                     (w->has_minimize_button ? WIN_BTN_W + 6 : 0);
+        int room = tw - 2 * (btns_w + 8);
+        if (room > 0) {
+            int tl = ui_text_w(15, 1, w->title, -1);
+            if (tl > room) tl = room;
+            ui_text_draw(&s, tx + (tw - tl) / 2, ty + WIN_TITLE_H / 2, 15, 1,
+                         w->focused ? HDR_TEXT : HDR_TEXT_U, w->title, -1, room, hbg);
         }
-        draw_string_fg(txx, ty + 4, w->title,
-                       w->focused ? TITLE_TEXT_F : TITLE_TEXT_U);
-        if (w->has_close_button) {
-            int bx = w->x + w->w - WIN_BORDER - 4 - WIN_BTN_W, by = w->y + WIN_BORDER;
-            if (w->red_chrome) rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, CHROME_BTN_BG);
-            else round_rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, TBTN_CLOSE_BG, 4);
-            int cx = bx + WIN_BTN_W / 2, cy = by + WIN_BTN_H / 2, d = 5;
-            line(cx - d, cy - d, cx + d, cy + d, TBTN_FG);
-            line(cx - d + 1, cy - d, cx + d + 1, cy + d, TBTN_FG);
-            line(cx + d, cy - d, cx - d, cy + d, TBTN_FG);
-            line(cx + d + 1, cy - d, cx - d + 1, cy + d, TBTN_FG);
+        for (int m = 0; m < 2; m++) {
+            if (m == 0 ? !w->has_close_button : !w->has_minimize_button) continue;
+            int r[4];
+            title_btn_rect(w, m, r);
+            int d = 24, cx = r[0] + (r[2] - d) / 2, cy = r[1] + (r[3] - d) / 2;
+            ui_rrect(&s, cx, cy, d, d, d / 2, w->focused ? HDR_BTN : HDR_BTN_U);
+            struct ui_pen p;
+            ui_pen_at(&p, cx, cy, 150);
+            ui_path_begin();
+            if (m == 0) {
+                ui_seg(&p, UI_U(8), UI_U(8), UI_U(16), UI_U(16), 1);
+                ui_seg(&p, UI_U(16), UI_U(8), UI_U(8), UI_U(16), 1);
+            } else {
+                ui_seg(&p, UI_U(8), UI_U(15.5), UI_U(16), UI_U(15.5), 1);
+            }
+            ui_path_fill(&s, w->focused ? HDR_TEXT : HDR_TEXT_U);
         }
-        if (w->has_minimize_button) {
-            int bx = w->x + w->w - WIN_BORDER - 8 - 2 * WIN_BTN_W, by = w->y + WIN_BORDER;
-            if (w->red_chrome) rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, CHROME_BTN_BG);
-            else round_rect_fill(bx, by, WIN_BTN_W, WIN_BTN_H, TBTN_NEUTRAL_BG, 4);
-            int cy = by + WIN_BTN_H / 2 + 4, d = 5;
-            hline(bx + WIN_BTN_W / 2 - d, cy, 2 * d + 1, TBTN_FG);
-            hline(bx + WIN_BTN_W / 2 - d, cy + 1, 2 * d + 1, TBTN_FG);
-        }
+        ui_screen_done(ty, WIN_TITLE_H);
     }
 
     // ---- Content cells (pre-computed row/col range, no redundant bg fill) ----
@@ -1085,33 +1152,3 @@ void window_set_title(int id, const char* title) {
     window_mark_all(&windows[id]);
 }
 
-void window_draw_taskbar(void) {
-    int y = SCREEN_H - TASKBAR_H;
-    gradient_fill(0, y, SCREEN_W, TASKBAR_H, TASKBAR_TOP, TASKBAR_BOT, 1);
-    hline(0, y, SCREEN_W, TITLE_DIVIDER);
-
-    int count = 0;
-    for (int i = 0; i < MAX_WINDOWS; i++) if (windows[i].visible) count++;
-    if (count == 0) return;
-
-    int total_pad = (count + 1) * 6;
-    int btn_w = (SCREEN_W - total_pad) / count;
-    if (btn_w > 180) btn_w = 180;
-    if (btn_w < 60) btn_w = 60;
-
-    int x = 6;
-    for (int i = 0; i < MAX_WINDOWS; i++) {
-        struct window* w = &windows[i];
-        if (!w->visible) continue;
-        int focused = w->focused && !w->minimized;
-        uint32_t btn_bg = focused ? CHROME_TAB_ACTIVE : TASK_BTN_INACT;
-        round_rect_fill(x, y + 3, btn_w, TASKBAR_H - 6, btn_bg, 4);
-        char label[20]; int li = 0;
-        int max_chars = (btn_w - 8) / CHAR_W;
-        if (max_chars > 18) max_chars = 18;
-        while (w->title[li] && li < max_chars) { label[li] = w->title[li]; li++; }
-        label[li] = 0;
-        draw_string_fg(x + 4, y + 5, label, focused ? CHROME_TAB_TEXT : TITLE_TEXT_F);
-        x += btn_w + 6;
-    }
-}

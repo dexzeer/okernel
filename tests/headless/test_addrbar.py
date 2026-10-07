@@ -38,18 +38,16 @@ def shot(vm):
     vm.dump()
     return Image.open(vm.PPM).convert("RGB")
 
-def addr_bar_rect(im):
-    """The address bar: x from 172 in the toolbar row (okai maximized at (0,0),
-    border 2: toolbar y 40..98, bar y 44..94). None if it is not white there."""
-    if all(abs(c - 255) < 12 for c in im.getpixel((180, 50))[:3]):
-        return (172, 50, 1880, 88)
-    return None
+def addr_bar_rect(vm):
+    """The address field (x0, y0, x1, y1) from okai's `[okai] ui` geometry."""
+    r = vm.ui_rect("url")
+    return (r[0], r[1] + 4, r[0] + r[2], r[1] + r[3] - 4) if r else None
 
 def dark_pixels(im, rect):
     x0, y0, x1, y1 = rect
     n = 0
     for y in range(y0, y1):
-        for x in range(x0 + 20, x1):  # skip the lock icon area
+        for x in range(x0 + 44, x1):  # skip the identity (lock) box
             r, g, b = im.getpixel((x, y))[:3]
             if r < 100 and g < 100 and b < 100: n += 1
     return n
@@ -68,7 +66,7 @@ assert "...(truncated)" not in log, "old header dump still present"
 print("PASS: no raw-header dump in event stream")
 
 imA = shot(vm)
-rect = addr_bar_rect(imA)
+rect = addr_bar_rect(vm)
 assert rect, "address bar rect not found"
 dpA = dark_pixels(imA, rect)
 print(f"addr bar {rect}, dark pixels (URL text) = {dpA}")
