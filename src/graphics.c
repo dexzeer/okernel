@@ -4,6 +4,7 @@
 #include "paging.h"
 #include "serial.h"
 #include "io.h"
+#include "string.h"
 #include <stdint.h>
 
 // VGA 16-color palette as 0x00RRGGBB
@@ -807,6 +808,20 @@ void graphics_mark_dirty(int y) {
 void graphics_write_pixel(int x, int y, uint32_t color) {
     if (x >= clip_x0 && x < clip_x1 && y >= clip_y0 && y < clip_y1)
         backbuffer[y * SCREEN_W + x] = color;
+}
+
+void graphics_blit_pixels(int x, int y, const uint32_t* src, int w, int h, int stride) {
+    if (!backbuffer || !src) return;
+    int x0 = x < clip_x0 ? clip_x0 : x;
+    int y0 = y < clip_y0 ? clip_y0 : y;
+    int x1 = x + w < clip_x1 ? x + w : clip_x1;
+    int y1 = y + h < clip_y1 ? y + h : clip_y1;
+    if (x0 >= x1 || y0 >= y1) return;
+    for (int j = y0; j < y1; j++) {
+        dirty_rows[j] = 1;
+        memcpy(backbuffer + j * SCREEN_W + x0, src + (j - y) * stride + (x0 - x),
+               (uint32_t)(x1 - x0) * 4);
+    }
 }
 
 void graphics_blit_rect(int sx, int sy, int w, int h, int dx, int dy) {

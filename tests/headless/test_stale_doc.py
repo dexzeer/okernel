@@ -33,6 +33,14 @@ time.sleep(1)
 def parses(log):
     return len(re.findall(r"\[br\] (?:https )?parse: count=\d+", log))
 
+def wait_parses(vm, n, timeout=70):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if parses(vm.serial()) >= n:
+            return True
+        time.sleep(1)
+    return False
+
 results = []
 try:
     vm = OkVM("stale")
@@ -40,7 +48,7 @@ try:
 
     # Page A: dense, fills the doc grid
     vm.type_string("okai http://10.0.2.2:8137/a.html\n")
-    results.append(("page A loads", vm.wait_for("parse: count=", timeout=70)))
+    results.append(("page A loads", wait_parses(vm, 1)))
     time.sleep(3)
     vm.dump()
 
@@ -48,17 +56,17 @@ try:
     vm.type_string("g"); time.sleep(0.5)
     vm.type_string("10.0.2.2:8137/b.html\n")
     results.append(("page B loads",
-                    vm.wait_for("parse: count=", timeout=70) and parses(vm.serial()) >= 2))
+                    wait_parses(vm, 2)))
     time.sleep(3)
     vm.dump(os.path.expanduser("~/okvm/stale_b.ppm"))
 
     from PIL import Image
     img = Image.open(os.path.expanduser("~/okvm/stale_b.ppm")).convert("RGB")
     px = img.load()
-    # Content area of the okai window (window at x=1010,y=60, chrome ~96px tall)
+    # Page area of the (maximized) okai window: below the 96px chrome band
     lit = 0
-    for y in range(60 + 100, 60 + 640):
-        for x in range(1015, 1880):
+    for y in range(100, 1030):
+        for x in range(4, 1900):
             r, g, bl = px[x, y]
             if r > 180 and g > 180 and bl > 180:
                 lit += 1

@@ -46,8 +46,9 @@ static int tls_active;           // 1 while a fetch is in progress
 static int tls_phase;            // HP_* current phase
 static char tls_host_buf[128];   // copied (caller's host buffer may be transient)
 static const char* tls_host;
-static char tls_path[128];
-static char tls_req_buf[512];
+static char tls_path[1024];       // real-site query strings run long
+static char tls_req_buf[1024 + 512];
+extern int net_accept_gzip;      // network.c: okai opts in to gzip bodies
 static uint32_t tls_req_len;
 
 static int tls_done = 0;         // 1 once the response is buffered
@@ -74,6 +75,12 @@ static int tls_last_unaccepted = 0;
 // gives up instead of re-tcp_connect() forever (which would wedge the okai
 // single-owner fetch model).
 static int tls_conn_attempts = 0;
+// Every fetch opens its OWN TCP connection. The previous fetch's socket can
+// still read ESTABLISHED (its response completed by framing before the
+// server's FIN arrived); handshaking on it sent the ClientHello into a
+// closing connection and every other back-to-back sub-resource failed.
+static int tls_fresh_conn = 0;
+static uint32_t tls_seen_len = 0; // plaintext length at the last framing check
 #define TLS_MAX_CONN_ATTEMPTS 4
 
 static uint32_t tls_resolved_ip = 0;
@@ -150,6 +157,8 @@ void https_get_port(const char* host, const char* path, uint16_t port) {
     tls_peer_closed = 0;
     tls_resolved_ip = 0;
     tls_conn_attempts = 0;
+    tls_fresh_conn = 1;
+    tls_seen_len = 0;
     tls_start_tick = tick_count;
 
     int i;
@@ -157,7 +166,7 @@ void https_get_port(const char* host, const char* path, uint16_t port) {
     tls_host_buf[i] = 0;
     tls_host = tls_host_buf;
 
-    for (i = 0; path[i] && i < 127; i++) tls_path[i] = path[i];
+    for (i = 0; path[i] && i < (int)sizeof(tls_path) - 1; i++) tls_path[i] = path[i];
     tls_path[i] = 0;
 
     int rlen = 0;
@@ -168,7 +177,9 @@ void https_get_port(const char* host, const char* path, uint16_t port) {
     req = "HTTP/1.1\r\nHost: ";
     while (*req) tls_req_buf[rlen++] = *req++;
     for (i = 0; tls_host[i]; i++) tls_req_buf[rlen++] = tls_host[i];
-    req = "\r\nUser-Agent: okernel/0.4\r\nAccept: */*\r\nConnection: close\r\n\r\n";
+    req = net_accept_gzip
+        ? "\r\nUser-Agent: okernel/0.4\r\nAccept: */*\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n"
+        : "\r\nUser-Agent: okernel/0.4\r\nAccept: */*\r\nConnection: close\r\n\r\n";
     while (*req) tls_req_buf[rlen++] = *req++;
     tls_req_len = rlen;
 
@@ -228,7 +239,7 @@ void https_get_poll(void) {
     }
 
     if (tls_phase == HP_TCP) {
-        if (tcp_is_established()) {
+        if (!tls_fresh_conn && tcp_is_established()) {
             // Connection is up: run the TLS handshake exactly once.
             tls_state_init(&tls_s, tls_host, 443,
                            (const uint8_t*)tls_req_buf, tls_req_len,
@@ -249,7 +260,8 @@ void https_get_poll(void) {
         // the 2nd fetch just retransmits forever and the window stays black.
         // A SYN_SENT connection is owned by tcp_poll()'s retransmit timer: send
         // the SYN once here, then let that timer ride until ESTABLISHED.
-        if (tcp_conn_state() != TCP_STATE_SYN_SENT) {
+        if (tls_fresh_conn || tcp_conn_state() != TCP_STATE_SYN_SENT) {
+            tls_fresh_conn = 0;
             tls_conn_attempts++;
             if (tls_conn_attempts > TLS_MAX_CONN_ATTEMPTS) {
                 // Unreachable after several SYN attempts: abandon so the okai
@@ -269,6 +281,24 @@ void https_get_poll(void) {
 
     if (tls_phase == HP_TLS) {
         int r = tls_state_step(&tls_s, &tls_io);
+        // Stop at the end of the HTTP message, like curl and browsers: once
+        // the AUTHENTICATED plaintext so far is complete by HTTP framing
+        // (Content-Length reached / terminal chunk seen), nothing after it
+        // belongs to the response. Reading on to the close made every fetch
+        // hostage to the trailing records — www.google.com's final record
+        // fails AEAD on this path (OpenSSL agrees: bad_record_mac, both
+        // GCM and ChaCha20), which aborted fully-received pages as MAC
+        // failures. tls_s.out only ever holds verified plaintext, so this
+        // cannot accept forged bytes; the okai-side completeness gate sees
+        // COMPLETE either way.
+        if (r == TLS_STEP_AGAIN && tls_s.phase == TLS_PH_RECV_BODY &&
+            tls_s.out_len != tls_seen_len) {
+            tls_seen_len = tls_s.out_len;
+            if (tls_response_complete((const uint8_t*)tls_response, tls_s.out_len) == TLS_RESP_COMPLETE) {
+                serial_puts("[tls-net] HTTP message complete, not waiting for close\n");
+                r = TLS_STEP_DONE;
+            }
+        }
         if (r == TLS_STEP_DONE) {
             tls_response_len = tls_s.out_len;
             tls_response[tls_s.out_len] = 0;

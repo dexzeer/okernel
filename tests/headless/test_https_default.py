@@ -16,7 +16,7 @@ from okvm import OkVM
 vm = OkVM("httpsdefault")
 time.sleep(14)
 print("booted; typing okai example.com", flush=True)
-vm.type_string("okai http://example.com/\n")
+vm.type_string("okai example.com\n")  # bare host: okai defaults to https://
 
 # 1) The page must be fetched + parsed over HTTPS (desktop TLS branch prints
 #    "[br] https parse: count="). Proves the bare host was upgraded to

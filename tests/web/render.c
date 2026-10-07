@@ -76,6 +76,29 @@ int main(int argc, char** argv) {
     double t2 = now_ms();
     wdoc_update(d);
     double t3 = now_ms();
+    // WR_DUMP_TAG=figure: print the laid-out boxes of every <tag> element
+    // and its ancestors (layout debugging against Edge).
+    if (getenv("WR_DUMP_TAG")) {
+        struct wdom* dom = wdoc_dom(d);
+        const char* tg = getenv("WR_DUMP_TAG");
+        int shown = 0;
+        for (int n = dom->n[0].first; n >= 0 && shown < 12; n = wdom_next(dom, n, 0)) {
+            int tl;
+            const char* t = dom->n[n].type == WN_ELEM ? wdom_tag_name(dom, n, &tl) : 0;
+            if (!t || tl != (int)strlen(tg) || memcmp(t, tg, tl)) continue;
+            shown++;
+            for (int p = n, k = 0; p > 0 && k < 8; p = dom->n[p].parent, k++) {
+                int x, y, w, h, pl;
+                const char* pt = wdom_tag_name(dom, p, &pl);
+                char cls[64] = "";
+                wdom_attr_copy(dom, p, A_class, cls, sizeof cls);
+                if (wdoc_node_rect(d, p, &x, &y, &w, &h))
+                    printf("%*s<%.*s class=%s> x=%d y=%d w=%d h=%d\n", k * 2, "", pl, pt, cls, x, y, w, h);
+                else
+                    printf("%*s<%.*s class=%s> (no box)\n", k * 2, "", pl, pt, cls);
+            }
+        }
+    }
     int dh = wdoc_height(d);
     int ph = dh < maxh ? dh : maxh;
     if (ph < vh) ph = vh;

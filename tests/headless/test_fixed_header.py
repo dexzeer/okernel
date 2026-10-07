@@ -17,12 +17,26 @@ header's first row tucks under the 96px pixel chrome (pre-existing
 chrome/content overlap affecting every page's row 0, so tracking uses
 rows 1+).
 
-Needs: local HTTP server on 127.0.0.1:18080 serving pos.html/control.html
-(see TESTING.md network notes; QEMU user-net must be up).
+Self-contained: writes the fixtures to ~/okvm/www-fixhdr and serves them on
+:18080 (QEMU user-net must be up).
 """
-import sys, os, time
+import sys, os, time, re, subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from okvm import OkVM
+from okvm import OkVM, OUTDIR
+
+WWW = os.path.join(OUTDIR, "www-fixhdr")
+os.makedirs(WWW, exist_ok=True)
+BODY = "".join("<div>Body line %d of the scrolling page</div>" % i for i in range(150))
+open(os.path.join(WWW, "control.html"), "w").write(
+    "<!doctype html><title>control</title><body style='font-size:20px'>" + BODY)
+open(os.path.join(WWW, "pos.html"), "w").write(
+    "<!doctype html><title>pos</title><body style='font-size:20px;padding-top:96px'>"
+    "<div style='position:fixed;top:0;left:0;right:0;background:#0000cc;color:#fff'>"
+    "<div style='height:32px'>header row 1</div><div style='height:32px'>header row 2</div>"
+    "<div style='height:32px;background:#cc0000'>header row 3</div></div>" + BODY)
+SRV = subprocess.Popen([sys.executable, "-m", "http.server", "18080", "--directory", WWW],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(1)
 
 BASE = "http://10.0.2.2:18080/"
 ROW_THRESH = 10
@@ -71,10 +85,17 @@ def is_red(R, G, B):
 
 
 def load(vm, page):
+    n = vm.serial().count("parse: count=")
     vm.type_string("g")  # focus address bar
     time.sleep(0.7)
     vm.type_string(BASE + page + "\n")
-    return vm.wait_for("parse: count=", timeout=90)
+    t0 = time.time()
+    while time.time() - t0 < 90:
+        if vm.serial().count("parse: count=") > n:
+            time.sleep(2)
+            return True
+        time.sleep(1)
+    return False
 
 
 def scroll12(vm):
@@ -136,6 +157,7 @@ if blue0:
 crash = "triple fault" in vm.serial()
 print("crash:", crash)
 vm.kill()
+SRV.terminate()
 if ok and not crash:
     print("FIXHDR PASS")
     sys.exit(0)

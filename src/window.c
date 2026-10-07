@@ -217,7 +217,7 @@ static void cell_blank(struct window* w, int idx) {
 // union one cell into the pending range. Callers must still set w->dirty=1
 // (all writers below do). Invariant: backbuffer == model everywhere outside
 // overlay/cursor pixels, so skipping unchanged cells is pixel-identical.
-static void window_mark_all(struct window* w) { w->pr_valid = 0; }
+static void window_mark_all(struct window* w) { w->pr_valid = 0; w->pxd_valid = 0; }
 static void window_mark_cell(struct window* w, int row, int col) {
     if (!w || row < 0 || col < 0 || row >= w->content_h || col >= w->content_w)
         return;
@@ -253,7 +253,7 @@ static void window_apply_metrics(struct window* w) {
     }
     w->cursor_x = 0; w->cursor_y = 0;
     w->scroll_off = 0; // resize reflows the grid — re-anchor at the live tail
-    w->dirty = 1; w->pr_valid = 0; needs_redraw = 1; // full repaint
+    w->dirty = 1; w->pr_valid = 0; w->pxd_valid = 0; needs_redraw = 1; // full repaint
 }
 
 int window_create(const char* title, int x, int y, int w, int h) {
@@ -268,7 +268,7 @@ int window_create(const char* title, int x, int y, int w, int h) {
             windows[i].text_fg_rgb = vga_to_rgb[15]; windows[i].text_bg_rgb = vga_to_rgb[0];
             windows[i].content_bg = WIN_BG;
             windows[i].content_bg_rgb = WIN_BG_RGB;
-            windows[i].dirty = 1; windows[i].pr_valid = 0; needs_redraw = 1; // full (slot reuse)
+            windows[i].dirty = 1; windows[i].pr_valid = 0; windows[i].pxd_valid = 0; windows[i].pix = 0; needs_redraw = 1; // full (slot reuse)
             sb_count[i] = 0; sb_next[i] = 0; windows[i].scroll_off = 0;
             int j = 0;
             while (title[j] && j < 31) { windows[i].title[j] = title[j]; j++; }
@@ -298,6 +298,7 @@ void window_destroy(int id) {
     if (windows[id].cell_bg) { kfree(windows[id].cell_bg); windows[id].cell_bg = 0; }
     if (windows[id].cell_attr) { kfree(windows[id].cell_attr); windows[id].cell_attr = 0; }
     windows[id].visible = 0;
+    windows[id].pix = 0; windows[id].pxd_valid = 0;
     // Backbuffer is persistent now: repair the freed region (wallpaper + icons +
     // any window behind) instead of relying on a full per-frame repaint.
     desktop_paint_rect_pub(windows[id].x, windows[id].y, windows[id].w, windows[id].h);
@@ -349,6 +350,36 @@ void window_set_no_titlebar(int id, int flag) {
     if (w->no_titlebar == flag) return;
     w->no_titlebar = flag;
     window_apply_metrics(w);
+}
+
+void window_set_pixels(int id, const uint32_t* px, int x, int y, int w, int h, int stride) {
+    if (id < 0 || id >= MAX_WINDOWS) return;
+    struct window* win = &windows[id];
+    win->pix = px;
+    win->pix_x = x; win->pix_y = y;
+    win->pix_w = w; win->pix_h = h;
+    win->pix_stride = stride;
+    win->pxd_valid = 0;
+    win->dirty = 1;
+    window_mark_all(win);
+}
+
+void window_dirty_pixels(int id, int x, int y, int w, int h) {
+    if (id < 0 || id >= MAX_WINDOWS) return;
+    struct window* win = &windows[id];
+    if (!win->pix || w <= 0 || h <= 0) return;
+    if (win->dirty && !win->pxd_valid) return; // full repaint already pending
+    if (win->pxd_valid) {
+        if (x < win->pxd_x0) win->pxd_x0 = x;
+        if (y < win->pxd_y0) win->pxd_y0 = y;
+        if (x + w > win->pxd_x1) win->pxd_x1 = x + w;
+        if (y + h > win->pxd_y1) win->pxd_y1 = y + h;
+    } else {
+        win->pxd_x0 = x; win->pxd_y0 = y;
+        win->pxd_x1 = x + w; win->pxd_y1 = y + h;
+        win->pxd_valid = 1;
+    }
+    win->dirty = 1;
 }
 
 void window_set_hide_cursor(int id, int flag) {
@@ -427,7 +458,7 @@ void window_resize(int id, int new_w, int new_h) {
     w->w = new_w; w->h = new_h;
     if (w->cursor_x >= ncw) w->cursor_x = ncw - 1;
     if (w->cursor_y >= nch) w->cursor_y = nch - 1;
-    w->dirty = 1; needs_redraw = 1;
+    w->dirty = 1; w->pxd_valid = 0; w->pr_valid = 0; needs_redraw = 1;
 }
 
 int window_check_resize_grip(int id, int mx, int my) {
@@ -539,7 +570,27 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
     int x1 = (cx + cw) < (rx + rw) ? (cx + cw) : (rx + rw);
     int y1 = (cy + ch) < (ry + rh) ? (cy + ch) : (ry + rh);
 
-    if (x0 < x1 && y0 < y1) {
+    if (x0 < x1 && y0 < y1 && w->pix) {
+        // Client pixel surface (okai page): blit the overlap, fill the rest
+        // of the content area (chrome band, slack) with the content bg.
+        int sx0 = cx + w->pix_x, sy0 = cy + w->pix_y;
+        int sx1 = sx0 + w->pix_w, sy1 = sy0 + w->pix_h;
+        if (sx1 > cx + cw) sx1 = cx + cw;
+        if (sy1 > cy + ch) sy1 = cy + ch;
+        int ix0 = x0 > sx0 ? x0 : sx0, iy0 = y0 > sy0 ? y0 : sy0;
+        int ix1 = x1 < sx1 ? x1 : sx1, iy1 = y1 < sy1 ? y1 : sy1;
+        if (ix0 >= ix1 || iy0 >= iy1) {
+            rect_fill(x0, y0, x1 - x0, y1 - y0, w->content_bg_rgb);
+        } else {
+            if (y0 < iy0) rect_fill(x0, y0, x1 - x0, iy0 - y0, w->content_bg_rgb);
+            if (iy1 < y1) rect_fill(x0, iy1, x1 - x0, y1 - iy1, w->content_bg_rgb);
+            if (x0 < ix0) rect_fill(x0, iy0, ix0 - x0, iy1 - iy0, w->content_bg_rgb);
+            if (ix1 < x1) rect_fill(ix1, iy0, x1 - ix1, iy1 - iy0, w->content_bg_rgb);
+            graphics_blit_pixels(ix0, iy0,
+                                 w->pix + (iy0 - sy0) * w->pix_stride + (ix0 - sx0),
+                                 ix1 - ix0, iy1 - iy0, w->pix_stride);
+        }
+    } else if (x0 < x1 && y0 < y1) {
         // Fill content background — essential: null chars (0x00) in the
         // buffer cause draw_char_scaled to bail early, leaving gaps.
         rect_fill(x0, y0, x1 - x0, y1 - y0, w->content_bg_rgb);
@@ -716,6 +767,15 @@ int window_draw(int id) {
     int cursor_live = (w->focused && w->content && !w->hide_cursor);
     int blink_changed = (cursor_live && blink != w->last_cursor_visible);
     if (!w->dirty && !blink_changed) return 0;
+    if (w->dirty && w->pix && w->pxd_valid) {
+        // Partial pixel-surface repaint (a focused form field, a scrolled band).
+        int title_off = w->no_titlebar ? 0 : WIN_TITLE_H;
+        int px = w->x + WIN_BORDER + w->pix_x + w->pxd_x0;
+        int py = w->y + WIN_BORDER + title_off + w->pix_y + w->pxd_y0;
+        window_paint_uncovered(id, px, py, w->pxd_x1 - w->pxd_x0, w->pxd_y1 - w->pxd_y0);
+        w->dirty = 0; w->pr_valid = 0; w->pxd_valid = 0; w->last_cursor_visible = blink;
+        return 1;
+    }
     if (w->dirty && w->pr_valid && !w->scroll_off && w->content) {
         // Partial repaint: only the marked cells + the cursor cell. Typing a
         // key repaints 1-3 cells instead of ~2000 — same pixels, ~1000x less.
@@ -764,7 +824,7 @@ int window_draw(int id) {
         return 1;
     }
     window_paint_uncovered(id, w->x, w->y, w->w, w->h);
-    w->dirty = 0; w->pr_valid = 0; w->last_cursor_visible = blink;
+    w->dirty = 0; w->pr_valid = 0; w->pxd_valid = 0; w->last_cursor_visible = blink;
     return 1;
 }
 

@@ -61,7 +61,8 @@ def main():
     if url and (not os.path.exists(ref) or '--fresh' in sys.argv):
         local = offline_copy(name, url)
         winlocal = subprocess.run(['wslpath', '-w', os.path.abspath(local)], capture_output=True, text=True).stdout.strip()
-        subprocess.run([EDGE, '--headless=new', '--disable-gpu', '--hide-scrollbars',
+        prof = subprocess.run(['wslpath', '-w', os.path.abspath(out + '/edgeprof')], capture_output=True, text=True).stdout.strip()
+        subprocess.run([EDGE, '--headless=new', '--disable-gpu', '--hide-scrollbars', '--user-data-dir=' + prof,
                         '--allow-file-access-from-files', '--blink-settings=scriptEnabled=false,preferredColorScheme=1',
                         '--window-size=%d,%d' % (w, h), '--screenshot=' + winref,
                         'file:///' + winlocal.replace('\\', '/')],

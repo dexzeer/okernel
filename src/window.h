@@ -79,6 +79,15 @@ struct window {
     int red_chrome;  // anarchy terminal chrome: flat red title bar + border,
                      // centered title, square black buttons. Set explicitly
                      // per window (reset in window_create against slot reuse).
+    // Client pixel surface (okai page): when set, the content area paints
+    // these pixels instead of the cell grid. Placed at (pix_x, pix_y)
+    // relative to the content origin; the rest of the content area gets
+    // content_bg_rgb. Owned by the client (never freed here).
+    const uint32_t* pix;
+    int pix_x, pix_y, pix_w, pix_h, pix_stride;
+    // Partial pixel repaint (surface coords, inclusive-exclusive); valid only
+    // while dirty is set and no full repaint is pending.
+    int pxd_valid, pxd_x0, pxd_y0, pxd_x1, pxd_y1;
 };
 
 void window_init(void);
@@ -112,6 +121,10 @@ void window_set_minimize_button(int id, int has_min);
 void window_set_red_chrome(int id, int flag); // flat-red anarchy terminal chrome
 void window_set_no_titlebar(int id, int flag);
 void window_set_hide_cursor(int id, int flag);
+// Attach (px != NULL) or detach a client pixel surface; marks the window dirty.
+void window_set_pixels(int id, const uint32_t* px, int x, int y, int w, int h, int stride);
+// Repaint only a sub-rect of the pixel surface (surface coordinates).
+void window_dirty_pixels(int id, int x, int y, int w, int h);
 int window_check_close_click(int id, int mx, int my);
 int window_check_minimize_click(int id, int mx, int my);
 void window_minimize(int id);

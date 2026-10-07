@@ -86,9 +86,6 @@ static int info_win = -1;
 uint32_t tick_count = 0;
 int needs_redraw = 1; // Global flag: wallpaper + windows need full redraw
 
-// Scratch for inline <style> extraction (both fetch paths share it;
-// only live during parse).
-static char inline_css_scratch[INLINE_CSS_SCRATCH];
 // FPS tracking
 static uint32_t frame_count = 0;
 static uint32_t fps = 0;
@@ -2160,6 +2157,7 @@ void kernel_main(uint32_t mboot_phys) {
                                 // click inside the window dismisses it first.
                                 if (okai_lock_hit(br_id, mx, my)) {
                                     ok->show_security = !ok->show_security;
+                                    serial_printf("[okai] security popup %s\n", ok->show_security ? "open" : "closed");
                                     ok->chrome_dirty = 1;
                                     needs_redraw = 1;
                                     clicked = 1;
@@ -2213,7 +2211,7 @@ void kernel_main(uint32_t mboot_phys) {
                                     ok->addr_bar_focused = 1;
                                     ok->addr_input_len = 0;
                                     ok->addr_input[0] = 0;
-                                    okai_render_content(br_id2);
+                                    ok->chrome_dirty = 1;
                                 }
                             } else {
                                 drag_win = i;
@@ -2221,46 +2219,11 @@ void kernel_main(uint32_t mboot_phys) {
                                 drag_off_y = my - w->y;
                             }
                         }
-                        // Okai content → hit-test clickable links.
-                        else if (mx >= w->x + WIN_BORDER && mx < w->x + w->w - WIN_BORDER &&
-                                 my >= grid_top &&
-                                 my < w->y + w->h - WIN_BORDER) {
+                        // Okai page area → pixel hit test (links, form
+                        // controls) against the engine's layout.
+                        else {
                             int br_id = okai_find_by_win(i);
-                            if (br_id >= 0) {
-                                struct okai* ok = okai_get(br_id);
-                                struct okai_tab* T = ok ? okai_tab_of(ok) : 0;
-                                if (ok && T->link_count > 0) {
-                                    int ox = w->x + WIN_BORDER;
-                                    int cw = CONTENT_GW * w->font_scale;
-                                    int chh = CONTENT_GH * w->font_scale;
-                                    int col = (mx - ox) / cw;
-                                    int row = (my - grid_top) / chh;
-                                    serial_printf("[okai] click row=%d col=%d (mx=%d my=%d) links=%d\n",
-                                                  row, col, mx, my, T->link_count);
-                                    for (int li = 0; li < T->link_count; li++) {
-                                        // Multi-row spans (wrapped links):
-                                        // first row from col0, last row to
-                                        // col1, middle rows full width.
-                                        int r0 = T->links[li].row;
-                                        int r1 = T->links[li].end_row;
-                                        if (r1 < r0) r1 = r0;
-                                        if (row < r0 || row > r1) continue;
-                                        if (row == r0 && col < T->links[li].col0)
-                                            continue;
-                                        if (row == r1 && col > T->links[li].col1)
-                                            continue;
-                                        {
-                                            serial_printf("[okai] LINK HIT li=%d -> %s\n",
-                                                          li, T->links[li].href);
-                                            // Links navigate the CURRENT tab
-                                            // in place — one browser window,
-                                            // tabs instead of window sprawl.
-                                            okai_navigate(br_id, T->links[li].href);
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
+                            if (br_id >= 0) okai_content_click(br_id, mx, my);
                         }
                         clicked = 1;
                         break;
@@ -2288,310 +2251,10 @@ void kernel_main(uint32_t mboot_phys) {
         // Check for pending HTTP responses to save
         check_save_http_response();
 
-        // Drive okai fetches. The network stack services a SINGLE global TCP
-        // connection + response buffer, so only one fetch may be in flight at a
-        // time. It is attributed to okai_fetch_owner; windows with token_count==0
-        // are pending and are started in turn (lowest id first). Serializing this
-        // way stops concurrent/mixed-protocol windows from corrupting the shared
-        // TLS/TCP state (which froze the desktop) or mis-routing each other's
-        // response bytes into the wrong buffer (which left windows blank).
-        if (okai_fetch_owner >= 0) {
-            int bi = okai_fetch_owner;
-            struct okai* ok = okai_get(bi);
-            struct okai_tab* T = ok ? okai_tab_of(ok) : 0;
-            if (!ok) {
-                okai_fetch_owner = -1;
-            } else if (T->sub_res_phase > 0) {
-            // Sub-resource fetch in progress
-            if (T->is_https) {
-                if (tls_is_done()) {
-                    int resp_len = tls_get_response_len();
-                    char* resp = tls_get_response();
-                    if (resp && resp_len > 0) {
-                        // Same truncation gate as the main fetch: never
-                        // feed a cut sub-resource (CSS/JS) to the parsers.
-                        // Skipped (not failed) — the page renders without
-                        // it, which is availability-safe either way.
-                        if (!tls_saw_close_notify() &&
-                            tls_response_complete((const uint8_t*)resp,
-                                                  (uint32_t)resp_len) == TLS_RESP_SHORT) {
-                            serial_puts("[okai] TLS sub-resource truncated, skipping\n");
-                        } else {
-                            okai_sub_res_done(bi, resp, resp_len);
-                        }
-                    }
-                    if (okai_start_sub_res_fetch(bi) != 0) {
-                        // Queue drained: re-render only if a stylesheet
-                        // landed (JS-only completions change nothing and the
-                        // main render already painted).
-                        if (T->sub_res_css_changed) {
-                            T->sub_res_css_changed = 0;
-                            okai_render_content(bi);
-                        }
-                        okai_fetch_owner = -1;
-                    }
-                } else if (!tls_is_active() && !tls_is_done()) {
-                    T->sub_res_idx++;
-                    if (okai_start_sub_res_fetch(bi) != 0) {
-                        if (T->sub_res_css_changed) {
-                            T->sub_res_css_changed = 0;
-                            okai_render_content(bi);
-                        }
-                        okai_fetch_owner = -1;
-                    }
-                }
-            } else {
-                int resp_len = http_get_response_len();
-                int done = http_is_done();
-                if (done && resp_len > 0) {
-                    char* resp = http_get_response();
-                    if (resp) okai_sub_res_done(bi, resp, resp_len);
-                    if (okai_start_sub_res_fetch(bi) != 0) {
-                        if (T->sub_res_css_changed) {
-                            T->sub_res_css_changed = 0;
-                            okai_render_content(bi);
-                        }
-                        okai_fetch_owner = -1;
-                    }
-                } else if (!http_is_pending() && !http_is_retry_pending() && !http_is_done()) {
-                    T->sub_res_idx++;
-                    if (okai_start_sub_res_fetch(bi) != 0) {
-                        if (T->sub_res_css_changed) {
-                            T->sub_res_css_changed = 0;
-                            okai_render_content(bi);
-                        }
-                        okai_fetch_owner = -1;
-                    }
-                }
-            }
-            } else if (T->is_https) {
-                if (tls_is_done()) {
-                    int resp_len = tls_get_response_len();
-                    char* resp = tls_get_response();
-                    if (resp && resp_len > 0) {
-                        // Truncation integrity (cryptoholes #1): without an
-                        // authenticated close_notify, HTTP framing must
-                        // prove the message complete. SHORT = attacker-cut
-                        // stream: no render, no HTTP fallback (same bucket
-                        // as cert failures). UNKNOWN (close-delimited, no
-                        // length signal) accepts per curl-parity — that
-                        // ambiguity is inherent to HTTP, not our bug.
-                        if (!tls_saw_close_notify() &&
-                            tls_response_complete((const uint8_t*)resp,
-                                                  (uint32_t)resp_len) == TLS_RESP_SHORT) {
-                            serial_printf("[okai] TLS response truncated for %s, no HTTP fallback\n",
-                                          T->url);
-                            T->truncated = 1;
-                            okai_fetch_owner = -1;
-                            T->token_count = -1;
-                            T->last_resp_len = 0;
-                            okai_render_content(bi); // show TRUNCATED warning
-                        } else if (okai_check_redirect(bi, resp, resp_len)) {
-                            // 3xx followed; owner stays bi, new fetch issued
-                        } else {
-                            resp_len = http_dechunk(resp, resp_len);
-                            int css_len = html_extract_css(resp, resp_len,
-                                                           inline_css_scratch, INLINE_CSS_SCRATCH);
-                            T->css_n = css_parse(inline_css_scratch, css_len,
-                                                  T->css_rules, CSS_MAX_RULES);
-                            serial_printf("[br] css rules=%d\n", T->css_n);
-                            serial_puts("[br] css text (first 200): ");
-                            for (int ci = 0; ci < 200 && inline_css_scratch[ci]; ci++)
-                                serial_putchar(inline_css_scratch[ci]);
-                            serial_putchar('\n');
-                            int count = html_parse(resp, resp_len,
-                                                  T->tokens, OKAI_TAB_TOKENS);
-                            dom_build(&T->dom, resp, resp_len);
-                            serial_printf("[br] https parse: count=%d len=%d dom_nodes=%d\n",
-                                          count, resp_len, T->dom.node_count);
-                            T->token_count = count > 0 ? count : -1;
-                            html_get_title(resp, resp_len, T->title, 64);
-                            T->last_resp_len = resp_len;
-                            // Queue external <link rel=stylesheet>/<script src>
-                            // so the page completes with its real styling (the
-                            // desktop loop fetches them sequentially and
-                            // re-renders after each external CSS).
-                            okai_queue_sub_resources(bi, resp, resp_len);
-                            okai_render_content(bi);
-                            window_set_title(ok->win_id,
-                                             T->title[0] ? T->title : "okai");
-                            // Keep ownership when external resources were
-                            // queued: the sub_res_phase branch below only runs
-                            // while okai_fetch_owner >= 0, so clearing it here
-                            // would strand the queued stylesheets forever.
-                            // Kick the FIRST sub-resource fetch now:
-                            // start_sub_res_fetch resets the HTTP/TLS response
-                            // state, so without this kick the sub_res branch
-                            // below fires immediately on the STALE main-page
-                            // done/length and eats the first queued entry.
-                            if (T->sub_res_phase > 0) {
-                                okai_fetch_owner = bi;
-                                if (okai_start_sub_res_fetch(bi) != 0) {
-                                    okai_render_content(bi);
-                                    okai_fetch_owner = -1;
-                                }
-                            } else {
-                                okai_fetch_owner = -1;
-                            }
-                        }
-                    }
-                } else if (!tls_is_active() && !tls_is_done()) {
-                    // Fetch gave up. Classify: certificate failures AND
-                    // secure-channel failures MUST NOT fall back to plain
-                    // HTTP — a MITM can force that downgrade by killing the
-                    // handshake. Only transport failures (timeout /
-                    // unreachable / no A record) downgrade. Cert problems
-                    // render the SECURITY WARNING; everything else (protocol
-                    // error, oversized page) renders a connection error —
-                    // never the cert warning (mislabeling trains users to
-                    // click through real warnings).
-                    int fr = tls_get_fail_reason();
-                    int cert_fail = (fr == TLS_FAIL_CERT ||
-                                     fr == TLS_FAIL_HOSTNAME);
-                    int conn_fail = (fr == TLS_FAIL_PROTO ||
-                                     fr == TLS_FAIL_MAC ||
-                                     fr == TLS_FAIL_ALERT ||
-                                     fr == TLS_FAIL_RNG ||
-                                     fr == TLS_FAIL_OVERFLOW);
-                    if (cert_fail) {
-                        serial_printf("[okai] TLS cert failure (reason=%d), no HTTP fallback for %s\n",
-                                      fr, T->url);
-                        T->cert_failed = 1;
-                        T->cert_detail = tls_get_fail_detail();
-                        okai_fetch_owner = -1;
-                        T->token_count = -1;
-                        T->last_resp_len = 0;
-                        okai_render_content(bi); // show SECURITY WARNING page
-                    } else if (conn_fail) {
-                        // Resumption fallback first: if the server aborted
-                        // our PSK resumption, retry once with a full
-                        // handshake (same origin, not a downgrade). Only
-                        // when that also fails do we show the error page.
-                        if (okai_resumption_fallback(bi, fr) == 0) {
-                            serial_printf("[okai] resumption retry in flight for %s\n", T->url);
-                        } else {
-                            serial_printf("[okai] TLS connection failure (reason=%d), no HTTP fallback for %s\n",
-                                          fr, T->url);
-                            T->conn_failed = 1;
-                            T->conn_kind = (fr == TLS_FAIL_OVERFLOW)
-                                               ? OKAI_CONN_TOOLARGE
-                                               : OKAI_CONN_PROTO;
-                            okai_fetch_owner = -1;
-                            T->token_count = -1;
-                            T->last_resp_len = 0;
-                            okai_render_content(bi); // show CONNECTION ERROR page
-                        }
-                    } else if (okai_fallback_http(bi) == 0) {
-                        serial_printf("[okai] http fallback in flight for %s\n", T->url);
-                    } else {
-                        okai_fetch_owner = -1;
-                        T->token_count = -1;
-                        T->last_resp_len = 0;
-                        okai_render_content(bi); // show "Unable to load" page
-                    }
-                }
-            } else {
-                int resp_len = http_get_response_len();
-                int done = http_is_done();
-                if (done && resp_len > 0) {
-                    char* resp = http_get_response();
-                    if (resp && okai_check_redirect(bi, resp, resp_len)) {
-                        // 3xx followed; owner stays bi
-                    } else if (resp) {
-                        resp_len = http_dechunk(resp, resp_len);
-                        int css_len = html_extract_css(resp, resp_len,
-                                                       inline_css_scratch, INLINE_CSS_SCRATCH);
-                        T->css_n = css_parse(inline_css_scratch, css_len,
-                                              T->css_rules, CSS_MAX_RULES);
-                        serial_printf("[br] css rules=%d\n", T->css_n);
-                        serial_puts("[br] css text (first 200): ");
-                        for (int ci = 0; ci < 200 && inline_css_scratch[ci]; ci++)
-                            serial_putchar(inline_css_scratch[ci]);
-                        serial_putchar('\n');
-                        int count = html_parse(resp, resp_len,
-                                               T->tokens, OKAI_TAB_TOKENS);
-                        dom_build(&T->dom, resp, resp_len);
-                        serial_printf("[br] parse: count=%d len=%d dom_nodes=%d\n",
-                                      count, resp_len, T->dom.node_count);
-                        // -1 sentinel: "parsed, nothing renderable" — keeps this
-                        // block from re-parsing every frame on empty pages
-                        T->token_count = count > 0 ? count : -1;
-                        html_get_title(resp, resp_len, T->title, 64);
-                        T->last_resp_len = resp_len;
-                        // Queue external stylesheets/scripts (same as the
-                        // HTTPS path) so http pages get their real styling.
-                        okai_queue_sub_resources(bi, resp, resp_len);
-                        okai_render_content(bi);
-                        window_set_title(ok->win_id,
-                                         T->title[0] ? T->title : "okai");
-                        // Same kick as the HTTPS path above: fire the first
-                        // sub-resource fetch now (resets response state; a
-                        // stale done/length would otherwise eat queue entry 0).
-                        if (T->sub_res_phase > 0) {
-                            okai_fetch_owner = bi;
-                            if (okai_start_sub_res_fetch(bi) != 0) {
-                                okai_render_content(bi);
-                                okai_fetch_owner = -1;
-                            }
-                        } else {
-                            okai_fetch_owner = -1;
-                        }
-                    }
-                } else if (!http_is_pending() && !http_is_retry_pending() && !http_is_done()) {
-                    // Fetch gave up (connection closed with no data / unreachable)
-                    okai_fetch_owner = -1;
-                    T->token_count = -1;
-                    T->last_resp_len = 0;
-                    okai_render_content(bi); // show "Unable to load" page
-                }
-            }
-        } else {
-            // No fetch in flight: start the lowest-index window still needing one.
-            for (int bi = 0; bi < MAX_OKAIS; bi++) {
-                struct okai* ok = okai_get(bi);
-                struct okai_tab* T = ok ? okai_tab_of(ok) : 0;
-                if (ok && T->token_count == 0) {
-                    if (okai_start_fetch(bi) == 0)
-                        okai_fetch_owner = bi; // only claim ownership if a fetch fired
-                    break;
-                }
-            }
-        }
-
-        // Fetch-status erase hook (companion to okai_draw_fetch_status):
-        // the progress pill is a pixel overlay, so when a fetch ends
-        // WITHOUT a repaint (JS-only subres drain, error pages drawn with
-        // window_puts), one content blit wipes its pixels. Successful
-        // fetches re-render anyway; the extra blit there is harmless.
-        {
-            static int st_active = 0;
-            static int st_bi = -1;
-            int cur_bi = -1;
-            long cur_rx = -1;
-            if (okai_fetch_owner >= 0) {
-                struct okai* sok = okai_get(okai_fetch_owner);
-                struct okai_tab* ST = sok ? okai_tab_of(sok) : 0;
-                if (sok && ST) {
-                    if (ST->is_https) {
-                        if (tls_is_active() && !tls_is_done()) {
-                            cur_bi = okai_fetch_owner;
-                            cur_rx = tls_get_progress_len();
-                        }
-                    } else if (!http_is_done() &&
-                               (http_is_pending() || http_is_retry_pending())) {
-                        cur_bi = okai_fetch_owner;
-                        cur_rx = http_get_response_len();
-                    }
-                }
-            }
-            if (cur_rx >= 0) { st_active = 1; st_bi = cur_bi; }
-            else if (st_active) {
-                st_active = 0;
-                int pb = st_bi; st_bi = -1;
-                struct okai* pok = (pb >= 0) ? okai_get(pb) : 0;
-                if (pok) okai_blit_content(pb);
-            }
-        }
+        // Drive okai: main-document + sub-resource fetches over the single
+        // global connection (okai_fetch_owner), coalesced page renders, and
+        // the fetch-pill erase. See okai_poll().
+        okai_poll();
 
         // Check if JS DOM mutations require a re-render
         if (js_dom_is_rerender_needed()) {

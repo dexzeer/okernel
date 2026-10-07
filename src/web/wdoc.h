@@ -55,6 +55,20 @@ struct wdom* wdoc_dom(struct wdoc* d);
 void wdoc_invalidate(struct wdoc* d);
 // Document y (px) of an element with id/name (fragment navigation), -1 if none.
 int  wdoc_anchor_y(struct wdoc* d, const char* frag);
+// Stylesheets not yet delivered (gate the first paint).
+int  wdoc_pending_css(struct wdoc* d);
+// 1 if any painted content is position:fixed (scroll must repaint fully).
+int  wdoc_has_fixed(struct wdoc* d);
+// Border box of a node in document px; 0 if it has no box.
+int  wdoc_node_rect(struct wdoc* d, int node, int* x, int* y, int* w, int* h);
+// Hit regions (links, controls) of the current layout, document px.
+struct wdoc_region {
+    int kind, node, fixed;
+    int x, y, w, h;
+    char href[512];
+};
+int  wdoc_hit_count(struct wdoc* d);
+int  wdoc_hit_get(struct wdoc* d, int i, struct wdoc_region* out);
 // Diagnostics.
 void wdoc_stats(struct wdoc* d, char* out, int cap);
 

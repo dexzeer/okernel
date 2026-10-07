@@ -113,6 +113,10 @@ void graphics_clip_reset(void);
 // Direct backbuffer write
 void graphics_write_pixel(int x, int y, uint32_t color);
 
+// Copy a w x h block of opaque XRGB pixels (row stride in pixels) to (x, y),
+// honoring the clip rect.
+void graphics_blit_pixels(int x, int y, const uint32_t* src, int w, int h, int stride);
+
 // Move a rectangle within the backbuffer by (dx, dy) — used by window
 // dragging so unchanged window pixels are copied instead of re-rendered
 void graphics_blit_rect(int sx, int sy, int w, int h, int dx, int dy);

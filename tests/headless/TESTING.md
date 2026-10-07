@@ -25,7 +25,7 @@ Never guess system state from screenshots alone. The kernel prints every network
 
 **Method: reproduce the bug, read the serial log, and find the FIRST line where the working case and the broken case diverge.** That divergence point is usually within 10 lines of the root cause. (The stale-tail DNS bug was found exactly this way: fetch 1's log had "DNS resolved, opening TCP:443", fetch 2's log just... stopped after "resolved".)
 
-If the serial log doesn't tell you what you need — **add instrumentation**. The kernel already has `serial_printf()`; it's a 2-line change and a rebuild (HANDOFF.md says builds take seconds). The `[okai] click row=.. col=..` lines in desktop.c exist precisely because pixel-guessing wasn't working. Instrument, rebuild, re-run.
+If the serial log doesn't tell you what you need — **add instrumentation**. The kernel already has `serial_printf()`; it's a 2-line change and a rebuild (HANDOFF.md says builds take seconds). The `[okai] click x=.. y=..` lines in okai.c exist precisely because pixel-guessing wasn't working. Instrument, rebuild, re-run.
 
 ## 1. The QEMU harness
 
@@ -142,48 +142,52 @@ This is the hardest part of GUI testing here. The facts:
 
 **Solution: forget where the cursor IS. Ask the kernel where the click LANDED.**
 
-The kernel (desktop.c, this is already merged) prints for EVERY click inside an okai content area:
+The kernel prints, for EVERY click inside an okai page (page px, relative to the page origin below the 96px chrome):
 
 ```
-[okai] click row=13 col=2 (mx=49 my=266) links=1
+[okai] click x=958 y=442 (mx=960 my=540) hit=1 node=39
+[okai] LINK HIT -> http://example.com/
 ```
 
-and for every rendered link (okai.c):
+and after each page's first render, its link / form-control regions in view (same coordinates):
 
 ```
-[okai] link[0] row=13 col0=0 col1=11 href=https://iana.org/domains/example
-[okai] LINK HIT li=0 -> https://iana.org/domains/example
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 80ms (page origin 2,98) stack=13KB
+[okai] link[0] x=368 y=276 w=379 h=102 href=http://example.com/
+[okai] field[2] x=26 y=128 w=216 h=28 node=19 btn=0
 ```
 
-So clicking a link becomes a feedback-control loop (this is `okvm.py click_link()`):
+So clicking becomes a feedback-control loop (`okvm.py`):
 
 ```
-loop up to 12 times:
-    click (mouse_button 1, then mouse_button 0)
-    parse the LAST `[okai] click ...` line from serial  ← exact ground truth
-    if row/col inside the link region → done, check for LINK HIT line
-    else: burst-correct toward the target and repeat
+vm.click_link("example.com")      # first link region whose href contains it
+vm.click_at(page_x, page_y, done=lambda log: ...)
+vm.click_screen(x, y, r"nav action=5")   # chrome: tabs, toolbar, lock (reads [mse] btn=1)
 ```
 
-Movement correction uses **bursts**: send the same delta 5× so the smoothing ring fills with it (net displacement ≈ 3.75 × delta). Empirically: `burst(-30,0)×5` moved the cursor −90px; single `mouse_move -150` also moved ≈ −88px. Correct in ~3px/step units, iterate. Convergence took 4–5 attempts reliably.
+Each one first dead-reckons the cursor toward the target (`premove`, so the probe click never lands on whatever link sits under the cursor), then: click → parse the LAST logged position → burst-correct → repeat until the expected log line appears.
 
-If you need to click something that is NOT an okai link (taskbar, close button), use the same loop but read the cursor position from screendump diffs: dump → `mouse_move 12 0` ×5 → dump → changed-pixel clusters ≈ 12×16 in the second dump = the new cursor position (white-core filter kills the blinking-caret false positive).
+Movement correction uses **bursts**: send the same delta 5× so the smoothing ring fills with it (net displacement ≈ 4.8 × delta). Correct in small steps and iterate; convergence takes 2–5 clicks.
+
+Chrome geometry (okai opens maximized at (0,0), border 2, no title bar): tab strip y 2..40 (tab i at x 6+302i, 300 wide, x-box centered at +290; '+' right after the last tab), toolbar y 40..98 (back/fwd/reload/home centers x 25/63/101/139 at y 69; address bar from x 172; lock hit box x 174..194, y 48..68), page from (2, 98).
 
 ## 7. Host-side unit tests (fast, no QEMU)
 
-The kernel's parser code is plain C — compile and test it ON THE HOST against real captured data:
+The web engine (`src/web`) is plain C and builds unchanged on the host — debug rendering there, not in QEMU:
 
 ```bash
-gcc -O1 -o /tmp/htest tests/test_html_google.c src/html.c src/serial.c -Isrc -include string.h
-./tmp/htest downloaded_page.html
+make web-tests                                   # CSS unit tests, font tests, builds build-host/wrender
+python3 tools/fetch_corpus.py                    # real-site corpus into tests/web/corpus/ (gitignored)
+./build-host/wrender wikipedia_os 1916 936 out.ppm 4000
+python3 tests/web/compare.py wikipedia_os 1916 936 --fresh   # side-by-side vs headless Edge
+WR_DUMP_TAG=figure ./build-host/wrender wikipedia_os 1916 936 out.ppm 100   # boxes of <figure> + ancestors
+SAN="-fsanitize=address,undefined" OPT=-O1 sh tests/web/build.sh            # ASan/UBSan renderer
+python3 tests/web/html5_diff.py ; python3 tests/web/image_diff.py           # parser vs html5lib, decoders vs PIL
 ```
 
-This found the google.com bugs in minutes: "parsed 21 tokens from an 85KB page" and "LINK '&#1055;&#1086;...'" pointed straight at truncation and missing entity decode. Steps:
-1. `curl -H 'User-Agent: okernel/0.4' -A ... -o page.html http://site/` — capture EXACTLY what the server sends our UA (google serves a Russian page to this IP; UA matters).
-2. Run the kernel's parser on it, dump tokens.
-3. Compare token count/content to expectations; a healthy page yields headings+text+links, a broken parse yields header links only.
+To capture what a server sends OUR client: `curl -H 'User-Agent: okernel/0.4' -H 'Accept-Encoding: gzip' ...` (google serves a localized page to this IP; UA matters). To reproduce a layout bug, cut the page down in a corpus directory and bisect (styles vs structure vs classes) until one rule remains — that is how the Wikipedia thumbnail bug (percentage `max-width` on a replaced element) was found.
 
-Existing host tests (run these after ANY change): `tests/test_css.c` (link with `../src/css.c ../src/html.c ../src/serial.c`), `test_sha256`, `test_tls_crypto`. A test that fails to LINK is a broken test command, not a code failure — check `undefined reference` before concluding anything.
+Crypto/TLS host suites: `make host-tests` (also runs `web-tests`). A test that fails to LINK is a broken test command, not a code failure — check `undefined reference` before concluding anything.
 
 ## 8. Root-cause discipline (how the bugs were actually found)
 
@@ -197,17 +201,18 @@ Existing host tests (run these after ANY change): `tests/test_css.c` (link with 
 
 ```
 1. make desktop && make text        — both build, zero NEW warnings in edited files
-2. Host unit tests: test_css, test_sha256, test_tls_crypto
-3. tests/headless/test_link_click.py — link click → new window → fetch → render
-4. tests/headless/test_errors.py     — empty-host refusal, NXDOMAIN abort, error
-                                        page pixels, owner RELEASED (recovery works)
-5. tests/headless/test_google.py     — redirect + 85KB chunked + white bg + ≥40 tokens
-   (needs internet; skip with a note if offline)
-6. Regression: example.com still loads (it's the canary — smallest page, any
-   buffer/buffering change that breaks IT is fatal)
+2. make web-tests (+ the corpus under ASan if you touched src/web)
+3. python3 tests/headless/run_suite.py -j3 test_okai_interact.py test_links.py test_nav.py \
+       test_tab_x.py test_errors.py test_addrbar.py test_lock.py test_stale_doc.py \
+       test_fixed_header.py test_https_default.py test_certfail.py test_boot_mem.py
+4. Network (needs internet): test_google_search.py, test_resume.py, test_pki_qemu.py,
+   test_firstrender.py, and `test_okai_page.py https://en.wikipedia.org/wiki/Operating_system wiki --scroll 3`
+5. Regression: example.com still loads (the canary)
 ```
 
-Each headless test: boots QEMU (~15s), drives the scenario, prints `VERDICT: PASS/FAIL`, exits non-zero on fail. Verdicts come from the serial log + pixel counts, never vibes.
+Each headless test boots QEMU (~25s), drives the scenario, prints PASS/FAIL, exits non-zero on fail. Verdicts come from the serial log (+ pixel counts where the log can't say), never vibes.
+
+**`wait_for` matches any EARLIER occurrence.** "Did the second page load?" must count `parse: count=` lines before and after, not `wait_for("parse: count=")` — several old tests raced exactly this way.
 
 ## 10. Environment gotchas that actually bit
 
@@ -225,7 +230,7 @@ sys.path.insert(0, 'tests/headless')
 from okvm import OkVM
 
 vm = OkVM("quick")            # boots headless QEMU
-time.sleep(14)
+vm.wait_for("[mem] heap", timeout=40); time.sleep(10)
 vm.type_string("okai https://example.com/\n")
 ok = vm.wait_for("https parse: count=", timeout=70)
 w, h, px = vm.dump()          # screenshot

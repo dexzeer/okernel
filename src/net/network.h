@@ -123,6 +123,9 @@ int http_is_pending(void);
 int http_is_done(void);
 int http_is_retry_pending(void);
 void http_reset_conn_attempts(void);
+// Accept-Encoding: gzip opt-in, latched per request (okai decodes bodies;
+// raw saves leave it 0 so files land uncompressed).
+extern int net_accept_gzip;
 int http_dechunk(char* buf, int len);
 
 // TCP retransmission timer — called from net_poll, exported for tests

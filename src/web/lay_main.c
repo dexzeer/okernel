@@ -231,7 +231,12 @@ void fl_place(struct wlayout* L, int bi, int32_t cb_left, int32_t cb_right, int3
 
 // ---- replaced sizing --------------------------------------------------------------
 
+// cbw < 0: indefinite containing block (intrinsic sizing) — percentage
+// width / min-width / max-width then behave as auto / none (CSS Sizing 3
+// section 5.2.1c); the caller zeroes the min-content contribution instead.
 static void replaced_size(struct wlayout* L, int bi, int32_t cbw, int32_t* cw, int32_t* ch) {
+    int indef = cbw < 0;
+    if (indef) cbw = 0;
     struct lbox* b = &L->b[bi];
     const struct wstyle* s = b->st;
     struct wfmetrics fm;
@@ -337,7 +342,7 @@ static void replaced_size(struct wlayout* L, int bi, int32_t cbw, int32_t* cw, i
     int32_t box_extra_h = b->p[0] + b->p[2] + b->b[0] + b->b[2];
     int bb = s->box_sizing == BX_BORDER;
     int32_t W = -1, H = -1;
-    if (s->width.t == WL_LEN) {
+    if (s->width.t == WL_LEN && !(indef && s->width.pct)) {
         W = wl_resolve(s->width, cbw, 0);
         if (bb) W -= box_extra_w;
         if (W < 0) W = 0;
@@ -356,11 +361,11 @@ static void replaced_size(struct wlayout* L, int bi, int32_t cbw, int32_t* cw, i
         H = ratio ? w_muldiv(W, 1000, ratio) : ih;
     }
     // min/max
-    if (s->max_w.t == WL_LEN) {
+    if (s->max_w.t == WL_LEN && !(indef && s->max_w.pct)) {
         int32_t mx = wl_resolve(s->max_w, cbw, 0) - (bb ? box_extra_w : 0);
         if (W > mx) { if (ratio && s->height.t != WL_LEN) H = w_muldiv(mx, 1000, ratio); W = mx; }
     }
-    if (s->min_w.t == WL_LEN) {
+    if (s->min_w.t == WL_LEN && !(indef && s->min_w.pct)) {
         int32_t mn = wl_resolve(s->min_w, cbw, 0) - (bb ? box_extra_w : 0);
         if (W < mn) W = mn;
     }
@@ -401,10 +406,13 @@ void lay_intrinsic(struct wlayout* L, int bi, int32_t* mn, int32_t* mx) {
     int32_t fw = fixed_width(L, bi, &ok);
     if (b->kind == LB_REPLACED && !(b->kind == LB_BLOCK)) {
         int32_t cw, ch;
-        replaced_size(L, bi, 0, &cw, &ch);
+        replaced_size(L, bi, -1, &cw, &ch);
         b = &L->b[bi];
         a = z = cw + extra;
-        if (b->st->width.t == WL_LEN && b->st->width.pct) { a = 0; }
+        // compressible: a percentage width / max-width gives a zero
+        // min-content contribution (max-content keeps the natural size)
+        if ((b->st->width.t == WL_LEN && b->st->width.pct) ||
+            (b->st->max_w.t == WL_LEN && b->st->max_w.pct)) a = 0;
     } else if (ok) {
         a = z = fw;
     } else if (b->kind == LB_BLOCK) {

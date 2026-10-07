@@ -31,11 +31,20 @@ okernel/
 │   ├── paging.c/.h        # High-half page tables, paging_map_user, user-range validation
 │   ├── memlayout.h        # KERNEL_VBASE/V2P/P2V_U32/IS_HIGH
 │   │
-│   ├── dom.c/.h           # HTML tokenizer + DOM tree (arenas). Source of truth for layout/CSS/JS
-│   ├── css.c/.h           # From-scratch CSS engine (selector chains, UA sheet, @media, cascade)
-│   ├── layout.c/.h        # Display-list layout (block/inline/table/flex/grid), chrome suppression
-│   ├── html.c/.h          # Flat token stream + <style>/<link>/<script> extraction + entities
-│   ├── okai.c/.h          # Browser: tabs, URL bar, fetch orchestration, renderer, links/fields
+│   ├── okai.c/.h          # Browser shell: tabs, chrome, URL bar, fetch driver (okai_poll),
+│   │                      #   page surface, input routing, forms, error/home pages
+│   ├── web/               # Web engine (desktop-only; see "Browser (okai)" below)
+│   │   ├── wdoc.c/.h      # Document controller: load, sub-resource queue, update, paint, hit
+│   │   ├── wdom.c/.h      # Heap DOM (int32 links, attrs, text arena, atoms)
+│   │   ├── html5.c, charset.c, entities.h   # WHATWG tokenizer + tree builder, decoders
+│   │   ├── css_*.c, css.h, css_int.h        # CSS parse/select/cascade/computed values
+│   │   ├── lay_*.c, layout.h, lay_int.h     # Box tree, block/inline/float/abs, flex, grid, table, display list
+│   │   ├── paint.c, raster.c, surface.h     # Painter + AA rasterizer into a 32bpp surface
+│   │   ├── font.c, fontdata.asm             # TrueType engine + embedded Noto subsets (fonts/)
+│   │   ├── image.c, svg.c                   # PNG/JPEG/GIF/BMP + inflate/gzip, SVG renderer
+│   │   ├── wurl.c                           # RFC 3986 URL resolution
+│   │   └── callstack.asm                    # call_on_stack: engine runs on its own 1MB stack
+│   ├── textslot.c/.h      # Codepoint -> bitmap-font slot (editor/terminal; split from old html.c)
 │   ├── editor.c/.h        # Text editor (open/edit/save)
 │   ├── filesystem.c/.h    # In-memory VFS (write-through hooks to PFS)
 │   ├── pfs.c/.h           # OKPFS1 persistent FS on ATA (mount-or-format + hydrate)
@@ -53,7 +62,7 @@ okernel/
 │   ├── spinlock.c/.h      # xchg spinlock + IRQ-safe variants + mutex (locktest selftest)
 │   ├── ata.c/.h           # Polling-PIO LBA28 primary-master disk
 │   │
-│   ├── memory.c/.h        # Physical page allocator (bitmap) + bump heap
+│   ├── memory.c/.h        # Physical page allocator (bitmap) + segregated-fit heap (kfree works)
 │   ├── serial.c/.h        # COM1 + serial_printf
 │   ├── string.c/.h        # Freestanding mem*/str* (used by crypto + JS)
 │   ├── rtc.c/.h           # CMOS real-time clock
@@ -92,7 +101,7 @@ okernel/
 ```
 
 Shared between builds: `gdt.c`, `idt.c`, `memory.c`, `serial.c`, `keyboard.c`, `mouse.c`, `string.c`, `syscall.c`, `paging.c`.
-Desktop-only: everything else above. **Networking, TLS, CSS, DOM, layout, JS engine, okai are desktop-only.**
+Desktop-only: everything else above. **Networking, TLS, the web engine (src/web), JS engine, okai are desktop-only.**
 If you touch shared code, build **both** targets.
 
 ---
@@ -101,7 +110,7 @@ If you touch shared code, build **both** targets.
 
 ### Boot Sequence
 1. GRUB loads the kernel; desktop links high at `0xC0100000` (`linker-high.ld`; text keeps `linker.ld`).
-2. LOW `_start` (phys `0x100030`, paging off) builds a private boot GDT + boot PD, then `_start_high` sets the high stack and calls `kernel_main()`.
+2. LOW `_start` (phys `0x100030`, paging off) builds a private boot GDT + boot PD (4MB PSE pages: phys 0-64M identity at PD 0-15 AND high at PD 768-783 — the image + .bss outgrew a single 4K-page table once fonts/engine landed; the boot stack lives in .bss), then `_start_high` sets the high stack and calls `kernel_main()`.
 3. Order in `kernel_main()`: memory → mboot copy (fb@88/pitch@96) → `paging_init` → process table → graphics → windows → mouse → keyboard → networking → CPRNG seed → `sti` → main loop.
 4. Desktop asks GRUB for `gfxpayload=1920x1080x32`.
 
@@ -109,7 +118,8 @@ If you touch shared code, build **both** targets.
 - Kernel physical base 0x100000, virtual base 0xC0000000 (`KERNEL_VBASE`). `V2P`/`P2V_U32` in `src/memlayout.h`.
 - `paging_init` builds full low identity (0-128M, supervisor) + high alias (PD 768-799) + FB/MMIO supervisor mappings. The framebuffer is above 4MB (typically `0xFD000000`) and is **identity-mapped**, never via `paging_map` (a window map faults).
 - Page tables: user-low is per-process (private PD, copy via high alias); kernel-high (PD 768-1023) is shared.
-- BSS is large (backbuffer 1920×1080×32 ≈ 8MB + per-window content + page tables + crypto/CSS/DOM tables). `_kernel_end` is now ~32MB physical — still well inside QEMU's default 128MB. Verify after adding large static arrays.
+- Image: ~2.8MB text (1.5MB embedded fonts) + ~7.9MB BSS; `_kernel_end` ≈ 11.3MB physical. The old per-tab okai arrays (~37MB) are gone — page data lives on the heap (DOM/styles/layout per `struct wdoc`, page surface per window). Keep big tables on the heap, not in BSS.
+- Heap: segregated-fit, coalescing `kfree`, RAM-sized (414MB at `-m 512`, ~54MB at 128MB); `heap_stats()` / shell `mem`.
 - NIC RX/TX buffers live in low memory (`0x80000-0x9FFFF`) for DMA.
 
 ### Display Pipeline
@@ -152,7 +162,9 @@ Rules that keep it correct:
   `mouse_paint_cursor()`, artifacts WILL return.
 
 ### Window content cells
-The window interior is a **fixed character-cell grid** (`CONTENT_GW=12`, `CONTENT_GH=24`, `CONTENT_COLS_MAX` stride). Each cell carries VGA nibbles + per-cell RGB planes (`cell_fg`/`cell_bg`/`cell_attr`). `window_write_cell_rgb` writes RGB; `cell_attr` (BOLD/UL) routes to `draw_char_cell` which draws a styled glyph.
+A window can instead show a **client pixel surface** (`window_set_pixels`, `window_dirty_pixels`): the content area blits those pixels (occlusion-clipped like cells) and fills the rest with `content_bg_rgb`. okai uses this for the page; the cell grid is unused there.
+
+The window interior is otherwise a **fixed character-cell grid** (`CONTENT_GW=12`, `CONTENT_GH=24`, `CONTENT_COLS_MAX` stride). Each cell carries VGA nibbles + per-cell RGB planes (`cell_fg`/`cell_bg`/`cell_attr`). `window_write_cell_rgb` writes RGB; `cell_attr` (BOLD/UL) routes to `draw_char_cell` which draws a styled glyph.
 **Gotcha:** `draw_char_cell`/`draw_char_sized` now paint the cell **background even when the glyph is NULL** (control char / uninitialized) — skipping it left stale backbuffer pixels.
 
 ### Input Pipeline
@@ -187,22 +199,28 @@ The window interior is a **fixed character-cell grid** (`CONTENT_GW=12`, `CONTEN
 `http_parse_framing()` (RFC 9112 line grammar, exact-name match) feeds **both** `tls_response_complete()` and `http_dechunk()` — one parser, no differentials. Verdicts: COMPLETE (C-L satisfied / chunked terminated), SHORT (headers cut / short body / unterminated chunks), UNKNOWN (close-delimited; curl-parity accept). SHORT renders a TRUNCATED warning in the UI and never falls back to HTTP.
 
 ### Browser (okai) — rendering pipeline
-The modern renderer is a three-stage pipeline (the old flat-token renderer is kept as a shim/legacy consumer):
+okai is a shell around the web engine in `src/web/` (all integer/fixed-point: LU = 1/64 px; no FPU, no libgcc — use `w_div64`/`w_muldiv` for 64-bit division).
 
-1. **`dom.c`** — HTML tokenizer + bounded DOM tree. Arenas: `DOM_MAX_NODES 16000`, `DOM_MAX_ATTRS 24000`, `DOM_MAX_TEXT 524288`, `DOM_MAX_NAMES 131072`, open-stack 2048. Implied end tags, void/raw-text elements, `find_open_scoped` (table-scoped closes so nested tables survive), charset + entity decode. **All text/name offsets are `uint32_t`** (see Critical Bugs — 16-bit offsets corrupted attribute values on big pages).
-2. **`css.c`** — from-scratch cascade. Selector chains (`tag`, `.class`, `#id`, compounds, descendant/child combinators, comma lists) stored right-to-left in `chain[CSS_MAX_COMPOUND]`. UA stylesheet `UA_CSS` at specificity base `-10000`; `@media` min/max width honored; rules with no supported property filtered at parse time. `CSS_MAX_RULES 512`.
-3. **`layout.c`** — display-list layout: items (lines/bands) + runs + a text arena. Anonymous inline boxes, word wrap, per-line alignment relative to the content box, list markers, `pre`, `hr`, headings (H1=3×/H2=2× via pixel overlay, H3+=body), tables (rows side-by-side, weighted widths, `bgcolor`/`align`), flex row/column, grid tracks (`fr`/px/rem/em/ch, `repeat`, `minmax`), float, chrome suppression (nav/aside/footer + class/id patterns).
+1. **Parse** — `whtml_parse` (WHATWG tokenizer + tree builder, scripting-off so `<noscript>` renders; charset from HTTP/meta/BOM with a 1252 fallback) → `struct wdom`.
+2. **Style** — `css_set_*`: UA + quirks sheets, author sheets in document order (`<style>`, `<link>`, `@import`, `media=`), selectors L3/L4 (`:has`, `:is`, `:nth-*(of S)`), cascade origins/importance, `var()`, `calc()`, `@media`/`@supports`/nesting, presentational hints; interned computed styles.
+3. **Layout** — `wlay_run`: box tree with anonymous fixups, block flow + margin collapsing, floats, abs/fixed, inline formatting (line breaking, `text-align`, `vertical-align`, inline boxes), flexbox, grid, tables, list markers, replaced elements → a **display list** + hit regions.
+4. **Paint** — `wpaint` into a `struct wsurf` (AA rasterizer, TrueType glyph cache 6MB, gradients, shadows, borders/radii, images, SVG).
 
-`okai_render_content()` walks the layout list, blits runs into the window cell grid, records link/field regions, and blanks scaled-heading grid cells (the pixel overlay `okai_draw_heading_pixels` draws them). `g_lay[MAX_OKAIS]` holds the laid-out document.
+`struct wdoc` ties it together (`wdoc_load` → `wdoc_next_fetch`/`wdoc_fetch_done` → `wdoc_update` → `wdoc_paint` / `wdoc_hit`). Each okai window owns a page surface (viewport-sized, kmalloc'd); `okai_render_content` paints the active tab into it and the window system blits it. Scrolling shifts the surface and repaints only the exposed band (full repaint when the layout has `position:fixed` content). The chrome (tabs/toolbar/address bar/lock popup), scrollbar and fetch pill are an overlay painted after the window (`okai_paint_overlays*`).
 
-**Cell geometry:** `CONTENT_GW=12`, `CONTENT_GH=24`, `CHAR_W=16`, `CHAR_H=32`. Heading runs are spaced `scale` columns apart and heading lines consume `scale` rows.
+**Engine stack:** every engine call goes through `run_job()` → `call_on_stack()` onto a private 1MB heap stack (boot stack is 256KB; Wikipedia peaks ~20KB — the render log prints the high-water mark as `stack=NKB`).
+
+**Logs (headless tests key on these):** `[br] [https ]parse: count=N ...` per document, `[okai] render tab=.. (page origin X,Y)` + `[okai] link[i] x= y= w= h= href=` / `[okai] field[i] ... btn=` for each page's first render (page px, viewport-relative), `[okai] click x= y= (mx= my=) hit= node=`, `[okai] LINK HIT -> url`, `[okai] focus input node=`, `[okai] toggle node= checked=`, `[okai] submit form -> url`, `[okai] error page: <title> for <url>`, `[okai] sub-res fetch: CSS|IMG url` / `sub-res done`.
 
 ### Browser — navigation & fetching
-- URL bar (g to focus, Esc to exit); toolbar; j/k scroll; back/forward/reload/home; tabs; internal `okai:home`.
-- **`okai_normalize_https`**: bare host (no scheme) defaults to `https://`; an **explicit `http://` is respected** (typing the scheme is deliberate — auto-upgrading made plain-HTTP hosts unreachable). `okai:home`/other schemes untouched.
-- **No-downgrade gate**: on HTTPS failure, cert/hostname failures render the SECURITY WARNING; secure-channel failures (PROTO/MAC/ALERT/RNG/OVERFLOW) render a CONNECTION error; **only transport failures** (timeout / unreachable / DNS no-A-record) trigger the one-shot plain-HTTP retry via `okai_fallback_http`.
-- **Sub-resources**: after the main page parses, `okai_queue_sub_resources()` queues `<link rel=stylesheet>` URLs, resolved and HTML-decoded (`&amp;`→`&`). The desktop loop fetches them sequentially through the single connection and re-renders after each CSS. Serial: `[okai] sub-res: N resources queued`, `sub-res fetch: CSS url`, `sub-res CSS: X bytes (kept Y), Z rules`.
-- **External `<script src>` is deliberately NOT executed.** tinyjs is not a spec-compliant runtime; running a real site's minified bundle wedges the single-threaded kernel (this was a live freeze — see Session log). Inline `<script>` still runs via `js_dom_run_page` for controlled content. The DOM bridge remains available.
+- URL bar (g to focus, Esc to exit); toolbar; j/k/arrows (48px), space/PgDn/PgUp (page), wheel (80px/notch); b/f back/forward, r reload; tabs; internal `okai:home` (an HTML page rendered by the engine). History: 8 entries/tab, redirects replace the current entry.
+- **`okai_normalize_https`**: bare host defaults to `https://`, except IP literals and explicit non-443 ports (`10.0.2.2:8000/x`) which default to `http://` (local/dev servers — TLS against them fails closed with no fallback). An explicit `http://` is respected.
+- **No-downgrade gate** (unchanged): cert/hostname failures → security warning page; secure-channel failures (PROTO/MAC/ALERT/RNG/OVERFLOW) → connection error page (after up to 2 same-origin resumption retries); **only transport failures** get the one-shot plain-HTTP retry. Error pages are generated HTML documents (`show_error`).
+- **Fetch driver** = `okai_poll()` (called once per desktop main-loop spin): one request at a time on the single connection (`okai_fetch_owner` + `fetch_tab`). Responses: status/headers parsed, `http_dechunk`, gzip inflated (okai sends `Accept-Encoding: gzip`, opt-in per request via `net_accept_gzip`). Non-HTML documents are wrapped (`text/plain` → `<pre>`, `image/*` → `<img>`).
+- **Sub-resources**: after the document parses, stylesheets then images stream in one at a time (`wdoc_next_fetch`), each with its own scheme, 3xx following and one transport retry; caps `OKAI_MAX_CSS_FETCH` 24 / `OKAI_MAX_IMG_FETCH` 32. Rendering is coalesced: first paint waits for stylesheets (≤3s), image arrivals repaint at most every 1.5s, plus a final paint on drain.
+- **TLS fetches stop at the end of the HTTP message** (`tls_net.c`: verified plaintext complete by Content-Length / terminal chunk → done) instead of reading to the close — www.google.com's trailing record fails AEAD on this network path (OpenSSL agrees), which used to abort complete pages as MAC failures. Each HTTPS fetch opens a fresh TCP connection (reusing the previous, about-to-close socket failed every other sub-resource).
+- **Forms**: click focuses text fields (caret drawn), typing edits the `value` attribute, Enter submits (GET; POST forms are sent as GET), Tab cycles controls, checkboxes/radios toggle, `<select>` cycles options.
+- **Scripts are not executed.** tinyjs remains (shell `js` paths) and its DOM bridge (`js_dom.c`) now operates on the active tab's `wdom` (`okai_active_dom` / `okai_dom_changed`). A real engine (QuickJS) is the planned Phase 6.
 
 ---
 
@@ -253,15 +271,12 @@ Working end-to-end: GDT user segments + TSS, INT 0x80 gate (DPL=3), `paging_map_
 
 ## Known Limitations
 
-- **Bump allocator** — heap never frees (`kfree` is a no-op).
 - **Single CPU** — no SMP.
 - **In-memory VFS** — only files explicitly synced to PFS survive reboot.
 - **TCP** — single connection; no congestion control; reorder buffer limited to 8×1500B.
 - **TLS 1.3** — ChaCha20-Poly1305 + SHA-256/384 only; no AES-GCM.
-- **CSS** — no pseudo-classes beyond tag-degradation, no gradients/alpha, no TTF (fixed bitmap font; Cyrillic/symbols via `font8x16_ext`, no CJK).
-- **JS** — tinyjs subset; cannot run real frameworks. External site scripts are not executed (see above).
-- **External CSS** — applied, but the concatenation buffer (`OKAI_CSS_TEXT`, 128KB) truncates very large bundles; only the first ~8 sub-resources are fetched (`OKAI_MAX_SUBRES`).
-- **Sub-resource fetch is best-effort** — a stalled sub-fetch can hold the fetch owner; no per-resource timeout yet.
+- **Web engine** — no JavaScript execution (pages render as with scripts disabled: `<noscript>` content shows, client-rendered UIs are missing); no `position: sticky`, transforms are translate-only, no animations/transitions, `mask-image` boxes skip their background; JPEG chroma is nearest-neighbour; CJK beyond the 16px bitmap fallback table renders as tofu.
+- **Sub-resources** — sequential over one connection (each HTTPS fetch is a fresh handshake; resumption helps); capped at 24 stylesheets / 32 images per page; no per-resource timeout beyond the TLS fetch timeout.
 
 ---
 
@@ -344,7 +359,8 @@ okai / browser:
 
 ## Testing
 
-Host suites (`make host-tests`): crypto (sha256/sha1/sha512/chacha/poly/aead), TLS record/handshake/keysched/client, PKI, adversarial (185/185 plain + ASan/UBSan), RNG, CSS, DOM, layout, render pages, editor text, text decode.
+Host suites (`make host-tests`): crypto (sha256/sha1/sha512/chacha/poly/aead), TLS record/handshake/keysched/client, PKI, adversarial, RNG, editor text, and `make web-tests` (web CSS unit tests 54/54, font tests, builds `build-host/wrender`).
+Web engine (needs the corpus: `python3 tools/fetch_corpus.py`, gitignored): `tests/web/html5_diff.py` (85/85 trees == html5lib), `tests/web/image_diff.py` (59/59 == PIL), every corpus page through `wrender` under ASan/UBSan (`SAN="-fsanitize=address,undefined" OPT=-O1 sh tests/web/build.sh`), `tests/web/compare.py <name> [w] [h] [--fresh]` (side-by-side vs headless Edge; `WR_DUMP_TAG=figure ./build-host/wrender <name> ...` prints a tag's boxes + ancestors). okai's built-in pages export to the corpus with `python3 tools/okai_pages.py`.
 Differential tooling: `make diff-oracle` / `make diff-test` (X25519, SHA-256, HMAC, HKDF, AEAD vs python-cryptography).
 Interop: pyserver + TLS-Attacker (`tests/tlsattacker-*.xml`) — full HS P-256/RSA-P384 PASS, mutilation rejection, fragmentation.
 Persistent FS tests: `OkVM(tag, disk=path)` appends `-hda` for PFS tests; a stale `-hda` QEMU holds the image write-lock (kill it first).
@@ -362,17 +378,21 @@ vm.kill()
 - Serial log (`~/okvm/<tag>_serial.log`) is ground truth — never guess from pixels.
 - `vm.wait_for(pattern)` polls serial — never raw `sleep()`.
 - `vm.burst()` for mouse movement (4-sample smoothing ≈ 4× dilation).
-- `vm.click_link()` is closed-loop (click → read `[okai] click row=.. col=..` → correct → repeat).
-- Scripts: `test_nav.py`, `test_links.py`, `test_link_click.py`, `test_link_local.py`, `test_errors.py`, `test_google.py`, `test_google_search.py`, `test_addrbar.py`, `test_certfail.py`, `test_https_default.py`, `test_pki_qemu.py`, `test_resume.py`, `test_sh_hello.py`, `test_lock.py`, `test_tab_x.py`, `test_css_box.py`, `test_firstrender.py`, `test_font_render.py`, `test_stale_doc.py`, `test_subres.py`.
+- Closed-loop clicks: `vm.click_link(href_part)` / `vm.click_at(page_x, page_y)` (read `[okai] click x= y=` → correct → repeat) and `vm.click_screen(x, y, regex)` for chrome (reads `[mse] btn=1`). `vm.link_regions()` parses the last render's link log; `vm.premove()` dead-reckons first so the probe click never lands on a link under the cursor.
+- okai opens maximized at (0,0): tab strip y 2..40 (tab i at x 6+302i, x-box at +290, '+' after the last tab), toolbar y 40..98 (back/fwd/reload/home centers x 25/63/101/139, y 69; address bar from x 172; lock box x 174..194 y 48..68), page from (2, 98).
+- `python3 tests/headless/run_suite.py -j3 test_a.py ...` runs tests in parallel (outputs in `~/okvm/<test>.out`).
+- Scripts (all green 2026-10-07): `test_okai_interact.py` (offline: CSS+image load, checkbox, link click, back, Tab+typing+Enter submit, wheel), `test_okai_page.py <url> [tag] [--scroll N]` (load + screenshot any page), `test_links.py`, `test_nav.py`, `test_tab_x.py`, `test_addrbar.py`, `test_lock.py`, `test_errors.py`, `test_https_default.py`, `test_certfail.py` (starts its own self-signed `openssl s_server`), `test_resume.py`, `test_pki_qemu.py`, `test_google.py`, `test_google_search.py`, `test_firstrender.py`, `test_stale_doc.py`, `test_fixed_header.py` (self-contained fixtures), `test_boot_mem.py`, `test_font_render.py`, `test_css_box.py`, `test_sh_hello.py`.
 
 ### Host preview (no QEMU)
-`tests/okai_preview.c` (build via `tests/Makefile.preview`) compiles the real `okai.c/html.c/css.c/dom.c/layout.c` and renders a page to PNG. `PREVIEW_DUMP=1` (text dump), `PREVIEW_CSS=<file>` (append external stylesheet). Fast loop for iterating on the renderer.
+`build-host/wrender <corpus-name> <w> <h> out.ppm [page_h]` runs the exact engine sources (`src/web`) on the host — the same code okai links. `tests/web/compare.py` pairs it with an Edge screenshot.
 
 ---
 
 ## Session Log (condensed)
 
 Older, fully-resolved narratives were collapsed. Newest first.
+
+**2026-10-07 — new web engine integrated into the kernel (phases 0-5 done).** `src/web` linked into the desktop build (+`fontdata.asm`, `callstack.asm`); okai rewritten around `struct wdoc` (per-tab heap documents, per-window page surface via the new window pixel-surface mode, pixel hit-testing, coalesced renders, HTML error/home pages, forms incl. checkbox/radio/select, gzip, sub-resource images). Old renderer retired (`dom.c`, `css.c`, `layout.c`, `html.c` + their host tests/preview; the editor's slot map moved to `textslot.c`). Kernel fixes found on the way: boot PD widened to 0-64M PSE (bigger image put the boot stack past 4M → silent triple fault), HTTPS fetches no longer reuse the previous connection (every other sub-resource failed), TLS fetch ends at HTTP message completion (Google's trailing record fails AEAD on this path — OpenSSL too), 1024-byte request paths (Wikipedia's load.php URLs were truncated), host:port/IP default to http. Engine fixes: root/body gradient & image paint the canvas, inline-box fragments double-counted padding+border, percentage max-width on replaced elements zeroed their max-content (Wikipedia thumbnails at 100px). Verified in QEMU: home, example.com, Wikipedia (675KB gzip HTML, 2 CSS + 24 images, first render ~250-400ms), HN, Google search submit, error pages; full headless suite green; host CSS 54/54, corpus clean under ASan/UBSan.
 
 **2026-10-01 — KAnarchy rebrand + i18n push (overnight session).** Dual identity: KAnarchy OS product, okernel kernel. Boot/desktop/shell rebranded (red block-logo banner from `kanarchy.txt`, red prompt/chrome, `kanarchy-*.iso`, GRUB entries); code identifiers, User-Agent, and history prose intentionally untouched. things.txt done: flat-red terminal chrome (per-window `red_chrome` flag, square black buttons), closeable main terminal, global Ctrl+Alt+T (new Alt tracking in the keyboard driver), wallpaper replaced with a circled-K on black. Text boot resurrected (bug #30). Wikipedia zero-???: census found 459 fallback codepoints across ~25 scripts; transliteration tables for all of them (~4300 cases, generated from Unicode names with per-script review), 4-byte UTF-8 decoder + Gothic + math folds + astral drop, and a real-glyph CJK path (Unifont-extracted 16x16 bitmaps for 228 Han/Hangul/kana, raw-UTF-8 runs flagged `LAYOUT_FLAG_CJK`, codepoints bit-packed into unused model bytes so repair repaints stay exact — zero struct changes). Verified: portal 0 fallback '?', main-page only legit punctuation, torture page clean, host suite + sh_hello green, both ISOs screenshot-verified. Known gaps: Kanji beyond the 228-glyph table still '?', JA/ZH Wikipedias need table growth (mechanism supports it).
 
@@ -400,22 +420,9 @@ Older, fully-resolved narratives were collapsed. Newest first.
 
 ## Next Steps
 
-1. **Browser rendering:** finish chasing the deterministic content-area noise in `draw_char_cell` (likely a cell-buffer read past the cleared `content_w` or a glyph-index issue) and the stalled sub-resource fetch (add a per-resource timeout / size budget so a stalled fetch always releases the owner).
-2. **Sub-resource CSS fidelity:** the 128KB `OKAI_CSS_TEXT` truncates large bundles, and the `http_dechunk`-on-TLS length is bogus (682KB logged for a 210KB sheet) — investigate the length computation.
-3. **Re-run headless suites** (`test_links.py`, `test_link_local.py`, `test_errors.py`, `test_google.py`, `test_nav.py`) after the renderer changes.
-4. **Deferred (unchanged):** CT/SCT verification, HTTP/2, OpenSSL-PSK inquiry, broader CSS (pseudo-classes, gradients), CJK fonts.
+1. **Phase 6 — real JavaScript (QuickJS)**: port to the freestanding kernel (no FPU-free guarantee there: QuickJS uses doubles — needs FPU state save/restore around engine calls or a soft-float build), bind a DOM (`wdom`) + event loop + timers + fetch/XHR over the single connection, then flip the parser to scripting-on.
+2. **Engine fidelity**: GitHub's right "About" sidebar and button wrapping, `position: sticky`, transforms beyond translate, smoother JPEG chroma upsampling, CJK TrueType fallback, `<select>` popup menu.
+3. **Networking**: parallel/keep-alive connections would cut sub-resource time (each HTTPS fetch is a fresh handshake today); per-resource timeouts.
+4. **Deferred (unchanged):** CT/SCT verification, HTTP/2, OpenSSL-PSK inquiry.
 
 ---
-
-## WIP 2026-10-06 — new web engine (src/web/), renderer rewrite phases 0-5
-
-Done + tested (host): Phase 0 kernel heap (real free/coalesce, RAM-sized, PSE high alias, QEMU -m 512; boot-tested 128MB+512MB);
-fonts (TrueType rasterizer + Noto subsets, tests/web/test_font.c); HTML5 parser (85/85 trees == html5lib incl. 17 real sites,
-tests/web/html5_diff.py); CSS engine (54/54 unit tests, corpus clean under ASan, tests/web/test_css.c); URL resolver.
-Corpus: `python3 tools/fetch_corpus.py` (not committed).
-
-In progress: layout. Written but NOT yet compiled: src/web/layout.h, lay_int.h, lay_tree.c, lay_main.c.
-Still to write: lay_inline.c (IFC/line breaking), lay_flex.c, lay_grid.c, lay_table.c, lay_dl.c (display list),
-paint.c, wdoc.c (doc controller), image decoders (inflate/PNG/JPEG/GIF) + gzip, okai/desktop integration
-(page surface blit in okai_paint_overlays, pixel hit-testing), Makefile wiring, headless QEMU verification.
-None of src/web is linked into the kernel yet; the shipped browser is unchanged.

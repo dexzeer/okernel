@@ -53,7 +53,14 @@ static int dns_retry_pending = 0;
 static char dns_query_host[128] = {0};
 
 static char http_pending_host[128] = {0};
-static char http_pending_path[128] = {0};
+// Paths carry real-site query strings (wikipedia's load.php stylesheet URLs
+// run 300+ bytes) — the old 128-byte copy truncated them into 404s.
+#define NET_PATH_MAX 1024
+static char http_pending_path[NET_PATH_MAX] = {0};
+// Accept-Encoding: gzip opt-in (okai decodes; raw saves must not get gzip).
+// Latched per request in http_get_port: the GET itself is built later.
+int net_accept_gzip = 0;
+static int http_req_gzip = 0;
 static int http_retry_pending = 0;
 static uint16_t http_pending_port = 80; // port for the parked request
 // Connection attempts for the current (in-flight) request. Bounded so an
@@ -71,6 +78,11 @@ static int http_conn_attempts = 0;
 static void net_copy_str(char* dst, const char* src) {
     int i = 0;
     while (src[i] && i < 127) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
+static void net_copy_path(char* dst, const char* src) {
+    int i = 0;
+    while (src[i] && i < NET_PATH_MAX - 1) { dst[i] = src[i]; i++; }
     dst[i] = 0;
 }
 
@@ -1551,6 +1563,7 @@ void http_get(const char* host, const char* path) {
 void http_get_port(const char* host, const char* path, uint16_t port) {
     uint16_t use_port = port ? port : 80;
     http_pending_port = use_port;
+    http_req_gzip = net_accept_gzip;
 
     // Every request starts a fresh response lifecycle. Without this, a
     // second fetch (e.g. okai refresh) raced the parse block with the
@@ -1572,13 +1585,13 @@ void http_get_port(const char* host, const char* path, uint16_t port) {
     } else if (dns_is_pending()) {
         // Save for retry after DNS completes
         net_copy_str(http_pending_host, host);
-        net_copy_str(http_pending_path, path);
+        net_copy_path(http_pending_path, path);
         http_retry_pending = 1;
         return;
     } else {
         dns_resolve(host);
         net_copy_str(http_pending_host, host);
-        net_copy_str(http_pending_path, path);
+        net_copy_path(http_pending_path, path);
         http_retry_pending = 1;
         return;
     }
@@ -1593,7 +1606,7 @@ void http_get_port(const char* host, const char* path, uint16_t port) {
         // Handshake already in progress for this request; the retry path
         // re-fires http_get() once it reaches ESTABLISHED.
         net_copy_str(http_pending_host, host);
-        net_copy_str(http_pending_path, path);
+        net_copy_path(http_pending_path, path);
         http_retry_pending = 1;
         serial_puts("[http] waiting for TCP handshake...\n");
         return;
@@ -1609,14 +1622,14 @@ void http_get_port(const char* host, const char* path, uint16_t port) {
             return;
         }
         net_copy_str(http_pending_host, host);
-        net_copy_str(http_pending_path, path);
+        net_copy_path(http_pending_path, path);
         http_retry_pending = 1;
         tcp_connect(ip, use_port);
         return;
     }
 
     // Build HTTP GET request
-    uint8_t req_buf[512];
+    uint8_t req_buf[NET_PATH_MAX + 512];
     int req_len = 0;
 
     const char* method = "GET ";
@@ -1642,6 +1655,10 @@ void http_get_port(const char* host, const char* path, uint16_t port) {
 
     const char* hdr_ua = "User-Agent: okernel/0.4\r\nAccept: */*\r\n";
     for (int i = 0; hdr_ua[i]; i++) req_buf[req_len++] = hdr_ua[i];
+    if (http_req_gzip) {
+        const char* hdr_ae = "Accept-Encoding: gzip\r\n";
+        for (int i = 0; hdr_ae[i]; i++) req_buf[req_len++] = hdr_ae[i];
+    }
 
     const char* hdr_end = "Connection: close\r\n\r\n";
     for (int i = 0; hdr_end[i]; i++) req_buf[req_len++] = hdr_end[i];
@@ -1826,10 +1843,14 @@ void net_poll(void) {
         if (dns_is_resolved(&ip, http_pending_host)) {
             if (tcp_conn.state == TCP_STATE_CLOSED) {
                 http_retry_pending = 0;
-                http_get_port(http_pending_host, http_pending_path, http_pending_port);
+                { int sv = net_accept_gzip; net_accept_gzip = http_req_gzip; // keep the original request's opt-in
+                  http_get_port(http_pending_host, http_pending_path, http_pending_port);
+                  net_accept_gzip = sv; }
             } else if (tcp_conn.state == TCP_STATE_ESTABLISHED) {
                 http_retry_pending = 0;
-                http_get_port(http_pending_host, http_pending_path, http_pending_port);
+                { int sv = net_accept_gzip; net_accept_gzip = http_req_gzip; // keep the original request's opt-in
+                  http_get_port(http_pending_host, http_pending_path, http_pending_port);
+                  net_accept_gzip = sv; }
             }
         }
     }

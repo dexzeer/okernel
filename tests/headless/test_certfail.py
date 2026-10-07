@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 # Negative test: self-signed HTTPS server (not in root store) must be
 # REJECTED with the SECURITY WARNING page and NO plain-HTTP fallback.
-import sys, time
-sys.path.insert(0, 'tests/headless')
-from okvm import OkVM
+import sys, time, os, subprocess
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from okvm import OkVM, OUTDIR
+
+# Self-contained: a fresh self-signed certificate (never in the root store)
+# served by `openssl s_server` on the host's :8443 (guest reaches 10.0.2.2).
+CERT = os.path.join(OUTDIR, "certfail_cert.pem")
+KEY = os.path.join(OUTDIR, "certfail_key.pem")
+subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", KEY,
+                "-out", CERT, "-days", "2", "-subj", "/CN=10.0.2.2"],
+               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+srv = subprocess.Popen(["openssl", "s_server", "-accept", "8443", "-cert", CERT, "-key", KEY,
+                        "-www", "-tls1_3"],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(1)
 
 vm = OkVM("certfail")
 time.sleep(14)
@@ -40,5 +52,6 @@ reason = int(m.group(1)) if m else -1
 check(f"reason is cert-class (got {reason})", reason in (4, 5, 6))
 vm.dump()
 vm.kill()
+srv.terminate()
 print("CERTFAIL-QEMU:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

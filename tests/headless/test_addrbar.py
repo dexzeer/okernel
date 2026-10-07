@@ -7,7 +7,7 @@
 Ground truth: [mse] lines for click positioning, pixel analysis of the white
 address-bar rect for URL presence."""
 import sys, os, time, re
-sys.path.insert(0, "/home/notdexy/projects/okernel/tests/headless")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from okvm import OkVM
 from PIL import Image
 
@@ -39,16 +39,10 @@ def shot(vm):
     return Image.open(vm.PPM).convert("RGB")
 
 def addr_bar_rect(im):
-    """Locate the white (0xFFFFFF) rect in the toolbar band y 40..70."""
-    W, H = im.size
-    for y in range(60, 130):
-        x0 = None
-        for x in range(150, W - 40):
-            white = all(abs(c - 255) < 12 for c in im.getpixel((x, y))[:3])
-            if white and x0 is None: x0 = x
-            if x0 is not None and not white:
-                if x - x0 > 100: return (x0, y, x, y + 22)
-                x0 = None
+    """The address bar: x from 172 in the toolbar row (okai maximized at (0,0),
+    border 2: toolbar y 40..98, bar y 44..94). None if it is not white there."""
+    if all(abs(c - 255) < 12 for c in im.getpixel((180, 50))[:3]):
+        return (172, 50, 1880, 88)
     return None
 
 def dark_pixels(im, rect):
@@ -81,7 +75,7 @@ print(f"addr bar {rect}, dark pixels (URL text) = {dpA}")
 assert dpA > 50, "URL text missing from address bar"
 
 # 2. stray chrome click (tab strip right of the active tab) must NOT clear URL
-settle(vm, 400, 30); vm.click(); time.sleep(0.5)
+settle(vm, 1000, 21); vm.click(); time.sleep(0.5)  # empty tab strip
 imB = shot(vm)
 dpB = dark_pixels(imB, rect)
 print(f"after tab-strip click, dark pixels = {dpB}")

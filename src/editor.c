@@ -4,7 +4,7 @@
 #include "filesystem.h"
 #include "memory.h"
 #include "serial.h"
-#include "html.h"
+#include "textslot.h"
 #include <stdint.h>
 
 #define MAX_EDITORS 4
@@ -43,14 +43,14 @@ static void editor_decode1(const char* text, int p, int end,
     if ((b & 0xE0) == 0xC0 && p + 1 < end &&
         ((unsigned char)text[p+1] & 0xC0) == 0x80) {
         int cp = ((b & 0x1F) << 6) | ((unsigned char)text[p+1] & 0x3F);
-        *slot = html_slot_for_codepoint(cp); *seqlen = 2; return;
+        *slot = text_slot_for_codepoint(cp); *seqlen = 2; return;
     }
     if ((b & 0xF0) == 0xE0 && p + 2 < end &&
         ((unsigned char)text[p+1] & 0xC0) == 0x80 &&
         ((unsigned char)text[p+2] & 0xC0) == 0x80) {
         int cp = ((b & 0x0F) << 12) | (((unsigned char)text[p+1] & 0x3F) << 6)
                | ((unsigned char)text[p+2] & 0x3F);
-        *slot = html_slot_for_codepoint(cp); *seqlen = 3; return;
+        *slot = text_slot_for_codepoint(cp); *seqlen = 3; return;
     }
     *slot = '?'; *seqlen = 1;
 }

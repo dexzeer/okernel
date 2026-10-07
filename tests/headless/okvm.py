@@ -17,9 +17,10 @@ Usage pattern (see test_link_click.py for a full example):
 
 Ground rules that make this work (read TESTING.md §0-§2):
   - The SERIAL LOG is ground truth. Never guess state from pixels alone.
-  - The kernel logs `[okai] click row=R col=C (mx=X my=Y)` for every click
-    inside an okai content area, and `[okai] link[i] row=.. col0=.. col1=..`
-    for every rendered link region. Convergence = click, read, correct.
+  - The kernel logs `[okai] click x=X y=Y (mx=.. my=..) hit=K node=N` for
+    every click in an okai page (page px), and after each page's first render
+    `[okai] link[i] x=.. y=.. w=.. h=.. href=..` for the links in view.
+    Convergence = click, read, correct (click_at / click_link).
 """
 import subprocess, time, os, signal, socket, re
 
@@ -81,7 +82,8 @@ class OkVM:
         extend it if you need new punctuation (check `qemu sendkey` names)."""
         km = {' ': 'spc', '/': 'slash', '.': 'dot', ':': 'shift-semicolon',
               '-': 'minus', '\n': 'ret', '=': 'equal', '_': 'shift-minus',
-              '?': 'shift-slash'}
+              '?': 'shift-slash', '\t': 'tab', '\b': 'backspace',
+              '\x1b': 'esc'}
         for ch in s:
             k = km.get(ch, ch.lower() if ch.isalpha() else ch)
             if ch.isupper(): k = f"shift-{ch.lower()}"
@@ -110,25 +112,41 @@ class OkVM:
 
     def click_lines(self):
         """Parse kernel click instrumentation: exact ground-truth coords.
-        Returns list of (row, col, mx, my)."""
+        Returns list of (x, y, mx, my): page px (relative to the page origin)
+        and the screen position the kernel saw."""
         out = []
         for line in self.serial().splitlines():
-            m = re.search(r"\[okai\] click row=(\d+) col=(\d+) \(mx=(\d+) my=(\d+)\)", line)
+            m = re.search(r"\[okai\] click x=(-?\d+) y=(-?\d+) \(mx=(\d+) my=(\d+)\)", line)
             if m:
-                out.append((int(m.group(1)), int(m.group(2)),
-                            int(m.group(3)), int(m.group(4))))
+                out.append(tuple(int(m.group(i)) for i in range(1, 5)))
         return out
 
     def link_regions(self):
-        """Parse rendered link regions: list of (i, row, col0, col1, href)."""
+        """Link regions of the LAST full render (page px, viewport-relative):
+        list of (i, x, y, w, h, href)."""
         out = []
         for line in self.serial().splitlines():
-            m = re.search(r"\[okai\] link\[(\d+)\] row=(\d+) col0=(\d+) col1=(\d+) href=(\S*)", line)
+            if "[okai] render tab=" in line and "page origin" in line:
+                out = []
+            m = re.search(r"\[okai\] link\[(\d+)\] x=(-?\d+) y=(-?\d+) w=(\d+) h=(\d+) href=(\S*)", line)
             if m:
-                out.append((int(m.group(1)), int(m.group(2)),
-                            int(m.group(3)), int(m.group(4)), m.group(5)))
+                out.append((int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                            int(m.group(4)), int(m.group(5)), m.group(6)))
         return out
 
+    def page_origin(self):
+        """Screen position of the page's (0,0) from the last full render."""
+        org = (2, 98)
+        for m in re.finditer(r"page origin (\d+),(\d+)", self.serial()):
+            org = (int(m.group(1)), int(m.group(2)))
+        return org
+
+    def find_link(self, href_part):
+        """First link region of the last render whose href contains href_part."""
+        for r in self.link_regions():
+            if href_part in r[5]:
+                return r
+        return None
     # ---- Screenshots -------------------------------------------------------
 
     def dump(self, path=None):
@@ -155,50 +173,106 @@ class OkVM:
         self.mon("mouse_button 1", 0.22)
         self.mon("mouse_button 0", 0.35)
 
-    def click_link(self, row, col0, col1, max_iters=20, expect_href=None):
-        """CLOSED-LOOP link click: click, read the kernel-reported coordinates
-        from serial, correct with a burst, repeat until inside the region.
-        This is the single most reliable way to click anything in okernel.
-        Geometry (verified 2026-09-10 against the kernel hit-test): content
-        cells are CONTENT_GW x CONTENT_GH = 12x24 px (font_scale 1);
-        serial link rows are DOC rows, the hit-test uses BUFFER rows
-        (doc + CHROME_ROWS(3), scroll 0). expect_href (exact logged href)
-        rejects WRONG-link hits: any hit for another href returns False
-        immediately instead of compounding clicks in the new page.
-        Returns True iff the expected HIT appears (or any HIT when
-        expect_href is None)."""
-        # content origin: FIRST okai window at (1010,60), no_titlebar, so the
-        # content grid starts at x+2/y+2 (border).
-        ox, oy = 1012, 62
-        tcol = (col0 + col1) // 2
-        tx = ox + tcol * 12 + 6
-        ty = oy + (row + 3) * 24 + 12  # +CHROME_ROWS for the reserved chrome
-        # Baseline LINK HIT count: stop at the FIRST hit. Verifying via a
-        # later click leaves the cursor over the NEW window's links, where
-        # stray confirmation clicks navigate again and pollute the lifecycle.
-        hits0 = self.serial().count("[okai] LINK HIT")
+    def mse_presses(self):
+        """Screen positions of every left-button press ([mse] btn=1 lines,
+        logged anywhere on screen)."""
+        return [(int(m.group(1)), int(m.group(2))) for m in
+                re.finditer(r"\[mse\] btn=1 x=(\d+) y=(\d+)", self.serial())]
+
+    def premove(self, tx, ty, gain=4.8):
+        """Dead-reckon the cursor toward SCREEN (tx, ty) WITHOUT clicking,
+        from the last logged press (or the boot position, screen center), so
+        the first probe click of a closed loop does not land on whatever sits
+        under the cursor (e.g. a link that would navigate away)."""
+        ps = self.mse_presses()
+        x, y = ps[-1] if ps else (960, 540)
+        for _ in range(10):
+            dx, dy = tx - x, ty - y
+            if abs(dx) <= 6 and abs(dy) <= 6:
+                break
+            bx = max(-60, min(60, int(dx / gain)))
+            by = max(-60, min(60, int(dy / gain)))
+            self.burst(bx, by)
+            x += bx * gain
+            y += by * gain
+        for _ in range(5):
+            self.mon("mouse_move 0 0", 0.05)
+        time.sleep(0.3)
+
+    def click_screen(self, tx, ty, expect, tries=12, gain=4.8):
+        """CLOSED-LOOP click at SCREEN (tx, ty) until the regex `expect`
+        gains a match in the serial log (chrome buttons, tabs, anything
+        outside the page). Corrects with bursts from the logged press."""
+        self.premove(tx, ty, gain)
+        for _ in range(tries):
+            before = len(re.findall(expect, self.serial()))
+            self.click()
+            time.sleep(0.6)
+            if len(re.findall(expect, self.serial())) > before:
+                return True
+            ps = self.mse_presses()
+            if not ps:
+                self.burst(0, 10)
+                continue
+            cx, cy = ps[-1]
+            dx, dy = tx - cx, ty - cy
+            if abs(dx) <= 3 and abs(dy) <= 3:
+                continue
+            self.burst(max(-60, min(60, int(dx / gain))), max(-60, min(60, int(dy / gain))))
+            for _ in range(5):
+                self.mon("mouse_move 0 0", 0.05)
+            time.sleep(0.3)
+        return False
+
+    def click_at(self, tx, ty, max_iters=20, done=None):
+        """CLOSED-LOOP click at page px (tx, ty): click, read the kernel-logged
+        page coords, correct with a burst, repeat. done(serial) -> bool stops
+        early (e.g. when the expected LINK HIT shows up). Returns the last
+        (x, y) the kernel reported, or None."""
+        last = None
+        ox, oy = self.page_origin()
+        self.premove(ox + tx, oy + ty)
         for attempt in range(max_iters):
             before = len(self.click_lines())
             self.click()
             time.sleep(0.6)
-            if self.serial().count("[okai] LINK HIT") > hits0:
-                if expect_href is None:
-                    return True
-                return expect_href in self.serial()
+            if done and done(self.serial()):
+                return last
             clicks = self.click_lines()
             if len(clicks) <= before:
-                continue  # click not registered (shouldn't happen)
-            c_row, c_col, mx, my = clicks[-1]
-            if c_row == row + 3 and col0 <= c_col <= col1:
-                time.sleep(1)
-                return "[okai] LINK HIT" in self.serial()
-            dx, dy = tx - mx, ty - my
+                # click outside the page (chrome band): nudge down/right
+                self.burst(0, 8)
+                continue
+            x, y, mx, my = clicks[-1]
+            last = (x, y)
+            dx, dy = tx - x, ty - y
+            if abs(dx) <= 3 and abs(dy) <= 3:
+                return last
             bx = max(-60, min(60, int(dx / 4.0)))
             by = max(-60, min(60, int(dy / 4.0)))
-            if bx == 0 and abs(dx) > 6: bx = 1 if dx > 0 else -1
-            if by == 0 and abs(dy) > 6: by = 1 if dy > 0 else -1
+            if bx == 0 and abs(dx) > 3: bx = 1 if dx > 0 else -1
+            if by == 0 and abs(dy) > 3: by = 1 if dy > 0 else -1
             self.burst(bx, by)
-        return "[okai] LINK HIT" in self.serial()
+        return last
+
+    def click_link(self, href_part, max_iters=20):
+        """Click the first rendered link whose href contains href_part
+        (closed loop on the kernel's own click/LINK HIT logs). Returns True
+        iff a LINK HIT for that href appears."""
+        r = self.find_link(href_part)
+        if not r:
+            return False
+        _, x, y, w, h, href = r
+        tx, ty = x + min(w // 2, 20), y + h // 2
+        hits0 = self.serial().count("[okai] LINK HIT")
+        def done(log):
+            return log.count("[okai] LINK HIT") > hits0
+        self.click_at(tx, ty, max_iters=max_iters, done=done)
+        log = self.serial()
+        if log.count("[okai] LINK HIT") <= hits0:
+            return False
+        last = log[log.rindex("[okai] LINK HIT"):].splitlines()[0]
+        return href_part in last
 
     # ---- Teardown -----------------------------------------------------------
 

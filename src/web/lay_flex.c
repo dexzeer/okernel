@@ -221,7 +221,7 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
             int32_t free = main_size - used;
             if (grow && sumf < 1000) {
                 // sum of flex-grow < 1: only that fraction of the free space is used
-                free = (int32_t)((int64_t)free * sumf / 1000);
+                free = w_muldiv(free, (int32_t)sumf, 1000);
             }
             int64_t total_viol = 0;
             for (int i = a; i < z; i++) {

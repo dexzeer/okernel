@@ -84,12 +84,10 @@ try:
         for _ in range(10):
             vm.type_string("k")
             time.sleep(0.15)
-        ms = list(re.finditer(r"\[okai\] link\[(\d+)\] row=(\d+) col0=(\d+) col1=(\d+) href=(\S+)", vm.serial()))
-        if ms:
-            m = ms[-1]
+        regions = vm.link_regions()
+        if regions:
             try:
-                vm.click_link(int(m.group(2)), int(m.group(3)), int(m.group(4)),
-                              max_iters=6, expect_href=None)
+                vm.click_link(regions[-1][5], max_iters=6)
                 time.sleep(2)
             except Exception as e:
                 log(f"c{cycle} click exception: {e}")

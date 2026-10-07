@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include "../src/editor.h"
 #include "../src/window.h"
+#include <string.h>
 
 static int fails = 0;
 #define CHECK(cond, msg) do { \
