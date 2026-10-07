@@ -51,8 +51,6 @@ extern uint32_t tick_count;
 static uint32_t okai_last_tick = 0;
 
 // Tab chrome sizing / animation constants
-#define OKAI_XBOX       16   // close-× square outline box, px
-#define OKAI_NB         32   // new-tab "+" button box, px (matches the 32px glyph)
 #define OKAI_ANIM_FACTOR 18  // % of remaining width eased per 10ms tick (exponential
                              // ease-out; ~150ms to fully open/close a tab)
 #define CHROME_PX (CHROME_TAB_H + CHROME_TOOL_H) // chrome band above the page, px
@@ -68,6 +66,11 @@ static int okai_count = 0;
 // A window with requests in flight (drives the progress-pill erase), or -1.
 int okai_fetch_owner = -1;
 int okai_scripts_on = 1;
+
+// Chrome drawing + hit tests live in okai_ui.c.
+int  okai_ui_tab_width(struct okai* b);
+void okai_ui_paint(int id);
+void okai_ui_forget(int id);
 
 static void okai_tab_reset(struct okai_tab* T);
 static void load_home(int id, int tab);
@@ -1021,6 +1024,12 @@ void okai_blit_content(int id) {
 
 // Scroll the active tab to document y = ny. Small moves shift the surface
 // and repaint only the exposed band.
+static uint64_t rdtsc64(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 static void scroll_to(int id, int ny) {
     struct okai* b = &okais[id];
     struct okai_tab* T = okai_tab_of(b);
@@ -1033,6 +1042,7 @@ static void scroll_to(int id, int ny) {
     int dy = ny - T->scroll_y;
     if (!dy) return;
     int ady = dy < 0 ? -dy : dy;
+    uint64_t c0 = rdtsc64();
     T->js_scroll_evt = 1;
     if (T->has_fixed || ady >= ph * 3 / 4 || T->render_pending) {
         T->scroll_y = ny;
@@ -1054,6 +1064,7 @@ static void scroll_to(int id, int ny) {
     j.scroll = ny;
     run_job(&j);
     window_set_dirty(b->win_id);
+    serial_printf("[okai] scroll dy=%d in %dkcyc\n", dy, (int)((rdtsc64() - c0) >> 10));
 }
 
 // ---- fetch driver ------------------------------------------------------------------
@@ -1696,6 +1707,7 @@ void okai_close(int id) {
     }
     if (b->page_px) { kfree(b->page_px); b->page_px = 0; }
     b->page_cap = b->page_w = b->page_h = 0;
+    for (int i = 0; i < MAX_OKAIS; i++) okai_ui_forget(i); // slots shift below
     // Compact so the one-window policy (`okai` reuses slot 0) never targets
     // a dead slot (okai_get would return NULL mid-click-handler).
     for (int i = id; i < okai_count - 1; i++) okais[i] = okais[i + 1];
@@ -2234,195 +2246,6 @@ void okai_handle_mouse_scroll(int id, int dy) {
 }
 
 
-// ---- Toolbar nav buttons ---------------------------------------------------
-// These mirror the back/forward/reload/home buttons drawn in okai_draw_chrome().
-
-// Hit-test the address bar. Geometry MUST mirror okai_draw_chrome(). Used by
-// desktop.c so clicking the address bar focuses it for typing, while clicks
-// elsewhere in the chrome band just focus/drag the window (the old blanket
-// "any top-band click focuses + clears the address bar" wiped the URL display
-// whenever a click missed a nav button).
-int okai_addr_bar_hit(int id, int mx, int my) {
-    if (id < 0 || id >= MAX_OKAIS) return 0;
-    struct okai* b = &okais[id];
-    if (b->win_id < 0) return 0;
-    struct window* w = window_get(b->win_id);
-    if (!w || !w->visible) return 0;
-    int cx0 = w->x + WIN_BORDER;
-    int topoff = w->no_titlebar ? 0 : WIN_TITLE_H;
-    int tool_y = w->y + WIN_BORDER + topoff + CHROME_TAB_H;
-    int btn = 30, gap = 8;
-    int addr_x = cx0 + 8 + 4 * (btn + gap) + 10; // after the 4 nav buttons
-    int ctrl_space = w->no_titlebar ? (WIN_CTRL_BTN + 10) : 8;
-    int addr_w = (w->w - 2 * WIN_BORDER) - (addr_x - cx0) - ctrl_space;
-    int ay = tool_y + 4, ah = CHROME_TOOL_H - 8;
-    return addr_w > 24 && mx >= addr_x && mx < addr_x + addr_w &&
-           my >= ay && my < ay + ah;
-}
-
-int okai_check_nav_click(int id, int mx, int my) {
-    struct okai* b = &okais[id];
-    if (b->win_id < 0) return NAV_NONE;
-    struct window* w = window_get(b->win_id);
-    if (!w) return NAV_NONE;
-    // Geometry MUST match okai_draw_chrome(): button bar in the toolbar row.
-    int cx0 = w->x + WIN_BORDER;
-    int cy0 = w->y + WIN_BORDER + (w->no_titlebar ? 0 : WIN_TITLE_H);
-    int tool_y = cy0 + CHROME_TAB_H;
-    int btn = 30, gap = 8;
-    int bx = cx0 + 8;
-    int by = tool_y + (CHROME_TOOL_H - btn) / 2;
-    if (my >= by && my <= by + btn) {
-        for (int i = 0; i < 4; i++) {
-            if (mx >= bx && mx <= bx + btn)
-                return i == 0 ? NAV_BACK : i == 1 ? NAV_FWD :
-                       i == 2 ? NAV_RELOAD : NAV_HOME;
-            bx += btn + gap;
-        }
-    }
-    // New-tab '+' box in the tab strip: after the LAST tab (mirrors the draw)
-    {
-        int n = b->tab_count; if (n < 1) n = 1;
-        int cwp = w->w - 2 * WIN_BORDER;
-        int tw = (cwp - 40) / n; if (tw > 300) tw = 300; if (tw < 60) tw = 60;
-        int nb = OKAI_NB;
-        int nbx = cx0 + 4 + n * (tw + 2);
-        int nby = cy0 + (CHROME_TAB_H - nb) / 2;
-        if (mx >= nbx && mx <= nbx + nb && my >= nby && my <= nby + nb)
-            return NAV_NEWTAB;
-    }
-    return NAV_NONE;
-}
-
-// Tab-strip hit test: which tab (or its close box) is under (mx,my)?
-int okai_tab_hit(int id, int mx, int my, int* on_close) {
-    if (on_close) *on_close = 0;
-    if (id < 0 || id >= okai_count) return -1;
-    struct okai* b = &okais[id];
-    if (b->win_id < 0) return -1;
-    struct window* w = window_get(b->win_id);
-    if (!w || !w->visible) return -1;
-    int cx0 = w->x + WIN_BORDER;
-    int cy0 = w->y + WIN_BORDER + (w->no_titlebar ? 0 : WIN_TITLE_H);
-    if (my < cy0 + 2 || my >= cy0 + CHROME_TAB_H) return -1;
-    int n = b->tab_count; if (n < 1) return -1;
-    int cwp = w->w - 2 * WIN_BORDER;
-    int tw = (cwp - 40) / n; if (tw > 300) tw = 300; if (tw < 60) tw = 60;
-    for (int ti = 0; ti < n; ti++) {
-        int tx = cx0 + 4 + ti * (tw + 2);
-        if (mx >= tx && mx < tx + tw) {
-            // close × box: white outline at the tab's right edge (every tab)
-            int xx = tx + tw - OKAI_XBOX - 2, xy = cy0 + (CHROME_TAB_H - OKAI_XBOX) / 2;
-            if (on_close && mx >= xx && mx <= xx + OKAI_XBOX && my >= xy && my <= xy + OKAI_XBOX)
-                *on_close = 1;
-            return ti;
-        }
-    }
-    return -1;
-}
-
-
-// ---- Pixel chrome: tab strip + toolbar drawn with graphics primitives over
-// the top CHROME_PX band of the window's content area. ----
-
-// 12-point unit circle for icon arcs (no trig in-kernel), scaled by r/8.
-static const int OKAI_CIRC_X[12] = {8,7,4,0,-4,-7,-8,-7,-4,0,4,7};
-static const int OKAI_CIRC_Y[12] = {0,4,7,8,7,4,0,-4,-7,-8,-7,-4};
-
-static void okai_poly_ring(int cx, int cy, int r, int start, int count, uint32_t fg) {
-    int px = cx + OKAI_CIRC_X[start] * r / 8;
-    int py = cy + OKAI_CIRC_Y[start] * r / 8;
-    for (int k = 1; k <= count; k++) {
-        int idx = (start + k) % 12;
-        int nx = cx + OKAI_CIRC_X[idx] * r / 8;
-        int ny = cy + OKAI_CIRC_Y[idx] * r / 8;
-        line(px, py, nx, ny, fg);
-        px = nx; py = ny;
-    }
-}
-
-// Navigation icons drawn as bold, filled glyphs so they read clearly on the
-// toolbar gradient (white on the dark nav chips).
-static void okai_fill_tri(int x0, int y0, int x1, int y1, int x2, int y2, uint32_t c) {
-    int miny = y0; if (y1 < miny) miny = y1; if (y2 < miny) miny = y2;
-    int maxy = y0; if (y1 > maxy) maxy = y1; if (y2 > maxy) maxy = y2;
-    for (int y = miny; y <= maxy; y++) {
-        int xs[4]; int n = 0;
-        int ex[3] = {x0, x1, x2}; int ey[3] = {y0, y1, y2};
-        for (int i = 0; i < 3; i++) {
-            int j = (i + 1) % 3;
-            int ya = ey[i], yb = ey[j], xa = ex[i], xb = ex[j];
-            if ((y >= ya && y < yb) || (y >= yb && y < ya)) {
-                int xx = xa + (y - ya) * (xb - xa) / (yb - ya);
-                if (n < 4) xs[n++] = xx;
-            }
-        }
-        if (n >= 2) {
-            int a = xs[0], b = xs[1];
-            if (a > b) { int t = a; a = b; b = t; }
-            hline(a, y, b - a + 1, c);
-        }
-    }
-}
-
-static void okai_icon_back(int x, int y, int s, uint32_t fg) {
-    int cy = y + s / 2;
-    okai_fill_tri(x + 5, cy, x + 19, y + 5, x + 19, y + s - 5, fg); // left-pointing head
-    rect_fill(x + 19, cy - 3, 6, 6, fg);                            // stem
-}
-
-static void okai_icon_fwd(int x, int y, int s, uint32_t fg) {
-    int cy = y + s / 2;
-    okai_fill_tri(x + s - 5, cy, x + s - 19, y + 5, x + s - 19, y + s - 5, fg); // right-pointing head
-    rect_fill(x + s - 25, cy - 3, 6, 6, fg);                            // stem
-}
-
-static void okai_icon_reload(int x, int y, int s, uint32_t fg) {
-    int cx = x + s / 2, cy = y + s / 2, r = s / 2 - 3;
-    okai_poly_ring(cx, cy, r,     1, 9, fg);   // open ring (gap at top)
-    okai_poly_ring(cx, cy, r - 1, 1, 9, fg);   // 2px-thick ring
-    okai_poly_ring(cx, cy, r - 2, 1, 9, fg);   // 3px-thick ring
-    // bold arrowhead at the ring's open end (top, index 10)
-    int hx = cx + OKAI_CIRC_X[10] * r / 8, hy = cy + OKAI_CIRC_Y[10] * r / 8;
-    okai_fill_tri(hx - 4, hy + 5, hx + 4, hy + 5, hx, hy - 4, fg);
-}
-
-static void okai_icon_home(int x, int y, int s, uint32_t fg) {
-    int mid = x + s / 2;
-    int half = (s - 8) / 2;
-    okai_fill_tri(mid, y + 4, x + 4, y + 5 + half, x + s - 4, y + 5 + half, fg); // roof
-    int body_y = y + 5 + half;
-    int body_h = (y + s - 4) - body_y;
-    if (body_h < 4) return;
-    rect_outline(mid - half, body_y, 2 * half + 1, body_h, fg, 1);   // walls
-    if (body_h >= 7) rect_fill(mid - 1, body_y + body_h - 5, 3, 5, fg); // door
-}
-
-static void okai_icon_lock(int x, int y, int s, uint32_t fg) {
-    rect_fill(x + 2, y + s / 2, s - 4, s / 2 - 1, fg);   // body
-    okai_poly_ring(x + s / 2, y + s / 2, s / 2 - 3, 8, 4, fg); // shackle (top arc)
-}
-
-// Click hit-test for the address-bar lock icon. Geometry mirrors the draw in
-// okai_draw_chrome: 4 nav buttons (30px + 8px gap) from cx0+8, then the address
-// bar starts 10px later; the lock sits at addr_x+6, 12px square, in the toolbar.
-int okai_lock_hit(int id, int mx, int my) {
-    struct okai* b = &okais[id];
-    if (b->win_id < 0) return 0;
-    struct window* w = window_get(b->win_id);
-    if (!w || !w->visible || w->minimized) return 0;
-    int topoff = w->no_titlebar ? 0 : WIN_TITLE_H;
-    int cy0 = w->y + WIN_BORDER + topoff;
-    int cx0 = w->x + WIN_BORDER;
-    int tool_y = cy0 + CHROME_TAB_H;
-    int addr_x = cx0 + 8 + 4 * (30 + 8) + 10;
-    // Forgiving hit area centered on the 12px lock icon (20x20px) so it is
-    // easy to click even when the mouse settles a few px off.
-    int lx0 = addr_x + 2, lx1 = addr_x + 22;
-    int ly0 = tool_y + 8, ly1 = tool_y + 28;
-    return (mx >= lx0 && mx < lx1 && my >= ly0 && my < ly1);
-}
-
 // Advance tab open/close animations. Eases every live tab's rendered width
 // (anim_w) toward its target with a frame-rate-independent exponential ease-out
 // (tied to the 100Hz tick clock), then removes any tab whose close finished.
@@ -2437,9 +2260,7 @@ int okai_is_animating(int id) {
     if (b->win_id < 0) return 0;
     struct window* w = window_get(b->win_id);
     if (!w) return 0;
-    int n = b->tab_count; if (n < 1) n = 1;
-    int cwp = w->w - 2 * WIN_BORDER;
-    int tw = (cwp - 40) / n; if (tw > 300) tw = 300; if (tw < 60) tw = 60;
+    int tw = okai_ui_tab_width(b);
     for (int ti = 0; ti < b->tab_count; ti++) {
         int target = b->tabs[ti].closing ? 0 : tw;
         if (b->tabs[ti].anim_w != target) return 1;
@@ -2452,9 +2273,7 @@ static int okai_anim_step(int id) {
     if (b->win_id < 0) return 0;
     struct window* w = window_get(b->win_id);
     if (!w) return 0;
-    int n = b->tab_count; if (n < 1) n = 1;
-    int cwp = w->w - 2 * WIN_BORDER;
-    int tw = (cwp - 40) / n; if (tw > 300) tw = 300; if (tw < 60) tw = 60;
+    int tw = okai_ui_tab_width(b);
 
     // Real-time delta since the last step, in ticks (10ms each at 100Hz).
     int dt = (int)(tick_count - okai_last_tick);
@@ -2497,192 +2316,29 @@ static int okai_anim_step(int id) {
     return animating;
 }
 
-static void okai_draw_fetch_status(int id); // defined below (progress pill)
-static void okai_draw_chrome(int id) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return;
-    struct window* w = window_get(b->win_id);
-    if (!w || !w->visible || w->minimized) return;
-
-    int cx0 = w->x + WIN_BORDER;
-    int topoff = w->no_titlebar ? 0 : WIN_TITLE_H;
-    int cy0 = w->y + WIN_BORDER + topoff;
-    int cwp = w->w - 2 * WIN_BORDER;
-    if (cwp <= 0) return;
-    int tool_y = cy0 + CHROME_TAB_H;
-
-    // Tab strip (gradient) with one tab per open page -------------------------
-    gradient_fill(cx0, cy0, cwp, CHROME_TAB_H, CHROME_TAB_TOP, CHROME_TAB_BOT, 1);
-    {
-        int n = b->tab_count; if (n < 1) n = 1;
-        int x = cx0 + 4;
-        for (int ti = 0; ti < n; ti++) {
-            int tw = b->tabs[ti].anim_w;
-            if (tw < 2) { x += 2; continue; } // fully-collapsed (closing) tab
-            int tx = x;
-            int active = (ti == b->active_tab);
-            uint32_t fill = active ? CHROME_TAB_ACTIVE : 0x004A648F;
-            rect_fill(tx, cy0 + 2, tw, CHROME_TAB_H - 2, fill);
-            if (active) { // round the active tab's top corners
-                int r = 5;
-                for (int i = 0; i < r && i < tw; i++) {
-                    int cl = r - i;
-                    rect_fill(tx, cy0 + 2 + i, cl, 1, CHROME_TAB_TOP);
-                    rect_fill(tx + tw - cl, cy0 + 2 + i, cl, 1, CHROME_TAB_TOP);
-                }
-            }
-            struct okai_tab* TT = &b->tabs[ti];
-            const char* t = TT->title[0] ? TT->title : TT->url;
-            int max_ch = (tw - (OKAI_XBOX + 8)) / FONT_W; // reserve room for × box
-            if (max_ch > 0)
-                for (int i = 0; t[i] && i < max_ch; i++)
-                    draw_char_1x(tx + 8 + i * FONT_W, cy0 + (CHROME_TAB_H - FONT_H) / 2, t[i],
-                                 active ? CHROME_TAB_TEXT : CHROME_TAB_INACT, fill);
-            // Close × in a white square outline — present on every tab. The
-            // box is filled (like the + button) so the white outline stays
-            // visible even on the near-white active tab.
-            if (tw >= OKAI_XBOX + 8) {
-                int xx = tx + tw - OKAI_XBOX - 2, xy = cy0 + (CHROME_TAB_H - OKAI_XBOX) / 2;
-                rect_fill(xx, xy, OKAI_XBOX, OKAI_XBOX, CHROME_TAB_TOP);
-                rect_outline(xx, xy, OKAI_XBOX, OKAI_XBOX, 0x00FFFFFF, 1);
-                line(xx + 3, xy + 3, xx + OKAI_XBOX - 3, xy + OKAI_XBOX - 3, 0x00FFFFFF);
-                line(xx + OKAI_XBOX - 3, xy + 3, xx + 3, xy + OKAI_XBOX - 3, 0x00FFFFFF);
-            }
-            x += tw + 2;
-        }
-        // New-tab "+" button right after the last tab
-        int nb = OKAI_NB;
-        int nbx = x, nby = cy0 + (CHROME_TAB_H - nb) / 2;
-        rect_fill(nbx, nby, nb, nb, CHROME_TAB_TOP);   // uniform fill (no dark gradient patch)
-        rect_outline(nbx, nby, nb, nb, 0x00FFFFFF, 1);  // white outline
-        draw_string_1x(nbx + (nb - FONT_W) / 2, nby, "+", 0x00FFFFFF, CHROME_TAB_TOP);
-    }
-
-    // Toolbar (gradient) ----------------------------------------------------
-    gradient_fill(cx0, tool_y, cwp, CHROME_TOOL_H, CHROME_TOOL_TOP, CHROME_TOOL_BOT, 1);
-    hline(cx0, tool_y - 1, cwp, 0x001A2E4D); // crisp 2px divider between tab strip and toolbar
-    hline(cx0, tool_y, cwp, 0x001A2E4D);
-
-    // Nav buttons: rounded dark chips with the glyph centered inside
-    int btn = 30, gap = 8;
-    int by = tool_y + (CHROME_TOOL_H - btn) / 2;
-    int bx = cx0 + 8;
-    for (int i = 0; i < 4; i++) {
-        round_rect_fill(bx, by, btn, btn, NAVBTN_BG, NAVBTN_R);
-        hline(bx + NAVBTN_R, by, btn - 2 * NAVBTN_R, NAVBTN_HI);
-        bx += btn + gap;
-    }
-    bx = cx0 + 8;
-    okai_icon_back(bx, by, btn, CHROME_BTN_FG);   bx += btn + gap;
-    okai_icon_fwd(bx, by, btn, CHROME_BTN_FG);    bx += btn + gap;
-    okai_icon_reload(bx, by, btn, CHROME_BTN_FG); bx += btn + gap;
-    okai_icon_home(bx, by, btn, CHROME_BTN_FG);   bx += btn + gap;
-
-    // Address bar -----------------------------------------------------------
-    int addr_x = bx + 10;
-    // Reserve room for the top-right close control so the bar never overlaps it.
-    int ctrl_space = w->no_titlebar ? (WIN_CTRL_BTN + 10) : 8;
-    int addr_w = cwp - (addr_x - cx0) - ctrl_space;
-    if (addr_w > 24) {
-        int ay = tool_y + 4, ah = CHROME_TOOL_H - 8;
-        rect_fill(addr_x, ay, addr_w, ah, ADDR_BG);
-        rect_outline(addr_x, ay, addr_w, ah, ADDR_BORDER, 1);
-        okai_icon_lock(addr_x + 6, ay + (ah - 12) / 2, 12,
-                       T->is_https ? LOCK_OK : 0x006A6A6A);
-        const char* u = b->addr_bar_focused ? b->addr_input : T->url;
-        int max_ch = (addr_w - 24 - 8) / FONT_W; // stay inside the bar
-        for (int i = 0; u[i] && i < max_ch; i++)
-            draw_char_1x(addr_x + 24 + i * FONT_W, ay + (ah - FONT_H) / 2,
-                         u[i], ADDR_TEXT, ADDR_BG);
-    }
-
-    // HTTPS lock popup: a security card anchored under the address bar. Toggled
-    // by clicking the lock icon (okai_lock_hit); dismissed on any click elsewhere
-    // or keypress (okai_handle_key clears show_security).
-    if (b->show_security) {
-        int px = addr_x;
-        int py = tool_y + CHROME_TOOL_H + 3;
-        int pw = 300, ph = 150;
-        round_rect_fill(px, py, pw, ph, 0x00FFFFFF, 6);
-        rect_outline(px, py, pw, ph, ADDR_BORDER, 1);
-        int card_bg = 0x00FFFFFF;
-        const char* head = T->is_https ? "Connection is secure" : "Not secure";
-        uint32_t hcol = T->is_https ? LOCK_OK : 0x002020C0;
-        draw_string_1x(px + 14, py + 14, head, hcol, card_bg);
-        if (T->is_https) {
-            draw_string_1x(px + 14, py + 48, "Protocol: TLS 1.3", 0x00202020, card_bg);
-            char host[OKAI_URL_LEN]; int hi = 0; const char* hp = T->url;
-            if (hp[0]=='h'&&hp[1]=='t'&&hp[2]=='t'&&hp[3]=='p'&&hp[4]=='s'&&hp[5]==':') hp += 8;
-            else if (hp[0]=='h'&&hp[1]=='t'&&hp[2]=='t'&&hp[3]=='p'&&hp[4]==':') hp += 7;
-            while (*hp && *hp!='/' && *hp!=':' && hi < OKAI_URL_LEN-1) host[hi++] = *hp++;
-            host[hi] = 0;
-            char line[64]; int li = 0; const char* h2 = "Host: ";
-            while (*h2 && li < 60) line[li++] = *h2++;
-            for (int k = 0; host[k] && li < 60; k++) line[li++] = host[k];
-            line[li] = 0;
-            draw_string_1x(px + 14, py + 82, line, 0x00202020, card_bg);
-            draw_string_1x(px + 14, py + 116, "Certificate: valid", 0x00202020, card_bg);
-        } else {
-            draw_string_1x(px + 14, py + 48, "This page is not encrypted.", 0x00202020, card_bg);
-            draw_string_1x(px + 14, py + 82, "Info you send may be visible.", 0x00202020, card_bg);
-        }
-    }
-
-    // Close control at the top-right (replaces the title-bar × in title-less
-    // mode). Its hit area is defined by window_check_close_click().
-    if (w->no_titlebar) {
-        int cs = WIN_CTRL_BTN;
-        int cbx = w->x + w->w - WIN_BORDER - 4 - cs;
-        int cby = w->y + WIN_BORDER;
-        uint32_t xc = 0x00C8C8C8; // light gray ×
-        int m = 5, e = cs - 5;
-        line(cbx + m, cby + m, cbx + e, cby + e, xc);
-        line(cbx + e, cby + m, cbx + m, cby + e, xc);
-    }
-    okai_draw_fetch_status(id);
+// Loading state of a tab for the chrome spinner: 2 = main document in
+// flight, 1 = resources in flight, 0 = idle.
+int okai_tab_busy(int id, int tab) {
+    if (id < 0 || id >= MAX_OKAIS || okais[id].win_id < 0) return 0;
+    if (req_has_main(id, tab)) return 2;
+    return okais[id].tabs[tab].sub_inflight > 0 ? 1 : 0;
 }
 
-
-// Fetch progress pill, bottom-left of the page area ("Loading 123K" in
-// small text). Pixel overlay like the chrome: painted while a fetch is in
-// flight for this window; okai_poll repaints the window once when it ends.
-static void okai_draw_fetch_status(int id) {
+// Bytes received so far for the active tab's fetches (main document alone
+// while it loads, else the sum over its resources), -1 when none run.
+long okai_fetch_bytes(int id, int* subs) {
     struct okai* b = &okais[id];
-    if (b->win_id < 0) return;
-    // Main document of the active tab, else the sum over its resources.
     long rxb = -1;
-    int subs = 0;
+    *subs = 0;
     for (int i = 0; i < FETCH_MAX; i++) {
         struct oreq* q = &reqs[i];
         if (!q->used || q->bi != id || q->tab != b->active_tab || q->h < 0) continue;
         long p = fetch_progress(q->h);
-        if (q->sub_id < 0) { rxb = p; subs = 0; break; }
+        if (q->sub_id < 0) { *subs = 0; return p; }
         rxb = (rxb < 0 ? 0 : rxb) + p;
-        subs++;
+        (*subs)++;
     }
-    if (rxb < 0) return;
-    struct window* w = window_get(b->win_id);
-    if (!w || !w->visible || w->minimized) return;
-    int sx, sy, pw, ph;
-    if (!page_geom(b, &sx, &sy, &pw, &ph)) return;
-    char msg[40];
-    int mi = 0;
-    const char* pre = subs ? "Loading resources " : "Loading ";
-    while (pre[mi] && mi < 30) { msg[mi] = pre[mi]; mi++; }
-    long kb = rxb / 1024;
-    char rev[12];
-    int rl = 0;
-    if (kb == 0) rev[rl++] = '0';
-    while (kb > 0 && rl < 11) { rev[rl++] = (char)('0' + kb % 10); kb /= 10; }
-    while (rl > 0 && mi < 37) msg[mi++] = rev[--rl];
-    msg[mi++] = 'K';
-    msg[mi] = 0;
-    int cw = 8, chh = 16; // small text: half-size glyphs
-    int x = sx + 8, y = sy + ph - chh - 8;
-    rect_fill(x - 6, y - 3, mi * cw + 12, chh + 6, 0x00202830);
-    for (int k = 0; k < mi; k++)
-        draw_char_sized(x + k * cw, y, msg[k], 0x00E8EEF5, 0x00202830, cw, chh);
+    return rxb;
 }
 
 // Scroll position indicator along the right edge of the page area.
@@ -2705,12 +2361,12 @@ static void okai_draw_scrollbar(int id) {
     int den = maxs, num = pos;
     while (den > 1000000) { den >>= 4; num >>= 4; }
     int ty = sy + 4 + (den > 0 ? (track - th) * num / den : 0);
-    round_rect_fill(sx + pw - 11, ty, 7, th, 0x00888E96, 3);
+    round_rect_fill(sx + pw - 10, ty, 6, th, 0x008F8F9D, 3);
 }
 
 // Chrome overlay for one window. desktop.c paints it right after the window
-// itself (in z-order). The security popup card (okai_draw_chrome) must sit ON
-// TOP of page content, so the page-area overlays go first and chrome last.
+// itself (in z-order). The security panel (okai_ui.c) must sit ON TOP of
+// page content, so the page-area overlays go first and chrome last.
 void okai_paint_overlays(int id) {
     // This *is* the live render path (desktop.c calls it every main-loop
     // iteration for each visible okai window). Stepping the animation here
@@ -2720,7 +2376,7 @@ void okai_paint_overlays(int id) {
     okai_anim_step(id);
     if (!okai_get(id)) return;
     okai_draw_scrollbar(id);
-    okai_draw_chrome(id);
+    okai_ui_paint(id);
 }
 
 // Draw okai's chrome overlay clipped to the given sub-rects (okai's window
@@ -2734,7 +2390,7 @@ void okai_paint_overlays_rects(int id, int rects[][4], int nr) {
     for (int i = 0; i < nr; i++) {
         graphics_set_clip(rects[i][0], rects[i][1], rects[i][2], rects[i][3]);
         okai_draw_scrollbar(id);
-        okai_draw_chrome(id);
+        okai_ui_paint(id);
     }
     graphics_clip_reset();
 }

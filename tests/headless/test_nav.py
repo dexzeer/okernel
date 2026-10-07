@@ -4,17 +4,14 @@ Convergence uses the kernel's [mse] btn=1 serial lines (logged on every press,
 anywhere on screen) via OkVM.click_screen; each button logs `[okai] nav
 action=N` when hit.
 
-Geometry (okai opens maximized at (0,0), border 2, no title bar): toolbar row
-y 40..98, buttons 30px wide with an 8px gap from x = 10 -> centers x = 25, 63,
-101, 139 at y = 69.
+Button positions come from okai's `[okai] ui` geometry log (vm.click_ui).
 History is set up first (home -> example.com) so back/forward really move.
 """
 import sys, os, time, re
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from okvm import OkVM
 
-TARGETS = [(1, 25, "back"), (2, 63, "forward"), (3, 101, "reload"), (4, 139, "home")]
-Y = 69
+TARGETS = [(1, "back", "back"), (2, "fwd", "forward"), (3, "reload", "reload"), (4, "home", "home")]
 
 vm = OkVM("nav")
 vm.wait_for("[mem] heap", timeout=40)
@@ -29,8 +26,8 @@ vm.wait_for("parse: count=", timeout=90)
 time.sleep(2)
 
 results = []
-for action, x, name in TARGETS:
-    ok = vm.click_screen(x, Y, r"nav action=%d" % action)
+for action, ui, name in TARGETS:
+    ok = vm.click_ui(ui, r"nav action=%d" % action)
     time.sleep(3)
     navs = re.findall(r"\[okai\] navigate (\S+)", vm.serial())
     last = navs[-1] if navs else ""

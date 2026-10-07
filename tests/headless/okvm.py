@@ -206,6 +206,60 @@ class OkVM:
             self.mon("mouse_move 0 0", 0.05)
         time.sleep(0.3)
 
+    def ui_rect(self, name):
+        """Latest chrome rect (x, y, w, h) for `name` from okai's `[okai] ui`
+        geometry lines: back fwd reload home url ident newtab min max close,
+        tab<i> tabx<i> (tab i / its close box). None if never logged."""
+        pat = re.compile(r"\[okai\] ui .*?\b%s=(-?\d+),(-?\d+),(\d+),(\d+)" % re.escape(name))
+        for line in reversed(self.serial().splitlines()):
+            m = pat.search(line)
+            if m:
+                return tuple(int(v) for v in m.groups())
+        return None
+
+    def taskbar_rect(self, win):
+        """Latest taskbar button rect (x, y, w, h) of window id `win`, from
+        taskbar.c's `[taskbar] btn win=N x,y,w,h` lines (logged whenever the
+        bar's layout changes). None if never logged."""
+        pat = re.compile(r"\[taskbar\] btn win=%d (\d+),(\d+),(\d+),(\d+)" % win)
+        for line in reversed(self.serial().splitlines()):
+            if "[taskbar] start=" in line:
+                break                      # older layout: not current
+            m = pat.search(line)
+            if m:
+                return tuple(int(v) for v in m.groups())
+        return None
+
+    def ui_center(self, name, timeout=20):
+        """Center of chrome element `name` (waits for its geometry line)."""
+        end = time.time() + timeout
+        while True:
+            r = self.ui_rect(name)
+            if r or time.time() > end:
+                break
+            time.sleep(0.5)
+        if not r:
+            raise RuntimeError("no [okai] ui geometry for " + name)
+        return r[0] + r[2] // 2, r[1] + r[3] // 2
+
+    def anchor(self, x, y):
+        """Click once at a harmless spot near (x, y) so the next dead-reckoned
+        move starts from a logged press (long moves drift ~50px — enough to
+        hit a neighbouring caption button such as close)."""
+        n = len(self.mse_presses())
+        self.premove(x, y)
+        self.click()
+        time.sleep(0.4)
+        return len(self.mse_presses()) > n
+
+    def click_ui(self, name, expect, tries=12, anchor=None):
+        """Closed-loop click on chrome element `name` until `expect` logs.
+        anchor=(x, y): probe-click there first (a harmless spot near it)."""
+        x, y = self.ui_center(name)
+        if anchor:
+            self.anchor(*anchor)
+        return self.click_screen(x, y, expect, tries)
+
     def click_screen(self, tx, ty, expect, tries=12, gain=4.8):
         """CLOSED-LOOP click at SCREEN (tx, ty) until the regex `expect`
         gains a match in the serial log (chrome buttons, tabs, anything

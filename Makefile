@@ -57,6 +57,8 @@ WEB_OBJ = src/web/wdom.o src/web/html5.o src/web/charset.o src/web/wurl.o \
           src/web/wdoc.o src/web/fontdata.o src/web/callstack.o \
           src/web/wjs.o src/web/wjs_dom.o src/web/wjs_prelude.o src/web/wcookie.o
 WEB_HEADERS := $(wildcard src/web/*.h) src/qjs/quickjs.h
+src/wallpaper.o: src/wallpaper.asm tools/wallpaper/wallpaper.jpg
+	$(AS) $(ASFLAGS) $< -o $@
 src/web/fontdata.o: src/web/fontdata.asm $(wildcard fonts/*.ttf)
 	$(AS) $(ASFLAGS) $< -o $@
 src/web/wjs_prelude.o: src/web/wjs_prelude.asm src/web/wjs_prelude.js
@@ -82,7 +84,7 @@ src/qjs/qjs_libc.o: src/qjs/qjs_libc.c $(QJS_HEADERS)
 src/qjs/%.o: src/qjs/%.c $(QJS_HEADERS)
 	$(CC) $(QJS_CFLAGS) -c $< -o $@
 src/userland_seed.o: $(USERLAND_GEN)
-DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/textslot.o src/cjk.o \
+DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/wallpaper.o src/textslot.o src/cjk.o \
               src/font_data.o $(WEB_OBJ) $(QJS_OBJ) \
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/aes.o src/crypto/chacha20.o src/crypto/poly1305.o \

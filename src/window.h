@@ -23,7 +23,11 @@ extern const uint32_t vga_to_rgb[16];
 #define MIN_WIN_H 80
 #define RESIZE_GRIP 16   // clickable corner zone
 #define WIN_GRIP_SIZE 12 // visible triangle legs
-#define WIN_CTRL_BTN 18  // size of the top-right close control for no-titlebar windows
+#define WIN_CTRL_W 46    // caption button width for no-titlebar windows (min/max/close,
+                         // full tab-strip height; the client draws them)
+#define WIN_CTRL_MIN   0
+#define WIN_CTRL_MAX   1
+#define WIN_CTRL_CLOSE 2
 
 #define CURSOR_W 12
 #define CURSOR_H 16
@@ -76,9 +80,8 @@ struct window {
     // go at the TAIL (PCB-offset rule applies to struct process, same habit).
     int pr_valid;
     int pr_c0, pr_r0, pr_c1, pr_r1;
-    int red_chrome;  // anarchy terminal chrome: flat red title bar + border,
-                     // centered title, square black buttons. Set explicitly
-                     // per window (reset in window_create against slot reuse).
+    int is_term;     // terminal window (taskbar icon). Set explicitly per
+                     // window (reset in window_create against slot reuse).
     // Client pixel surface (okai page): when set, the content area paints
     // these pixels instead of the cell grid. Placed at (pix_x, pix_y)
     // relative to the content origin; the rest of the content area gets
@@ -88,6 +91,8 @@ struct window {
     // Partial pixel repaint (surface coords, inclusive-exclusive); valid only
     // while dirty is set and no full repaint is pending.
     int pxd_valid, pxd_x0, pxd_y0, pxd_x1, pxd_y1;
+    // Maximize/restore: the rect to return to when un-maximizing.
+    int has_restore, restore_x, restore_y, restore_w, restore_h;
 };
 
 void window_init(void);
@@ -118,7 +123,7 @@ void window_clear(int id);
 void window_set_font_scale(int id, int scale);
 void window_set_close_button(int id, int has_close);
 void window_set_minimize_button(int id, int has_min);
-void window_set_red_chrome(int id, int flag); // flat-red anarchy terminal chrome
+void window_set_terminal(int id, int flag); // mark as a terminal (taskbar icon)
 void window_set_no_titlebar(int id, int flag);
 void window_set_hide_cursor(int id, int flag);
 // Attach (px != NULL) or detach a client pixel surface; marks the window dirty.
@@ -127,6 +132,13 @@ void window_set_pixels(int id, const uint32_t* px, int x, int y, int w, int h, i
 void window_dirty_pixels(int id, int x, int y, int w, int h);
 int window_check_close_click(int id, int mx, int my);
 int window_check_minimize_click(int id, int mx, int my);
+int window_check_maximize_click(int id, int mx, int my);
+// Caption button rect (WIN_CTRL_*) of a no-titlebar window, screen coords in
+// r = {x, y, w, h}; 0 if the window has no such control.
+int window_ctrl_rect(int id, int which, int r[4]);
+// Maximized = covers the whole work area (screen minus taskbar).
+int window_is_maximized(int id);
+void window_toggle_maximize(int id);
 void window_minimize(int id);
 void window_restore(int id);
 void window_resize(int id, int w, int h);
@@ -139,7 +151,6 @@ void window_set_content_bg(int id, uint8_t bg);
 void window_set_content_bg_rgb(int id, uint32_t bg);
 int window_color_is_light(uint8_t idx);
 int window_rgb_is_light(uint32_t c);
-void window_draw_taskbar(void);
 struct window* window_get(int id);
 void window_get_cursor(int id, int* out_x, int* out_y);
 void window_set_title(int id, const char* title);

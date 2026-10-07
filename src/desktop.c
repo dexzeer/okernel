@@ -5,8 +5,9 @@
 #include "net/e1000.h"
 #include "crypto/tls_client.h"  // TLS_FAIL_* reason codes for the no-downgrade gate
 #include "rtc.h"
+#include "taskbar.h"
 #include "graphics.h"
-#include "wallpaper.h"
+#include "web/image.h"
 #include "window.h"
 #include "paging.h"
 #include "memlayout.h"
@@ -312,7 +313,7 @@ static void desktop_paint_rect_skip(int skip_win, int x, int y, int w, int h) {
     }
 
     if (y + h > SCREEN_H - TASKBAR_H) {
-        window_draw_taskbar();
+        taskbar_paint();
     }
 
     graphics_clip_reset();
@@ -631,7 +632,7 @@ static int create_terminal(void) {
     int win_id = window_create("Terminal", x, y, 900, 650);
     window_set_close_button(win_id, 1);
     window_set_minimize_button(win_id, 1);
-    window_set_red_chrome(win_id, 1);
+    window_set_terminal(win_id, 1);
     term_wins[term_count] = win_id;
     term_lens[term_count] = 0;
     term_bufs[term_count][0] = 0;
@@ -1382,7 +1383,18 @@ void kernel_main(uint32_t mboot_phys) {
     okai_init();
 
     // Cache wallpaper for fast blitting
-    graphics_cache_wallpaper(wp_pixels, wp_palette, WP_W, WP_H);
+    {
+        extern const uint8_t wp_jpg[], wp_jpg_end[];
+        int ww = 0, wh = 0;
+        uint32_t* wpx = 0;
+        if (wimage_decode(wp_jpg, (int)(wp_jpg_end - wp_jpg), 0, &ww, &wh, &wpx) &&
+            ww == SCREEN_W && wh == SCREEN_H) {
+            graphics_set_wallpaper(wpx);
+        } else {
+            serial_puts("[gfx] wallpaper decode failed\n");
+            if (wpx) kfree(wpx);
+        }
+    }
 
     // Draw initial wallpaper
     graphics_blit_wallpaper();
@@ -1396,31 +1408,18 @@ void kernel_main(uint32_t mboot_phys) {
     outb(0x40, 0x9C);            // divisor lo  (1193182 / 100 = 11932 = 0x2E9C)
     outb(0x40, 0x2E);            // divisor hi
 
-    // Create main terminal — extra-wide: the KAnarchy block logo is 109
-    // columns and must never wrap ((1400-2*WIN_BORDER)/12 = 116 cols).
-    term_wins[0] = window_create("Terminal", 260, 30, 1400, 650);
+    // Create main terminal: a plain shell, just the prompt (no banner).
+    // 72x24 cells (12x24 content glyphs), left of the wallpaper emblem and
+    // below the first desktop-icon row.
+    term_wins[0] = window_create("Terminal", 16, 128, 72 * CONTENT_GW + 2 * WIN_BORDER,
+                                 24 * CONTENT_GH + WIN_TITLE_H + 2 * WIN_BORDER);
     window_set_close_button(term_wins[0], 1);
     window_set_minimize_button(term_wins[0], 1);
-    window_set_red_chrome(term_wins[0], 1);
+    window_set_terminal(term_wins[0], 1);
     term_count = 1;
     active_term_idx = 0;
     window_set_focus(term_wins[0]);
 
-    window_set_text_color(term_wins[0], 12, 0);
-    window_puts(term_wins[0], " \x01\x01\x01\x01\x01   \x01\x01\x01\x01   \x01\x01\x01\x01\x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01     \x01\x01\x01\x01\x01\x01\x01\x01\x01  \x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01 \x01\x01\x01\x01\x01 \x01\x01\x01\x01\x01\n");
-    window_puts(term_wins[0], "\x02\x02\x01\x01\x01   \x01\x01\x01\x02   \x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01 \x02\x02\x01\x01\x01\x01\x01\x01 \x02\x02\x01\x01\x01   \x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01 \x02\x02\x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01   \x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01\x02\x02\x01\x01\x01   \x02\x02\x01\x01\x01 \x02\x02\x01\x01\x01 \x02\x02\x01\x01\x01 \n");
-    window_puts(term_wins[0], " \x02\x01\x01\x01  \x01\x01\x01    \x02\x01\x01\x01    \x02\x01\x01\x01  \x02\x01\x01\x01\x02\x01\x01\x01 \x02\x01\x01\x01  \x02\x01\x01\x01    \x02\x01\x01\x01  \x02\x01\x01\x01    \x02\x01\x01\x01  \x01\x01\x01     \x02\x02\x02  \x02\x01\x01\x01    \x02\x01\x01\x01  \x02\x02\x01\x01\x01 \x01\x01\x01  \n");
-    window_puts(term_wins[0], " \x02\x01\x01\x01\x01\x01\x01\x01     \x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01  \x02\x01\x01\x01\x02\x02\x01\x01\x01\x02\x01\x01\x01  \x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01  \x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01  \x02\x01\x01\x01          \x02\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01\x01   \x02\x02\x01\x01\x01\x01\x01   \n");
-    window_puts(term_wins[0], " \x02\x01\x01\x01\x02\x02\x01\x01\x01    \x02\x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01  \x02\x01\x01\x01 \x02\x02\x01\x01\x01\x01\x01\x01  \x02\x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01  \x02\x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01 \x02\x01\x01\x01          \x02\x01\x01\x01\x02\x02\x02\x02\x02\x01\x01\x01    \x02\x02\x01\x01\x01    \n");
-    window_puts(term_wins[0], " \x02\x01\x01\x01 \x02\x02\x01\x01\x01   \x02\x01\x01\x01    \x02\x01\x01\x01  \x02\x01\x01\x01  \x02\x02\x01\x01\x01\x01\x01  \x02\x01\x01\x01    \x02\x01\x01\x01  \x02\x01\x01\x01    \x02\x01\x01\x01 \x02\x02\x01\x01\x01     \x01\x01\x01 \x02\x01\x01\x01    \x02\x01\x01\x01     \x02\x01\x01\x01    \n");
-    window_puts(term_wins[0], " \x01\x01\x01\x01\x01 \x02\x02\x01\x01\x01\x01 \x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01 \x01\x01\x01\x01\x01  \x02\x02\x01\x01\x01\x01\x01 \x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01 \x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01 \x02\x02\x01\x01\x01\x01\x01\x01\x01\x01\x01  \x01\x01\x01\x01\x01   \x01\x01\x01\x01\x01    \x01\x01\x01\x01\x01   \n");
-    window_puts(term_wins[0], "\x02\x02\x02\x02\x02   \x02\x02\x02\x02 \x02\x02\x02\x02\x02   \x02\x02\x02\x02\x02 \x02\x02\x02\x02\x02    \x02\x02\x02\x02\x02 \x02\x02\x02\x02\x02   \x02\x02\x02\x02\x02 \x02\x02\x02\x02\x02   \x02\x02\x02\x02\x02   \x02\x02\x02\x02\x02\x02\x02\x02\x02  \x02\x02\x02\x02\x02   \x02\x02\x02\x02\x02    \x02\x02\x02\x02\x02    \n");
-    window_set_text_color(term_wins[0], 15, 0);
-    window_puts(term_wins[0], "Welcome to KAnarchy OS v0.8\n\n");
-    window_set_text_color(term_wins[0], 8, 0);
-    window_puts(term_wins[0], "Type 'help' for commands.\n");
-    window_puts(term_wins[0], "Type 'terminal' for new window.\n");
-    window_puts(term_wins[0], "Type 'exit' to close this terminal.\n\n");
     window_set_text_color(term_wins[0], 15, 0);
     shell_prompt(term_wins[0]);
 
@@ -2003,33 +2002,26 @@ void kernel_main(uint32_t mboot_phys) {
         if (mb && !mouse_down) {
             int clicked = 0;
 
-            // Check taskbar clicks (bottom 20px)
+            // Taskbar clicks (geometry from taskbar.c's layout)
             if (my >= SCREEN_H - TASKBAR_H) {
-                // Count visible windows to match dynamic width
-                int vis_count = 0;
-                for (int i = 0; i < MAX_WINDOWS; i++) {
-                    if (window_get(i) && window_get(i)->visible) vis_count++;
-                }
-                if (vis_count > 0) {
-                    int total_pad = (vis_count + 1) * 6;
-                    int btn_w = (SCREEN_W - total_pad) / vis_count;
-                    if (btn_w > 180) btn_w = 180;
-                    if (btn_w < 60) btn_w = 60;
-
-                    int tx = 6;
-                    for (int i = 0; i < MAX_WINDOWS; i++) {
-                        struct window* w = window_get(i);
-                        if (!w || !w->visible) continue;
-                        if (mx >= tx && mx < tx + btn_w) {
-                            window_restore(i);
-                            window_set_focus(i);
-                            int tidx = find_term_idx(i);
-                            if (tidx >= 0) active_term_idx = tidx;
-                            clicked = 1;
-                            break;
-                        }
-                        tx += btn_w + 6;
+                int hit = taskbar_hit(mx, my);
+                clicked = 1;
+                if (hit == TB_HIT_START) {
+                    serial_puts("[taskbar] start\n");
+                    int nw = create_terminal();
+                    if (nw >= 0) {
+                        active_term_idx = term_count - 1;
+                        window_set_focus(nw);
+                        window_set_text_color(nw, 15, 0);
+                        shell_prompt(nw);
                     }
+                } else if (hit >= 0) {
+                    struct window* w = window_get(hit);
+                    if (w->minimized) serial_printf("[win] %d restored from taskbar\n", hit);
+                    window_restore(hit);
+                    window_set_focus(hit);
+                    int tidx = find_term_idx(hit);
+                    if (tidx >= 0) active_term_idx = tidx;
                 }
             }
 
@@ -2085,9 +2077,20 @@ void kernel_main(uint32_t mboot_phys) {
 
                     if (window_check_minimize_click(i, mx, my)) {
                         window_minimize(i);
+                        serial_printf("[win] %d minimized\n", i);
                         // window_minimize sets needs_redraw — the periodic
                         // full-redraw section rebuilds wallpaper and marks all
                         // remaining windows dirty later this same frame
+                        clicked = 1;
+                        break;
+                    }
+
+                    if (window_check_maximize_click(i, mx, my)) {
+                        window_toggle_maximize(i);
+                        window_set_focus(i);
+                        serial_printf("[win] %d %s\n", i, window_is_maximized(i) ? "maximized" : "restored");
+                        int br_id = okai_find_by_win(i);
+                        if (br_id >= 0) okai_render_content(br_id); // new viewport
                         clicked = 1;
                         break;
                     }
@@ -2176,6 +2179,7 @@ void kernel_main(uint32_t mboot_phys) {
                             if (br_id2 >= 0 && okai_addr_bar_hit(br_id2, mx, my)) {
                                 struct okai* ok = okai_get(br_id2);
                                 if (ok && !ok->addr_bar_focused) {
+                                    serial_printf("[okai] address bar focused\n");
                                     ok->addr_bar_focused = 1;
                                     ok->addr_input_len = 0;
                                     ok->addr_input[0] = 0;
@@ -2285,21 +2289,6 @@ void kernel_main(uint32_t mboot_phys) {
                         w->x = nx; w->y = ny;
                         needs_redraw = 1;
                     } else {
-                        // wipe the FPS-box HUD only if it overlaps the old
-                        // window footprint — most drags are far from the
-                        // top-right corner, saving a full recomposite call
-                        {
-                            int fps_rx = SCREEN_W - (9 * CHAR_W + 8) - 12;
-                            int fps_ry = 4;
-                            int fps_rw = (9 * CHAR_W + 8) + 16;
-                            int fps_rh = CHAR_H + 8;
-                            if (ox < fps_rx + fps_rw && ox + ow > fps_rx &&
-                                oy < fps_ry + fps_rh && oy + oh > fps_ry) {
-                                desktop_paint_rect_skip(drag_win,
-                                    fps_rx, fps_ry, fps_rw, fps_rh);
-                            }
-                        }
-
                         w->x = nx; w->y = ny;
                         graphics_blit_rect(ox, oy, ow, oh, nx - ox, ny - oy);
 
@@ -2443,6 +2432,7 @@ void kernel_main(uint32_t mboot_phys) {
                     int want = painted ||
                         (okw && okw->chrome_dirty) ||
                         okai_is_animating(ob) ||
+                        okai_ui_needs_paint(ob) ||
                         (tick_count - chrome_last_paint >= 120);
                     if (want) {
                         int rects[64][4], nr = 1;
@@ -2486,51 +2476,18 @@ void kernel_main(uint32_t mboot_phys) {
                 }
             }
         }
-        // Taskbar: state-gated, not per-frame. It has no clock/animation —
-        // only the window set (count/focus/minimize/titles) changes it, and
-        // region repairs (cursor erase, drags) repaint it when overlapped.
-        // The old code gradient-filled 1920px + bilinear title strings every
-        // main-loop spin.
-        {
-            static uint32_t last_taskbar_sig = 0xFFFFFFFF;
-            uint32_t sig = 0;
-            for (int i = 0; i < MAX_WINDOWS; i++) {
-                struct window* tw = window_get(i);
-                if (tw && tw->visible) {
-                    sig = sig * 33 + (uint32_t)(i + 1);
-                    sig = sig * 33 + (uint32_t)(tw->focused ? 7 : 1);
-                    sig = sig * 33 + (uint32_t)(tw->minimized ? 3 : 5);
-                    for (int k = 0; tw->title[k]; k++)
-                        sig = sig * 33 + (uint32_t)(unsigned char)tw->title[k];
-                }
-            }
-            if (sig != last_taskbar_sig) {
-                window_draw_taskbar();
-                last_taskbar_sig = sig;
-            }
-        }
-
-        // FPS counter (drawn before the cursor so the sprite sits on top)
-        static int g_show_fps = 1; // debug HUD; set 0 to leave the desktop clean
+        // FPS: frames actually presented per second (serial is ground truth).
         if (tick_count - last_fps_tick >= 100) {
             fps = frame_count;
             frame_count = 0;
             last_fps_tick = tick_count;
             serial_printf("[fps] %u\n", fps); // 1Hz, headless perf ground truth
         }
-        if (g_show_fps) {
-            // FPS counter — box sized from glyph metrics ("FPS: 9999" = 9 cells)
-            char fps_buf[16] = "FPS: ";
-            char num[8];
-            put_uint(num, fps);
-            int fi = 5;
-            int ni = 0;
-            while (num[ni]) fps_buf[fi++] = num[ni++];
-            fps_buf[fi] = 0;
-            int fps_w = 9 * CHAR_W + 8;
-            rect_fill(SCREEN_W - fps_w - 4, 4, fps_w, CHAR_H + 8, 0x00000000);
-            draw_string(SCREEN_W - fps_w, 8, fps_buf, 0x00FFFFFF, 0x00000000);
-        }
+        // Taskbar (window buttons, FPS chip, clock): state-gated — taskbar.c
+        // re-renders its cached strip only when its signature changes (window
+        // set/focus/titles, hover, fps, clock minute) and blits it then.
+        // Drawn before the cursor so the sprite sits on top.
+        taskbar_update(fps);
 
         // Cursor composited last. With the backbuffer now persistent, we erase
         // the old sprite (restoring the underlying scene via desktop_paint_rect)

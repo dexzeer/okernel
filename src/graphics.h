@@ -109,6 +109,7 @@ void graphics_mark_dirty(int y);
 // Clip rectangle
 void graphics_set_clip(int x, int y, int w, int h);
 void graphics_clip_reset(void);
+void graphics_get_clip(int* x0, int* y0, int* x1, int* y1); // [x0,x1) x [y0,y1)
 
 // Direct backbuffer write
 void graphics_write_pixel(int x, int y, uint32_t color);
@@ -123,7 +124,10 @@ void graphics_blit_rect(int sx, int sy, int w, int h, int dx, int dy);
 
 // Wallpaper
 void graphics_cache_wallpaper(const unsigned char* pixels, const unsigned char* palette, int src_w, int src_h);
+// Adopt a SCREEN_W x SCREEN_H heap buffer of 0x??RRGGBB pixels as the wallpaper.
+void graphics_set_wallpaper(uint32_t* px);
 void graphics_blit_wallpaper(void);
+const uint32_t* graphics_wallpaper(void); // SCREEN_W x SCREEN_H or NULL
 void graphics_blit_wallpaper_rect(int x, int y, int w, int h);
 
 // Fill entire screen

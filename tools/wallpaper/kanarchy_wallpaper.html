@@ -1,0 +1,287 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>KAnarchy wallpaper</title>
+<!--
+  KAnarchy desktop wallpaper: a raymarched 3D scene (WebGL fragment shader).
+  A dark brushed-metal "K" inside a polished red ring floats over a glossy
+  black floor, lit by a cool key light and a red rim light, in red haze.
+
+  Render the kernel's wallpaper (1920x1080, 2x2 supersampled) with headless
+  Edge/Chrome — see tools/wallpaper/render.sh. Open it in a browser to preview;
+  query params: ?w=1920&h=1080&ss=2
+-->
+<style>
+  html, body { margin: 0; background: #050507; overflow: hidden; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+uniform vec2 R;          // output size (px)
+uniform float SS;        // supersampling per axis
+
+#define MAXD 40.0
+
+mat2 rot(float a) { float c = cos(a), s = sin(a); return mat2(c, -s, s, c); }
+
+float sdBox(vec3 p, vec3 b) {
+  vec3 q = abs(p) - b;
+  return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0);
+}
+float sdRBox(vec3 p, vec3 b, float r) { return sdBox(p, b - r) - r; }
+float sdTorus(vec3 p, vec2 t) {            // ring in the xy plane
+  vec2 q = vec2(length(p.xy) - t.x, p.z);
+  return length(q) - t.y;
+}
+
+// emblem space: K + rings, centered at the origin, facing +z
+vec3 toEmblem(vec3 p) {
+  p -= vec3(1.15, 1.62, 0.0);
+  p /= 1.12;
+  p.xz = rot(0.42) * p.xz;
+  p.yz = rot(-0.08) * p.yz;
+  return p;
+}
+
+float sdK(vec3 p) {
+  const float T = 0.17;                    // half depth
+  float stem = sdRBox(p - vec3(-0.34, 0.0, 0.0), vec3(0.135, 0.74, T), 0.03);
+  vec3 a = p - vec3(0.12, 0.37, 0.0);
+  a.xy = rot(0.885) * a.xy;                // upper arm, ~51 deg
+  float arm = sdRBox(a, vec3(0.52, 0.118, T), 0.03);
+  vec3 l = p - vec3(0.18, -0.35, 0.0);
+  l.xy = rot(-1.0) * l.xy;                  // lower leg, ~-57 deg
+  float leg = sdRBox(l, vec3(0.52, 0.118, T), 0.03);
+  float k = min(stem, min(arm, leg));
+  return max(k, sdBox(p - vec3(0.02, 0.0, 0.0), vec3(0.52, 0.74, T + 0.02)));
+}
+
+// material ids: 1 = K (dark metal), 2 = red ring, 3 = thin glow ring, 4 = floor
+vec2 map(vec3 p) {
+  vec3 e = toEmblem(p);
+  vec2 r = vec2(sdK(e), 1.0);
+  float ring = sdTorus(e, vec2(1.22, 0.095));
+  if (ring < r.x) r = vec2(ring, 2.0);
+  float halo = sdTorus(e, vec2(1.42, 0.018));
+  if (halo < r.x) r = vec2(halo, 3.0);
+  float floorD = p.y;
+  if (floorD < r.x) r = vec2(floorD, 4.0);
+  return r;
+}
+
+vec3 normalAt(vec3 p) {
+  vec2 e = vec2(0.0008, 0.0);
+  return normalize(vec3(map(p + e.xyy).x - map(p - e.xyy).x,
+                        map(p + e.yxy).x - map(p - e.yxy).x,
+                        map(p + e.yyx).x - map(p - e.yyx).x));
+}
+
+vec2 march(vec3 ro, vec3 rd, float tmax) {
+  float t = 0.0;
+  for (int i = 0; i < 160; i++) {
+    vec2 h = map(ro + rd * t);
+    if (h.x < 0.0004 * t + 0.0002) return vec2(t, h.y);
+    t += h.x * 0.9;
+    if (t > tmax) break;
+  }
+  return vec2(-1.0, 0.0);
+}
+
+float softShadow(vec3 ro, vec3 rd) {
+  float res = 1.0, t = 0.02;
+  for (int i = 0; i < 48; i++) {
+    float h = map(ro + rd * t).x;
+    res = min(res, 10.0 * h / t);
+    t += clamp(h, 0.02, 0.25);
+    if (res < 0.002 || t > 8.0) break;
+  }
+  return clamp(res, 0.0, 1.0);
+}
+
+float ao(vec3 p, vec3 n) {
+  float o = 0.0, s = 1.0;
+  for (int i = 1; i <= 5; i++) {
+    float h = 0.03 * float(i);
+    o += (h - map(p + n * h).x) * s;
+    s *= 0.7;
+  }
+  return clamp(1.0 - 3.0 * o, 0.0, 1.0);
+}
+
+float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+
+const vec3 KEY_DIR = normalize(vec3(-0.6, 0.85, 0.55));
+const vec3 RIM_DIR = normalize(vec3(0.5, 0.35, -0.9));
+const vec3 RED = vec3(0.95, 0.07, 0.10);
+
+// studio environment seen in chrome: two soft white light strips + red floor bounce
+vec3 studio(vec3 r) {
+  float a = smoothstep(0.80, 0.97, dot(r, normalize(vec3(-0.7, 0.6, 0.4))));
+  float b = smoothstep(0.90, 0.99, dot(r, normalize(vec3(0.35, 0.9, 0.3))));
+  vec3 c = vec3(0.85, 0.88, 0.95) * (a * 0.9 + b * 0.6);
+  c += RED * 0.10 * smoothstep(0.0, -0.6, r.y);
+  return c;
+}
+
+vec3 sky(vec3 rd) {
+  // near-black with a red haze band behind the emblem and a faint cool top
+  float h = clamp(rd.y * 1.6 + 0.15, 0.0, 1.0);
+  vec3 c = mix(vec3(0.020, 0.008, 0.010), vec3(0.006, 0.007, 0.012), h);
+  vec3 toE = normalize(vec3(1.15, 1.62, 0.0) - vec3(0.0, 1.45, 7.2));
+  float g = max(dot(rd, toE), 0.0);
+  c += RED * (pow(g, 60.0) * 0.30 + pow(g, 12.0) * 0.045);
+  return c;
+}
+
+// surface shading for a hit (no reflection recursion)
+vec3 shade(vec3 p, vec3 rd, float m, out float refl) {
+  vec3 n = normalAt(p);
+  vec3 v = -rd;
+  float occ = ao(p, n);
+  float sh = softShadow(p + n * 0.004, KEY_DIR);
+  float dif = max(dot(n, KEY_DIR), 0.0);
+  float rim = max(dot(n, RIM_DIR), 0.0);
+  vec3 hk = normalize(KEY_DIR + v), hr = normalize(RIM_DIR + v);
+  float fres = pow(1.0 - max(dot(n, v), 0.0), 5.0);
+  vec3 col;
+  refl = 0.0;
+  if (m < 1.5) {                            // K: dark polished chrome
+    vec3 base = vec3(0.05, 0.05, 0.06);
+    float spk = pow(max(dot(n, hk), 0.0), 120.0);
+    float spr = pow(max(dot(n, hr), 0.0), 40.0);
+    col = base * (0.25 + 1.4 * dif * sh) * occ;
+    col += vec3(0.9, 0.92, 1.0) * spk * sh * 1.6;
+    col += studio(reflect(rd, n)) * (0.35 + 0.65 * fres) * occ;
+    col += RED * (spr * 2.2 + rim * 0.35) ;
+    col += RED * fres * 0.6;
+    // edge glow along the bevels (front-facing rim)
+    float edge = 1.0 - smoothstep(0.0, 0.25, abs(n.z));
+    col += RED * edge * 0.18 * occ;
+  } else if (m < 2.5) {                     // ring: polished red lacquer
+    vec3 base = vec3(0.55, 0.02, 0.04);
+    float spk = pow(max(dot(n, hk), 0.0), 140.0);
+    float spr = pow(max(dot(n, hr), 0.0), 30.0);
+    col = base * (0.12 + 1.3 * dif * sh) * occ;
+    col += vec3(1.0, 0.85, 0.85) * spk * sh * 1.8;
+    col += vec3(1.0, 0.25, 0.25) * spr * 1.2;
+    col += RED * fres * 0.8;
+  } else if (m < 3.5) {                     // halo: emissive
+    col = RED * 2.2 + vec3(0.4, 0.05, 0.05);
+  } else {                                  // floor: glossy black tiles
+    vec2 g = abs(fract(p.xz * 0.5) - 0.5);
+    float line = smoothstep(0.012, 0.0, min(g.x, g.y) - 0.002);
+    float fade = exp(-0.12 * length(p.xz - vec2(1.0, 0.0)));
+    col = vec3(0.012, 0.010, 0.013) * (0.4 + dif * sh);
+    col += RED * line * 0.10 * fade;
+    // light pool under the emblem
+    float pool = exp(-0.55 * length(p.xz - vec2(1.15, 0.0)));
+    col += RED * pool * 0.05 * sh;
+    refl = 0.35 * (0.2 + 0.8 * fres) + 0.12;
+  }
+  return col;
+}
+
+vec3 render(vec3 ro, vec3 rd) {
+  vec2 h = march(ro, rd, MAXD);
+  if (h.x < 0.0) return sky(rd);
+  vec3 p = ro + rd * h.x;
+  float refl;
+  vec3 col = shade(p, rd, h.y, refl);
+  if (refl > 0.0) {                         // one reflection bounce (floor)
+    vec3 n = vec3(0.0, 1.0, 0.0);
+    vec3 r = reflect(rd, normalize(n));
+    vec2 h2 = march(p + n * 0.003, r, 20.0);
+    vec3 rc;
+    if (h2.x < 0.0) rc = sky(r);
+    else { float d; rc = shade(p + n * 0.003 + r * h2.x, r, h2.y, d); }
+    col += rc * refl;
+  }
+  // distance fog toward the haze
+  float f = 1.0 - exp(-0.0016 * h.x * h.x);
+  col = mix(col, sky(rd), clamp(f, 0.0, 0.9));
+  return col;
+}
+
+void main() {
+  vec3 ro = vec3(0.0, 1.45, 7.2);
+  vec3 ta = vec3(0.05, 1.30, 0.0);
+  vec3 ww = normalize(ta - ro), uu = normalize(cross(ww, vec3(0.0, 1.0, 0.0))), vv = cross(uu, ww);
+  vec3 acc = vec3(0.0);
+  for (float j = 0.0; j < 4.0; j++) {
+    if (j >= SS) break;
+    for (float i = 0.0; i < 4.0; i++) {
+      if (i >= SS) break;
+      vec2 o = (vec2(i, j) + 0.5) / SS - 0.5;
+      vec2 q = (2.0 * (gl_FragCoord.xy + o) - R) / R.y;
+      vec3 rd = normalize(q.x * uu + q.y * vv + 2.6 * ww);
+      acc += render(ro, rd);
+    }
+  }
+  vec3 col = acc / (SS * SS);
+  // drifting embers (screen-space bokeh)
+  for (int i = 0; i < 40; i++) {
+    float fi = float(i);
+    vec2 c = vec2(hash(vec2(fi, 1.3)), hash(vec2(fi, 7.1)));
+    c = vec2(0.25 + c.x * 0.75, 0.05 + c.y * 0.9) * R;
+    float rad = (2.0 + 9.0 * pow(hash(vec2(fi, 3.7)), 3.0)) * R.y / 1080.0;
+    float d = length(gl_FragCoord.xy - c);
+    float disc = smoothstep(rad, rad * 0.55, d);
+    float glow = exp(-d / (rad * 2.5)) * 0.25;
+    col += RED * (disc * 0.35 + glow) * (0.25 + 0.75 * hash(vec2(fi, 9.9)));
+  }
+  // filmic tone map + vignette + grain
+  col = col / (col + 0.55) * 1.25;
+  vec2 uv = gl_FragCoord.xy / R;
+  col *= 0.55 + 0.45 * pow(16.0 * uv.x * uv.y * (1.0 - uv.x) * (1.0 - uv.y), 0.22);
+  col = pow(clamp(col, 0.0, 1.0), vec3(0.85));
+  col += (hash(gl_FragCoord.xy) - 0.5) * 0.012;
+  gl_FragColor = vec4(col, 1.0);
+}
+</script>
+<script>
+(function () {
+  const q = new URLSearchParams(location.search);
+  const W = +(q.get("w") || 1920), H = +(q.get("h") || 1080), SS = +(q.get("ss") || 2);
+  const c = document.getElementById("c");
+  c.width = W; c.height = H;
+  c.style.width = W + "px"; c.style.height = H + "px";
+  const gl = c.getContext("webgl", { preserveDrawingBuffer: true, antialias: false });
+  if (!gl) { document.body.textContent = "WebGL unavailable"; return; }
+  function sh(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  const pr = gl.createProgram();
+  gl.attachShader(pr, sh(gl.VERTEX_SHADER, "attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}"));
+  gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, document.getElementById("fs").textContent));
+  gl.linkProgram(pr); gl.useProgram(pr);
+  const b = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, b);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);
+  gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+  gl.uniform2f(gl.getUniformLocation(pr, "R"), W, H);
+  gl.uniform1f(gl.getUniformLocation(pr, "SS"), SS);
+  gl.enable(gl.SCISSOR_TEST);
+  // render in strips so a software rasterizer never hits a GPU watchdog
+  const STRIP = 36;
+  let y = 0;
+  function step() {
+    gl.scissor(0, y, W, STRIP);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.finish();
+    y += STRIP;
+    if (y < H) setTimeout(step, 0);
+    else document.title = "done";
+  }
+  step();
+})();
+</script>
+</body>
+</html>
