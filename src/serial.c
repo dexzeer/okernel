@@ -16,9 +16,18 @@ static int serial_transmit_empty(void) {
     return inb(0x3F8 + 5) & 0x20;
 }
 
+// FIFO mode (FCR 0xC7 above): "transmitter empty" means the whole 16-byte
+// FIFO is free, so one status read covers 16 characters. Every port access
+// is an emulated I/O exit — this halves the cost of serial logging.
+static int tx_room = 0;
+
 void serial_putchar(char c) {
-    while (!serial_transmit_empty());
+    if (tx_room == 0) {
+        while (!serial_transmit_empty());
+        tx_room = 16;
+    }
     outb(0x3F8, c);
+    tx_room--;
 }
 
 void serial_puts(const char* str) {

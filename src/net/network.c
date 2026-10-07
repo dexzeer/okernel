@@ -1,22 +1,16 @@
 #include "network.h"
 #include "../string.h"
+#include "../memory.h"
 #include "../crypto/tls_client.h" // http_parse_framing (shared framing)
 #include "e1000.h"
 #include "../io.h"
 #include "../serial.h"
-#include "tls_net.h"
 
 static uint8_t our_ip[4] = {10, 0, 2, 15};    // QEMU user-mode default
 static uint8_t gateway_ip[4] = {10, 0, 2, 2};  // QEMU user-mode gateway
+static uint8_t dns_server_ip[4] = {10, 0, 2, 3}; // QEMU SLIRP DNS
 static uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 static const char hex[] = "0123456789abcdef";
-
-static void print_hex32(uint32_t val) {
-    for (int s = 28; s >= 0; s -= 4)
-        serial_putchar(hex[(val >> s) & 0xF]);
-}
-
-static int tls_dumped = 0; // one-shot dump of first TLS segment bytes
 
 // ARP cache (4 entries)
 #define ARP_CACHE_SIZE 4
@@ -29,64 +23,19 @@ typedef void (*udp_callback_t)(uint8_t* data, uint32_t len, uint16_t src_port, u
 static udp_callback_t udp_callback = 0;
 static uint16_t udp_callback_port = 0;
 
-// DNS resolver state
-static uint16_t dns_tx_id = 0x1234;
-static uint32_t dns_resolved_ip = 0;
-static int dns_resolved = 0;
-static int dns_pending = 0;
-// The host the cached dns_resolved_ip belongs to. DNS has no per-host cache,
-// so we must only reuse the cached IP when the requested host matches — otherwise
-// a second navigation would connect to the first host's IP and hang.
-static char dns_resolved_host[128] = {0};
-
 // Pending operation state (for retry after ARP resolves)
 static int ping_pending = 0;
 static uint8_t ping_target_ip[4];
 static uint16_t ping_id = 0;
 static uint16_t ping_seq = 0;
 
-static char dns_pending_host[128] = {0};
-static int dns_retry_pending = 0;
-// Host of the last DNS query actually TRANSMITTED (set where the query goes
-// on the wire, after ARP). On a definitive DNS failure (RCODE error or a
-// response with no A record), this tells us whose pending request to abort.
-static char dns_query_host[128] = {0};
-
-static char http_pending_host[128] = {0};
-// Paths carry real-site query strings (wikipedia's load.php stylesheet URLs
-// run 300+ bytes) — the old 128-byte copy truncated them into 404s.
-#define NET_PATH_MAX 2048   // script module batches (Wikipedia load.php) run ~1.5KB
-static char http_pending_path[NET_PATH_MAX] = {0};
-// Accept-Encoding: gzip opt-in (okai decodes; raw saves must not get gzip).
-// Latched per request in http_get_port: the GET itself is built later.
-int net_accept_gzip = 0;
-static int http_req_gzip = 0;
-int net_accept_html = 0;
-static int http_req_html = 0;
-const char* net_extra_headers = 0;
-static char http_req_extra[NET_EXTRA_MAX];   // latched copy (DNS retries reuse it)
-static int http_retry_pending = 0;
-static uint16_t http_pending_port = 80; // port for the parked request
-// Connection attempts for the current (in-flight) request. Bounded so an
-// unreachable host gives up instead of letting net_poll re-fire http_get forever
-// (which would wedge the single-owner fetch model in okai.c).
-static int http_conn_attempts = 0;
-#define HTTP_MAX_CONN_ATTEMPTS 4
-
-// Copy a host/path string, always NUL-terminating at the ACTUAL length.
-// The old pattern (copy loop + dst[127]=0) left the previous, longer value's
-// tail in place when the new value was shorter: fetching example.com then
-// iana.org left "iana.orgcom" in dns_resolved_host, so dns_host_matches()
-// failed forever and the okai fetch stalled in HP_DNS until timeout
-// (the "clicked link opens a black window" bug).
+// Copy a host string, always NUL-terminating at the ACTUAL length.
+// (A copy loop + dst[127]=0 once left the previous, longer value's tail in
+// place: example.com then iana.org gave "iana.orgcom" and the lookup never
+// matched — the "clicked link opens a black window" bug.)
 static void net_copy_str(char* dst, const char* src) {
     int i = 0;
     while (src[i] && i < 127) { dst[i] = src[i]; i++; }
-    dst[i] = 0;
-}
-static void net_copy_path(char* dst, const char* src) {
-    int i = 0;
-    while (src[i] && i < NET_PATH_MAX - 1) { dst[i] = src[i]; i++; }
     dst[i] = 0;
 }
 
@@ -103,126 +52,79 @@ static void net_event_post(const char* msg) {
     net_event_pending = 1;
 }
 
-// TCP state constants live in network.h (shared with tls_net.c).
-
-// --- Reorder buffer: hold out-of-order gap segments until the hole fills.
-// 8 slots x 1500B (12KB — covers a typical burst of reordered segments).
-// All IRQ-context (tcp_handle_packet runs in IRQ): single-threaded vs the
-// main loop's readers (buffers are only drained here, never concurrently).
-// Declared up here (not at tcp_handle_packet) because tcp_connect resets it.
-#define TCP_REORDER_SLOTS 8
-#define TCP_REORDER_SEG 1500
-static uint8_t tcp_reorder_data[TCP_REORDER_SLOTS][TCP_REORDER_SEG];
-static uint32_t tcp_reorder_seq[TCP_REORDER_SLOTS];
-static uint16_t tcp_reorder_len[TCP_REORDER_SLOTS];
-static uint8_t tcp_reorder_used[TCP_REORDER_SLOTS];
-
-struct tcp_conn {
-    uint8_t dst_ip[4]; // stored in network byte order
-    uint16_t src_port;
-    uint16_t dst_port;
-    uint32_t seq;      // SND.NXT: next seq to send
-    uint32_t ack;      // RCV.NXT: next seq expected from peer
-    uint32_t snd_una;  // oldest unacked sequence number (flight start)
-    uint16_t dst_mac[3]; // stored as 3 x uint16_t for alignment
-    int state;
-    // Retransmission state (single connection, single in-flight request)
-    uint16_t rtx_len;        // bytes of unacked data in tcp_rtx_buf
-    uint8_t  rtx_has_syn;    // SYN occupies one seq number at snd_una
-    uint8_t  rtx_has_fin;    // FIN occupies one seq number after data
-    uint8_t  rtx_tries;      // retransmit attempts since last progress
-    uint16_t rtx_timeout;    // current RTO in ticks (doubles per retry)
-    uint32_t rtx_last_tick;  // tick when the flight was (re)sent
-    // Receive window (what WE advertise): fixed 32KB. Our buffers are huge
-    // (1MB http_response, 64KB TLS ring), so we never need to shrink it —
-    // but advertising a real window (not a stub) lets fast servers stream
-    // without silly-window stalls. Sent on every segment (tcp_send_raw).
-    // Peer window (what THEY advertise): cached from incoming segments,
-    // caps our sends (never send past SND.UNA + peer_win). 0 = persist
-    // (send 1-byte probes on rtx timer instead of stalling forever).
-    uint32_t peer_win;       // last advertised peer window (bytes)
-    uint32_t persist_since;  // tick when peer_win went 0 (0 = not persisting).
-                             // Bounds zero-window probing (see tcp_poll) so a
-                             // dead peer fails the fetch instead of probing
-                             // forever with no timeout.
-    // Fast retransmit: count DUP acks (same ack_num, no progress). At 3,
-    // resend the head of the flight immediately (no RTO wait) — classic
-    // Tahoe fast-retransmit (no fast-recovery/cwnd inflation: congestion
-    // window stays 1 MSS-equivalent since we only ever have one small
-    // flight; the gain is latency, not throughput).
-    uint32_t dup_acks;       // consecutive duplicate ACKs
-    uint32_t last_ack_num;   // ack number of the last processed ACK
-    // RTT estimation (Jacobson/Karels, tick granularity): SRTT/RTTVAR drive
-    // the RTO instead of the fixed 220ms. Ticks are ~10ms (100Hz PIT), so
-    // alpha=1/8 beta=1/4 via shifts. RTO clamped [2 ticks, 60 ticks].
-    uint32_t srtt;           // smoothed RTT (ticks << 3)
-    uint32_t rttvar;         // variance (ticks << 2)
-    uint32_t rtt_seq;        // seq being timed (0 = none in flight)
-    uint32_t rtt_tick;       // tick when rtt_seq was first sent
-    // Early FIN: the peer's FIN arrived while a receive hole was still
-    // open (seq + len != RCV.NXT — reordered tail). Acting on it then
-    // jumps RCV.NXT over unreceived bytes (data loss → TLS decrypts
-    // garbage → bogus PROTO failure). Instead stash the FIN's own seq
-    // and complete the close when the drain catches up (see
-    // tcp_deliver_in_order tail). fin_seq = FIN seq number itself
-    // (first byte AFTER the FIN-carrying segment's data).
-    uint8_t  fin_pending;    // 1 = early FIN stashed, close not yet run
-    uint32_t fin_seq;        // expected RCV.NXT at which the FIN completes
-};
-
-static struct tcp_conn tcp_conn;
-
-// Ephemeral source port for outbound TCP connections. Incremented on every
-// connect so consecutive fetches don't share a 4-tuple — QEMU's SLIRP NAT
-// keeps the previous connection's mapping (TIME_WAIT) around and would
-// otherwise route/drop the second connection's SYN and its response. Observed
-// symptom: the first HTTPS fetch worked, the second hung forever at the TCP
-// handshake (SYN retransmits, no SYNACK). A fresh source port gives SLIRP a
-// clean mapping so the second fetch completes on the first attempt.
-static uint16_t tcp_ephemeral_port = 43210;
-
-// Unacked outbound data for retransmission. Our sends are a GET request
-// (<= ~512 bytes) or bare FIN, so 4KB is ample for this stack.
-#define TCP_RTX_BUF_SIZE 8192   // one request flight: path + cookie headers
-static uint8_t tcp_rtx_buf[TCP_RTX_BUF_SIZE];
-
-// RTO in 18Hz ticks (~55ms each): 4 ticks ~= 220ms initial, doubling
-#define TCP_RTO_TICKS 4
-#define TCP_MAX_RTX 6
-// Zero-window persist ceiling (~66s at 18Hz): a shut window with unacked
-// flight probes forever by design (RFC 793 has no persist give-up), but a
-// browser cannot wedge a fetch indefinitely — dead peers, blackholed probes
-// and never-updating windows must fail the fetch so the UI shows an error.
-#define TCP_PERSIST_TIMEOUT 1200
-
-extern uint32_t tick_count;
+extern uint32_t tick_count;   // 100 Hz PIT
 
 // Sequence comparison with 32-bit wraparound (RFC 793 ordering)
 static int seq_lt(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
 
-static void tcp_rtx_arm(void) {
-    tcp_conn.rtx_last_tick = tick_count;
-}
-// HTTP response accumulation happens directly in tcp_handle_packet (IRQ
-// context). A shared one-segment buffer dropped every segment that arrived
-// before the main loop's http_poll ran — a multi-segment response started
-// mid-headers with no clean \r\n\r\n, so html_parse showed raw headers as
-// page text. Main loop only READS http_response after http_done (connection
-// closed, no further IRQ appends), so there is no concurrent writer.
+// ---- TCP socket table ---------------------------------------------------------------
+// Every socket: retransmit flight (our unacked bytes), reorder buffer
+// (out-of-order segments held until the hole fills), receive ring (in-order
+// bytes the application has not read yet). All buffers are heap blocks
+// allocated the first time a slot is used and kept for reuse.
+#define TCP_RTX_CAP     16384          // unacked outbound bytes (requests, TLS flights)
+#define TCP_RX_CAP      (256 * 1024)   // receive ring
+#define TCP_REORDER_SLOTS 8
+#define TCP_REORDER_SEG 1500
+#define TCP_WIN_MAX     65535          // no window scaling: 16-bit window
 
-// Simple HTTP client state
-static int http_pending = 0;
-static int http_done = 0; // Set when connection closes with data
-// Real pages run large (google.com serves ~85KB of HTML); a 64KB buffer
-// truncated mid-script, and the parser then produced only the header links.
-// Plain-HTTP response accumulator. Raised from 128 KiB to 1 MiB so larger
-// pages (multi-hundred-KiB bodies, e.g. real homepages) are captured whole
-// instead of being truncated mid-stream. Raising this array is the only change
-// needed: the clamp in tcp_handle_packet keys off sizeof(http_response), and
-// html_parse / dechunk read http_response_len, not a fixed size.
-static char http_response[2097152]; // 2MB cap: pages above render truncated
-static int  http_response_len = 0;
-static int  http_response_overflow = 0; // set once when a response exceeds the buffer
+struct tcp_sock {
+    uint8_t used;
+    uint8_t dst_ip[4];       // network byte order
+    uint16_t src_port, dst_port;
+    int state;
+    uint32_t seq;            // SND.NXT
+    uint32_t ack;            // RCV.NXT
+    uint32_t snd_una;        // oldest unacked sequence number
+    // Retransmit flight
+    uint8_t* rtx;
+    uint32_t rtx_len;
+    uint8_t rtx_has_syn, rtx_has_fin, rtx_tries;
+    uint16_t rtx_timeout;    // RTO in ticks
+    uint32_t rtx_last_tick;
+    // Peer window (caps our sends; 0 = persist probing)
+    uint32_t peer_win, persist_since;
+    // Fast retransmit (pure duplicate ACKs only — see tcp_process_ack)
+    uint32_t dup_acks, last_ack_num;
+    // RTT estimation (Jacobson/Karels, ticks)
+    uint32_t srtt, rttvar, rtt_seq, rtt_tick;
+    // Early FIN: arrived while a receive hole was open (see tcp_handle_packet)
+    uint8_t fin_pending;
+    uint32_t fin_seq;
+    // Receive ring
+    uint8_t* rx;
+    uint32_t rx_head, rx_tail, rx_len;
+    uint32_t adv_win;        // window in the last segment we sent
+    uint8_t ack_pending;     // in-order data arrived: ACK at the next flush
+    uint8_t peer_closed;     // FIN received: EOF once the ring drains
+    uint8_t failed;          // RST or retransmit give-up
+    uint8_t app_closed;      // owner let go: free the slot once CLOSED
+    uint32_t close_tick;     // when app_closed was set (force-free bound)
+    // Reorder buffer
+    uint8_t* ro_data;        // TCP_REORDER_SLOTS * TCP_REORDER_SEG
+    uint32_t ro_seq[TCP_REORDER_SLOTS];
+    uint16_t ro_len[TCP_REORDER_SLOTS];
+    uint8_t ro_used[TCP_REORDER_SLOTS];
+};
+
+static struct tcp_sock tcp_socks[TCP_MAX_SOCKS];
+
+// Ephemeral source port, advanced on every connect so no two connections
+// share a 4-tuple — QEMU's SLIRP NAT keeps a closed connection's mapping
+// around and would route a reused tuple's SYN-ACK to the dead one.
+static uint16_t tcp_ephemeral_port = 43210;
+
+// Initial RTO 250ms (SLIRP answers the SYN only once the host-side connect
+// completes — a real Internet round trip); data RTOs come from the RTT
+// estimator, floored at 200ms (Linux's minimum).
+#define TCP_RTO_SYN   25
+#define TCP_RTO_MIN   20
+#define TCP_RTO_MAX   300
+#define TCP_MAX_RTX   6
+// Zero-window persist ceiling: a shut window must fail the fetch eventually.
+#define TCP_PERSIST_TIMEOUT 3000
+// A closed-by-owner socket still in FIN_WAIT after this is freed anyway.
+#define TCP_CLOSE_LINGER 500
 
 static uint16_t net_checksum(void* data, int len) {
     uint16_t* buf = (uint16_t*)data;
@@ -432,7 +334,7 @@ void udp_send(uint8_t* dst_ip, uint16_t src_port, uint16_t dst_port, uint8_t* da
     for (int i = 0; i < 4; i++) ip->dst_ip[i] = dst_ip[i];
     ip->checksum = ip_checksum(ip);
 
-    struct udp_header* udp = (struct udp_header*)(frame + sizeof(struct ip_header));
+    struct udp_header* udp = (struct udp_header*)(frame + sizeof(struct eth_header) + sizeof(struct ip_header));
     udp->src_port = ((src_port >> 8) & 0xFF) | ((src_port & 0xFF) << 8);
     udp->dst_port = ((dst_port >> 8) & 0xFF) | ((dst_port & 0xFF) << 8);
     uint16_t udp_len = sizeof(struct udp_header) + len;
@@ -530,23 +432,21 @@ static int dns_decode_name(uint8_t* packet, int packet_len, int offset,
 }
 
 // Case-insensitive hostname comparison (hostnames are case-insensitive).
-static int dns_host_matches(const char* a, const char* b);
-
-// A DNS query for `dns_query_host` has definitively failed (RCODE error or a
-// response carrying no A record). If an HTTP fetch was parked waiting on this
-// host (http_retry_pending), abort it now — otherwise the okai HTTP give-up
-// condition (!http_is_retry_pending()) can never fire and the fetch owner
-// wedges forever, leaving every later okai window black.
-static void dns_fail_pending_http(void) {
-    if (http_retry_pending && dns_host_matches(dns_query_host, http_pending_host)) {
-        http_retry_pending = 0;
-        serial_puts("[dns] failed for pending HTTP host, aborting request\n");
+static int dns_host_matches(const char* a, const char* b) {
+    int i = 0;
+    while (a[i] && b[i]) {
+        char ca = a[i], cb = b[i];
+        if (ca >= 'A' && ca <= 'Z') ca += 32;
+        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        if (ca != cb) return 0;
+        i++;
     }
+    return a[i] == b[i];
 }
 
-// Parse a strict dotted-quad ("10.0.2.2") into the DNS-cache layout
-// (first octet in the high byte). Returns 1 on success.
-int net_parse_ip(const char* s, uint32_t* out) {  // shared: TLS path skips DNS for numeric hosts
+// Parse a strict dotted-quad ("10.0.2.2") into host order (first octet in
+// the high byte). Returns 1 on success.
+int net_parse_ip(const char* s, uint32_t* out) {
     uint32_t ip = 0;
     for (int oct = 0; oct < 4; oct++) {
         int val = 0, digits = 0;
@@ -563,227 +463,206 @@ int net_parse_ip(const char* s, uint32_t* out) {  // shared: TLS path skips DNS 
     return 1;
 }
 
-// Seed the DNS cache with a literal address — numeric-IP URLs skip DNS.
-void dns_seed(const char* host, uint32_t ip) {
-    net_copy_str(dns_resolved_host, host);
-    dns_resolved_ip = ip;
-    dns_resolved = 1;
-    dns_pending = 0;
-    serial_puts("[dns] numeric host, seeded\n");
+// ---- DNS cache + concurrent resolver ----
+// One entry per host: PENDING (query on the wire or waiting for ARP),
+// OK (address until expiry) or FAILED (negative-cached briefly). Queries
+// are matched by transaction id, so several lookups run at once — the
+// old single-slot resolver made parallel fetches to different hosts
+// supersede each other's queries.
+#define DNS_SLOTS 32
+#define DNS_ST_FREE    0
+#define DNS_ST_PENDING 1
+#define DNS_ST_OK      2
+#define DNS_ST_FAILED  3
+#define DNS_RETRY_TICKS 200      // resend an unanswered query after 2s
+#define DNS_MAX_TRIES   4        // ~8s before a lookup is given up
+#define DNS_NEG_TICKS   1000     // remember a failure for 10s
+struct dns_ent {
+    char host[128];
+    uint32_t ip;
+    uint8_t st, tries, notify;
+    uint16_t txid;
+    uint32_t sent_tick;          // 0 = not on the wire yet (waiting for ARP)
+    uint32_t expire_tick;
+    uint32_t used_tick;
+};
+static struct dns_ent dns_tab[DNS_SLOTS];
+static uint16_t dns_txid = 0x1234;
+
+static int dns_expired(const struct dns_ent* e) {
+    return (int32_t)(tick_count - e->expire_tick) >= 0;
+}
+
+static void dns_notify(struct dns_ent* e) {
+    if (!e->notify) return;
+    e->notify = 0;
+    char msg[64];
+    int n = 0;
+    const char* pre = e->st == DNS_ST_OK ? "Resolved: " : "DNS lookup failed";
+    while (*pre) msg[n++] = *pre++;
+    if (e->st == DNS_ST_OK) {
+        for (int octet = 0; octet < 4; octet++) {
+            uint8_t v = (uint8_t)(e->ip >> (24 - octet * 8));
+            if (v >= 100) msg[n++] = (char)('0' + v / 100);
+            if (v >= 10) msg[n++] = (char)('0' + (v / 10) % 10);
+            msg[n++] = (char)('0' + v % 10);
+            if (octet < 3) msg[n++] = '.';
+        }
+    }
+    msg[n] = 0;
+    net_event_post(msg);
+}
+
+static void dns_send_query(struct dns_ent* e) {
+    uint8_t target_mac[6];
+    if (!arp_resolve(dns_server_ip, target_mac)) {
+        arp_send_request(dns_server_ip);
+        e->sent_tick = 0;              // net_poll sends once ARP resolves
+        return;
+    }
+    // Same id for every resend: a slow answer to an earlier copy (SLIRP asks
+    // the host resolver, which can take seconds for NXDOMAIN) still counts.
+    if (e->tries == 0) e->txid = ++dns_txid;
+    e->tries++;
+    e->sent_tick = tick_count ? tick_count : 1;
+
+    uint8_t q[300];
+    int n = 0;
+    q[n++] = (uint8_t)(e->txid >> 8); q[n++] = (uint8_t)e->txid;
+    q[n++] = 0x01; q[n++] = 0x00;      // standard query, recursion desired
+    q[n++] = 0x00; q[n++] = 0x01;      // 1 question
+    for (int i = 0; i < 6; i++) q[n++] = 0;
+    n += dns_encode_name(e->host, q + n);
+    q[n++] = 0x00; q[n++] = 0x01;      // QTYPE A
+    q[n++] = 0x00; q[n++] = 0x01;      // QCLASS IN
+    serial_printf("[dns] querying '%s'...\n", e->host);
+    udp_send(dns_server_ip, 12345, 53, q, (uint16_t)n);
+}
+
+int dns_lookup(const char* host, uint32_t* ip) {
+    if (!host || !host[0]) return -1;
+    if (net_parse_ip(host, ip)) return 1;
+    int free_i = -1, lru_i = -1;
+    for (int i = 0; i < DNS_SLOTS; i++) {
+        struct dns_ent* e = &dns_tab[i];
+        if (e->st == DNS_ST_FREE) { if (free_i < 0) free_i = i; continue; }
+        if (!dns_host_matches(e->host, host)) {
+            if (e->st != DNS_ST_PENDING &&
+                (lru_i < 0 || (int32_t)(e->used_tick - dns_tab[lru_i].used_tick) < 0)) lru_i = i;
+            continue;
+        }
+        e->used_tick = tick_count;
+        if (e->st == DNS_ST_PENDING) return 0;
+        if (!dns_expired(e)) {
+            if (e->st == DNS_ST_OK) { *ip = e->ip; return 1; }
+            return -1;
+        }
+        // expired: query again in place
+        e->st = DNS_ST_PENDING;
+        e->tries = 0;
+        dns_send_query(e);
+        return 0;
+    }
+    int slot = free_i >= 0 ? free_i : lru_i;
+    if (slot < 0) return 0;            // every slot is mid-query: try again shortly
+    struct dns_ent* e = &dns_tab[slot];
+    memset(e, 0, sizeof *e);
+    net_copy_str(e->host, host);
+    e->st = DNS_ST_PENDING;
+    e->used_tick = tick_count;
+    dns_send_query(e);
+    return 0;
+}
+
+int dns_resolve(const char* hostname) {
+    uint32_t ip;
+    int r = dns_lookup(hostname, &ip);
+    for (int i = 0; i < DNS_SLOTS; i++)
+        if (dns_tab[i].st != DNS_ST_FREE && dns_host_matches(dns_tab[i].host, hostname)) {
+            dns_tab[i].notify = 1;
+            if (r != 0) dns_notify(&dns_tab[i]);
+            break;
+        }
+    return r;
+}
+
+static void dns_fail(struct dns_ent* e) {
+    e->st = DNS_ST_FAILED;
+    e->expire_tick = tick_count + DNS_NEG_TICKS;
+    serial_printf("[dns] lookup failed for '%s'\n", e->host);
+    dns_notify(e);
+}
+
+// Retries: queries waiting for ARP go out once it resolves; unanswered
+// ones are resent, then fail.
+static void dns_poll(void) {
+    for (int i = 0; i < DNS_SLOTS; i++) {
+        struct dns_ent* e = &dns_tab[i];
+        if (e->st != DNS_ST_PENDING) continue;
+        if (e->sent_tick == 0) { dns_send_query(e); continue; }
+        if ((uint32_t)(tick_count - e->sent_tick) < DNS_RETRY_TICKS) continue;
+        if (e->tries >= DNS_MAX_TRIES) dns_fail(e);
+        else dns_send_query(e);
+    }
 }
 
 static void handle_dns_response(uint8_t* data, uint16_t len) {
     if (len < 12) return;
-
-    uint16_t tx_id = ((data[0] << 8) | data[1]);
-    uint16_t flags = ((data[2] << 8) | data[3]);
-    uint16_t an_count = ((data[6] << 8) | data[7]);
-
-    if (tx_id != dns_tx_id) return;
-    if (!(flags & 0x8000)) return; // Not a response
-    if (flags & 0x000F) { // RCODE != 0 (error)
-        serial_puts("[dns] query error, rcode=");
-        serial_putchar('0' + (flags & 0xF));
-        serial_putchar('\n');
-        dns_pending = 0;
-        dns_fail_pending_http();
+    uint16_t tx_id = (uint16_t)((data[0] << 8) | data[1]);
+    uint16_t flags = (uint16_t)((data[2] << 8) | data[3]);
+    uint16_t qd_count = (uint16_t)((data[4] << 8) | data[5]);
+    uint16_t an_count = (uint16_t)((data[6] << 8) | data[7]);
+    if (!(flags & 0x8000)) return;     // not a response
+    struct dns_ent* e = 0;
+    for (int i = 0; i < DNS_SLOTS; i++)
+        // A late answer to a query already given up on still updates the
+        // cache (the next lookup of that host then hits).
+        if ((dns_tab[i].st == DNS_ST_PENDING || dns_tab[i].st == DNS_ST_FAILED) &&
+            dns_tab[i].sent_tick && dns_tab[i].txid == tx_id) {
+            e = &dns_tab[i];
+            break;
+        }
+    if (!e) return;                    // stale / unknown transaction
+    if (flags & 0x000F) {              // RCODE error (NXDOMAIN...)
+        serial_printf("[dns] query error, rcode=%u\n", flags & 0xF);
+        dns_fail(e);
         return;
     }
 
-    serial_puts("[dns] response, answers=");
-    serial_putchar('0' + an_count);
-    serial_putchar('\n');
-
-    // Skip question section
     int offset = 12;
     int pkt_len = (int)len;
-    uint16_t qd_count = ((data[4] << 8) | data[5]);
     for (int i = 0; i < qd_count; i++) {
         char name[256];
         offset = dns_decode_name(data, pkt_len, offset, name, 256);
         if (offset < 0 || offset + 4 > pkt_len) return; // malformed question
-        offset += 4; // Skip QTYPE + QCLASS
+        offset += 4;
     }
-
-    // Parse answer section
     for (int i = 0; i < an_count && offset < pkt_len; i++) {
         char name[256];
         offset = dns_decode_name(data, pkt_len, offset, name, 256);
-        if (offset < 0 || offset + 4 > pkt_len) return;
-        uint16_t atype = ((data[offset] << 8) | data[offset + 1]);
-        uint16_t aclass = ((data[offset + 2] << 8) | data[offset + 3]);
-        offset += 4;
-        if (offset + 4 > pkt_len) return;
-        uint32_t ttl = ((uint32_t)data[offset] << 24) | ((uint32_t)data[offset + 1] << 16) |
-                        ((uint32_t)data[offset + 2] << 8) | data[offset + 3];
-        (void)ttl;
-        offset += 4;
-        if (offset + 2 > pkt_len) return;
-        uint16_t rdlength = ((data[offset] << 8) | data[offset + 1]);
-        offset += 2;
-
-        if (atype == 1 && aclass == 1 && rdlength == 4) { // A record, IN class
+        if (offset < 0 || offset + 10 > pkt_len) return;
+        uint16_t atype = (uint16_t)((data[offset] << 8) | data[offset + 1]);
+        uint16_t aclass = (uint16_t)((data[offset + 2] << 8) | data[offset + 3]);
+        uint32_t ttl = ((uint32_t)data[offset + 4] << 24) | ((uint32_t)data[offset + 5] << 16) |
+                       ((uint32_t)data[offset + 6] << 8) | data[offset + 7];
+        uint16_t rdlength = (uint16_t)((data[offset + 8] << 8) | data[offset + 9]);
+        offset += 10;
+        if (atype == 1 && aclass == 1 && rdlength == 4) {   // A record, IN class
             if (offset + 4 > pkt_len) return;
-            dns_resolved_ip = ((uint32_t)data[offset] << 24) | ((uint32_t)data[offset + 1] << 16) |
-                               ((uint32_t)data[offset + 2] << 8) | data[offset + 3];
-            dns_resolved = 1;
-            dns_pending = 0;
-
-            // Queue event for terminal
-            for (int i = 0; i < 255; i++) net_event_msg[i] = 0;
-            int idx = 0;
-            const char* prefix = "Resolved: ";
-            for (int i = 0; prefix[i]; i++) net_event_msg[idx++] = prefix[i];
-            for (int octet = 0; octet < 4; octet++) {
-                uint8_t v = (dns_resolved_ip >> (24 - octet * 8)) & 0xFF;
-                char num[4]; int n = 0;
-                if (v >= 100) num[n++] = '0' + v / 100;
-                if (v >= 10) num[n++] = '0' + (v / 10) % 10;
-                num[n++] = '0' + v % 10;
-                for (int j = 0; j < n; j++) net_event_msg[idx++] = num[j];
-                if (octet < 3) net_event_msg[idx++] = '.';
-            }
-            net_event_msg[idx++] = '\n';
-            net_event_msg[idx] = 0;
-            net_event_pending = 1;
-
-            serial_puts("[dns] resolved: ");
-            serial_puts(net_event_msg + 10); // skip "Resolved: "
+            e->ip = ((uint32_t)data[offset] << 24) | ((uint32_t)data[offset + 1] << 16) |
+                    ((uint32_t)data[offset + 2] << 8) | data[offset + 3];
+            e->st = DNS_ST_OK;
+            if (ttl < 30) ttl = 30;
+            if (ttl > 600) ttl = 600;
+            e->expire_tick = tick_count + ttl * 100;
+            serial_printf("[dns] resolved: %s -> %u.%u.%u.%u\n", e->host,
+                          e->ip >> 24, (e->ip >> 16) & 0xFF, (e->ip >> 8) & 0xFF, e->ip & 0xFF);
+            dns_notify(e);
             return;
         }
         offset += rdlength;
     }
-    // Response parsed but carried no usable A record — definitive failure.
-    dns_pending = 0;
-    dns_fail_pending_http();
-}
-
-int dns_resolve(const char* hostname) {
-    dns_resolved = 0;
-    dns_pending = 1;
-    dns_tx_id++;
-    net_copy_str(dns_resolved_host, hostname);
-
-    uint8_t dns_server_ip[4] = {10, 0, 2, 3}; // QEMU SLIRP DNS
-
-    uint8_t target_mac[6];
-    if (!arp_resolve(dns_server_ip, target_mac)) {
-        arp_send_request(dns_server_ip);
-        net_copy_str(dns_pending_host, hostname);
-        dns_retry_pending = 1;
-        return -1; // Waiting for ARP
-    }
-    dns_retry_pending = 0;
-    net_copy_str(dns_query_host, hostname);
-
-    uint8_t frame[ETH_FRAME_MAX];
-    uint8_t* mac = e1000_get_mac();
-
-    // Build DNS query
-    uint8_t dns_query[256];
-    int dns_len = 0;
-
-    // Header
-    dns_query[0] = (dns_tx_id >> 8) & 0xFF; // Transaction ID
-    dns_query[1] = dns_tx_id & 0xFF;
-    dns_query[2] = 0x01; // Flags: standard query, recursion desired
-    dns_query[3] = 0x00;
-    dns_query[4] = 0x00; // Questions: 1
-    dns_query[5] = 0x01;
-    dns_query[6] = 0x00; // Answer RRs: 0
-    dns_query[7] = 0x00;
-    dns_query[8] = 0x00; // Authority RRs: 0
-    dns_query[9] = 0x00;
-    dns_query[10] = 0x00; // Additional RRs: 0
-    dns_query[11] = 0x00;
-    dns_len = 12;
-
-    // Question: encoded name
-    dns_len += dns_encode_name(hostname, dns_query + dns_len);
-
-    // QTYPE = A (1), QCLASS = IN (1)
-    dns_query[dns_len++] = 0x00;
-    dns_query[dns_len++] = 0x01; // QTYPE A
-    dns_query[dns_len++] = 0x00;
-    dns_query[dns_len++] = 0x01; // QCLASS IN
-
-    serial_puts("[dns] querying '");
-    serial_puts(hostname);
-    serial_puts("'...\n");
-
-    // Wrap in UDP
-    uint16_t src_port = 12345;
-    uint16_t dst_port = 53;
-
-    struct eth_header* eth = (struct eth_header*)frame;
-    build_eth_header(eth, target_mac, mac, 0x0800);
-
-    struct ip_header* ip = (struct ip_header*)(frame + sizeof(struct eth_header));
-    ip->version_ihl = 0x45;
-    ip->tos = 0;
-    uint16_t ip_total = sizeof(struct ip_header) + sizeof(struct udp_header) + dns_len;
-    ip->total_length = ((ip_total >> 8) & 0xFF) | ((ip_total & 0xFF) << 8);
-    ip->id = 0;
-    ip->flags_frag = 0;
-    ip->ttl = 64;
-    ip->protocol = 17; // UDP
-    for (int i = 0; i < 4; i++) ip->src_ip[i] = our_ip[i];
-    for (int i = 0; i < 4; i++) ip->dst_ip[i] = dns_server_ip[i];
-    ip->checksum = ip_checksum(ip);
-
-    struct udp_header* udp = (struct udp_header*)(frame + sizeof(struct eth_header) + sizeof(struct ip_header));
-    udp->src_port = ((src_port >> 8) & 0xFF) | ((src_port & 0xFF) << 8);
-    udp->dst_port = ((dst_port >> 8) & 0xFF) | ((dst_port & 0xFF) << 8);
-    uint16_t udp_len = sizeof(struct udp_header) + dns_len;
-    udp->length = ((udp_len >> 8) & 0xFF) | ((udp_len & 0xFF) << 8);
-    udp->checksum = 0;
-
-    // Copy DNS query into UDP payload
-    for (int i = 0; i < dns_len; i++) {
-        frame[sizeof(struct eth_header) + sizeof(struct ip_header) + sizeof(struct udp_header) + i] = dns_query[i];
-    }
-
-    int total = sizeof(struct eth_header) + sizeof(struct ip_header) + sizeof(struct udp_header) + dns_len;
-    e1000_send(frame, total);
-    return 0;
-}
-
-// Case-insensitive hostname comparison (hostnames are case-insensitive).
-static int dns_host_matches(const char* a, const char* b) {
-    int i = 0;
-    while (a[i] && b[i]) {
-        char ca = a[i], cb = b[i];
-        if (ca >= 'A' && ca <= 'Z') ca += 32;
-        if (cb >= 'A' && cb <= 'Z') cb += 32;
-        if (ca != cb) return 0;
-        i++;
-    }
-    return a[i] == b[i];
-}
-
-int dns_is_resolved(uint32_t* ip, const char* host) {
-    if (dns_resolved && dns_host_matches(dns_resolved_host, host)) {
-        *ip = dns_resolved_ip;
-        return 1;
-    }
-    return 0;
-}
-
-int dns_is_pending(void) { return dns_pending; }
-
-// A query for THIS host is in flight. Another host's pending query is stale
-// (its fetch was abandoned, e.g. a sub-resource cut off by navigation):
-// callers must send their own instead of waiting on it — the new tx id makes
-// the stale answer drop. Waiting on it made the next navigation's fetch see
-// "not pending, not resolved for my host" and abort as a DNS failure.
-int dns_is_pending_for(const char* host) {
-    return dns_pending && dns_host_matches(dns_resolved_host, host);
-}
-
-// The last query sent (or seeded) was for this host — so "not pending and
-// not resolved" means it definitively failed rather than being superseded.
-int dns_last_query_for(const char* host) {
-    return dns_host_matches(dns_resolved_host, host);
+    dns_fail(e);                       // answered, but no usable A record
 }
 
 // TCP checksum (with pseudo-header) — uses big-endian reads for correctness
@@ -806,940 +685,543 @@ static uint16_t tcp_checksum(uint8_t* src_ip, uint8_t* dst_ip, uint8_t* tcp_data
     return ~sum;
 }
 
-void tcp_connect(uint32_t dst_ip, uint16_t dst_port) {
-    // Store IP in network byte order
-    tcp_conn.dst_ip[0] = (dst_ip >> 24) & 0xFF;
-    tcp_conn.dst_ip[1] = (dst_ip >> 16) & 0xFF;
-    tcp_conn.dst_ip[2] = (dst_ip >> 8) & 0xFF;
-    tcp_conn.dst_ip[3] = dst_ip & 0xFF;
-    tcp_conn.src_port = tcp_ephemeral_port;
-    if (tcp_ephemeral_port >= 0xFFFE) tcp_ephemeral_port = 44000;
-    else tcp_ephemeral_port++;
-    tcp_conn.dst_port = dst_port;
-    tcp_conn.seq = 0x1000;
-    tcp_conn.ack = 0;
-    tcp_conn.state = TCP_STATE_CLOSED;
-    // Retransmit state: SYN (if sent) occupies seq 0x1000
-    tcp_conn.snd_una = 0x1000;
-    tcp_conn.rtx_len = 0;
-    tcp_conn.rtx_has_syn = 0;
-    tcp_conn.rtx_has_fin = 0;
-    tcp_conn.rtx_tries = 0;
-    tcp_conn.rtx_timeout = TCP_RTO_TICKS;
-    // Estimator + window state reset per connection (stale SRTT from a LAN
-    // peer would mis-time a WAN peer and vice versa).
-    tcp_conn.peer_win = 65535; // assume open until the first segment says so
-    tcp_conn.persist_since = 0; // not in zero-window persistence
-    tcp_conn.dup_acks = 0;
-    tcp_conn.last_ack_num = 0;
-    tcp_conn.srtt = 0;
-    tcp_conn.rttvar = 0;
-    tcp_conn.rtt_seq = 0;
-    tcp_conn.rtt_tick = 0;
-    tcp_conn.fin_pending = 0;
-    tcp_conn.fin_seq = 0;
-    // Reorder buffer is per-connection: a stale gap from the previous
-    // connection would deliver garbage into the new stream on seq overlap.
-    for (int ri = 0; ri < TCP_REORDER_SLOTS; ri++) tcp_reorder_used[ri] = 0;
 
-    uint8_t dst_nbo[4]; // network byte order
-    dst_nbo[0] = (dst_ip >> 24) & 0xFF;
-    dst_nbo[1] = (dst_ip >> 16) & 0xFF;
-    dst_nbo[2] = (dst_ip >> 8) & 0xFF;
-    dst_nbo[3] = dst_ip & 0xFF;
+// ---- TCP sockets ------------------------------------------------------------------
 
-    // For NAT (QEMU SLIRP), all external traffic goes through gateway
-    uint8_t* arp_target = dst_nbo;
-    uint8_t gw_ip[4];
-    uint8_t* gw = net_get_gateway();
-    for (int i = 0; i < 4; i++) gw_ip[i] = gw[i];
-
-    // Check if target is on local network (same /24)
-    if ((dst_nbo[0] & 0xF0) != (our_ip[0] & 0xF0) ||
-        dst_nbo[1] != our_ip[1] || dst_nbo[2] != our_ip[2]) {
-        arp_target = gw_ip; // Use gateway for external IPs
-    }
-
-    uint8_t target_mac[6];
-    if (!arp_resolve(arp_target, target_mac)) {
-        arp_send_request(arp_target);
-        return;
-    }
-
-    // Build SYN packet
-    uint8_t frame[ETH_FRAME_MAX];
-    uint8_t* mac = e1000_get_mac();
-    struct eth_header* eth = (struct eth_header*)frame;
-    build_eth_header(eth, target_mac, mac, 0x0800);
-
-    struct ip_header* ip = (struct ip_header*)(frame + sizeof(struct eth_header));
-    ip->version_ihl = 0x45;
-    ip->tos = 0;
-    uint16_t ip_total = sizeof(struct ip_header) + 20; // TCP header only (no options)
-    ip->total_length = ((ip_total >> 8) & 0xFF) | ((ip_total & 0xFF) << 8);
-    ip->id = 0;
-    ip->flags_frag = 0;
-    ip->ttl = 64;
-    ip->protocol = 6; // TCP
-    for (int i = 0; i < 4; i++) ip->src_ip[i] = our_ip[i];
-    for (int i = 0; i < 4; i++) ip->dst_ip[i] = tcp_conn.dst_ip[i];
-    ip->checksum = 0;
-    ip->checksum = ip_checksum(ip);
-
-    uint8_t* tcp = frame + sizeof(struct eth_header) + sizeof(struct ip_header);
-    tcp[0] = (tcp_conn.src_port >> 8) & 0xFF;
-    tcp[1] = tcp_conn.src_port & 0xFF;
-    tcp[2] = (dst_port >> 8) & 0xFF;
-    tcp[3] = dst_port & 0xFF;
-    tcp[4] = (tcp_conn.seq >> 24) & 0xFF;
-    tcp[5] = (tcp_conn.seq >> 16) & 0xFF;
-    tcp[6] = (tcp_conn.seq >> 8) & 0xFF;
-    tcp[7] = tcp_conn.seq & 0xFF;
-    tcp[8] = 0; tcp[9] = 0; tcp[10] = 0; tcp[11] = 0; // ACK number
-    tcp[12] = 0x50; // Data offset: 5 words
-    tcp[13] = 0x02; // Flags: SYN
-    tcp[14] = 0x80; tcp[15] = 0x00; // Window: 32768 (see tcp_send_raw)
-    tcp[16] = 0; tcp[17] = 0; // Checksum (set below)
-    tcp[18] = 0; tcp[19] = 0; // Urgent pointer
-
-    // Set checksum
-    tcp[16] = 0; tcp[17] = 0;
-    uint16_t cksum = tcp_checksum(our_ip, dst_nbo, tcp, 20);
-    tcp[16] = (cksum >> 8) & 0xFF;
-    tcp[17] = cksum & 0xFF;
-
-    int total = sizeof(struct eth_header) + sizeof(struct ip_header) + 20;
-    e1000_send(frame, total);
-    tcp_conn.state = TCP_STATE_SYN_SENT;
-    tcp_conn.rtx_has_syn = 1; // SYN is now in flight
-    tcp_rtx_arm();
-    tcp_conn.seq++; // SYN consumes 1 sequence number
-
-    serial_puts("[tcp] SYN sent\n");
+static struct tcp_sock* sock_get(int s) {
+    if (s < 0 || s >= TCP_MAX_SOCKS || !tcp_socks[s].used) return 0;
+    return &tcp_socks[s];
 }
+
+// Free receive-ring space = the window we may advertise.
+static uint32_t tcp_rx_free(const struct tcp_sock* c) {
+    uint32_t f = TCP_RX_CAP - c->rx_len;
+    return f > TCP_WIN_MAX ? TCP_WIN_MAX : f;
+}
+
+static int tcp_is_local(const uint8_t* ip) {
+    return (ip[0] & 0xF0) == (our_ip[0] & 0xF0) && ip[1] == our_ip[1] && ip[2] == our_ip[2];
+}
+
+// TCP checksum over pseudo-header + segment (big-endian 16-bit words).
+static uint16_t tcp_checksum(uint8_t* src_ip, uint8_t* dst_ip, uint8_t* tcp_data, int tcp_len);
 
 // Largest TCP payload in one Ethernet frame (MTU 1500 - IP 20 - TCP 20).
 #define TCP_SEG_MAX (ETH_FRAME_MAX - 14 - 20 - 20)
 
 // One segment. data_len MUST be <= TCP_SEG_MAX: the frame is a 1514-byte
-// stack buffer (a 1.6KB request once overflowed it and smashed the stack —
-// requests grew past one segment with long script URLs, 2026-10-07).
-static void tcp_send_one(uint32_t seq_num, uint32_t ack_num, uint8_t flags,
-                         uint8_t* data, uint16_t data_len) {
+// stack buffer (a 1.6KB request once overflowed it and smashed the stack).
+// SYN segments carry an MSS option.
+static void tcp_send_one(struct tcp_sock* c, uint32_t seq_num, uint32_t ack_num, uint8_t flags,
+                         const uint8_t* data, uint16_t data_len) {
     uint8_t target_mac[6];
     if (data_len > TCP_SEG_MAX) data_len = TCP_SEG_MAX;   // never overflow the frame
-
-    // Route through gateway for external IPs (same logic as tcp_connect)
-    uint8_t* arp_target = tcp_conn.dst_ip;
-    if ((tcp_conn.dst_ip[0] & 0xF0) != (our_ip[0] & 0xF0) ||
-        tcp_conn.dst_ip[1] != our_ip[1] || tcp_conn.dst_ip[2] != our_ip[2]) {
-        arp_target = net_get_gateway();
-    }
+    // Route through the gateway for off-subnet hosts (QEMU SLIRP NAT)
+    uint8_t* arp_target = tcp_is_local(c->dst_ip) ? c->dst_ip : gateway_ip;
     if (!arp_resolve(arp_target, target_mac)) {
         arp_send_request(arp_target);
-        return;
+        return;                          // the retransmit timer resends
     }
 
     uint8_t frame[ETH_FRAME_MAX];
-    uint8_t* mac = e1000_get_mac();
     struct eth_header* eth = (struct eth_header*)frame;
-    build_eth_header(eth, target_mac, mac, 0x0800);
+    build_eth_header(eth, target_mac, e1000_get_mac(), 0x0800);
 
+    uint16_t tcp_hdr_len = (flags & 0x02) ? 24 : 20;
     struct ip_header* ip = (struct ip_header*)(frame + sizeof(struct eth_header));
     ip->version_ihl = 0x45;
     ip->tos = 0;
-    uint16_t tcp_hdr_len = 20;
-    uint16_t ip_total = sizeof(struct ip_header) + tcp_hdr_len + data_len;
-    ip->total_length = ((ip_total >> 8) & 0xFF) | ((ip_total & 0xFF) << 8);
+    uint16_t ip_total = (uint16_t)(sizeof(struct ip_header) + tcp_hdr_len + data_len);
+    ip->total_length = (uint16_t)(((ip_total >> 8) & 0xFF) | ((ip_total & 0xFF) << 8));
     ip->id = 0;
     ip->flags_frag = 0;
     ip->ttl = 64;
     ip->protocol = 6;
     for (int i = 0; i < 4; i++) ip->src_ip[i] = our_ip[i];
-    for (int i = 0; i < 4; i++) ip->dst_ip[i] = tcp_conn.dst_ip[i];
+    for (int i = 0; i < 4; i++) ip->dst_ip[i] = c->dst_ip[i];
     ip->checksum = 0;
     ip->checksum = ip_checksum(ip);
 
     uint8_t* tcp = frame + sizeof(struct eth_header) + sizeof(struct ip_header);
-    tcp[0] = (tcp_conn.src_port >> 8) & 0xFF;
-    tcp[1] = tcp_conn.src_port & 0xFF;
-    tcp[2] = (tcp_conn.dst_port >> 8) & 0xFF;
-    tcp[3] = tcp_conn.dst_port & 0xFF;
-    tcp[4] = (seq_num >> 24) & 0xFF;
-    tcp[5] = (seq_num >> 16) & 0xFF;
-    tcp[6] = (seq_num >> 8) & 0xFF;
-    tcp[7] = seq_num & 0xFF;
-    tcp[8] = (ack_num >> 24) & 0xFF;
-    tcp[9] = (ack_num >> 16) & 0xFF;
-    tcp[10] = (ack_num >> 8) & 0xFF;
-    tcp[11] = ack_num & 0xFF;
-    tcp[12] = 0x50;
+    tcp[0] = (uint8_t)(c->src_port >> 8); tcp[1] = (uint8_t)c->src_port;
+    tcp[2] = (uint8_t)(c->dst_port >> 8); tcp[3] = (uint8_t)c->dst_port;
+    tcp[4] = (uint8_t)(seq_num >> 24); tcp[5] = (uint8_t)(seq_num >> 16);
+    tcp[6] = (uint8_t)(seq_num >> 8);  tcp[7] = (uint8_t)seq_num;
+    tcp[8] = (uint8_t)(ack_num >> 24); tcp[9] = (uint8_t)(ack_num >> 16);
+    tcp[10] = (uint8_t)(ack_num >> 8); tcp[11] = (uint8_t)ack_num;
+    tcp[12] = (uint8_t)((tcp_hdr_len / 4) << 4);
     tcp[13] = flags;
-    // Advertise a real receive window (32KB — our buffers dwarf it) instead
-    // of the old 60-byte stub (0x3C). The stub throttled fast servers to
-    // ~60 bytes per round trip (silly-window behavior on THEIR side).
-    tcp[14] = 0x80; tcp[15] = 0x00;
+    // Window = free receive-ring space: the peer can never send more than
+    // we can keep (the old fixed 32KB window over a ring that could fill
+    // while the main loop rendered meant ACKed-then-dropped bytes).
+    uint32_t win = tcp_rx_free(c);
+    c->adv_win = win;
+    tcp[14] = (uint8_t)(win >> 8); tcp[15] = (uint8_t)win;
     tcp[16] = 0; tcp[17] = 0;
     tcp[18] = 0; tcp[19] = 0;
-
-    for (int i = 0; i < data_len; i++) {
-        tcp[tcp_hdr_len + i] = data[i];
+    if (tcp_hdr_len == 24) {             // MSS option (SYN only)
+        tcp[20] = 2; tcp[21] = 4;
+        tcp[22] = (uint8_t)(TCP_SEG_MAX >> 8); tcp[23] = (uint8_t)TCP_SEG_MAX;
     }
+    if (data_len) memcpy(tcp + tcp_hdr_len, data, data_len);
+    uint16_t cksum = tcp_checksum(our_ip, c->dst_ip, tcp, tcp_hdr_len + data_len);
+    tcp[16] = (uint8_t)(cksum >> 8);
+    tcp[17] = (uint8_t)cksum;
 
-    tcp[16] = 0; tcp[17] = 0;
-    uint16_t cksum = tcp_checksum(our_ip, tcp_conn.dst_ip, tcp, tcp_hdr_len + data_len);
-    tcp[16] = (cksum >> 8) & 0xFF;
-    tcp[17] = cksum & 0xFF;
-
-    int total = sizeof(struct eth_header) + sizeof(struct ip_header) + tcp_hdr_len + data_len;
-    e1000_send(frame, total);
+    e1000_send(frame, (uint32_t)(sizeof(struct eth_header) + sizeof(struct ip_header) + tcp_hdr_len + data_len));
+    if (flags & 0x10) c->ack_pending = 0;   // this segment carried the ACK
 }
 
 // Send data as MSS-sized segments (PSH/FIN only on the last one). Every
 // sender (first transmission, RTO and fast retransmit of the whole
 // unacked flight) goes through here.
-static void tcp_send_raw(uint32_t seq_num, uint32_t ack_num, uint8_t flags,
-                         uint8_t* data, uint16_t data_len) {
-    if (data_len <= TCP_SEG_MAX) { tcp_send_one(seq_num, ack_num, flags, data, data_len); return; }
-    uint16_t off = 0;
+static void tcp_send_raw(struct tcp_sock* c, uint32_t seq_num, uint32_t ack_num, uint8_t flags,
+                         const uint8_t* data, uint32_t data_len) {
+    if (data_len <= TCP_SEG_MAX) { tcp_send_one(c, seq_num, ack_num, flags, data, (uint16_t)data_len); return; }
+    uint32_t off = 0;
     while (off < data_len) {
-        uint16_t n = (uint16_t)(data_len - off > TCP_SEG_MAX ? TCP_SEG_MAX : data_len - off);
+        uint32_t n = data_len - off > TCP_SEG_MAX ? TCP_SEG_MAX : data_len - off;
         uint8_t f = flags;
         if (off + n < data_len) f &= (uint8_t)~(0x08 | 0x01);   // PSH/FIN: last segment only
-        tcp_send_one(seq_num + off, ack_num, f, data + off, n);
-        off = (uint16_t)(off + n);
+        tcp_send_one(c, seq_num + off, ack_num, f, data + off, (uint16_t)n);
+        off += n;
     }
 }
 
-static void tcp_send_packet(uint8_t flags, uint8_t* data, uint16_t data_len) {
-    tcp_send_raw(tcp_conn.seq, tcp_conn.ack, flags, data, data_len);
+static void tcp_send_ctl(struct tcp_sock* c, uint8_t flags) {
+    tcp_send_one(c, c->seq, c->ack, flags, 0, 0);
 }
 
-// Cumulative ACK processing: drop acked bytes from the retransmit buffer,
-// advance snd_una, reset backoff on progress. Also feeds the RTT estimator,
-// the duplicate-ACK counter (fast retransmit), and the peer-window cache.
-static void tcp_process_ack(uint32_t ack_num, uint16_t seg_plen) {
-    // DUP-ACK DISCIPLINE (RFC 5681 §2: a duplicate ACK acknowledges NO new
-    // data AND carries no payload). Fast retransmit counts ONLY pure-ACK
-    // repeats (plen == 0, ack_num <= SND.UNA). A segment carrying THEIR data
-    // (plen > 0) advances the receive stream even when the ack field repeats
-    // (their data ACKs are usually piggybacked, not per-segment) — counting
-    // those fired bogus fast retransmits mid-download (bisected 2026-09-08:
-    // 3 "fast rtx" during a healthy example.com fetch, each resending the
-    // GET and stalling the server into SYN-timeout on the NEXT connection).
-    if (seg_plen == 0 && !seq_lt(tcp_conn.snd_una, ack_num)) {
-        // Duplicate ACK (no progress): count toward fast retransmit. Only
-        // count pure ACKs (the retransmit path resends on #3 — see below).
-        // Cap the counter so a long stall doesn't overflow it.
-        if (ack_num == tcp_conn.last_ack_num && tcp_conn.dup_acks < 100)
-            tcp_conn.dup_acks++;
-        else if (ack_num != tcp_conn.last_ack_num) {
-            tcp_conn.last_ack_num = ack_num;
-            tcp_conn.dup_acks = 1;
-        }
-        if (tcp_conn.dup_acks == 3) {
-            // Fast retransmit: resend the head of the flight NOW (Tahoe —
-            // no cwnd inflation, just skip the RTO wait). Serial-gated so
-            // headless logs show exactly when it fires.
+static void tcp_rtx_arm(struct tcp_sock* c) { c->rtx_last_tick = tick_count; }
+
+// Resend the head of the unacked flight (RTO / fast retransmit).
+static void tcp_resend(struct tcp_sock* c) {
+    if (c->rtx_has_syn) {
+        tcp_send_one(c, c->snd_una, 0, 0x02, 0, 0);
+        return;
+    }
+    uint8_t flags = 0x10;
+    if (c->rtx_len > 0) flags |= 0x08;
+    if (c->rtx_has_fin) flags |= 0x01;
+    tcp_send_raw(c, c->snd_una, c->ack, flags, c->rtx, c->rtx_len);
+}
+
+int tcp_open(uint32_t dst_ip, uint16_t dst_port) {
+    int s = -1;
+    for (int i = 0; i < TCP_MAX_SOCKS; i++) if (!tcp_socks[i].used) { s = i; break; }
+    if (s < 0) return -1;
+    struct tcp_sock* c = &tcp_socks[s];
+    // Buffers survive slot reuse (allocated once per slot).
+    uint8_t* rtx = c->rtx; uint8_t* rx = c->rx; uint8_t* ro = c->ro_data;
+    if (!rtx) rtx = (uint8_t*)kmalloc(TCP_RTX_CAP);
+    if (!rx) rx = (uint8_t*)kmalloc(TCP_RX_CAP);
+    if (!ro) ro = (uint8_t*)kmalloc(TCP_REORDER_SLOTS * TCP_REORDER_SEG);
+    memset(c, 0, sizeof *c);
+    c->rtx = rtx; c->rx = rx; c->ro_data = ro;
+    if (!rtx || !rx || !ro) return -1;   // (keeps whatever did allocate for next time)
+    c->used = 1;
+    c->dst_ip[0] = (uint8_t)(dst_ip >> 24); c->dst_ip[1] = (uint8_t)(dst_ip >> 16);
+    c->dst_ip[2] = (uint8_t)(dst_ip >> 8);  c->dst_ip[3] = (uint8_t)dst_ip;
+    // Unique ephemeral port among live sockets
+    for (int tries = 0; tries < 64; tries++) {
+        uint16_t p = tcp_ephemeral_port;
+        tcp_ephemeral_port = tcp_ephemeral_port >= 0xFFFE ? 44000 : (uint16_t)(tcp_ephemeral_port + 1);
+        int clash = 0;
+        for (int i = 0; i < TCP_MAX_SOCKS; i++)
+            if (i != s && tcp_socks[i].used && tcp_socks[i].src_port == p) clash = 1;
+        if (!clash) { c->src_port = p; break; }
+    }
+    c->dst_port = dst_port;
+    // ISN from the timestamp counter (distinct per connection; SLIRP keeps
+    // stale mappings around, so never reuse a predictable sequence space)
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    c->seq = (lo ^ (hi << 13) ^ ((uint32_t)c->src_port << 16)) & 0x7FFFFFFFu;
+    c->snd_una = c->seq;
+    c->peer_win = 65535;
+    c->rtx_timeout = TCP_RTO_SYN;
+    c->state = TCP_STATE_SYN_SENT;
+    c->rtx_has_syn = 1;
+    tcp_send_one(c, c->seq, 0, 0x02, 0, 0);
+    c->seq++;                            // SYN consumes one sequence number
+    tcp_rtx_arm(c);
+    if (net_trace) serial_printf("[tcp] s%d SYN -> port %u\n", s, dst_port);
+    return s;
+}
+
+int tcp_state(int s) {
+    struct tcp_sock* c = sock_get(s);
+    return c ? c->state : TCP_STATE_CLOSED;
+}
+
+int tcp_failed(int s) {
+    struct tcp_sock* c = sock_get(s);
+    return c ? c->failed : 1;
+}
+
+int tcp_rx_avail(int s) {
+    struct tcp_sock* c = sock_get(s);
+    return c ? (int)c->rx_len : 0;
+}
+
+int tcp_send(int s, const uint8_t* data, uint32_t len) {
+    struct tcp_sock* c = sock_get(s);
+    if (!c || c->state != TCP_STATE_ESTABLISHED || c->failed) return -1;
+    if (len > TCP_RTX_CAP - c->rtx_len) {
+        serial_printf("[tcp] s%d flight buffer full (%u + %u)\n", s, c->rtx_len, len);
+        return -1;
+    }
+    memcpy(c->rtx + c->rtx_len, data, len);
+    uint32_t first = c->rtx_len;
+    c->rtx_len += len;
+    // Zero peer window: keep it buffered, the persist timer probes.
+    if (c->peer_win != 0)
+        tcp_send_raw(c, c->seq, c->ack, 0x18, c->rtx + first, len);   // PSH+ACK
+    c->seq += len;
+    // RTT sample (Karn: only on a fresh flight, never across a retransmit)
+    if (c->rtx_tries == 0 && c->rtt_seq == 0) {
+        c->rtt_seq = c->seq;
+        c->rtt_tick = tick_count;
+    }
+    if (first == 0) tcp_rtx_arm(c);
+    return 0;
+}
+
+int tcp_recv(int s, uint8_t* buf, uint32_t cap) {
+    struct tcp_sock* c = sock_get(s);
+    if (!c) return -1;
+    if (c->rx_len == 0) {
+        if (c->peer_closed || c->failed || c->state == TCP_STATE_CLOSED) return -1;
+        return 0;
+    }
+    uint32_t n = c->rx_len < cap ? c->rx_len : cap;
+    uint32_t first = TCP_RX_CAP - c->rx_tail;
+    if (first > n) first = n;
+    memcpy(buf, c->rx + c->rx_tail, first);
+    if (n > first) memcpy(buf + first, c->rx, n - first);
+    c->rx_tail = (c->rx_tail + n) % TCP_RX_CAP;
+    c->rx_len -= n;
+    // Window update: the window we last advertised was small and reading
+    // opened it up a lot — tell the peer (otherwise a sender stalled on a
+    // nearly shut window waits for its persist timer).
+    if (c->state == TCP_STATE_ESTABLISHED && c->adv_win < 4 * TCP_SEG_MAX &&
+        tcp_rx_free(c) >= TCP_WIN_MAX / 2)
+        c->ack_pending = 1;
+    return (int)n;
+}
+
+static void tcp_release(struct tcp_sock* c) {
+    c->used = 0;
+    c->state = TCP_STATE_CLOSED;
+    c->rtx_len = 0;
+    c->rx_len = 0;
+}
+
+void tcp_close(int s) {
+    struct tcp_sock* c = sock_get(s);
+    if (!c) return;
+    c->app_closed = 1;
+    c->close_tick = tick_count;
+    c->rx_len = c->rx_head = c->rx_tail = 0;   // nobody reads it any more
+    if (c->state == TCP_STATE_ESTABLISHED) {
+        c->rtx_has_fin = 1;
+        tcp_send_raw(c, c->seq, c->ack, 0x11, c->rtx, 0);   // FIN+ACK
+        c->seq++;
+        c->state = TCP_STATE_FIN_WAIT;
+        tcp_rtx_arm(c);
+    } else if (c->state != TCP_STATE_FIN_WAIT) {
+        tcp_release(c);
+    }
+}
+
+void tcp_abort(int s) {
+    struct tcp_sock* c = sock_get(s);
+    if (!c) return;
+    if (c->state == TCP_STATE_ESTABLISHED || c->state == TCP_STATE_FIN_WAIT)
+        tcp_send_ctl(c, 0x14);           // RST+ACK
+    tcp_release(c);
+}
+
+// Cumulative ACK processing: drop acked bytes from the retransmit flight,
+// advance snd_una, reset backoff on progress, feed the RTT estimator and
+// the duplicate-ACK counter.
+static void tcp_process_ack(struct tcp_sock* c, uint32_t ack_num, uint16_t seg_plen) {
+    // DUP-ACK DISCIPLINE (RFC 5681 §2): a duplicate ACK acknowledges no new
+    // data AND carries no payload. Counting data-carrying segments with a
+    // repeated ack field fired bogus fast retransmits mid-download.
+    if (!seq_lt(c->snd_una, ack_num)) {
+        if (seg_plen != 0) return;
+        uint32_t flight = (c->rtx_has_syn ? 1u : 0u) + c->rtx_len + (c->rtx_has_fin ? 1u : 0u);
+        if (flight == 0) return;
+        if (ack_num == c->last_ack_num && c->dup_acks < 100) c->dup_acks++;
+        else if (ack_num != c->last_ack_num) { c->last_ack_num = ack_num; c->dup_acks = 1; }
+        if (c->dup_acks == 3) {
             serial_puts("[tcp] fast rtx (3 dup ACKs)\n");
-            tcp_conn.rtx_tries++; // counts toward give-up like an RTO retry
-            tcp_rtx_arm();
-            if (tcp_conn.rtx_has_syn) {
-                tcp_send_raw(tcp_conn.snd_una, 0, 0x02, 0, 0);
-            } else {
-                uint8_t flags = 0x10;
-                if (tcp_conn.rtx_len > 0) flags |= 0x08;
-                else if (tcp_conn.rtx_has_fin) flags |= 0x01;
-                tcp_send_raw(tcp_conn.snd_una, tcp_conn.ack, flags,
-                             tcp_rtx_buf, tcp_conn.rtx_len);
-            }
+            c->rtx_tries++;
+            tcp_rtx_arm(c);
+            tcp_resend(c);
         }
-        return; // old / duplicate ack
+        return;
     }
-
-    uint32_t flight = (tcp_conn.rtx_has_syn ? 1u : 0u) +
-                      tcp_conn.rtx_len +
-                      (tcp_conn.rtx_has_fin ? 1u : 0u);
-    uint32_t acked = ack_num - tcp_conn.snd_una;
+    uint32_t flight = (c->rtx_has_syn ? 1u : 0u) + c->rtx_len + (c->rtx_has_fin ? 1u : 0u);
+    uint32_t acked = ack_num - c->snd_una;
     if (acked > flight) acked = flight; // clamp bogus acks
-
-    if (tcp_conn.rtx_has_syn && acked > 0) {
-        tcp_conn.rtx_has_syn = 0;
-        tcp_conn.snd_una++;
-        acked--;
-    }
-    if (acked > 0 && tcp_conn.rtx_len > 0) {
-        uint32_t take = acked < tcp_conn.rtx_len ? acked : (uint32_t)tcp_conn.rtx_len;
-        for (uint32_t i = 0; i < tcp_conn.rtx_len - take; i++)
-            tcp_rtx_buf[i] = tcp_rtx_buf[i + take];
-        tcp_conn.rtx_len -= take;
+    if (c->rtx_has_syn && acked > 0) { c->rtx_has_syn = 0; c->snd_una++; acked--; }
+    if (acked > 0 && c->rtx_len > 0) {
+        uint32_t take = acked < c->rtx_len ? acked : c->rtx_len;
+        memmove(c->rtx, c->rtx + take, c->rtx_len - take);
+        c->rtx_len -= take;
         acked -= take;
-        tcp_conn.snd_una += take;
+        c->snd_una += take;
     }
-    if (acked > 0 && tcp_conn.rtx_has_fin) {
-        tcp_conn.rtx_has_fin = 0;
-        tcp_conn.snd_una++;
-    }
+    if (acked > 0 && c->rtx_has_fin) { c->rtx_has_fin = 0; c->snd_una++; }
 
-    // Progress: fresh ACK number resets the dup counter; RTT sample if the
-    // ack covers the timed seq (Karn: skip samples from retransmitted flights
-    // — rtx_tries > 0 means this ACK may ack a resend, so don't sample).
-    tcp_conn.dup_acks = 0;
-    tcp_conn.last_ack_num = ack_num;
-    if (tcp_conn.rtx_tries == 0 && tcp_conn.rtt_seq != 0 &&
-        !seq_lt(ack_num, tcp_conn.rtt_seq)) {
-        uint32_t rtt = tick_count - tcp_conn.rtt_tick; // ~10ms ticks
-        if (tcp_conn.srtt == 0) {
-            // First sample: SRTT = R, RTTVAR = R/2.
-            tcp_conn.srtt = rtt << 3;
-            tcp_conn.rttvar = rtt << 1;
+    c->dup_acks = 0;
+    c->last_ack_num = ack_num;
+    if (c->rtx_tries == 0 && c->rtt_seq != 0 && !seq_lt(ack_num, c->rtt_seq)) {
+        uint32_t rtt = tick_count - c->rtt_tick;
+        if (c->srtt == 0) {
+            c->srtt = rtt << 3;
+            c->rttvar = rtt << 1;
         } else {
-            // Jacobson/Karels: SRTT += (R-SRTT)/8; RTTVAR += (|R-SRTT|-RTTVAR)/4.
-            uint32_t sr = tcp_conn.srtt >> 3;
+            uint32_t sr = c->srtt >> 3;
             uint32_t diff = rtt > sr ? rtt - sr : sr - rtt;
-            tcp_conn.srtt += (rtt << 3 > tcp_conn.srtt) ?
-                             ((rtt << 3) - tcp_conn.srtt) >> 3 :
-                             0 - (tcp_conn.srtt - (rtt << 3) >> 3);
-            uint32_t rv = tcp_conn.rttvar >> 2;
-            if (diff > rv) tcp_conn.rttvar += (diff - rv);
-            else tcp_conn.rttvar -= (rv - diff);
+            if ((rtt << 3) > c->srtt) c->srtt += ((rtt << 3) - c->srtt) >> 3;
+            else c->srtt -= (c->srtt - (rtt << 3)) >> 3;
+            uint32_t rv = c->rttvar >> 2;
+            if (diff > rv) c->rttvar += diff - rv;
+            else c->rttvar -= rv - diff;
         }
-        // RTO = SRTT + 4*RTTVAR, clamped [2, 60] ticks (20ms..600ms).
-        uint32_t rto = (tcp_conn.srtt >> 3) + tcp_conn.rttvar;
-        if (rto < 2) rto = 2;
-        if (rto > 60) rto = 60;
-        tcp_conn.rtx_timeout = (uint16_t)rto;
-        tcp_conn.rtt_seq = 0;
+        uint32_t rto = (c->srtt >> 3) + c->rttvar;
+        if (rto < TCP_RTO_MIN) rto = TCP_RTO_MIN;
+        if (rto > TCP_RTO_MAX) rto = TCP_RTO_MAX;
+        c->rtx_timeout = (uint16_t)rto;
+        c->rtt_seq = 0;
     }
-    // Fresh progress always clears the retry count (backoff restarts).
-    tcp_conn.rtx_tries = 0;
-    if (tcp_conn.rtx_len > 0 || tcp_conn.rtx_has_syn || tcp_conn.rtx_has_fin)
-        tcp_rtx_arm();
+    if (c->rtx_timeout < TCP_RTO_MIN) c->rtx_timeout = TCP_RTO_MIN;
+    c->rtx_tries = 0;
+    if (c->rtx_len > 0 || c->rtx_has_syn || c->rtx_has_fin) tcp_rtx_arm(c);
 }
 
-void tcp_send_data(uint8_t* data, uint16_t len) {
-    if (tcp_conn.state != TCP_STATE_ESTABLISHED) return;
-    // Peer-window gate: never send past SND.UNA + peer_win. Our flights are
-    // one small GET (<=512B) and the peer window is KBs, so this never fires
-    // in practice — but a zero-window peer must NOT get a full send (it
-    // would drop it); tcp_poll covers persistence (see below).
-    if (tcp_conn.peer_win == 0) {
-        // Zero window: buffer (if room) and let the persist timer probe.
-        if (tcp_conn.rtx_len + len > TCP_RTX_BUF_SIZE) {
-            serial_puts("[tcp] rtx buffer overflow, resetting\n");
-            tcp_conn.rtx_len = 0;
-        }
-        for (int i = 0; i < len; i++)
-            tcp_rtx_buf[tcp_conn.rtx_len + i] = data[i];
-        tcp_conn.rtx_len += len;
-        tcp_rtx_arm();
-        return;
-    }
-    // Buffer for retransmission (a second GET would mean a protocol bug —
-    // log and drop old unacked data rather than corrupt the stream)
-    if (tcp_conn.rtx_len + len > TCP_RTX_BUF_SIZE) {
-        serial_puts("[tcp] rtx buffer overflow, resetting\n");
-        tcp_conn.rtx_len = 0;
-    }
-    for (int i = 0; i < len; i++)
-        tcp_rtx_buf[tcp_conn.rtx_len + i] = data[i];
-    tcp_conn.rtx_len += len;
-
-    tcp_send_packet(0x18, data, len); // PSH+ACK
-    tcp_conn.seq += len;
-    // Start an RTT sample on this flight (Karn: only when nothing unacked —
-    // otherwise the ACK is ambiguous).
-    if (tcp_conn.rtx_tries == 0 && tcp_conn.rtt_seq == 0) {
-        tcp_conn.rtt_seq = tcp_conn.seq;
-        tcp_conn.rtt_tick = tick_count;
-    }
-    if (tcp_conn.rtx_tries == 0) tcp_rtx_arm();
+// Append in-order payload to the receive ring. The window never exceeds
+// the free space, so this only truncates for a peer that ignores it.
+static uint32_t tcp_rx_put(struct tcp_sock* c, const uint8_t* p, uint32_t n) {
+    uint32_t room = TCP_RX_CAP - c->rx_len;
+    if (n > room) n = room;
+    uint32_t first = TCP_RX_CAP - c->rx_head;
+    if (first > n) first = n;
+    memcpy(c->rx + c->rx_head, p, first);
+    if (n > first) memcpy(c->rx, p + first, n - first);
+    c->rx_head = (c->rx_head + n) % TCP_RX_CAP;
+    c->rx_len += n;
+    return n;
 }
 
-void tcp_close(void) {
-    if (tcp_conn.state == TCP_STATE_ESTABLISHED || tcp_conn.state == TCP_STATE_SYN_SENT) {
-        tcp_send_packet(0x11, 0, 0); // FIN+ACK
-        tcp_conn.rtx_has_fin = 1;
-        tcp_conn.seq++;
-        tcp_conn.state = TCP_STATE_FIN_WAIT;
-        tcp_rtx_arm();
-        serial_puts("[tcp] FIN sent\n");
-    }
-}
-
-// --- TCP state probes (used by the TLS integration to drive a blocking
-//     handshake from a single call context, e.g. the keyboard ISR) ---
-
-int tcp_is_established(void) {
-    return tcp_conn.state == TCP_STATE_ESTABLISHED;
-}
-
-int tcp_conn_state(void) {
-    return tcp_conn.state;
-}
-
-// True once the peer has closed (FIN seen, possibly our FIN already ACKed).
-// Used by the TLS recv callback to return EOF promptly instead of spinning
-// on the 5s record timeout.
-int tcp_is_closed(void) {
-    return tcp_conn.state == TCP_STATE_CLOSED ||
-           tcp_conn.state == TCP_STATE_FIN_WAIT;
-}
-
-// Retransmission + persist timer — call from the main loop. Fires when a
-// flight (SYN, data, or FIN) goes unacked past the RTO; backs off
-// exponentially and gives up after TCP_MAX_RTX attempts. Doubles as the
-// zero-window persist timer: with peer_win == 0 and data buffered, sends a
-// 1-byte probe (RFC 793 §3.7) instead of the full flight so a window update
-// (not a drop) comes back.
-void tcp_poll(void) {
-    if (tcp_conn.state == TCP_STATE_CLOSED &&
-        !(tcp_conn.rtx_len || tcp_conn.rtx_has_syn || tcp_conn.rtx_has_fin))
-        return;
-
-    uint32_t flight = (tcp_conn.rtx_has_syn ? 1u : 0u) +
-                      tcp_conn.rtx_len +
-                      (tcp_conn.rtx_has_fin ? 1u : 0u);
-    if (flight == 0) return;
-    if ((uint32_t)(tick_count - tcp_conn.rtx_last_tick) < tcp_conn.rtx_timeout) return;
-
-    // Zero-window persist: probe with 1 byte (never the full flight — the
-    // peer advertised zero and would drop it). Does NOT count toward give-up
-    // (a shut window is not packet loss) and does NOT double the RTO.
-    // Bounded by TCP_PERSIST_TIMEOUT instead: a window that never reopens
-    // (dead peer, blackholed probes) fails the fetch instead of probing
-    // forever with no error and no UI update.
-    if (tcp_conn.peer_win == 0 && tcp_conn.rtx_len > 0 &&
-        !tcp_conn.rtx_has_syn && tcp_conn.state == TCP_STATE_ESTABLISHED) {
-        if (!tcp_conn.persist_since) tcp_conn.persist_since = tick_count;
-        if ((uint32_t)(tick_count - tcp_conn.persist_since) > TCP_PERSIST_TIMEOUT) {
-            serial_puts("[tcp] persist give-up (window shut), closing\n");
-            tcp_conn.state = TCP_STATE_CLOSED;
-            tcp_conn.rtx_len = 0;
-            tcp_conn.rtx_has_syn = 0;
-            tcp_conn.rtx_has_fin = 0;
-            tcp_conn.persist_since = 0;
-            http_retry_pending = 0;
-            if (http_pending) {
-                http_pending = 0;
-                http_done = 0;
-            }
-            return;
-        }
-        serial_puts("[tcp] persist probe (peer win 0)\n");
-        tcp_send_raw(tcp_conn.snd_una, tcp_conn.ack, 0x10,
-                     tcp_rtx_buf, 1);
-        tcp_rtx_arm();
-        return;
-    }
-
-    if (tcp_conn.rtx_tries >= TCP_MAX_RTX) {
-        serial_puts("[tcp] retransmit give-up, closing connection\n");
-        tcp_conn.state = TCP_STATE_CLOSED;
-        tcp_conn.rtx_len = 0;
-        tcp_conn.rtx_has_syn = 0;
-        tcp_conn.rtx_has_fin = 0;
-        // Cancel the pending retry too — otherwise net_poll reconnects
-        // forever (observed: SYN -> 6 rtx -> give-up -> SYN -> ... loop)
-        http_retry_pending = 0;
-        if (http_pending) {
-            http_pending = 0;
-            http_done = 0;
-            for (int i = 0; i < 255; i++) net_event_msg[i] = 0;
-            int idx = 0;
-            const char* msg = "Connection timed out.\n";
-            for (int i = 0; msg[i]; i++) net_event_msg[idx++] = msg[i];
-            net_event_msg[idx] = 0;
-            net_event_pending = 1;
-        }
-        return;
-    }
-
-    tcp_conn.rtx_tries++;
-    if (tcp_conn.rtx_tries > 1) tcp_conn.rtx_timeout *= 2;
-    tcp_rtx_arm();
-
-    serial_puts("[tcp] retransmit #");
-    serial_putchar('0' + tcp_conn.rtx_tries);
-    serial_putchar('\n');
-
-    if (tcp_conn.rtx_has_syn) {
-        // SYN still unacked: resend it alone (seq = snd_una, no ACK flag)
-        tcp_send_raw(tcp_conn.snd_una, 0, 0x02, 0, 0);
-    } else {
-        uint8_t flags = 0x10; // ACK
-        if (tcp_conn.rtx_len > 0) flags |= 0x08; // PSH with data
-        else if (tcp_conn.rtx_has_fin) flags |= 0x01; // bare FIN
-        tcp_send_raw(tcp_conn.snd_una, tcp_conn.ack, flags,
-                     tcp_rtx_buf, tcp_conn.rtx_len);
-    }
-}
-
-// --- Reorder helpers (definitions live just above tcp_handle_packet).
 // Store a gap segment (seq > RCV.NXT). Returns 1 stored, 0 dropped.
-static int tcp_reorder_store(uint32_t seq, const uint8_t *payload, uint16_t plen);
-// Deliver one in-order payload + drain abutting buffered segments.
-static void tcp_deliver_in_order(uint32_t seq, const uint8_t *payload,
-                                 uint16_t plen, int is_tls);
-
-// Complete a peer FIN: RCV.NXT has reached the FIN's own seq (all data
-// received). Shared by the in-order FIN path and the early-FIN drain path
-// below — one close sequence, never two (fin_pending cleared first so a
-// duplicate FIN during the sends can't re-enter).
-static void tcp_complete_fin(void) {
-    tcp_conn.fin_pending = 0;
-    tcp_conn.ack++; // FIN consumes one sequence number
-    tcp_send_packet(0x10, 0, 0); // ACK their FIN
-    tcp_send_packet(0x11, 0, 0); // FIN+ACK (our side closes too)
-    tcp_conn.rtx_has_fin = 1;    // track it until ACKed
-    tcp_conn.rtx_tries = 0;
-    tcp_conn.rtx_timeout = TCP_RTO_TICKS;
-    tcp_rtx_arm();
-    tcp_conn.seq++;
-    tcp_conn.state = TCP_STATE_FIN_WAIT;
-    if (tls_is_active()) tls_connection_closed();
-    serial_puts("[tcp] FIN_WAIT (server FIN)\n");
-}
-
-void tcp_handle_packet(uint8_t* data, uint32_t len) {
-    if (len < 20) return;
-    uint16_t src_port = ((data[0] << 8) | data[1]);
-    uint16_t dst_port = ((data[2] << 8) | data[3]);
-    // 4-tuple check: ignore segments for any other connection. Without
-    // this, stray segments poison peer_win and the reorder state — observed:
-    // phantom win-0 locked a fetch in a persist-probe storm under 23K stray
-    // RSTs that belonged to no live connection.
-    if (src_port != tcp_conn.dst_port || dst_port != tcp_conn.src_port) return;
-    uint32_t seq_num = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
-                        ((uint32_t)data[6] << 8) | data[7];
-    uint32_t ack_num = ((uint32_t)data[8] << 24) | ((uint32_t)data[9] << 16) |
-                        ((uint32_t)data[10] << 8) | data[11];
-    uint8_t flags = data[13];
-    uint8_t data_offset = (data[12] >> 4) * 4;
-    uint16_t payload_len = len - data_offset;
-    // Cache the peer's advertised window on EVERY segment (window updates
-    // ride on pure ACKs too, not just data). Zero is meaningful (persist).
-    tcp_conn.peer_win = ((uint32_t)data[14] << 8) | data[15];
-    if (tcp_conn.peer_win != 0) tcp_conn.persist_since = 0;
-
-    serial_puts("[tcp] pkt src=");
-    serial_putchar(hex[(src_port >> 8) & 0xF]);
-    serial_putchar(hex[src_port & 0xF]);
-    serial_puts(" dst=");
-    serial_putchar(hex[(dst_port >> 8) & 0xF]);
-    serial_putchar(hex[dst_port & 0xF]);
-    serial_puts(" flags=");
-    serial_putchar(hex[(flags >> 4) & 0xF]);
-    serial_putchar(hex[flags & 0xF]);
-    serial_puts(" seq=");
-    print_hex32(seq_num);
-    serial_puts(" ack=");
-    print_hex32(ack_num);
-    serial_puts(" our_ack=");
-    print_hex32(tcp_conn.ack);
-    serial_puts(" plen=");
-    serial_putchar(hex[(payload_len >> 8) & 0xF]);
-    serial_putchar(hex[payload_len & 0xF]);
-    serial_puts(" state=");
-    serial_putchar('0' + tcp_conn.state);
-    serial_putchar('\n');
-
-    if (dst_port != tcp_conn.src_port) return;
-
-    serial_puts("[tcp] pkt flags=");
-    serial_putchar(hex[(flags >> 4) & 0xF]);
-    serial_putchar(hex[flags & 0xF]);
-    serial_puts(" state=");
-    serial_putchar('0' + tcp_conn.state);
-    serial_putchar('\n');
-
-    if (tcp_conn.state == TCP_STATE_CLOSED) {
-        // Late ACK (e.g. for our FIN after the server closed first) —
-        // still clears the retransmit flight
-        if (flags & 0x10) tcp_process_ack(ack_num, payload_len);
-        return;
-    }
-
-    // RST: peer aborted — tear down immediately (RFC 793). Without this a
-    // reset connection sits in ESTABLISHED forever, retransmitting/probing
-    // into the void (observed: infinite persist storm, wedged fetch, dead
-    // UI). Ports already verified above; seq is intentionally not checked
-    // (same trust level as our FIN handling — a MITM that can spoof RSTs
-    // can deny service by dropping packets anyway).
-    if (flags & 0x04) {
-        serial_puts("[tcp] RST, aborting connection\n");
-        tcp_conn.state = TCP_STATE_CLOSED;
-        tcp_conn.rtx_len = 0;
-        tcp_conn.rtx_has_syn = 0;
-        tcp_conn.rtx_has_fin = 0;
-        tcp_conn.fin_pending = 0;
-        tcp_conn.persist_since = 0;
-        if (tls_is_active()) tls_connection_closed();
-        if (http_pending) {
-            http_pending = 0;
-            if (http_response_len > 0) http_done = 1;
-        }
-        return;
-    }
-
-    if (tcp_conn.state == TCP_STATE_SYN_SENT) {
-        if (flags & 0x12) { // SYN+ACK
-            tcp_conn.ack = seq_num + 1;
-            tcp_conn.seq = ack_num; // Sync our seq
-            tcp_conn.state = TCP_STATE_ESTABLISHED;
-            tcp_process_ack(ack_num, payload_len); // clears in-flight SYN
-            tcp_send_packet(0x10, 0, 0); // ACK
-            serial_puts("[tcp] ESTABLISHED\n");
-            for (int i = 0; i < 255; i++) net_event_msg[i] = 0;
-            int idx = 0;
-            const char* msg = "TCP connected, sending HTTP request...\n";
-            for (int i = 0; msg[i]; i++) net_event_msg[idx++] = msg[i];
-            net_event_msg[idx] = 0;
-            net_event_pending = 1;
-        }
-    } else if (tcp_conn.state == TCP_STATE_ESTABLISHED) {
-        // Cumulative ACK for our in-flight data/FIN (usually piggybacked).
-        // Thread the segment length so pure-ACK repeats (fast-retransmit
-        // candidates) are distinguished from data-carrying segments.
-        if (flags & 0x10) tcp_process_ack(ack_num, payload_len);
-
-        // In-order fast path; duplicates + gaps go to the reorder buffer.
-        // Duplicates (seq < RCV.NXT) arrive when OUR ack of their data was
-        // lost — re-ACK only. Gaps (seq > RCV.NXT) mean an earlier segment
-        // went missing — STASH the payload in the reorder buffer (up to 8
-        // segments / 12KB) instead of dropping it; tcp_reorder_drain()
-        // delivers it in order once the hole fills. Beyond capacity: drop +
-        // re-ACK (classic behavior, sender retransmits).
-        // seg_dlen preserves the segment's original data length for the FIN
-        // branch below (payload_len is zeroed when gap-stashed/duped).
-        uint16_t seg_dlen = payload_len;
-        if (payload_len > 0 && seq_num != tcp_conn.ack) {
-            if (seq_lt(seq_num, tcp_conn.ack)) {
-                serial_puts("[tcp] dup seq, re-ACKing\n");
-                tcp_send_packet(0x10, 0, 0);
-                payload_len = 0; // don't double-append below
-            } else if (!tcp_reorder_store(seq_num, data + data_offset,
-                                           payload_len)) {
-                serial_puts("[tcp] reorder full, dropping gap segment\n");
-                tcp_send_packet(0x10, 0, 0);
-                payload_len = 0;
-            } else {
-                // Stored for later: ACK the hole edge (fast-retransmit hint
-                // for the sender) but don't advance RCV.NXT yet.
-                serial_puts("[tcp] gap buffered, re-ACKing\n");
-                tcp_send_packet(0x10, 0, 0);
-                payload_len = 0;
-            }
-        }
-
-        // Payload BEFORE FIN: servers may piggyback the last data bytes on
-        // the FIN packet — checking FIN first would drop that payload.
-        // Both branches go through tcp_deliver_in_order() so a filled hole
-        // immediately drains any buffered gap segments sitting behind it.
-        if (payload_len > 0) {
-            if (tls_is_active()) {
-                // TLS session in progress: feed raw TCP payload into the TLS
-                // receive buffer. tls_client_run polls this buffer from its
-                // recv callback; the main loop never reads it concurrently
-                // with the IRQ, so there is no writer race.
-                tcp_deliver_in_order(seq_num, data + data_offset, payload_len, 1);
-            } else if (http_pending) {
-                tcp_deliver_in_order(seq_num, data + data_offset, payload_len, 0);
-            }
-        }
-        if (flags & 0x01) { // FIN
-            // The FIN consumes the seq number right after this segment's
-            // data. If a receive hole is still open (FIN seq ahead of
-            // RCV.NXT), the FIN arrived ahead of missing data: advancing
-            // RCV.NXT to it would ACK bytes never received (data loss →
-            // TLS decrypts garbage → bogus PROTO failure, observed on
-            // bursty senders). Stash it and re-ACK; the drain path
-            // completes the close once retransmits fill the hole (same
-            // helper, single close). A FIN at/behind the edge is already
-            // fully received → complete (also covers duplicate FINs).
-            // NOTE: payload_len was zeroed above when gap-stashed, so use
-            // the segment's original data length here.
-            uint32_t fin_seq = seq_num + seg_dlen;
-            if (fin_seq != tcp_conn.ack && seq_lt(tcp_conn.ack, fin_seq)) {
-                tcp_conn.fin_pending = 1;
-                tcp_conn.fin_seq = fin_seq;
-                tcp_send_packet(0x10, 0, 0); // re-ACK the hole edge
-                serial_puts("[tcp] FIN early (hole open), queued\n");
-                return;
-            }
-            tcp_complete_fin();
-            return;
-        }
-    } else if (tcp_conn.state == TCP_STATE_FIN_WAIT) {
-        if (flags & 0x10) { // ACK of our FIN
-            tcp_process_ack(ack_num, payload_len); // clears rtx_has_fin
-            tcp_conn.state = TCP_STATE_CLOSED;
-            serial_puts("[tcp] CLOSED (FIN ACKed)\n");
-        }
-        // Retransmitted server FIN (our ACK was lost) — re-ACK it
-        if (flags & 0x01) {
-            tcp_send_packet(0x10, 0, 0);
-        }
-    }
-}
-
-// --- Reorder helper definitions (prototypes above tcp_handle_packet). ---
-static int tcp_reorder_store(uint32_t seq, const uint8_t *payload, uint16_t plen) {
+static int tcp_reorder_store(struct tcp_sock* c, uint32_t seq, const uint8_t* payload, uint16_t plen) {
     if (!payload || plen == 0 || plen > TCP_REORDER_SEG) return 0;
+    for (int i = 0; i < TCP_REORDER_SLOTS; i++)
+        if (c->ro_used[i] && c->ro_seq[i] == seq) return 1;   // already held
     for (int i = 0; i < TCP_REORDER_SLOTS; i++) {
-        if (tcp_reorder_used[i] && tcp_reorder_seq[i] == seq) return 0;
-    }
-    for (int i = 0; i < TCP_REORDER_SLOTS; i++) {
-        if (!tcp_reorder_used[i]) {
-            for (int b = 0; b < plen; b++)
-                tcp_reorder_data[i][b] = payload[b];
-            tcp_reorder_seq[i] = seq;
-            tcp_reorder_len[i] = plen;
-            tcp_reorder_used[i] = 1;
+        if (!c->ro_used[i]) {
+            memcpy(c->ro_data + i * TCP_REORDER_SEG, payload, plen);
+            c->ro_seq[i] = seq;
+            c->ro_len[i] = plen;
+            c->ro_used[i] = 1;
             return 1;
         }
     }
     return 0;
 }
 
-static void tcp_sink_payload(const uint8_t *payload, uint16_t plen, int is_tls) {
-    if (is_tls) {
-        int copy = plen < 1500 ? plen : 1500;
-        tls_append_data((uint8_t*)payload, copy);
-        if (!tls_dumped) {
-            tls_dumped = 1;
-            serial_puts("[tls] RX bytes: ");
-            for (int d = 0; d < copy && d < 32; d++) {
-                serial_putchar(hex[(payload[d] >> 4) & 0xF]);
-                serial_putchar(hex[payload[d] & 0xF]);
-                serial_putchar(' ');
-            }
-            serial_putchar('\n');
-        }
-        serial_puts("[tls] segment, fed ");
-        serial_putchar('0' + (copy / 1000) % 10);
-        serial_putchar('0' + (copy / 100) % 10);
-        serial_putchar('0' + (copy / 10) % 10);
-        serial_putchar('0' + (copy % 10));
-        serial_puts(" bytes to TLS rx\n");
-        return;
-    }
-    int copy = plen;
-    if (copy > 1500) copy = 1500;
-    if (http_response_len + copy > (int)sizeof(http_response) - 1) {
-        copy = (int)sizeof(http_response) - 1 - http_response_len;
-        if (!http_response_overflow) {
-            http_response_overflow = 1;
-            serial_puts("[http] WARNING: response exceeded buffer, truncating\n");
-        }
-    }
-    for (int i = 0; i < copy; i++) {
-        http_response[http_response_len + i] = (char)payload[i];
-    }
-    http_response_len += copy;
-    http_response[http_response_len] = 0;
+static void tcp_complete_fin(struct tcp_sock* c);
 
-    serial_printf("[http] segment, total %u bytes\n",
-                  (unsigned)http_response_len);
-
-    // Terminal preview from the FIRST segment only. Show just the
-    // status line — the old 180-byte raw-header dump flooded the
-    // terminal on every fetch (full headers stay in the serial
-    // log, where debugging belongs).
-    if (http_response_len == copy) {
-        for (int i = 0; i < 255; i++) net_event_msg[i] = 0;
-        int idx = 0;
-        for (int i = 0; i < copy && idx < 60; i++) {
-            char ch = http_response[i];
-            if (ch == '\r' || ch == '\n') break;
-            net_event_msg[idx++] = ch;
-        }
-        const char* tail = " — receiving...";
-        for (int i = 0; tail[i] && idx < 254; i++) net_event_msg[idx++] = tail[i];
-        net_event_msg[idx++] = '\n';
-        net_event_msg[idx] = 0;
-        net_event_pending = 1;
-    }
-}
-
-static void tcp_deliver_in_order(uint32_t seq, const uint8_t *payload,
-                                 uint16_t plen, int is_tls) {
-    // Caller guarantees seq == RCV.NXT for the head segment.
-    tcp_conn.ack = seq + plen;
-    tcp_send_packet(0x10, 0, 0); // ACK
-    tcp_sink_payload(payload, plen, is_tls);
-    // Drain loop: find the buffered segment starting exactly at RCV.NXT.
+// Deliver one in-order payload (seq == RCV.NXT) + drain abutting buffered
+// segments. The ACK goes out at the next flush (one per receive batch,
+// not one per segment — each frame is an MMIO exit).
+static void tcp_deliver_in_order(struct tcp_sock* c, const uint8_t* payload, uint16_t plen) {
+    uint32_t took = tcp_rx_put(c, payload, plen);
+    c->ack += took;
+    c->ack_pending = 1;
+    if (took < plen) return;             // ring full: the rest is retransmitted
     for (;;) {
         int found = -1;
-        for (int i = 0; i < TCP_REORDER_SLOTS; i++) {
-            if (tcp_reorder_used[i] && tcp_reorder_seq[i] == tcp_conn.ack) {
-                found = i;
-                break;
+        for (int i = 0; i < TCP_REORDER_SLOTS; i++)
+            if (c->ro_used[i] && c->ro_seq[i] == c->ack) { found = i; break; }
+        if (found < 0) break;
+        uint16_t flen = c->ro_len[found];
+        if (TCP_RX_CAP - c->rx_len < flen) break;   // keep it until there is room
+        tcp_rx_put(c, c->ro_data + found * TCP_REORDER_SEG, flen);
+        c->ack += flen;
+        c->ro_used[found] = 0;
+    }
+    // Drop held segments the stream has already passed.
+    for (int i = 0; i < TCP_REORDER_SLOTS; i++)
+        if (c->ro_used[i] && seq_lt(c->ro_seq[i], c->ack)) c->ro_used[i] = 0;
+    if (c->fin_pending && c->fin_seq == c->ack) tcp_complete_fin(c);
+}
+
+// Complete a peer FIN once every byte before it has been received: ACK it,
+// close our side too (HTTP never sends after the server closes), mark EOF.
+static void tcp_complete_fin(struct tcp_sock* c) {
+    c->fin_pending = 0;
+    c->peer_closed = 1;
+    c->ack++;                            // FIN consumes one sequence number
+    if (c->state == TCP_STATE_ESTABLISHED) {
+        c->rtx_has_fin = 1;
+        c->rtx_tries = 0;
+        tcp_send_raw(c, c->seq, c->ack, 0x11, c->rtx, 0);   // ACK + our FIN
+        c->seq++;
+        c->state = TCP_STATE_FIN_WAIT;
+        tcp_rtx_arm(c);
+    } else {
+        tcp_send_ctl(c, 0x10);
+    }
+    if (net_trace) serial_printf("[tcp] s%d peer FIN\n", (int)(c - tcp_socks));
+}
+
+void tcp_handle_packet(uint8_t* src_ip, uint8_t* data, uint32_t len) {
+    if (len < 20) return;
+    uint16_t src_port = (uint16_t)((data[0] << 8) | data[1]);
+    uint16_t dst_port = (uint16_t)((data[2] << 8) | data[3]);
+    struct tcp_sock* c = 0;
+    for (int i = 0; i < TCP_MAX_SOCKS; i++) {
+        struct tcp_sock* t = &tcp_socks[i];
+        if (t->used && t->dst_port == src_port && t->src_port == dst_port &&
+            t->dst_ip[0] == src_ip[0] && t->dst_ip[1] == src_ip[1] &&
+            t->dst_ip[2] == src_ip[2] && t->dst_ip[3] == src_ip[3]) { c = t; break; }
+    }
+    if (!c) return;                      // no such connection (stale / stray)
+    uint32_t seq_num = ((uint32_t)data[4] << 24) | ((uint32_t)data[5] << 16) |
+                       ((uint32_t)data[6] << 8) | data[7];
+    uint32_t ack_num = ((uint32_t)data[8] << 24) | ((uint32_t)data[9] << 16) |
+                       ((uint32_t)data[10] << 8) | data[11];
+    uint8_t flags = data[13];
+    uint32_t data_offset = (uint32_t)(data[12] >> 4) * 4;
+    if (data_offset < 20 || data_offset > len) return;
+    uint16_t payload_len = (uint16_t)(len - data_offset);
+    const uint8_t* payload = data + data_offset;
+    c->peer_win = ((uint32_t)data[14] << 8) | data[15];
+    if (c->peer_win != 0) c->persist_since = 0;
+    if (net_trace)
+        serial_printf("[tcp] s%d flags=%x seq=%x ack=%x plen=%u state=%d\n", (int)(c - tcp_socks),
+                      flags, seq_num, ack_num, payload_len, c->state);
+
+    if (flags & 0x04) {                  // RST: peer aborted
+        if (c->state == TCP_STATE_SYN_SENT && !(flags & 0x10)) return;
+        c->failed = 1;
+        c->state = TCP_STATE_CLOSED;
+        c->rtx_len = 0; c->rtx_has_syn = 0; c->rtx_has_fin = 0;
+        c->fin_pending = 0;
+        if (c->app_closed) tcp_release(c);
+        return;
+    }
+
+    if (c->state == TCP_STATE_SYN_SENT) {
+        if ((flags & 0x12) == 0x12 && ack_num == c->snd_una + 1) {   // SYN+ACK for our SYN
+            c->ack = seq_num + 1;
+            c->state = TCP_STATE_ESTABLISHED;
+            tcp_process_ack(c, ack_num, 0);
+            tcp_send_ctl(c, 0x10);
+            if (net_trace) serial_printf("[tcp] s%d ESTABLISHED\n", (int)(c - tcp_socks));
+        }
+        return;
+    }
+    if (c->state == TCP_STATE_CLOSED) {
+        if (flags & 0x10) tcp_process_ack(c, ack_num, payload_len);
+        return;
+    }
+
+    if (flags & 0x10) tcp_process_ack(c, ack_num, payload_len);
+
+    if (c->state == TCP_STATE_FIN_WAIT && c->app_closed) {
+        // Owner is gone: just finish the close.
+        if (!c->rtx_has_fin && !c->rtx_len) tcp_release(c);
+        else if (flags & 0x01) tcp_send_ctl(c, 0x10);
+        return;
+    }
+
+    // In-order data is delivered (+ buffered successors drained); a gap is
+    // stashed and the hole edge re-ACKed (fast-retransmit hint); duplicates
+    // are re-ACKed only. Only ESTABLISHED accepts new data.
+    uint16_t seg_dlen = payload_len;
+    if (payload_len > 0 && c->state == TCP_STATE_ESTABLISHED) {
+        if (seq_num == c->ack) {
+            tcp_deliver_in_order(c, payload, payload_len);
+        } else if (seq_lt(seq_num, c->ack)) {
+            // Overlap: deliver only the new tail.
+            uint32_t skip = c->ack - seq_num;
+            if (skip < payload_len) tcp_deliver_in_order(c, payload + skip, (uint16_t)(payload_len - skip));
+            else tcp_send_ctl(c, 0x10);
+        } else {
+            if (!tcp_reorder_store(c, seq_num, payload, payload_len) && net_trace)
+                serial_puts("[tcp] reorder full, dropping gap segment\n");
+            tcp_send_ctl(c, 0x10);
+        }
+    }
+    if (flags & 0x01) {                  // FIN
+        uint32_t fin_seq = seq_num + seg_dlen;
+        if (c->peer_closed) { tcp_send_ctl(c, 0x10); }       // retransmitted FIN
+        else if (c->state != TCP_STATE_ESTABLISHED && c->state != TCP_STATE_FIN_WAIT) {}
+        else if (fin_seq != c->ack && seq_lt(c->ack, fin_seq)) {
+            // FIN ahead of missing data: completing it now would ACK bytes
+            // never received. Hold it; the drain completes the close.
+            c->fin_pending = 1;
+            c->fin_seq = fin_seq;
+            tcp_send_ctl(c, 0x10);
+        } else {
+            tcp_complete_fin(c);
+        }
+    }
+    if (c->state == TCP_STATE_FIN_WAIT && c->peer_closed && !c->rtx_has_fin && !c->rtx_len)
+        c->state = TCP_STATE_CLOSED;     // both FINs exchanged and acknowledged
+}
+
+// Retransmission + persist timers, delayed ACKs, closed-socket reaping.
+static void tcp_poll(void) {
+    for (int i = 0; i < TCP_MAX_SOCKS; i++) {
+        struct tcp_sock* c = &tcp_socks[i];
+        if (!c->used) continue;
+        if (c->ack_pending && c->state != TCP_STATE_CLOSED) tcp_send_ctl(c, 0x10);
+        if (c->app_closed) {
+            if (c->state == TCP_STATE_CLOSED ||
+                (uint32_t)(tick_count - c->close_tick) > TCP_CLOSE_LINGER) {
+                tcp_release(c);
+                continue;
             }
         }
-        if (found < 0) break;
-        uint16_t flen = tcp_reorder_len[found];
-        tcp_conn.ack += flen;
-        tcp_send_packet(0x10, 0, 0); // ACK (cumulative — covers the gap)
-        tcp_sink_payload(tcp_reorder_data[found], flen, is_tls);
-        tcp_reorder_used[found] = 0;
-        serial_puts("[tcp] reorder drain: delivered buffered segment\n");
-    }
-    // A FIN stashed while the hole was open completes here: RCV.NXT has
-    // caught up to the FIN's seq, so every byte is received exactly once.
-    if (tcp_conn.fin_pending && tcp_conn.fin_seq == tcp_conn.ack) {
-        serial_puts("[tcp] drained to queued FIN, closing\n");
-        tcp_complete_fin();
-    }
-}
+        uint32_t flight = (c->rtx_has_syn ? 1u : 0u) + c->rtx_len + (c->rtx_has_fin ? 1u : 0u);
+        if (flight == 0) continue;
+        if ((uint32_t)(tick_count - c->rtx_last_tick) < c->rtx_timeout) continue;
 
-void http_get(const char* host, const char* path) {
-    http_get_port(host, path, 80);
-}
-
-// Port-aware GET (numeric-IP URLs and non-80 ports). port 0 means 80.
-void http_get_port(const char* host, const char* path, uint16_t port) {
-    uint16_t use_port = port ? port : 80;
-    http_pending_port = use_port;
-    http_req_gzip = net_accept_gzip;
-    http_req_html = net_accept_html;
-    if (net_extra_headers != http_req_extra) {
-        int k = 0;
-        if (net_extra_headers)
-            for (; net_extra_headers[k] && k < NET_EXTRA_MAX - 1; k++) http_req_extra[k] = net_extra_headers[k];
-        http_req_extra[k] = 0;
-    }
-
-    // Every request starts a fresh response lifecycle. Without this, a
-    // second fetch (e.g. okai refresh) raced the parse block with the
-    // PREVIOUS response's stale http_done=1 + buffer: an immediate bogus
-    // parse ran, double-dechunked the buffer to garbage, and the sentinel
-    // then blocked the real response from ever rendering.
-    http_response_len = 0;
-    http_response_overflow = 0;
-    http_done = 0;
-
-    // Numeric host ("10.0.2.2")? Seed the cache and skip DNS entirely.
-    uint32_t nip;
-    if (net_parse_ip(host, &nip)) dns_seed(host, nip);
-
-    // Resolve hostname first
-    uint32_t ip;
-    if (dns_is_resolved(&ip, host)) {
-        // Already resolved for this host, connect directly
-    } else if (dns_is_pending_for(host)) {
-        // Save for retry after DNS completes
-        net_copy_str(http_pending_host, host);
-        net_copy_path(http_pending_path, path);
-        http_retry_pending = 1;
-        return;
-    } else {
-        dns_resolve(host);
-        net_copy_str(http_pending_host, host);
-        net_copy_path(http_pending_path, path);
-        http_retry_pending = 1;
-        return;
-    }
-
-    // The stack services one global connection, so a new request must open a
-    // fresh one unless the current session is a live, reusable ESTABLISHED
-    // (keep-alive) connection. Every other state (CLOSED, FIN_WAIT, CLOSE_WAIT,
-    // TIME_WAIT, LAST_ACK) means the previous fetch ended — reconnect.
-    if (tcp_conn.state == TCP_STATE_ESTABLISHED) {
-        // Keep-alive: reuse the live connection, fall through to send the GET.
-    } else if (tcp_conn.state == TCP_STATE_SYN_SENT) {
-        // Handshake already in progress for this request; the retry path
-        // re-fires http_get() once it reaches ESTABLISHED.
-        net_copy_str(http_pending_host, host);
-        net_copy_path(http_pending_path, path);
-        http_retry_pending = 1;
-        serial_puts("[http] waiting for TCP handshake...\n");
-        return;
-    } else {
-        // Previous connection ended (or is mid-close) — open a fresh one.
-        http_conn_attempts++;
-        if (http_conn_attempts > HTTP_MAX_CONN_ATTEMPTS) {
-            // Unreachable after several SYN attempts: abandon this request so
-            // the okai owner model can move on to the next pending window.
-            http_retry_pending = 0;
-            http_done = 0;
-            serial_puts("[http] giving up: host unreachable\n");
-            return;
+        // Zero-window persist: 1-byte probes (not counted as loss), bounded.
+        if (c->peer_win == 0 && c->rtx_len > 0 && c->state == TCP_STATE_ESTABLISHED) {
+            if (!c->persist_since) c->persist_since = tick_count;
+            if ((uint32_t)(tick_count - c->persist_since) > TCP_PERSIST_TIMEOUT) {
+                serial_printf("[tcp] s%d persist give-up (window shut)\n", i);
+                c->failed = 1;
+                c->state = TCP_STATE_CLOSED;
+                c->rtx_len = 0; c->rtx_has_syn = 0; c->rtx_has_fin = 0;
+                continue;
+            }
+            tcp_send_raw(c, c->snd_una, c->ack, 0x10, c->rtx, 1);
+            tcp_rtx_arm(c);
+            continue;
         }
-        net_copy_str(http_pending_host, host);
-        net_copy_path(http_pending_path, path);
-        http_retry_pending = 1;
-        tcp_connect(ip, use_port);
-        return;
-    }
-
-    // Build HTTP GET request (static: path + cookies make it several KB)
-    static uint8_t req_buf[NET_PATH_MAX + 512 + NET_EXTRA_MAX];
-    int req_len = 0;
-
-    const char* method = "GET ";
-    for (int i = 0; method[i]; i++) req_buf[req_len++] = method[i];
-    for (int i = 0; path[i]; i++) req_buf[req_len++] = path[i];
-    req_buf[req_len++] = ' ';
-    req_buf[req_len++] = 'H';
-    req_buf[req_len++] = 'T';
-    req_buf[req_len++] = 'T';
-    req_buf[req_len++] = 'P';
-    req_buf[req_len++] = '/';
-    req_buf[req_len++] = '1';
-    req_buf[req_len++] = '.';
-    req_buf[req_len++] = '1';
-    req_buf[req_len++] = '\r';
-    req_buf[req_len++] = '\n';
-
-    const char* hdr_host = "Host: ";
-    for (int i = 0; hdr_host[i]; i++) req_buf[req_len++] = hdr_host[i];
-    for (int i = 0; host[i]; i++) req_buf[req_len++] = host[i];
-    req_buf[req_len++] = '\r';
-    req_buf[req_len++] = '\n';
-
-    const char* hdr_ua = "User-Agent: okernel/0.4\r\n";
-    for (int i = 0; hdr_ua[i]; i++) req_buf[req_len++] = hdr_ua[i];
-    const char* hdr_acc = http_req_html ? NET_ACCEPT_HTML : "Accept: */*\r\n";
-    for (int i = 0; hdr_acc[i]; i++) req_buf[req_len++] = hdr_acc[i];
-    if (http_req_gzip) {
-        const char* hdr_ae = "Accept-Encoding: gzip\r\n";
-        for (int i = 0; hdr_ae[i]; i++) req_buf[req_len++] = hdr_ae[i];
-    }
-    for (int i = 0; http_req_extra[i]; i++) req_buf[req_len++] = (uint8_t)http_req_extra[i];
-
-    const char* hdr_end = "Connection: close\r\n\r\n";
-    for (int i = 0; hdr_end[i]; i++) req_buf[req_len++] = hdr_end[i];
-
-    serial_puts("[http] sending GET ");
-    serial_puts(path);
-    serial_puts(" to ");
-    serial_puts(host);
-    serial_puts("\n");
-
-    // Arm the RX accumulator BEFORE the request hits the wire — SLIRP is
-    // in-process and the response IRQ can land before this function returns
-    if (!http_pending) {
-        http_response_len = 0;
-        http_response_overflow = 0;
-        http_done = 0;
-    }
-    http_pending = 1;
-    tcp_send_data(req_buf, req_len);
-}
-
-void http_poll(void) {
-    if (!http_pending) return;
-    // Response bytes are accumulated in tcp_handle_packet (IRQ); here we
-    // only watch for connection close to flag the response as complete
-    if (tcp_conn.state == TCP_STATE_CLOSED && http_pending) {
-        http_pending = 0;
-        if (http_response_len > 0) http_done = 1;
-        serial_puts("[http] connection closed\n");
+        if (c->rtx_tries >= TCP_MAX_RTX) {
+            serial_printf("[tcp] s%d retransmit give-up, closing\n", i);
+            c->failed = 1;
+            c->state = TCP_STATE_CLOSED;
+            c->rtx_len = 0; c->rtx_has_syn = 0; c->rtx_has_fin = 0;
+            continue;
+        }
+        c->rtx_tries++;
+        if (c->rtx_tries > 1 && c->rtx_timeout < TCP_RTO_MAX) c->rtx_timeout = (uint16_t)(c->rtx_timeout * 2);
+        tcp_rtx_arm(c);
+        if (net_trace || c->rtx_tries > 2) serial_printf("[tcp] s%d retransmit #%d\n", i, c->rtx_tries);
+        tcp_resend(c);
     }
 }
-
-char* http_get_response(void) { return http_response; }
 
 // Decode chunked transfer encoding in place. QEMU SLIRP forwards the
 // server's framing verbatim, so a "Transfer-Encoding: chunked" response
@@ -1814,22 +1296,16 @@ int http_dechunk(char* buf, int len) {
     buf[wr] = 0;
     return wr;
 }
-int http_get_response_len(void) { return http_response_len; }
-int http_is_pending(void) { return http_pending; }
-int http_is_done(void) { return http_done; }
-int http_is_retry_pending(void) { return http_retry_pending; }
-// Reset the connection-attempt counter for a brand-new request (called by the
-// okai fetch driver before http_get; NOT by net_poll's retry re-fire).
-void http_reset_conn_attempts(void) { http_conn_attempts = 0; }
 
 void net_set_event_callback(void (*cb)(const char* msg)) {
     net_event_callback = cb;
 }
 
-// Retry pending operations (called from main loop)
+// Timers and retries (called from the main loop right after e1000_poll, so
+// the ACKs owed for the batch just received go out together).
 void net_poll(void) {
-    // Retransmission timer (SYN/data/FIN) — runs every main-loop pass
     tcp_poll();
+    dns_poll();
 
     // Dispatch pending network events to terminal
     if (net_event_pending && net_event_callback) {
@@ -1842,68 +1318,7 @@ void net_poll(void) {
         uint8_t target_mac[6];
         if (arp_resolve(ping_target_ip, target_mac)) {
             serial_puts("[icmp] ARP resolved, sending ping\n");
-            ping_pending = 0;
-            // Build and send the ICMP echo request
-            uint8_t frame[ETH_FRAME_MAX];
-            uint8_t* mac = e1000_get_mac();
-            struct eth_header* eth = (struct eth_header*)frame;
-            build_eth_header(eth, target_mac, mac, 0x0800);
-            struct ip_header* ip = (struct ip_header*)(frame + sizeof(struct eth_header));
-            ip->version_ihl = 0x45;
-            ip->tos = 0;
-            uint16_t ip_total = sizeof(struct ip_header) + sizeof(struct icmp_header);
-            ip->total_length = ((ip_total >> 8) & 0xFF) | ((ip_total & 0xFF) << 8);
-            ip->id = 0;
-            ip->flags_frag = 0;
-            ip->ttl = 64;
-            ip->protocol = 1;
-            for (int i = 0; i < 4; i++) ip->src_ip[i] = our_ip[i];
-            for (int i = 0; i < 4; i++) ip->dst_ip[i] = ping_target_ip[i];
-            ip->checksum = ip_checksum(ip);
-            struct icmp_header* icmp = (struct icmp_header*)(frame + sizeof(struct eth_header) + sizeof(struct ip_header));
-            icmp->type = 8;
-            icmp->code = 0;
-            icmp->id = ((ping_id >> 8) & 0xFF) | ((ping_id & 0xFF) << 8);
-            icmp->seq = ((ping_seq >> 8) & 0xFF) | ((ping_seq & 0xFF) << 8);
-            icmp->checksum = 0;
-            icmp->checksum = net_checksum(icmp, sizeof(struct icmp_header));
-            int total = sizeof(struct eth_header) + sizeof(struct ip_header) + sizeof(struct icmp_header);
-            e1000_send(frame, total);
-        }
-    }
-
-    // Retry DNS query after ARP for DNS server resolves
-    if (dns_retry_pending) {
-        uint8_t dns_server_ip[4] = {10, 0, 2, 3};
-        uint8_t target_mac[6];
-        if (arp_resolve(dns_server_ip, target_mac)) {
-            serial_puts("[dns] ARP resolved, sending query for '");
-            serial_puts(dns_pending_host);
-            serial_puts("'\n");
-            dns_retry_pending = 0;
-            dns_resolve(dns_pending_host);
-        }
-    }
-
-    // Retry HTTP after DNS resolves
-    if (http_retry_pending) {
-        uint32_t ip;
-        if (dns_is_resolved(&ip, http_pending_host)) {
-            if (tcp_conn.state == TCP_STATE_CLOSED) {
-                http_retry_pending = 0;
-                { int sv = net_accept_gzip, sh = net_accept_html; // keep the original request's opt-ins
-                  net_accept_gzip = http_req_gzip; net_accept_html = http_req_html;
-                  const char* sx = net_extra_headers; net_extra_headers = http_req_extra;
-                  http_get_port(http_pending_host, http_pending_path, http_pending_port);
-                  net_accept_gzip = sv; net_accept_html = sh; net_extra_headers = sx; }
-            } else if (tcp_conn.state == TCP_STATE_ESTABLISHED) {
-                http_retry_pending = 0;
-                { int sv = net_accept_gzip, sh = net_accept_html; // keep the original request's opt-ins
-                  net_accept_gzip = http_req_gzip; net_accept_html = http_req_html;
-                  const char* sx = net_extra_headers; net_extra_headers = http_req_extra;
-                  http_get_port(http_pending_host, http_pending_path, http_pending_port);
-                  net_accept_gzip = sv; net_accept_html = sh; net_extra_headers = sx; }
-            }
+            icmp_send_ping(ping_target_ip, ping_id, ping_seq);
         }
     }
 }
@@ -1996,7 +1411,7 @@ static void handle_ip(uint8_t* data, uint32_t len) {
         if (ip_total < (uint16_t)ip_hlen + 20) return; // malformed
         uint8_t* tcp_data = (uint8_t*)iph + ip_hlen;
         uint32_t tcp_len = ip_total - ip_hlen;
-        tcp_handle_packet(tcp_data, tcp_len);
+        tcp_handle_packet(iph->src_ip, tcp_data, tcp_len);
     }
 }
 

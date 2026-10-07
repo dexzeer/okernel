@@ -1,7 +1,8 @@
 #include "net/pci.h"
 #include "net/e1000.h"
 #include "net/network.h"
-#include "net/tls_net.h"
+#include "net/fetch.h"
+#include "net/e1000.h"
 #include "crypto/tls_client.h"  // TLS_FAIL_* reason codes for the no-downgrade gate
 #include "rtc.h"
 #include "graphics.h"
@@ -757,6 +758,11 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, ip_buf);
         window_puts(win_id, "\n");
     }
+    else if (str_eq(cmd_buf, "nettrace")) {
+        // Per-packet serial tracing (frames, TCP segments) on/off
+        net_trace = !net_trace;
+        window_puts(win_id, net_trace ? "Packet tracing on (serial).\n" : "Packet tracing off.\n");
+    }
     else if (str_eq(cmd_buf, "netdrop")) {
         // Test hook: drop every Nth received TCP packet (netdrop 0 = off)
         int n = 0;
@@ -1219,54 +1225,6 @@ static void on_net_event(const char* msg) {
     }
 }
 
-// Save HTTP response to the pending okse file
-static char okse_save_file[140] = {0};
-static int okse_saved_notified = 0;
-
-void net_set_okse_save(const char* filename) {
-    int i = 0;
-    while (filename[i] && i < 139) {
-        okse_save_file[i] = filename[i];
-        i++;
-    }
-    okse_save_file[i] = 0;
-    okse_saved_notified = 0;
-}
-
-static void check_save_http_response(void) {
-    if (okse_save_file[0] == 0) return;
-
-    int resp_len = http_get_response_len();
-
-    // Keep overwriting file with latest accumulated data every frame
-    if (resp_len > 0) {
-        char* resp = http_get_response();
-        if (resp) {
-            fs_write(okse_save_file, (uint8_t*)resp, resp_len);
-        }
-    }
-
-    // Once connection is closed and we have data, notify and stop
-    if (!okse_saved_notified && !http_is_pending() && resp_len > 0) {
-        okse_saved_notified = 1;
-        if (term_wins[0] >= 0) {
-            window_puts(term_wins[0], "Saved ");
-            char buf[8]; int bi = 0;
-            char rev[8]; int ri = 0;
-            int tmp = resp_len;
-            while (tmp > 0) { rev[ri++] = '0' + (tmp % 10); tmp /= 10; }
-            if (ri == 0) buf[bi++] = '0';
-            while (ri > 0) buf[bi++] = rev[--ri];
-            buf[bi] = 0;
-            window_puts(term_wins[0], buf);
-            window_puts(term_wins[0], " bytes to ");
-            window_puts(term_wins[0], okse_save_file);
-            window_puts(term_wins[0], "\n");
-            shell_prompt(term_wins[0]);
-        }
-        okse_save_file[0] = 0;
-    }
-}
 
 // Desktop-only syscall helpers (need paging.o + window.o + process.o):
 // fd-1 terminal output for SYS_WRITE, page-granular user mapping for
@@ -1986,8 +1944,7 @@ void kernel_main(uint32_t mboot_phys) {
         // Poll network for incoming packets
         e1000_poll();
         net_poll();
-        http_poll();
-        https_get_poll(); // advance any in-flight async HTTPS fetch
+        fetch_poll();     // drive the HTTP/HTTPS fetch engine (parallel, keep-alive)
         // Persist TOFU pins on change (write-through VFS, same as editor).
         {
             extern int tls_pin_dirty(void);
@@ -2260,7 +2217,7 @@ void kernel_main(uint32_t mboot_phys) {
         else { mouse_down = 1; }
 
         // Check for pending HTTP responses to save
-        check_save_http_response();
+
 
         // Drive okai: main-document + sub-resource fetches over the single
         // global connection (okai_fetch_owner), coalesced page renders, and

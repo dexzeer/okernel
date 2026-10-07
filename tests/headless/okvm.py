@@ -27,7 +27,7 @@ import subprocess, time, os, signal, socket, re
 # Resolve the project/ISO relative to this file so the driver works from any cwd.
 HERE     = os.path.dirname(os.path.abspath(__file__))
 PROJECT  = os.path.dirname(os.path.dirname(HERE))
-ISO      = os.path.join(PROJECT, "kanarchy-desktop.iso")
+ISO      = os.environ.get("OKVM_ISO") or os.path.join(PROJECT, "kanarchy-desktop.iso")
 # Durable output dir — /tmp gets aggressively cleaned on this host and wiped
 # logs mid-run, killing tests (QEMU keeps writing to the deleted inode).
 OUTDIR   = os.path.expanduser("~/okvm")
@@ -51,8 +51,12 @@ class OkVM:
                "-monitor", f"unix:{self.SOCK},server,nowait", "-no-reboot"]
         if extra_net:  # e1000 + SLIRP user networking (10.0.2.x)
             cmd += ["-device", "e1000,netdev=net0", "-netdev", "user,id=net0"]
+            if os.environ.get("OKVM_PCAP"):   # packet capture: ~/okvm/<tag>.pcap
+                cmd += ["-object", f"filter-dump,id=dump0,netdev=net0,file={os.path.join(OUTDIR, tag + '.pcap')}"]
         if disk:  # raw ATA disk image for the persistent-FS layer
             cmd += ["-hda", disk]
+        if os.environ.get("OKVM_ACCEL"):  # e.g. OKVM_ACCEL=kvm (needs /dev/kvm access)
+            cmd += ["-accel", os.environ["OKVM_ACCEL"]]
         self.q = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL, cwd=PROJECT)
         # Wait for the monitor socket to appear

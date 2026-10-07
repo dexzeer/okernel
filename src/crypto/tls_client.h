@@ -181,6 +181,13 @@ void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
 // Default 0 = unknown (stored tickets read age 0).
 void tls_state_set_now_ms(struct tls_state* st, uint64_t now_ms);
 int tls_state_step(struct tls_state* st, const struct tls_client_io* io);
+// HTTP keep-alive: send another request on a session whose previous
+// response has been fully read (phase RECV_BODY, no failure, no
+// close_notify). The response accumulates in out from offset 0; drive it
+// with tls_state_step as before. 0 = sent, -1 = session not reusable.
+int tls_state_reuse(struct tls_state* st, const struct tls_client_io* io,
+                    const uint8_t* request, uint32_t request_len,
+                    uint8_t* out, uint32_t out_cap);
 
 // Wipe all ephemeral key material in a finished/failed state (review #30):
 // ECDHE private, handshake/app secrets + keys/ivs, master + resumption

@@ -23,4 +23,9 @@ void e1000_set_rx_callback(e1000_rx_callback_t cb);
 // TCP retransmission path under controlled loss.
 void net_set_drop_rate(int every_nth);
 
+// Per-packet serial tracing (frames, descriptors, TCP segments). Off by
+// default: every serial byte is two emulated port I/Os, and the per-packet
+// lines made a page load write hundreds of KB to COM1. `nettrace` toggles.
+extern int net_trace;
+
 #endif

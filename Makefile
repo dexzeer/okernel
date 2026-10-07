@@ -91,7 +91,7 @@ DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o
              src/crypto/sha512.o src/crypto/der.o src/crypto/x509.o \
              src/crypto/rsa.o src/crypto/ec.o src/crypto/roots.o \
              src/crypto/certverify.o src/rtc.o \
-             src/net/tls_net.o
+             src/net/fetch.o
 
 .PHONY: all text desktop clean run debug host-tests host-tests-asan diff-oracle diff-test tls-interop web-tests
 
@@ -247,7 +247,7 @@ run: text
 	qemu-system-i386 -cdrom kanarchy-text.iso -boot d
 
 run-desktop: desktop
-	qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0 -fullscreen
+	qemu-system-i386 -accel kvm -accel tcg -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0 -fullscreen
 
 debug: text
 	qemu-system-i386 -cdrom kanarchy-text.iso -boot d -serial stdio

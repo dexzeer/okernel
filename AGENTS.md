@@ -16,8 +16,9 @@ Requires: `gcc` (multilib), `nasm`, `ld`, `grub-mkrescue`, `xorriso`, `mtools`.
 
 Desktop QEMU command (must use `-vga std` for framebuffer; `-device e1000` for networking — okai/HTTPS need it):
 ```bash
-qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0
+qemu-system-i386 -accel kvm -accel tcg -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0
 ```
+**Use hardware acceleration.** Pure emulation (TCG) runs the kernel ~10x slower (a Wikipedia relayout: ~300ms TCG vs ~30ms KVM). Linux: `-accel kvm` (needs `/dev/kvm` access). Windows: `run-windows.bat` — `qemu-system-x86_64 -accel whpx -accel tcg` (the Windows **i386** build has no WHPX; the 32-bit kernel boots fine in x86_64 QEMU; verified 2026-10-07: boot to heap 2s, mouse wheel mode OK).
 
 Serial debug variant (for TLS/network bring-up — serial is ground truth for network bugs):
 ```bash
@@ -45,7 +46,8 @@ qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e10
 - **QuickJS uses the x87 (2026-10-07).** The web engine itself stays integer-only, but page JS needs doubles: every realm entry sets the x87 control word to 53-bit precision (fldcw 0x027F), the kernel FNSAVE/FRSTORs per thread on preemptive switches, `abort()` longjmps out of the realm (a QuickJS assert kills the page, not the OS). Realm limits: 96MB heap, 8s per script, 1.5s per task. libgcc is linked for QuickJS's 64-bit division only — the engine rule above still holds for `src/web`.
 - **TLS trust (2026-10-07).** Chains anchor two ways: a cert ISSUED BY a store root (name-bound: issuer DN == root subject, AKI == root SKI when both exist, signature verifies under the root key — `root_issued()` in `certverify.c`; servers don't send roots), or an in-flight cert whose SPKI is a root key. Certs past the anchor are ignored (expired cross-signs must not fail the path). Root store = Mozilla's, regenerated with `python3 tools/gen_roots.py` (embeds whole certs: subject + SKI + SPKI). OCSP staples: only a verified REVOKED status or a Must-Staple leaf hard-fails; stale/unverifiable staples soft-fail like an absent one. Suites: ChaCha20-Poly1305 (preferred) + AES-128-GCM (`aes.c`, constant-time; Akamai sites need it); no SHA-384 suites, no TLS 1.2.
 - **Makefile tracks headers via `-MMD -MP` (2026-10-07).** Never drop it: before it, `src/crypto/*.h` weren't dependencies, a grown `struct tls_state` left `tls_net.o` at the old size, and `tls_state_init`'s memset zeroed the neighbouring fetch-timeout clock — every HTTPS fetch "timed out" instantly and silently downgraded to HTTP. When in doubt, `make clean`.
-- **okai fetches are serialized** on the single connection (`okai_fetch_owner` + `fetch_tab`, driven by `okai_poll()`); each HTTPS fetch opens a fresh TCP connection and ends at HTTP message completion. Never start a second request while one is in flight.
+- **Networking is parallel (2026-10-07).** `network.c` has a TCP socket table (`tcp_open/send/recv/close/abort`, 16 sockets, per-socket retransmit flight + reorder buffer + 256KB receive ring; the advertised window IS the ring's free space — never ACK bytes you can't keep) and a 32-entry DNS cache with concurrent queries (`dns_lookup`: 1/0/-1; ids reused across resends; late answers still update the cache). `src/net/fetch.c` runs up to `FETCH_MAX` (8) GETs at once over a keep-alive pool (`CONN_MAX` 8, 6 per host; idle connections reused, a stale reused connection that dies before the first byte retries fresh). okai keeps a request table (`struct oreq`): main document + up to `OKAI_SUB_PAR` (6) resources per tab, one engine slot always left for navigations. A finished request is DETACHED from the table before its response is processed — delivery can run scripts that navigate, and navigation cancels the tab's requests. The e1000 is polled (IRQs masked), 256 RX descriptors on the heap. Per-packet logs are behind `net_trace` (shell `nettrace`) — serial bytes are port-I/O exits.
+- **Cross-origin script requests send `Origin`** (okai `req_fetch`, `q->cors`). Servers echo Access-Control-Allow-Origin only for it; without it BBC's sign-in check failed and its script bounced bbc.com <-> bbc.co.uk forever (679 fetches).
 
 ## File ownership
 
@@ -74,7 +76,7 @@ qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e10
 | Browser | `src/okai.c/.h` | okai shell: tabs, chrome overlay, address bar, fetch driver (`okai_poll`), page surface, pixel hit-testing, forms, HTML error/home pages |
 | Web engine | `src/web/*` | `wdoc` (document controller), `wdom` + `html5` (WHATWG parser), `css_*` (cascade), `lay_*` (block/inline/float/abs/flex/grid/table → display list), `paint`/`raster` (AA painter), `font` + `fontdata.asm` (TrueType, Noto in `fonts/`), `image` (PNG/JPEG/GIF/BMP, inflate/gzip), `svg`, `wurl`, `callstack.asm` |
 | JS Engine | `src/qjs/*` (QuickJS 2026-06-04 + `libc/` shim + musl `libm/`, see `README.okernel`), `src/web/wjs.c/.h`, `wjs_dom.c`, `wjs_int.h`, `wjs_prelude.js` (+`.asm` embed), `src/web/wcookie.c/.h` | One QuickJS realm per document (lazy). Page scripts run: parser-blocking/defer/async/dynamic/`document.write`/module graphs (fetched ahead, `JS_EVAL_FLAG_NO_RESOLVE`), timers/rAF/microtasks under time budgets, DOM events before default actions, fetch()/XHR over the single connection. Web API = JS prelude over C natives (`W` object). Cookie jar shared by HTTP and `document.cookie`. tinyjs (`src/js`) is gone. |
-| Networking | `src/net/pci.c`, `src/net/e1000.c`, `src/net/network.c`, `src/net/tls_net.c` | PCI enum, e1000 NIC (TX+RX), ARP/IP/ICMP/UDP/TCP/DNS/HTTP, TLS 1.3 client wrapper |
+| Networking | `src/net/pci.c`, `src/net/e1000.c`, `src/net/network.c`, `src/net/fetch.c/.h` | PCI enum, e1000 NIC (polled, 256-entry RX ring), ARP/IP/ICMP/UDP, TCP socket table, DNS cache; fetch engine (parallel HTTP/HTTPS GETs, keep-alive pool, TLS via `tls_client`) |
 | Crypto | `src/crypto/*.c/.h` | SHA-256, ChaCha20, Poly1305, HMAC, HKDF, AEAD, AES-128-GCM (`aes.c`, constant-time bitsliced), X25519, TLS 1.3 record/handshake/keysched/client, X.509 + chain verify (`certverify.c`), Mozilla root store (`roots.c`, generated by `tools/gen_roots.py`), OCSP staples (`ocsp.c`), ChaCha20 CPRNG (`rand.c`) |
 | Libc | `src/string.c/.h` | freestanding memcpy/memset/memcmp/memmove/strlen/strncpy (needed by crypto + JS engine) |
 
@@ -85,7 +87,7 @@ qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e10
 3. `kernel_main()` does: GDT (kernel + user segments + TSS) → IDT (exceptions + IRQs + INT 0x80) → memory → paging → process table → graphics → windows → mouse → keyboard → networking → sti → main loop
 4. Main loop: handle mouse clicks/drags → `okai_poll()` (fetches, sub-resources, coalesced page renders) → check JS rerender → draw windows (+ okai chrome overlay) → draw cursor → flush dirty rows
 5. Keyboard/mouse work via hardware interrupts (IRQ1/IRQ12), not polling
-6. Page scripts, stylesheets and images are fetched sequentially through the single connection after the document parses; scripts run in the document's QuickJS realm (`okai_poll` pumps it under a time budget)
+6. Page scripts, stylesheets and images are fetched in parallel (keep-alive connection pool, `fetch_poll()` from the main loop) after the document parses; scripts run in the document's QuickJS realm (`okai_poll` pumps it under a time budget)
 
 ## Adding new features
 
@@ -129,6 +131,7 @@ Key facts:
 - `vm.wait_for(pattern)` matches ANY earlier occurrence — for "the next page loaded" count `parse: count=` lines instead
 - Full docs in `tests/headless/TESTING.md`; parallel runner: `python3 tests/headless/run_suite.py -j3 test_*.py`
 - Browser end-to-end: `test_okai_interact.py` (offline fixtures), `test_okai_js.py` (page scripts: offline JS fixture + Wikipedia), `test_okai_page.py <url> [tag] [--scroll N]`, `test_links.py`, `test_nav.py`, `test_tab_x.py`, `test_errors.py`, `test_google_search.py`, `test_sites.py [tag] [url ...]` (real-site HTTPS sweep: OK only when the page arrived over TLS — a plain-HTTP fallback counts as a failure), ...
+- Page-load profiling: `tests/headless/perf_load.py [tag] [url ...]` (timeline per page: doc / first render / settled; `PERF_ALL=1` stamps every line, `PERF_PRE=nettrace` enables packet tracing, `OKVM_PCAP=1` captures `~/okvm/<tag>.pcap` → `pcap_tcp.py` per-connection timing, `OKVM_ACCEL=kvm`, `OKVM_ISO=path` to compare builds). Windows/WHPX twin: `powershell -File tests\headless\perf_win.ps1 -Accel whpx`.
 - Host TLS: `make host-tests` (crypto, AES-GCM vs OpenSSL, PKI, adversarial 189 + live example.com MITM check), `make host-tests-asan` after crypto/TLS changes, `build-host/tls_scan` over `tests/tls_hosts.txt` for a real-site handshake census.
 
 Run after touching window.c/mouse code: `python3 tests/headless/test_nav.py` and `test_okai_interact.py`

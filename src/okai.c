@@ -1,11 +1,12 @@
 // okai — the web browser shell over the src/web engine (see okai.h).
 //
 // Pipeline: the desktop loop calls okai_poll() every iteration. A tab that
-// needs its document fetches it through the single global connection
-// (okai_fetch_owner), the response is header-parsed, dechunked and gunzipped
-// here, then handed to wdoc_load (HTML5 parse + stylesheet discovery). The
-// page's stylesheets and images then stream in one at a time through the
-// same connection (wdoc_next_fetch / wdoc_fetch_done). Rendering is
+// needs its document fetches it through the fetch engine (net/fetch.c:
+// parallel requests over pooled keep-alive connections); the response is
+// header-parsed, dechunked and gunzipped here, then handed to wdoc_load
+// (HTML5 parse + stylesheet discovery). The page's stylesheets, scripts and
+// images then stream in, up to OKAI_SUB_PAR at a time per tab
+// (wdoc_next_fetch / wdoc_fetch_done). Rendering is
 // coalesced: the first paint waits for the stylesheets (bounded), later
 // image arrivals repaint at most every ~1.5s. The engine paints the visible
 // viewport into a per-window pixel surface that the window system blits
@@ -28,7 +29,7 @@
 #include "string.h"
 #include "serial.h"
 #include "net/network.h"
-#include "net/tls_net.h"
+#include "net/fetch.h"
 #include "crypto/certverify.h" // CV_ERR_* for the warning-page reason line
 #include "crypto/tls_client.h" // TLS_FAIL_*, tls_ticket_drop(), tls_response_complete()
 #include "crypto/rand.h"
@@ -64,12 +65,8 @@ static uint32_t okai_last_tick = 0;
 static struct okai okais[MAX_OKAIS];
 static int okai_count = 0;
 
-// The network stack services a SINGLE global TCP connection + response buffer,
-// so only one okai fetch may be in flight at a time. okai_fetch_owner is the id
-// of the window that owns that in-flight fetch (-1 when idle) and fetch_tab
-// the tab inside it (tabs can switch while a fetch is in flight).
+// A window with requests in flight (drives the progress-pill erase), or -1.
 int okai_fetch_owner = -1;
-static int fetch_tab = -1;
 int okai_scripts_on = 1;
 
 static void okai_tab_reset(struct okai_tab* T);
@@ -364,36 +361,134 @@ static char* resp_body(char* resp, int len, const struct resp_info* ri, int* ble
 
 // ---- requests -----------------------------------------------------------------------
 
-// Issue a GET for an absolute http(s) URL on the single connection.
-// Returns 0 if a request was started, -1 if the URL has no host.
-// GET url. top: the page a sub-resource belongs to (cookie SameSite
-// context), NULL for a top-level navigation. Carries the jar's cookies.
-static int net_get_ex(const char* url, const char* top) {
+// In-flight requests. The fetch engine (net/fetch.c) runs up to FETCH_MAX
+// GETs at once over pooled keep-alive connections; each record ties a
+// fetch handle to its tab and to what it is for: the tab's main document
+// (sub_id -1) or one resource of the document `doc`.
+#define OKAI_SUB_PAR 6         // resources in flight per tab
+struct oreq {
+    int used;
+    int bi, tab;               // window + tab index (kept in sync on close)
+    struct wdoc* doc;          // document a resource belongs to (NULL = main)
+    int sub_id;                // wdoc resource id, -1 = the main document
+    int https;
+    int redirects, retried;
+    int cors;                  // script request (fetch/XHR): send Origin cross-origin
+    int h;                     // fetch handle, -1 = none
+    char url[OKAI_URL_LEN];
+};
+static struct oreq reqs[FETCH_MAX];
+
+// scheme://host[:port] of an absolute URL, lowercased ("" if none).
+static void url_origin(const char* u, char* out, int cap) {
+    int i = 0, slashes = 0;
+    for (; u[i] && i < cap - 1; i++) {
+        if (u[i] == '/' && ++slashes == 3) break;
+        out[i] = (char)lower((unsigned char)u[i]);
+    }
+    out[i] = 0;
+    if (slashes < 2) out[0] = 0;
+}
+
+static struct oreq* req_new(int bi, int tab, struct wdoc* doc, int sub_id, const char* url) {
+    for (int i = 0; i < FETCH_MAX; i++) {
+        struct oreq* q = &reqs[i];
+        if (q->used) continue;
+        q->used = 1;
+        q->bi = bi;
+        q->tab = tab;
+        q->doc = doc;
+        q->sub_id = sub_id;
+        q->https = url_is_https(url);
+        q->redirects = q->retried = 0;
+        q->cors = 0;
+        q->h = -1;
+        scopy(q->url, url, OKAI_URL_LEN);
+        return q;
+    }
+    return 0;
+}
+
+static void req_free(struct oreq* q) {
+    if (q->h >= 0) fetch_end(q->h);
+    q->h = -1;
+    q->used = 0;
+}
+
+// Start the GET for q->url. top: the page a resource belongs to (cookie
+// SameSite context), NULL for a top-level navigation. 0 = started, -1 = no
+// host in the URL, -2 = the fetch engine is full (try again later).
+static int req_fetch(struct oreq* q, const char* top) {
     char host[128];
     static char path[OKAI_URL_LEN];
     static char cookie_hdr[NET_EXTRA_MAX];
-    if (wurl_host(url, host, sizeof host) <= 0) return -1;
-    if (wurl_path(url, path, sizeof path) <= 0) { path[0] = '/'; path[1] = 0; }
-    int port = wurl_port(url);
+    if (wurl_host(q->url, host, sizeof host) <= 0) return -1;
+    if (wurl_path(q->url, path, sizeof path) <= 0) { path[0] = '/'; path[1] = 0; }
+    int port = wurl_port(q->url);
     if (port < 0) port = 0;
+    struct fetch_opts o;
+    o.gzip = 1;
+    o.accept_html = top == 0;
+    o.extra = 0;
+    int n = 0;
     memcpy(cookie_hdr, "Cookie: ", 8);
-    int cl = wcookie_header(url, top, cookie_hdr + 8, NET_EXTRA_MAX - 12);
+    int cl = wcookie_header(q->url, top, cookie_hdr + 8, NET_EXTRA_MAX - 512);
     if (cl > 0) {
-        cookie_hdr[8 + cl] = '\r';
-        cookie_hdr[9 + cl] = '\n';
-        cookie_hdr[10 + cl] = 0;
-        net_extra_headers = cookie_hdr;
+        n = 8 + cl;
+        cookie_hdr[n++] = '\r';
+        cookie_hdr[n++] = '\n';
     }
-    net_accept_gzip = 1;
-    net_accept_html = (top == 0);
-    if (url_is_https(url)) https_get_port(host, path, (uint16_t)port);
-    else { http_reset_conn_attempts(); http_get_port(host, path, (uint16_t)port); }
-    net_accept_gzip = 0;
-    net_accept_html = 0;
-    net_extra_headers = 0;
+    // fetch()/XHR across origins carry Origin (CORS): servers answer
+    // Access-Control-Allow-Origin from it — without it BBC's sign-in check
+    // failed and its script bounced bbc.com <-> bbc.co.uk forever.
+    if (q->cors && top) {
+        char oa[256], ob[256];
+        url_origin(top, oa, sizeof oa);
+        url_origin(q->url, ob, sizeof ob);
+        if (oa[0] && strcmp(oa, ob)) {
+            const char* pre = "Origin: ";
+            while (*pre) cookie_hdr[n++] = *pre++;
+            for (int k = 0; oa[k] && n < NET_EXTRA_MAX - 3; k++) cookie_hdr[n++] = oa[k];
+            cookie_hdr[n++] = '\r';
+            cookie_hdr[n++] = '\n';
+        }
+    }
+    cookie_hdr[n] = 0;
+    if (n > 0) o.extra = cookie_hdr;
+    q->https = url_is_https(q->url);
+    int h = fetch_begin(host, path, (uint16_t)port, q->https, &o);
+    if (h < 0) return -2;
+    q->h = h;
     return 0;
 }
-static int net_get(const char* url) { return net_get_ex(url, 0); }
+
+static int req_has_main(int bi, int tab) {
+    for (int i = 0; i < FETCH_MAX; i++)
+        if (reqs[i].used && reqs[i].bi == bi && reqs[i].tab == tab && reqs[i].sub_id < 0) return 1;
+    return 0;
+}
+
+// Cancel every request of a tab (navigation, close).
+static void req_cancel_tab(int bi, int tab) {
+    for (int i = 0; i < FETCH_MAX; i++)
+        if (reqs[i].used && reqs[i].bi == bi && reqs[i].tab == tab) req_free(&reqs[i]);
+    struct okai* b = (bi >= 0 && bi < MAX_OKAIS) ? &okais[bi] : 0;
+    if (b && tab >= 0 && tab < OKAI_MAX_TABS) b->tabs[tab].sub_inflight = 0;
+}
+
+// A tab left the array: drop its requests, renumber the tabs after it.
+static void req_tab_removed(int bi, int tab) {
+    req_cancel_tab(bi, tab);
+    for (int i = 0; i < FETCH_MAX; i++)
+        if (reqs[i].used && reqs[i].bi == bi && reqs[i].tab > tab) reqs[i].tab--;
+}
+
+// A window left the array (windows compact): same for window ids.
+static void req_window_removed(int bi) {
+    for (int t = 0; t < OKAI_MAX_TABS; t++) req_cancel_tab(bi, t);
+    for (int i = 0; i < FETCH_MAX; i++)
+        if (reqs[i].used && reqs[i].bi > bi) reqs[i].bi--;
+}
 
 // Every Set-Cookie of a response (redirect hops included) into the jar.
 static void store_cookies(const char* url, const char* r, int len) {
@@ -504,7 +599,6 @@ void okai_init(void) {
     }
     okai_count = 0;
     okai_fetch_owner = -1;
-    fetch_tab = -1;
 }
 
 struct okai_tab* okai_tab_of(struct okai* b) { return &b->tabs[b->active_tab]; }
@@ -522,12 +616,9 @@ static void tab_reset_load(struct okai_tab* T) {
     T->conn_failed = 0;
     T->conn_kind = 0;
     T->truncated = 0;
-    T->sub_id = -1;
-    T->sub_https = 0;
-    T->sub_redirects = 0;
+    T->sub_inflight = 0;
     T->sub_css = T->sub_img = 0;
     T->sub_landed = 0;
-    T->sub_url[0] = 0;
     T->render_pending = 0;
     T->render_due = 0;
     T->pending_frag[0] = 0;
@@ -554,10 +645,7 @@ static void okai_tab_reset(struct okai_tab* T) {
 static void tab_dispose(int id, int tab) {
     struct okai_tab* T = &okais[id].tabs[tab];
     if (T->doc) { doc_free(T->doc); T->doc = 0; }
-    if (okai_fetch_owner == id) {
-        if (fetch_tab == tab) { okai_fetch_owner = -1; fetch_tab = -1; }
-        else if (fetch_tab > tab) fetch_tab--;
-    }
+    req_tab_removed(id, tab);
 }
 
 // Switching re-renders the tab's cached page — no refetch.
@@ -600,7 +688,7 @@ void okai_close_tab(int id, int tab) {
     // Animate: keep the tab in the array but flag it closing; okai_anim_step()
     // shrinks its width to zero and removes it once the animation finishes.
     b->tabs[tab].closing = 1;
-    if (okai_fetch_owner == id && fetch_tab == tab) { okai_fetch_owner = -1; fetch_tab = -1; }
+    req_cancel_tab(id, tab);
     if (tab == b->active_tab) {
         // switch to a neighbour so the visible page updates immediately
         int nb = (tab + 1 < b->tab_count) ? tab + 1 : tab - 1;
@@ -971,7 +1059,8 @@ static void scroll_to(int id, int ny) {
 // ---- fetch driver ------------------------------------------------------------------
 
 // Start the main-document fetch for tab `tab`. Returns 0 if a request is in
-// flight, 1 if the page was produced locally (home/error), -1 if refused.
+// flight, 1 if the page was produced locally (home/error), -1 if refused,
+// 2 if the fetch engine is full (try again on a later poll).
 static int start_main_fetch(int id, int tab) {
     struct okai* b = &okais[id];
     struct okai_tab* T = &b->tabs[tab];
@@ -982,13 +1071,15 @@ static int start_main_fetch(int id, int tab) {
         return 1;
     }
     T->is_https = url_is_https(T->url);
-    T->sub_id = -1;
-    if (net_get(T->url) < 0) {
+    struct oreq* q = req_new(id, tab, 0, -1, T->url);
+    if (!q) return 2;
+    int r = req_fetch(q, 0);
+    if (r == -2) { q->used = 0; return 2; }
+    if (r < 0) {
         // No hostname (e.g. a malformed address-bar entry). Never fire the
-        // request — a DNS query for an empty host wedged the fetch owner.
-        serial_puts("[okai] refusing fetch: empty host in '");
-        serial_puts(T->url);
-        serial_puts("'\n");
+        // request — a DNS query for an empty host wedged the old fetch owner.
+        q->used = 0;
+        serial_printf("[okai] refusing fetch: empty host in '%s'\n", T->url);
         show_error(id, tab);
         return -1;
     }
@@ -1012,12 +1103,21 @@ static void sub_fail(struct okai_tab* T, int id, const char* url) {
     run_job(&j);
 }
 
-// Next sub-resource of the tab's document. Returns 1 if a request is in
-// flight, 0 when the queue is drained.
-static int start_next_sub(struct okai_tab* T) {
+static int req_slot_free(void) {
+    for (int i = 0; i < FETCH_MAX; i++) if (!reqs[i].used) return 1;
+    return 0;
+}
+
+// Start the next resource of tab (bi, ti). Returns 1 if a request started,
+// 0 when the document's queue is drained, 2 when the engine is full. One
+// fetch slot always stays free for main documents (navigation must never
+// queue behind another page's images).
+static int start_next_sub(int bi, int ti) {
+    struct okai_tab* T = &okais[bi].tabs[ti];
     if (!T->doc) return 0;
     static char url[OKAI_URL_LEN];
     for (;;) {
+        if (fetch_free_slots() < 2 || !req_slot_free()) return 2;
         int id = wdoc_next_fetch(T->doc, url, sizeof url);
         if (id < 0) return 0;
         int kind = wdoc_res_kind(T->doc, id);
@@ -1059,22 +1159,21 @@ static int start_next_sub(struct okai_tab* T) {
         else if (kind == WDOC_RK_IMG) T->sub_img++;
         else if (kind == WDOC_RK_SCRIPT) T->sub_js++;
         else T->sub_req++;
-        T->sub_id = id;
-        T->sub_https = url_is_https(url);
-        T->sub_redirects = 0;
-        T->sub_retried = 0;
-        scopy(T->sub_url, url, sizeof T->sub_url);
+        struct oreq* q = req_new(bi, ti, T->doc, id, url);
+        if (q) q->cors = kind == WDOC_RK_REQ;
         serial_printf("[okai] sub-res fetch: %s %s\n", kind_name(kind), url);
-        if (net_get_ex(url, T->url) < 0) {
-            T->sub_id = -1;
+        if (!q || req_fetch(q, T->url) != 0) {
+            if (q) q->used = 0;
             sub_fail(T, id, url);
             continue;
         }
+        T->sub_inflight++;
         return 1;
     }
 }
 
-// Follow a 3xx for the main document. Returns 1 if a new request fired.
+// Follow a 3xx for the main document: T->url becomes the target. Returns 1
+// if the caller should fetch it.
 static int follow_redirect(int id, struct okai_tab* T, const struct resp_info* ri) {
     if (ri->status < 300 || ri->status > 399 || !ri->location[0]) return 0;
     if (T->redirect_count >= OKAI_MAX_REDIRECTS) return 0;
@@ -1088,7 +1187,6 @@ static int follow_redirect(int id, struct okai_tab* T, const struct resp_info* r
     T->is_https = url_is_https(T->url);
     okais[id].chrome_dirty = 1;
     serial_printf("[okai] redirect %d -> %s\n", T->redirect_count, abs);
-    net_get(T->url);
     return 1;
 }
 
@@ -1149,19 +1247,20 @@ static void main_loaded(int id, int tab, char* resp, int len) {
     else request_render(T, 0);
 }
 
-// Deliver the finished sub-resource to the document. Returns 1 if the same
-// resource is still in flight (redirect / one-shot retry), else 0.
-static int sub_done(int id, struct okai_tab* T, int st, char* resp, int len) {
-    int rid = T->sub_id;
+// A resource finished (st: 1 done, -1 failed, -2 truncated). Delivers it to
+// the document and returns 0 — or returns 1 when the same resource should
+// be fetched again from q->url (redirect / one-shot transport retry; the
+// caller re-issues after releasing the old handle).
+static int sub_done(struct okai_tab* T, struct oreq* q, int st, char* resp, int len) {
+    int rid = q->sub_id;
     int kind = wdoc_res_kind(T->doc, rid);
-    int css = kind == WDOC_RK_CSS;
     struct job j;
     memset(&j, 0, sizeof j);
     j.op = JOB_FETCH_DONE;
     j.doc = T->doc;
     j.id = rid;
     j.len = -1;
-    j.final_url = T->sub_url;
+    j.final_url = q->url;
     int status = 0, blen = 0, heap = 0;
     char* body = 0;
     static char hdrs[8192];
@@ -1170,7 +1269,7 @@ static int sub_done(int id, struct okai_tab* T, int st, char* resp, int len) {
         struct resp_info ri;
         parse_resp(resp, len, &ri);
         status = ri.status;
-        store_cookies(T->sub_url, resp, len);
+        store_cookies(q->url, resp, len);
         // raw header lines (after the status line) for scripts (XHR
         // getResponseHeader, CORS)
         if (kind == WDOC_RK_REQ || kind == WDOC_RK_SCRIPT) {
@@ -1184,15 +1283,14 @@ static int sub_done(int id, struct okai_tab* T, int st, char* resp, int len) {
             hdrs[n > 0 ? n : 0] = 0;
             j.headers = hdrs;
         }
-        if (status >= 300 && status <= 399 && ri.location[0] && T->sub_redirects < 4) {
+        if (status >= 300 && status <= 399 && ri.location[0] && q->redirects < 4) {
             char abs[OKAI_URL_LEN];
-            if (wurl_resolve(T->sub_url, ri.location, (int)strlen(ri.location), abs, sizeof abs) > 0 &&
+            if (wurl_resolve(q->url, ri.location, (int)strlen(ri.location), abs, sizeof abs) > 0 &&
                 url_is_http(abs)) {
-                T->sub_redirects++;
-                scopy(T->sub_url, abs, sizeof T->sub_url);
-                T->sub_https = url_is_https(abs);
+                q->redirects++;
+                scopy(q->url, abs, OKAI_URL_LEN);
                 serial_printf("[okai] sub-res redirect -> %s\n", abs);
-                if (net_get_ex(abs, T->url) == 0) return 1; // same resource, new request
+                return 1;
             }
         } else if ((status >= 200 && status <= 299) || (kind == WDOC_RK_REQ && status >= 200)) {
             // requests see error statuses too (XHR status 404 + body)
@@ -1203,27 +1301,29 @@ static int sub_done(int id, struct okai_tab* T, int st, char* resp, int len) {
             j.status = status;
         }
     }
-    if (status == 0 && !T->sub_retried) {
-        // transport blip (DNS miss on a host switch, reset): retry once
-        T->sub_retried = 1;
-        serial_printf("[okai] sub-res retry %s\n", T->sub_url);
-        if (net_get_ex(T->sub_url, T->url) == 0) return 1;
+    if (status == 0 && !q->retried) {
+        // transport blip (reset, stale connection): retry once
+        q->retried = 1;
+        serial_printf("[okai] sub-res retry %s\n", q->url);
+        return 1;
     }
     run_job(&j);
     if (heap) kfree(body);
     serial_printf("[okai] sub-res %s: status=%d %d bytes%s\n", kind_name(kind), status,
                   j.len, j.len < 0 ? " (failed)" : "");
-    T->sub_id = -1;
+    return 0;
+}
+
+// Bookkeeping once a resource is delivered (or given up).
+static void sub_landed(struct okai_tab* T, int kind) {
     T->sub_landed++;
-    if (css) {
+    if (kind == WDOC_RK_CSS) {
         if (wdoc_pending_css(T->doc) == 0) request_render(T, 0);
     } else if (kind == WDOC_RK_IMG) {
         if (T->first_paint || wdoc_pending_css(T->doc) == 0) request_render(T, IMG_RENDER_TICKS);
     } else {
         T->js_next_tick = 0;   // a script/response arrived: pump the realm now
     }
-    (void)id;
-    return 0;
 }
 
 // ---- page scripts ------------------------------------------------------------------
@@ -1349,58 +1449,51 @@ static void js_pump(void) {
     }
 }
 
-// Is the in-flight request HTTPS? (sub-resources carry their own scheme.)
-static int fetch_https(struct okai_tab* T) { return T->sub_id >= 0 ? T->sub_https : T->is_https; }
+// Re-issue a request record for cur.url (redirect / retry / fallback).
+// Returns 1 if it is in flight again.
+static int req_reissue(const struct oreq* cur, const char* top) {
+    struct oreq* q = req_new(cur->bi, cur->tab, cur->doc, cur->sub_id, cur->url);
+    if (!q) return 0;
+    q->redirects = cur->redirects;
+    q->retried = cur->retried;
+    q->cors = cur->cors;
+    if (req_fetch(q, top) != 0) { q->used = 0; return 0; }
+    return 1;
+}
 
-static void poll_fetch(void) {
-    int bi = okai_fetch_owner;
-    struct okai* b = okai_get(bi);
-    if (!b || fetch_tab < 0 || fetch_tab >= b->tab_count) { okai_fetch_owner = -1; fetch_tab = -1; return; }
-    int tab = fetch_tab;
+// A resource request finished. `cur` is a detached copy of its record (the
+// table slot is already free: delivering may run scripts that navigate,
+// and navigation cancels the tab's requests).
+static void sub_complete(struct okai_tab* T, struct oreq* cur, int st, char* resp, int len) {
+    int kind = wdoc_res_kind(T->doc, cur->sub_id);
+    if (st == -2) serial_puts("[okai] TLS sub-resource truncated, skipping\n");
+    int again = sub_done(T, cur, st, resp, len);
+    fetch_end(cur->h);
+    cur->h = -1;
+    if (again) {
+        if (req_reissue(cur, T->url)) return;   // still in flight (sub_inflight unchanged)
+        sub_fail(T, cur->sub_id, cur->url);
+    }
+    T->sub_inflight--;
+    sub_landed(T, kind);
+    // a script/response landed: let the page run first so the scripts it
+    // inserts are queued ahead of the remaining images
+    if (kind == WDOC_RK_SCRIPT || kind == WDOC_RK_REQ) js_pump();
+    if (T->doc && T->sub_inflight <= 0 && wdoc_pending(T->doc) == 0) {
+        T->sub_inflight = 0;
+        request_render(T, 0);
+        serial_printf("[okai] sub-res done: %d css, %d img\n", T->sub_css, T->sub_img);
+    }
+}
+
+// The main document request finished (cur: detached record).
+static void main_complete(int bi, int tab, struct oreq* cur, int st, char* resp, int len) {
+    struct okai* b = &okais[bi];
     struct okai_tab* T = &b->tabs[tab];
-    char* resp = 0;
-    int len = 0, st = 0; // 1 done, -1 failed, -2 truncated
-    if (fetch_https(T)) {
-        if (tls_is_done()) {
-            resp = tls_get_response();
-            len = tls_get_response_len();
-            st = (resp && len > 0) ? 1 : -1;
-            // Truncation integrity (cryptoholes #1): without an authenticated
-            // close_notify, HTTP framing must prove the message complete.
-            if (st == 1 && !tls_saw_close_notify() &&
-                tls_response_complete((const uint8_t*)resp, (uint32_t)len) == TLS_RESP_SHORT)
-                st = -2;
-        } else if (!tls_is_active()) st = -1;
-    } else {
-        if (http_is_done()) {
-            resp = http_get_response();
-            len = http_get_response_len();
-            st = (resp && len > 0) ? 1 : -1;
-        } else if (!http_is_pending() && !http_is_retry_pending()) st = -1;
-    }
-    if (!st) return;
-
-    if (T->sub_id >= 0) {
-        if (st == -2) serial_puts("[okai] TLS sub-resource truncated, skipping\n");
-        int kind = wdoc_res_kind(T->doc, T->sub_id);
-        if (sub_done(bi, T, st, resp, len)) return; // redirect / retry in flight
-        // a script/response landed: let the page run first so the scripts
-        // it inserts are queued ahead of the remaining images
-        if (kind == WDOC_RK_SCRIPT || kind == WDOC_RK_REQ) js_pump();
-        if (!start_next_sub(T)) {
-            okai_fetch_owner = -1;
-            fetch_tab = -1;
-            request_render(T, 0);
-            serial_printf("[okai] sub-res done: %d css, %d img\n", T->sub_css, T->sub_img);
-        }
-        return;
-    }
-
     if (st == -2) {
+        fetch_end(cur->h);
         serial_printf("[okai] TLS response truncated for %s, no HTTP fallback\n", T->url);
         T->truncated = 1;
-        okai_fetch_owner = -1;
-        fetch_tab = -1;
         show_error(bi, tab);
         return;
     }
@@ -1408,28 +1501,34 @@ static void poll_fetch(void) {
         struct resp_info ri;
         parse_resp(resp, len, &ri);
         store_cookies(T->url, resp, len);
-        if (follow_redirect(bi, T, &ri)) return; // owner stays
-        main_loaded(bi, tab, resp, len);
-        if (start_next_sub(T)) return;           // owner stays for the sub-resources
-        okai_fetch_owner = -1;
-        fetch_tab = -1;
+        if (follow_redirect(bi, T, &ri)) {
+            fetch_end(cur->h);
+            scopy(cur->url, T->url, OKAI_URL_LEN);
+            if (!req_reissue(cur, 0)) show_error(bi, tab);
+            return;
+        }
+        main_loaded(bi, tab, resp, len);   // resources start from okai_poll
+        fetch_end(cur->h);
         return;
     }
     // st == -1: the fetch gave up.
+    int fr = fetch_fail_reason(cur->h);
+    int fdetail = fetch_fail_detail(cur->h);
+    int unaccepted = fetch_offer_unaccepted(cur->h);
+    fetch_end(cur->h);
     if (T->is_https) {
         // Classify: certificate failures AND secure-channel failures MUST NOT
         // fall back to plain HTTP — a MITM can force that downgrade by killing
         // the handshake. Only transport failures (timeout / unreachable / no A
         // record) downgrade. Cert problems render the SECURITY WARNING;
         // everything else renders a connection error — never the cert warning.
-        int fr = tls_get_fail_reason();
         int cert_fail = (fr == TLS_FAIL_CERT || fr == TLS_FAIL_HOSTNAME);
         int conn_fail = (fr == TLS_FAIL_PROTO || fr == TLS_FAIL_MAC || fr == TLS_FAIL_ALERT ||
                          fr == TLS_FAIL_RNG || fr == TLS_FAIL_OVERFLOW);
         if (cert_fail) {
             serial_printf("[okai] TLS cert failure (reason=%d), no HTTP fallback for %s\n", fr, T->url);
             T->cert_failed = 1;
-            T->cert_detail = tls_get_fail_detail();
+            T->cert_detail = fdetail;
         } else if (conn_fail) {
             // Resumption fallback first: if the server aborted our PSK
             // resumption, retry with a full handshake (same origin, not a
@@ -1437,7 +1536,7 @@ static void poll_fetch(void) {
             if (T->conn_retries < OKAI_CONN_MAX_RETRIES &&
                 (fr == TLS_FAIL_PROTO || fr == TLS_FAIL_ALERT || fr == TLS_FAIL_MAC)) {
                 T->conn_retries++;
-                if (tls_last_offer_unaccepted()) {
+                if (unaccepted) {
                     char host[128];
                     if (wurl_host(T->url, host, sizeof host) > 0) tls_ticket_drop(host);
                     serial_printf("[okai] resumption aborted, retrying full handshake: %s\n", T->url);
@@ -1446,12 +1545,13 @@ static void poll_fetch(void) {
                                   T->conn_retries, OKAI_CONN_MAX_RETRIES, T->url);
                 }
                 serial_printf("[okai] resumption retry in flight for %s\n", T->url);
-                net_get(T->url);
-                return;
+                scopy(cur->url, T->url, OKAI_URL_LEN);
+                if (req_reissue(cur, 0)) return;
+            } else {
+                serial_printf("[okai] TLS connection failure (reason=%d), no HTTP fallback for %s\n", fr, T->url);
+                T->conn_failed = 1;
+                T->conn_kind = (fr == TLS_FAIL_OVERFLOW) ? OKAI_CONN_TOOLARGE : OKAI_CONN_PROTO;
             }
-            serial_printf("[okai] TLS connection failure (reason=%d), no HTTP fallback for %s\n", fr, T->url);
-            T->conn_failed = 1;
-            T->conn_kind = (fr == TLS_FAIL_OVERFLOW) ? OKAI_CONN_TOOLARGE : OKAI_CONN_PROTO;
         } else if (!T->https_fell_back) {
             // transport failure: one-time plain-HTTP retry (http-only hosts)
             T->https_fell_back = 1;
@@ -1461,51 +1561,72 @@ static void poll_fetch(void) {
             b->chrome_dirty = 1;
             serial_printf("[okai] https failed, retrying http: %s\n", T->url);
             serial_printf("[okai] http fallback in flight for %s\n", T->url);
-            net_get(T->url);
-            return;
+            scopy(cur->url, T->url, OKAI_URL_LEN);
+            if (req_reissue(cur, 0)) return;
         }
     }
-    okai_fetch_owner = -1;
-    fetch_tab = -1;
     show_error(bi, tab);
 }
 
+// Check one request for completion.
+static void req_poll(struct oreq* q) {
+    int fst = fetch_status(q->h);
+    if (fst == FETCH_RUNNING) return;
+    struct oreq cur = *q;          // detach: the slot is free from here on
+    q->used = 0;
+    q->h = -1;
+    struct okai* b = okai_get(cur.bi);
+    if (!b || cur.tab < 0 || cur.tab >= b->tab_count) { fetch_end(cur.h); return; }
+    struct okai_tab* T = &b->tabs[cur.tab];
+    char* resp = 0;
+    int len = 0, st = -1;          // 1 done, -1 failed, -2 truncated
+    if (fst == FETCH_DONE) {
+        resp = fetch_response(cur.h, &len);
+        st = (resp && len > 0) ? 1 : -1;
+        // Truncation integrity (cryptoholes #1): without an authenticated
+        // close_notify, HTTP framing must prove the message complete.
+        if (st == 1 && cur.https && !fetch_saw_close(cur.h) &&
+            tls_response_complete((const uint8_t*)resp, (uint32_t)len) == TLS_RESP_SHORT)
+            st = -2;
+    }
+    if (cur.sub_id >= 0) {
+        if (T->doc != cur.doc || T->closing) { fetch_end(cur.h); return; }   // document replaced
+        sub_complete(T, &cur, st, resp, len);
+    } else {
+        main_complete(cur.bi, cur.tab, &cur, st, resp, len);
+    }
+}
+
 void okai_poll(void) {
-    if (okai_fetch_owner >= 0) poll_fetch();
-    // Late sub-resources: scripts insert scripts, images and requests after
-    // the page's initial queue drained.
-    if (okai_fetch_owner < 0) {
-        int started = 0;
-        for (int pass = 0; pass < 2 && !started; pass++)
-            for (int bi = 0; bi < MAX_OKAIS && !started; bi++) {
-                struct okai* b = okai_get(bi);
-                if (!b) continue;
-                for (int ti = 0; ti < b->tab_count && !started; ti++) {
-                    if ((pass == 0) != (ti == b->active_tab)) continue;
-                    struct okai_tab* T = &b->tabs[ti];
-                    if (T->load_state != 1 || !T->doc || T->closing) continue;
-                    if (start_next_sub(T)) { okai_fetch_owner = bi; fetch_tab = ti; started = 1; }
-                }
+    for (int i = 0; i < FETCH_MAX; i++)
+        if (reqs[i].used && reqs[i].h >= 0) req_poll(&reqs[i]);
+    // Main documents first (active tabs first).
+    for (int pass = 0; pass < 2; pass++)
+        for (int bi = 0; bi < MAX_OKAIS; bi++) {
+            struct okai* b = okai_get(bi);
+            if (!b) continue;
+            for (int ti = 0; ti < b->tab_count; ti++) {
+                if ((pass == 0) != (ti == b->active_tab)) continue;
+                struct okai_tab* T = &b->tabs[ti];
+                if (T->load_state != 0 || T->closing || req_has_main(bi, ti)) continue;
+                start_main_fetch(bi, ti);
             }
-    }
+        }
+    // Resources (stylesheets, scripts, images, script requests): up to
+    // OKAI_SUB_PAR per tab in parallel, active tabs first. Scripts insert
+    // more resources after the initial queue drained — this picks them up.
+    for (int pass = 0; pass < 2; pass++)
+        for (int bi = 0; bi < MAX_OKAIS; bi++) {
+            struct okai* b = okai_get(bi);
+            if (!b) continue;
+            for (int ti = 0; ti < b->tab_count; ti++) {
+                if ((pass == 0) != (ti == b->active_tab)) continue;
+                struct okai_tab* T = &b->tabs[ti];
+                if (T->load_state != 1 || !T->doc || T->closing) continue;
+                while (T->sub_inflight < OKAI_SUB_PAR && start_next_sub(bi, ti) == 1) {}
+            }
+        }
     js_pump();
-    if (okai_fetch_owner < 0) {
-        // No fetch in flight: start the next tab needing one (active tabs first).
-        int started = 0;
-        for (int pass = 0; pass < 2 && !started; pass++)
-            for (int bi = 0; bi < MAX_OKAIS && !started; bi++) {
-                struct okai* b = okai_get(bi);
-                if (!b) continue;
-                for (int ti = 0; ti < b->tab_count && !started; ti++) {
-                    if ((pass == 0) != (ti == b->active_tab)) continue;
-                    struct okai_tab* T = &b->tabs[ti];
-                    if (T->load_state != 0 || T->closing) continue;
-                    int r = start_main_fetch(bi, ti);
-                    if (r == 0) { okai_fetch_owner = bi; fetch_tab = ti; }
-                    started = 1;
-                }
-            }
-    }
     // Coalesced renders (active tabs only; others render on switch).
     for (int bi = 0; bi < MAX_OKAIS; bi++) {
         struct okai* b = okai_get(bi);
@@ -1513,14 +1634,16 @@ void okai_poll(void) {
         struct okai_tab* T = okai_tab_of(b);
         if (T->render_pending && (int)tick_count - T->render_due >= 0) okai_render_content(bi);
     }
-    // Fetch-pill erase: the progress pill is an overlay; when the fetch ends
-    // repaint the window once so its pixels go away.
+    // Fetch-pill erase: the progress pill is an overlay; when a window's
+    // requests end repaint it once so its pixels go away.
+    okai_fetch_owner = -1;
+    for (int i = 0; i < FETCH_MAX; i++)
+        if (reqs[i].used) { okai_fetch_owner = reqs[i].bi; break; }
     {
         static int pill_win = -1;
-        int cur = (okai_fetch_owner >= 0) ? okai_fetch_owner : -1;
-        if (cur >= 0) pill_win = cur;
+        if (okai_fetch_owner >= 0) pill_win = okai_fetch_owner;
         else if (pill_win >= 0) {
-            okai_blit_content(pill_win);
+            if (okai_get(pill_win)) okai_blit_content(pill_win);
             pill_win = -1;
         }
     }
@@ -1564,8 +1687,7 @@ int okai_open(const char* url) {
 void okai_close(int id) {
     if (id < 0 || id >= okai_count) return;
     struct okai* b = &okais[id];
-    if (okai_fetch_owner == id) { okai_fetch_owner = -1; fetch_tab = -1; }
-    else if (okai_fetch_owner > id) okai_fetch_owner--;
+    req_window_removed(id);
     for (int t = 0; t < OKAI_MAX_TABS; t++)
         if (b->tabs[t].doc) { wdoc_free(b->tabs[t].doc); b->tabs[t].doc = 0; }
     if (b->win_id >= 0) {
@@ -1590,8 +1712,9 @@ static void navigate_ex(int id, const char* url, int push) {
     struct okai* b = &okais[id];
     struct okai_tab* T = okai_tab_of(b);
     if (b->win_id < 0) return;
-    // Abort this tab's in-flight fetch so the new URL actually loads.
-    if (okai_fetch_owner == id && fetch_tab == b->active_tab) { okai_fetch_owner = -1; fetch_tab = -1; }
+    // Cancel this tab's requests (old document's resources included) so
+    // the new URL loads and nothing lands in the page being replaced.
+    req_cancel_tab(id, b->active_tab);
     char norm[OKAI_URL_LEN];
     okai_normalize_https(url, norm, OKAI_URL_LEN);
     scopy(T->url, norm, OKAI_URL_LEN);
@@ -1615,8 +1738,8 @@ static void navigate_ex(int id, const char* url, int push) {
     b->chrome_dirty = 1;
     serial_printf("[okai] navigate %s\n", T->url);
     if (okai_is_home(T->url)) load_home(id, b->active_tab);
-    // otherwise okai_poll starts the fetch (single-connection owner model);
-    // the old page stays visible until the new one arrives.
+    // otherwise okai_poll starts the fetch; the old page stays visible
+    // until the new one arrives.
 }
 
 void okai_navigate(int id, const char* url) {
@@ -2525,15 +2648,18 @@ static void okai_draw_chrome(int id) {
 // small text). Pixel overlay like the chrome: painted while a fetch is in
 // flight for this window; okai_poll repaints the window once when it ends.
 static void okai_draw_fetch_status(int id) {
-    if (okai_fetch_owner != id) return;
     struct okai* b = &okais[id];
-    if (b->win_id < 0 || fetch_tab < 0 || fetch_tab >= b->tab_count) return;
-    struct okai_tab* T = &b->tabs[fetch_tab];
+    if (b->win_id < 0) return;
+    // Main document of the active tab, else the sum over its resources.
     long rxb = -1;
-    if (fetch_https(T)) {
-        if (tls_is_active() && !tls_is_done()) rxb = tls_get_progress_len();
-    } else if (!http_is_done() && (http_is_pending() || http_is_retry_pending())) {
-        rxb = http_get_response_len();
+    int subs = 0;
+    for (int i = 0; i < FETCH_MAX; i++) {
+        struct oreq* q = &reqs[i];
+        if (!q->used || q->bi != id || q->tab != b->active_tab || q->h < 0) continue;
+        long p = fetch_progress(q->h);
+        if (q->sub_id < 0) { rxb = p; subs = 0; break; }
+        rxb = (rxb < 0 ? 0 : rxb) + p;
+        subs++;
     }
     if (rxb < 0) return;
     struct window* w = window_get(b->win_id);
@@ -2542,7 +2668,7 @@ static void okai_draw_fetch_status(int id) {
     if (!page_geom(b, &sx, &sy, &pw, &ph)) return;
     char msg[40];
     int mi = 0;
-    const char* pre = T->sub_id >= 0 ? "Loading resources " : "Loading ";
+    const char* pre = subs ? "Loading resources " : "Loading ";
     while (pre[mi] && mi < 30) { msg[mi] = pre[mi]; mi++; }
     long kb = rxb / 1024;
     char rev[12];

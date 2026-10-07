@@ -58,15 +58,11 @@ struct okai_tab {
     int history_count;
     int history_pos;
     int redirect_count;   // HTTP 3xx hops followed on this page (anti-loop)
-    // Sub-resources (stylesheets, images) of the loaded page, fetched one
-    // at a time through the single connection after the main document.
-    int sub_id;           // wdoc resource id in flight, or -1
-    int sub_https;        // scheme of THAT fetch (not of the page)
-    int sub_redirects;
-    int sub_retried;      // one transport retry per resource
+    // Sub-resources (stylesheets, scripts, images, script requests) of the
+    // loaded page, fetched in parallel after the main document.
+    int sub_inflight;     // resource requests in flight for this tab
     int sub_css, sub_img; // fetches issued this page (caps above)
     int sub_landed;       // resources applied since the last render
-    char sub_url[OKAI_URL_LEN];
     uint32_t load_tick;   // tick of the main document parse
     uint32_t last_render_tick;
     int render_pending;   // relayout+repaint requested (coalesced in okai_poll)
@@ -130,7 +126,7 @@ void okai_blit_content(int id);
 int okai_is_animating(int id);
 int okai_find_by_win(int win_id);
 struct okai* okai_get(int id);
-// Id of the window that currently owns the single in-flight okai fetch, or -1.
+// A window with requests in flight (any), or -1.
 extern int okai_fetch_owner;
 // Drive fetches (main document, then sub-resources) and coalesced renders.
 // Called once per desktop main-loop iteration.

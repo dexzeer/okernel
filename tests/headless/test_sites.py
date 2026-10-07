@@ -39,6 +39,8 @@ try:
     time.sleep(2)
     for url in urls:
         start = len(vm.serial())
+        vm.type_string("\x1b")   # Esc: leave any field a page script focused
+        time.sleep(0.2)
         vm.type_string("g")
         time.sleep(0.4)
         vm.type_string(url + "\n")
