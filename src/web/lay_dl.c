@@ -87,21 +87,33 @@ static void emit_bg_border(struct wlayout* L, int bi) {
             if (k >= 0) L->di[k].ref = L->ndsh++;
         }
     }
-    // the root element's background is the canvas; body's when propagated
-    int skip_bg = 0;
-    if (b->node >= 0 && b->node == L->d->html) skip_bg = 1;
+    // The root element's background is the canvas; body's when propagated
+    // (html has none). Its color is the canvas fill (wlay_canvas_bg); its
+    // gradient / image paint over the whole canvas, positioned against the
+    // element's own box.
+    int skip_bg = 0, canvas = 0;
+    if (b->node >= 0 && b->node == L->d->html) skip_bg = canvas = 1;
     if (b->node >= 0 && b->node == L->d->body && L->d->html >= 0) {
         const struct wstyle* hs = css_style_of(L->ss, L->d->html);
-        if (hs && !(hs->bg_color >> 24) && hs->bg_grad < 0 && !hs->bg_image) skip_bg = 1;
+        if (hs && !(hs->bg_color >> 24) && hs->bg_grad < 0 && !hs->bg_image) skip_bg = canvas = 1;
     }
     if (s->has_mask) skip_bg = 1; // mask-image unsupported: never paint an unmasked fill
+    // painting area: the border box, or the whole canvas for the root background
+    int32_t ax = x, ay = y, aw = w, ah = h;
+    if (canvas) {
+        const struct lbox* root = &L->b[L->root];
+        ax = 0;
+        ay = 0;
+        aw = W_MAX(root->w, x + w);
+        ah = W_MAX(root->h, y + h);
+    }
     if (!skip_bg && (s->bg_color >> 24)) {
         int k = di_add(L, DI_RECT, x, y, w, h, with_alpha(L, s->bg_color));
         if (k >= 0) L->di[k].ref = rref;
     }
-    if (!skip_bg && s->bg_grad >= 0) {
-        int k = di_add(L, DI_GRAD, x, y, w, h, 0xFF000000);
-        if (k >= 0) { L->di[k].a = s->bg_grad; L->di[k].ref = rref; }
+    if ((!skip_bg || canvas) && !s->has_mask && s->bg_grad >= 0) {
+        int k = di_add(L, DI_GRAD, ax, ay, aw, ah, 0xFF000000);
+        if (k >= 0) { L->di[k].a = s->bg_grad; L->di[k].ref = canvas ? -1 : rref; }
     }
     if (s->bg_image && !s->has_mask && L->imgs && L->imgs->for_url) {
         int iw = 0, ih = 0;
@@ -136,7 +148,7 @@ static void emit_bg_border(struct wlayout* L, int bi) {
                     struct dbgimg* bg = &L->dbg[L->ndbg];
                     bg->img = img; bg->ix = ox; bg->iy = oy; bg->iw = tw; bg->ih = th;
                     bg->repeat = s->bg_repeat;
-                    int k = di_add(L, DI_BGIMG, x, y, w, h, 0xFF000000);
+                    int k = di_add(L, DI_BGIMG, ax, ay, aw, ah, 0xFF000000);
                     if (k >= 0) L->di[k].ref = L->ndbg++;
                 }
             }

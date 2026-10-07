@@ -49,32 +49,26 @@ boot_gdtr:
     dw boot_gdtr - boot_gdt - 1 ; limit = 24-1
     dd boot_gdt                 ; base (LINKED high; fixed at runtime below)
 
-; Boot page tables: identity-map 0-4M AND high-map 0xC0000000-0xC0400000
-; to the same phys 0-4M, so the high-linked kernel can enable paging while
-; still running low and then jump high. Phys addrs stored (CPU reads CR3 +
-; PD entries as phys). 4K-aligned.
-; PHYS LABELS (the NASM wrap-around trap): `mov edx, boot_pt_low-0xC0000000'
-; does NOT subtract at build time — with unlinked .o VMAs (0x1000/0x2000)
-; NASM emits a RELOCATION (R_386_32 of 0x40001000), and LD resolves the
-; subtraction against the FINAL high VMA (0xC0188000-0xC0000000=0x188000).
-; So the checked-in disassembly shows 0x188000 (correct phys) while a raw
-; `nasm -o /tmp` object shows 0x40001000 (unlinked). Both are correct stages
-; of the same arithmetic — do NOT "fix" the expression to a hardcoded phys.
+; Boot page directory: identity-map 0-64M AND high-map 0xC0000000-0xC4000000
+; to the same phys 0-64M (4MB PSE pages), so the high-linked kernel can
+; enable paging while still running low and then jump high. Phys addrs
+; stored (CPU reads CR3 + PD entries as phys). 4K-aligned.
+; PHYS LABELS (the NASM wrap-around trap): `mov edx, boot_pd-0xC0000000'
+; does NOT subtract at build time — with unlinked .o VMAs NASM emits a
+; RELOCATION (R_386_32 of 0x40000000+off), and LD resolves the subtraction
+; against the FINAL high VMA. So the linked disassembly shows the correct
+; phys while a raw `nasm -o /tmp` object shows 0x400xxxxx (unlinked). Both
+; are correct stages of the same arithmetic — do NOT "fix" the expression
+; to a hardcoded phys.
 section .data
 align 4096
 global boot_pd
 boot_pd:
     times 1024 dd 0
-align 4096
-boot_pt_low:
-    times 1024 dd 0
-align 4096
-boot_pt_high:
-    times 1024 dd 0
 
-; Stack — 256KB (TLS needs it). HIGH-linked .bss (VMA 0xC01CB000, phys
-; 0x1CB000): pre-PG code must NOT touch it (not covered by any mapping
-; until paging_init's full map). Post-PG high code uses the VMA name.
+; Stack — 256KB (TLS needs it). HIGH-linked .bss: pre-PG code must NOT touch
+; it (the LOW trampoline runs on a scratch ESP). Post-PG high code uses the
+; VMA name; the boot PD's 0-64M high window covers it.
 section .bss
 align 16
 stack_bottom:
@@ -101,34 +95,30 @@ _start:
     ; ebx = phys multiboot pointer (save first — fill loop clobbers).
     mov edi, ebx                ; edi = phys mboot ptr
 
-    ; Fill both PTs: PTE[i] = (i*0x1000) | 0x03 (present + rw, supervisor)
-    mov ecx, 0
-.fill_pt:
-    mov eax, ecx
-    shl eax, 12
-    or eax, 0x03
-    mov edx, boot_pt_low - 0xC0000000
-    mov [edx + ecx*4], eax
-    mov edx, boot_pt_high - 0xC0000000
-    mov [edx + ecx*4], eax
-    inc ecx
-    cmp ecx, 1024
-    jl .fill_pt
-
-    ; PD[0] -> boot_pt_low (phys), PD[768] -> boot_pt_high (phys).
+    ; Boot map: 4MB PSE pages, phys 0-64M both identity (PD[0..15]) and
+    ; high (PD[768..783]). The image outgrew one 4K-page table (fonts + the
+    ; web engine put .bss — and the boot stack in it — past 4M), and
+    ; paging_init only runs after memory_init/mboot copy touch .bss too.
     ; ABSOLUTE-ADDRESS WARNING: `mov edx, boot_pd - 0xC0000000' looks like a
     ; numeric subtraction, but NASM treats `label - const' as LABEL+(-const):
     ; it emits a RELOCATION (R_386_32 of 0x40000000), NOT a folded immediate.
     ; The .o disassembly shows 0x40000000 (unlinked); LD resolves it against
-    ; the HIGH VMA to phys 0x187000. Verified via objdump -dr. Same for every
-    ; boot_* expression below — do NOT replace with hardcoded phys.
-    mov eax, boot_pt_low - 0xC0000000
-    or eax, 0x03
+    ; the HIGH VMA to phys. Verified via objdump -dr. Same for every boot_*
+    ; expression below — do NOT replace with hardcoded phys.
+    mov eax, cr4
+    or eax, 0x10                ; CR4.PSE: 4MB pages
+    mov cr4, eax
     mov edx, boot_pd - 0xC0000000
-    mov [edx + 0*4], eax
-    mov eax, boot_pt_high - 0xC0000000
-    or eax, 0x03
-    mov [edx + 768*4], eax
+    mov ecx, 0
+.fill_pd:
+    mov eax, ecx
+    shl eax, 22
+    or eax, 0x83                ; present + rw + PS (4MB)
+    mov [edx + ecx*4], eax
+    mov [edx + 768*4 + ecx*4], eax
+    inc ecx
+    cmp ecx, 16
+    jl .fill_pd
 
     ; Enable paging with the boot PD (phys addr)
     mov eax, boot_pd - 0xC0000000
@@ -156,14 +146,14 @@ _start:
     ; Target is _start_high (HIGH VMA in .text) — LD resolves the relocation.
     jmp 0x08:_start_high
 
-; HIGH ENTRY (VMA high in .text): runs with paging ON via boot_pt_high.
+; HIGH ENTRY (VMA high in .text): runs with paging ON via the boot PD high window.
 ; Fixes ESP to the high stack_top and calls kernel_main(mboot_phys).
 section .text
 global _start_high
 _start_high:
     ; Now running HIGH: fix ESP to the high stack_top, call kernel_main.
     ; NASM resolves stack_top/kernel_main to high linked addrs — correct now.
-    ; The phys stack page is the same (boot_pt_low + boot_pt_high alias it).
+    ; The phys stack page is the same (identity + high windows alias it).
     ; edi = multiboot pointer: the LOW trampoline sets it from ebx before the
     ; far jump, but the TEXT build enters here DIRECTLY from GRUB (ENTRY
     ; _start_high — the trampoline's phys math is high-link-only), so take it

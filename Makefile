@@ -45,9 +45,22 @@ boot/start_text.o: boot/start.asm
 # stale seed silently ships last week's ELFs — bisected 2026-09-08 when a
 # fresh forktest never reached the ISO).
 USERLAND_GEN = $(wildcard userland/gen_*.h)
+
+# Web engine (src/web): HTML5 parser, CSS, layout, painter, fonts, images.
+# Desktop-only. fontdata.o incbins the TrueType faces in fonts/; callstack.o
+# is the trampoline okai uses to run the engine on its own 2MB stack.
+WEB_OBJ = src/web/wdom.o src/web/html5.o src/web/charset.o src/web/wurl.o \
+          src/web/css_values.o src/web/css_parse.o src/web/css_select.o src/web/css_style.o \
+          src/web/lay_tree.o src/web/lay_main.o src/web/lay_inline.o src/web/lay_flex.o \
+          src/web/lay_grid.o src/web/lay_table.o src/web/lay_dl.o \
+          src/web/paint.o src/web/raster.o src/web/font.o src/web/svg.o src/web/image.o \
+          src/web/wdoc.o src/web/fontdata.o src/web/callstack.o
+WEB_HEADERS := $(wildcard src/web/*.h)
+src/web/fontdata.o: src/web/fontdata.asm $(wildcard fonts/*.ttf)
+	$(AS) $(ASFLAGS) $< -o $@
 src/userland_seed.o: $(USERLAND_GEN)
-DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/html.o src/css.o src/dom.o src/layout.o src/cjk.o \
-              src/font_data.o \
+DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/textslot.o src/cjk.o \
+              src/font_data.o $(WEB_OBJ) \
               src/js/js_os.o src/js/js_var.o src/js/js_lex.o src/js/js_parse.o src/js/js_funcs.o src/js/js_math.o src/js/js_dom.o \
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/chacha20.o src/crypto/poly1305.o \
@@ -58,7 +71,23 @@ DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o
              src/crypto/certverify.o src/rtc.o \
              src/net/tls_net.o
 
-.PHONY: all text desktop clean run debug host-tests host-tests-asan diff-oracle diff-test tls-interop
+.PHONY: all text desktop clean run debug host-tests host-tests-asan diff-oracle diff-test tls-interop web-tests
+
+# ---- Web engine host tests (src/web) ----
+# Offline must-pass: CSS cascade unit tests, font engine. With the corpus
+# fetched (python3 tools/fetch_corpus.py) also: HTML5 tree diff vs html5lib,
+# image decoders vs PIL, every corpus page through the renderer (see
+# tests/web/; ASan: SAN="-fsanitize=address,undefined" sh tests/web/build.sh).
+WEB_HOST_SRC = src/web/wdom.c src/web/html5.c src/web/charset.c src/web/css_values.c src/web/css_parse.c \
+               src/web/css_select.c src/web/css_style.c src/web/wurl.c src/web/font.c src/web/raster.c \
+               src/web/lay_tree.c src/web/lay_main.c src/web/lay_inline.c src/web/lay_flex.c src/web/lay_grid.c \
+               src/web/lay_table.c src/web/lay_dl.c src/web/paint.c src/web/svg.c src/web/wdoc.c src/web/image.c src/cjk.c
+web-tests:
+	mkdir -p build-host
+	nasm -f elf32 src/web/fontdata.asm -o build-host/fontdata.o
+	gcc -m32 -O2 -Isrc -Itests/web -o build-host/t_webcss tests/web/test_css.c $(WEB_HOST_SRC) build-host/fontdata.o && ./build-host/t_webcss | tail -n 2
+	gcc -m32 -O2 -Isrc -Itests/web -o build-host/t_font tests/web/test_font.c $(WEB_HOST_SRC) build-host/fontdata.o && ./build-host/t_font | tail -n 2
+	sh tests/web/build.sh
 
 # ---- Host tests (no QEMU; run from repo root — suites load tests/fixtures/*) ----
 # Offline must-pass: tls_crypto, css, subres, pki, adversarial (fast -O2 build;
@@ -77,15 +106,10 @@ host-tests:
 	gcc -m32 -O2 -Isrc -Isrc/crypto -o build-host/t_chachapoly tests/test_chachapoly.c src/crypto/chacha20.c src/crypto/poly1305.c && ./build-host/t_chachapoly | tail -n 3
 	gcc -m32 -O2 -Isrc -Isrc/crypto -o build-host/t_rng tests/test_rng.c src/crypto/rand.c src/crypto/chacha20.c src/crypto/sha256.c && ./build-host/t_rng | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_strict tests/test_crypto_strict.c $(HOST_CRYPTO_SRC) && ./build-host/t_strict | tail -n 2
-	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_css tests/test_css.c src/css.c src/html.c && ./build-host/t_css | tail -n 2
-	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_subres tests/test_subres.c src/html.c src/css.c && ./build-host/t_subres | tail -n 2
-	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_render tests/test_render_pages.c src/html.c && ./build-host/t_render | tail -n 2
-	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_dom tests/test_dom.c src/dom.c src/html.c && ./build-host/t_dom | tail -n 2
-	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_layout tests/test_layout.c src/dom.c src/html.c src/css.c src/layout.c && ./build-host/t_layout | tail -n 2
-	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_edtext tests/test_editor_text.c src/editor.c src/html.c && ./build-host/t_edtext | tail -n 2
+	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_edtext tests/test_editor_text.c src/editor.c src/textslot.c && ./build-host/t_edtext | tail -n 2
+	$(MAKE) web-tests
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_pki tests/test_pki.c $(HOST_CRYPTO_SRC) && ./build-host/t_pki | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_adv tests/test_adversarial.c $(HOST_CRYPTO_SRC) && timeout 300 ./build-host/t_adv | tail -n 3
-	-gcc -m32 -DKERNEL=0 -Isrc -o build-host/t_td tests/test_text_decode.c src/html.c && ./build-host/t_td | tail -n 2; echo "(text_decode: informational)"
 	-gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tls_live tests/test_tls_client.c $(HOST_CRYPTO_SRC) && timeout 60 ./build-host/t_tls_live | tail -n 3; echo "(tls_client_test: needs internet; SKIP if unreachable)"
 
 # Sanitizer run of the adversarial suite (review P0 infra): every parser,
@@ -181,8 +205,14 @@ HEADERS := $(wildcard src/*.h) $(wildcard src/net/*.h)
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+src/web/%.o: src/web/%.c $(HEADERS) $(WEB_HEADERS)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+src/okai.o: src/okai.c $(HEADERS) $(WEB_HEADERS)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # JS engine files need the freestanding shim (kmalloc/serial_printf + no libc)
-src/js/%.o: src/js/%.c $(HEADERS)
+src/js/%.o: src/js/%.c $(HEADERS) $(WEB_HEADERS)
 	$(CC) $(CFLAGS) -DJS_KERNEL -c $< -o $@
 
 # ---- Run ----

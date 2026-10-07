@@ -152,7 +152,7 @@ static void unit_tests(void) {
     load("<table id=t width=500 bgcolor=#eeeeee cellpadding=7 border=1><tr><td id=td align=center valign=top>x</td></tr></table>"
          "<font id=fn size=5 color=red>f</font><img id=im width=40 height=30>", 0);
     s = S("t"); CHECK(s && PXV(s->width.px) == 500 && s->bg_color == 0xFFEEEEEE, "table width/bgcolor hints");
-    s = S("td"); CHECK(s && s->text_align == TA_CENTER && s->vertical_align == VA_TOP && PXV(s->padding[0].px) == 7 && PXV(s->bw[0]) == 1, "td hints");
+    s = S("td"); CHECK(s && s->text_align == TA_WEBKIT_CENTER && s->vertical_align == VA_TOP && PXV(s->padding[0].px) == 7 && PXV(s->bw[0]) == 1, "td hints");
     s = S("fn"); CHECK(s && s->color == 0xFFFF0000 && PXV(s->font_size) == 24, "font element hints");
     s = S("im"); CHECK(s && PXV(s->width.px) == 40 && PXV(s->height.px) == 30, "img dims");
 

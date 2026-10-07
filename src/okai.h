@@ -2,68 +2,41 @@
 #define OKAI_H
 
 #include <stdint.h>
-#include "html.h"
-#include "css.h"
-#include "dom.h"
 
-#define OKAI_MAX_HISTORY 4
-#define OKAI_URL_LEN 128
+// okai — the web browser shell. Pages are parsed, styled, laid out and
+// painted by the web engine in src/web/ (struct wdoc); okai owns the
+// window, the chrome (tabs, toolbar, address bar), navigation/history,
+// the network fetch driver and input routing. The page is painted into a
+// per-window pixel surface that the window system blits (window_set_pixels).
+
+#define OKAI_MAX_HISTORY 8
+#define OKAI_URL_LEN 1024
 #define MAX_OKAIS 2            // one browser window (+ spare); tabs live inside
 #define OKAI_MAX_TABS 4        // tabs per browser window
-#define OKAI_TAB_TOKENS 384    // per-tab parsed-HTML cap (memory: ~250KB/tab)
-// Scratch for <style> extraction (inline sheets are small; external sheets
-// parse straight from the response buffer). Per-TU static, only live during
-// parse — the old 128KB-per-tab concat buffer is gone (see below).
-#define INLINE_CSS_SCRATCH (64 * 1024)
-#define OKAI_MAX_LINKS 64
 #define OKAI_MAX_REDIRECTS 8
-#define OKAI_MAX_SUBRES 8      // max external <link>/<script> per page
-#define OKAI_SUBRES_BUF 4096   // buffer for extracted URLs (double-null-terminated)
+#define OKAI_MAX_CSS_FETCH 24  // external stylesheets fetched per page
+#define OKAI_MAX_IMG_FETCH 32  // images fetched per page (rest stay blank)
 
 // Where the Home button, the '+' new tab, and `okai` with no argument go.
-// okai:home is an INTERNAL page rendered from OKAI_HOME_HTML (no network).
+// okai:home is an INTERNAL page (no network).
 #define OKAI_HOME_URL "okai:home"
 
-// A clickable link region in the window content buffer (buffer row/col space).
-// Long links wrap across rows: (row, col0) is the first cell, (end_row, col1)
-// the last; middle rows span full width. Single-row links have end_row == row.
-struct okai_link {
-    int row;            // content buffer row of the first cell
-    int col0;           // first column (inclusive)
-    int col1;           // last column (inclusive, on end_row)
-    int end_row;        // content buffer row of the last cell
-    char href[OKAI_URL_LEN]; // resolved, absolute URL
-};
-
-// A focusable form control (input/button) region, recorded during render for
-// mouse hit-testing. node is a DOM node index; is_button distinguishes
-// submit targets from text fields (click focuses a field, activates a button).
-struct okai_field {
-    int row;            // content buffer row
-    int col0;           // first column (inclusive)
-    int col1;           // last column (inclusive)
-    int node;           // DOM node index of the control
-    int is_button;      // 1 = submit button, 0 = text input
-};
+struct wdoc;
 
 // One page: everything that a tab switch must preserve so switching back
 // re-renders instantly (no refetch).
 struct okai_tab {
     char url[OKAI_URL_LEN];
     char title[64];
-    int scroll_y;
-    int content_height; // total lines of rendered content
-    // DOM tree — the source of truth for layout/render/CSS/JS. HTML_MAX_TOKENS
-    // legacy token array is kept only until the remaining consumers migrate.
-    struct dom dom;
-    struct html_token tokens[OKAI_TAB_TOKENS];
-    int token_count;
-    int last_resp_len;    // track HTTP response changes
+    struct wdoc* doc;     // parsed page (NULL until the first load)
+    int scroll_y;         // px
+    int content_height;   // document height, px
+    int load_state;       // 0 = needs fetch, 1 = loaded, -1 = error page shown
     int is_https;         // 1 if URL used the https:// scheme
     int https_fell_back;  // 1 once we've already retried a failed HTTPS fetch over HTTP
     int conn_retries;     // resumption/full-handshake retries this navigation
-                            // (max OKAI_CONN_MAX_RETRIES, same origin, not a
-                            // downgrade) against flaky backends
+                          // (max OKAI_CONN_MAX_RETRIES, same origin, not a
+                          // downgrade) against flaky backends
 #define OKAI_CONN_MAX_RETRIES 2
     int cert_failed;      // 1 = HTTPS failed certificate verification: render a
                           // distinct security error and NEVER fall back to HTTP
@@ -73,39 +46,35 @@ struct okai_tab {
                           // NEVER a certificate warning, NEVER fall back
     int conn_kind;        // OKAI_CONN_* below (meaningful when conn_failed)
 #define OKAI_CONN_PROTO 1    // handshake/protocol/transport failure
-#define OKAI_CONN_TOOLARGE 2 // response exceeded the 1MB buffer
+#define OKAI_CONN_TOOLARGE 2 // response exceeded the fetch buffer
     int truncated;        // 1 = secure response proven TRUNCATED (EOF without
                           // close_notify and short of Content-Length framing):
                           // render a distinct warning, NEVER fall back
-    // CSS: parsed rules for this page. Sheets parse incrementally (inline
-    // first, then each external sheet appends) — no concat buffer, no
-    // O(n^2) re-parse. Cascade order = sheet order = append order.
-    struct css_rule css_rules[CSS_MAX_RULES];
-    int css_n;
-    // Clickable links recorded during render, for mouse hit-testing
-    struct okai_link links[OKAI_MAX_LINKS];
-    int link_count;
-    // Form controls (inputs/buttons) recorded during render, for mouse focus/submit
-    struct okai_field fields[OKAI_MAX_LINKS];
-    int field_count;
-    int focused_input;  // token index of the focused <input>, or -1
+    int focused_node;     // DOM node of the focused form control, or -1
     // History
     char history[OKAI_MAX_HISTORY][OKAI_URL_LEN];
     int history_count;
     int history_pos;
-    int redirect_count;    // HTTP 3xx hops followed on this page (anti-loop)
-    // External resource fetch queue (<link rel=stylesheet>, <script src>)
-    int sub_res_phase;     // 0=idle, 1=fetching CSS links, 2=fetching JS scripts
-    int sub_res_idx;       // index into sub_res_urls for the current fetch
-    int sub_res_count;     // number of URLs in sub_res_urls
-    int sub_res_css_changed; // a sub-resource stylesheet was applied since the
-                             // last full render — the drain re-render is only
-                             // needed then (JS-only completions change nothing)
-    char sub_res_type[OKAI_MAX_SUBRES]; // 'c'=CSS link, 'j'=JS script
-    char sub_res_urls[OKAI_MAX_SUBRES][OKAI_URL_LEN]; // resolved absolute URLs
+    int redirect_count;   // HTTP 3xx hops followed on this page (anti-loop)
+    // Sub-resources (stylesheets, images) of the loaded page, fetched one
+    // at a time through the single connection after the main document.
+    int sub_id;           // wdoc resource id in flight, or -1
+    int sub_https;        // scheme of THAT fetch (not of the page)
+    int sub_redirects;
+    int sub_retried;      // one transport retry per resource
+    int sub_css, sub_img; // fetches issued this page (caps above)
+    int sub_landed;       // resources applied since the last render
+    char sub_url[OKAI_URL_LEN];
+    uint32_t load_tick;   // tick of the main document parse
+    uint32_t last_render_tick;
+    int render_pending;   // relayout+repaint requested (coalesced in okai_poll)
+    char pending_frag[128]; // #fragment to scroll to after the load
+    int render_due;       // tick at which a pending render fires
+    int has_fixed;        // layout has position:fixed content (scroll repaints fully)
+    int first_paint;      // 1 once the loaded document has been painted
     // Animation: current rendered tab width (px) and close-in-progress flag.
-    int anim_w;            // eased toward the target width for open/close animation
-    int closing;           // 1 while the tab is shrinking before removal
+    int anim_w;           // eased toward the target width for open/close animation
+    int closing;          // 1 while the tab is shrinking before removal
 };
 
 struct okai {
@@ -116,9 +85,14 @@ struct okai {
     int addr_bar_focused; // 1 = typing in address bar, 0 = scrolling
     char addr_input[OKAI_URL_LEN];
     int addr_input_len;
-    int show_security;   // HTTPS lock popup open (toggled by clicking the lock icon)
-    int chrome_dirty;    // overlay state changed without a window repaint
-                         // (addr typing, security popup) — forces a repaint
+    int show_security;    // HTTPS lock popup open (toggled by clicking the lock icon)
+    int chrome_dirty;     // overlay state changed without a window repaint
+                          // (addr typing, security popup) — forces a repaint
+    // Page surface: the visible viewport of the active tab, painted by the
+    // engine and blitted by the window system below the chrome band.
+    uint32_t* page_px;
+    int page_w, page_h;   // surface size (px)
+    int page_cap;         // allocated pixels
 };
 
 void okai_init(void);
@@ -136,30 +110,13 @@ void okai_close_tab(int id, int tab);
 // Tab-strip hit test: tab index for (mx,my), or -1. *on_close is set to 1 if
 // the click landed on that tab's close box.
 int  okai_tab_hit(int id, int mx, int my, int* on_close);
-// Begin the network fetch for window `id` from its current URL. Driven by the
-// desktop response loop under the single-connection owner model (okai_fetch_owner).
-// Returns 0 if a fetch was started, -1 if the URL was refused (empty host).
-int okai_start_fetch(int id);
-// Re-issue the current tab's fetch over plain HTTP after an HTTPS failure
-// (one-time fallback so http-only hosts still load). Returns okai_start_fetch()'s
-// result, or -1 if already fallen back this navigation.
-int okai_fallback_http(int id);
 void okai_navigate(int id, const char* url);
-// Re-issue the current tab's HTTPS fetch after a transport-class failure:
-// an aborted PSK resumption retries with a full handshake (ticket dropped),
-// a failed full handshake retries identically (flaky backends). Same origin
-// in all cases, NEVER a downgrade. fail_reason gates resumption-abort
-// signatures (PROTO/ALERT/MAC); overflow/RNG/cert failures fail closed.
-// Bounded by OKAI_CONN_MAX_RETRIES per navigation. Returns
-// okai_start_fetch()'s result, or -1.
-int okai_resumption_fallback(int id, int fail_reason);
 void okai_handle_key(int id, char c);
 void okai_handle_mouse_scroll(int id, int dy);
-void okai_draw(int id);
-void okai_draw_chrome_all(void);
+// Full render: relayout (if the document changed) + repaint the page surface.
 void okai_render_content(int id);
-void okai_relayout(int id);      // layout pass only (no window blit)
-void okai_blit_content(int id);  // scroll-path blit: no layout, quiet logs
+// Repaint the window from the existing page surface (no engine work).
+void okai_blit_content(int id);
 // Non-mutating tab-animation check (okai_anim_step advances state; this only
 // reads) so the desktop loop can throttle overlay repaints to when the chrome
 // can actually change.
@@ -167,13 +124,10 @@ int okai_is_animating(int id);
 int okai_find_by_win(int win_id);
 struct okai* okai_get(int id);
 // Id of the window that currently owns the single in-flight okai fetch, or -1.
-// The desktop response loop sets/clears this; declared here so desktop.c can
-// read it without reaching into okai.c internals.
 extern int okai_fetch_owner;
-// Inspect an HTTP response for a 3xx + Location header; if found, resolve the
-// target against the current URL and re-issue the request (http<->https aware).
-// Returns 1 if a redirect was followed (caller should skip parsing this frame).
-int okai_check_redirect(int id, const char* resp, int len);
+// Drive fetches (main document, then sub-resources) and coalesced renders.
+// Called once per desktop main-loop iteration.
+void okai_poll(void);
 
 // Toolbar nav actions, returned by okai_check_nav_click(). The browser's
 // back/forward/reload/home buttons are drawn in okai_draw_chrome(); this is
@@ -188,31 +142,23 @@ int okai_check_redirect(int id, const char* resp, int len);
 int  okai_check_nav_click(int id, int mx, int my);
 int  okai_lock_hit(int id, int mx, int my); // click hit-test for the address-bar lock icon
 int  okai_addr_bar_hit(int id, int mx, int my); // click-to-focus the address bar
-// Content hit-test for form controls (inputs/buttons), given buffer-row/col
-// already transformed by the caller (one coordinate space with links). Returns
-// 1 and performs the action (focus the input / submit the form), else 0.
-int  okai_check_content_click(int id, int row, int col);
-// Build the form's GET query from its inputs and navigate (used on Enter / button
-// click). `input_idx` is the submitting field's token index (input or button).
-void okai_submit_form(int id, int input_idx);
+// Click in the page area at screen (mx, my): follows links, focuses fields,
+// activates buttons/checkboxes. Returns 1 if the click did something.
+int  okai_content_click(int id, int mx, int my);
 void okai_nav_back(int id);
 void okai_nav_fwd(int id);
 void okai_nav_reload(int id);
 void okai_nav_home(int id);
-// Chrome + heading overlays for ONE window — desktop.c paints these right
-// after the window itself in z-order (okai_draw_chrome_all drew them after
-// ALL windows, so a lower okai's chrome painted over a higher window).
+// Chrome overlay for ONE window — desktop.c paints it right after the
+// window itself in z-order.
 void okai_paint_overlays(int id);
 // Clip the overlay to the given sub-rects (okai window minus higher-z windows)
-// so it never paints over a covering window — avoids forcing that window to
-// repaint every frame (FPS regression when a window sits over okai).
+// so it never paints over a covering window.
 void okai_paint_overlays_rects(int id, int rects[][4], int nr);
 
-// Sub-resource fetch queue (<link rel=stylesheet>, <script src>).
-// After the main page is parsed, external CSS/JS are queued and fetched
-// sequentially through the single TCP connection.
-void okai_queue_sub_resources(int id, const char* html, int html_len);
-int  okai_start_sub_res_fetch(int id);
-int  okai_sub_res_done(int id, const char* resp, int resp_len);
+// Page DOM of the active tab of window id (JS bridge), and a hook to tell
+// okai the DOM changed (restyle + relayout + repaint on the next poll).
+struct wdom* okai_active_dom(int id);
+void okai_dom_changed(int id);
 
 #endif

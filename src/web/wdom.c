@@ -511,3 +511,15 @@ char* wdom_dump(const struct wdom* d, int* out_len) {
     *out_len = b.len - 1;
     return b.p;
 }
+
+void wdom_remove_attr(struct wdom* d, int el, int name) {
+    if (el < 0 || !name) return;
+    int prev = -1;
+    for (int a = d->n[el].attr; a >= 0; prev = a, a = d->a[a].next) {
+        if (d->a[a].name != name) continue;
+        if (prev < 0) d->n[el].attr = d->a[a].next;
+        else d->a[prev].next = d->a[a].next;
+        if (name == A_class || name == A_id) wdom_index_attrs(d, el);
+        return;
+    }
+}

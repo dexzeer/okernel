@@ -1,20 +1,36 @@
-#define BLITGEO 1 // TEMP
+// okai — the web browser shell over the src/web engine (see okai.h).
+//
+// Pipeline: the desktop loop calls okai_poll() every iteration. A tab that
+// needs its document fetches it through the single global connection
+// (okai_fetch_owner), the response is header-parsed, dechunked and gunzipped
+// here, then handed to wdoc_load (HTML5 parse + stylesheet discovery). The
+// page's stylesheets and images then stream in one at a time through the
+// same connection (wdoc_next_fetch / wdoc_fetch_done). Rendering is
+// coalesced: the first paint waits for the stylesheets (bounded), later
+// image arrivals repaint at most every ~1.5s. The engine paints the visible
+// viewport into a per-window pixel surface that the window system blits
+// (window_set_pixels); okai paints only its chrome as an overlay.
+//
+// All engine work runs on a dedicated 2MB stack (call_on_stack): real pages
+// nest deeper than the 256KB boot stack allows.
 #include "okai.h"
 #include "window.h"
 #include "graphics.h"
 #include "theme.h"
 #include "memory.h"
+#include "string.h"
+#include "serial.h"
 #include "net/network.h"
 #include "net/tls_net.h"
 #include "crypto/certverify.h" // CV_ERR_* for the warning-page reason line
-#include "crypto/tls_client.h" // tls_ticket_drop() for the resumption fallback
-#include "filesystem.h"
-#include "serial.h"
+#include "crypto/tls_client.h" // TLS_FAIL_*, tls_ticket_drop(), tls_response_complete()
 #include "js/js_dom.h"
-#include "layout.h"
-#include "cjk.h"
+#include "web/wdoc.h"
+#include "web/wdom.h"
+#include "web/wurl.h"
+#include "web/image.h"
+#include "web/surface.h"
 #include <stdint.h>
-#include <string.h>
 
 // Wall-clock baseline for the tab open/close animation. okai_anim_step eases
 // each tab's width toward its target once per 10ms tick (the PIT runs at 100Hz),
@@ -27,23 +43,331 @@ static uint32_t okai_last_tick = 0;
 #define OKAI_NB         32   // new-tab "+" button box, px (matches the 32px glyph)
 #define OKAI_ANIM_FACTOR 18  // % of remaining width eased per 10ms tick (exponential
                              // ease-out; ~150ms to fully open/close a tab)
+#define CHROME_PX (CHROME_TAB_H + CHROME_TOOL_H) // chrome band above the page, px
+#define SCROLL_STEP 48       // j/k/arrows
+#define WHEEL_STEP  80       // per wheel notch
+#define CSS_WAIT_TICKS 300   // first paint waits at most 3s for stylesheets
+#define IMG_RENDER_TICKS 150 // image arrivals repaint at most every 1.5s
+#define MAX_BODY (16u << 20) // decompressed document cap
 
 static struct okai okais[MAX_OKAIS];
 static int okai_count = 0;
 
 // The network stack services a SINGLE global TCP connection + response buffer,
 // so only one okai fetch may be in flight at a time. okai_fetch_owner is the id
-// of the window that currently owns that in-flight fetch (-1 when idle). The
-// desktop response loop starts pending windows (token_count == 0) in turn and
-// attributes each completed response to its owner, which is the only correct
-// behavior the single-connection architecture can give (concurrent/mixed
-// fetches would corrupt the shared TLS/TCP state and mis-route responses).
+// of the window that owns that in-flight fetch (-1 when idle) and fetch_tab
+// the tab inside it (tabs can switch while a fetch is in flight).
 int okai_fetch_owner = -1;
-
-// External: save filename for browse command
-extern void net_set_browse_save(const char* filename);
+static int fetch_tab = -1;
 
 static void okai_tab_reset(struct okai_tab* T);
+static void load_home(int id, int tab);
+static void show_error(int id, int tab);
+static void request_render(struct okai_tab* T, int delay);
+
+// ---- small string helpers -----------------------------------------------------
+
+static void scopy(char* dst, const char* src, int cap) {
+    int i = 0;
+    while (src[i] && i < cap - 1) { dst[i] = src[i]; i++; }
+    dst[i] = 0;
+}
+
+static int lower(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
+static int iprefix(const char* s, const char* lit) {
+    for (int i = 0; lit[i]; i++)
+        if (lower((unsigned char)s[i]) != lit[i]) return 0;
+    return 1;
+}
+
+static int url_is_https(const char* u) { return iprefix(u, "https:"); }
+static int url_is_http(const char* u) { return iprefix(u, "http:") || iprefix(u, "https:"); }
+
+// ---- engine jobs on the private stack ----------------------------------------------
+
+extern void call_on_stack(void (*fn)(void*), void* arg, void* stack_top);
+
+#define ENGINE_STACK (1u << 20) // Wikipedia peaks ~20KB; deep DOMs recurse more
+#define STACK_FILL 0x5AC4F00Du
+static uint8_t* engine_stack;
+static int in_engine;
+
+enum { JOB_LOAD, JOB_FETCH_DONE, JOB_PAINT, JOB_HIT, JOB_RECT, JOB_ANCHOR, JOB_INFLATE, JOB_LINKS };
+
+struct job {
+    int op;
+    struct wdoc* doc;
+    const char* url;
+    const char* bytes;
+    int len;
+    const char* charset;
+    int id;
+    struct wsurf* surf;
+    int scroll, vw, vh;
+    int x, y, w, h;
+    struct wdoc_hit* hit;
+    const char* frag;
+    uint8_t* out;
+    int out_len;
+    int result;
+};
+
+static void job_entry(void* p) {
+    struct job* j = (struct job*)p;
+    switch (j->op) {
+    case JOB_LOAD:
+        j->result = wdoc_load(j->doc, j->url, j->bytes, j->len, j->charset);
+        break;
+    case JOB_FETCH_DONE:
+        wdoc_fetch_done(j->doc, j->id, j->bytes, j->len, j->charset);
+        break;
+    case JOB_PAINT:
+        // vw/vh > 0: full paint (viewport may have changed); else a band
+        // repaint into the clip already set on the surface.
+        if (j->vw > 0) wdoc_set_viewport(j->doc, j->vw, j->vh);
+        j->result = wdoc_height(j->doc);
+        if (j->vw > 0) {
+            int maxs = j->result - j->vh;
+            if (maxs < 0) maxs = 0;
+            if (j->scroll > maxs) j->scroll = maxs;
+            if (j->scroll < 0) j->scroll = 0;
+            j->h = wdoc_has_fixed(j->doc);
+        }
+        wdoc_paint(j->doc, j->surf, j->scroll);
+        break;
+    case JOB_HIT:
+        j->result = wdoc_hit(j->doc, j->x, j->y, j->scroll, j->hit);
+        break;
+    case JOB_RECT:
+        j->result = wdoc_node_rect(j->doc, j->id, &j->x, &j->y, &j->w, &j->h);
+        break;
+    case JOB_ANCHOR:
+        j->result = wdoc_anchor_y(j->doc, j->frag);
+        break;
+    case JOB_INFLATE:
+        j->out = winflate_gzip((const uint8_t*)j->bytes, j->len, &j->out_len, (int)MAX_BODY);
+        break;
+    case JOB_LINKS: {
+        // Log the link/control regions in the viewport (headless tests aim
+        // clicks with these; page px relative to the page origin).
+        int n = wdoc_hit_count(j->doc), shown = 0;
+        static struct wdoc_region r;
+        int seen[48];
+        for (int i = 0; i < n && shown < 48; i++) {
+            if (!wdoc_hit_get(j->doc, i, &r)) continue;
+            int y = r.fixed ? r.y : r.y - j->scroll;
+            if (y + r.h <= 0 || y >= j->vh || r.w <= 0 || r.h <= 0) continue;
+            int dup = 0; // one line per element (its first, outermost region)
+            for (int k = 0; k < shown; k++) if (seen[k] == r.node) { dup = 1; break; }
+            if (dup) continue;
+            seen[shown] = r.node;
+            if (r.kind == WDOC_HIT_LINK)
+                serial_printf("[okai] link[%d] x=%d y=%d w=%d h=%d href=%s\n",
+                              shown, r.x, y, r.w, r.h, r.href);
+            else
+                serial_printf("[okai] field[%d] x=%d y=%d w=%d h=%d node=%d btn=%d\n",
+                              shown, r.x, y, r.w, r.h, r.node, r.kind == WDOC_HIT_BUTTON);
+            shown++;
+        }
+        break;
+    }
+    }
+}
+
+static void run_job(struct job* j) {
+    if (!engine_stack) {
+        engine_stack = (uint8_t*)kmalloc(ENGINE_STACK);
+        if (engine_stack) {
+            uint32_t* w = (uint32_t*)engine_stack;
+            for (uint32_t i = 0; i < ENGINE_STACK / 4; i++) w[i] = STACK_FILL;
+        } else serial_puts("[okai] engine stack alloc failed — using the boot stack\n");
+    }
+    if (!engine_stack || in_engine) { job_entry(j); return; }
+    in_engine = 1;
+    call_on_stack(job_entry, j, engine_stack + ENGINE_STACK);
+    in_engine = 0;
+}
+
+// Deepest engine stack use so far (KB), from the fill pattern.
+static int engine_stack_hwm_kb(void) {
+    if (!engine_stack) return 0;
+    const uint32_t* w = (const uint32_t*)engine_stack;
+    uint32_t i = 0;
+    while (i < ENGINE_STACK / 4 && w[i] == STACK_FILL) i++;
+    return (int)((ENGINE_STACK - i * 4) / 1024);
+}
+
+// ---- HTTP response handling -------------------------------------------------------
+
+struct resp_info {
+    int status;
+    int gzip;
+    char ctype[64];
+    char charset[32];
+    char location[OKAI_URL_LEN];
+};
+
+static int header_end(const char* r, int len) {
+    for (int i = 0; i + 3 < len; i++)
+        if (r[i] == '\r' && r[i + 1] == '\n' && r[i + 2] == '\r' && r[i + 3] == '\n') return i;
+    for (int i = 0; i + 1 < len; i++)
+        if (r[i] == '\n' && r[i + 1] == '\n') return i;
+    return -1;
+}
+
+// Value of header `name` (lowercase) within r[0..hend), or -1.
+static int header_get(const char* r, int hend, const char* name, const char** val) {
+    int nl = (int)strlen(name);
+    int p = 0;
+    while (p < hend) {
+        int e = p;
+        while (e < hend && r[e] != '\n') e++;
+        if (e - p > nl && r[p + nl] == ':') {
+            int ok = 1;
+            for (int k = 0; k < nl; k++) if (lower((unsigned char)r[p + k]) != name[k]) { ok = 0; break; }
+            if (ok) {
+                int v = p + nl + 1;
+                while (v < e && (r[v] == ' ' || r[v] == '\t')) v++;
+                int ve = e;
+                while (ve > v && (r[ve - 1] == '\r' || r[ve - 1] == ' ' || r[ve - 1] == '\t')) ve--;
+                *val = r + v;
+                return ve - v;
+            }
+        }
+        p = e + 1;
+    }
+    return -1;
+}
+
+static void parse_resp(const char* r, int len, struct resp_info* ri) {
+    ri->status = 0;
+    ri->gzip = 0;
+    ri->ctype[0] = ri->charset[0] = ri->location[0] = 0;
+    if (len < 12 || !(r[0] == 'H' && r[1] == 'T' && r[2] == 'T' && r[3] == 'P' && r[4] == '/')) return;
+    int sp = 0;
+    while (sp < len && r[sp] != ' ') sp++;
+    for (int k = sp + 1; k < sp + 4 && k < len && r[k] >= '0' && r[k] <= '9'; k++)
+        ri->status = ri->status * 10 + (r[k] - '0');
+    int he = header_end(r, len);
+    if (he < 0) he = len;
+    const char* v;
+    int vl = header_get(r, he, "content-type", &v);
+    if (vl > 0) {
+        int i = 0;
+        while (i < vl && v[i] != ';' && i < 63) { ri->ctype[i] = (char)lower((unsigned char)v[i]); i++; }
+        ri->ctype[i] = 0;
+        for (int k = 0; k + 8 <= vl; k++) {
+            if (iprefix(v + k, "charset=")) {
+                int s = k + 8, n = 0;
+                if (s < vl && (v[s] == '"' || v[s] == '\'')) s++;
+                while (s < vl && n < 31 && v[s] != ';' && v[s] != '"' && v[s] != '\'' && v[s] != ' ')
+                    ri->charset[n++] = v[s++];
+                ri->charset[n] = 0;
+                break;
+            }
+        }
+    }
+    vl = header_get(r, he, "content-encoding", &v);
+    if (vl >= 4) for (int k = 0; k + 4 <= vl; k++) if (iprefix(v + k, "gzip")) { ri->gzip = 1; break; }
+    vl = header_get(r, he, "location", &v);
+    if (vl > 0) {
+        if (vl > OKAI_URL_LEN - 1) vl = OKAI_URL_LEN - 1;
+        memcpy(ri->location, v, vl);
+        ri->location[vl] = 0;
+    }
+}
+
+// Strip headers + dechunk in place, then gunzip when encoded. Returns the
+// body; *heap = 1 if it is a kmalloc'd buffer the caller must free.
+static char* resp_body(char* resp, int len, const struct resp_info* ri, int* blen, int* heap) {
+    *heap = 0;
+    int n = http_dechunk(resp, len);
+    if (n < 0) n = 0;
+    *blen = n;
+    if (ri->gzip && n >= 18 && (uint8_t)resp[0] == 0x1F && (uint8_t)resp[1] == 0x8B) {
+        struct job j;
+        memset(&j, 0, sizeof j);
+        j.op = JOB_INFLATE;
+        j.bytes = resp;
+        j.len = n;
+        run_job(&j);
+        if (j.out) {
+            *heap = 1;
+            *blen = j.out_len;
+            return (char*)j.out;
+        }
+        serial_printf("[okai] gzip body failed to inflate (%d bytes)\n", n);
+    }
+    return resp;
+}
+
+// ---- requests -----------------------------------------------------------------------
+
+// Issue a GET for an absolute http(s) URL on the single connection.
+// Returns 0 if a request was started, -1 if the URL has no host.
+static int net_get(const char* url) {
+    char host[128], path[OKAI_URL_LEN];
+    if (wurl_host(url, host, sizeof host) <= 0) return -1;
+    if (wurl_path(url, path, sizeof path) <= 0) { path[0] = '/'; path[1] = 0; }
+    int port = wurl_port(url);
+    if (port < 0) port = 0;
+    net_accept_gzip = 1;
+    if (url_is_https(url)) https_get_port(host, path, (uint16_t)port);
+    else { http_reset_conn_attempts(); http_get_port(host, path, (uint16_t)port); }
+    net_accept_gzip = 0;
+    return 0;
+}
+
+// Default a web URL to HTTPS unless the user typed an explicit scheme.
+// An explicit `https://` is kept; an explicit `http://` is RESPECTED as plain
+// HTTP (typing the scheme is a deliberate choice); a bare host with no scheme
+// defaults to HTTPS. The home/internal scheme and other schemes are untouched.
+static void okai_normalize_https(const char* in, char* out, int outlen) {
+    while (*in == ' ') in++;
+    int has_scheme = 0;
+    for (int i = 0; in[i] && in[i] != '/'; i++) {
+        if (in[i] == ':') { has_scheme = 1; break; }
+    }
+    // host:port (digits after the colon) is not a scheme
+    if (has_scheme) {
+        int c = 0;
+        while (in[c] && in[c] != ':') c++;
+        if (in[c + 1] >= '0' && in[c + 1] <= '9') has_scheme = 0;
+    }
+    int j = 0;
+    if (!has_scheme) {
+        // IP literals and explicit non-443 ports are local/dev servers:
+        // plain HTTP (a TLS handshake against them fails closed, no fallback).
+        int h = 0, digits_dots = 1, port = -1;
+        while (in[h] && in[h] != '/' && in[h] != ':' && in[h] != '?' && in[h] != '#') {
+            if (!((in[h] >= '0' && in[h] <= '9') || in[h] == '.')) digits_dots = 0;
+            h++;
+        }
+        if (in[h] == ':') {
+            port = 0;
+            for (int k = h + 1; in[k] >= '0' && in[k] <= '9'; k++) port = port * 10 + (in[k] - '0');
+        }
+        const char* s = (digits_dots && h > 0) || (port > 0 && port != 443) ? "http://" : "https://";
+        while (s[j] && j < outlen - 1) { out[j] = s[j]; j++; }
+    }
+    for (int i = 0; in[i] && j < outlen - 1; i++) out[j++] = in[i];
+    while (j > 0 && out[j - 1] == ' ') j--;
+    out[j] = 0;
+}
+
+// Rewrite an in-place URL from https:// to http:// (used for the one-time
+// HTTP fallback after an HTTPS fetch definitively fails).
+static void okai_rewrite_scheme_http(char* url) {
+    if (strncmp(url, "https:", 6) == 0) {
+        int n = 0; while (url[n]) n++;
+        for (int i = 4; i < n; i++) url[i] = url[i + 1]; // drop the 's' after "http"
+    }
+}
+
+int okai_is_home(const char* url) { return strcmp(url, OKAI_HOME_URL) == 0; }
+
+// ---- init / tabs -----------------------------------------------------------------
 
 void okai_init(void) {
     for (int i = 0; i < MAX_OKAIS; i++) {
@@ -51,7 +375,10 @@ void okai_init(void) {
         okais[i].active_tab = 0;
         okais[i].tab_count = 0;
         okais[i].show_security = 0;
+        okais[i].page_px = 0;
+        okais[i].page_w = okais[i].page_h = okais[i].page_cap = 0;
         for (int t = 0; t < OKAI_MAX_TABS; t++) {
+            okais[i].tabs[t].doc = 0;
             okai_tab_reset(&okais[i].tabs[t]);
             okais[i].tabs[t].anim_w = 0;
             okais[i].tabs[t].closing = 0;
@@ -59,22 +386,17 @@ void okai_init(void) {
     }
     okai_count = 0;
     okai_fetch_owner = -1;
+    fetch_tab = -1;
 }
-
-// ---- Tabs --------------------------------------------------------------------
 
 struct okai_tab* okai_tab_of(struct okai* b) { return &b->tabs[b->active_tab]; }
 
 int okai_window_count(void) { return okai_count; }
 
-static void okai_tab_reset(struct okai_tab* T) {
-    T->url[0] = 0;
-    T->title[0] = 0;
-    T->scroll_y = 0;
-    T->content_height = 0;
-    T->token_count = 0;
-    T->last_resp_len = 0;
-    T->is_https = 0;
+// Per-load state (navigation keeps url/history/doc).
+static void tab_reset_load(struct okai_tab* T) {
+    T->load_state = 0;
+    T->redirect_count = 0;
     T->https_fell_back = 0;
     T->conn_retries = 0;
     T->cert_failed = 0;
@@ -82,19 +404,42 @@ static void okai_tab_reset(struct okai_tab* T) {
     T->conn_failed = 0;
     T->conn_kind = 0;
     T->truncated = 0;
-    T->css_n = 0;
-    T->link_count = 0;
-    T->field_count = 0;
-    T->focused_input = -1;
+    T->sub_id = -1;
+    T->sub_https = 0;
+    T->sub_redirects = 0;
+    T->sub_css = T->sub_img = 0;
+    T->sub_landed = 0;
+    T->sub_url[0] = 0;
+    T->render_pending = 0;
+    T->render_due = 0;
+    T->pending_frag[0] = 0;
+    T->first_paint = 0;
+}
+
+static void okai_tab_reset(struct okai_tab* T) {
+    if (T->doc) { wdoc_free(T->doc); T->doc = 0; }
+    T->url[0] = 0;
+    T->title[0] = 0;
+    T->scroll_y = 0;
+    T->content_height = 0;
+    T->is_https = 0;
+    T->focused_node = -1;
     T->history_count = 0;
     T->history_pos = 0;
-    T->redirect_count = 0;
-    T->sub_res_phase = 0;
-    T->sub_res_idx = 0;
-    T->sub_res_count = 0;
-    T->sub_res_css_changed = 0;
-    memset(T->sub_res_type, 0, OKAI_MAX_SUBRES);
-    memset(T->sub_res_urls, 0, sizeof(T->sub_res_urls));
+    T->has_fixed = 0;
+    T->last_render_tick = 0;
+    T->load_tick = 0;
+    tab_reset_load(T);
+}
+
+// A tab leaves the array (close animation finished / window closed).
+static void tab_dispose(int id, int tab) {
+    struct okai_tab* T = &okais[id].tabs[tab];
+    if (T->doc) { wdoc_free(T->doc); T->doc = 0; }
+    if (okai_fetch_owner == id) {
+        if (fetch_tab == tab) { okai_fetch_owner = -1; fetch_tab = -1; }
+        else if (fetch_tab > tab) fetch_tab--;
+    }
 }
 
 // Switching re-renders the tab's cached page — no refetch.
@@ -103,6 +448,7 @@ int okai_switch_tab(int id, int tab) {
     struct okai* b = &okais[id];
     if (tab < 0 || tab >= b->tab_count || tab == b->active_tab) return -1;
     b->active_tab = tab;
+    b->chrome_dirty = 1;
     okai_render_content(id);
     serial_printf("[okai] switch tab -> %d (%s)\n", tab, b->tabs[tab].url);
     return tab;
@@ -118,11 +464,13 @@ int okai_new_tab(int id, const char* url) {
     }
     int tab = b->tab_count++;
     b->active_tab = tab;
+    b->tabs[tab].doc = 0;
     okai_tab_reset(&b->tabs[tab]);
     b->tabs[tab].anim_w = 0;   // open animation: grow from zero width
     b->tabs[tab].closing = 0;
     okai_last_tick = tick_count; // start the ease-out cleanly from width 0
     okai_navigate(id, url);
+    if (!b->tabs[tab].doc) okai_render_content(id); // blank until the page arrives
     return tab;
 }
 
@@ -134,6 +482,7 @@ void okai_close_tab(int id, int tab) {
     // Animate: keep the tab in the array but flag it closing; okai_anim_step()
     // shrinks its width to zero and removes it once the animation finishes.
     b->tabs[tab].closing = 1;
+    if (okai_fetch_owner == id && fetch_tab == tab) { okai_fetch_owner = -1; fetch_tab = -1; }
     if (tab == b->active_tab) {
         // switch to a neighbour so the visible page updates immediately
         int nb = (tab + 1 < b->tab_count) ? tab + 1 : tab - 1;
@@ -144,1032 +493,707 @@ void okai_close_tab(int id, int tab) {
     serial_printf("[okai] closing tab %d, active=%d\n", tab, b->active_tab);
 }
 
-// ---- Internal homepage --------------------------------------------------------
+// ---- built-in pages ----------------------------------------------------------------
 
-// Rendered through the normal pipeline (html_parse + CSS engine) — headings,
-// styles and clickable links work like any page. No network.
 static const char OKAI_HOME_HTML[] =
-"<!DOCTYPE html><html><head><title>Homepage</title>"
-"<style>body{background:#1a2e4d;color:#ffffff}"
-"h1{color:#7db4f5;text-align:center}a{color:#55c1ff}"
-".sub{text-align:center;color:#9aa7b8}</style></head><body>"
-"<h1>okai</h1>"
-"<p class=sub>okernel web browser</p>"
-"<hr>"
-"<h3>Quick links</h3>"
-"<ul>"
-"<li><a href=\"http://example.com/\">example.com — test page</a></li>"
-"<li><a href=\"https://notdexy.ru/\">notdexy.ru</a></li>"
-"<li><a href=\"https://www.wikipedia.org/\">Wikipedia</a></li>"
-"<li><a href=\"http://info.cern.ch/\">info.cern.ch — the first website</a></li>"
-"</ul>"
-"<hr>"
-"<p class=sub>Type a URL below or press g to focus the address bar.</p>"
+"<!DOCTYPE html><html><head><meta charset=utf-8><title>okai</title><style>"
+"html{background:linear-gradient(160deg,#0f2027 0%,#203a43 55%,#2c5364 100%);min-height:100%}"
+"body{margin:0;font-family:'Noto Sans',sans-serif;color:#e8eef5}"
+".hero{text-align:center;padding:72px 24px 24px}"
+".logo{font-size:96px;font-weight:700;letter-spacing:-3px;color:#7db4f5;margin:0;line-height:1.1}"
+".tag{color:#9fb3c8;font-size:21px;margin:10px 0 0}"
+".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:22px;"
+"max-width:1180px;margin:36px auto;padding:0 28px}"
+".card{display:block;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.14);"
+"border-radius:16px;padding:22px 24px;text-decoration:none;color:#e8eef5;"
+"box-shadow:0 10px 28px rgba(0,0,0,.28)}"
+".card b{display:block;font-size:21px;color:#fff;margin-bottom:6px}"
+".card span{color:#9fb3c8;font-size:15px}"
+".dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:10px;"
+"vertical-align:middle}"
+".foot{text-align:center;color:#8aa0b6;font-size:15px;margin:44px 0 56px}"
+"kbd{background:#16283a;border:1px solid #3a5068;border-radius:5px;padding:1px 7px;"
+"font-family:'Noto Sans Mono',monospace;color:#cfe3ff}"
+"</style></head><body>"
+"<div class=hero><h1 class=logo>okai</h1>"
+"<p class=tag>the okernel web browser</p></div>"
+"<div class=grid>"
+"<a class=card href=\"http://example.com/\"><b><i class=dot style=\"background:#7db4f5\"></i>example.com</b>"
+"<span>The classic test page</span></a>"
+"<a class=card href=\"https://en.wikipedia.org/wiki/Operating_system\"><b><i class=dot style=\"background:#f5f5f5\"></i>Wikipedia</b>"
+"<span>Operating system &mdash; the free encyclopedia</span></a>"
+"<a class=card href=\"https://news.ycombinator.com/\"><b><i class=dot style=\"background:#ff6600\"></i>Hacker News</b>"
+"<span>news.ycombinator.com</span></a>"
+"<a class=card href=\"http://info.cern.ch/\"><b><i class=dot style=\"background:#5fd38d\"></i>info.cern.ch</b>"
+"<span>The first website</span></a>"
+"<a class=card href=\"https://notdexy.ru/\"><b><i class=dot style=\"background:#c792ea\"></i>notdexy.ru</b>"
+"<span>Home of KAnarchy</span></a>"
+"<a class=card href=\"https://www.python.org/\"><b><i class=dot style=\"background:#ffd43b\"></i>python.org</b>"
+"<span>Python programming language</span></a>"
+"</div>"
+"<p class=foot>Press <kbd>g</kbd> to type an address &nbsp;&middot;&nbsp; <kbd>j</kbd> <kbd>k</kbd> or the wheel to scroll"
+" &nbsp;&middot;&nbsp; <kbd>Tab</kbd> cycles form fields</p>"
 "</body></html>";
 
-int okai_is_home(const char* url) {
-    return url[0] == 'o' && url[1] == 'k' && url[2] == 'a' && url[3] == 'i' &&
-           url[4] == ':' && url[5] == 'h' && url[6] == 'o' && url[7] == 'm' &&
-           url[8] == 'e' && url[9] == 0;
+// HTML-escape src into out (returns new length).
+static int html_esc(char* out, int at, int cap, const char* src) {
+    for (int i = 0; src[i] && at < cap - 8; i++) {
+        char c = src[i];
+        const char* e = c == '<' ? "&lt;" : c == '>' ? "&gt;" : c == '&' ? "&amp;" :
+                        c == '"' ? "&quot;" : c == '\'' ? "&#39;" : 0;
+        if (e) while (*e) out[at++] = *e++;
+        else out[at++] = ((unsigned char)c < 32) ? '?' : c;
+    }
+    out[at] = 0;
+    return at;
 }
 
-// Parse + render the internal homepage into the active tab.
-static void okai_load_home(int id) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    {   // local copy (net_copy_str is static to network.c)
-        int i = 0; while (OKAI_HOME_URL[i] && i < OKAI_URL_LEN - 1) { T->url[i] = OKAI_HOME_URL[i]; i++; }
-        T->url[i] = 0;
-        i = 0; while ("okai Homepage"[i] && i < 63) { T->title[i] = "okai Homepage"[i]; i++; }
-        T->title[i] = 0;
-    }
-    int len = 0; while (OKAI_HOME_HTML[len]) len++;
-    static char home_css[INLINE_CSS_SCRATCH];
-    int css_len = html_extract_css(OKAI_HOME_HTML, len, home_css, INLINE_CSS_SCRATCH);
-    T->css_n = css_parse(home_css, css_len, T->css_rules, CSS_MAX_RULES);
-    int count = html_parse(OKAI_HOME_HTML, len, T->tokens, OKAI_TAB_TOKENS);
-    dom_build(&T->dom, OKAI_HOME_HTML, len);
-    T->token_count = count > 0 ? count : -1;
+static int html_put(char* out, int at, int cap, const char* s) {
+    while (*s && at < cap - 1) out[at++] = *s++;
+    out[at] = 0;
+    return at;
+}
+
+static void tab_load_html(int id, int tab, const char* html, int len, const char* charset) {
+    struct okai_tab* T = &okais[id].tabs[tab];
+    if (!T->doc) T->doc = wdoc_new();
+    if (!T->doc) { serial_puts("[okai] out of memory (wdoc_new)\n"); return; }
+    struct job j;
+    memset(&j, 0, sizeof j);
+    j.op = JOB_LOAD;
+    j.doc = T->doc;
+    j.url = T->url;
+    j.bytes = html;
+    j.len = len;
+    j.charset = charset;
+    run_job(&j);
     T->scroll_y = 0;
-    T->history_count = 0; // home is the root of its own history
-    T->history_pos = 0;
-    okai_render_content(id);
-    window_set_title(b->win_id, T->title);
+    T->focused_node = -1;
+    T->has_fixed = 0;
+    T->first_paint = 0;
+    const char* t = wdoc_title(T->doc);
+    scopy(T->title, t && t[0] ? t : T->url, sizeof T->title);
+    if (okais[id].active_tab == tab) {
+        window_set_title(okais[id].win_id, T->title[0] ? T->title : "okai");
+        okais[id].chrome_dirty = 1;
+    }
+}
+
+static void load_home(int id, int tab) {
+    struct okai_tab* T = &okais[id].tabs[tab];
+    scopy(T->url, OKAI_HOME_URL, OKAI_URL_LEN);
+    tab_reset_load(T);
+    T->is_https = 0;
+    tab_load_html(id, tab, OKAI_HOME_HTML, (int)sizeof(OKAI_HOME_HTML) - 1, "utf-8");
+    T->load_state = 1;
+    request_render(T, 0);
+    if (okais[id].active_tab == tab) okai_render_content(id);
     serial_puts("[br] home rendered\n");
 }
 
-static void parse_url(const char* url, char* host, char* path, int* port) {
-    host[0] = 0;
-    path[0] = 0;
-    if (port) *port = 0;
-    int i = 0;
-    // Skip http:// (7) or https:// (8)
-    if (url[0] == 'h' && url[1] == 't' && url[2] == 't' && url[3] == 'p' &&
-        url[4] == ':' && url[5] == '/' && url[6] == '/') {
-        i = 7;
-    } else if (url[0] == 'h' && url[1] == 't' && url[2] == 't' && url[3] == 'p' &&
-               url[4] == 's' && url[5] == ':' && url[6] == '/' && url[7] == '/') {
-        i = 8;
-    }
-    // Extract host
-    int hi = 0;
-    while (url[i] && url[i] != '/' && url[i] != ':' && hi < 127) {
-        host[hi++] = url[i++];
-    }
-    host[hi] = 0;
-    // Capture port if present
-    if (url[i] == ':') {
-        i++;
-        int p = 0;
-        while (url[i] >= '0' && url[i] <= '9') { p = p * 10 + (url[i] - '0'); i++; }
-        if (port) *port = p;
-    }
-    // Extract path
-    if (url[i] == '/') {
-        int pi = 0;
-        while (url[i] && pi < 127) {
-            path[pi++] = url[i++];
+// Error pages are ordinary documents (rendered by the engine like any page).
+static void show_error(int id, int tab) {
+    struct okai_tab* T = &okais[id].tabs[tab];
+    static char h[8192];
+    int n = 0;
+    const char* title = "Unable to load page";
+    const char* accent = "#ffb454";
+    if (T->truncated) { title = "Response truncated"; accent = "#ff6b6b"; }
+    else if (T->cert_failed) { title = "Security warning"; accent = "#ff6b6b"; }
+    else if (T->conn_failed) title = T->conn_kind == OKAI_CONN_TOOLARGE ? "Page too large" : "Connection error";
+    n = html_put(h, n, sizeof h, "<!DOCTYPE html><html><head><meta charset=utf-8><title>");
+    n = html_put(h, n, sizeof h, title);
+    n = html_put(h, n, sizeof h, "</title><style>"
+        "html{background:#14181f}body{margin:0;font-family:'Noto Sans',sans-serif;color:#d6dde6}"
+        ".box{max-width:760px;margin:72px auto;padding:36px 44px;background:#1d232d;border-radius:16px;"
+        "border:1px solid #2c3542;box-shadow:0 14px 40px rgba(0,0,0,.45)}"
+        "h1{margin:0 0 18px;font-size:34px}"
+        ".u{font-family:'Noto Sans Mono',monospace;color:#ffd479;word-break:break-all;background:#151a22;"
+        "padding:8px 12px;border-radius:8px;display:block;margin:10px 0 18px}"
+        ".why{color:#ff9b9b}.dim{color:#8b97a6;font-size:15px}"
+        "a{color:#7db4f5}</style></head><body><div class=box><h1 style=\"color:");
+    n = html_put(h, n, sizeof h, accent);
+    n = html_put(h, n, sizeof h, "\">");
+    n = html_put(h, n, sizeof h, title);
+    n = html_put(h, n, sizeof h, "</h1>");
+    if (T->truncated) {
+        n = html_put(h, n, sizeof h, "<p>The secure connection to</p><span class=u>");
+        n = html_esc(h, n, sizeof h, T->url);
+        n = html_put(h, n, sizeof h, "</span><p>ended mid-response. The page may have been cut by an attacker.</p>"
+            "<p class=dim>Nothing was rendered and no HTTP fallback was attempted.</p>");
+    } else if (T->cert_failed) {
+        n = html_put(h, n, sizeof h, "<p>The certificate for</p><span class=u>");
+        n = html_esc(h, n, sizeof h, T->url);
+        n = html_put(h, n, sizeof h, "</span><p>failed verification.</p>");
+        const char* why = 0;
+        switch (T->cert_detail) {
+        case CV_ERR_PINCHANGED: why = "site key changed since first visit"; break;
+        case CV_ERR_EXPIRED: why = "certificate expired (or no clock)"; break;
+        case CV_ERR_HOSTNAME: why = "name does not match certificate"; break;
+        case CV_ERR_KEYUSE: why = "key not valid for this use"; break;
+        case CV_ERR_ROOT: why = "unknown issuer (not in store)"; break;
+        case CV_ERR_CHAIN: why = "chain signature invalid"; break;
+        case CV_ERR_REVOKED: why = "certificate revoked (local blocklist)"; break;
+        case CV_ERR_PRELOAD: why = "site key differs from pinned key"; break;
         }
-        path[pi] = 0;
+        if (why) {
+            n = html_put(h, n, sizeof h, "<p class=why>Reason: ");
+            n = html_put(h, n, sizeof h, why);
+            n = html_put(h, n, sizeof h, ".</p>");
+        }
+        n = html_put(h, n, sizeof h, "<p>The connection may be intercepted, the site's certificate expired, "
+            "or the identity does not match.</p><p class=dim>Nothing was loaded and no HTTP fallback was "
+            "attempted. Revocation: stapled OCSP is enforced when sent; absent staples are not fetched "
+            "(soft-fail).</p>");
+    } else if (T->conn_failed) {
+        n = html_put(h, n, sizeof h, "<p>Could not load</p><span class=u>");
+        n = html_esc(h, n, sizeof h, T->url);
+        n = html_put(h, n, sizeof h, "</span>");
+        if (T->conn_kind == OKAI_CONN_TOOLARGE)
+            n = html_put(h, n, sizeof h, "<p>The page is larger than the fetch buffer and was not loaded.</p>");
+        else
+            n = html_put(h, n, sizeof h, "<p>The secure connection broke before the page arrived. This is "
+                "<b>not</b> a certificate problem &mdash; try reloading.</p>");
+        n = html_put(h, n, sizeof h, "<p class=dim>Nothing was loaded and no HTTP fallback was attempted.</p>");
     } else {
-        path[0] = '/';
-        path[1] = 0;
+        n = html_put(h, n, sizeof h, "<p>okai could not fetch</p><span class=u>");
+        n = html_esc(h, n, sizeof h, T->url);
+        n = html_put(h, n, sizeof h, "</span><p>Check the address, or the site may be unreachable.</p>");
     }
+    n = html_put(h, n, sizeof h, "<p class=dim><a href=\"");
+    n = html_esc(h, n, sizeof h, T->url);
+    n = html_put(h, n, sizeof h, "\">Try again</a> &nbsp;&middot;&nbsp; <a href=\"okai:home\">Home</a></p></div></body></html>");
+    serial_printf("[okai] error page: %s for %s\n", title, T->url);
+    tab_load_html(id, tab, h, n, "utf-8");
+    T->load_state = -1;
+    T->title[0] = 0;
+    scopy(T->title, title, sizeof T->title);
+    if (okais[id].active_tab == tab) window_set_title(okais[id].win_id, T->title);
+    request_render(T, 0);
+    if (okais[id].active_tab == tab) okai_render_content(id);
 }
 
-// Resolve a link href against the current page into an absolute URL.
-static void okai_resolve_href(struct okai* b, const char* href, char* out, int outlen) {
-    struct okai_tab* T = okai_tab_of(b);
-    out[0] = 0;
-    if (!href || !href[0]) return;
+// ---- rendering -------------------------------------------------------------------
 
-    // Already absolute (http:// or https://)
-    if ((href[0]=='h'&&href[1]=='t'&&href[2]=='t'&&href[3]=='p'&&href[4]==':'&&href[5]=='/') ||
-        (href[0]=='h'&&href[1]=='t'&&href[2]=='t'&&href[3]=='p'&&href[4]=='s'&&href[5]==':'&&href[6]=='/')) {
-        int i = 0;
-        while (href[i] && i < outlen - 1) { out[i] = href[i]; i++; }
-        out[i] = 0;
-        return;
-    }
-
-    // Protocol-relative //host/path
-    if (href[0] == '/' && href[1] == '/') {
-        const char* scheme = T->is_https ? "https:" : "http:";
-        int i = 0;
-        while (scheme[i] && i < outlen - 1) { out[i] = scheme[i]; i++; }
-        int j = 0;
-        while (href[j] && i < outlen - 1) { out[i] = href[j]; i++; j++; }
-        out[i] = 0;
-        return;
-    }
-
-    // Fragment only -> stay on the current page
-    if (href[0] == '#') {
-        int i = 0;
-        while (T->url[i] && i < outlen - 1) { out[i] = T->url[i]; i++; }
-        out[i] = 0;
-        return;
-    }
-
-    // Otherwise resolve relative to the current host + directory.
-    const char* p = T->url;
-    if (p[0]=='h'&&p[1]=='t'&&p[2]=='t'&&p[3]=='p'&&p[4]==':'&&p[5]=='/'&&p[6]=='/') p += 7;
-    else if (p[0]=='h'&&p[1]=='t'&&p[2]=='t'&&p[3]=='p'&&p[4]=='s'&&p[5]==':'&&p[6]=='/'&&p[7]=='/') p += 8;
-    char host[128]; int hi = 0;
-    while (*p && *p != '/' && *p != ':' && hi < 127) host[hi++] = *p++;
-    host[hi] = 0;
-    // Preserve a numeric :port suffix (bisected 2026-09-10: relative hrefs
-    // on http://host:port/ dropped the port and fetched :80 instead).
-    char port[8]; int pi = 0;
-    if (*p == ':') {
-        p++;
-        while (*p >= '0' && *p <= '9' && pi < 7) port[pi++] = *p++;
-    }
-    port[pi] = 0;
-
-    const char* scheme = T->is_https ? "https://" : "http://";
-    int i = 0;
-    while (scheme[i] && i < outlen - 1) { out[i] = scheme[i]; i++; }
-    int j = 0;
-    while (host[j] && i < outlen - 1) { out[i] = host[j]; i++; j++; }
-    if (pi > 0) {
-        if (i < outlen - 1) out[i++] = ':';
-        int q = 0;
-        while (port[q] && i < outlen - 1) { out[i] = port[q]; i++; q++; }
-    }
-
-    if (href[0] == '/') {
-        int k = 0;
-        while (href[k] && i < outlen - 1) { out[i] = href[k]; i++; k++; }
-    } else {
-        int lastslash = -1;
-        for (int x = 0; p[x]; x++) if (p[x] == '/') lastslash = x;
-        int x = 0;
-        while (x <= lastslash && i < outlen - 1) { out[i] = p[x]; i++; x++; }
-        int k = 0;
-        while (href[k] && i < outlen - 1) { out[i] = href[k]; i++; k++; }
-    }
-    out[i] = 0;
+static void request_render(struct okai_tab* T, int delay) {
+    int due = (int)tick_count + delay;
+    if (!T->render_pending || due - T->render_due < 0) T->render_due = due;
+    T->render_pending = 1;
 }
 
-// ---- Virtual document (scroll model) ----
-// The whole page is laid out ONCE into this offscreen grid, then the visible
-// slice [scroll_y, scroll_y+view_h) is blitted into the window content
-// buffer. This makes scrolling LINE-based and fixes two bugs of the old
-// token-granular skip: (1) content_height was re-measured from the scrolled
-// render, so every scroll step shrank the max-scroll bound (~2 lines per 1
-// line scrolled) and j/k stalled after a few presses; (2) skipping one token
-// skipped 2-3 rendered lines, so the page jumped and misaligned.
-//
-// Layout is produced by src/layout.c into a display list (g_lay); the renderer
-// blits the visible slice into the window content buffer. Scrolling is a pure
-// document-row offset, so content_height never shifts under the scroll bound.
-#define OKAI_TEXT_PAD  3   // left/right page margin in character columns
-
-// The most recent render's display list for the ACTIVE tab (heading overlay
-// reads it after window_draw). One shared per-window slot is not needed: the
-// overlay runs immediately after each okai window paints, and only the
-// active tab of each window is ever laid out.
-static struct layout g_lay[MAX_OKAIS];
-static uint32_t g_page_fg, g_page_bg; // page text/bg colors, for the heading pixel pass
-
-// Map a byte to a printable glyph: control bytes become spaces; bytes
-// 0x80-0xFF are font slots (Cyrillic + symbols) and pass through. Block
-// slots 0x01/0x02 (KAnarchy logo) pass through too — they render blank
-// nowhere; the layout splitter already treats them as word chars.
-static char doc_sanitize(char ch) {
-    if (ch == 1 || ch == 2) return ch;
-    if ((unsigned char)ch >= 128) return ch;
-    if (ch < 32) return ' ';
-    if (ch == 127) return '?';
-    return ch;
-}
-
-// ---- Layout pass only: DOM -> display list (no window writes except the
-// page background). Scrolling a page re-blits the existing layout — it must
-// NOT pay for layout_run again (on a wikipedia-size page that pass alone is
-// most of a frame). Callers that change content/DOM/CSS call
-// okai_render_content() (relayout + blit); pure scroll offset changes call
-// okai_blit_content() (blit only).
-void okai_relayout(int ed_id) {
-    struct okai* b = &okais[ed_id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return;
+// Page viewport of window id: surface size and its screen origin.
+static int page_geom(struct okai* b, int* sx, int* sy, int* pw, int* ph) {
     struct window* w = window_get(b->win_id);
-    if (!w) return;
-    if (!w->content) return;
-    if (T->token_count == -1 && T->last_resp_len == 0) return; // error pages: no DOM
-
-    int view_w = w->content_w;
-    int view_h = w->content_h - CHROME_ROWS; // Reserve top rows for pixel chrome
-    if (view_h < 0) view_h = 0;
-
-    // ---- Compute the page's base colors from the <body> rules ----
-    const struct css_rule* ua = 0;
-    int ua_n = css_ua_rules(&ua);
-
-    struct css_style body_style;
-    css_compute(T->css_rules, T->css_n, "body", 0, 0, 0, &body_style);
-    // Merge the UA body defaults (and any page body rules) so the page
-    // background and default text color are correct even un-styled.
-    if (ua_n > 0) {
-        struct css_style ub;
-        css_compute(ua, ua_n, "body", 0, 0, 0, &ub);
-        css_merge_base(&body_style, &ub);
-    }
-    uint32_t page_bg = body_style.has_bg_rgb ? body_style.bg_rgb : WIN_BG_RGB;
-    uint32_t default_fg;
-    if (body_style.has_fg_rgb) default_fg = body_style.fg_rgb;
-    else if (window_rgb_is_light(page_bg)) default_fg = 0x000000;
-    else default_fg = 0xFFFFFF;
-    g_page_fg = default_fg; g_page_bg = page_bg;
-
-    int page_left = OKAI_TEXT_PAD;
-    int page_w = view_w - 2 * OKAI_TEXT_PAD;
-    if (page_w < 20) page_w = 20;
-
-    // ---- Layout pass: DOM -> display list (authored CSS + UA sheet) ----
-    // Author rules and the UA sheet share one table so inheritance and
-    // specificity resolve in a single cascade. UA rules carry a big negative
-    // specificity base, so any author rule wins a tie.
-    // Static (not stack): ~336 rules is ~200KB, which would blow the 256KB
-    // kernel stack once the renderer's own frames are added.
-    static struct css_rule combined[CSS_MAX_RULES + CSS_UA_MAX_RULES];
-    int combined_n = 0;
-    for (int i = 0; i < ua_n && combined_n < CSS_MAX_RULES + CSS_UA_MAX_RULES; i++)
-        combined[combined_n++] = ua[i];
-    for (int i = 0; i < T->css_n && combined_n < CSS_MAX_RULES + CSS_UA_MAX_RULES; i++)
-        combined[combined_n++] = T->css_rules[i];
-
-    struct layout_opts lo;
-    lo.width_cols = page_w;
-    lo.page_left = page_left;
-    lo.page_bg = page_bg;
-    lo.page_fg = default_fg;
-    struct layout* layp = &g_lay[ed_id];
-    layout_run(&T->dom, combined, combined_n, &lo, layp);
-    serial_printf("[lay] id=%d tab=%d/nt=%d toks=%d items=%d h=%d bg=%x\n", ed_id,
-                  b->active_tab, b->tab_count, T->token_count,
-                  layp->n_items, layp->height, layp->page_bg);
-
-    window_set_content_bg_rgb(b->win_id, layp->page_bg);
-
-    T->content_height = layp->height;
-
-    // ---- Clamp scroll against the real document height ----
-    {
-        int max_scroll = layp->height - view_h;
-        if (max_scroll < 0) max_scroll = 0;
-        if (T->scroll_y > max_scroll) T->scroll_y = max_scroll;
-        if (T->scroll_y < 0) T->scroll_y = 0;
-    }
-}
-
-// Blit core: writes the visible slice of the EXISTING layout into the window
-// (no layout_run). When log_links==0 the link/field records still update
-// (clicks must hit-test post-scroll rows) but the per-link serial dump is
-// skipped — a wikipedia page logs hundreds of lines per scroll step otherwise.
-// Linear RGB interpolation for gradient bands (t = 0..255).
-static uint32_t okai_lerp_rgb(uint32_t c0, uint32_t c1, int t) {
-    int r0 = (c0 >> 16) & 0xFF, g0 = (c0 >> 8) & 0xFF, b0 = c0 & 0xFF;
-    int r1 = (c1 >> 16) & 0xFF, g1 = (c1 >> 8) & 0xFF, b1 = c1 & 0xFF;
-    int r = r0 + (r1 - r0) * t / 255;
-    int g = g0 + (g1 - g0) * t / 255;
-    int b = b0 + (b1 - b0) * t / 255;
-    return ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
-}
-
-static void okai_blit_inner(int ed_id, int log_links) {
-    struct okai* b = &okais[ed_id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return;
-    struct window* w = window_get(b->win_id);
-    if (!w) return;
-    if (!w->content) return;
-
-
-    T->link_count = 0;
-    T->field_count = 0;
-
-    int view_w = w->content_w;
-    int view_h = w->content_h - CHROME_ROWS; // Reserve top rows for pixel chrome
-    if (view_h < 0) view_h = 0;
-
-    // Failed fetch (DNS failure, unreachable host, timeout): show a readable
-    // error instead of a black page. token_count == -1 with no response bytes
-    // means nothing ever arrived; a response that parsed to zero tokens is a
-    // different (benign) case.
-    if (T->token_count == -1 && T->last_resp_len == 0) {
-        // Drop the previous page's layout: the heading overlay reads g_lay
-        // live, and without this the old page's H1/H2 keeps floating over
-        // the error text. (Link/field regions are reset above already.)
-        g_lay[ed_id].n_items = 0;
-        g_lay[ed_id].height = 0;
-        uint32_t page_bg = WIN_BG_RGB;
-        uint32_t default_fg = 0xFFFFFF;
-    g_page_fg = default_fg; g_page_bg = page_bg;
-        window_set_content_bg_rgb(b->win_id, page_bg);
-        window_clear(b->win_id);
-        window_set_cursor(b->win_id, CHROME_ROWS, OKAI_TEXT_PAD);
-
-        if (T->truncated) {
-            window_set_text_color_rgb(b->win_id, 0xFF5555, 0x000000);
-            window_puts(b->win_id, "\n RESPONSE TRUNCATED\n\n");
-            window_set_text_color_rgb(b->win_id, 0xAAAAAA, 0x000000);
-            window_puts(b->win_id, " The secure connection ended\n");
-            window_puts(b->win_id, " mid-response. The page may have\n");
-            window_puts(b->win_id, " been cut by an attacker.\n\n");
-            window_puts(b->win_id, " Nothing was loaded and no HTTP\n");
-            window_puts(b->win_id, " fallback was attempted.\n");
-            window_set_text_color_rgb(b->win_id, default_fg, page_bg);
-            T->content_height = 10;
-            w->dirty = 1;
-            return;
-        }
-        if (T->cert_failed) {
-            window_puts(b->win_id, "\n SECURITY WARNING\n\n");
-            window_set_text_color_rgb(b->win_id, 0xAAAAAA, 0x000000);
-            window_puts(b->win_id, " The certificate for\n ");
-            {
-                int i = 0;
-                while (T->url[i] && i < view_w - 2) {
-                    char ch = T->url[i];
-                    if (ch < 32 || (unsigned char)ch >= 127) ch = '?';
-                    window_put_char(b->win_id, ch);
-                    i++;
-                }
-            }
-            window_puts(b->win_id, "\n failed verification.\n\n");
-            {
-                const char* why = NULL;
-                if (T->cert_detail == CV_ERR_PINCHANGED)
-                    why = " Reason: site key changed since first visit.\n";
-                else if (T->cert_detail == CV_ERR_EXPIRED)
-                    why = " Reason: certificate expired (or no clock).\n";
-                else if (T->cert_detail == CV_ERR_HOSTNAME)
-                    why = " Reason: name does not match certificate.\n";
-                else if (T->cert_detail == CV_ERR_KEYUSE)
-                    why = " Reason: key not valid for this use.\n";
-                else if (T->cert_detail == CV_ERR_ROOT)
-                    why = " Reason: unknown issuer (not in store).\n";
-                else if (T->cert_detail == CV_ERR_CHAIN)
-                    why = " Reason: chain signature invalid.\n";
-                else if (T->cert_detail == CV_ERR_REVOKED)
-                    why = " Reason: certificate revoked (local blocklist).\n";
-                else if (T->cert_detail == CV_ERR_PRELOAD)
-                    why = " Reason: site key differs from pinned key.\n";
-                if (why) window_puts(b->win_id, why);
-            }
-            window_puts(b->win_id, " The connection may be intercepted,\n");
-            window_puts(b->win_id, " the site's certificate expired, or\n");
-            window_puts(b->win_id, " the identity does not match.\n\n");
-            window_puts(b->win_id, " Nothing was loaded and no HTTP\n");
-            window_puts(b->win_id, " fallback was attempted.\n");
-            window_puts(b->win_id, " Revocation: stapled OCSP is enforced\n");
-            window_puts(b->win_id, " when sent; absent staples are not\n");
-            window_puts(b->win_id, " fetched (soft-fail).\n");
-            window_set_text_color_rgb(b->win_id, default_fg, page_bg);
-            T->content_height = 14;
-            w->dirty = 1;
-            return;
-        }
-        if (T->conn_failed) {
-            if (T->conn_kind == OKAI_CONN_TOOLARGE)
-                window_puts(b->win_id, "\n PAGE TOO LARGE\n\n");
-            else
-                window_puts(b->win_id, "\n CONNECTION ERROR\n\n");
-            window_set_text_color_rgb(b->win_id, 0xAAAAAA, 0x000000);
-            window_puts(b->win_id, " Could not load:\n ");
-            {
-                int i = 0;
-                while (T->url[i] && i < view_w - 2) {
-                    char ch = T->url[i];
-                    if (ch < 32 || (unsigned char)ch >= 127) ch = '?';
-                    window_put_char(b->win_id, ch);
-                    i++;
-                }
-            }
-            if (T->conn_kind == OKAI_CONN_TOOLARGE) {
-                window_puts(b->win_id, "\n The page is larger than the\n");
-                window_puts(b->win_id, " 2MB fetch buffer and was not\n");
-                window_puts(b->win_id, " loaded (nothing rendered).\n\n");
-            } else {
-                window_puts(b->win_id, "\n The secure connection broke\n");
-                window_puts(b->win_id, " before the page arrived.\n");
-                window_puts(b->win_id, " This is NOT a certificate\n");
-                window_puts(b->win_id, " problem - try reloading.\n\n");
-            }
-            window_puts(b->win_id, " Nothing was loaded and no HTTP\n");
-            window_puts(b->win_id, " fallback was attempted.\n");
-            window_set_text_color_rgb(b->win_id, default_fg, page_bg);
-            T->content_height = 14;
-            w->dirty = 1;
-            return;
-        }
-        window_puts(b->win_id, "\n Unable to load page\n\n");
-        window_set_text_color_rgb(b->win_id, 0xAAAAAA, 0x000000);
-        window_puts(b->win_id, " The okai could not fetch:\n ");
-        {
-            int i = 0;
-            while (T->url[i] && i < view_w - 2) {
-                char ch = T->url[i];
-                if (ch < 32 || (unsigned char)ch >= 127) ch = '?';
-                window_put_char(b->win_id, ch);
-                i++;
-            }
-        }
-        window_puts(b->win_id, "\n\n Check the address, or the site may\n");
-        window_puts(b->win_id, " be unreachable.\n");
-        window_set_text_color_rgb(b->win_id, default_fg, page_bg);
-        T->content_height = 8;
-        w->dirty = 1;
-        return;
-    }
-
-    window_clear(b->win_id);
-    window_set_cursor(b->win_id, CHROME_ROWS, OKAI_TEXT_PAD);
-
-    struct layout* layp = &g_lay[ed_id];
-    uint32_t default_fg = g_page_fg; // stored by okai_relayout
-#ifdef BLITGEO
-    if (layp->n_items < 20)
-        serial_printf("[blitgeo] ch=%d cw=%d view_h=%d scroll=%d items=%d height=%d wx=%d wy=%d ww=%d wh=%d\n",
-                      w->content_h, w->content_w, view_h, T->scroll_y,
-                      layp->n_items, layp->height, w->x, w->y, w->w, w->h);
-#endif
-    // A resize may have changed the view since layout: re-clamp cheaply
-    // (no layout_run here — that is the whole point of the blit split).
-    {
-        int max_scroll = layp->height - view_h;
-        if (max_scroll < 0) max_scroll = 0;
-        if (T->scroll_y > max_scroll) T->scroll_y = max_scroll;
-        if (T->scroll_y < 0) T->scroll_y = 0;
-    }
-
-
-// ---- Blit the visible slice ----
-    // Item-driven: one pass over bands, one fill, one pass over lines. The old
-    // code scanned ALL items per visible row (O(view * items) per scroll
-    // step — brutal on wikipedia). Bands and lines are keyed by DOCUMENT row,
-    // so scroll stays a pure offset and every cell gets the same final value.
-    struct window* win = w;
-    (void)win;
-    int doc_first = T->scroll_y;
-    int doc_last = T->scroll_y + view_h - 1;
-    // 2) default page background (FIRST: bands and runs overpaint it)
-    for (int r = 0; r < view_h; r++) {
-        int brow = CHROME_ROWS + r;
-        if (brow >= w->content_h) break;
-        for (int c = 0; c < view_w; c++)
-            window_write_cell_rgb(b->win_id, brow, c, ' ', default_fg, layp->page_bg);
-    }
-    // 3+4) bands then lines, in two phases: normal flow first, out-of-flow
-    // (absolute/fixed) boxes on top — positioned content paints above
-    // scrolled content (dropdown menus, fixed headers). Fixed rows carry
-    // viewport rows (mapped without the scroll offset).
-    for (int oof_phase = 0; oof_phase < 2; oof_phase++) {
-        for (int bi = 0; bi < layp->n_items; bi++) {
-            struct layout_item* it = &layp->items[bi];
-            if (it->kind != LOUT_BAND || !it->draw_box) continue;
-            if (!!it->is_oof != oof_phase) continue;
-            int r0 = it->row, r1 = it->row + it->height - 1;
-            if (!it->is_fixed && (r1 < doc_first || r0 > doc_last)) continue;
-            int c0 = it->box_left, c1 = it->box_left + it->box_width;
-            int rr0 = r0, rr1 = r1;
-            if (!it->is_fixed) {
-                if (rr0 < doc_first) rr0 = doc_first;
-                if (rr1 > doc_last) rr1 = doc_last;
-            }
-            int is_grad = (it->draw_box >= 2);
-            int grad_vert = (it->draw_box == 2);
-            for (int dr = rr0; dr <= rr1; dr++) {
-            int brow = it->is_fixed ? CHROME_ROWS + dr
-                                    : CHROME_ROWS + (dr - T->scroll_y);
-            if (brow < CHROME_ROWS || brow >= w->content_h) continue;
-                uint32_t row_bg = it->box_bg;
-                if (is_grad && grad_vert && it->height > 1)
-                    row_bg = okai_lerp_rgb(it->box_bg, it->box_c1,
-                                           (dr - r0) * 255 / (it->height - 1));
-                for (int c = c0; c < c1 && c < view_w; c++) {
-                    if (c < 0) continue;
-                    if (it->box_border && (dr == it->row || dr == it->row + it->height - 1 ||
-                                           c < c0 + 1 || c >= c1 - 1))
-                        window_write_cell_rgb(b->win_id, brow, c, ' ', it->box_border, it->box_border);
-                    else {
-                        uint32_t bg = row_bg;
-                        if (is_grad && !grad_vert && it->box_width > 1)
-                            bg = okai_lerp_rgb(it->box_bg, it->box_c1,
-                                               (c - c0) * 255 / (it->box_width - 1));
-                        window_write_cell_rgb(b->win_id, brow, c, ' ', default_fg, bg);
-                    }
-                }
-            }
-        }
-        // 4) line runs in the view (same phase: bands under their own lines)
-        for (int li = 0; li < layp->n_items; li++) {
-            struct layout_item* it = &layp->items[li];
-            if (it->kind != LOUT_LINE) continue;
-            if (!!it->is_oof != oof_phase) continue;
-        {
-            int dr = it->row;
-            if (!it->is_fixed && (dr < doc_first || dr > doc_last)) continue;
-            int brow = it->is_fixed ? CHROME_ROWS + dr
-                                    : CHROME_ROWS + (dr - T->scroll_y);
-            if (brow < CHROME_ROWS || brow >= w->content_h) continue;
-                // Scaled headings (H1=3x, H2=2x) are painted by the pixel overlay
-                // (okai_draw_heading_pixels). Their runs carry columns in SCALED
-                // units, so blitting them into the 1-column grid here leaves
-                // garbage in the gaps between glyphs. Leave the white fill and let
-                // the overlay draw them.
-                if (it->heading && (it->heading == 1 || it->heading == 2)) continue;
-                int first = it->run_start, last = it->run_start + it->run_count - 1;
-                for (int ri = first; ri <= last; ri++) {
-                    struct layout_run* run = &layp->runs[ri];
-                    int hidden = (run->flags & LAYOUT_FLAG_HIDE) != 0;
-                    int run_cjk = !hidden && (run->flags & LAYOUT_FLAG_CJK) != 0;
-                    // Runs without an explicit bg inherit the band beneath (else
-                    // every glyph would punch a page-colored hole in boxes).
-                    int use_band = (!hidden && run->bg == layp->page_bg);
-                    if (run_cjk) {
-                        // CJK run: text holds raw UTF-8 while text_len counts
-                        // display CHARACTERS. Decode each char and draw from
-                        // the CJK bitmap table (table miss '?', same as an
-                        // unmapped codepoint today). Decode advances even for
-                        // off-view cells so the byte cursor never desyncs.
-                        // Band/focus logic mirrors the byte path below exactly.
-                        int boff = 0;
-                        for (int kk = 0; kk < run->text_len; kk++) {
-                            int bl = 1;
-                            uint32_t cp = utf8_decode_char(
-                                layp->text + run->text_off + boff,
-                                LAYOUT_MAX_TEXT - (int)run->text_off - boff, &bl);
-                            if (bl <= 0) bl = 1;
-                            boff += bl;
-                            int c = run->col + kk;
-                            if (c < 0 || c >= view_w) continue;
-                            uint32_t bg = run->bg;
-                            if (use_band) {
-                                // topmost covering band wins (bands paint in order).
-                                // Fixed and scrolling rows live in different spaces —
-                                // never inherit across the boundary.
-                                for (int bi = 0; bi < layp->n_items; bi++) {
-                                    struct layout_item* bd = &layp->items[bi];
-                                    if (bd->kind != LOUT_BAND || !bd->draw_box) continue;
-                                    if (!!bd->is_fixed != !!it->is_fixed) continue;
-                                    int bc1 = bd->box_left + bd->box_width;
-                                    if (dr < bd->row || dr >= bd->row + bd->height) continue;
-                                    if (c < bd->box_left || c >= bc1) continue;
-                                    if (bd->draw_box >= 2 && bd->height > 1 && bd->box_width > 1) {
-                                        if (bd->draw_box == 2)
-                                            bg = okai_lerp_rgb(bd->box_bg, bd->box_c1,
-                                                               (dr - bd->row) * 255 / (bd->height - 1));
-                                        else
-                                            bg = okai_lerp_rgb(bd->box_bg, bd->box_c1,
-                                                               (c - bd->box_left) * 255 / (bd->box_width - 1));
-                                    } else {
-                                        bg = bd->box_bg;
-                                    }
-                                }
-                            }
-                            uint32_t pfg = run->fg, pbg = bg;
-                            if (T->focused_input >= 0 &&
-                                run->node == T->focused_input) {
-                                pfg = bg; pbg = run->fg;
-                            }
-                            const uint8_t* g = cjk_glyph_for(cp);
-                            if (g) window_write_cjk_cell(b->win_id, brow, c, cp,
-                                                         pfg, pbg, run->flags);
-                            else {
-                                window_write_cell_rgb(b->win_id, brow, c, '?',
-                                                      pfg, pbg);
-                                uint8_t attr = run->flags & 3;
-                                if (attr) window_write_cell_attr(b->win_id, brow, c, attr);
-                            }
-                        }
-                        continue;
-                    }
-                    for (int k = 0; k < run->text_len; k++) {
-                        int c = run->col + k;
-                        if (c < 0 || c >= view_w) continue;
-                        char ch = hidden ? ' ' : layp->text[run->text_off + k];
-                        // Block slots 0x01/0x02 render real glyphs (KAnarchy
-                        // logo); every other control byte is a space here.
-                        if ((unsigned char)ch < 32 && ch != 1 && ch != 2) ch = ' ';
-                        uint32_t bg = run->bg;
-                        if (use_band) {
-                            // topmost covering band wins (bands paint in order).
-                            // Fixed and scrolling rows live in different spaces —
-                            // never inherit across the boundary.
-                            for (int bi = 0; bi < layp->n_items; bi++) {
-                                struct layout_item* bd = &layp->items[bi];
-                                if (bd->kind != LOUT_BAND || !bd->draw_box) continue;
-                                if (!!bd->is_fixed != !!it->is_fixed) continue;
-                                int bc1 = bd->box_left + bd->box_width;
-                                if (dr < bd->row || dr >= bd->row + bd->height) continue;
-                                if (c < bd->box_left || c >= bc1) continue;
-                                if (bd->draw_box >= 2 && bd->height > 1 && bd->box_width > 1) {
-                                    if (bd->draw_box == 2)
-                                        bg = okai_lerp_rgb(bd->box_bg, bd->box_c1,
-                                                           (dr - bd->row) * 255 / (bd->height - 1));
-                                    else
-                                        bg = okai_lerp_rgb(bd->box_bg, bd->box_c1,
-                                                           (c - bd->box_left) * 255 / (bd->box_width - 1));
-                                } else {
-                                    bg = bd->box_bg;
-                                }
-                            }
-                        }
-                        // Keyboard/mouse focus indicator: invert the focused
-                        // field's cells so Tab/click focus is visible with
-                        // no layout change (paint-only).
-                        uint32_t pfg = run->fg, pbg = bg;
-                        if (!hidden && T->focused_input >= 0 &&
-                            run->node == T->focused_input) {
-                            pfg = bg; pbg = run->fg;
-                        }
-                        window_write_cell_rgb(b->win_id, brow, c, ch, pfg, pbg);
-                        uint8_t attr = hidden ? 0 : run->flags;
-                        if (attr) window_write_cell_attr(b->win_id, brow, c, attr);
-                    }
-                }
-            }
-        }
-    } // end oof_phase (normal flow, then positioned boxes on top)
-
-    // ---- Record clickable link regions (buffer rows) ----
-    for (int li = 0; li < layp->n_items && T->link_count < OKAI_MAX_LINKS; li++) {
-        struct layout_item* it = &layp->items[li];
-        if (it->kind != LOUT_LINE) continue;
-        int row = it->is_fixed ? it->row + CHROME_ROWS
-                               : it->row - T->scroll_y + CHROME_ROWS;
-        if (row < CHROME_ROWS || row >= w->content_h) continue;
-        int first = it->run_start, last = it->run_start + it->run_count - 1;
-        for (int ri = first; ri <= last; ri++) {
-            struct layout_run* run = &layp->runs[ri];
-            if (!run->is_link || run->node >= T->dom.node_count) continue;
-            if (run->flags & LAYOUT_FLAG_HIDE) continue; // invisible: not clickable
-            char href[192];
-            if (dom_attr_get(&T->dom, run->node, "href", href, sizeof(href)) < 0) continue;
-            int col0 = run->col, col1 = run->col + run->text_len - 1;
-            // Extend an existing region on the same row if it is the same link.
-            int merged = 0;
-            for (int k = 0; k < T->link_count; k++) {
-                if (T->links[k].row == row && T->links[k].end_row == row &&
-                    !strcmp(T->links[k].href, "") ) { merged = 0; }
-            }
-            (void)merged;
-            int idx = T->link_count;
-            T->links[idx].row = row;
-            T->links[idx].end_row = row;
-            T->links[idx].col0 = col0;
-            T->links[idx].col1 = col1;
-            okai_resolve_href(b, href, T->links[idx].href, OKAI_URL_LEN);
-            T->link_count++;
-            if (log_links)
-                serial_printf("[okai] link[%d] row=%d col0=%d col1=%d href=%s endrow=%d\n",
-                              idx, row, col0, col1, T->links[idx].href, row);
-            if (T->link_count >= OKAI_MAX_LINKS) break;
-        }
-    }
-
-    // ---- Record form control regions ----
-    if (T->focused_input >= T->dom.node_count) T->focused_input = -1;
-    for (int li = 0; li < layp->n_items && T->field_count < OKAI_MAX_LINKS; li++) {
-        struct layout_item* it = &layp->items[li];
-        if (it->kind != LOUT_LINE) continue;
-        int row = it->is_fixed ? it->row + CHROME_ROWS
-                               : it->row - T->scroll_y + CHROME_ROWS;
-        if (row < CHROME_ROWS || row >= w->content_h) continue;
-        int first = it->run_start, last = it->run_start + it->run_count - 1;
-        for (int ri = first; ri <= last; ri++) {
-            struct layout_run* run = &layp->runs[ri];
-            if (!run->is_field || run->node >= T->dom.node_count) continue;
-            if (run->flags & LAYOUT_FLAG_HIDE) continue;
-            int is_btn = dom_tag_is(&T->dom, run->node, "button");
-            int idx = T->field_count++;
-            T->fields[idx].row = row;
-            T->fields[idx].col0 = run->col;
-            T->fields[idx].col1 = run->col + run->text_len - 1;
-            T->fields[idx].node = run->node; // now a DOM node index
-            T->fields[idx].is_button = is_btn;
-            if (log_links)
-                serial_printf("[okai] field[%d] row=%d col0=%d col1=%d btn=%d node=%d\n",
-                              idx, row, T->fields[idx].col0, T->fields[idx].col1,
-                              is_btn, run->node);
-        }
-    }
-
-    T->content_height = layp->height;
-    w->dirty = 1;
-}
-
-// Full render: re-layout then blit (content/DOM/CSS changed). Scroll offset
-// changes use okai_blit_content() instead — layout is scroll-invariant.
-void okai_render_content(int ed_id) {
-    okai_relayout(ed_id);
-    okai_blit_inner(ed_id, 1);
-}
-
-// Scroll-path blit: no layout_run, no link serial dump. Records still update
-// so clicks hit-test the post-scroll rows.
-void okai_blit_content(int ed_id) {
-    okai_blit_inner(ed_id, 0);
-}
-
-// ---- Sub-resource fetch queue (<link rel=stylesheet>, <script src>) ----------
-
-// Extract external CSS and JS URLs from the raw HTML and queue them for
-// sequential fetching. Called after the main page is parsed and rendered.
-void okai_queue_sub_resources(int id, const char* html, int html_len) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    T->sub_res_count = 0;
-    T->sub_res_idx = 0;
-    T->sub_res_phase = 0;
-    T->sub_res_css_changed = 0;
-    if (!html || html_len <= 0) return;
-
-    // Extract <link rel="stylesheet" href="..."> URLs.
-    char css_urls[OKAI_SUBRES_BUF];
-    int n_css = html_extract_link_css(html, html_len, css_urls, OKAI_SUBRES_BUF);
-
-    // Extract <script src="..."> URLs. External scripts are FETCHED but
-    // deliberately NOT executed (HANDOFF #27): tinyjs is not a
-    // spec-compliant runtime and running a real site's minified bundle
-    // wedges the single-threaded kernel. The fetch keeps parity with the
-    // documented behavior; the bytes are discarded in okai_sub_res_done
-    // ('j' arm). Dropping them at queue time silently broke scripted pages.
-    char js_urls[OKAI_SUBRES_BUF];
-    int n_js = html_extract_script_src(html, html_len, js_urls, OKAI_SUBRES_BUF);
-
-    if (n_css == 0 && n_js == 0) return;
-
-    // Resolve all URLs against the current page URL and queue them
-    int idx = 0;
-    const char* p = css_urls;
-    for (int i = 0; i < n_css && idx < OKAI_MAX_SUBRES; i++) {
-        char abs_url[OKAI_URL_LEN];
-        okai_resolve_href(b, p, abs_url, OKAI_URL_LEN);
-        if (abs_url[0]) {
-            int k = 0;
-            while (abs_url[k] && k < OKAI_URL_LEN - 1) {
-                T->sub_res_urls[idx][k] = abs_url[k]; k++;
-            }
-            T->sub_res_urls[idx][k] = 0;
-            T->sub_res_type[idx] = 'c'; // CSS
-            idx++;
-        }
-        while (*p) p++; p++; // skip to next null-terminated URL
-    }
-
-    p = js_urls;
-    for (int i = 0; i < n_js && idx < OKAI_MAX_SUBRES; i++) {
-        char abs_url[OKAI_URL_LEN];
-        okai_resolve_href(b, p, abs_url, OKAI_URL_LEN);
-        if (abs_url[0]) {
-            int k = 0;
-            while (abs_url[k] && k < OKAI_URL_LEN - 1) {
-                T->sub_res_urls[idx][k] = abs_url[k]; k++;
-            }
-            T->sub_res_urls[idx][k] = 0;
-            T->sub_res_type[idx] = 'j'; // JS (fetched, never executed)
-            idx++;
-        }
-        while (*p) p++; p++;
-    }
-
-    T->sub_res_count = idx;
-    if (idx > 0) {
-        T->sub_res_phase = 1; // start fetching CSS links first
-        T->sub_res_idx = 0;
-        serial_printf("[okai] sub-res: %d resources queued (%d css, %d js)\n",
-                      idx, n_css, n_js);
-    }
-}
-
-// Start fetching the next sub-resource in the queue. Returns 0 if a fetch
-// was started, 1 if all done, -1 on error.
-int okai_start_sub_res_fetch(int id) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-
-    // Find the next resource to fetch
-    while (T->sub_res_idx < T->sub_res_count) {
-        int i = T->sub_res_idx;
-        char type = T->sub_res_type[i];
-        char* url = T->sub_res_urls[i];
-
-        // Skip CSS during JS phase
-        if (T->sub_res_phase == 2 && type == 'c') { T->sub_res_idx++; continue; }
-        // Skip JS during CSS phase
-        if (T->sub_res_phase == 1 && type == 'j') { T->sub_res_idx++; continue; }
-
-        if (!url[0]) { T->sub_res_idx++; continue; }
-
-        // Parse the URL and start the fetch
-        char host[128], path[128];
-        int url_port = 0;
-        parse_url(url, host, path, &url_port);
-        if (!host[0]) { T->sub_res_idx++; continue; }
-
-        int is_https = (url[0]=='h' && url[1]=='t' && url[2]=='t' && url[3]=='p' &&
-                        url[4]=='s' && url[5]==':');
-        serial_printf("[okai] sub-res fetch: %s %s\n", type == 'c' ? "CSS" : "JS", url);
-        if (is_https) https_get_port(host, path, (uint16_t)url_port);
-        else { http_reset_conn_attempts(); http_get_port(host, path, (uint16_t)url_port); }
-        return 0;
-    }
-
-    // All resources in current phase done; advance to next phase
-    if (T->sub_res_phase == 1) {
-        T->sub_res_phase = 2; // switch to JS phase
-        T->sub_res_idx = 0;
-        return okai_start_sub_res_fetch(id); // recurse to start JS fetches
-    }
-
-    // All phases done
-    T->sub_res_phase = 0;
+    if (!w) return 0;
+    int title_off = w->no_titlebar ? 0 : WIN_TITLE_H;
+    int cw = w->w - 2 * WIN_BORDER;
+    int ch = w->h - title_off - 2 * WIN_BORDER - CHROME_PX;
+    if (cw < 16 || ch < 16) return 0;
+    if (sx) *sx = w->x + WIN_BORDER;
+    if (sy) *sy = w->y + WIN_BORDER + title_off + CHROME_PX;
+    *pw = cw;
+    *ph = ch;
     return 1;
 }
 
-// Called by desktop.c when a sub-resource fetch completes. Processes the
-// response and advances to the next resource. Returns 1 if all done.
-int okai_sub_res_done(int id, const char* resp, int resp_len) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (T->sub_res_phase == 0 || T->sub_res_idx >= T->sub_res_count) return 1;
-
-    int i = T->sub_res_idx;
-    char type = T->sub_res_type[i];
-
-    if (type == 'c' && resp && resp_len > 0) {
-        // Dechunk and strip HTTP headers
-        int total = http_dechunk(resp, resp_len);
-        // Find the body (after \r\n\r\n)
-        char* body = resp;
-        int body_len = total;
-        for (int k = 0; k < total - 3; k++) {
-            if (resp[k] == '\r' && resp[k+1] == '\n' && resp[k+2] == '\r' && resp[k+3] == '\n') {
-                body = resp + k + 4;
-                body_len = total - k - 4;
-                break;
-            }
+static int ensure_surface(struct okai* b, int pw, int ph) {
+    if (pw * ph > b->page_cap) {
+        if (b->page_px) kfree(b->page_px);
+        b->page_px = (uint32_t*)kmalloc((uint32_t)pw * (uint32_t)ph * 4);
+        b->page_cap = b->page_px ? pw * ph : 0;
+        if (!b->page_px) {
+            serial_printf("[okai] page surface alloc failed (%dx%d)\n", pw, ph);
+            window_set_pixels(b->win_id, 0, 0, 0, 0, 0, 0);
+            return 0;
         }
-        // External CSS is raw CSS text (not wrapped in <style> tags).
-        // Parse it directly into the table tail: sheets append in fetch
-        // order (= cascade order), no concat buffer, no full re-parse.
-        // Oversized sheets fill the remaining slots from the start rather
-        // than dropping everything, so leading rules still style the page.
-        int room_rules = CSS_MAX_RULES - T->css_n;
-        int added = 0;
-        if (room_rules > 0 && body_len > 0)
-            added = css_parse(body, body_len,
-                              T->css_rules + T->css_n, room_rules);
-        if (added < 0) added = 0;
-        T->css_n += added;
-        T->sub_res_css_changed = 1; // external styling landed: re-render matters
-        serial_printf("[okai] sub-res CSS: %d bytes, +%d rules (%d total)\n",
-                      body_len, added, T->css_n);
-    } else if (type == 'j' && resp && resp_len > 0) {
-        // External scripts are intentionally not executed — see the note in
-        // okai_queue_sub_resources(). A real site's bundle wedges tinyjs.
-        serial_printf("[okai] sub-res JS: skipped %d bytes (not executed)\n", resp_len);
     }
-
-    T->sub_res_idx++;
-    // Re-render with updated CSS after each external stylesheet
-    if (type == 'c') okai_render_content(id);
-
-    return 0; // not done yet
+    if (pw != b->page_w || ph != b->page_h) {
+        b->page_w = pw;
+        b->page_h = ph;
+    }
+    window_set_pixels(b->win_id, b->page_px, 0, CHROME_PX, pw, ph, pw);
+    return 1;
 }
 
-// Begin the network fetch for window `id` using its current URL. Called by the
-// desktop response loop (never more than one at a time — the owner model
-// guarantees it). Detects scheme and kicks off http_get / https_get.
-// Returns 0 if a fetch was started, -1 if refused (bad URL / empty host).
-int okai_start_fetch(int id) {
+static void surf_of(struct okai* b, struct wsurf* s) {
+    s->px = b->page_px;
+    s->w = b->page_w;
+    s->h = b->page_h;
+    s->stride = b->page_w;
+    ws_reset_clip(s);
+}
+
+void okai_render_content(int id) {
+    if (id < 0 || id >= MAX_OKAIS) return;
+    struct okai* b = &okais[id];
+    if (b->win_id < 0) return;
+    struct okai_tab* T = okai_tab_of(b);
+    int pw, ph;
+    T->render_pending = 0;
+    if (!page_geom(b, 0, 0, &pw, &ph) || !ensure_surface(b, pw, ph)) return;
+    struct wsurf s;
+    surf_of(b, &s);
+    uint32_t t0 = tick_count;
+    if (!T->doc) {
+        // nothing loaded yet: blank white page under the chrome
+        for (int i = 0; i < pw * ph; i++) b->page_px[i] = 0xFFFFFF;
+        T->content_height = 0;
+        window_set_content_bg_rgb(b->win_id, 0xFFFFFF);
+        window_set_dirty(b->win_id);
+        return;
+    }
+    struct job j;
+    memset(&j, 0, sizeof j);
+    if (T->pending_frag[0] && T->load_state == 1) {
+        j.op = JOB_ANCHOR;
+        j.doc = T->doc;
+        j.frag = T->pending_frag;
+        run_job(&j);
+        if (j.result >= 0) {
+            T->scroll_y = j.result;
+            T->pending_frag[0] = 0;
+        }
+        memset(&j, 0, sizeof j);
+    }
+    j.op = JOB_PAINT;
+    j.doc = T->doc;
+    j.surf = &s;
+    j.scroll = T->scroll_y;
+    j.vw = pw;
+    j.vh = ph;
+    run_job(&j);
+    T->content_height = j.result;
+    T->scroll_y = j.scroll;
+    T->has_fixed = j.h;
+    T->last_render_tick = tick_count;
+    window_set_content_bg_rgb(b->win_id, 0xFFFFFF);
+    window_set_dirty(b->win_id);
+    b->chrome_dirty = 1;
+    int first = !T->first_paint;
+    T->first_paint = 1;
+    if (first) {
+        serial_printf("[okai] render tab=%d %dx%d doc_h=%d scroll=%d in %dms (page origin %d,%d) stack=%dKB\n",
+                      b->active_tab, pw, ph, T->content_height, T->scroll_y,
+                      (int)(tick_count - t0) * 10,
+                      window_get(b->win_id)->x + WIN_BORDER,
+                      window_get(b->win_id)->y + WIN_BORDER + CHROME_PX, engine_stack_hwm_kb());
+        memset(&j, 0, sizeof j);
+        j.op = JOB_LINKS;
+        j.doc = T->doc;
+        j.scroll = T->scroll_y;
+        j.vh = ph;
+        run_job(&j);
+    } else {
+        serial_printf("[okai] render tab=%d doc_h=%d scroll=%d in %dms\n", b->active_tab,
+                      T->content_height, T->scroll_y, (int)(tick_count - t0) * 10);
+    }
+}
+
+// Repaint the window from the existing page surface (no engine work).
+void okai_blit_content(int id) {
+    if (id < 0 || id >= MAX_OKAIS || okais[id].win_id < 0) return;
+    window_set_dirty(okais[id].win_id);
+}
+
+// Scroll the active tab to document y = ny. Small moves shift the surface
+// and repaint only the exposed band.
+static void scroll_to(int id, int ny) {
     struct okai* b = &okais[id];
     struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return -1;
-    if (okai_is_home(T->url)) { okai_load_home(id); return 0; }
-    char host[128], path[128];
-    int url_port = 0;
-    parse_url(T->url, host, path, &url_port);
-    if (!host[0]) {
-        // No hostname (e.g. a malformed address-bar entry like "/path" or
-        // "example.com page"). Never fire the request — a DNS query for an
-        // empty host wedged the fetch owner until timeout.
+    if (!T->doc || !b->page_px) return;
+    int pw = b->page_w, ph = b->page_h;
+    int maxs = T->content_height - ph;
+    if (maxs < 0) maxs = 0;
+    if (ny > maxs) ny = maxs;
+    if (ny < 0) ny = 0;
+    int dy = ny - T->scroll_y;
+    if (!dy) return;
+    int ady = dy < 0 ? -dy : dy;
+    if (T->has_fixed || ady >= ph * 3 / 4 || T->render_pending) {
+        T->scroll_y = ny;
+        okai_render_content(id);
+        return;
+    }
+    if (dy > 0) memmove(b->page_px, b->page_px + dy * pw, (uint32_t)(ph - dy) * pw * 4);
+    else memmove(b->page_px + ady * pw, b->page_px, (uint32_t)(ph - ady) * pw * 4);
+    T->scroll_y = ny;
+    struct wsurf s;
+    surf_of(b, &s);
+    if (dy > 0) { s.cy0 = ph - dy; s.cy1 = ph; }
+    else { s.cy0 = 0; s.cy1 = ady; }
+    struct job j;
+    memset(&j, 0, sizeof j);
+    j.op = JOB_PAINT;
+    j.doc = T->doc;
+    j.surf = &s;
+    j.scroll = ny;
+    run_job(&j);
+    window_set_dirty(b->win_id);
+}
+
+// ---- fetch driver ------------------------------------------------------------------
+
+// Start the main-document fetch for tab `tab`. Returns 0 if a request is in
+// flight, 1 if the page was produced locally (home/error), -1 if refused.
+static int start_main_fetch(int id, int tab) {
+    struct okai* b = &okais[id];
+    struct okai_tab* T = &b->tabs[tab];
+    if (okai_is_home(T->url)) { load_home(id, tab); return 1; }
+    if (!url_is_http(T->url)) {
+        serial_printf("[okai] unsupported scheme in '%s'\n", T->url);
+        show_error(id, tab);
+        return 1;
+    }
+    T->is_https = url_is_https(T->url);
+    T->sub_id = -1;
+    if (net_get(T->url) < 0) {
+        // No hostname (e.g. a malformed address-bar entry). Never fire the
+        // request — a DNS query for an empty host wedged the fetch owner.
         serial_puts("[okai] refusing fetch: empty host in '");
         serial_puts(T->url);
         serial_puts("'\n");
-        T->token_count = -1;
-        T->last_resp_len = 0;
-        okai_render_content(id);
+        show_error(id, tab);
         return -1;
     }
-    T->is_https = (T->url[0] == 'h' && T->url[1] == 't' && T->url[2] == 't' &&
-                   T->url[3] == 'p' && T->url[4] == 's' && T->url[5] == ':');
-    if (T->is_https) https_get_port(host, path, (uint16_t)url_port);
-    else { http_reset_conn_attempts(); http_get_port(host, path, (uint16_t)url_port); }
+    serial_printf("[okai] fetch %s\n", T->url);
     return 0;
 }
 
-// Called by the desktop response loop when an HTTPS fetch has definitively
-// failed. Rewrites the tab URL to http:// and re-issues the fetch exactly once
-// so http-only hosts still load. Returns okai_start_fetch()'s result, or -1 if
-// we've already fallen back (so the caller can give up cleanly).
-static void okai_rewrite_scheme_http(char* url); // defined later in this file
-int okai_fallback_http(int id) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return -1;
-    if (T->https_fell_back) return -1;
-    T->https_fell_back = 1;
-    okai_rewrite_scheme_http(T->url); // https:// -> http://, in place
-    serial_printf("[okai] https failed, retrying http: %s\n", T->url);
-    T->token_count = 0;
-    T->last_resp_len = 0;
-    return okai_start_fetch(id);
+// Next sub-resource of the tab's document. Returns 1 if a request is in
+// flight, 0 when the queue is drained.
+static int start_next_sub(struct okai_tab* T) {
+    if (!T->doc) return 0;
+    static char url[OKAI_URL_LEN];
+    for (;;) {
+        int id = wdoc_next_fetch(T->doc, url, sizeof url);
+        if (id < 0) return 0;
+        int css = wdoc_is_css(T->doc, id);
+        if ((css && T->sub_css >= OKAI_MAX_CSS_FETCH) || (!css && T->sub_img >= OKAI_MAX_IMG_FETCH)) {
+            wdoc_fetch_done(T->doc, id, 0, -1, 0);
+            continue;
+        }
+        if (iprefix(url, "data:")) {
+            int bl = 0;
+            char mime[64];
+            char* bytes = wdoc_data_url(url, (int)strlen(url), &bl, mime, sizeof mime);
+            struct job j;
+            memset(&j, 0, sizeof j);
+            j.op = JOB_FETCH_DONE;
+            j.doc = T->doc;
+            j.id = id;
+            j.bytes = bytes;
+            j.len = bytes ? bl : -1;
+            j.charset = mime;
+            run_job(&j);
+            if (bytes) kfree(bytes);
+            continue;
+        }
+        if (!url_is_http(url)) { wdoc_fetch_done(T->doc, id, 0, -1, 0); continue; }
+        if (css) T->sub_css++;
+        else T->sub_img++;
+        T->sub_id = id;
+        T->sub_https = url_is_https(url);
+        T->sub_redirects = 0;
+        T->sub_retried = 0;
+        scopy(T->sub_url, url, sizeof T->sub_url);
+        serial_printf("[okai] sub-res fetch: %s %s\n", css ? "CSS" : "IMG", url);
+        if (net_get(url) < 0) {
+            T->sub_id = -1;
+            wdoc_fetch_done(T->doc, id, 0, -1, 0);
+            continue;
+        }
+        return 1;
+    }
 }
 
-// Resumption fallback (mirror of the http fallback above, but same-origin):
-// some backends abort a resumed handshake (FIN instead of negotiating)
-// while accepting a fresh full handshake for the same host. Only when the
-// failed connection actually offered an UNACCEPTED psk (transport-class
-// failure, never cert/hostname — those still fail closed), and only once
-// per navigation (conn_retries guards the loop).
-int okai_resumption_fallback(int id, int fail_reason) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return -1;
-    if (T->conn_retries >= OKAI_CONN_MAX_RETRIES) return -1;
-    // Only resumption-abort signatures retry: a full handshake can't fix
-    // overflow (page still too big), RNG failure, or cert/hostname (which
-    // must fail closed, never retry into anything).
-    if (fail_reason != TLS_FAIL_PROTO && fail_reason != TLS_FAIL_ALERT &&
-        fail_reason != TLS_FAIL_MAC)
-        return -1;
-    T->conn_retries++;
-    // If we offered an unaccepted PSK, its ticket is poison for this
-    // backend — drop it so the retry fully handshakes. A failed full
-    // handshake retries identically (transient blips).
-    if (tls_last_offer_unaccepted()) {
-        char host[128], path[128];
-        int url_port = 0;
-        parse_url(T->url, host, path, &url_port);
-        if (!host[0]) return -1;
-        tls_ticket_drop(host);
-        serial_printf("[okai] resumption aborted, retrying full handshake: %s\n", T->url);
+// Follow a 3xx for the main document. Returns 1 if a new request fired.
+static int follow_redirect(int id, struct okai_tab* T, const struct resp_info* ri) {
+    if (ri->status < 300 || ri->status > 399 || !ri->location[0]) return 0;
+    if (T->redirect_count >= OKAI_MAX_REDIRECTS) return 0;
+    char abs[OKAI_URL_LEN];
+    if (wurl_resolve(T->url, ri->location, (int)strlen(ri->location), abs, sizeof abs) <= 0) return 0;
+    if (!url_is_http(abs)) return 0;
+    T->redirect_count++;
+    scopy(T->url, abs, OKAI_URL_LEN);
+    // a redirect replaces the history entry (it is not a new page)
+    if (T->history_count > 0) scopy(T->history[T->history_pos], T->url, OKAI_URL_LEN);
+    T->is_https = url_is_https(T->url);
+    okais[id].chrome_dirty = 1;
+    serial_printf("[okai] redirect %d -> %s\n", T->redirect_count, abs);
+    net_get(T->url);
+    return 1;
+}
+
+static void main_loaded(int id, int tab, char* resp, int len) {
+    struct okai_tab* T = &okais[id].tabs[tab];
+    struct resp_info ri;
+    parse_resp(resp, len, &ri);
+    int blen, heap;
+    char* body = resp_body(resp, len, &ri, &blen, &heap);
+    char* page = body;
+    int plen = blen;
+    int page_heap = 0;
+    // Non-HTML documents: plain text in a <pre>, images in an <img>.
+    if (ri.ctype[0] && !iprefix(ri.ctype, "text/html") && !iprefix(ri.ctype, "application/xhtml")) {
+        int is_img = iprefix(ri.ctype, "image/");
+        int cap = is_img ? OKAI_URL_LEN * 2 + 512 : blen * 5 + 512;
+        char* w = (char*)kmalloc((uint32_t)cap);
+        if (w) {
+            int n = html_put(w, 0, cap, "<!DOCTYPE html><html><head><meta charset=utf-8></head>");
+            if (is_img) {
+                n = html_put(w, n, cap, "<body style=\"margin:0;background:#0e0e0e;min-height:100vh;display:flex;"
+                                        "align-items:center;justify-content:center\"><img src=\"");
+                n = html_esc(w, n, cap, T->url);
+                n = html_put(w, n, cap, "\" style=\"max-width:100%\"></body></html>");
+            } else {
+                n = html_put(w, n, cap, "<body><pre style=\"white-space:pre-wrap;margin:16px;font-size:14px\">");
+                for (int i = 0; i < blen && n < cap - 16; i++) {
+                    char c = body[i];
+                    const char* e = c == '<' ? "&lt;" : c == '>' ? "&gt;" : c == '&' ? "&amp;" : 0;
+                    if (e) while (*e) w[n++] = *e++;
+                    else w[n++] = c;
+                }
+                n = html_put(w, n, cap, "</pre></body></html>");
+            }
+            page = w;
+            plen = n;
+            page_heap = 1;
+        }
+    }
+    tab_load_html(id, tab, page, plen, ri.charset[0] ? ri.charset : 0);
+    struct wdom* dom = T->doc ? wdoc_dom(T->doc) : 0;
+    serial_printf("[br] %sparse: count=%d len=%d dom_nodes=%d status=%d%s ctype=%s\n",
+                  T->is_https ? "https " : "", dom ? dom->nn : 0, blen, dom ? dom->nn : 0,
+                  ri.status, heap ? " gzip" : "", ri.ctype[0] ? ri.ctype : "-");
+    if (page_heap) kfree(page);
+    if (heap) kfree(body);
+    T->load_state = dom ? 1 : -1;
+    T->load_tick = tick_count;
+    T->sub_landed = 0;
+    // #fragment: scroll there once laid out
+    {
+        const char* hsh = 0;
+        for (const char* p = T->url; *p; p++) if (*p == '#') { hsh = p + 1; break; }
+        if (hsh && *hsh) scopy(T->pending_frag, hsh, sizeof T->pending_frag);
+    }
+    if (T->doc && wdoc_pending_css(T->doc) > 0) request_render(T, CSS_WAIT_TICKS);
+    else request_render(T, 0);
+}
+
+// Deliver the finished sub-resource to the document. Returns 1 if the same
+// resource is still in flight (redirect / one-shot retry), else 0.
+static int sub_done(int id, struct okai_tab* T, int st, char* resp, int len) {
+    int rid = T->sub_id;
+    int css = wdoc_is_css(T->doc, rid);
+    struct job j;
+    memset(&j, 0, sizeof j);
+    j.op = JOB_FETCH_DONE;
+    j.doc = T->doc;
+    j.id = rid;
+    j.len = -1;
+    int status = 0, blen = 0, heap = 0;
+    char* body = 0;
+    if (st == 1 && resp && len > 0) {
+        struct resp_info ri;
+        parse_resp(resp, len, &ri);
+        status = ri.status;
+        if (status >= 300 && status <= 399 && ri.location[0] && T->sub_redirects < 4) {
+            char abs[OKAI_URL_LEN];
+            if (wurl_resolve(T->sub_url, ri.location, (int)strlen(ri.location), abs, sizeof abs) > 0 &&
+                url_is_http(abs)) {
+                T->sub_redirects++;
+                scopy(T->sub_url, abs, sizeof T->sub_url);
+                T->sub_https = url_is_https(abs);
+                serial_printf("[okai] sub-res redirect -> %s\n", abs);
+                if (net_get(abs) == 0) return 1; // same resource, new request
+            }
+        } else if (status >= 200 && status <= 299) {
+            body = resp_body(resp, len, &ri, &blen, &heap);
+            j.bytes = body;
+            j.len = blen;
+            j.charset = ri.ctype;
+        }
+    }
+    if (status == 0 && !T->sub_retried) {
+        // transport blip (DNS miss on a host switch, reset): retry once
+        T->sub_retried = 1;
+        serial_printf("[okai] sub-res retry %s\n", T->sub_url);
+        if (net_get(T->sub_url) == 0) return 1;
+    }
+    run_job(&j);
+    if (heap) kfree(body);
+    serial_printf("[okai] sub-res %s: status=%d %d bytes%s\n", css ? "CSS" : "IMG", status,
+                  j.len, j.len < 0 ? " (failed)" : "");
+    T->sub_id = -1;
+    T->sub_landed++;
+    if (css) {
+        if (wdoc_pending_css(T->doc) == 0) request_render(T, 0);
+    } else if (T->first_paint || wdoc_pending_css(T->doc) == 0) {
+        request_render(T, IMG_RENDER_TICKS);
+    }
+    (void)id;
+    return 0;
+}
+
+// Is the in-flight request HTTPS? (sub-resources carry their own scheme.)
+static int fetch_https(struct okai_tab* T) { return T->sub_id >= 0 ? T->sub_https : T->is_https; }
+
+static void poll_fetch(void) {
+    int bi = okai_fetch_owner;
+    struct okai* b = okai_get(bi);
+    if (!b || fetch_tab < 0 || fetch_tab >= b->tab_count) { okai_fetch_owner = -1; fetch_tab = -1; return; }
+    int tab = fetch_tab;
+    struct okai_tab* T = &b->tabs[tab];
+    char* resp = 0;
+    int len = 0, st = 0; // 1 done, -1 failed, -2 truncated
+    if (fetch_https(T)) {
+        if (tls_is_done()) {
+            resp = tls_get_response();
+            len = tls_get_response_len();
+            st = (resp && len > 0) ? 1 : -1;
+            // Truncation integrity (cryptoholes #1): without an authenticated
+            // close_notify, HTTP framing must prove the message complete.
+            if (st == 1 && !tls_saw_close_notify() &&
+                tls_response_complete((const uint8_t*)resp, (uint32_t)len) == TLS_RESP_SHORT)
+                st = -2;
+        } else if (!tls_is_active()) st = -1;
     } else {
-        serial_printf("[okai] fetch failed, retrying (%d/%d): %s\n",
-                      T->conn_retries, OKAI_CONN_MAX_RETRIES, T->url);
+        if (http_is_done()) {
+            resp = http_get_response();
+            len = http_get_response_len();
+            st = (resp && len > 0) ? 1 : -1;
+        } else if (!http_is_pending() && !http_is_retry_pending()) st = -1;
     }
-    T->token_count = 0;
-    T->last_resp_len = 0;
-    return okai_start_fetch(id);
+    if (!st) return;
+
+    if (T->sub_id >= 0) {
+        if (st == -2) serial_puts("[okai] TLS sub-resource truncated, skipping\n");
+        if (sub_done(bi, T, st, resp, len)) return; // redirect / retry in flight
+        if (!start_next_sub(T)) {
+            okai_fetch_owner = -1;
+            fetch_tab = -1;
+            request_render(T, 0);
+            serial_printf("[okai] sub-res done: %d css, %d img\n", T->sub_css, T->sub_img);
+        }
+        return;
+    }
+
+    if (st == -2) {
+        serial_printf("[okai] TLS response truncated for %s, no HTTP fallback\n", T->url);
+        T->truncated = 1;
+        okai_fetch_owner = -1;
+        fetch_tab = -1;
+        show_error(bi, tab);
+        return;
+    }
+    if (st == 1) {
+        struct resp_info ri;
+        parse_resp(resp, len, &ri);
+        if (follow_redirect(bi, T, &ri)) return; // owner stays
+        main_loaded(bi, tab, resp, len);
+        if (start_next_sub(T)) return;           // owner stays for the sub-resources
+        okai_fetch_owner = -1;
+        fetch_tab = -1;
+        return;
+    }
+    // st == -1: the fetch gave up.
+    if (T->is_https) {
+        // Classify: certificate failures AND secure-channel failures MUST NOT
+        // fall back to plain HTTP — a MITM can force that downgrade by killing
+        // the handshake. Only transport failures (timeout / unreachable / no A
+        // record) downgrade. Cert problems render the SECURITY WARNING;
+        // everything else renders a connection error — never the cert warning.
+        int fr = tls_get_fail_reason();
+        int cert_fail = (fr == TLS_FAIL_CERT || fr == TLS_FAIL_HOSTNAME);
+        int conn_fail = (fr == TLS_FAIL_PROTO || fr == TLS_FAIL_MAC || fr == TLS_FAIL_ALERT ||
+                         fr == TLS_FAIL_RNG || fr == TLS_FAIL_OVERFLOW);
+        if (cert_fail) {
+            serial_printf("[okai] TLS cert failure (reason=%d), no HTTP fallback for %s\n", fr, T->url);
+            T->cert_failed = 1;
+            T->cert_detail = tls_get_fail_detail();
+        } else if (conn_fail) {
+            // Resumption fallback first: if the server aborted our PSK
+            // resumption, retry with a full handshake (same origin, not a
+            // downgrade). Only resumption-abort signatures retry.
+            if (T->conn_retries < OKAI_CONN_MAX_RETRIES &&
+                (fr == TLS_FAIL_PROTO || fr == TLS_FAIL_ALERT || fr == TLS_FAIL_MAC)) {
+                T->conn_retries++;
+                if (tls_last_offer_unaccepted()) {
+                    char host[128];
+                    if (wurl_host(T->url, host, sizeof host) > 0) tls_ticket_drop(host);
+                    serial_printf("[okai] resumption aborted, retrying full handshake: %s\n", T->url);
+                } else {
+                    serial_printf("[okai] fetch failed, retrying (%d/%d): %s\n",
+                                  T->conn_retries, OKAI_CONN_MAX_RETRIES, T->url);
+                }
+                serial_printf("[okai] resumption retry in flight for %s\n", T->url);
+                net_get(T->url);
+                return;
+            }
+            serial_printf("[okai] TLS connection failure (reason=%d), no HTTP fallback for %s\n", fr, T->url);
+            T->conn_failed = 1;
+            T->conn_kind = (fr == TLS_FAIL_OVERFLOW) ? OKAI_CONN_TOOLARGE : OKAI_CONN_PROTO;
+        } else if (!T->https_fell_back) {
+            // transport failure: one-time plain-HTTP retry (http-only hosts)
+            T->https_fell_back = 1;
+            okai_rewrite_scheme_http(T->url);
+            if (T->history_count > 0) scopy(T->history[T->history_pos], T->url, OKAI_URL_LEN);
+            T->is_https = 0;
+            b->chrome_dirty = 1;
+            serial_printf("[okai] https failed, retrying http: %s\n", T->url);
+            serial_printf("[okai] http fallback in flight for %s\n", T->url);
+            net_get(T->url);
+            return;
+        }
+    }
+    okai_fetch_owner = -1;
+    fetch_tab = -1;
+    show_error(bi, tab);
 }
 
-// Default a web URL to HTTPS unless the user typed an explicit scheme.
-// An explicit `https://` is kept; an explicit `http://` is RESPECTED as plain
-// HTTP (typing the scheme is a deliberate choice — auto-upgrading it would make
-// a plain-HTTP host unreachable, e.g. a local dev server a user named by hand);
-// a bare host with no scheme defaults to HTTPS. The home/internal scheme and
-// any other non-http scheme are left untouched.
-static void okai_normalize_https(const char* in, char* out, int outlen) {
-    int has_scheme = 0;
-    for (int i = 0; in[i]; i++) {
-        if (in[i] == ':') { has_scheme = 1; break; }
+void okai_poll(void) {
+    if (okai_fetch_owner >= 0) poll_fetch();
+    if (okai_fetch_owner < 0) {
+        // No fetch in flight: start the next tab needing one (active tabs first).
+        int started = 0;
+        for (int pass = 0; pass < 2 && !started; pass++)
+            for (int bi = 0; bi < MAX_OKAIS && !started; bi++) {
+                struct okai* b = okai_get(bi);
+                if (!b) continue;
+                for (int ti = 0; ti < b->tab_count && !started; ti++) {
+                    if ((pass == 0) != (ti == b->active_tab)) continue;
+                    struct okai_tab* T = &b->tabs[ti];
+                    if (T->load_state != 0 || T->closing) continue;
+                    int r = start_main_fetch(bi, ti);
+                    if (r == 0) { okai_fetch_owner = bi; fetch_tab = ti; }
+                    started = 1;
+                }
+            }
     }
-    if (strncmp(in, "https://", 8) == 0 ||
-        strncmp(in, "http://", 7) == 0 ||
-        strncmp(in, "http:", 5) == 0 ||
-        has_scheme) {
-        // Explicit scheme (https, http, okai:home, ftp://, ...): use as-is.
-        int j = 0; while (in[j] && j < outlen - 1) { out[j] = in[j]; j++; } out[j] = 0;
-    } else {
-        // Bare host (no scheme): default to https://.
-        int j = 0; const char* s = "https://";
-        while (s[j] && j < outlen - 1) { out[j] = s[j]; j++; }
-        int i = 0; while (in[i] && j < outlen - 1) { out[j] = in[i]; j++; i++; }
-        out[j] = 0;
+    // Coalesced renders (active tabs only; others render on switch).
+    for (int bi = 0; bi < MAX_OKAIS; bi++) {
+        struct okai* b = okai_get(bi);
+        if (!b) continue;
+        struct okai_tab* T = okai_tab_of(b);
+        if (T->render_pending && (int)tick_count - T->render_due >= 0) okai_render_content(bi);
+    }
+    // Fetch-pill erase: the progress pill is an overlay; when the fetch ends
+    // repaint the window once so its pixels go away.
+    {
+        static int pill_win = -1;
+        int cur = (okai_fetch_owner >= 0) ? okai_fetch_owner : -1;
+        if (cur >= 0) pill_win = cur;
+        else if (pill_win >= 0) {
+            okai_blit_content(pill_win);
+            pill_win = -1;
+        }
     }
 }
 
-// Rewrite an in-place URL from https:// to http:// (used for the one-time
-// HTTP fallback after an HTTPS fetch definitively fails).
-static void okai_rewrite_scheme_http(char* url) {
-    if (strncmp(url, "https://", 8) == 0) {
-        int n = 0; while (url[n]) n++;
-        for (int i = 4; i < n; i++) url[i] = url[i + 1]; // drop the 's' after "http"
-    } else if (strncmp(url, "https:", 6) == 0) {
-        int n = 0; while (url[n]) n++;
-        for (int i = 4; i < n; i++) url[i] = url[i + 1];
-    }
-}
+// ---- open / close / navigate ---------------------------------------------------------
 
 int okai_open(const char* url) {
     if (okai_count >= MAX_OKAIS) return -1;
-
     int id = okai_count;
     struct okai* b = &okais[id];
     b->win_id = -1;
@@ -1178,7 +1202,11 @@ int okai_open(const char* url) {
     b->addr_bar_focused = 0;
     b->addr_input_len = 0;
     b->addr_input[0] = 0;
+    b->show_security = 0;
+    b->chrome_dirty = 1;
     okai_tab_reset(&b->tabs[0]);
+    b->tabs[0].anim_w = 0;
+    b->tabs[0].closing = 0;
 
     // One browser window, maximized to the work area on open (NOT fullscreen:
     // keeps its border/chrome and stays draggable/resizable like any window).
@@ -1191,101 +1219,511 @@ int okai_open(const char* url) {
     b->win_id = win;
     okai_count++;
     window_set_focus(win); // take focus so keyboard input (g/j/k) works immediately
-
-    // Seed the tab's URL and history. Default every web URL to HTTPS
-    // (http:// or bare host -> https://); the home/internal scheme is left alone.
-    {
-        char norm[OKAI_URL_LEN];
-        okai_normalize_https(url, norm, OKAI_URL_LEN);
-        int ui = 0;
-        while (norm[ui] && ui < OKAI_URL_LEN - 1) { b->tabs[0].url[ui] = norm[ui]; ui++; }
-        b->tabs[0].url[ui] = 0;
-        for (int i = 0; i < ui + 1; i++) b->tabs[0].history[0][i] = b->tabs[0].url[i];
-        b->tabs[0].history_count = 1;
-        b->tabs[0].is_https = (strncmp(b->tabs[0].url, "https", 5) == 0);
-    }
-    if (okai_is_home(b->tabs[0].url)) {
-        okai_load_home(id);
-        return id;
-    }
-    // Defer the actual request: the desktop response loop starts it once the
-    // previous fetch (if any) finishes — see okai_fetch_owner.
-    b->tabs[0].token_count = 0;
+    okai_last_tick = tick_count;
+    okai_navigate(id, url);
+    if (!okai_tab_of(b)->doc) okai_render_content(id); // blank until the page arrives
     return id;
 }
 
 void okai_close(int id) {
     if (id < 0 || id >= okai_count) return;
-    if (okais[id].win_id >= 0) {
-        window_destroy(okais[id].win_id);
-        okais[id].win_id = -1;
+    struct okai* b = &okais[id];
+    if (okai_fetch_owner == id) { okai_fetch_owner = -1; fetch_tab = -1; }
+    else if (okai_fetch_owner > id) okai_fetch_owner--;
+    for (int t = 0; t < OKAI_MAX_TABS; t++)
+        if (b->tabs[t].doc) { wdoc_free(b->tabs[t].doc); b->tabs[t].doc = 0; }
+    if (b->win_id >= 0) {
+        window_destroy(b->win_id);
+        b->win_id = -1;
     }
+    if (b->page_px) { kfree(b->page_px); b->page_px = 0; }
+    b->page_cap = b->page_w = b->page_h = 0;
     // Compact so the one-window policy (`okai` reuses slot 0) never targets
     // a dead slot (okai_get would return NULL mid-click-handler).
     for (int i = id; i < okai_count - 1; i++) okais[i] = okais[i + 1];
     okai_count--;
-    if (okai_fetch_owner == id) okai_fetch_owner = -1;
-    else if (okai_fetch_owner > id) okai_fetch_owner--;
+    okais[okai_count].win_id = -1;
+    okais[okai_count].page_px = 0;
+    okais[okai_count].page_cap = 0;
+    for (int t = 0; t < OKAI_MAX_TABS; t++) okais[okai_count].tabs[t].doc = 0;
+    okais[okai_count].tab_count = 0;
 }
 
-void okai_navigate(int id, const char* url) {
+// Load `url` into the active tab. push = add a history entry.
+static void navigate_ex(int id, const char* url, int push) {
     struct okai* b = &okais[id];
     struct okai_tab* T = okai_tab_of(b);
     if (b->win_id < 0) return;
+    // Abort this tab's in-flight fetch so the new URL actually loads.
+    if (okai_fetch_owner == id && fetch_tab == b->active_tab) { okai_fetch_owner = -1; fetch_tab = -1; }
+    char norm[OKAI_URL_LEN];
+    okai_normalize_https(url, norm, OKAI_URL_LEN);
+    scopy(T->url, norm, OKAI_URL_LEN);
+    if (push) {
+        if (T->history_count > 0 && T->history_pos < T->history_count - 1)
+            T->history_count = T->history_pos + 1;    // drop forward history
+        if (T->history_count == OKAI_MAX_HISTORY) {
+            for (int i = 1; i < OKAI_MAX_HISTORY; i++) scopy(T->history[i - 1], T->history[i], OKAI_URL_LEN);
+            T->history_count--;
+        }
+        scopy(T->history[T->history_count], T->url, OKAI_URL_LEN);
+        T->history_pos = T->history_count++;
+    }
+    tab_reset_load(T);
+    T->is_https = url_is_https(T->url);
+    if (T->focused_node >= 0 && T->doc && wdoc_dom(T->doc)) {
+        struct wdom* d = wdoc_dom(T->doc);
+        if (T->focused_node < d->nn) d->n[T->focused_node].flags &= ~(WNF_FOCUSED);
+    }
+    T->focused_node = -1;
+    b->chrome_dirty = 1;
+    serial_printf("[okai] navigate %s\n", T->url);
+    if (okai_is_home(T->url)) load_home(id, b->active_tab);
+    // otherwise okai_poll starts the fetch (single-connection owner model);
+    // the old page stays visible until the new one arrives.
+}
 
-    // If this window owns the single in-flight fetch, abort it so the new URL
-    // actually loads (otherwise the old response completes and fills the window,
-    // discarding this navigation). The response loop will start the new fetch.
-    if (okai_fetch_owner == id) okai_fetch_owner = -1;
+void okai_navigate(int id, const char* url) {
+    if (id < 0 || id >= MAX_OKAIS) return;
+    navigate_ex(id, url, 1);
+}
 
-    // Internal homepage: parse + render immediately, no network.
-    if (okai_is_home(url)) {
-        okai_tab_reset(T);
-        okai_load_home(id);
+static void okai_goto_history(int id, int pos) {
+    struct okai* b = &okais[id];
+    struct okai_tab* T = okai_tab_of(b);
+    if (pos < 0 || pos >= T->history_count) return;
+    T->history_pos = pos;
+    char u[OKAI_URL_LEN];
+    scopy(u, T->history[pos], sizeof u);
+    navigate_ex(id, u, 0);
+}
+
+void okai_nav_back(int id) {
+    struct okai* b = &okais[id];
+    if (b->win_id < 0) return;
+    struct okai_tab* T = okai_tab_of(b);
+    if (T->history_pos > 0) okai_goto_history(id, T->history_pos - 1);
+}
+
+void okai_nav_fwd(int id) {
+    struct okai* b = &okais[id];
+    if (b->win_id < 0) return;
+    struct okai_tab* T = okai_tab_of(b);
+    if (T->history_pos + 1 < T->history_count) okai_goto_history(id, T->history_pos + 1);
+}
+
+void okai_nav_reload(int id) {
+    struct okai* b = &okais[id];
+    if (b->win_id < 0) return;
+    char u[OKAI_URL_LEN];
+    scopy(u, okai_tab_of(b)->url, sizeof u);
+    navigate_ex(id, u, 0);
+}
+
+void okai_nav_home(int id) {
+    if (okais[id].win_id < 0) return;
+    okai_navigate(id, OKAI_HOME_URL); // a real Home: pushes history
+}
+
+// ---- forms + input -----------------------------------------------------------------
+
+static int is_tag(struct wdom* d, int n, int tag) {
+    return n >= 0 && n < d->nn && d->n[n].type == WN_ELEM && d->n[n].tag == tag && d->n[n].ns == NS_HTML;
+}
+
+static int attr_ieq(struct wdom* d, int n, int atom, const char* lit) {
+    int l;
+    const char* v = wdom_attr(d, n, atom, &l);
+    if (!v) return 0;
+    int i = 0;
+    for (; i < l && lit[i]; i++) if (lower((unsigned char)v[i]) != lit[i]) return 0;
+    return i == l && !lit[i];
+}
+
+// input types that take typed text
+static int is_text_input(struct wdom* d, int n) {
+    if (is_tag(d, n, T_textarea)) return 1;
+    if (!is_tag(d, n, T_input)) return 0;
+    int l;
+    const char* t = wdom_attr(d, n, A_type, &l);
+    if (!t || !l) return 1;
+    static const char* const txt[] = { "text", "search", "email", "url", "password", "tel", "number", 0 };
+    for (int i = 0; txt[i]; i++) if (attr_ieq(d, n, A_type, txt[i])) return 1;
+    return 0;
+}
+
+static int focusable(struct wdom* d, int n) {
+    if (d->n[n].type != WN_ELEM || d->n[n].ns != NS_HTML) return 0;
+    if (wdom_has_attr(d, n, A_disabled)) return 0;
+    int t = d->n[n].tag;
+    if (t == T_input) return !attr_ieq(d, n, A_type, "hidden");
+    return t == T_select || t == T_textarea || t == T_button;
+}
+
+static void set_focus(int id, struct okai_tab* T, int node) {
+    struct wdom* d = T->doc ? wdoc_dom(T->doc) : 0;
+    if (!d) return;
+    if (T->focused_node == node) return;
+    if (T->focused_node >= 0 && T->focused_node < d->nn) {
+        d->n[T->focused_node].flags &= ~WNF_FOCUSED;
+        for (int p = T->focused_node; p >= 0; p = d->n[p].parent) d->n[p].flags &= ~WNF_FOCUS_WITHIN;
+    }
+    T->focused_node = node;
+    if (node >= 0) {
+        d->n[node].flags |= WNF_FOCUSED;
+        for (int p = node; p >= 0; p = d->n[p].parent) d->n[p].flags |= WNF_FOCUS_WITHIN;
+    }
+    wdoc_invalidate(T->doc);
+    request_render(T, 0);
+    (void)id;
+}
+
+// URL-encode s[0..n) (application/x-www-form-urlencoded) onto out.
+static int form_enc(char* out, int at, int cap, const char* s, int n) {
+    static const char hex[] = "0123456789ABCDEF";
+    for (int i = 0; i < n && at < cap - 4; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '-' || c == '_' || c == '.' || c == '*') out[at++] = (char)c;
+        else if (c == ' ') out[at++] = '+';
+        else { out[at++] = '%'; out[at++] = hex[c >> 4]; out[at++] = hex[c & 15]; }
+    }
+    return at;
+}
+
+static int form_pair(char* q, int ql, int cap, const char* nm, int nl, const char* v, int vl) {
+    if (ql > 0 && ql < cap - 1) q[ql++] = '&';
+    ql = form_enc(q, ql, cap, nm, nl);
+    if (ql < cap - 1) q[ql++] = '=';
+    return form_enc(q, ql, cap, v, vl);
+}
+
+// Value of a control (value attr, or text for textarea / option), into buf.
+static int control_value(struct wdom* d, int n, char* buf, int cap) {
+    int l = wdom_attr_copy(d, n, A_value, buf, cap);
+    if (l >= 0) return l;
+    if (is_tag(d, n, T_textarea) || is_tag(d, n, T_option)) return wdom_text_content(d, n, buf, cap);
+    return 0;
+}
+
+// Submit the form owning `submitter` (GET; POST forms are sent as GET).
+static void submit_form(int id, struct okai_tab* T, int submitter) {
+    struct wdom* d = T->doc ? wdoc_dom(T->doc) : 0;
+    if (!d) return;
+    int form = -1;
+    for (int p = submitter; p >= 0; p = d->n[p].parent) if (is_tag(d, p, T_form)) { form = p; break; }
+    if (form < 0) { serial_puts("[okai] submit: control is not in a form\n"); return; }
+    static char q[2048];
+    static char val[1024];
+    int ql = 0;
+    q[0] = 0;
+    for (int n = d->n[form].first; n >= 0; n = wdom_next(d, n, form)) {
+        if (d->n[n].type != WN_ELEM || wdom_has_attr(d, n, A_disabled)) continue;
+        int nl;
+        const char* nm = wdom_attr(d, n, A_name, &nl);
+        if (!nm || !nl) continue;
+        if (is_tag(d, n, T_input)) {
+            if (attr_ieq(d, n, A_type, "checkbox") || attr_ieq(d, n, A_type, "radio")) {
+                if (!wdom_has_attr(d, n, A_checked)) continue;
+                int vl = control_value(d, n, val, sizeof val);
+                if (!wdom_has_attr(d, n, A_value)) { memcpy(val, "on", 2); vl = 2; }
+                ql = form_pair(q, ql, sizeof q, nm, nl, val, vl);
+            } else if (attr_ieq(d, n, A_type, "submit") || attr_ieq(d, n, A_type, "image") ||
+                       attr_ieq(d, n, A_type, "button") || attr_ieq(d, n, A_type, "reset") ||
+                       attr_ieq(d, n, A_type, "file")) {
+                if (n != submitter || attr_ieq(d, n, A_type, "button") || attr_ieq(d, n, A_type, "reset")) continue;
+                int vl = control_value(d, n, val, sizeof val);
+                ql = form_pair(q, ql, sizeof q, nm, nl, val, vl);
+            } else {
+                int vl = control_value(d, n, val, sizeof val);
+                ql = form_pair(q, ql, sizeof q, nm, nl, val, vl);
+            }
+        } else if (is_tag(d, n, T_textarea)) {
+            int vl = control_value(d, n, val, sizeof val);
+            ql = form_pair(q, ql, sizeof q, nm, nl, val, vl);
+        } else if (is_tag(d, n, T_select)) {
+            int first = -1, sel = -1;
+            for (int c = d->n[n].first; c >= 0; c = wdom_next(d, c, n)) {
+                if (!is_tag(d, c, T_option)) continue;
+                if (first < 0) first = c;
+                if (wdom_has_attr(d, c, A_selected)) { sel = c; break; }
+            }
+            if (sel < 0) sel = first;
+            if (sel < 0) continue;
+            int vl = control_value(d, sel, val, sizeof val);
+            ql = form_pair(q, ql, sizeof q, nm, nl, val, vl);
+        } else if (is_tag(d, n, T_button) && n == submitter && !attr_ieq(d, n, A_type, "button")) {
+            int vl = control_value(d, n, val, sizeof val);
+            ql = form_pair(q, ql, sizeof q, nm, nl, val, vl);
+        }
+    }
+    q[ql] = 0;
+    if (attr_ieq(d, form, A_method, "post")) serial_puts("[okai] POST form submitted as GET\n");
+    static char action[OKAI_URL_LEN];
+    char url[OKAI_URL_LEN];
+    int al;
+    const char* a = wdom_attr(d, form, A_action, &al);
+    if (!a || !al || wurl_resolve(T->url, a, al, action, sizeof action) <= 0) scopy(action, T->url, sizeof action);
+    // the query replaces the action's query + fragment
+    int ul = 0;
+    while (action[ul] && action[ul] != '?' && action[ul] != '#' && ul < OKAI_URL_LEN - 2) { url[ul] = action[ul]; ul++; }
+    url[ul++] = '?';
+    for (int i = 0; q[i] && ul < OKAI_URL_LEN - 1; i++) url[ul++] = q[i];
+    url[ul] = 0;
+    serial_printf("[okai] submit form -> %s\n", url);
+    okai_navigate(id, url);
+}
+
+// Click / Enter on a non-text control.
+static void activate_control(int id, struct okai_tab* T, int node) {
+    struct wdom* d = wdoc_dom(T->doc);
+    if (is_tag(d, node, T_input) && (attr_ieq(d, node, A_type, "checkbox") || attr_ieq(d, node, A_type, "radio"))) {
+        int radio = attr_ieq(d, node, A_type, "radio");
+        if (radio) {
+            int nl;
+            const char* nm = wdom_attr(d, node, A_name, &nl);
+            if (nm) {
+                for (int n = 0; n < d->nn; n++) {
+                    if (n == node || !is_tag(d, n, T_input) || !attr_ieq(d, n, A_type, "radio")) continue;
+                    int ol;
+                    const char* on = wdom_attr(d, n, A_name, &ol);
+                    if (on && ol == nl && !memcmp(on, nm, nl)) wdom_remove_attr(d, n, A_checked);
+                }
+            }
+            wdom_set_attr(d, node, A_checked, "", 0);
+        } else if (wdom_has_attr(d, node, A_checked)) wdom_remove_attr(d, node, A_checked);
+        else wdom_set_attr(d, node, A_checked, "", 0);
+        serial_printf("[okai] toggle node=%d checked=%d\n", node, wdom_has_attr(d, node, A_checked));
+        set_focus(id, T, node);
+        wdoc_invalidate(T->doc);
+        request_render(T, 0);
+        return;
+    }
+    if (is_tag(d, node, T_select)) {
+        // cycle to the next option (no popup menu yet)
+        int first = -1, sel = -1, next = -1;
+        for (int c = d->n[node].first; c >= 0; c = wdom_next(d, c, node)) {
+            if (!is_tag(d, c, T_option)) continue;
+            if (first < 0) first = c;
+            if (sel >= 0 && next < 0) next = c;
+            if (sel < 0 && wdom_has_attr(d, c, A_selected)) sel = c;
+        }
+        if (sel < 0) { sel = first; next = -1; for (int c = first; c >= 0; c = wdom_next(d, c, node)) if (c != first && is_tag(d, c, T_option)) { next = c; break; } }
+        if (next < 0) next = first;
+        if (sel >= 0) wdom_remove_attr(d, sel, A_selected);
+        if (next >= 0) wdom_set_attr(d, next, A_selected, "", 0);
+        set_focus(id, T, node);
+        wdoc_invalidate(T->doc);
+        request_render(T, 0);
+        return;
+    }
+    int submit = is_tag(d, node, T_button) ? !attr_ieq(d, node, A_type, "button") && !attr_ieq(d, node, A_type, "reset")
+                                           : (attr_ieq(d, node, A_type, "submit") || attr_ieq(d, node, A_type, "image"));
+    if (submit) submit_form(id, T, node);
+    else set_focus(id, T, node);
+}
+
+static void scroll_node_into_view(int id, struct okai_tab* T, int node) {
+    struct okai* b = &okais[id];
+    struct job j;
+    memset(&j, 0, sizeof j);
+    j.op = JOB_RECT;
+    j.doc = T->doc;
+    j.id = node;
+    run_job(&j);
+    if (!j.result) return;
+    if (j.y < T->scroll_y + 8 || j.y + j.h > T->scroll_y + b->page_h - 8) {
+        T->scroll_y = j.y - b->page_h / 3;
+        if (T->scroll_y < 0) T->scroll_y = 0;
+        request_render(T, 0);
+    }
+}
+
+static void focus_next(int id, struct okai_tab* T) {
+    struct wdom* d = T->doc ? wdoc_dom(T->doc) : 0;
+    if (!d) return;
+    int start = T->focused_node >= 0 ? T->focused_node : 0;
+    int n = start;
+    for (int k = 0; k < d->nn; k++) {
+        n = wdom_next(d, n, 0);
+        if (n < 0) n = d->n[0].first;
+        if (n < 0) return;
+        if (n != T->focused_node && focusable(d, n)) {
+            set_focus(id, T, n);
+            serial_printf("[okai] tab focus node=%d\n", n);
+            scroll_node_into_view(id, T, n);
+            return;
+        }
+    }
+}
+
+int okai_content_click(int id, int mx, int my) {
+    if (id < 0 || id >= MAX_OKAIS) return 0;
+    struct okai* b = &okais[id];
+    if (b->win_id < 0) return 0;
+    struct okai_tab* T = okai_tab_of(b);
+    int sx, sy, pw, ph;
+    if (!page_geom(b, &sx, &sy, &pw, &ph)) return 0;
+    int x = mx - sx, y = my - sy;
+    if (x < 0 || y < 0 || x >= pw || y >= ph || !T->doc) return 0;
+    static struct wdoc_hit hit;
+    struct job j;
+    memset(&j, 0, sizeof j);
+    j.op = JOB_HIT;
+    j.doc = T->doc;
+    j.x = x;
+    j.y = y;
+    j.scroll = T->scroll_y;
+    j.hit = &hit;
+    run_job(&j);
+    serial_printf("[okai] click x=%d y=%d (mx=%d my=%d) hit=%d node=%d\n", x, y, mx, my, hit.kind, hit.node);
+    if (hit.kind == WDOC_HIT_LINK) {
+        if (!hit.href[0] || iprefix(hit.href, "javascript:")) return 1;
+        serial_printf("[okai] LINK HIT -> %s\n", hit.href);
+        // same-document fragment link: just scroll
+        const char* hs = 0;
+        for (const char* p = hit.href; *p; p++) if (*p == '#') { hs = p; break; }
+        if (hs) {
+            int n = (int)(hs - hit.href), m = 0;
+            while (T->url[m] && T->url[m] != '#') m++;
+            if (n == m && !strncmp(hit.href, T->url, n)) {
+                memset(&j, 0, sizeof j);
+                j.op = JOB_ANCHOR;
+                j.doc = T->doc;
+                j.frag = hs + 1;
+                run_job(&j);
+                if (j.result >= 0) scroll_to(id, j.result);
+                return 1;
+            }
+        }
+        okai_navigate(id, hit.href);
+        return 1;
+    }
+    if (hit.kind == WDOC_HIT_FIELD) {
+        struct wdom* d = wdoc_dom(T->doc);
+        if (is_tag(d, hit.node, T_select)) activate_control(id, T, hit.node);
+        else set_focus(id, T, hit.node);
+        serial_printf("[okai] focus input node=%d\n", hit.node);
+        return 1;
+    }
+    if (hit.kind == WDOC_HIT_BUTTON) {
+        activate_control(id, T, hit.node);
+        return 1;
+    }
+    if (T->focused_node >= 0) set_focus(id, T, -1);
+    return 0;
+}
+
+static void edit_field(struct okai_tab* T, char c) {
+    struct wdom* d = wdoc_dom(T->doc);
+    int n = T->focused_node;
+    static char cur[1024];
+    int l = control_value(d, n, cur, sizeof cur);
+    if (l < 0) l = 0;
+    if (c == '\b') {
+        if (l > 0) {
+            l--;
+            while (l > 0 && ((unsigned char)cur[l] & 0xC0) == 0x80) l--;
+        }
+    } else if (l < (int)sizeof cur - 1) cur[l++] = c;
+    wdom_set_attr(d, n, A_value, cur, l);
+    wdoc_invalidate(T->doc);
+    request_render(T, 2);
+}
+
+void okai_handle_key(int id, char c) {
+    struct okai* b = &okais[id];
+    if (b->win_id < 0) return;
+    struct okai_tab* T = okai_tab_of(b);
+    b->show_security = 0; // any keypress dismisses the security popup
+    b->chrome_dirty = 1;  // addr text / focus / popup may have changed
+
+    if (b->addr_bar_focused) {
+        if (c == '\n') {
+            b->addr_bar_focused = 0;
+            if (b->addr_input_len > 0) okai_navigate(id, b->addr_input);
+            b->addr_input_len = 0;
+            b->addr_input[0] = 0;
+        } else if (c == '\b') {
+            if (b->addr_input_len > 0) b->addr_input[--b->addr_input_len] = 0;
+        } else if (c == 27) { // Escape
+            b->addr_bar_focused = 0;
+            b->addr_input_len = 0;
+            b->addr_input[0] = 0;
+        } else if (c >= 32 && c < 127 && b->addr_input_len < OKAI_URL_LEN - 1) {
+            b->addr_input[b->addr_input_len++] = c;
+            b->addr_input[b->addr_input_len] = 0;
+        }
+        // The address text is drawn by the chrome overlay — no page work.
         return;
     }
 
-    // Set URL (default every web URL to HTTPS; home/internal scheme left alone).
-    char norm[OKAI_URL_LEN];
-    okai_normalize_https(url, norm, OKAI_URL_LEN);
-    int ui = 0;
-    while (norm[ui] && ui < OKAI_URL_LEN - 1) {
-        T->url[ui] = norm[ui];
-        ui++;
+    struct wdom* d = T->doc ? wdoc_dom(T->doc) : 0;
+    int fn = T->focused_node;
+    if (d && fn >= 0 && fn < d->nn) {
+        if (c == 27) { set_focus(id, T, -1); return; }
+        if (c == '\t') { focus_next(id, T); return; }
+        if (is_text_input(d, fn)) {
+            if (c == '\n') {
+                if (is_tag(d, fn, T_textarea)) edit_field(T, '\n');
+                else submit_form(id, T, fn);
+                return;
+            }
+            if (c == '\b' || (c >= 32 && c < 127)) { edit_field(T, c); return; }
+            // arrows fall through to scrolling
+        } else if (c == '\n' || c == ' ') {
+            activate_control(id, T, fn);
+            return;
+        }
     }
-    T->url[ui] = 0;
 
-    // Add to history
-    if (T->history_count < OKAI_MAX_HISTORY) {
-        for (int i = 0; i < ui + 1; i++)
-            T->history[T->history_count][i] = T->url[i];
-        T->history_count++;
-        T->history_pos = T->history_count - 1;
+    if (c == 'g' || c == 'G') {
+        b->addr_bar_focused = 1;
+        b->addr_input_len = 0;
+        b->addr_input[0] = 0;
+    } else if (c == '\t') {
+        focus_next(id, T);
+    } else if (c == 'j' || c == '\n' || c == '\x10') {
+        scroll_to(id, T->scroll_y + SCROLL_STEP);
+    } else if (c == 'k' || c == '\x11') {
+        scroll_to(id, T->scroll_y - SCROLL_STEP);
+    } else if (c == ' ' || c == '\x04') { // space / Page Down
+        scroll_to(id, T->scroll_y + (b->page_h > 120 ? b->page_h - 80 : 40));
+    } else if (c == '\x12') {             // Page Up
+        scroll_to(id, T->scroll_y - (b->page_h > 120 ? b->page_h - 80 : 40));
+    } else if (c == 'r') {
+        okai_nav_reload(id);
+    } else if (c == 'b') {
+        okai_nav_back(id);
+    } else if (c == 'f') {
+        okai_nav_fwd(id);
     }
+}
 
-    T->scroll_y = 0;
-    T->token_count = 0;
-    T->title[0] = 0;
-    T->redirect_count = 0;
-    T->https_fell_back = 0;
-    T->conn_retries = 0;
-    T->focused_input = -1; // stale DOM node from the old page must not persist
-    T->cert_failed = 0;
-    T->cert_detail = 0;
-    T->conn_failed = 0;
-    T->conn_kind = 0;
-    T->truncated = 0;
+void okai_handle_mouse_scroll(int id, int dy) {
+    struct okai* b = &okais[id];
+    if (b->win_id < 0) return;
+    struct okai_tab* T = okai_tab_of(b);
+    serial_printf("[okai] wheel dy=%d old_scroll=%d\n", dy, T->scroll_y);
+    scroll_to(id, T->scroll_y + dy * WHEEL_STEP);
+}
 
-    // Defer the request to the desktop response loop (single-connection owner
-    // model); okai_start_fetch() derives scheme/host/path from T->url when it
-    // actually fires, so nothing is fetched concurrently here.
+struct wdom* okai_active_dom(int id) {
+    struct okai* b = okai_get(id);
+    if (!b) return 0;
+    struct okai_tab* T = okai_tab_of(b);
+    return T->doc ? wdoc_dom(T->doc) : 0;
+}
 
-    okai_render_content(id);
+void okai_dom_changed(int id) {
+    struct okai* b = okai_get(id);
+    if (!b) return;
+    struct okai_tab* T = okai_tab_of(b);
+    if (T->doc) { wdoc_invalidate(T->doc); request_render(T, 0); }
 }
 
 // ---- Toolbar nav buttons ---------------------------------------------------
 // These mirror the back/forward/reload/home buttons drawn in okai_draw_chrome().
-// They are wired so the (already-drawn) controls actually navigate.
 
 // Hit-test the address bar. Geometry MUST mirror okai_draw_chrome(). Used by
 // desktop.c so clicking the address bar focuses it for typing, while clicks
@@ -1295,7 +1733,6 @@ void okai_navigate(int id, const char* url) {
 int okai_addr_bar_hit(int id, int mx, int my) {
     if (id < 0 || id >= MAX_OKAIS) return 0;
     struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
     if (b->win_id < 0) return 0;
     struct window* w = window_get(b->win_id);
     if (!w || !w->visible) return 0;
@@ -1313,7 +1750,6 @@ int okai_addr_bar_hit(int id, int mx, int my) {
 
 int okai_check_nav_click(int id, int mx, int my) {
     struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
     if (b->win_id < 0) return NAV_NONE;
     struct window* w = window_get(b->win_id);
     if (!w) return NAV_NONE;
@@ -1373,457 +1809,9 @@ int okai_tab_hit(int id, int mx, int my, int* on_close) {
     return -1;
 }
 
-static void okai_goto_history(int id, int pos) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (pos < 0 || pos >= T->history_count) return;
-    int pi = 0;
-    while (T->history[pos][pi] && pi < OKAI_URL_LEN - 1) {
-        T->url[pi] = T->history[pos][pi]; pi++;
-    }
-    T->url[pi] = 0;
-    T->history_pos = pos;
-    okai_navigate(id, T->url);
-}
 
-void okai_nav_back(int id) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return;
-    if (T->history_pos > 0) okai_goto_history(id, T->history_pos - 1);
-}
-
-void okai_nav_fwd(int id) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return;
-    if (T->history_pos + 1 < T->history_count) okai_goto_history(id, T->history_pos + 1);
-}
-
-void okai_nav_reload(int id) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return;
-    okai_navigate(id, T->url); // re-request the current URL
-}
-
-void okai_nav_home(int id) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return;
-    okai_navigate(id, OKAI_HOME_URL); // a real Home: pushes history
-}
-
-// Detect an HTTP 3xx response with a Location header and follow it by re-issuing
-// the request against the resolved target. Handles absolute/relative/protocol-
-// relative targets and http<->https switches. Returns 1 if a redirect fired.
-int okai_check_redirect(int id, const char* resp, int len) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0 || !resp || len <= 0) return 0;
-
-    // Must be an HTTP response...
-    if (len < 12) return 0;
-    if (!(resp[0]=='H'&&resp[1]=='T'&&resp[2]=='T'&&resp[3]=='P'&&resp[4]=='/')) return 0;
-    // ...with a 3xx status code.
-    int sp = 0; while (sp < len && resp[sp] != ' ') sp++;
-    if (sp >= len) return 0;
-    int code = sp + 1;
-    if (code + 1 >= len || resp[code] != '3') return 0;
-
-    // Locate the "Location:" header (case-insensitive) within the headers.
-    int header_end = len;
-    for (int p = 0; p < len - 3; p++) {
-        if (resp[p]=='\r' && resp[p+1]=='\n' && resp[p+2]=='\r' && resp[p+3]=='\n') { header_end = p; break; }
-        if (resp[p]=='\n' && resp[p+1]=='\n') { header_end = p; break; }
-    }
-    int loc = -1;
-    for (int p = 0; p < header_end - 8; p++) {
-        int ok = 1;
-        const char* w = "location";
-        for (int k = 0; k < 8; k++) {
-            char c = resp[p+k];
-            if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
-            if (c != w[k]) { ok = 0; break; }
-        }
-        if (ok && resp[p+8] == ':') { loc = p + 9; break; }
-    }
-    if (loc < 0) return 0;
-    while (loc < len && (resp[loc]==' ' || resp[loc]=='\t')) loc++;
-    int end = loc;
-    while (end < len && resp[end] != '\r' && resp[end] != '\n') end++;
-    if (end <= loc) return 0;
-
-    char target[256]; int ti = 0;
-    for (int p = loc; p < end && ti < 255; p++) target[ti++] = resp[p];
-    target[ti] = 0;
-
-    if (T->redirect_count >= OKAI_MAX_REDIRECTS) return 0;
-    T->redirect_count++;
-
-    // Resolve the target against the current page URL, adopt it, re-request.
-    char abs[OKAI_URL_LEN];
-    okai_resolve_href(b, target, abs, OKAI_URL_LEN);
-    if (abs[0] == 0) return 0;
-
-    // Default the redirect target to HTTPS too (home/internal left alone).
-    char norm[OKAI_URL_LEN];
-    okai_normalize_https(abs, norm, OKAI_URL_LEN);
-
-    int ui = 0;
-    while (norm[ui] && ui < OKAI_URL_LEN - 1) { T->url[ui] = norm[ui]; ui++; }
-    T->url[ui] = 0;
-    if (T->history_count < OKAI_MAX_HISTORY) {
-        for (int k = 0; k <= ui; k++) T->history[T->history_count][k] = T->url[k];
-        T->history_count++;
-        T->history_pos = T->history_count - 1;
-    }
-    T->scroll_y = 0;
-    T->token_count = 0;
-    T->title[0] = 0;
-
-    char host[128], path[128];
-    int url_port = 0;
-    parse_url(T->url, host, path, &url_port);
-    T->is_https = (abs[0]=='h'&&abs[1]=='t'&&abs[2]=='t'&&abs[3]=='p'&&
-                   abs[4]=='s'&&abs[5]==':');
-    if (T->is_https) https_get_port(host, path, (uint16_t)url_port);
-    else { http_reset_conn_attempts(); http_get_port(host, path, (uint16_t)url_port); }
-
-    serial_printf("[okai] redirect %d -> %s\n", T->redirect_count, abs);
-    return 1;
-}
-
-// Clamp scroll_y against the true document height (content_height) and the
-// visible slice height. content_height is measured by the layout pass over
-// the WHOLE page, so it no longer shrinks as you scroll (the old bug that
-// stalled scrolling after a few lines).
-static void okai_scroll_clamp(struct okai* b, struct window* w) {
-    struct okai_tab* T = okai_tab_of(b);
-    int view_h = w->content_h - CHROME_ROWS;
-    if (view_h < 1) view_h = 1;
-    int max_scroll = T->content_height - view_h;
-    if (max_scroll < 0) max_scroll = 0;
-    if (T->scroll_y > max_scroll) T->scroll_y = max_scroll;
-    if (T->scroll_y < 0) T->scroll_y = 0;
-}
-
-// Submit a form: gather all <input> values of the submitting control's form
-// (form_idx), URL-encode them as a GET query, and navigate to
-// <form action>?<query>. Used by Enter-in-field and button clicks.
-void okai_submit_form(int id, int input_idx) {
-    // input_idx is a DOM node index (clicked field run or focused input).
-    // Walk up to the enclosing <form>, gather its named controls' values
-    // from the DOM (user edits included — they live in value attributes),
-    // and navigate to action?query. <button type="button"> never submits.
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return;
-    if (input_idx < 0 || input_idx >= T->dom.node_count) return;
-    if (dom_tag_is(&T->dom, input_idx, "button")) {
-        char btype[16] = {0};
-        dom_attr_get(&T->dom, input_idx, "type", btype, sizeof(btype));
-        if (btype[0] == 'b' && btype[1] == 'u') return; // type=button
-    } else if (!dom_tag_is(&T->dom, input_idx, "input")) {
-        return;
-    } else {
-        char itype[16] = {0};
-        dom_attr_get(&T->dom, input_idx, "type", itype, sizeof(itype));
-        if ((itype[0] == 'b' && itype[1] == 'u') || // button
-            (itype[0] == 'c' && itype[1] == 'h') || // checkbox (v1: no toggle UI)
-            (itype[0] == 'r' && itype[1] == 'a') || // radio
-            (itype[0] == 'h' && itype[1] == 'i'))   // hidden
-            return;
-    }
-    // Enclosing form (or none: submit bare inputs against the page URL).
-    int form = -1;
-    for (int p = T->dom.nodes[input_idx].parent;
-         p >= 0 && p < T->dom.node_count;
-         p = T->dom.nodes[p].parent) {
-        if (dom_tag_is(&T->dom, p, "form")) { form = p; break; }
-    }
-    char query[1024]; int ql = 0; query[0] = 0;
-    static const char hex[] = "0123456789ABCDEF";
-    // Gather named, submittable controls: the form's subtree, or just the
-    // one control when there is no form. Unchecked boxes/radios skip.
-    int self_only = (form < 0);
-    for (int pass = 0; pass < 2 && ql < 1023; pass++) {
-        // pass 0: the clicked control first (matches legacy order-ish);
-        // pass 1: the rest of the form in DOM order.
-        for (int n = (pass == 0 ? input_idx : 0);
-             n < T->dom.node_count && ql < 1023;
-             n = (pass == 0 ? T->dom.node_count : n + 1)) {
-            if (pass == 1 && n == input_idx) continue;
-            if (!dom_tag_is(&T->dom, n, "input") &&
-                !dom_tag_is(&T->dom, n, "button"))
-                continue;
-            if (!self_only) {
-                // Must be inside the same form.
-                int inf = 0;
-                for (int p = n; p >= 0 && p < T->dom.node_count;
-                     p = T->dom.nodes[p].parent) {
-                    if (p == form) { inf = 1; break; }
-                }
-                if (!inf) continue;
-            } else if (n != input_idx) {
-                continue;
-            }
-            char nm[64] = {0}, vv[160] = {0}, tp[16] = {0};
-            int is_btn = dom_tag_is(&T->dom, n, "button");
-            dom_attr_get(&T->dom, n, "name", nm, sizeof(nm));
-            if (nm[0] == 0) continue; // unnamed control: skip
-            dom_attr_get(&T->dom, n, "type", tp, sizeof(tp));
-            if (is_btn) {
-                if (!(tp[0] == 's' && tp[1] == 'u')) continue; // only submit
-            } else if ((tp[0] == 'b' && tp[1] == 'u') ||
-                       (tp[0] == 'h' && tp[1] == 'i') ||
-                       (tp[0] == 'c' && tp[1] == 'h') ||
-                       (tp[0] == 'r' && tp[1] == 'a')) {
-                continue;
-            }
-            dom_attr_get(&T->dom, n, "value", vv, sizeof(vv));
-            if (ql > 0 && ql < 1023) query[ql++] = '&';
-            int ni = 0; while (nm[ni] && ql < 1023) query[ql++] = nm[ni++];
-            if (ql < 1023) query[ql++] = '=';
-            for (int vi = 0; vv[vi] && ql < 1023; vi++) {
-                unsigned char ch = (unsigned char)vv[vi];
-                if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
-                    (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ||
-                    ch == '.' || ch == '~') {
-                    query[ql++] = (char)ch;
-                } else if (ch == ' ') {
-                    query[ql++] = '+';
-                } else {
-                    query[ql++] = '%';
-                    query[ql++] = hex[ch >> 4];
-                    query[ql++] = hex[ch & 0xF];
-                }
-            }
-        }
-    }
-    query[ql] = 0;
-    char action[OKAI_URL_LEN]; action[0] = 0;
-    if (form >= 0) dom_attr_get(&T->dom, form, "action", action, sizeof(action));
-    char url[OKAI_URL_LEN]; int ul = 0;
-    if (action[0]) {
-        okai_resolve_href(b, action, url, OKAI_URL_LEN);
-    } else {
-        int ui = 0;
-        while (T->url[ui] && ui < OKAI_URL_LEN - 1) { url[ul++] = T->url[ui++]; }
-        url[ul] = 0;
-    }
-    {
-        int ul2 = 0; while (url[ul2]) ul2++;
-        ul = ul2;
-        if (ql > 0 && ul < OKAI_URL_LEN - 1) url[ul++] = '?';
-        int qi = 0; while (query[qi] && ul < OKAI_URL_LEN - 1) url[ul++] = query[qi++];
-        url[ul] = 0;
-    }
-    T->focused_input = -1;
-    serial_printf("[okai] submit form -> %s\n", url);
-    okai_navigate(id, url);
-}
-
-// Content hit-test for form controls (inputs/buttons). Returns 1 and performs
-// the action (focus a field / submit a button) if a control was clicked, else 0.
-// `row`/`col` are buffer-space coords already transformed by the caller
-// (desktop.c uses the same transform for links, so fields line up exactly).
-int okai_check_content_click(int id, int row, int col) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return 0;
-    if (row < CHROME_ROWS) return 0; // chrome, not content
-    for (int li = 0; li < T->field_count; li++) {
-        struct okai_field* f = &T->fields[li];
-        if (f->row < 0) continue;
-        if (row == f->row && col >= f->col0 && col <= f->col1) {
-            if (f->is_button) {
-                okai_submit_form(id, f->node);
-            } else {
-                T->focused_input = f->node;
-                okai_render_content(id);
-                serial_printf("[okai] focus input node=%d\n", f->node);
-            }
-            return 1;
-        }
-    }
-    return 0;
-}
-
-void okai_handle_key(int id, char c) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return;
-    b->show_security = 0; // any keypress dismisses the security popup
-    b->chrome_dirty = 1;  // addr text / focus / popup may have changed
-
-    struct window* w = window_get(b->win_id);
-    if (!w) return;
-
-    if (b->addr_bar_focused) {
-        // Address bar input mode
-        if (c == '\n') {
-            // Navigate
-            b->addr_bar_focused = 0;
-            if (b->addr_input_len > 0) {
-                okai_navigate(id, b->addr_input);
-            }
-            b->addr_input_len = 0;
-            b->addr_input[0] = 0;
-        } else if (c == '\b') {
-            if (b->addr_input_len > 0) {
-                b->addr_input_len--;
-                b->addr_input[b->addr_input_len] = 0;
-            }
-        } else if (c == 27) { // Escape
-            b->addr_bar_focused = 0;
-            b->addr_input_len = 0;
-            b->addr_input[0] = 0;
-        } else if (c >= 32 && c < 127 && b->addr_input_len < OKAI_URL_LEN - 1) {
-            b->addr_input[b->addr_input_len++] = c;
-            b->addr_input[b->addr_input_len] = 0;
-        }
-        // No re-render: the address text is drawn by the pixel overlay
-        // (okai_draw_chrome reads addr_input live), which repaints on its own
-        // throttle. A full layout per keystroke is what made URL typing crawl
-        // on large pages — the DOM/CSS cannot change from chrome input.
-    } else if (T->focused_input >= 0 && T->focused_input < T->dom.node_count &&
-               dom_tag_is(&T->dom, T->focused_input, "input")) {
-        // Form field input mode: keys edit the focused control's value
-        // attribute (in the DOM, so re-render displays it and submit reads
-        // it) instead of scrolling; Enter submits the form, Esc blurs.
-        // focused_input is a DOM node index (set by clicking a field run).
-        int fn = T->focused_input;
-        // Non-textual controls aren't editable: submit/image submit on
-        // Enter, everything else ignores keystrokes here. Typeless inputs
-        // default to text (editable); hidden/checkbox/radio are skipped.
-        char ftype[16] = {0};
-        dom_attr_get(&T->dom, fn, "type", ftype, sizeof(ftype));
-        int is_btn = dom_tag_is(&T->dom, fn, "button") ||
-            (ftype[0] == 's' && ftype[1] == 'u') || // submit
-            (ftype[0] == 'i' && ftype[1] == 'm');   // image
-        int editable = !is_btn &&
-            !(ftype[0] == 'h' && ftype[1] == 'i') && // hidden
-            !(ftype[0] == 'b' && ftype[1] == 'u') && // button
-            !(ftype[0] == 'c' && ftype[1] == 'h') && // checkbox
-            !(ftype[0] == 'r' && ftype[1] == 'a');   // radio
-        if (c == '\n') {
-            okai_submit_form(id, fn);
-            return;
-        }
-        if (!editable) {
-            if (c == 27) { T->focused_input = -1; okai_render_content(id); }
-            return;
-        }
-        if (c == '\b') {
-            char cur[160];
-            if (dom_attr_get(&T->dom, fn, "value", cur, sizeof(cur)) > 0) {
-                int vl = 0; while (cur[vl]) vl++;
-                if (vl > 0) {
-                    cur[--vl] = 0;
-                    dom_attr_set(&T->dom, fn, "value", cur);
-                }
-            }
-            okai_render_content(id);
-        } else if (c == 27) { // Escape blurs the field
-            T->focused_input = -1;
-            okai_render_content(id);
-        } else if (c >= 32 && c < 127) {
-            char cur[160];
-            int gl = dom_attr_get(&T->dom, fn, "value", cur, sizeof(cur));
-            if (gl < 0) { cur[0] = 0; gl = 0; }
-            int vl = 0; while (cur[vl]) vl++;
-            if (vl < 159) {
-                cur[vl++] = c; cur[vl] = 0;
-                dom_attr_set(&T->dom, fn, "value", cur);
-            }
-            okai_render_content(id);
-        }
-        // other keys ignored while typing in a field
-    } else {
-        // Content scroll mode
-        if (c == 'g' || c == 'G') {
-            // Go to address bar
-            b->addr_bar_focused = 1;
-            b->addr_input_len = 0;
-            b->addr_input[0] = 0;
-            okai_render_content(id);
-        } else if (c == '\t') {
-            // Tab: cycle keyboard focus through form fields (mouseless
-            // form access). Buttons focus like inputs; Enter activates
-            // whatever is focused. Esc blurs.
-            if (T->field_count > 0) {
-                int at = -1;
-                for (int k = 0; k < T->field_count; k++)
-                    if (T->fields[k].node == T->focused_input) { at = k; break; }
-                int nx = (at + 1) % T->field_count;
-                T->focused_input = T->fields[nx].node;
-                serial_printf("[okai] tab focus field=%d node=%d\n",
-                              nx, T->focused_input);
-                // Scroll the field into view when needed (field rows are
-                // buffer rows at the current scroll offset).
-                int fr = T->fields[nx].row;
-                int vh = w->content_h - CHROME_ROWS;
-                if (vh < 1) vh = 1;
-                if (fr < CHROME_ROWS || fr >= CHROME_ROWS + vh) {
-                    T->scroll_y += fr - CHROME_ROWS;
-                    okai_scroll_clamp(b, w);
-                    okai_blit_content(id);
-                }
-                okai_render_content(id);
-            }
-        } else if (c == 'j' || c == '\n') {
-            // Scroll down one line
-            int old = T->scroll_y;
-            T->scroll_y++;
-            okai_scroll_clamp(b, w);
-            if (T->scroll_y != old) okai_blit_content(id);
-        } else if (c == 'k') {
-            // Scroll up one line
-            int old = T->scroll_y;
-            T->scroll_y--;
-            okai_scroll_clamp(b, w);
-            if (T->scroll_y != old) okai_blit_content(id);
-        } else if (c == 'l') {
-            // Scroll right (no-op for now)
-        } else if (c == 'h') {
-            // Scroll left (no-op for now)
-        } else if (c == 'r') {
-            // Refresh
-            okai_navigate(id, T->url);
-        } else if (c == 'b') {
-            // Back
-            if (T->history_pos > 0) {
-                T->history_pos--;
-                int pi = 0;
-                while (T->history[T->history_pos][pi] && pi < OKAI_URL_LEN - 1) {
-                    T->url[pi] = T->history[T->history_pos][pi];
-                    pi++;
-                }
-                T->url[pi] = 0;
-                okai_navigate(id, T->url);
-            }
-        }
-    }
-}
-
-void okai_handle_mouse_scroll(int id, int dy) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return;
-    struct window* w = window_get(b->win_id);
-    if (!w) return;
-
-    int old = T->scroll_y;
-    serial_printf("[okai] wheel dy=%d old_scroll=%d\n", dy, T->scroll_y);
-    T->scroll_y += dy * 3; // dy positive = wheel down; 3 lines per detent
-    okai_scroll_clamp(b, w);
-    if (T->scroll_y != old) okai_blit_content(id);
-}
-
-// ---- Pixel chrome (Option B): tab strip + toolbar drawn with graphics
-// primitives over the window's content area. The content buffer's top
-// CHROME_ROWS rows are left blank and overdrawn by this. ----
+// ---- Pixel chrome: tab strip + toolbar drawn with graphics primitives over
+// the top CHROME_PX band of the window's content area. ----
 
 // 12-point unit circle for icon arcs (no trig in-kernel), scaled by r/8.
 static const int OKAI_CIRC_X[12] = {8,7,4,0,-4,-7,-8,-7,-4,0,4,7};
@@ -1983,7 +1971,9 @@ static int okai_anim_step(int id) {
     // Remove tabs whose close animation finished (width hit zero).
     for (int i = 0; i < b->tab_count; ) {
         if (b->tabs[i].closing && b->tabs[i].anim_w <= 0) {
+            tab_dispose(id, i);
             for (int j = i; j < b->tab_count - 1; j++) b->tabs[j] = b->tabs[j + 1];
+            b->tabs[b->tab_count - 1].doc = 0;
             b->tab_count--;
             if (b->active_tab >= b->tab_count) b->active_tab = b->tab_count - 1;
             else if (i < b->active_tab) b->active_tab--;
@@ -1996,7 +1986,7 @@ static int okai_anim_step(int id) {
 }
 
 static void okai_draw_fetch_status(int id); // defined below (progress pill)
-void okai_draw_chrome(int id) {
+static void okai_draw_chrome(int id) {
     struct okai* b = &okais[id];
     struct okai_tab* T = okai_tab_of(b);
     if (b->win_id < 0) return;
@@ -2141,173 +2131,97 @@ void okai_draw_chrome(int id) {
     okai_draw_fetch_status(id);
 }
 
-// Fetch progress pill, bottom-left of the content area ("Loading 123K" in
-// small text). Pixel overlay like the chrome: painted every frame while a
-// fetch is in flight for this window. When the fetch ends, desktop.c fires
-// one content blit (see the erase hook) to wipe its pixels.
+
+// Fetch progress pill, bottom-left of the page area ("Loading 123K" in
+// small text). Pixel overlay like the chrome: painted while a fetch is in
+// flight for this window; okai_poll repaints the window once when it ends.
 static void okai_draw_fetch_status(int id) {
     if (okai_fetch_owner != id) return;
     struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return;
+    if (b->win_id < 0 || fetch_tab < 0 || fetch_tab >= b->tab_count) return;
+    struct okai_tab* T = &b->tabs[fetch_tab];
     long rxb = -1;
-    if (T->is_https) {
-        if (tls_is_active() && !tls_is_done())
-            rxb = tls_get_progress_len();
-    } else if (!http_is_done() &&
-               (http_is_pending() || http_is_retry_pending())) {
+    if (fetch_https(T)) {
+        if (tls_is_active() && !tls_is_done()) rxb = tls_get_progress_len();
+    } else if (!http_is_done() && (http_is_pending() || http_is_retry_pending())) {
         rxb = http_get_response_len();
     }
     if (rxb < 0) return;
     struct window* w = window_get(b->win_id);
     if (!w || !w->visible || w->minimized) return;
-    char msg[20];
+    int sx, sy, pw, ph;
+    if (!page_geom(b, &sx, &sy, &pw, &ph)) return;
+    char msg[40];
     int mi = 0;
-    const char* pre = "Loading ";
-    while (pre[mi] && mi < 18) { msg[mi] = pre[mi]; mi++; }
+    const char* pre = T->sub_id >= 0 ? "Loading resources " : "Loading ";
+    while (pre[mi] && mi < 30) { msg[mi] = pre[mi]; mi++; }
     long kb = rxb / 1024;
-    char num[12]; int nl = 0; long v = kb;
-    if (v == 0) num[nl++] = '0';
-    else {
-        char rev[12]; int rl = 0;
-        while (v > 0 && rl < 11) { rev[rl++] = (char)('0' + v % 10); v /= 10; }
-        while (rl > 0) num[nl++] = rev[--rl];
-    }
-    for (int k = 0; k < nl && mi < 18; k++) msg[mi++] = num[k];
-    if (mi < 18) msg[mi++] = 'K';
+    char rev[12];
+    int rl = 0;
+    if (kb == 0) rev[rl++] = '0';
+    while (kb > 0 && rl < 11) { rev[rl++] = (char)('0' + kb % 10); kb /= 10; }
+    while (rl > 0 && mi < 37) msg[mi++] = rev[--rl];
+    msg[mi++] = 'K';
     msg[mi] = 0;
     int cw = 8, chh = 16; // small text: half-size glyphs
-    int tw = mi * cw;
-    int cell_h = CONTENT_GH * w->font_scale;
-    int cx = w->x + WIN_BORDER;
-    int cytop = w->y + WIN_BORDER + (w->no_titlebar ? 0 : WIN_TITLE_H);
-    int cbot = cytop + w->content_h * cell_h;
-    int winbot = w->y + w->h - WIN_BORDER;
-    if (cbot > winbot) cbot = winbot;
-    int x = cx + 4, y = cbot - chh - 4;
-    if (y < cytop || tw <= 0) return;
-    rect_fill(x - 4, y - 2, tw + 8, chh + 4, 0x000000);
+    int x = sx + 8, y = sy + ph - chh - 8;
+    rect_fill(x - 6, y - 3, mi * cw + 12, chh + 6, 0x00202830);
     for (int k = 0; k < mi; k++)
-        draw_char_sized(x + k * cw, y, msg[k], 0x00FFFFFF, 0x000000, cw, chh);
+        draw_char_sized(x + k * cw, y, msg[k], 0x00E8EEF5, 0x00202830, cw, chh);
 }
 
-static void okai_draw_heading_pixels(int id); // defined just below
+// Scroll position indicator along the right edge of the page area.
+static void okai_draw_scrollbar(int id) {
+    struct okai* b = &okais[id];
+    if (b->win_id < 0) return;
+    struct window* w = window_get(b->win_id);
+    if (!w || !w->visible || w->minimized) return;
+    struct okai_tab* T = okai_tab_of(b);
+    int sx, sy, pw, ph;
+    if (!page_geom(b, &sx, &sy, &pw, &ph)) return;
+    int total = T->content_height;
+    if (total <= ph || ph < 40) return;
+    int track = ph - 8;
+    int th = (int)((long)track * ph / total);
+    if (th < 32) th = 32;
+    int maxs = total - ph;
+    int pos = T->scroll_y > maxs ? maxs : T->scroll_y;
+    // 32-bit safe: (track - th) <= ~1100, pos scaled down for huge pages
+    int den = maxs, num = pos;
+    while (den > 1000000) { den >>= 4; num >>= 4; }
+    int ty = sy + 4 + (den > 0 ? (track - th) * num / den : 0);
+    round_rect_fill(sx + pw - 11, ty, 7, th, 0x00888E96, 3);
+}
 
-// Chrome + heading overlays for one window. desktop.c paints these right
-// after the window itself (in z-order) — the old draw-after-all-windows pass
-// let a LOWER okai's chrome paint over a HIGHER overlapping window ("text
-// leaking through").
-// The security popup card (okai_draw_chrome) must sit ON TOP of page content,
-// so the heading pixels are painted first and the chrome/card last.
+// Chrome overlay for one window. desktop.c paints it right after the window
+// itself (in z-order). The security popup card (okai_draw_chrome) must sit ON
+// TOP of page content, so the page-area overlays go first and chrome last.
 void okai_paint_overlays(int id) {
     // This *is* the live render path (desktop.c calls it every main-loop
     // iteration for each visible okai window). Stepping the animation here
     // grows/shrinks each tab's anim_w; the chrome drawn below is flushed every
     // frame by graphics_flush(), so no full window re-render is needed during
-    // the animation (the page body only re-renders when its content changes).
+    // the animation (the page only repaints when its content changes).
     okai_anim_step(id);
-    okai_draw_heading_pixels(id);
+    if (!okai_get(id)) return;
+    okai_draw_scrollbar(id);
     okai_draw_chrome(id);
 }
 
-// Draw okai's chrome/heading overlay clipped to the given sub-rects (okai's
-// window minus any higher-z overlapping windows). This keeps the overlay from
+// Draw okai's chrome overlay clipped to the given sub-rects (okai's window
+// minus any higher-z overlapping windows). This keeps the overlay from
 // painting over a covering window, so that window does NOT need to be force-
 // repainted every frame — which was tanking FPS when a window sat over okai.
 // rects[i] = {x, y, w, h} in screen coords; nr may be 0 (fully covered).
 void okai_paint_overlays_rects(int id, int rects[][4], int nr) {
     okai_anim_step(id);
+    if (!okai_get(id)) return;
     for (int i = 0; i < nr; i++) {
         graphics_set_clip(rects[i][0], rects[i][1], rects[i][2], rects[i][3]);
-        okai_draw_heading_pixels(id);
+        okai_draw_scrollbar(id);
         okai_draw_chrome(id);
     }
     graphics_clip_reset();
-}
-
-void okai_draw_chrome_all(void) {
-    for (int i = 0; i < MAX_OKAIS; i++) {
-        if (okais[i].win_id >= 0) {
-            okai_draw_chrome(i);
-            okai_draw_heading_pixels(i);
-        }
-    }
-}
-
-// Paint heading lines (flagged in the layout pass) as raw scaled glyphs over
-// the window's content region. The window char grid is one uniform size, so
-// headings can't be bigger there; this runs after window_draw_all() and draws
-// them directly into the backbuffer (kind 1 = 2x, kind 2 = 3x body size),
-// matching the body text color.
-static void okai_draw_heading_pixels(int id) {
-    struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
-    if (b->win_id < 0) return;
-    struct window* w = window_get(b->win_id);
-    if (!w || !w->visible || w->minimized) return;
-
-    int cell_w = CONTENT_GW * w->font_scale;
-    int cell_h = CONTENT_GH * w->font_scale;
-    int cx = w->x + WIN_BORDER;
-    int cy = w->y + WIN_BORDER + (w->no_titlebar ? 0 : WIN_TITLE_H);
-    uint32_t fg = g_page_fg;
-    uint32_t bg = g_page_bg;
-
-    const struct layout* lay = &g_lay[id];
-    int view_h = w->content_h - CHROME_ROWS;
-    if (view_h < 0) view_h = 0;
-    for (int li = 0; li < lay->n_items; li++) {
-        const struct layout_item* it = &lay->items[li];
-        if (it->kind != LOUT_LINE || !it->heading) continue;
-        // H1 = 3x, H2 = 2x, H3-H6 = body size (heading but no scaling).
-        int level = it->heading;
-        int hscale = level <= 1 ? 3 : level == 2 ? 2 : 1;
-        if (hscale <= 1) continue; // H3+ renders in the grid normally
-        int cell_row = it->is_fixed ? it->row + CHROME_ROWS
-                                    : it->row - T->scroll_y + CHROME_ROWS;
-        if (cell_row < CHROME_ROWS || cell_row >= w->content_h) continue;
-        int py = cy + cell_row * cell_h;
-        for (int ri = it->run_start; ri < it->run_start + it->run_count; ri++) {
-            const struct layout_run* run = &lay->runs[ri];
-            for (int k = 0; k < run->text_len; k++) {
-                int c = run->col + k * hscale; // heading runs are scale-columns apart
-                if (c < 0 || c >= w->content_w) continue;
-                int px = cx + c * cell_w;
-                if ((run->flags & LAYOUT_FLAG_CJK) != 0) {
-                    // CJK heading: decode the kth char and draw the bitmap
-                    // scaled like the Latin overlay (square box, vertically
-                    // centered). Table miss: skip (the grid '?' shows through).
-                    int boff = 0;
-                    uint32_t cjk = 0;
-                    for (int q = 0; q <= k; q++) {
-                        int bl = 1;
-                        cjk = utf8_decode_char(
-                            lay->text + run->text_off + boff,
-                            LAYOUT_MAX_TEXT - (int)run->text_off - boff, &bl);
-                        if (bl <= 0) bl = 1;
-                        boff += bl;
-                    }
-                    const uint8_t* g = cjk_glyph_for(cjk);
-                    if (!g) continue;
-                    int side = CONTENT_GW * hscale;
-                    draw_cjk_box(px, py + (cell_h - side) / 2, g,
-                                 run->fg, lay->page_bg, side, side);
-                    continue;
-                }
-                char ch = lay->text[run->text_off + k];
-                if (ch == ' ' || (unsigned char)ch < 33) continue;
-                draw_char_cell(px, py, doc_sanitize(ch), run->fg, lay->page_bg,
-                               CONTENT_GW * hscale, CONTENT_GH * hscale, CELL_BOLD);
-            }
-        }
-    }
-}
-
-// NOTE: okai_draw() is dead — the desktop main loop paints okai via
-// okai_paint_overlays() (which steps the animation). Kept for API symmetry.
-void okai_draw(int id) {
-    if (id < 0 || id >= MAX_OKAIS) return;
-    okai_draw_chrome(id);
 }
 
 int okai_find_by_win(int win_id) {
@@ -2322,54 +2236,3 @@ struct okai* okai_get(int id) {
     if (okais[id].win_id < 0) return 0;
     return &okais[id];
 }
-
-// ---- Host preview support (tests/okai_preview.c) ---------------------------
-// Exposes the laid-out virtual document so the host tool can render the page
-// to a PNG with the real font/colors — a QEMU-free preview of okai output.
-#ifdef HOST_PREVIEW
-// The preview paints the layout display list directly (same source as the
-// kernel renderer). Exposed as a borrowed pointer valid until the next
-// okai_render_content_for_preview call.
-static struct layout g_preview_lay;
-const struct layout* preview_layout(void) { return &g_preview_lay; }
-struct okai*    okai_get_for_preview(void) { return &okais[0]; }
-void            okai_render_content_for_preview(void) {
-    struct okai* b = &okais[0];
-    struct okai_tab* T = okai_tab_of(b);
-    // Rebuild the layout exactly as okai_render_content does (minus the
-    // window blit, which the preview does not have a real window for).
-    const struct css_rule* ua = 0;
-    int ua_n = css_ua_rules(&ua);
-    struct css_style body_style;
-    css_compute(T->css_rules, T->css_n, "body", 0, 0, 0, &body_style);
-    if (ua_n > 0) {
-        struct css_style ub;
-        css_compute(ua, ua_n, "body", 0, 0, 0, &ub);
-        css_merge_base(&body_style, &ub);
-    }
-    uint32_t page_bg = body_style.has_bg_rgb ? body_style.bg_rgb : 0xFFFFFF;
-    uint32_t default_fg = body_style.has_fg_rgb ? body_style.fg_rgb
-                          : (window_rgb_is_light(page_bg) ? 0x000000 : 0xFFFFFF);
-    g_page_fg = default_fg; g_page_bg = page_bg;
-
-    static struct css_rule combined[CSS_MAX_RULES + CSS_UA_MAX_RULES];
-    int cn = 0;
-    for (int i = 0; i < ua_n && cn < CSS_MAX_RULES + CSS_UA_MAX_RULES; i++) combined[cn++] = ua[i];
-    for (int i = 0; i < T->css_n && cn < CSS_MAX_RULES + CSS_UA_MAX_RULES; i++) combined[cn++] = T->css_rules[i];
-
-    int view_w = 80;
-    struct window* w = window_get(b->win_id);
-    if (w && w->content_w > 0) view_w = w->content_w;
-    int page_left = OKAI_TEXT_PAD;
-    int page_w = view_w - 2 * OKAI_TEXT_PAD;
-    if (page_w < 20) page_w = 20;
-
-    struct layout_opts lo;
-    lo.width_cols = page_w;
-    lo.page_left = page_left;
-    lo.page_bg = page_bg;
-    lo.page_fg = default_fg;
-    layout_run(&T->dom, combined, cn, &lo, &g_preview_lay);
-    T->content_height = g_preview_lay.height;
-}
-#endif

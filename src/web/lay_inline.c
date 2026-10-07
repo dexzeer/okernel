@@ -534,8 +534,10 @@ static void finish_line(struct ifc* c, int n, int forced) {
         fr->box = spans[k].box;
         fr->first = spans[k].first;
         fr->last = spans[k].last;
-        fr->x = spans[k].x0 - (fr->first ? ib->b[3] + ib->p[3] : 0);
-        fr->w = spans[k].x1 - spans[k].x0 + (fr->first ? ib->b[3] + ib->p[3] : 0) + (fr->last ? ib->b[1] + ib->p[1] : 0);
+        // span edges are border-box edges already (open/close pieces carry
+        // margin+border+padding; ostart/xe step over the margin only)
+        fr->x = spans[k].x0;
+        fr->w = spans[k].x1 - spans[k].x0;
         fr->y = base + sh - m.ascent - ib->p[0] - ib->b[0];
         fr->h = m.ascent + m.descent + ib->p[0] + ib->p[2] + ib->b[0] + ib->b[2];
     }

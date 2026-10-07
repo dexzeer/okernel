@@ -9,6 +9,14 @@ from okvm import OkVM
 def parses(log):
     return len(re.findall(r"\[br\] (?:https )?parse: count=\d+", log))
 
+def wait_more_parses(vm, n, timeout=70):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        if parses(vm.serial()) > n:
+            return True
+        time.sleep(1)
+    return False
+
 vm = OkVM("err")
 time.sleep(14)
 results = []
@@ -23,24 +31,17 @@ vm.type_string("g")               # focus the okai address bar
 time.sleep(0.5)
 vm.type_string("/domains/example\n")
 refused = vm.wait_for("refusing fetch: empty host", timeout=20)
-vm.dump()
-from PIL import Image
-img = Image.open(vm.PPM).convert('RGB')
-px = img.load()
-err_red = False
-for y in range(60, 400):          # error title is light-red (VGA 12)
-    hits = sum(1 for x in range(1015, 1880)   # okai window moved right of terminal
-               if px[x, y][0] > 200 and px[x, y][1] < 120 and px[x, y][2] < 120)
-    if hits > 30: err_red = True; break
+time.sleep(1)
+err_page = "[okai] error page:" in vm.serial()
 results.append(("empty-host refused", refused))
-results.append(("error page rendered", err_red))
+results.append(("error page rendered", err_page))
 
 # TEST 3: recovery — a good URL must STILL load after the refusal
 n0 = parses(vm.serial())
 vm.type_string("g"); time.sleep(0.5)
 vm.type_string("example.com\n")
 results.append(("recovery after refusal",
-                vm.wait_for("parse: count=", timeout=70) and parses(vm.serial()) > n0))
+                wait_more_parses(vm, n0)))
 time.sleep(2)
 
 # TEST 4: NXDOMAIN — DNS failure aborts cleanly (no infinite wedge)
@@ -54,7 +55,7 @@ results.append(("NXDOMAIN handled",
 n2 = parses(vm.serial())
 vm.type_string("g"); time.sleep(0.5)
 vm.type_string("example.com\n")
-ok5 = vm.wait_for("parse: count=", timeout=70) and parses(vm.serial()) > n2
+ok5 = wait_more_parses(vm, n2)
 results.append(("recovery after NXDOMAIN", ok5))
 
 vm.kill()

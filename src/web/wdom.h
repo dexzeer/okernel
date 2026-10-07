@@ -96,6 +96,7 @@ void wdom_append_text(struct wdom* d, int parent, const char* s, int len);
 void wdom_insert_text_before(struct wdom* d, int parent, int ref, const char* s, int len);
 // Attributes (name is an atom). set replaces an existing value.
 void wdom_set_attr(struct wdom* d, int el, int name_atom, const char* v, int vlen);
+void wdom_remove_attr(struct wdom* d, int el, int name_atom);
 int  wdom_has_attr(const struct wdom* d, int el, int name_atom);
 // Value pointer (not NUL-terminated) + length, or NULL when absent.
 const char* wdom_attr(const struct wdom* d, int el, int name_atom, int* len);

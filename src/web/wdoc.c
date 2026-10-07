@@ -654,3 +654,55 @@ void wdoc_stats(struct wdoc* d, char* out, int cap) {
     memcpy(out, tmp, c);
     out[c] = 0;
 }
+
+int wdoc_pending_css(struct wdoc* d) {
+    int n = 0;
+    for (int i = 0; i < d->nres; i++)
+        if (d->res[i].kind == RES_CSS && d->res[i].state <= RS_INFLIGHT) n++;
+    return n;
+}
+
+int wdoc_has_fixed(struct wdoc* d) {
+    wdoc_update(d);
+    if (!d->L) return 0;
+    const struct ditem* it;
+    int n = wlay_items(d->L, &it);
+    for (int i = 0; i < n; i++) if (it[i].fixed) return 1;
+    return 0;
+}
+
+int wdoc_node_rect(struct wdoc* d, int node, int* x, int* y, int* w, int* h) {
+    wdoc_update(d);
+    int32_t X, Y, W, H;
+    if (!d->L || node < 0 || !wlay_node_rect(d->L, node, &X, &Y, &W, &H)) return 0;
+    *x = LU_FLOOR(X); *y = LU_FLOOR(Y); *w = LU_ROUND(W); *h = LU_ROUND(H);
+    return 1;
+}
+
+int wdoc_hit_count(struct wdoc* d) {
+    wdoc_update(d);
+    if (!d->L) return 0;
+    const struct dhit* h;
+    return wlay_hits(d->L, &h);
+}
+
+int wdoc_hit_get(struct wdoc* d, int i, struct wdoc_region* out) {
+    if (!d->L) return 0;
+    const struct dhit* h;
+    int n = wlay_hits(d->L, &h);
+    if (i < 0 || i >= n) return 0;
+    out->kind = h[i].kind == HIT_LINK ? WDOC_HIT_LINK : h[i].kind == HIT_FIELD ? WDOC_HIT_FIELD : WDOC_HIT_BUTTON;
+    out->node = h[i].node;
+    out->x = LU_FLOOR(h[i].x);
+    out->y = LU_FLOOR(h[i].y);
+    out->w = LU_ROUND(h[i].w);
+    out->h = LU_ROUND(h[i].h);
+    out->fixed = h[i].fixed;
+    out->href[0] = 0;
+    if (out->kind == WDOC_HIT_LINK) {
+        int hl;
+        const char* href = wdom_attr(d->d, h[i].node, A_href, &hl);
+        if (href) wurl_resolve(d->base, href, hl, out->href, sizeof out->href);
+    }
+    return 1;
+}
