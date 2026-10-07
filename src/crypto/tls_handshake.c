@@ -263,11 +263,12 @@ uint32_t tls_build_client_hello(uint8_t* out, uint32_t cap,
     if (!buf_has(sizeof(body), pos, 1 + 32)) return 0;
     body[pos++] = 32;
     for (int i = 0; i < 32; i++) body[pos++] = session_id[i];
-    // cipher_suites (2B len + entries). Offer ONLY ChaCha20-Poly1305-SHA256
-    // because we only implement SHA-256 + 32-byte key derivation. Servers
-    // that pick AES-GCM would require SHA-384 keys we don't compute.
+    // cipher_suites (2B len + entries): the SHA-256 suites. ChaCha20 first
+    // (fast in software); AES-128-GCM for servers without it (Akamai and
+    // friends). AES-256-GCM-SHA384 would need the SHA-384 schedule.
     static const uint16_t ciphers[] = {
         0x1303, // TLS_CHACHA20_POLY1305_SHA256
+        0x1301, // TLS_AES_128_GCM_SHA256
         0x00ff, // TLS_EMPTY_RENEGOTIATION_INFO_SCSV
     };
     uint32_t cs_n = sizeof(ciphers) / sizeof(ciphers[0]);
@@ -332,9 +333,10 @@ int tls_parse_server_hello(const uint8_t* sh, uint32_t sh_len,
     }
     p += sid_len;
     out->cipher_suite = get_u16(sh + p); p += 2;
-    // We offered exactly one real cipher suite; anything else (a server
-    // "negotiating" an algorithm we cannot do) is a hard failure.
-    if (out->cipher_suite != TLS_CIPHER_CHACHA20_POLY1305_SHA256) return -1;
+    // Only the suites we offered; anything else (a server "negotiating" an
+    // algorithm we cannot do) is a hard failure.
+    if (out->cipher_suite != TLS_CIPHER_CHACHA20_POLY1305_SHA256 &&
+        out->cipher_suite != TLS_CIPHER_AES_128_GCM_SHA256) return -1;
     if (sh[p] != 0) return -1;                  // compression_method
     p += 1;
     if (sh_len < p + 2) return -1;
@@ -625,6 +627,7 @@ uint32_t tls_build_client_hello_psk(uint8_t* out, uint32_t cap,
     for (int i = 0; i < 32; i++) body[pos++] = session_id[i];
     static const uint16_t ciphers[] = {
         0x1303, // TLS_CHACHA20_POLY1305_SHA256
+        0x1301, // TLS_AES_128_GCM_SHA256
         0x00ff, // TLS_EMPTY_RENEGOTIATION_INFO_SCSV
     };
     uint32_t cs_n = sizeof(ciphers) / sizeof(ciphers[0]);

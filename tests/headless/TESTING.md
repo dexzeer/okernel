@@ -195,6 +195,7 @@ Crypto/TLS host suites: `make host-tests` (also runs `web-tests`). A test that f
 - **Diff working vs broken.** Fetch 1 (example.com) printed `DNS resolved, opening TCP:443`; fetch 2 stopped after `[dns] resolved:`. The missing line told us which code path died, and `dns_host_matches` reading `iana.orgcom` explained it.
 - **One variable at a time.** Instrument → rebuild → re-run → compare logs. Never change two things between runs.
 - **Beware tools that lie.** The serial formatter printed `total 6729 bytes` for an 86692-byte response (4-digit counter wrap). When numbers look impossible, verify the INSTRUMENT before believing the data (or the bug).
+- **A "pass" can hide a downgrade.** The first real-site sweep counted pages as loaded when `parse: count=` appeared — every HTTPS fetch had actually timed out and okai's plain-HTTP fallback parsed a 14-byte page. Check HOW the page arrived (`[tls-net] received`, no `https failed, retrying http`), not just that something parsed.
 - **Check assumptions about the environment**: is the ISO newer than the sources you just edited? `ls --time-style` both. An ISO rebuild you forgot, or (as actually happened) another agent concurrently editing `src/`, silently invalidates every test run. Verify `make desktop` rebuilt from YOUR sources before blaming the kernel.
 
 ## 9. Full regression checklist (after any okai/network change)
@@ -202,12 +203,14 @@ Crypto/TLS host suites: `make host-tests` (also runs `web-tests`). A test that f
 ```
 1. make desktop && make text        — both build, zero NEW warnings in edited files
 2. make web-tests (+ the corpus under ASan if you touched src/web)
-3. python3 tests/headless/run_suite.py -j3 test_okai_interact.py test_links.py test_nav.py \
+3. python3 tests/headless/run_suite.py -j3 test_okai_interact.py test_okai_js.py test_links.py test_nav.py \
        test_tab_x.py test_errors.py test_addrbar.py test_lock.py test_stale_doc.py \
        test_fixed_header.py test_https_default.py test_certfail.py test_boot_mem.py
 4. Network (needs internet): test_google_search.py, test_resume.py, test_pki_qemu.py,
    test_firstrender.py, and `test_okai_page.py https://en.wikipedia.org/wiki/Operating_system wiki --scroll 3`
-5. Regression: example.com still loads (the canary)
+5. TLS/network change: make host-tests (+ make host-tests-asan) and test_sites.py — every site must
+   arrive over TLS ("OK"); a FALLBACK verdict means HTTPS failed and plain HTTP was used
+6. Regression: example.com still loads (the canary)
 ```
 
 Each headless test boots QEMU (~25s), drives the scenario, prints PASS/FAIL, exits non-zero on fail. Verdicts come from the serial log (+ pixel counts where the log can't say), never vibes.

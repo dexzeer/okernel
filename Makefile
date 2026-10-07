@@ -11,7 +11,7 @@ LD = ld
 # struct pointers (ip_header*, tcp on byte arrays) — UB under strict aliasing.
 CFLAGS = -m32 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
          -nostartfiles -nodefaultlibs -fno-pic -fno-pie -mno-red-zone \
-         -O2 -fno-strict-aliasing \
+         -O2 -fno-strict-aliasing -MMD -MP \
          -Wall -Wextra -DKERNEL -Isrc
 
 # Assembler flags
@@ -72,7 +72,7 @@ LIBGCC := $(shell $(CC) -m32 -print-libgcc-file-name)
 QJS_CFLAGS = -m32 -nostdinc -Isrc/qjs/libc -Isrc/qjs/libm -Isrc/qjs -isystem $(GCC_INC) \
              -fno-pic -fno-pie -O2 -fno-strict-aliasing -fwrapv -fno-stack-protector \
              -mno-sse -mno-sse2 -mno-mmx -mfpmath=387 -fno-asynchronous-unwind-tables \
-             -D_GNU_SOURCE -DQJS_NO_ATOMICS -DCONFIG_VERSION=\"2026-06-04\" -DKERNEL -w
+             -D_GNU_SOURCE -DQJS_NO_ATOMICS -DCONFIG_VERSION=\"2026-06-04\" -DKERNEL -w -MMD -MP
 QJS_HEADERS := $(wildcard src/qjs/*.h) $(wildcard src/qjs/libc/*.h) $(wildcard src/qjs/libc/sys/*.h) \
                $(wildcard src/qjs/libm/*.h)
 QJS_OBJ = src/qjs/quickjs.o src/qjs/cutils.o src/qjs/libregexp.o src/qjs/libunicode.o src/qjs/dtoa.o \
@@ -85,7 +85,7 @@ src/userland_seed.o: $(USERLAND_GEN)
 DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/textslot.o src/cjk.o \
               src/font_data.o $(WEB_OBJ) $(QJS_OBJ) \
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
-             src/crypto/aead.o src/crypto/chacha20.o src/crypto/poly1305.o \
+             src/crypto/aead.o src/crypto/aes.o src/crypto/chacha20.o src/crypto/poly1305.o \
              src/crypto/x25519.o src/crypto/tls_record.o src/crypto/tls_handshake.o \
              src/crypto/tls_keysched.o src/crypto/tls_client.o src/crypto/rand.o \
              src/crypto/sha512.o src/crypto/der.o src/crypto/x509.o \
@@ -120,7 +120,7 @@ web-tests:
 # the ASan build is 2-3x slower — see the commented line in the recipe).
 # Informational (never gates): text_decode (charset/entity/slot coverage)
 # and the live-network tls_client_test (needs internet to example.com:443).
-HOST_CRYPTO_SRC = src/crypto/tls_client.c src/crypto/tls_record.c src/crypto/tls_handshake.c \
+HOST_CRYPTO_SRC = src/crypto/tls_client.c src/crypto/tls_record.c src/crypto/tls_handshake.c src/crypto/aes.c \
               src/crypto/tls_keysched.c src/crypto/sha256.c src/crypto/sha1.c src/crypto/ocsp.c src/crypto/sha512.c \
               src/crypto/hmac.c src/crypto/hkdf.c src/crypto/aead.c \
               src/crypto/chacha20.c src/crypto/poly1305.c src/crypto/x25519.c \
@@ -134,6 +134,7 @@ host-tests:
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_strict tests/test_crypto_strict.c $(HOST_CRYPTO_SRC) && ./build-host/t_strict | tail -n 2
 	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_edtext tests/test_editor_text.c src/editor.c src/textslot.c && ./build-host/t_edtext | tail -n 2
 	$(MAKE) web-tests
+	gcc -m32 -O2 -Isrc/crypto -o build-host/t_aes tests/test_aes.c src/crypto/aes.c && (python3 tests/aes_vectors.py 300 2>/dev/null | ./build-host/t_aes - || ./build-host/t_aes) | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_pki tests/test_pki.c $(HOST_CRYPTO_SRC) && ./build-host/t_pki | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_adv tests/test_adversarial.c $(HOST_CRYPTO_SRC) && timeout 300 ./build-host/t_adv | tail -n 3
 	-gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tls_live tests/test_tls_client.c $(HOST_CRYPTO_SRC) && timeout 60 ./build-host/t_tls_live | tail -n 3; echo "(tls_client_test: needs internet; SKIP if unreachable)"
@@ -226,8 +227,12 @@ kanarchy-desktop.iso: kanarchy-desktop.bin
 
 # ---- Compile ----
 # Objects depend on all headers — FONT_SCALE/layout constants live in
-# graphics.h/window.h and stale objects with mixed metrics garble rendering
-HEADERS := $(wildcard src/*.h) $(wildcard src/net/*.h)
+# graphics.h/window.h and stale objects with mixed metrics garble rendering.
+# On top of that every compile writes a -MMD dependency file (included at
+# the bottom): a struct grown in src/crypto/tls_client.h once left
+# tls_net.o at the old size, tls_state_init's memset ran past it and zeroed
+# the fetch-timeout clock — every HTTPS fetch "timed out" instantly.
+HEADERS := $(wildcard src/*.h) $(wildcard src/net/*.h) $(wildcard src/crypto/*.h)
 %.o: %.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -247,7 +252,11 @@ run-desktop: desktop
 debug: text
 	qemu-system-i386 -cdrom kanarchy-text.iso -boot d -serial stdio
 
+ALL_C_OBJ = $(COMMON_OBJ) $(TEXT_OBJ) $(DESKTOP_OBJ) src/kernel.o src/desktop.o
+
 clean:
-	rm -f $(ASM_OBJ) boot/start_text.o $(COMMON_OBJ) $(TEXT_OBJ) $(DESKTOP_OBJ) src/kernel.o src/desktop.o
+	rm -f $(ASM_OBJ) boot/start_text.o $(ALL_C_OBJ) $(ALL_C_OBJ:.o=.d)
 	rm -f kanarchy-text.bin kanarchy-text.iso kanarchy-desktop.bin kanarchy-desktop.iso
 	rm -rf isodir
+
+-include $(wildcard $(ALL_C_OBJ:.o=.d))

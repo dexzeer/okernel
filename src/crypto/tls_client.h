@@ -77,6 +77,7 @@ enum tls_phase {
 
 struct tls_state {
     int phase;
+    uint16_t suite;    // negotiated cipher suite (TLS_CIPHER_*), from ServerHello
     const char* host; // ALWAYS canonical (see tls_canon_host): set once in
                       // tls_state_init from the caller string into host_canon
                       // below, so SNI/cert/pin/ticket provably agree. Points
@@ -137,9 +138,10 @@ struct tls_state {
     int got_staple;
     // Stapled OCSP response bytes (copied for post-auth validation — the
     // cert_body views stay alive, but an explicit bounded copy keeps the
-    // validator's lifetime independent). Cap 2048B (real staples run
-    // 500-1500B); larger staples fail the flight, not the parser.
-    uint8_t staple[2048];
+    // validator's lifetime independent). Cap 8KB (direct staples run
+    // 500-1500B, delegated ones carry a 1-2KB responder cert); larger
+    // staples fail the flight, not the parser.
+    uint8_t staple[8192];   // delegated-responder staples carry a cert (2-3KB seen)
     uint32_t staple_len;
 
     // Handshake flight order: 0=expect EE, 1=CERT, 2=CV, 3=Finished.
@@ -175,7 +177,7 @@ void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
                     const uint8_t* request, uint32_t request_len,
                     uint8_t* out, uint32_t out_cap);
 // Optional wall clock (ms) for ticket-age accounting. The kernel passes
-// tick_count at fetch time; host callers pass gettimeofday-ish ms.
+// ms since boot (tick_count * 10); host callers pass gettimeofday-ish ms.
 // Default 0 = unknown (stored tickets read age 0).
 void tls_state_set_now_ms(struct tls_state* st, uint64_t now_ms);
 int tls_state_step(struct tls_state* st, const struct tls_client_io* io);

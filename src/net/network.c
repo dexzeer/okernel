@@ -61,6 +61,8 @@ static char http_pending_path[NET_PATH_MAX] = {0};
 // Latched per request in http_get_port: the GET itself is built later.
 int net_accept_gzip = 0;
 static int http_req_gzip = 0;
+int net_accept_html = 0;
+static int http_req_html = 0;
 const char* net_extra_headers = 0;
 static char http_req_extra[NET_EXTRA_MAX];   // latched copy (DNS retries reuse it)
 static int http_retry_pending = 0;
@@ -627,10 +629,6 @@ static void handle_dns_response(uint8_t* data, uint16_t len) {
             dns_resolved = 1;
             dns_pending = 0;
 
-            serial_puts("[dns] resolved: ");
-            serial_puts(net_event_msg + 10); // reuse net_event_msg after building it
-            serial_putchar('\n');
-
             // Queue event for terminal
             for (int i = 0; i < 255; i++) net_event_msg[i] = 0;
             int idx = 0;
@@ -772,6 +770,21 @@ int dns_is_resolved(uint32_t* ip, const char* host) {
 }
 
 int dns_is_pending(void) { return dns_pending; }
+
+// A query for THIS host is in flight. Another host's pending query is stale
+// (its fetch was abandoned, e.g. a sub-resource cut off by navigation):
+// callers must send their own instead of waiting on it — the new tx id makes
+// the stale answer drop. Waiting on it made the next navigation's fetch see
+// "not pending, not resolved for my host" and abort as a DNS failure.
+int dns_is_pending_for(const char* host) {
+    return dns_pending && dns_host_matches(dns_resolved_host, host);
+}
+
+// The last query sent (or seeded) was for this host — so "not pending and
+// not resolved" means it definitively failed rather than being superseded.
+int dns_last_query_for(const char* host) {
+    return dns_host_matches(dns_resolved_host, host);
+}
 
 // TCP checksum (with pseudo-header) — uses big-endian reads for correctness
 static uint16_t tcp_checksum(uint8_t* src_ip, uint8_t* dst_ip, uint8_t* tcp_data, int tcp_len) {
@@ -1589,6 +1602,7 @@ void http_get_port(const char* host, const char* path, uint16_t port) {
     uint16_t use_port = port ? port : 80;
     http_pending_port = use_port;
     http_req_gzip = net_accept_gzip;
+    http_req_html = net_accept_html;
     if (net_extra_headers != http_req_extra) {
         int k = 0;
         if (net_extra_headers)
@@ -1613,7 +1627,7 @@ void http_get_port(const char* host, const char* path, uint16_t port) {
     uint32_t ip;
     if (dns_is_resolved(&ip, host)) {
         // Already resolved for this host, connect directly
-    } else if (dns_is_pending()) {
+    } else if (dns_is_pending_for(host)) {
         // Save for retry after DNS completes
         net_copy_str(http_pending_host, host);
         net_copy_path(http_pending_path, path);
@@ -1684,8 +1698,10 @@ void http_get_port(const char* host, const char* path, uint16_t port) {
     req_buf[req_len++] = '\r';
     req_buf[req_len++] = '\n';
 
-    const char* hdr_ua = "User-Agent: okernel/0.4\r\nAccept: */*\r\n";
+    const char* hdr_ua = "User-Agent: okernel/0.4\r\n";
     for (int i = 0; hdr_ua[i]; i++) req_buf[req_len++] = hdr_ua[i];
+    const char* hdr_acc = http_req_html ? NET_ACCEPT_HTML : "Accept: */*\r\n";
+    for (int i = 0; hdr_acc[i]; i++) req_buf[req_len++] = hdr_acc[i];
     if (http_req_gzip) {
         const char* hdr_ae = "Accept-Encoding: gzip\r\n";
         for (int i = 0; hdr_ae[i]; i++) req_buf[req_len++] = hdr_ae[i];
@@ -1875,16 +1891,18 @@ void net_poll(void) {
         if (dns_is_resolved(&ip, http_pending_host)) {
             if (tcp_conn.state == TCP_STATE_CLOSED) {
                 http_retry_pending = 0;
-                { int sv = net_accept_gzip; net_accept_gzip = http_req_gzip; // keep the original request's opt-in
+                { int sv = net_accept_gzip, sh = net_accept_html; // keep the original request's opt-ins
+                  net_accept_gzip = http_req_gzip; net_accept_html = http_req_html;
                   const char* sx = net_extra_headers; net_extra_headers = http_req_extra;
                   http_get_port(http_pending_host, http_pending_path, http_pending_port);
-                  net_accept_gzip = sv; net_extra_headers = sx; }
+                  net_accept_gzip = sv; net_accept_html = sh; net_extra_headers = sx; }
             } else if (tcp_conn.state == TCP_STATE_ESTABLISHED) {
                 http_retry_pending = 0;
-                { int sv = net_accept_gzip; net_accept_gzip = http_req_gzip; // keep the original request's opt-in
+                { int sv = net_accept_gzip, sh = net_accept_html; // keep the original request's opt-ins
+                  net_accept_gzip = http_req_gzip; net_accept_html = http_req_html;
                   const char* sx = net_extra_headers; net_extra_headers = http_req_extra;
                   http_get_port(http_pending_host, http_pending_path, http_pending_port);
-                  net_accept_gzip = sv; net_extra_headers = sx; }
+                  net_accept_gzip = sv; net_accept_html = sh; net_extra_headers = sx; }
             }
         }
     }

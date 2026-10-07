@@ -84,6 +84,7 @@ static uint32_t tls_seen_len = 0; // plaintext length at the last framing check
 #define TLS_MAX_CONN_ATTEMPTS 4
 
 static uint32_t tls_resolved_ip = 0;
+static int tls_dns_queries = 0;   // re-queries after being superseded (capped)
 static uint16_t tls_port = 443;   // destination TCP port (https default)
 
 // Fetch start tick, for a defensive timeout so a connection that can never
@@ -91,7 +92,7 @@ static uint16_t tls_port = 443;   // destination TCP port (https default)
 // forever and leaving the okai on a blank page.
 extern uint32_t tick_count;
 static uint32_t tls_start_tick = 0;
-#define TLS_FETCH_TIMEOUT_TICKS 1200 // ~66s at 18 ticks/s; generous on purpose
+#define TLS_FETCH_TIMEOUT_TICKS 3000 // 30s at 100 ticks/s (was 1200 = 66s at the old 18 Hz PIT)
 
 // Resumable TLS client state, advanced one step per https_get_poll() call.
 static int kernel_tcp_send(const uint8_t* buf, uint32_t len, void* user);
@@ -156,6 +157,7 @@ void https_get_port(const char* host, const char* path, uint16_t port) {
     tls_done = 0;
     tls_peer_closed = 0;
     tls_resolved_ip = 0;
+    tls_dns_queries = 0;
     tls_conn_attempts = 0;
     tls_fresh_conn = 1;
     tls_seen_len = 0;
@@ -177,10 +179,14 @@ void https_get_port(const char* host, const char* path, uint16_t port) {
     req = "HTTP/1.1\r\nHost: ";
     while (*req) tls_req_buf[rlen++] = *req++;
     for (i = 0; tls_host[i]; i++) tls_req_buf[rlen++] = tls_host[i];
-    req = net_accept_gzip
-        ? "\r\nUser-Agent: okernel/0.4\r\nAccept: */*\r\nAccept-Encoding: gzip\r\n"
-        : "\r\nUser-Agent: okernel/0.4\r\nAccept: */*\r\n";
+    req = "\r\nUser-Agent: okernel/0.4\r\n";
     while (*req) tls_req_buf[rlen++] = *req++;
+    req = net_accept_html ? NET_ACCEPT_HTML : "Accept: */*\r\n";
+    while (*req) tls_req_buf[rlen++] = *req++;
+    if (net_accept_gzip) {
+        req = "Accept-Encoding: gzip\r\n";
+        while (*req) tls_req_buf[rlen++] = *req++;
+    }
     if (net_extra_headers)
         for (i = 0; net_extra_headers[i] && i < NET_EXTRA_MAX - 1; i++) tls_req_buf[rlen++] = net_extra_headers[i];
     req = "Connection: close\r\n\r\n";
@@ -197,7 +203,7 @@ void https_get_port(const char* host, const char* path, uint16_t port) {
         uint32_t nip, dummy;
         if (net_parse_ip(tls_host_buf, &nip)) {
             dns_seed(tls_host_buf, nip);
-        } else if (!dns_is_resolved(&dummy, tls_host_buf) && !dns_is_pending()) {
+        } else if (!dns_is_resolved(&dummy, tls_host_buf) && !dns_is_pending_for(tls_host_buf)) {
             dns_resolve(tls_host_buf);
         }
     }
@@ -228,9 +234,15 @@ void https_get_poll(void) {
         if (dns_is_resolved(&tls_resolved_ip, tls_host)) {
             serial_puts("[tls-net] DNS resolved, opening TCP:443\n");
             tls_phase = HP_TCP;
-        } else if (!dns_is_pending()) {
+        } else if (!dns_is_pending_for(tls_host) && !dns_last_query_for(tls_host) &&
+                   tls_dns_queries < 3) {
+            // Our query was superseded by another host's (single resolver
+            // slot): ask again rather than read that as a failure.
+            tls_dns_queries++;
+            dns_resolve(tls_host);
+        } else if (!dns_is_pending_for(tls_host)) {
             // The query was answered but carried no A record (bad/empty host,
-            // NXDOMAIN). Abort now instead of stalling until the 66s timeout —
+            // NXDOMAIN). Abort now instead of stalling until the fetch timeout —
             // the okai owner model must be released for the next window.
             serial_puts("[tls-net] DNS failed (no A record), aborting fetch\n");
             tls_response_len = 0;
@@ -245,13 +257,21 @@ void https_get_poll(void) {
     if (tls_phase == HP_TCP) {
         if (!tls_fresh_conn && tcp_is_established()) {
             // Connection is up: run the TLS handshake exactly once.
+            // A TLS 1.3 server says nothing before our ClientHello, so any
+            // byte (or FIN) buffered now belongs to the PREVIOUS connection —
+            // its trailing alert record landed after the reset in
+            // https_get_port and was parsed as this ServerHello (reason=6,
+            // phase=1 on back-to-back sub-resources).
+            tls_rx_reset();
+            tls_peer_closed = 0;
             tls_state_init(&tls_s, tls_host, 443,
                            (const uint8_t*)tls_req_buf, tls_req_len,
                            (uint8_t*)tls_response, sizeof(tls_response) - 1);
-            // Ticket-age clock: tick_count is ms since boot. The ticket
-            // cache (tls_client.c) uses it for lifetime expiry + the
-            // obfuscated ticket_age in PSK offers.
-            tls_state_set_now_ms(&tls_s, (uint64_t)tick_count);
+            // Ticket-age clock in ms (the PIT runs at 100 Hz: 10 ms per
+            // tick). The ticket cache (tls_client.c) uses it for lifetime
+            // expiry + the obfuscated ticket_age in PSK offers — raw ticks
+            // kept tickets 10x past their lifetime.
+            tls_state_set_now_ms(&tls_s, (uint64_t)tick_count * 10);
             tls_phase = HP_TLS;
             serial_puts("[tls-net] TCP established, handshake...\n");
             return;

@@ -126,11 +126,19 @@ typedef struct {
     // stapled OCSP response fails the handshake (enforced in tls_client.c
     // where staple state lives — cert_verify itself is staple-unaware).
     int has_must_staple;
+    // EKU id-kp-OCSPSigning (1.3.6.1.5.5.7.3.9): a delegated OCSP responder
+    // certificate (ocsp.c accepts its signatures for its issuer's leaves).
+    int eku_ocsp_signing;
 } x509_cert;
 
 // Parse a DER certificate. Returns 0 on success, -1 on malformed input.
 // `out` holds views into `der` — keep `der` alive while using `out`.
 int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out);
+// Parse a bare SubjectPublicKeyInfo element: only the key fields of `out`
+// (key_type, rsa_n/rsa_e or ec_point, keybits, spki) are set. Trust
+// anchors are used this way — their own certificates may carry legacy
+// encodings the strict certificate parser refuses (never re-validated).
+int x509_parse_spki(const uint8_t* der, uint32_t len, x509_cert* out);
 
 // -1 if a < b, 0 equal, 1 if a > b.
 int x509_time_cmp(const x509_time* a, const x509_time* b);

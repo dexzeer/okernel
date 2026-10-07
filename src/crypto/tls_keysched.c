@@ -90,6 +90,10 @@ int tls_record_key(const uint8_t traffic_secret[32], uint8_t out[32]) {
     return tls_hkdf_expand_label(traffic_secret, "key", NULL, 0, out, 32);
 }
 
+int tls_record_key_len(const uint8_t traffic_secret[32], uint8_t* out, uint32_t key_len) {
+    return tls_hkdf_expand_label(traffic_secret, "key", NULL, 0, out, key_len);
+}
+
 int tls_record_iv(const uint8_t traffic_secret[32], uint8_t out[12]) {
     return tls_hkdf_expand_label(traffic_secret, "iv", NULL, 0, out, 12);
 }
