@@ -5,18 +5,19 @@
 #include "x509.h"
 
 // OCSP response validation for TLS staples (RFC 6960, stapling profile).
-// Scope: issuer-signed responses only (responder == issuing CA, byName =
-// issuer subject). Delegated responders (OCSPSigning EKU) are rejected as
-// untrusted — documented, not silent: a staple we cannot authorize fails
-// the same as a bad staple. Rationale: our chains are short and test CAs
-// respond directly; delegated-OCSP adds a second chain walk.
+// Signer: the issuing CA itself, or a delegated responder certificate
+// carried in the response (issued by that CA, EKU id-kp-OCSPSigning,
+// currently valid, RSA >= 2048) — what real CAs (DigiCert, Sectigo,
+// Amazon, ...) use. responderID may be byName or byKey (SHA-1 of the
+// signer's subjectPublicKey).
 //
 /// Verification steps (all must pass):
 //   1. OCSPResponse: responseStatus == successful(0), responseBytes present
 //      with responseType id-pkix-ocsp-basic.
-//   2. BasicOCSPResponse: version + responderID byName == issuer subject
-//      (byte-exact, same rule as chain matching).
-//   3. response signature verifies with the ISSUER key (RSA v1.5 or ECDSA
+//   2. BasicOCSPResponse: version + responderID (byName == signer subject,
+//      byte-exact, or byKey == SHA-1(signer key)) naming the issuer or an
+//      authorized delegated responder from `certs`.
+//   3. response signature verifies with the SIGNER key (RSA v1.5 or ECDSA
 //      per the TBS sig alg — same verifiers as the chain path).
 //   4. SingleResponse[0]: certID matches (hashAlgorithm SHA-1 (ubiquitous)
 //      or SHA-256; issuerNameHash over the full issuer Name DER;

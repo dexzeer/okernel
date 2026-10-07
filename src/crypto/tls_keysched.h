@@ -70,6 +70,9 @@ int tls_finished_key(const uint8_t traffic_secret[32], uint8_t out[32]);
 // Derive the record-protection key (32 bytes for ChaCha20-Poly1305).
 // Returns 0/-1 (see above).
 int tls_record_key(const uint8_t traffic_secret[32], uint8_t out[32]);
+// Record key of key_len bytes (32 ChaCha20-Poly1305, 16 AES-128-GCM; the
+// length is part of the HKDF label, so it must match the suite).
+int tls_record_key_len(const uint8_t traffic_secret[32], uint8_t* out, uint32_t key_len);
 
 // Derive the record IV (12 bytes for ChaCha20-Poly1305).
 // Returns 0/-1 (see above).

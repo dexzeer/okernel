@@ -29,6 +29,7 @@
 
 // Cipher suites we offer / accept.
 #define TLS_CIPHER_CHACHA20_POLY1305_SHA256 0x1303
+#define TLS_CIPHER_AES_128_GCM_SHA256       0x1301
 
 // TLS 1.3 supported_versions body.
 #define TLS_VERSION_TLS13 0x0304

@@ -89,6 +89,8 @@ int dns_is_resolved(uint32_t* ip, const char* host);
 void dns_seed(const char* host, uint32_t ip);
 int net_parse_ip(const char* s, uint32_t* out); // "a.b.c.d" -> host-order IP (0 = fail)
 int dns_is_pending(void);
+int dns_is_pending_for(const char* host);  // a query for THIS host is in flight
+int dns_last_query_for(const char* host);  // last query sent/seeded was this host
 
 // TCP connection
 void tcp_connect(uint32_t dst_ip, uint16_t dst_port);
@@ -126,6 +128,11 @@ void http_reset_conn_attempts(void);
 // Accept-Encoding: gzip opt-in, latched per request (okai decodes bodies;
 // raw saves leave it 0 so files land uncompressed).
 extern int net_accept_gzip;
+// Top-level navigation: send a browser's HTML-first Accept instead of */*
+// (latched like the gzip opt-in). Some sites route on it — crates.io
+// answers "Accept: */*" with an empty 404 (its API), text/html with the app.
+#define NET_ACCEPT_HTML "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8\r\n"
+extern int net_accept_html;
 // Extra request header lines ("Cookie: ...\r\n"), latched per request like
 // the gzip opt-in (okai sets it around a fetch; NULL = none). <= 4KB.
 #define NET_EXTRA_MAX 4096

@@ -42,6 +42,9 @@ qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e10
 - **Compiler flags matter:** `-fno-pic -fno-pie -mno-red-zone` are required. Without them, GCC generates position-independent code with `__x86.get_pc_thunk` calls that crash in a freestanding kernel.
 - **Image size** (~2.8MB text incl. 1.5MB embedded fonts, ~7.9MB BSS; `_kernel_end` ≈ 11.3MB phys). Must stay inside the boot PD's 64M window. Put big tables on the heap (segregated-fit `kmalloc`/`kfree`, RAM-sized: 414MB at `-m 512`), not in BSS.
 - **Web engine rules (src/web).** Integer/fixed-point only (LU = 1/64 px) — no FPU. No libgcc: 64-bit `/` or `%` links `__divdi3` and fails; use `w_div64`/`w_muldiv`. Every engine call from okai goes through `run_job()` (private 1MB stack via `call_on_stack`). The same sources build on the host (`make web-tests`, `tests/web/build.sh`) — fix layout bugs there against Edge (`tests/web/compare.py`), then rebuild the kernel.
+- **QuickJS uses the x87 (2026-10-07).** The web engine itself stays integer-only, but page JS needs doubles: every realm entry sets the x87 control word to 53-bit precision (fldcw 0x027F), the kernel FNSAVE/FRSTORs per thread on preemptive switches, `abort()` longjmps out of the realm (a QuickJS assert kills the page, not the OS). Realm limits: 96MB heap, 8s per script, 1.5s per task. libgcc is linked for QuickJS's 64-bit division only — the engine rule above still holds for `src/web`.
+- **TLS trust (2026-10-07).** Chains anchor two ways: a cert ISSUED BY a store root (name-bound: issuer DN == root subject, AKI == root SKI when both exist, signature verifies under the root key — `root_issued()` in `certverify.c`; servers don't send roots), or an in-flight cert whose SPKI is a root key. Certs past the anchor are ignored (expired cross-signs must not fail the path). Root store = Mozilla's, regenerated with `python3 tools/gen_roots.py` (embeds whole certs: subject + SKI + SPKI). OCSP staples: only a verified REVOKED status or a Must-Staple leaf hard-fails; stale/unverifiable staples soft-fail like an absent one. Suites: ChaCha20-Poly1305 (preferred) + AES-128-GCM (`aes.c`, constant-time; Akamai sites need it); no SHA-384 suites, no TLS 1.2.
+- **Makefile tracks headers via `-MMD -MP` (2026-10-07).** Never drop it: before it, `src/crypto/*.h` weren't dependencies, a grown `struct tls_state` left `tls_net.o` at the old size, and `tls_state_init`'s memset zeroed the neighbouring fetch-timeout clock — every HTTPS fetch "timed out" instantly and silently downgraded to HTTP. When in doubt, `make clean`.
 - **okai fetches are serialized** on the single connection (`okai_fetch_owner` + `fetch_tab`, driven by `okai_poll()`); each HTTPS fetch opens a fresh TCP connection and ends at HTTP message completion. Never start a second request while one is in flight.
 
 ## File ownership
@@ -70,9 +73,9 @@ qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e10
 | Editor | `src/editor.c/.h`, `src/textslot.c/.h` | Text editor opened inside windows; codepoint → bitmap-font slot map |
 | Browser | `src/okai.c/.h` | okai shell: tabs, chrome overlay, address bar, fetch driver (`okai_poll`), page surface, pixel hit-testing, forms, HTML error/home pages |
 | Web engine | `src/web/*` | `wdoc` (document controller), `wdom` + `html5` (WHATWG parser), `css_*` (cascade), `lay_*` (block/inline/float/abs/flex/grid/table → display list), `paint`/`raster` (AA painter), `font` + `fontdata.asm` (TrueType, Noto in `fonts/`), `image` (PNG/JPEG/GIF/BMP, inflate/gzip), `svg`, `wurl`, `callstack.asm` |
-| JS Engine | `src/js/js_os.h/.c`, `src/js/js.h`, `src/js/js_var.c`, `src/js/js_lex.c`, `src/js/js_parse.c`, `src/js/js_funcs.c`, `src/js/js_math.c`, `src/js/js_dom.c/.h` | tinyjs ok edition — C port of tiny-js (MIT, substantially rewritten). DOM bridge on the active tab's `wdom` (getElementById, querySelector(All), createElement, setText, setStyle, set/getAttribute, appendChild, setInnerHTML). Page scripts are not executed (QuickJS = Phase 6). |
+| JS Engine | `src/qjs/*` (QuickJS 2026-06-04 + `libc/` shim + musl `libm/`, see `README.okernel`), `src/web/wjs.c/.h`, `wjs_dom.c`, `wjs_int.h`, `wjs_prelude.js` (+`.asm` embed), `src/web/wcookie.c/.h` | One QuickJS realm per document (lazy). Page scripts run: parser-blocking/defer/async/dynamic/`document.write`/module graphs (fetched ahead, `JS_EVAL_FLAG_NO_RESOLVE`), timers/rAF/microtasks under time budgets, DOM events before default actions, fetch()/XHR over the single connection. Web API = JS prelude over C natives (`W` object). Cookie jar shared by HTTP and `document.cookie`. tinyjs (`src/js`) is gone. |
 | Networking | `src/net/pci.c`, `src/net/e1000.c`, `src/net/network.c`, `src/net/tls_net.c` | PCI enum, e1000 NIC (TX+RX), ARP/IP/ICMP/UDP/TCP/DNS/HTTP, TLS 1.3 client wrapper |
-| Crypto | `src/crypto/*.c/.h` | SHA-256, ChaCha20, Poly1305, HMAC, HKDF, AEAD, X25519, TLS 1.3 record/handshake/keysched/client, ChaCha20 CPRNG (`rand.c`) |
+| Crypto | `src/crypto/*.c/.h` | SHA-256, ChaCha20, Poly1305, HMAC, HKDF, AEAD, AES-128-GCM (`aes.c`, constant-time bitsliced), X25519, TLS 1.3 record/handshake/keysched/client, X.509 + chain verify (`certverify.c`), Mozilla root store (`roots.c`, generated by `tools/gen_roots.py`), OCSP staples (`ocsp.c`), ChaCha20 CPRNG (`rand.c`) |
 | Libc | `src/string.c/.h` | freestanding memcpy/memset/memcmp/memmove/strlen/strncpy (needed by crypto + JS engine) |
 
 ## Architecture in 30 seconds
@@ -82,7 +85,7 @@ qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e10
 3. `kernel_main()` does: GDT (kernel + user segments + TSS) → IDT (exceptions + IRQs + INT 0x80) → memory → paging → process table → graphics → windows → mouse → keyboard → networking → sti → main loop
 4. Main loop: handle mouse clicks/drags → `okai_poll()` (fetches, sub-resources, coalesced page renders) → check JS rerender → draw windows (+ okai chrome overlay) → draw cursor → flush dirty rows
 5. Keyboard/mouse work via hardware interrupts (IRQ1/IRQ12), not polling
-6. Page stylesheets then images are fetched sequentially through the single connection after the document parses (scripts are not fetched)
+6. Page scripts, stylesheets and images are fetched sequentially through the single connection after the document parses; scripts run in the document's QuickJS realm (`okai_poll` pumps it under a time budget)
 
 ## Adding new features
 
@@ -90,18 +93,18 @@ qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e10
 - **New window type:** use `window_create()`, `window_puts()`, `window_set_close_button()`. Windows auto-manage content buffers.
 - **New interrupt handler:** add ISR stub in `isr.asm` (use `ISR_NOERRCODE`/`ISR_ERRCODE` macros), register in `idt_init()` in `idt.c`, add handler function.
 - **New drawing primitive:** add to `graphics.c`, write to `backbuffer[]`, mark dirty rows with `graphics_mark_dirty(y)`.
-- **New JS DOM method:** add callback in `js_dom.c`, register via `js_add_native()` in `js_init()`, or create native function var directly on element in `js_dom_get_element()`.
+- **New Web API:** prefer plain JS in `src/web/wjs_prelude.js` (rebuilt into `wjs_prelude.o`); add a C native in `wjs_dom.c` (exposed on the `W` object) only when it needs engine internals (DOM arena, layout, CSS). Test on the host first: `build-host/wbrowse <url|file> ...` (`tests/web/js/basic.html` must stay ALLPASS).
 - **New process feature:** extend `process.c` (process_create/destroy/switch), update `process.h` with new fields.
 
 ## Text vs Desktop mode
 
 The Makefile builds completely separate binaries from different source sets:
 - Text: `kernel.c` + `vga.c` + `terminal.c` + `shell.c`
-- Desktop: `desktop.c` + `graphics.c` + `window.c` + `paging.c` + `filesystem.c` + `editor.c` + `textslot.c` + `okai.c` + `web/*` + `js/*` + `net/*` + `crypto/*` + `string.c` + `theme.h`
+- Desktop: `desktop.c` + `graphics.c` + `window.c` + `paging.c` + `filesystem.c` + `editor.c` + `textslot.c` + `okai.c` + `web/*` + `qjs/*` + `net/*` + `crypto/*` + `string.c` + `theme.h`
 
 Shared: `gdt.c`, `idt.c`, `memory.c`, `serial.c`, `keyboard.c`, `mouse.c`, `io.h`
 
-If you modify shared code, test both builds. If you modify mode-specific code, only that build is affected. Networking, TLS, the web engine, the JS engine, and okai are desktop-only.
+If you modify shared code, test both builds. If you modify mode-specific code, only that build is affected. Networking, TLS, the web engine, QuickJS, and okai are desktop-only.
 
 ## Headless testing (okvm)
 
@@ -125,7 +128,8 @@ Key facts:
 - `vm.click_link(href_part)` / `vm.click_at(page_x, page_y)` are closed-loop on `[okai] click x=.. y=..` (page px); `vm.click_screen(x, y, regex)` for chrome, on `[mse] btn=1`. Link targets come from `[okai] link[i] x= y= w= h= href=` (each page's first render; `vm.link_regions()`).
 - `vm.wait_for(pattern)` matches ANY earlier occurrence — for "the next page loaded" count `parse: count=` lines instead
 - Full docs in `tests/headless/TESTING.md`; parallel runner: `python3 tests/headless/run_suite.py -j3 test_*.py`
-- Browser end-to-end: `test_okai_interact.py` (offline fixtures), `test_okai_page.py <url> [tag] [--scroll N]`, `test_links.py`, `test_nav.py`, `test_tab_x.py`, `test_errors.py`, `test_google_search.py`, ...
+- Browser end-to-end: `test_okai_interact.py` (offline fixtures), `test_okai_js.py` (page scripts: offline JS fixture + Wikipedia), `test_okai_page.py <url> [tag] [--scroll N]`, `test_links.py`, `test_nav.py`, `test_tab_x.py`, `test_errors.py`, `test_google_search.py`, `test_sites.py [tag] [url ...]` (real-site HTTPS sweep: OK only when the page arrived over TLS — a plain-HTTP fallback counts as a failure), ...
+- Host TLS: `make host-tests` (crypto, AES-GCM vs OpenSSL, PKI, adversarial 189 + live example.com MITM check), `make host-tests-asan` after crypto/TLS changes, `build-host/tls_scan` over `tests/tls_hosts.txt` for a real-site handshake census.
 
 Run after touching window.c/mouse code: `python3 tests/headless/test_nav.py` and `test_okai_interact.py`
 

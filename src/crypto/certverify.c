@@ -189,6 +189,31 @@ static int verify_sig(const x509_cert* cert, const x509_cert* issuer) {
                            cert->signature.p, cert->signature.len);
 }
 
+// Name-bound anchor (see roots.h): is `cert` issued by a trusted root?
+// Root and issuer names must match byte-exactly, key identifiers must
+// agree when both are present, the root must be fit to issue (CA,
+// keyCertSign, serverAuth if constrained, key strength) and the signature
+// must verify under its key. Several roots may share a name (re-keyed
+// roots): every candidate is tried.
+static int root_issued(const x509_cert* cert) {
+    static x509_cert root;   // static: x509_cert is large (kernel stacks)
+    for (int i = 0; i < x509_root_count; i++) {
+        const x509_root* r = &x509_roots[i];
+        if (!r->subject || r->subject_len != cert->issuer.len ||
+            memcmp(r->subject, cert->issuer.p, r->subject_len) != 0)
+            continue;
+        if (cert->has_aki && r->ski &&
+            (cert->aki_len != r->ski_len || memcmp(cert->aki, r->ski, cert->aki_len) != 0))
+            continue;
+        // Trust anchor = name + key (RFC 5280 6.1.1 d): only the key is
+        // parsed; the root's own certificate is not re-validated.
+        if (x509_parse_spki(r->spki, r->spki_len, &root) != 0) continue;
+        if (root.key_type == X509_KEY_RSA && root.rsa_n_len < 256) continue;
+        if (verify_sig(cert, &root) == 0) return 1;
+    }
+    return 0;
+}
+
 int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname) {
     // ---- walk the certificate_list into views ----
     if (msg_len < 4) return CV_ERR_NO_CERT;
@@ -230,12 +255,12 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
     // clockless machine must never render HTTPS as trustworthy.
     if (!x509_time_known()) return CV_ERR_EXPIRED;
 
-    // ---- validity window for every cert in the flight ----
+    // ---- validity window: the leaf now, each issuer as the walk uses it
+    // (an unused extra certificate past the anchor — e.g. an expired
+    // cross-signature some servers still append — must not fail the path)
     const x509_time* now = x509_get_now();
-    for (int i = 0; i < ncerts; i++) {
-        if (x509_time_cmp(now, &certs[i].not_before) < 0) return CV_ERR_NOT_YET;
-        if (x509_time_cmp(now, &certs[i].not_after) > 0) return CV_ERR_EXPIRED;
-    }
+    if (x509_time_cmp(now, &certs[0].not_before) < 0) return CV_ERR_NOT_YET;
+    if (x509_time_cmp(now, &certs[0].not_after) > 0) return CV_ERR_EXPIRED;
 
     // ---- hostname (do it first: cheapest rejection) ----
     if (x509_hostname_match(&certs[0], hostname) != 0) return CV_ERR_HOSTNAME;
@@ -249,15 +274,15 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
 
     // ---- chain walk ----
     // leaf = certs[0]; each certs[i] is verified with certs[i+1]'s key until
-    // a chain cert's SPKI matches an embedded root (trust anchor). Cross-
-    // signed roots work naturally: the cross-cert carries the root's KEY.
-    // ORDER-DEPENDENT by design (cryptoholes #4): no path building, no
-    // alternate-issuer search — the flight must arrive leaf-first per
+    // either certs[i] is issued by a store root (name-bound anchor, see
+    // root_issued: the server need not send the root) or a chain cert's
+    // SPKI matches a root key (in-flight anchor; cross-signed roots work
+    // naturally: the cross-cert carries the root's KEY). Certificates past
+    // the anchor are ignored. ORDER-DEPENDENT by design (cryptoholes #4):
+    // no alternate-issuer search — the flight must arrive leaf-first per
     // RFC 8446 §4.4.2 (every compliant server does). Reordering a valid
     // chain fails CLOSED (availability, never auth bypass: we never accept
-    // on a partial walk). Full path building would only matter with
-    // name-bound anchors (see HANDOFF trust-anchor item); under SPKI
-    // pinning the anchor must be in-flight anyway.
+    // on a partial walk).
     // ---- key usage / EKU on the leaf (review 2026-09-10 #6) ----
     // A clientAuth/codeSigning-only leaf must not terminate a TLS-server
     // chain even if perfectly chained. Absent extensions constrain nothing
@@ -286,9 +311,21 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
         return CV_OK;
     }
 
-    for (int i = 0; i + 1 < ncerts; i++) {
+    for (int i = 0; i < ncerts; i++) {
+        // Anchored through the root store? certs[i] issued by a trusted
+        // root (the usual case: the server did not send the root).
+        if (root_issued(&certs[i])) {
+            for (int a = 1; a <= i; a++)
+                for (int b = 0; b < a; b++)
+                    if (nc_pair_ok(&certs[a], &certs[b]) != 0) return CV_ERR_CAFLAGS;
+            if (cert_revoked(certs, ncerts)) return CV_ERR_REVOKED;
+            return CV_OK;
+        }
+        if (i + 1 >= ncerts) break;
         const x509_cert* subject = &certs[i];
         const x509_cert* issuer = &certs[i + 1];
+        if (x509_time_cmp(now, &issuer->not_before) < 0) return CV_ERR_NOT_YET;
+        if (x509_time_cmp(now, &issuer->not_after) > 0) return CV_ERR_EXPIRED;
 
         // issuer/subject names must match byte-exactly (same DER encoding)
         if (subject->issuer.len != issuer->subject.len ||

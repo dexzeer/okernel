@@ -1,108 +1,136 @@
 #!/usr/bin/env python3
-# Generates src/crypto/roots.c from PEM root certificates.
-# Embeds each root's SubjectPublicKeyInfo DER + a name string; matching is by
-# SHA-256 over the SPKI DER (see certverify.c). Rerun to refresh the store.
-import base64, hashlib, subprocess, sys, os
+# Generates src/crypto/roots.c: the trusted root CA store.
+#
+# Source: the Mozilla CA program as packaged by Debian/Ubuntu
+# (/usr/share/ca-certificates/mozilla/*.crt — roots trusted for TLS server
+# authentication). Each entry embeds the full root certificate DER; the
+# SubjectPublicKeyInfo and subject Name are views into it. certverify.c
+# anchors a chain either at an in-flight certificate carrying a root's key
+# (SPKI hash match) or at a flight certificate ISSUED by a root (subject
+# name + key identifier match, signature verified with the root's key).
+#
+#   python3 tools/gen_roots.py [cert-dir]
+import base64, hashlib, os, sys, glob
 
-ROOTS = [
-    "SSL.com_TLS_ECC_Root_CA_2022",     # example.com chain (SSL.com)
-    "SSL.com_TLS_RSA_Root_CA_2022",
-    "ISRG_Root_X1",                      # Let's Encrypt (RSA-4096)
-    "ISRG_Root_X2",                      # Let's Encrypt (ECDSA P-384)
-    "GTS_Root_R1",                       # Google Trust Services
-    "GTS_Root_R4",
-    "DigiCert_Global_Root_G2",
-    "Amazon_Root_CA_1",
-    "Amazon_Root_CA_3",
-    "USERTrust_RSA_Certification_Authority",
-    "USERTrust_ECC_Certification_Authority",
-    "GlobalSign_Root_CA_-_R3",
-    "Sectigo_Public_Server_Authentication_Root_R46",
-    "Sectigo_Public_Server_Authentication_Root_E46",
-]
+DEFAULT_DIR = "/usr/share/ca-certificates/mozilla"
 
-def pem_spki_and_name(path):
-    # SPKI DER
-    out = subprocess.run(["openssl", "x509", "-in", path, "-noout", "-pubkey"],
-                         capture_output=True, text=True).stdout
-    b64 = "".join(l for l in out.splitlines() if "-----" not in l)
-    spki = base64.b64decode(b64)
-    # subject (one-line)
-    name = subprocess.run(["openssl", "x509", "-in", path, "-noout", "-subject",
-                           "-nameopt", "sep_multiline,utf8"],
-                          capture_output=True, text=True).stdout
-    # compact: take CN or fall back to whole thing
-    cn = ""
-    for line in name.splitlines():
-        line = line.strip()
-        if line.startswith("CN="):
-            cn = line[3:]
-            break
-    if not cn:
-        cn = os.path.basename(path).replace(".pem", "")
-    # key type from the SPKI algorithm OID
-    oid = subprocess.run(["openssl", "x509", "-in", path, "-noout", "-text"],
-                         capture_output=True, text=True).stdout
-    if "id-ecPublicKey" in oid:
-        ktype = "X509_KEY_EC_P384" if "secp384r1" in oid else "X509_KEY_EC_P256"
-    elif "Public-Key" in oid:
+# ---- minimal DER walker ----
+def tlv(b, i):
+    tag = b[i]; i += 1
+    l = b[i]; i += 1
+    if l & 0x80:
+        n = l & 0x7F
+        l = int.from_bytes(b[i:i + n], "big"); i += n
+    return tag, i, l          # tag, content start, content length
+
+def children(b, start, length):
+    out, i, end = [], start, start + length
+    while i < end:
+        tag, cs, cl = tlv(b, i)
+        out.append((tag, i, cs, cl))   # tag, element start, content start, content len
+        i = cs + cl
+    return out
+
+OID_RSA = bytes.fromhex("2a864886f70d010101")
+OID_EC = bytes.fromhex("2a8648ce3d0201")
+OID_P256 = bytes.fromhex("2a8648ce3d030107")
+OID_P384 = bytes.fromhex("2b81040022")
+
+def parse(der):
+    _, cs, cl = tlv(der, 0)                     # Certificate
+    tbs = children(der, cs, cl)[0]              # TBSCertificate
+    f = children(der, tbs[2], tbs[3])
+    k = 1 if f[0][0] == 0xA0 else 0             # [0] version present?
+    # serial, sigalg, issuer, validity, subject, spki
+    subj = f[k + 4]
+    spki = f[k + 5]
+    subj_der = (subj[1], subj[2] + subj[3] - subj[1])
+    spki_der = (spki[1], spki[2] + spki[3] - spki[1])
+    # SubjectKeyIdentifier (2.5.29.14) from the [3] extensions, if any
+    ski = None
+    for el in f[k + 6:]:
+        if el[0] != 0xA3:
+            continue
+        exts = children(der, el[2], el[3])[0]
+        for ext in children(der, exts[2], exts[3]):
+            parts = children(der, ext[2], ext[3])
+            if der[parts[0][2]:parts[0][2] + parts[0][3]] == bytes.fromhex("551d0e"):
+                octet = parts[-1]                       # extnValue OCTET STRING
+                inner = children(der, octet[2], octet[3])[0]   # KeyIdentifier OCTET STRING
+                ski = (inner[2], inner[3])
+    alg = children(der, spki[2], spki[3])[0]    # AlgorithmIdentifier
+    a = children(der, alg[2], alg[3])
+    oid = der[a[0][2]:a[0][2] + a[0][3]]
+    ktype = None
+    if oid == OID_RSA:
         ktype = "X509_KEY_RSA"
-    else:
-        ktype = "X509_KEY_NONE"
-    return spki, cn, ktype
+    elif oid == OID_EC and len(a) > 1:
+        curve = der[a[1][2]:a[1][2] + a[1][3]]
+        ktype = {OID_P256: "X509_KEY_EC_P256", OID_P384: "X509_KEY_EC_P384"}.get(curve)
+    return subj_der, spki_der, ktype, ski
+
+def cn_of(der, subj):
+    # best effort: the last CN (2.5.4.3) or O (2.5.4.10) in the subject
+    s, n = subj
+    name, org = None, None
+    for rdn in children(der, *tlv(der, s)[1:]):
+        for atv in children(der, rdn[2], rdn[3]):
+            parts = children(der, atv[2], atv[3])
+            oid = der[parts[0][2]:parts[0][2] + parts[0][3]]
+            val = der[parts[1][2]:parts[1][2] + parts[1][3]].decode("utf-8", "replace")
+            if oid == bytes.fromhex("550403"): name = val
+            if oid == bytes.fromhex("55040a"): org = val
+    return name or org or "root"
 
 def main():
-    out = []
-    out.append("// roots.c — GENERATED by tools/gen_roots.py — do not edit by hand.")
-    out.append("// Trusted root CA store for TLS 1.3 certificate verification.")
-    out.append("// Each entry: raw SubjectPublicKeyInfo DER + its SHA-256 (the SPKI")
-    out.append("// hash the chain verifier matches against, see certverify.c).")
-    out.append('#include "roots.h"')
-    out.append('#include "x509.h"')
-    out.append("")
+    d = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DIR
+    files = sorted(glob.glob(os.path.join(d, "*.crt")) + glob.glob(os.path.join(d, "*.pem")))
+    out = ["// roots.c — GENERATED by tools/gen_roots.py — do not edit by hand.",
+           "// Trusted root CA store (Mozilla CA program, TLS server auth) for",
+           "// TLS 1.3 certificate verification. Each entry: the root certificate",
+           "// DER, views of its SubjectPublicKeyInfo and subject Name, and the",
+           "// SHA-256 of the SPKI (see certverify.c for both anchoring modes).",
+           '#include "roots.h"', '#include "x509.h"', ""]
     entries = []
-    for name in ROOTS:
-        path = f"/etc/ssl/certs/{name}.pem"
-        if not os.path.exists(path):
-            print(f"skip (missing): {name}", file=sys.stderr)
+    seen = set()
+    for path in files:
+        pem = open(path).read()
+        b64 = "".join(l for l in pem.splitlines() if l and "-----" not in l)
+        der = base64.b64decode(b64)
+        try:
+            subj, spki, ktype, ski = parse(der)
+        except Exception as e:
+            print(f"skip (parse): {path}: {e}", file=sys.stderr)
             continue
-        spki, cn, ktype = pem_spki_and_name(path)
-        sym = "root_spki_" + "".join(ch if ch.isalnum() else "_" for ch in cn)[:48]
-        toks = [f"0x{b:02X}" for b in spki]
-        lines = []
-        cur = []
-        cur_len = 0
-        for t in toks:
-            add = len(t) + (1 if cur else 0)
-            if cur_len + add > 66:
-                lines.append(", ".join(cur) + ",")
-                cur = [t]
-                cur_len = len(t)
-            else:
-                cur.append(t)
-                cur_len += add
-        if cur:
-            lines.append(", ".join(cur) + ",")
-        out.append(f"static const uint8_t {sym}[] = {{")
-        for l in lines:
-            out.append(f"    {l}")
+        if not ktype:
+            print(f"skip (key type): {os.path.basename(path)}", file=sys.stderr)
+            continue
+        h = hashlib.sha256(der[spki[0]:spki[0] + spki[1]]).digest()
+        if (h, der[subj[0]:subj[0] + subj[1]]) in seen:
+            continue
+        seen.add((h, der[subj[0]:subj[0] + subj[1]]))
+        cn = cn_of(der, subj)
+        sym = "root_" + str(len(entries))
+        toks = [f"0x{x:02X}" for x in der]
+        out.append(f"// {cn}")
+        out.append(f"static const uint8_t {sym}[{len(der)}] = {{")
+        for i in range(0, len(toks), 16):
+            out.append("    " + ", ".join(toks[i:i + 16]) + ",")
         out.append("};")
-        h = hashlib.sha256(spki).digest()
-        hsym = sym.replace("root_spki_", "root_hash_")
-        out.append(f"static const uint8_t {hsym}[32] = {{")
-        out.append("    " + ", ".join(f"0x{b:02X}" for b in h) + ",")
+        out.append(f"static const uint8_t {sym}_hash[32] = {{")
+        out.append("    " + ", ".join(f"0x{x:02X}" for x in h) + ",")
         out.append("};")
-        entries.append((sym, hsym, len(spki), cn, ktype))
-        print(f"embedded: {cn} ({len(spki)} bytes, {ktype})", file=sys.stderr)
+        entries.append((sym, len(der), spki, subj, cn, ktype, ski))
     out.append("")
     out.append("const x509_root x509_roots[] = {")
-    for sym, hsym, ln, cn, ktype in entries:
+    for sym, ln, spki, subj, cn, ktype, ski in entries:
         esc = cn.replace("\\", "\\\\").replace('"', '\\"')
-        out.append(f'    {{ {sym}, sizeof({sym}), {hsym}, "{esc}", {ktype} }},')
+        sk = f"{sym} + {ski[0]}, {ski[1]}" if ski else "0, 0"
+        out.append(f'    {{ {sym} + {spki[0]}, {spki[1]}, {sym}_hash, "{esc}", {ktype},')
+        out.append(f'      {sym}, {ln}, {sym} + {subj[0]}, {subj[1]}, {sk} }},')
     out.append("};")
     out.append("")
     out.append(f"const int x509_root_count = {len(entries)};")
-    out.append("")
     with open("src/crypto/roots.c", "w") as f:
         f.write("\n".join(out) + "\n")
     print(f"wrote src/crypto/roots.c with {len(entries)} roots", file=sys.stderr)

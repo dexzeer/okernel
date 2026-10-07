@@ -4,6 +4,7 @@
 #include "tls_keysched.h"
 #include "x25519.h"
 #include "aead.h"
+#include "aes.h"
 #include "hmac.h"
 #include "certverify.h"
 #include "ocsp.h"
@@ -702,7 +703,23 @@ static uint8_t send_ct[18432 + 16 + 1];
 // record is consumed.
 static uint8_t dec_pt[TLS_RECORD_MAX_PAYLOAD];
 
-static int send_aead(uint8_t key[32], const uint8_t iv[12], uint64_t* seq,
+// Record AEAD for the negotiated suite (keys are 32 bytes for ChaCha20,
+// the first 16 for AES-128-GCM).
+static int rec_seal(uint16_t suite, const uint8_t key[32], const uint8_t nonce[12], const uint8_t* aad,
+                    uint32_t aad_len, const uint8_t* in, uint32_t len, uint8_t* out, uint8_t tag[16]) {
+    if (suite == TLS_CIPHER_AES_128_GCM_SHA256)
+        return aead_aes128gcm_encrypt(key, nonce, aad, aad_len, in, len, out, tag);
+    return aead_chacha20_poly1305_encrypt(key, nonce, aad, aad_len, in, len, out, tag);
+}
+static int rec_open(uint16_t suite, const uint8_t key[32], const uint8_t nonce[12], const uint8_t* aad,
+                    uint32_t aad_len, const uint8_t* in, uint32_t len, const uint8_t tag[16], uint8_t* out) {
+    if (suite == TLS_CIPHER_AES_128_GCM_SHA256)
+        return aead_aes128gcm_decrypt(key, nonce, aad, aad_len, in, len, tag, out);
+    return aead_chacha20_poly1305_decrypt(key, nonce, aad, aad_len, in, len, tag, out);
+}
+static uint32_t suite_key_len(uint16_t suite) { return suite == TLS_CIPHER_AES_128_GCM_SHA256 ? 16 : 32; }
+
+static int send_aead(uint16_t suite, uint8_t key[32], const uint8_t iv[12], uint64_t* seq,
                      uint8_t ct_type, const uint8_t* pt, uint32_t pt_len,
                      const struct tls_client_io* io) {
     uint8_t* inner = send_inner;
@@ -731,8 +748,7 @@ static int send_aead(uint8_t key[32], const uint8_t iv[12], uint64_t* seq,
     aad[3] = (uint8_t)(ct_len >> 8); aad[4] = (uint8_t)(ct_len & 0xff);
     // AEAD refusal (oversize) aborts the connection — never emit untagged
     // records (review 2026-09-10 #1).
-    if (aead_chacha20_poly1305_encrypt(key, nonce, aad, 5,
-                                       inner, pt_len + 1, ct, tag) != 0) {
+    if (rec_seal(suite, key, nonce, aad, 5, inner, pt_len + 1, ct, tag) != 0) {
         secure_zero(inner, sizeof(send_inner));
         secure_zero(ct, sizeof(send_ct));
         secure_zero(tag, sizeof(tag));
@@ -896,8 +912,7 @@ static int tls_decrypt_one(struct tls_state* st, uint8_t key[32], uint8_t iv[12]
     make_nonce(nonce, iv, *seq);
     uint8_t aad[5]; memcpy(aad, st->rec_buf, 5);
     uint8_t* enc = st->rec_buf + 5;
-    if (aead_chacha20_poly1305_decrypt(key, nonce, aad, 5,
-                                       enc, ct_len, enc + ct_len, pt) != 0)
+    if (rec_open(st->suite, key, nonce, aad, 5, enc, ct_len, enc + ct_len, pt) != 0)
         return -1;
     (*seq)++;
     // Inner content-type + padding (RFC 8446 §5.4 — cryptoholes #6 was a
@@ -1006,7 +1021,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         // trustworthy clock. With unknown time we can neither enforce the
         // ticket lifetime nor report an honest age (age 0 for a months-old
         // ticket is a lie the server shouldn't have to catch). The kernel
-        // always passes tick_count; host tls_client_run stamps wall time;
+        // passes ms since boot (tick_count * 10); host tls_client_run stamps wall time;
         // the mock stamps a fixed ms. now_ms == 0 (unwired caller) → no
         // offer, full handshake as if no ticket existed.
         if (st->now_ms != 0) {
@@ -1185,6 +1200,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             st->fail_reason = TLS_FAIL_PROTO;
             return TLS_STEP_ERR;
         }
+        st->suite = sh.cipher_suite;
         st->sh_bl = hs_bl;
         for (uint32_t i = 0; i < hs_bl; i++)
             st->sh_body[i] = st->hs_buf[4 + i];
@@ -1266,9 +1282,9 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         uint8_t s_hs[32];
         if (tls_traffic_secret(st->hs_secret, "c hs traffic", transcript_after_sh, st->c_hs_secret) != 0 ||
             tls_traffic_secret(st->hs_secret, "s hs traffic", transcript_after_sh, s_hs) != 0 ||
-            tls_record_key(st->c_hs_secret, st->c_hs_key) != 0 ||
+            tls_record_key_len(st->c_hs_secret, st->c_hs_key, suite_key_len(st->suite)) != 0 ||
             tls_record_iv(st->c_hs_secret, st->c_hs_iv) != 0 ||
-            tls_record_key(s_hs, st->s_hs_key) != 0 ||
+            tls_record_key_len(s_hs, st->s_hs_key, suite_key_len(st->suite)) != 0 ||
             tls_record_iv(s_hs, st->s_hs_iv) != 0 ||
             tls_finished_key(s_hs, st->s_fin_key) != 0) {
             st->fail_reason = TLS_FAIL_PROTO;
@@ -1641,11 +1657,22 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                                            &leaf, &issuer, x509_get_now());
                 tls_dbg("[tls] OCSP staple verdict: %s\n",
                         ocsp_strerror(ocsp_rc));
-                if (ocsp_rc != OCSP_OK) {
+                // Policy (2026-10-07): a VERIFIED revoked/unknown status
+                // always fails; a staple we cannot verify (stale, unknown
+                // responder form, bad signature) fails only for Must-Staple
+                // leaves and is otherwise treated like an absent staple.
+                // Hard-failing it bought nothing — an attacker can strip
+                // the staple instead (absent = soft-fail) — and it broke
+                // most real sites whose CAs sign through delegated
+                // responders (Firefox soft-fails the same way).
+                if (ocsp_rc == OCSP_ERR_STATUS_BAD ||
+                    (ocsp_rc != OCSP_OK && leaf.has_must_staple)) {
                     st->fail_reason = TLS_FAIL_CERT;
                     st->cert_detail = CV_ERR_OCSP;
                     return TLS_STEP_ERR;
                 }
+                if (ocsp_rc != OCSP_OK)
+                    tls_dbg("[tls] unverifiable OCSP staple ignored (soft-fail)\n");
             }
         }
 
@@ -1676,8 +1703,8 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         uint8_t c_ap[32], s_ap[32];
         if (tls_traffic_secret(master, "c ap traffic", tx_through_sfin, c_ap) != 0 ||
             tls_traffic_secret(master, "s ap traffic", tx_through_sfin, s_ap) != 0 ||
-            tls_record_key(c_ap, st->c_ap_key) != 0 || tls_record_iv(c_ap, st->c_ap_iv) != 0 ||
-            tls_record_key(s_ap, st->s_ap_key) != 0 || tls_record_iv(s_ap, st->s_ap_iv) != 0 ||
+            tls_record_key_len(c_ap, st->c_ap_key, suite_key_len(st->suite)) != 0 || tls_record_iv(c_ap, st->c_ap_iv) != 0 ||
+            tls_record_key_len(s_ap, st->s_ap_key, suite_key_len(st->suite)) != 0 || tls_record_iv(s_ap, st->s_ap_iv) != 0 ||
             tls_finished_key(st->c_hs_secret, st->c_fin_key) != 0) {
             st->fail_reason = TLS_FAIL_PROTO;
             secure_zero(derived2, sizeof(derived2));
@@ -1725,7 +1752,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         uint8_t fin_msg[4 + 32];
         fin_msg[0] = TLS_HS_FINISHED; fin_msg[1] = 0; fin_msg[2] = 0; fin_msg[3] = 32;
         memcpy(fin_msg + 4, our_fin, 32);
-        if (send_aead(st->c_hs_key, st->c_hs_iv, &st->c_seq,
+        if (send_aead(st->suite, st->c_hs_key, st->c_hs_iv, &st->c_seq,
                       TLS_CT_HANDSHAKE, fin_msg, 36, io) != 0) {
             secure_zero(our_fin, sizeof(our_fin));
             secure_zero(fin_msg, sizeof(fin_msg));
@@ -1735,7 +1762,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         secure_zero(fin_msg, sizeof(fin_msg));
 
         st->c_ap_seq = 0; st->s_ap_seq = 0;
-        if (send_aead(st->c_ap_key, st->c_ap_iv, &st->c_ap_seq,
+        if (send_aead(st->suite, st->c_ap_key, st->c_ap_iv, &st->c_ap_seq,
                       TLS_CT_APPDATA, st->request, st->request_len, io) != 0)
             return TLS_STEP_ERR;
 
@@ -1956,7 +1983,7 @@ int tls_client_run(const char* host, uint16_t port,
     tls_state_init(&st, host, port, request, request_len, out, out_cap);
 #ifndef KERNEL
     // Host wall clock for the ticket-age gate (review #31). The kernel
-    // passes tick_count at fetch time instead (see tls_net.c).
+    // passes ms since boot (tick_count * 10) instead (see tls_net.c).
     {
         time_t tt = time(0);
         if (tt > 0) tls_state_set_now_ms(&st, (uint64_t)tt * 1000u);

@@ -13,6 +13,10 @@
 //
 // Build: gcc -m32 -O1 -g -fsanitize=address,undefined -Isrc/crypto -Isrc ...
 
+// 64-bit stat even in the -m32 build: on WSL's /mnt drives inode numbers
+// exceed 32 bits, plain stat() fails with EOVERFLOW and adv_clocks would
+// silently fall back to a fixed date.
+#define _FILE_OFFSET_BITS 64
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -165,11 +169,11 @@ static void fuzz_section(void) {
     uint32_t msg_len = build_cert_msg(msg, sizeof(msg), files, 4);
     CHECK(msg_len > 0, "real flight fixture builds");
 
-    // Locate the LAST cert (the trust anchor) in the flight: anchors are
-    // trusted BY KEY (RFC 5280) — mutations of the root's non-SPKI TBS
-    // fields (serial, unused extensions...) legitimately still verify, the
-    // same way a pinned SSH host key works. Everything up to the anchor and
-    // every security-relevant anchor region MUST reject mutations.
+    // Locate the LAST cert in the flight. The path anchors at c202, issued
+    // by the store root "SSL.com TLS ECC Root CA 2022" (name-bound anchor);
+    // c203 — AAA's cross-signature of that root — is never used, so
+    // mutations inside it legitimately still verify (proven below: the
+    // flight verifies without it). Every byte up to it MUST reject.
     x509_cert anchor;
     uint32_t rootx_off = 0;
     static uint8_t anchor_der[16384];
@@ -199,6 +203,12 @@ static void fuzz_section(void) {
     x509_set_now(&now);
     int r0 = cert_verify(msg, msg_len, "example.com");
     CHECK(r0 == CV_OK, "unmutated flight verifies (control)");
+    {
+        static uint8_t msg3[16384];
+        uint32_t msg3_len = build_cert_msg(msg3, sizeof(msg3), files, 3);
+        CHECK(msg3_len > 0 && cert_verify(msg3, msg3_len, "example.com") == CV_OK,
+              "flight anchors through the root store without the trailing cross-sign");
+    }
 
     uint64_t rng = 0x9E3779B97F4A7C15ull;
 #define NEXT32() (rng ^= rng << 13, rng ^= rng >> 7, rng ^= rng << 17, \
@@ -227,13 +237,10 @@ static void fuzz_section(void) {
         int r = cert_verify(mut, mlen, "example.com");
         if (r == CV_OK) {
             accepted++;
-            // tolerated ONLY if the mutation is inside the anchor's TBS but
-            // outside its SPKI (the trusted key) and signature areas.
-            uint32_t spki_off = (uint32_t)(anchor.spki.p - (msg + rootx_off));
+            // tolerated ONLY if the mutation is inside the unused trailing
+            // certificate.
             int in_anchor_ignored =
-                pos >= rootx_off && pos < rootx_off + (uint32_t)anchor_der_len &&
-                !(pos >= rootx_off + spki_off &&
-                  pos <  rootx_off + spki_off + anchor.spki.len);
+                pos >= rootx_off && pos < rootx_off + (uint32_t)anchor_der_len;
             if (!in_anchor_ignored) {
                 accepted_outside_ignored++;
                 if (accepted_outside_ignored <= 5)
@@ -320,7 +327,7 @@ enum mock_mode {
     MOCK_STAPLE,       // stapled status_request noted, flight completes
     MOCK_STAPLE_BAD,   // malformed staple (must ERR)
     MOCK_STAPLE_REVOKED, // valid sig, revoked status (must ERR)
-    MOCK_STAPLE_STALE,   // valid sig, aged past nextUpdate (must ERR)
+    MOCK_STAPLE_STALE,   // valid sig, aged past nextUpdate (soft-fail: must DONE)
     MOCK_MUSTSTAPLE,     // Must-Staple leaf, NO staple (must ERR)
     MOCK_MUSTSTAPLE_OK,  // Must-Staple leaf + valid staple (must DONE)
     MOCK_PRELOAD_OK,     // preloaded host, matching key (must DONE)
@@ -356,8 +363,8 @@ static void adv_clocks(x509_time* normal, x509_time* expired) {
     struct stat st;
     if (stat("tests/adversarial/at_leaf.der", &st) == 0) base = st.st_mtime;
     if (stat("tests/adversarial/at_leaf_expired.der", &st) == 0) expb = st.st_mtime;
-    time_t tn = base ? base + 7200 : 1780272000;   // ~2026-09-10
-    time_t te = expb ? expb + 172800 : 1780444800; // ~gen+2d
+    time_t tn = base ? base + 7200 : 1789064640;   // 2026-09-10 18:24 UTC (gen + 2h)
+    time_t te = expb ? expb + 172800 : 1789230240; // gen + 2d
     struct tm* g = gmtime(&tn);
     normal->year = 1900 + g->tm_year; normal->month = g->tm_mon + 1;
     normal->day = g->tm_mday; normal->hour = g->tm_hour;
@@ -632,7 +639,7 @@ static int parse_client_ch(const uint8_t* c0, uint32_t clen,
     const uint8_t* b = c0 + 5 + 4;      // CH body
     memcpy(sid, b + 2 + 32 + 1, 32);
     uint32_t p = 2 + 32 + 1 + 32;       // past version+random+sid
-    p += 2 + 2 * 2;                     // ciphers (len + 0x1303 + 0x00ff)
+    p += 2 + (((uint32_t)b[p] << 8) | b[p+1]);   // cipher_suites (len-prefixed)
     p += 1 + 1;                         // compression (len + null)
     uint32_t elen = ((uint32_t)b[p] << 8) | b[p+1];
     p += 2;
@@ -1390,7 +1397,8 @@ static void mock_run(int mode, struct mock_result* res) {
                           mode == MOCK_NST || mode == MOCK_NST_BAD ||
                           mode == MOCK_NST_BIGNONCE ||
                           mode == MOCK_PSK_ACCEPT || mode == MOCK_PSK_FALLBACK ||
-                          mode == MOCK_STAPLE || mode == MOCK_FRAGMENT ||
+                          mode == MOCK_STAPLE || mode == MOCK_STAPLE_STALE ||
+                          mode == MOCK_FRAGMENT ||
                           mode == MOCK_SH_SPLIT || mode == MOCK_APP_TRUNCATED ||
                           mode == MOCK_MUSTSTAPLE_OK ||
                           mode == MOCK_PRELOAD_OK || mode == MOCK_PRELOAD_BAD ||
@@ -1586,9 +1594,13 @@ static void mock_section(void) {
     mock_run(MOCK_STAPLE_REVOKED, &res);
     CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_CERT,
           "revoked staple fails closed (no fallback class)");
+    // Stale ≡ absent: an attacker can strip any staple, so an unverifiable
+    // one on a non-Must-Staple leaf soft-fails (browser behaviour). Only a
+    // verified REVOKED status (above) or a Must-Staple leaf hard-fails.
     mock_run(MOCK_STAPLE_STALE, &res);
-    CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_CERT,
-          "stale staple fails closed");
+    CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
+          memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
+          "stale staple soft-fails like an absent one");
     tls_pin_clear(); // MS leaf is a fresh key for evil.example.com
     mock_run(MOCK_MUSTSTAPLE, &res);
     CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_CERT,

@@ -87,6 +87,15 @@ const char* ocsp_strerror(int code) {
     }
 }
 
+// byKey responderID: SHA-1 over the subjectPublicKey BIT STRING value
+// (keybits[0] is the unused-bits octet, excluded per RFC 6960 4.2.1).
+static int key_hash_eq(const x509_cert* c, const uint8_t want[20]) {
+    if (!c->keybits || c->keybits_len < 2) return 0;
+    uint8_t h[SHA1_HASH_SIZE];
+    sha1(c->keybits + 1, c->keybits_len - 1, h);
+    return memcmp(h, want, 20) == 0;
+}
+
 int ocsp_check_staple(const uint8_t* resp, uint32_t resp_len,
                       const x509_cert* leaf, const x509_cert* issuer,
                       const x509_time* now) {
@@ -142,12 +151,15 @@ int ocsp_check_staple(const uint8_t* resp, uint32_t resp_len,
     }
     if (der_expect(basic.content, basic.content_len, &t, DER_TAG_BIT_STRING, &sigbits) != 0)
         return OCSP_ERR_PARSE;
-    // Allow optional trailing certs [0]: skip by length (must consume all).
+    // Optional trailing certs [0] EXPLICIT SEQUENCE OF Certificate: the
+    // candidates for a delegated responder (must consume all).
+    der_node certs_wrap;
+    int have_certs = 0;
     if (t < basic.content_len) {
         if (basic.content[t] != 0xA0) return OCSP_ERR_PARSE;
-        der_node certs;
-        if (der_expect(basic.content, basic.content_len, &t, 0xA0, &certs) != 0)
+        if (der_expect(basic.content, basic.content_len, &t, 0xA0, &certs_wrap) != 0)
             return OCSP_ERR_PARSE;
+        have_certs = 1;
     }
     if (t != basic.content_len) return OCSP_ERR_PARSE;
 
@@ -175,20 +187,29 @@ int ocsp_check_staple(const uint8_t* resp, uint32_t resp_len,
             return OCSP_ERR_PARSE;
         if (vv.content_len != 1 || vv.content[0] != 0) return OCSP_ERR_PARSE;
     }
-    // responderID: [1] byName (we only accept the issuer itself).
-    if (r >= tbs.content_len || tbs.content[r] != 0xA1) return OCSP_ERR_RESPONDER;
+    // responderID: [1] byName (Name) or [2] byKey (KeyHash OCTET STRING:
+    // SHA-1 of the responder's subjectPublicKey BIT STRING value).
+    if (r >= tbs.content_len || (tbs.content[r] != 0xA1 && tbs.content[r] != 0xA2)) return OCSP_ERR_RESPONDER;
+    int rid_by_key = tbs.content[r] == 0xA2;
+    const uint8_t* rid_name = 0;
+    uint32_t rid_name_len = 0;
+    uint8_t rid_hash[20];
     {
-        der_node byname_wrap;
-        if (der_expect(tbs.content, tbs.content_len, &r, 0xA1, &byname_wrap) != 0)
+        der_node rid_wrap;
+        if (der_expect(tbs.content, tbs.content_len, &r, tbs.content[r], &rid_wrap) != 0)
             return OCSP_ERR_RESPONDER;
-        // byName is EXPLICIT [1] wrapping a Name: compare the inner Name
-        // element bytes to the issuer subject element bytes.
-        // (issuer->subject is the full Name element incl. tag+len.)
-        uint32_t nlen = byname_wrap.content_len;
-        // The inner content should BE a Name SEQUENCE element.
-        if (nlen != issuer->subject.len ||
-            memcmp(byname_wrap.content, issuer->subject.p, nlen) != 0)
-            return OCSP_ERR_RESPONDER;
+        if (rid_by_key) {
+            uint32_t k = 0;
+            der_node kh;
+            if (der_expect(rid_wrap.content, rid_wrap.content_len, &k, DER_TAG_OCTET_STRING, &kh) != 0 ||
+                k != rid_wrap.content_len || kh.content_len != 20)
+                return OCSP_ERR_RESPONDER;
+            memcpy(rid_hash, kh.content, 20);
+        } else {
+            // EXPLICIT [1] wrapping a Name element (compared byte-exact).
+            rid_name = rid_wrap.content;
+            rid_name_len = rid_wrap.content_len;
+        }
     }
     // producedAt (parsed for hygiene; freshness comes from SingleResponse).
     {
@@ -366,8 +387,47 @@ int ocsp_check_staple(const uint8_t* resp, uint32_t resp_len,
             if (x509_time_cmp(&this_up, &week_ago) < 0) return OCSP_ERR_TIME;
         }
     }
+    // Signer: the issuer itself when the responderID names it, else a
+    // delegated responder from `certs` (issued + signed by the issuer,
+    // OCSPSigning EKU, valid now, adequate key).
+    const x509_cert* signer = 0;
+    static x509_cert delegated;   // static: x509_cert is large (kernel stacks)
+    {
+        #define RID_MATCHES(c) (rid_by_key ? key_hash_eq((c), rid_hash) \
+            : ((c)->subject.len == rid_name_len && memcmp((c)->subject.p, rid_name, rid_name_len) == 0))
+        if (RID_MATCHES(issuer)) signer = issuer;
+        else if (have_certs) {
+            uint32_t c0 = 0;
+            der_node seq;
+            if (der_expect(certs_wrap.content, certs_wrap.content_len, &c0, DER_TAG_SEQUENCE, &seq) != 0)
+                return OCSP_ERR_PARSE;
+            uint32_t ci = 0;
+            while (ci < seq.content_len && !signer) {
+                uint32_t start = ci;
+                der_node cn;
+                if (der_expect(seq.content, seq.content_len, &ci, DER_TAG_SEQUENCE, &cn) != 0)
+                    return OCSP_ERR_PARSE;
+                if (x509_parse(seq.content + start, ci - start, &delegated) != 0) continue;
+                if (!RID_MATCHES(&delegated)) continue;
+                if (delegated.issuer.len != issuer->subject.len ||
+                    memcmp(delegated.issuer.p, issuer->subject.p, issuer->subject.len) != 0)
+                    return OCSP_ERR_RESPONDER;
+                if (!delegated.eku_ocsp_signing) return OCSP_ERR_RESPONDER;
+                if (delegated.key_type == X509_KEY_RSA && delegated.rsa_n_len < 256) return OCSP_ERR_RESPONDER;
+                if (x509_time_cmp(now, &delegated.not_before) < 0 ||
+                    x509_time_cmp(now, &delegated.not_after) > 0)
+                    return OCSP_ERR_TIME;
+                if (cert_sig_verify(delegated.sig_alg, issuer, delegated.tbs.p, delegated.tbs.len,
+                                    delegated.signature.p, delegated.signature.len) != 0)
+                    return OCSP_ERR_SIG;
+                signer = &delegated;
+            }
+        }
+        #undef RID_MATCHES
+        if (!signer) return OCSP_ERR_RESPONDER;
+    }
     // Response signature over tbsResponseData element bytes with the
-    // ISSUER key (responder == issuer enforced above).
+    // SIGNER key.
     {
         uint32_t bw = 0;
         der_node t2, ao;
@@ -384,7 +444,7 @@ int ocsp_check_staple(const uint8_t* resp, uint32_t resp_len,
             if (alg == 0) return OCSP_ERR_SIG;
             if (sigbits.content_len < 1 || sigbits.content[0] != 0)
                 return OCSP_ERR_PARSE;
-            if (cert_sig_verify(alg, issuer, tbs_elem, tbs_elem_len,
+            if (cert_sig_verify(alg, signer, tbs_elem, tbs_elem_len,
                                 sigbits.content + 1, sigbits.content_len - 1) != 0)
                 return OCSP_ERR_SIG;
         }

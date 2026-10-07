@@ -23,6 +23,7 @@ static const uint8_t OID_AUTH_KEY_ID[]      = {0x55,0x1D,0x23};
 static const uint8_t OID_NAME_CONSTRAINTS[] = {0x55,0x1D,0x1E};
 static const uint8_t OID_EKU_SERVER_AUTH[]  = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x01};
 static const uint8_t OID_EKU_ANY[]          = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x00};
+static const uint8_t OID_EKU_OCSP_SIGNING[] = {0x2B,0x06,0x01,0x05,0x05,0x07,0x03,0x09};
 static const uint8_t OID_TLS_FEATURE[]      = {0x2B,0x06,0x01,0x05,0x05,0x07,0x01,0x18};
 
 static int oid_is(const der_node* n, const uint8_t* oid, uint32_t oid_len) {
@@ -201,6 +202,91 @@ static int int_bytes_strict(const der_node* n, const uint8_t** out,
     return 0;
 }
 
+// SubjectPublicKeyInfo element at tb[*tp]: key type + key material views
+// into `out` (shared by certificate parsing and bare SPKI parsing).
+static int parse_spki(const uint8_t* tb, uint32_t tl, uint32_t* tp, x509_cert* out) {
+    uint32_t t = *tp;
+    uint32_t spki_start = t;
+    der_node spki;
+    if (der_expect(tb, tl, &t, DER_TAG_SEQUENCE, &spki) != 0) return -1;
+    out->spki.p = tb + spki_start;
+    out->spki.len = t - spki_start;   // full element incl. tag+len
+    uint32_t s = 0;
+    der_node alg_oid, param;
+    if (parse_alg_id(spki.content, spki.content_len, &s, &alg_oid, &param) != 0)
+        return -1;
+    if (oid_is(&alg_oid, OID_RSA_ENCRYPTION, sizeof(OID_RSA_ENCRYPTION))) {
+        // parameters: NULL (required by RFC 4055; some encoders omit)
+        if (param.tag != 0 && param.tag != DER_TAG_NULL) return -1;
+        der_node keybits;
+        if (der_expect(spki.content, spki.content_len, &s,
+                       DER_TAG_BIT_STRING, &keybits) != 0) return -1;
+        if (keybits.content_len < 1 || keybits.content[0] != 0) return -1;
+        out->keybits = keybits.content;
+        out->keybits_len = keybits.content_len;
+        // BIT STRING payload = DER RSAPublicKey = SEQUENCE { n, e }
+        uint32_t r = 0;
+        der_node rsakey;
+        if (der_expect(keybits.content + 1, keybits.content_len - 1, &r,
+                       DER_TAG_SEQUENCE, &rsakey) != 0) return -1;
+        uint32_t q = 0;
+        der_node nn, ee;
+        if (der_expect(rsakey.content, rsakey.content_len, &q,
+                       DER_TAG_INTEGER, &nn) != 0) return -1;
+        if (der_expect(rsakey.content, rsakey.content_len, &q,
+                       DER_TAG_INTEGER, &ee) != 0) return -1;
+        // Strict key integers (review #17) + tight bounds (e fits the
+        // rsa_pub 32-bit-exponent rule; n bounds are sanity, strength
+        // is enforced exact in rsa_pub_from_x509 + certverify).
+        // Upper bound (exactness fix): 512B = 4096 bits, matching
+        // RSA_MAX_LIMBS (132 limbs = 528B). The old 1024B cap admitted
+        // keys rsa_pub_from_x509 can never use (be_to_limbs fails) —
+        // pointless parse-then-reject and wasted reassembly on absurd
+        // flights. 4096-bit chains still fit the 16KB flight cap.
+        if (int_bytes_strict(&nn, &out->rsa_n, &out->rsa_n_len, 0) != 0)
+            return -1;
+        if (int_bytes_strict(&ee, &out->rsa_e, &out->rsa_e_len, 0) != 0)
+            return -1;
+        if (out->rsa_n_len < 128 || out->rsa_n_len > 512) return -1;
+        if (out->rsa_e_len < 1 || out->rsa_e_len > 4) return -1;
+        out->key_type = X509_KEY_RSA;
+    } else if (oid_is(&alg_oid, OID_EC_PUBLIC_KEY, sizeof(OID_EC_PUBLIC_KEY))) {
+        // parameters: named curve OID (required)
+        if (param.tag != DER_TAG_OID) return -1;
+        int curve = 0;
+        if (oid_is(&param, OID_EC_P256, sizeof(OID_EC_P256)))
+            curve = X509_KEY_EC_P256;
+        else if (oid_is(&param, OID_EC_P384, sizeof(OID_EC_P384)))
+            curve = X509_KEY_EC_P384;
+        else
+            return -1;   // P-521 / other curves: unsupported, don't trust
+        der_node keybits;
+        if (der_expect(spki.content, spki.content_len, &s,
+                       DER_TAG_BIT_STRING, &keybits) != 0) return -1;
+        if (keybits.content_len < 1 || keybits.content[0] != 0) return -1;
+        out->keybits = keybits.content;
+        out->keybits_len = keybits.content_len;
+        out->ec_point = keybits.content + 1;
+        out->ec_point_len = keybits.content_len - 1;
+        int want = (curve == X509_KEY_EC_P256) ? 65 : 97;
+        if (out->ec_point_len != (uint32_t)want || out->ec_point[0] != 0x04) return -1;
+        out->key_type = curve;
+    } else {
+        return -1;   // unknown key algorithm
+    }
+    *tp = t;
+    return 0;
+}
+
+// A bare SubjectPublicKeyInfo DER (trust-anchor keys, see certverify.c).
+int x509_parse_spki(const uint8_t* der, uint32_t len, x509_cert* out) {
+    memset(out, 0, sizeof(*out));
+    out->path_len = -1;
+    uint32_t t = 0;
+    if (parse_spki(der, len, &t, out) != 0) return -1;
+    return t == len ? 0 : -1;
+}
+
 int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
     memset(out, 0, sizeof(*out));
     out->path_len = -1;
@@ -354,76 +440,7 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
     out->subject.len = t - name_start;
 
     // subjectPublicKeyInfo
-    {
-        uint32_t spki_start = t;
-        der_node spki;
-        if (der_expect(tb, tl, &t, DER_TAG_SEQUENCE, &spki) != 0) return -1;
-        out->spki.p = tb + spki_start;
-        out->spki.len = t - spki_start;   // full element incl. tag+len
-        uint32_t s = 0;
-        der_node alg_oid, param;
-        if (parse_alg_id(spki.content, spki.content_len, &s, &alg_oid, &param) != 0)
-            return -1;
-        if (oid_is(&alg_oid, OID_RSA_ENCRYPTION, sizeof(OID_RSA_ENCRYPTION))) {
-            // parameters: NULL (required by RFC 4055; some encoders omit)
-            if (param.tag != 0 && param.tag != DER_TAG_NULL) return -1;
-            der_node keybits;
-            if (der_expect(spki.content, spki.content_len, &s,
-                           DER_TAG_BIT_STRING, &keybits) != 0) return -1;
-            if (keybits.content_len < 1 || keybits.content[0] != 0) return -1;
-            out->keybits = keybits.content;
-            out->keybits_len = keybits.content_len;
-            // BIT STRING payload = DER RSAPublicKey = SEQUENCE { n, e }
-            uint32_t r = 0;
-            der_node rsakey;
-            if (der_expect(keybits.content + 1, keybits.content_len - 1, &r,
-                           DER_TAG_SEQUENCE, &rsakey) != 0) return -1;
-            uint32_t q = 0;
-            der_node nn, ee;
-            if (der_expect(rsakey.content, rsakey.content_len, &q,
-                           DER_TAG_INTEGER, &nn) != 0) return -1;
-            if (der_expect(rsakey.content, rsakey.content_len, &q,
-                           DER_TAG_INTEGER, &ee) != 0) return -1;
-            // Strict key integers (review #17) + tight bounds (e fits the
-            // rsa_pub 32-bit-exponent rule; n bounds are sanity, strength
-            // is enforced exact in rsa_pub_from_x509 + certverify).
-            // Upper bound (exactness fix): 512B = 4096 bits, matching
-            // RSA_MAX_LIMBS (132 limbs = 528B). The old 1024B cap admitted
-            // keys rsa_pub_from_x509 can never use (be_to_limbs fails) —
-            // pointless parse-then-reject and wasted reassembly on absurd
-            // flights. 4096-bit chains still fit the 16KB flight cap.
-            if (int_bytes_strict(&nn, &out->rsa_n, &out->rsa_n_len, 0) != 0)
-                return -1;
-            if (int_bytes_strict(&ee, &out->rsa_e, &out->rsa_e_len, 0) != 0)
-                return -1;
-            if (out->rsa_n_len < 128 || out->rsa_n_len > 512) return -1;
-            if (out->rsa_e_len < 1 || out->rsa_e_len > 4) return -1;
-            out->key_type = X509_KEY_RSA;
-        } else if (oid_is(&alg_oid, OID_EC_PUBLIC_KEY, sizeof(OID_EC_PUBLIC_KEY))) {
-            // parameters: named curve OID (required)
-            if (param.tag != DER_TAG_OID) return -1;
-            int curve = 0;
-            if (oid_is(&param, OID_EC_P256, sizeof(OID_EC_P256)))
-                curve = X509_KEY_EC_P256;
-            else if (oid_is(&param, OID_EC_P384, sizeof(OID_EC_P384)))
-                curve = X509_KEY_EC_P384;
-            else
-                return -1;   // P-521 / other curves: unsupported, don't trust
-            der_node keybits;
-            if (der_expect(spki.content, spki.content_len, &s,
-                           DER_TAG_BIT_STRING, &keybits) != 0) return -1;
-            if (keybits.content_len < 1 || keybits.content[0] != 0) return -1;
-            out->keybits = keybits.content;
-            out->keybits_len = keybits.content_len;
-            out->ec_point = keybits.content + 1;
-            out->ec_point_len = keybits.content_len - 1;
-            int want = (curve == X509_KEY_EC_P256) ? 65 : 97;
-            if (out->ec_point_len != (uint32_t)want || out->ec_point[0] != 0x04) return -1;
-            out->key_type = curve;
-        } else {
-            return -1;   // unknown key algorithm
-        }
-    }
+    if (parse_spki(tb, tl, &t, out) != 0) return -1;
 
     // [3] EXPLICIT extensions — optional
     if (t < tl) {
@@ -603,6 +620,9 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                             oid_is(&eku, OID_EKU_ANY,
                                    sizeof(OID_EKU_ANY)))
                             out->eku_server_auth = 1;
+                        if (oid_is(&eku, OID_EKU_OCSP_SIGNING,
+                                   sizeof(OID_EKU_OCSP_SIGNING)))
+                            out->eku_ocsp_signing = 1;
                     }
                 }
             } else if (oid_is(&ext_oid, OID_TLS_FEATURE,

@@ -220,7 +220,14 @@ okai is a shell around the web engine in `src/web/` (all integer/fixed-point: LU
 - **Sub-resources**: after the document parses, stylesheets then images stream in one at a time (`wdoc_next_fetch`), each with its own scheme, 3xx following and one transport retry; caps `OKAI_MAX_CSS_FETCH` 24 / `OKAI_MAX_IMG_FETCH` 32. Rendering is coalesced: first paint waits for stylesheets (≤3s), image arrivals repaint at most every 1.5s, plus a final paint on drain.
 - **TLS fetches stop at the end of the HTTP message** (`tls_net.c`: verified plaintext complete by Content-Length / terminal chunk → done) instead of reading to the close — www.google.com's trailing record fails AEAD on this network path (OpenSSL agrees), which used to abort complete pages as MAC failures. Each HTTPS fetch opens a fresh TCP connection (reusing the previous, about-to-close socket failed every other sub-resource).
 - **Forms**: click focuses text fields (caret drawn), typing edits the `value` attribute, Enter submits (GET; POST forms are sent as GET), Tab cycles controls, checkboxes/radios toggle, `<select>` cycles options.
-- **Scripts are not executed.** tinyjs remains (shell `js` paths) and its DOM bridge (`js_dom.c`) now operates on the active tab's `wdom` (`okai_active_dom` / `okai_dom_changed`). A real engine (QuickJS) is the planned Phase 6.
+- **Requests**: top-level navigations send a browser's HTML-first `Accept` (`net_accept_html`; crates.io 404s `*/*`), sub-resources and script fetches `*/*`; cookies from the shared jar (`wcookie`, SameSite against the top-level page); `Accept-Encoding: gzip`.
+
+### Browser — page scripts (QuickJS, Phase 6)
+- **Engine**: QuickJS 2026-06-04 in `src/qjs/` (see `README.okernel`: freestanding libc shim — kmalloc heap, serial stdio, RTC+PIT clock, `abort()` unwinds the realm — plus musl libm; small additions for async module loading). x87 doubles at 53-bit precision: `wjs` sets the control word on every entry, the kernel FNSAVE/FRSTORs per thread. libgcc linked for 64-bit division. QuickJS's own suites pass on the exact kernel objects (`sh tests/qjs/build.sh ...`, part of `make web-tests`).
+- **Realm per document** (`src/web/wjs.c`, created lazily by `wdoc`): 96MB heap cap, 900KB stack cap, 8s per script / 1.5s per task (interrupt handler); a QuickJS assertion kills the realm only. Web API = `wjs_prelude.js` (events, DOM classes, forms, custom elements, MutationObserver, CSSOM + constructable sheets, URL, storage, Intl en-US, ...; compiled to bytecode once per boot) over C natives in `wjs_dom.c` (selectors through the CSS engine, layout queries, HTML serialization).
+- **Scheduling** follows the HTML spec's shape: parser-blocking classic scripts in order (external fetched first), then defer + module scripts, DOMContentLoaded, async/dynamic as they arrive, load once scripts/sheets/images settle. Module graphs are fetched ahead (compile with `JS_EVAL_FLAG_NO_RESOLVE` to discover imports; dynamic `import()` parks until fetched). Timers/rAF/microtasks run from `okai_poll` under a budget; script DOM mutations trigger stylesheet rebuilds/image rescans and a coalesced re-render.
+- **okai integration**: DOM events dispatch before default actions (click/keys/input/change/submit/focus/scroll; `preventDefault` honoured); script navigation/scroll/focus/title/pushState flow back through `wdoc_js_take_*`; fetch()/XHR go over the single connection (CORS-checked) like any sub-resource. `J` (Shift+J) toggles page scripts globally and reloads (`[okai] page scripts on|off`).
+- **Host harness**: `build-host/wbrowse <url|file> w h out.ppm [secs]` runs the same engine + scripts on the host (live sites cached under `~/.cache/wbrowse`); `tests/web/js/basic.html` is the DOM/API regression page (`[js] RESULT ALLPASS 37`). Headless: `test_okai_js.py`.
 
 ---
 
@@ -274,8 +281,9 @@ Working end-to-end: GDT user segments + TSS, INT 0x80 gate (DPL=3), `paging_map_
 - **Single CPU** — no SMP.
 - **In-memory VFS** — only files explicitly synced to PFS survive reboot.
 - **TCP** — single connection; no congestion control; reorder buffer limited to 8×1500B.
-- **TLS 1.3** — ChaCha20-Poly1305 + SHA-256/384 only; no AES-GCM.
-- **Web engine** — no JavaScript execution (pages render as with scripts disabled: `<noscript>` content shows, client-rendered UIs are missing); no `position: sticky`, transforms are translate-only, no animations/transitions, `mask-image` boxes skip their background; JPEG chroma is nearest-neighbour; CJK beyond the 16px bitmap fallback table renders as tofu.
+- **TLS 1.3 only** — suites ChaCha20-Poly1305-SHA256 + AES-128-GCM-SHA256 (no AES-256-GCM-SHA384, no TLS 1.2: whatwg.org, baidu.com, arstechnica.com fail the handshake). Bot protection (Akamai/Cloudflare/Fastly) answers many big sites with 403 pages — TLS works, the page is a challenge.
+- **JavaScript** — no WebAssembly or workers; WebSocket (never opens), canvas (`getContext()` → null) and media elements are inert stubs; layout queries are answered from the last layout; `Intl` is en-US only.
+- **Web engine** — no `position: sticky`, transforms are translate-only, no animations/transitions, `mask-image` boxes skip their background; JPEG chroma is nearest-neighbour; CJK beyond the 16px bitmap fallback table renders as tofu.
 - **Sub-resources** — sequential over one connection (each HTTPS fetch is a fresh handshake; resumption helps); capped at 24 stylesheets / 32 images per page; no per-resource timeout beyond the TLS fetch timeout.
 
 ---
@@ -317,6 +325,10 @@ okai / browser:
 28. **External CSS wasn't fetched on main-page load** — `okai_queue_sub_resources()` existed but was never called, and the fetch owner was cleared immediately (so the sub-res branch, which requires an active owner, never ran). Fix: call it after parsing and keep ownership while resources are queued.
 29. **kbd offer-wake stole input for wait-parked init (2026-09-30)** — the OFFER-WAKE scan took the oldest BLOCKED slot with any staged resume, so wait-parked init (slot 1, ret=-2) always beat read-parked sh (slot 2): deterministic starvation, sh never received typed lines. Fix: skip staged ret `-2` (wait-park; re-stage untouched) so offers reach readers. Plus: `kbd_wake_armed` was set even when the offer was dropped (stale-backlog guard) — `sys_proc_kbd_offer` now returns queued/dropped and the IRQ arms only on queued.
 30. **Text build triple-faulted at boot (2026-10-01)** — the LOW trampoline builds its boot page tables with `label - 0xC0000000` expressions that only resolve against HIGH-VMA links; low-linked they wrap to garbage phys (bisected: #DF at `_start+0x5D`, IDT=0). The text kernel never enables paging, so `linker.ld` now enters at `_start_high` directly (with a `mov edi, ebx` there — the trampoline used to set up the mboot pointer). Follow-ups in the same session: text GRUB entry needs `gfxpayload=text` AND its own multiboot header without the video request (`-DTEXTMODE` start object — the shared header asks GRUB for 1920x1080x32, leaving the text kernel writing an invisible 0xB8000).
+31. **TCP send > MSS crashed the kernel (2026-10-07)** — a 1594-byte TLS record (long module-batch URL) went through `tcp_send_raw`'s 1514-byte stack frame; the overflow smashed the return address (EIP garbage). TCP sends are now split at the MSS.
+32. **Stale objects after a header change (2026-10-07)** — the Makefile didn't list `src/crypto/*.h` as dependencies; `struct tls_state` grew (`suite`, 8KB staple) but `tls_net.o` kept the old size, so `tls_state_init`'s memset ran past `tls_s` and zeroed `tls_start_tick`: every HTTPS fetch "timed out" on its first step and downgraded to plain HTTP (14-byte pages). Fix: `-MMD -MP` dependency files + `src/crypto/*.h` in `HEADERS`.
+33. **DNS race on navigation (2026-10-07)** — the resolver has one slot; a sub-resource lookup still pending when the user navigated made the new fetch skip its own query, then read the stale answer for another host as "no A record" → abort → HTTP fallback. Fix: `dns_is_pending_for(host)` (only a query for the same host is waited on; a new query's tx id drops the stale answer) and a superseded TLS lookup re-queries.
+34. **Fetch timeout / ticket clock units (2026-10-07)** — `TLS_FETCH_TIMEOUT_TICKS 1200` was "66s at 18 Hz" but the PIT runs at 100 Hz (12s; now 3000 = 30s), and the ticket-age clock was fed raw ticks as ms (tickets lived 10× their lifetime; now `tick_count * 10`).
 
 ---
 
@@ -343,12 +355,20 @@ okai / browser:
 - X25519 is constant-time and **fail-closed**: `x25519_shared_secret` returns 1/0; reject u=0/u=1.
 - Hostname canonicalization is centralized in `tls_canon_host()` (applied at SNI/cert/pin/ticket boundaries).
 
+**Trust / PKI (2026-10-07)**
+- Root store = Mozilla's (`tools/gen_roots.py` → `roots.c`, 120 roots; e-Szigno's P-521 root is skipped — no P-521 support). Each entry embeds the whole root cert: SPKI, subject DN, SKI.
+- Two anchors: `root_issued()` (cert's issuer DN == a root subject byte-exactly, AKI == root SKI when both present, signature verifies under the root key — servers don't send roots, so this is the normal path) and the older in-flight SPKI match. Several roots may share a name (re-keyed): every candidate is tried.
+- Validity: leaf up front, each issuer as the walk reaches it. Certs past the anchor are never examined — an expired cross-sign appended by the server must not fail the path (the mutation fuzz proves the trailing example.com cross-sign is unused).
+- OCSP: delegated responders (cert in the response, issued by the CA, `id-kp-OCSPSigning`, RSA ≥ 2048) and byKey responder IDs. Policy: only a verified REVOKED status or a Must-Staple leaf hard-fails; a stale/unverifiable staple is treated like an absent one (it is strippable anyway). Staples up to 8KB.
+- AES-128-GCM (`aes.c`): bitsliced Boyar-Peralta S-box and masked GHASH — no table lookups on secret data. The record key length is part of the HKDF label (`tls_record_key_len`: 16 for AES, 32 for ChaCha20).
+- Adversarial suite clocks come from the test PKI's file mtimes; build it with 64-bit `stat` (`_FILE_OFFSET_BITS 64`) — on WSL's `/mnt` drives 32-bit `stat()` fails with EOVERFLOW and the suite silently used a fallback date (42 bogus failures).
+
 **Kernel**
-- Heap is a bump allocator; big static arrays go in BSS; check `_kernel_end`.
+- Heap is a segregated-fit allocator (`kmalloc`/`kfree`); big tables go on the heap, not BSS; check `_kernel_end`.
 - e1000 RX release: `RDT = last processed index`.
 - `tcp_handle_packet` runs in IRQ context — IRQ appends to a buffer; the main loop reads after close.
 - `http_get` resets done/length at entry — a stale done-flag races the parse block.
-- Makefile `%.o` depends on headers — never remove.
+- Makefile `%.o` depends on headers (`HEADERS` + `-MMD -MP` dep files) — never remove (bug #32).
 - Mouse is relative + smoothed; converge iteratively in scripted tests.
 
 **Process**
@@ -359,7 +379,8 @@ okai / browser:
 
 ## Testing
 
-Host suites (`make host-tests`): crypto (sha256/sha1/sha512/chacha/poly/aead), TLS record/handshake/keysched/client, PKI, adversarial, RNG, editor text, and `make web-tests` (web CSS unit tests 54/54, font tests, builds `build-host/wrender`).
+Host suites (`make host-tests`): crypto (sha256/sha1/sha512/chacha/poly/aead), AES-128/GCM (FIPS-197, GCM spec cases, 300 random vectors vs OpenSSL via `tests/aes_vectors.py`), TLS record/handshake/keysched/client, PKI, adversarial (189 checks; `make host-tests-asan` for the ASan/UBSan run), RNG, editor text, live example.com handshake + wrong-hostname rejection, and `make web-tests` (web CSS unit tests 54/54, font tests, JS regression page `[js] RESULT ALLPASS 37`, QuickJS's own suites on the kernel objects; builds `build-host/wrender` + `build-host/wbrowse`).
+Real-site TLS census on the host: `build-host/tls_scan -f tests/tls_hosts.txt` (the kernel's TLS client over host sockets; prints the failure reason per site).
 Web engine (needs the corpus: `python3 tools/fetch_corpus.py`, gitignored): `tests/web/html5_diff.py` (85/85 trees == html5lib), `tests/web/image_diff.py` (59/59 == PIL), every corpus page through `wrender` under ASan/UBSan (`SAN="-fsanitize=address,undefined" OPT=-O1 sh tests/web/build.sh`), `tests/web/compare.py <name> [w] [h] [--fresh]` (side-by-side vs headless Edge; `WR_DUMP_TAG=figure ./build-host/wrender <name> ...` prints a tag's boxes + ancestors). okai's built-in pages export to the corpus with `python3 tools/okai_pages.py`.
 Differential tooling: `make diff-oracle` / `make diff-test` (X25519, SHA-256, HMAC, HKDF, AEAD vs python-cryptography).
 Interop: pyserver + TLS-Attacker (`tests/tlsattacker-*.xml`) — full HS P-256/RSA-P384 PASS, mutilation rejection, fragmentation.
@@ -381,7 +402,7 @@ vm.kill()
 - Closed-loop clicks: `vm.click_link(href_part)` / `vm.click_at(page_x, page_y)` (read `[okai] click x= y=` → correct → repeat) and `vm.click_screen(x, y, regex)` for chrome (reads `[mse] btn=1`). `vm.link_regions()` parses the last render's link log; `vm.premove()` dead-reckons first so the probe click never lands on a link under the cursor.
 - okai opens maximized at (0,0): tab strip y 2..40 (tab i at x 6+302i, x-box at +290, '+' after the last tab), toolbar y 40..98 (back/fwd/reload/home centers x 25/63/101/139, y 69; address bar from x 172; lock box x 174..194 y 48..68), page from (2, 98).
 - `python3 tests/headless/run_suite.py -j3 test_a.py ...` runs tests in parallel (outputs in `~/okvm/<test>.out`).
-- Scripts (all green 2026-10-07): `test_okai_interact.py` (offline: CSS+image load, checkbox, link click, back, Tab+typing+Enter submit, wheel), `test_okai_page.py <url> [tag] [--scroll N]` (load + screenshot any page), `test_links.py`, `test_nav.py`, `test_tab_x.py`, `test_addrbar.py`, `test_lock.py`, `test_errors.py`, `test_https_default.py`, `test_certfail.py` (starts its own self-signed `openssl s_server`), `test_resume.py`, `test_pki_qemu.py`, `test_google.py`, `test_google_search.py`, `test_firstrender.py`, `test_stale_doc.py`, `test_fixed_header.py` (self-contained fixtures), `test_boot_mem.py`, `test_font_render.py`, `test_css_box.py`, `test_sh_hello.py`.
+- Scripts (all green 2026-10-07): `test_okai_js.py` (page scripts: offline fixture + Wikipedia), `test_sites.py [tag] [url ...]` (real-site sweep, needs internet: OK only when the document arrived over TLS — a plain-HTTP fallback or error page fails; 15/15 on 2026-10-07), `test_okai_interact.py` (offline: CSS+image load, checkbox, link click, back, Tab+typing+Enter submit, wheel), `test_okai_page.py <url> [tag] [--scroll N]` (load + screenshot any page), `test_links.py`, `test_nav.py`, `test_tab_x.py`, `test_addrbar.py`, `test_lock.py`, `test_errors.py`, `test_https_default.py`, `test_certfail.py` (starts its own self-signed `openssl s_server`), `test_resume.py`, `test_pki_qemu.py`, `test_google.py`, `test_google_search.py`, `test_firstrender.py`, `test_stale_doc.py`, `test_fixed_header.py` (self-contained fixtures), `test_boot_mem.py`, `test_font_render.py`, `test_css_box.py`, `test_sh_hello.py`.
 
 ### Host preview (no QEMU)
 `build-host/wrender <corpus-name> <w> <h> out.ppm [page_h]` runs the exact engine sources (`src/web`) on the host — the same code okai links. `tests/web/compare.py` pairs it with an Edge screenshot.
@@ -391,6 +412,10 @@ vm.kill()
 ## Session Log (condensed)
 
 Older, fully-resolved narratives were collapsed. Newest first.
+
+**2026-10-07 (late) — "half the sites give a connection or security error" fixed.** Census with `tls_scan` (kernel TLS client on the host, `tests/tls_hosts.txt`) went 31/91 → 86/91 (left: 3 TLS-1.2-only servers, netflix truncating mid-body, washingtonpost timing out). Causes and fixes: no name-bound anchoring + a tiny root store ("untrusted root" for most sites) → full Mozilla store with subject/SKI and `root_issued()`; 11 roots the strict parser rejected → `x509_parse_spki` (only the key is needed); OCSP staples from delegated/byKey responders rejected → supported, plus soft-fail for unverifiable staples; Akamai sites (eBay, Microsoft, Apple…) offer no ChaCha20 → constant-time AES-128-GCM. In the kernel, every HTTPS fetch had silently been timing out and downgrading to HTTP since the header change (bug #32), plus the DNS navigation race (#33), the stale previous-connection bytes parsed as the next ServerHello (reason=6 phase=1 on back-to-back sub-resources), timeout/ticket clock units (#34) and the `Accept: */*` 404 on crates.io. `test_sites.py` 15/15 over HTTPS (bot-protection 403s count — the TLS side works); adversarial 189/189 (+ASan), live MITM check PASS. Still failing: TLS-1.2-only servers (whatwg.org, baidu.com, arstechnica.com), netflix (server truncates), washingtonpost (times out).
+
+**2026-10-07 — Phase 6: real JavaScript (QuickJS), commit 67fc1c7.** See *Browser — page scripts*. QuickJS hosted-style on a freestanding libc shim + musl libm, x87 per-thread state, realm-per-document with budgets and abort containment; spec-shaped script scheduling incl. module graphs and deferred `import()`; Web API prelude + C DOM natives; events before default actions; fetch/XHR; cookie jar shared with HTTP. TCP sends split at the MSS (bug #31). tinyjs retired. Verified: Wikipedia (ResourceLoader, 10 scripts, 0 errors) in QEMU, `test_okai_js.py` + full headless suite, GitHub/MDN modules clean on the host under ASan.
 
 **2026-10-07 — new web engine integrated into the kernel (phases 0-5 done).** `src/web` linked into the desktop build (+`fontdata.asm`, `callstack.asm`); okai rewritten around `struct wdoc` (per-tab heap documents, per-window page surface via the new window pixel-surface mode, pixel hit-testing, coalesced renders, HTML error/home pages, forms incl. checkbox/radio/select, gzip, sub-resource images). Old renderer retired (`dom.c`, `css.c`, `layout.c`, `html.c` + their host tests/preview; the editor's slot map moved to `textslot.c`). Kernel fixes found on the way: boot PD widened to 0-64M PSE (bigger image put the boot stack past 4M → silent triple fault), HTTPS fetches no longer reuse the previous connection (every other sub-resource failed), TLS fetch ends at HTTP message completion (Google's trailing record fails AEAD on this path — OpenSSL too), 1024-byte request paths (Wikipedia's load.php URLs were truncated), host:port/IP default to http. Engine fixes: root/body gradient & image paint the canvas, inline-box fragments double-counted padding+border, percentage max-width on replaced elements zeroed their max-content (Wikipedia thumbnails at 100px). Verified in QEMU: home, example.com, Wikipedia (675KB gzip HTML, 2 CSS + 24 images, first render ~250-400ms), HN, Google search submit, error pages; full headless suite green; host CSS 54/54, corpus clean under ASan/UBSan.
 
@@ -420,9 +445,10 @@ Older, fully-resolved narratives were collapsed. Newest first.
 
 ## Next Steps
 
-1. **Phase 6 — real JavaScript (QuickJS)**: port to the freestanding kernel (no FPU-free guarantee there: QuickJS uses doubles — needs FPU state save/restore around engine calls or a soft-float build), bind a DOM (`wdom`) + event loop + timers + fetch/XHR over the single connection, then flip the parser to scripting-on.
-2. **Engine fidelity**: GitHub's right "About" sidebar and button wrapping, `position: sticky`, transforms beyond translate, smoother JPEG chroma upsampling, CJK TrueType fallback, `<select>` popup menu.
-3. **Networking**: parallel/keep-alive connections would cut sub-resource time (each HTTPS fetch is a fresh handshake today); per-resource timeouts.
-4. **Deferred (unchanged):** CT/SCT verification, HTTP/2, OpenSSL-PSK inquiry.
+1. **TLS coverage**: TLS 1.2 (ECDHE + AES-GCM/ChaCha20, needed for whatwg.org, baidu.com, arstechnica.com) and the SHA-384 schedule for TLS_AES_256_GCM_SHA384. The intermittent resumption failure noted 2026-09-29 should be re-checked now that stale previous-connection bytes are dropped.
+2. **JavaScript**: canvas 2D, WebSocket over TLS, layout-dependent APIs that need a fresh layout mid-script, performance on heavy SPAs (budget slices).
+3. **Engine fidelity**: GitHub's right "About" sidebar and button wrapping, `position: sticky`, transforms beyond translate, smoother JPEG chroma upsampling, CJK TrueType fallback, `<select>` popup menu.
+4. **Networking**: parallel/keep-alive connections would cut sub-resource time (each HTTPS fetch is a fresh handshake today); per-resource timeouts; a multi-entry DNS cache.
+5. **Deferred (unchanged):** CT/SCT verification, HTTP/2, OpenSSL-PSK inquiry.
 
 ---

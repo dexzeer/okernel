@@ -385,9 +385,11 @@ static int net_get_ex(const char* url, const char* top) {
         net_extra_headers = cookie_hdr;
     }
     net_accept_gzip = 1;
+    net_accept_html = (top == 0);
     if (url_is_https(url)) https_get_port(host, path, (uint16_t)port);
     else { http_reset_conn_attempts(); http_get_port(host, path, (uint16_t)port); }
     net_accept_gzip = 0;
+    net_accept_html = 0;
     net_extra_headers = 0;
     return 0;
 }
