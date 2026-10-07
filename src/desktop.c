@@ -19,7 +19,7 @@
 #include "filesystem.h"
 #include "editor.h"
 #include "okai.h"
-#include "js/js_dom.h"
+
 #include "theme.h"
 #include "crypto/rand.h"
 #include "string.h"
@@ -1312,6 +1312,17 @@ void kernel_main(uint32_t mboot_phys) {
     serial_init();
     gdt_init();
     idt_init();
+    // x87 FPU for QuickJS (okai page scripts): CR0.EM=0 (no emulation trap),
+    // MP=1, NE=1 (native error reporting; every exception stays masked),
+    // TS=0. Preemptive switches FNSAVE/FRSTOR per thread (process.c).
+    {
+        uint32_t cr0;
+        __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+        cr0 &= ~(0x4u | 0x8u);   // EM, TS
+        cr0 |= 0x2u | 0x20u;     // MP, NE
+        __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
+        __asm__ volatile("fninit");
+    }
     memory_init(mboot_phys);
 
     // mboot_info.framebuffer_addr is the uint64 at offset 88 (NOT 44: count
@@ -2256,13 +2267,6 @@ void kernel_main(uint32_t mboot_phys) {
         // the fetch-pill erase. See okai_poll().
         okai_poll();
 
-        // Check if JS DOM mutations require a re-render
-        if (js_dom_is_rerender_needed()) {
-            for (int bi = 0; bi < MAX_OKAIS; bi++) {
-                struct okai* ok = okai_get(bi);
-                if (ok) okai_render_content(bi);
-            }
-        }
 
         // Erase last frame's cursor sprite — only if the sprite overlaps
         // the dragged window's old footprint (avoids a full recomposite

@@ -1,0 +1,35 @@
+QuickJS for okernel
+===================
+
+Upstream: QuickJS 2026-06-04 by Fabrice Bellard and Charlie Gordon
+(https://bellard.org/quickjs/, MIT license, see LICENSE). Only the engine
+files are vendored: quickjs.c/.h, quickjs-atom.h, quickjs-opcode.h,
+cutils.c/.h, list.h, libregexp*, libunicode*, dtoa.c/.h. No quickjs-libc,
+no qjs/qjsc.
+
+Local changes (search for "okernel" in the sources):
+
+  quickjs.c   CONFIG_ATOMICS is off when QJS_NO_ATOMICS is defined (no
+              threads in the kernel).
+  quickjs.c/h JS_EVAL_FLAG_NO_RESOLVE: compile a module without loading its
+              imports (JS_ResolveModule() does that later).
+  quickjs.c/h JS_FindLoadedModule(), JS_GetModuleRequestCount(),
+              JS_GetModuleRequest(): module graph introspection so the host
+              can fetch a module graph asynchronously before linking it.
+  quickjs.c/h JS_SetDynamicImportHook() + JS_LoadModuleDeferred(): the host
+              may park an import() until its module has been fetched.
+
+Kernel build (Makefile QJS_*): compiled hosted-style (builtins on) with
+-nostdinc against the freestanding libc in libc/ (headers) + qjs_libc.c
+(heap = kmalloc, stdio = serial, clock = RTC + PIT ticks, abort() unwinds
+the current page realm via __builtin_longjmp) and the musl libm subset in
+libm/ (musl 1.2.5, MIT, see libm/COPYRIGHT.musl; libm/sqrt_x87.c is local).
+Doubles use the x87 at 53-bit precision (wjs.c sets the control word on
+every entry; libc/float.h reports FLT_EVAL_METHOD 0 accordingly); the
+kernel FNSAVEs the FPU per thread on preemptive switches (process.c).
+
+Verification: tests/qjs/build.sh links these exact objects into a
+freestanding 32-bit Linux binary (no glibc) and runs QuickJS's own suites
+(tests/qjs/suite: language, closures, loops, builtins, BigInt). Host
+builds of the web engine (tests/web/build.sh) compile QuickJS against the
+system libc instead.

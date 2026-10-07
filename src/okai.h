@@ -10,12 +10,14 @@
 // per-window pixel surface that the window system blits (window_set_pixels).
 
 #define OKAI_MAX_HISTORY 8
-#define OKAI_URL_LEN 1024
+#define OKAI_URL_LEN 2048
 #define MAX_OKAIS 2            // one browser window (+ spare); tabs live inside
 #define OKAI_MAX_TABS 4        // tabs per browser window
 #define OKAI_MAX_REDIRECTS 8
 #define OKAI_MAX_CSS_FETCH 24  // external stylesheets fetched per page
 #define OKAI_MAX_IMG_FETCH 32  // images fetched per page (rest stay blank)
+#define OKAI_MAX_JS_FETCH  160 // script/module sources fetched per page
+#define OKAI_MAX_REQ_FETCH 64  // fetch()/XHR requests per page
 
 // Where the Home button, the '+' new tab, and `okai` with no argument go.
 // okai:home is an INTERNAL page (no network).
@@ -75,6 +77,11 @@ struct okai_tab {
     // Animation: current rendered tab width (px) and close-in-progress flag.
     int anim_w;           // eased toward the target width for open/close animation
     int closing;          // 1 while the tab is shrinking before removal
+    // Page scripts
+    int sub_js, sub_req;  // script / request fetches issued this page (caps above)
+    uint32_t js_next_tick;// next realm pump (tick); 0 = poll wjs_next_due
+    int js_scroll_evt;    // a scroll happened: dispatch `scroll` on the next pump
+    uint32_t links_hash;  // hash of the last logged link/field regions
 };
 
 struct okai {
@@ -156,9 +163,7 @@ void okai_paint_overlays(int id);
 // so it never paints over a covering window.
 void okai_paint_overlays_rects(int id, int rects[][4], int nr);
 
-// Page DOM of the active tab of window id (JS bridge), and a hook to tell
-// okai the DOM changed (restyle + relayout + repaint on the next poll).
-struct wdom* okai_active_dom(int id);
-void okai_dom_changed(int id);
+// Page scripts on/off for newly loaded pages (the J key toggles + reloads).
+extern int okai_scripts_on;
 
 #endif

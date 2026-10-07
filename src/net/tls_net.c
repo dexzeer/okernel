@@ -46,8 +46,8 @@ static int tls_active;           // 1 while a fetch is in progress
 static int tls_phase;            // HP_* current phase
 static char tls_host_buf[128];   // copied (caller's host buffer may be transient)
 static const char* tls_host;
-static char tls_path[1024];       // real-site query strings run long
-static char tls_req_buf[1024 + 512];
+static char tls_path[2048];       // real-site query strings run long (module batches ~1.5KB)
+static char tls_req_buf[2048 + 512 + NET_EXTRA_MAX];
 extern int net_accept_gzip;      // network.c: okai opts in to gzip bodies
 static uint32_t tls_req_len;
 
@@ -178,8 +178,12 @@ void https_get_port(const char* host, const char* path, uint16_t port) {
     while (*req) tls_req_buf[rlen++] = *req++;
     for (i = 0; tls_host[i]; i++) tls_req_buf[rlen++] = tls_host[i];
     req = net_accept_gzip
-        ? "\r\nUser-Agent: okernel/0.4\r\nAccept: */*\r\nAccept-Encoding: gzip\r\nConnection: close\r\n\r\n"
-        : "\r\nUser-Agent: okernel/0.4\r\nAccept: */*\r\nConnection: close\r\n\r\n";
+        ? "\r\nUser-Agent: okernel/0.4\r\nAccept: */*\r\nAccept-Encoding: gzip\r\n"
+        : "\r\nUser-Agent: okernel/0.4\r\nAccept: */*\r\n";
+    while (*req) tls_req_buf[rlen++] = *req++;
+    if (net_extra_headers)
+        for (i = 0; net_extra_headers[i] && i < NET_EXTRA_MAX - 1; i++) tls_req_buf[rlen++] = net_extra_headers[i];
+    req = "Connection: close\r\n\r\n";
     while (*req) tls_req_buf[rlen++] = *req++;
     tls_req_len = rlen;
 

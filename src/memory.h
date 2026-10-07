@@ -20,6 +20,7 @@ void* kmalloc(uint32_t size);
 void* kcalloc(uint32_t n, uint32_t size);
 void* krealloc(void* ptr, uint32_t size);
 void kfree(void* ptr);
+uint32_t ksize(void* ptr);   // usable bytes of a live block (0 if invalid)
 void heap_stats(uint32_t* total, uint32_t* used, uint32_t* peak, uint32_t* largest_free);
 
 #endif

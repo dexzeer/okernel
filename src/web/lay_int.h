@@ -105,6 +105,7 @@ struct wlayout {
     struct dhit* hits;
     int nhits, caphits;
     int32_t* node_box;            // DOM node -> first box (-1)
+    int node_box_n;               // entries in node_box (DOM size at layout time)
     int root;                     // root box index
     int32_t doc_h, doc_w;         // LU
     uint32_t canvas_bg;

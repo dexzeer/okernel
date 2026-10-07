@@ -14,6 +14,7 @@
 #define WN_ELEM    1
 #define WN_TEXT    2
 #define WN_COMMENT 3
+#define WN_FRAG    4   // DocumentFragment (script-created; never attached itself)
 
 #define NS_HTML 0
 #define NS_SVG  1
@@ -74,6 +75,7 @@ struct wdom {
     char title[128];     // UTF-8 <title> text (whitespace collapsed)
     char charset[24];    // detected encoding label
     int oom;             // an allocation failed; the tree may be incomplete
+    int scripting;       // scripting flag: <noscript> is raw text and hidden
 };
 
 struct wdom* wdom_new(void);
@@ -88,6 +90,7 @@ const char* watom_name(const struct watoms* t, int atom, int* len);
 int  wdom_create_element(struct wdom* d, int ns, int tag_atom);
 int  wdom_create_text(struct wdom* d, const char* s, int len);
 int  wdom_create_comment(struct wdom* d, const char* s, int len);
+int  wdom_create_fragment(struct wdom* d);
 void wdom_append(struct wdom* d, int parent, int child);
 void wdom_insert_before(struct wdom* d, int parent, int child, int ref); // ref -1 = append
 void wdom_remove(struct wdom* d, int child);   // detach from parent
@@ -121,12 +124,25 @@ int  wdom_next(const struct wdom* d, int node, int scope);
 int  wdom_text_content(const struct wdom* d, int node, char* out, int cap);
 // Replace all children with a single text node.
 void wdom_set_text_content(struct wdom* d, int el, const char* s, int len);
+// Script support: replace a text/comment node's data; tree connectivity;
+// clone (detached copy, deep = with descendants); HTML fragment
+// serialization (outer: the node itself, else its children) into a wbuf.
+struct wbuf;
+void wdom_set_data(struct wdom* d, int node, const char* s, int len);
+int  wdom_is_connected(const struct wdom* d, int node);
+int  wdom_clone(struct wdom* d, int node, int deep);
+void wdom_serialize(const struct wdom* d, int node, int outer, struct wbuf* b);
 
 // Parse an HTML document (bytes in `charset` or sniffed when NULL/empty).
 // Always returns a document (possibly empty) or NULL on allocation failure.
 struct wdom* whtml_parse(const char* bytes, int len, const char* charset_hint);
+// Same, with the scripting flag (1: scripts will run, <noscript> is raw text).
+struct wdom* whtml_parse_ex(const char* bytes, int len, const char* charset_hint, int scripting);
 // Parse a fragment into `parent` (innerHTML-style, body context).
 void whtml_parse_fragment(struct wdom* d, int parent, const char* utf8, int len);
+// Fragment parsing with a context element tag (atom): table/tbody/tr/select/
+// ... pick the matching insertion mode (innerHTML on a <tbody> etc.).
+void whtml_parse_fragment_ctx(struct wdom* d, int parent, int ctx_tag, const char* utf8, int len);
 
 // Charset helpers: decode bytes to UTF-8 (newlines normalized to \n).
 // Returns a heap buffer (caller frees) and its length in *out_len.

@@ -75,4 +75,25 @@ void wdoc_stats(struct wdoc* d, char* out, int cap);
 // Base64 / data: URL helper (returns heap bytes + length, or NULL).
 char* wdoc_data_url(const char* url, int len, int* out_len, char* mime, int mime_cap);
 
+// ---- page scripts ---------------------------------------------------------
+// Resource kinds (wdoc_res_kind): what the shell is fetching.
+#define WDOC_RK_CSS    0
+#define WDOC_RK_IMG    1
+#define WDOC_RK_SCRIPT 2
+#define WDOC_RK_REQ    3   // fetch()/XMLHttpRequest
+struct wjs;
+// Run page scripts (QuickJS) for the next wdoc_load. Off by default.
+void wdoc_set_scripting(struct wdoc* d, int on);
+struct wjs* wdoc_js(struct wdoc* d);     // NULL when scripting is off (see wjs.h)
+void wdoc_set_scroll(struct wdoc* d, int y);   // shell scroll (window.scrollY)
+void wdoc_set_focus(struct wdoc* d, int node); // focused control (activeElement)
+int  wdoc_res_kind(struct wdoc* d, int id);
+// Request details of a resource (RES_REQ may carry method/headers/body).
+int  wdoc_fetch_info(struct wdoc* d, int id, const char** method, const char** headers,
+                     const char** body, int* blen);
+// Completion with HTTP status, raw response headers and the final URL
+// (after redirects). len < 0 = failed.
+void wdoc_fetch_done2(struct wdoc* d, int id, const char* bytes, int len, const char* ctype,
+                      int status, const char* headers, const char* final_url);
+
 #endif

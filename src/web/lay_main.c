@@ -952,6 +952,7 @@ struct wlayout* wlay_run(struct wdom* d, struct wstyleset* ss, int vw, int vh,
     L->node_box = (int32_t*)w_malloc((d->nn + 1) * sizeof(int32_t));
     if (!L->node_box) { w_free(L); return 0; }
     for (int i = 0; i <= d->nn; i++) L->node_box[i] = -1;
+    L->node_box_n = d->nn + 1;
     if (lay_build_tree(L) < 0) return L;
     // replaced: intrinsic image sizes
     for (int i = 0; i < L->nb; i++) {
@@ -1031,7 +1032,8 @@ const char* wlay_text(const struct wlayout* L) { return L->text.p; }
 int wlay_hits(const struct wlayout* L, const struct dhit** hits) { *hits = L->hits; return L->nhits; }
 
 int wlay_node_rect(const struct wlayout* L, int node, int32_t* x, int32_t* y, int32_t* w, int32_t* h) {
-    if (node < 0 || node >= L->d->nn) return 0;
+    // node_box is sized for the DOM at layout time; scripts may have grown it since
+    if (node < 0 || node >= L->d->nn || node >= L->node_box_n) return 0;
     int b = L->node_box[node];
     if (b < 0) return 0;
     *x = L->b[b].ax; *y = L->b[b].ay; *w = L->b[b].w; *h = L->b[b].h;

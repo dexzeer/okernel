@@ -2180,6 +2180,57 @@ void csheet_parse(struct wsheet* sh, struct watoms* atoms, const char* text, int
     w_free(dup);
 }
 
+// ---- selector queries (DOM querySelector / matches / closest) -------------------
+
+struct wselq {
+    struct wsheet sh;
+    int first, count;
+};
+
+struct wselq* css_selq_compile(struct wdom* d, const char* s, int len) {
+    struct wselq* q = (struct wselq*)w_calloc(1, sizeof(struct wselq));
+    if (!q) return 0;
+    struct selp p;
+    memset(&p, 0, sizeof p);
+    p.sh = &q->sh;
+    p.atoms = &d->atoms;
+    p.s = s;
+    p.len = len;
+    uint32_t ms;
+    if (parse_sel_list(&p, 0, 0, &q->first, &q->count, &ms) < 0 || p.bad || q->count <= 0) {
+        csheet_free(&q->sh);
+        w_free(q);
+        return 0;
+    }
+    return q;
+}
+
+int css_selq_match(const struct wselq* q, const struct wdom* d, int el) {
+    if (!q || el < 0 || el >= d->nn || d->n[el].type != WN_ELEM) return 0;
+    for (int k = 0; k < q->count; k++)
+        if (q->sh.sels[q->first + k].pseudo == PE_NONE && csel_match(d, &q->sh, q->first + k, el))
+            return 1;
+    return 0;
+}
+
+void css_selq_free(struct wselq* q) {
+    if (!q) return;
+    csheet_free(&q->sh);
+    w_free(q);
+}
+
+int css_supports(struct wdom* d, const char* s, int len) {
+    struct wsheet sh;
+    memset(&sh, 0, sizeof sh);
+    struct pctx pc;
+    pc.sh = &sh;
+    pc.atoms = &d->atoms;
+    pc.order = 0;
+    int r = supports_cond(&pc, s, len);
+    csheet_free(&sh);
+    return r;
+}
+
 void csheet_parse_decls(struct wsheet* sh, struct watoms* atoms, const char* text, int len,
                         int* first, int* count) {
     (void)atoms;
