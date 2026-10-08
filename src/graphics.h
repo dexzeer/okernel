@@ -135,6 +135,9 @@ void graphics_fill(uint32_t color);
 
 // Flush backbuffer to VGA framebuffer
 void graphics_flush(void);
+// Raw framebuffer access for the cursor compositor (cursor.c).
+uint8_t* graphics_fb_base(void);
+int graphics_fb_pitch(void);
 
 // Draw a scaled bitmap (for icons)
 void graphics_draw_bitmap(int x, int y, const uint8_t* bitmap, int bmp_w, int bmp_h, uint32_t fg, uint32_t bg, int scale);

@@ -124,6 +124,7 @@ void okai_blit_content(int id);
 // reads) so the desktop loop can throttle overlay repaints to when the chrome
 // can actually change.
 int okai_is_animating(int id);
+int okai_wants_cpu(void);   // loading / render pending / animating anywhere
 // Hover target / loading spinner changed since the chrome was last drawn.
 int okai_ui_needs_paint(int id);
 int okai_find_by_win(int win_id);

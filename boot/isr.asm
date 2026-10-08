@@ -84,6 +84,9 @@ isr_common_stub:
     mov fs, ax
     mov gs, ax
 
+    cld                 ; C code assumes DF=0 (SysV ABI); the interrupted code
+                        ; may be inside a backward rep movs (memmove: std).
+                        ; iret restores its EFLAGS, DF included.
     push dword [esp + 36]  ; push interrupt number (4 ds + 32 pusha = 36)
     call isr_handler
     add esp, 4          ; clean up argument
@@ -112,6 +115,7 @@ irq_common_stub:
     mov fs, ax
     mov gs, ax
 
+    cld                 ; DF=0 for C (see isr_common_stub)
     push dword [esp + 36]  ; push interrupt number (4 ds + 32 pusha = 36)
     call irq_handler
     add esp, 4

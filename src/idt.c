@@ -373,6 +373,19 @@ void isr_handler(int int_num) {
 
 // Called from IRQ stubs
 void irq_handler(int irq) {
+    // Canary: the stub clears DF (cld) before calling C. A set DF here means
+    // that cld went missing — and every rep movs/stos in a handler (the
+    // timer's rand_stir memcpy every tick) would run BACKWARDS over memory
+    // whenever the IRQ lands inside memmove's std region.
+    {
+        static int df_warned;
+        uint32_t fl;
+        __asm__ volatile("pushfl; popl %0" : "=r"(fl));
+        if ((fl & 0x400) && !df_warned) {
+            df_warned = 1;
+            serial_puts("[isr] DF set in handler (missing cld)\n");
+        }
+    }
     int irq_num = irq - 32;
     if (irq_num >= 8) outb(0xA0, 0x20);
     outb(0x20, 0x20);

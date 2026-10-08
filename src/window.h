@@ -29,8 +29,6 @@ extern const uint32_t vga_to_rgb[16];
 #define WIN_CTRL_MAX   1
 #define WIN_CTRL_CLOSE 2
 
-#define CURSOR_W 12
-#define CURSOR_H 16
 
 // Window content colors (VGA palette indices; the title bar / border / button
 // chrome is drawn with RGB theme colors from theme.h)
@@ -155,13 +153,7 @@ struct window* window_get(int id);
 void window_get_cursor(int id, int* out_x, int* out_y);
 void window_set_title(int id, const char* title);
 
-void mouse_init_fb(void);
-void mouse_get_position(int* x, int* y);
-void mouse_paint_cursor(int px, int py);
-int mouse_get_x(void);
-int mouse_get_y(void);
-int mouse_get_left_button(void);
-int mouse_get_scroll(void);
+#include "cursor.h"   // mouse_* (driver + framebuffer cursor)
 int window_from_point(int x, int y);
 
 #endif

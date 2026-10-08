@@ -168,10 +168,9 @@ class OkVM:
     # ---- Mouse -------------------------------------------------------------
 
     def burst(self, dx, dy, n=5):
-        """Send the same relative delta n times so the kernel's 4-sample
-        moving-average smoothing ring fills with it. Net displacement is
-        ~= 3.75 * (dx, dy). Single HMP mouse_move moves are diluted by the
-        stale samples in the ring — that's why bursts."""
+        """Send the same relative delta n times. The driver applies packets
+        1:1 (cursor.c, no smoothing since 2026-10-08): net displacement is
+        ~= n * (dx, dy)."""
         for _ in range(n):
             self.mon(f"mouse_move {dx} {dy}", 0.09)
         time.sleep(0.12)
