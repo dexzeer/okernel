@@ -169,9 +169,12 @@ static void inc32(uint8_t cb[16]) {
     for (int i = 15; i >= 12; i--) if (++cb[i]) break;
 }
 
-// Shared GCM core: CTR over in -> out, GHASH over aad + ciphertext.
+// Shared GCM core. GCM_SEAL: CTR in -> out, tag over aad + out.
+// GCM_TAG: tag over aad + in (in = ciphertext), nothing written.
+// GCM_CTR: CTR in -> out only (tag untouched; decrypt after verifying).
+enum { GCM_SEAL, GCM_TAG, GCM_CTR };
 static void gcm(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* aad, uint32_t aad_len,
-                const uint8_t* in, uint32_t len, uint8_t* out, int encrypt, uint8_t tag[16]) {
+                const uint8_t* in, uint32_t len, uint8_t* out, int mode, uint8_t tag[16]) {
     aes128_ctx ctx;
     aes128_init(&ctx, key);
     uint8_t hb[16] = { 0 };
@@ -182,11 +185,11 @@ static void gcm(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* a
     uint8_t j0[16], cb[32], ks[32], y[16] = { 0 };
     memcpy(j0, nonce, 12);
     j0[12] = 0; j0[13] = 0; j0[14] = 0; j0[15] = 1;
-    ghash_update(y, h, aad, aad_len);
-    if (!encrypt) ghash_update(y, h, in, len);
+    if (mode != GCM_CTR) ghash_update(y, h, aad, aad_len);
+    if (mode == GCM_TAG) ghash_update(y, h, in, len);
     memcpy(cb, j0, 16);
     uint32_t off = 0;
-    while (off < len) {
+    while (mode != GCM_TAG && off < len) {
         // two counter blocks per AES call
         inc32(cb);
         memcpy(cb + 16, cb, 16);
@@ -198,7 +201,8 @@ static void gcm(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* a
         off += k;
         memcpy(cb, cb + 16, 16);
     }
-    if (encrypt) ghash_update(y, h, out, len);
+    if (mode == GCM_SEAL) ghash_update(y, h, out, len);
+    if (mode == GCM_CTR) goto done;
     uint8_t lens[16];
     uint64_t abits = (uint64_t)aad_len * 8, cbits = (uint64_t)len * 8;
     for (int i = 0; i < 8; i++) {
@@ -209,6 +213,7 @@ static void gcm(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* a
     gf_mul(y, h);
     aes128_encrypt_blocks(&ctx, j0, ks, 1);
     for (int i = 0; i < 16; i++) tag[i] = (uint8_t)(ks[i] ^ y[i]);
+done:
     secure_zero(&ctx, sizeof ctx);
     secure_zero(hb, sizeof hb);
     secure_zero(h, sizeof h);
@@ -219,27 +224,24 @@ static void gcm(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* a
 int aead_aes128gcm_encrypt(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* aad, uint32_t aad_len,
                            const uint8_t* in, uint32_t in_len, uint8_t* out, uint8_t tag[16]) {
     if (in_len > (1u << 24)) return -1;   // TLS records are <= 16KB
-    gcm(key, nonce, aad, aad_len, in, in_len, out, 1, tag);
+    gcm(key, nonce, aad, aad_len, in, in_len, out, GCM_SEAL, tag);
     return 0;
 }
 
 int aead_aes128gcm_decrypt(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* aad, uint32_t aad_len,
                            const uint8_t* in, uint32_t in_len, const uint8_t tag[16], uint8_t* out) {
     if (in_len > (1u << 24)) return -1;
-    // Verify before releasing plaintext: compute the tag over the
-    // ciphertext without writing `out` (keystream into a scratch pass).
-    static uint8_t scratch[16384 + 256];
+    // Verify before releasing plaintext: the tag is a function of the
+    // CIPHERTEXT, so pass 1 computes it without decrypting anything; only
+    // an authentic record is decrypted (pass 2). No shared scratch buffer
+    // (the old static 16KB staging area was a cross-connection hazard),
+    // and `out` is never written for a forged record. Works in place.
     uint8_t want[16];
-    uint8_t* dst = in_len <= sizeof scratch ? scratch : out;
-    gcm(key, nonce, aad, aad_len, in, in_len, dst, 0, want);
+    gcm(key, nonce, aad, aad_len, in, in_len, 0, GCM_TAG, want);
     uint8_t diff = 0;
     for (int i = 0; i < 16; i++) diff |= (uint8_t)(want[i] ^ tag[i]);
     secure_zero(want, sizeof want);
-    if (diff) {
-        secure_zero(dst, in_len);
-        return -1;
-    }
-    if (dst != out) memcpy(out, dst, in_len);
-    secure_zero(scratch, in_len <= sizeof scratch ? in_len : 0);
+    if (diff) return -1;
+    gcm(key, nonce, aad, aad_len, in, in_len, out, GCM_CTR, 0);
     return 0;
 }

@@ -275,67 +275,90 @@ int mouse_get_scroll(void) {
     return s;
 }
 
-static void ps2_wait_in(void) {   // controller input buffer empty
-    while (inb(0x64) & 0x02) {}
+// Controller input buffer empty (bounded: a wedged controller must not hang boot).
+static void ps2_wait_in(void) {
+    for (int spin = 0; spin < 200000 && (inb(0x64) & 0x02); spin++) {}
 }
 
 // Wait for the controller output buffer, then read the byte (bounded).
 static int ps2_read_wait(void) {
-    for (int spin = 0; spin < 100000; spin++)
+    for (int spin = 0; spin < 200000; spin++)
         if (inb(0x64) & 0x01) return inb(0x60);
     return -1;
 }
 
-static void ps2_mouse_cmd(uint8_t b) {
-    ps2_wait_in(); outb(0x64, 0xD4);
-    ps2_wait_in(); outb(0x60, b);
+static void ps2_flush(void) {
+    for (int i = 0; i < 256 && (inb(0x64) & 0x01); i++) (void)inb(0x60);
 }
 
+static void ps2_ctl(uint8_t c) { ps2_wait_in(); outb(0x64, c); }
+
+// Send a byte to the mouse and return its reply (ACK 0xFA, or -1).
+static int ps2_mouse_cmd(uint8_t b) {
+    ps2_ctl(0xD4);
+    ps2_wait_in(); outb(0x60, b);
+    return ps2_read_wait();
+}
+
+// Every reply is read IN ORDER with a wait (never "drain whatever is there,
+// then read"): a byte that has not arrived yet is otherwise taken from the
+// next command, and the config-byte read is the dangerous one — a stale byte
+// (a key pressed during boot, a late mouse ACK) read as the config and
+// written back cleared the translate bit (0x40). The keyboard then sent raw
+// set-2 scancodes: 'a' (0x1C) typed Enter, 's' (0x1B) typed ']', every key
+// release (F0 xx) typed the key again. Both ports are disabled while we talk
+// to the controller so nothing can interleave, and the bits we rely on are
+// forced rather than inherited.
 void mouse_init_fb(void) {
     mouse_x = SCREEN_W / 2; mouse_y = SCREEN_H / 2;
     mouse_buttons = 0; mouse_cycle = 0;
-    ps2_wait_in(); outb(0x64, 0xA8);
-    ps2_wait_in(); outb(0x64, 0x20);
-    ps2_wait_in(); uint8_t s = inb(0x60); s |= 0x02; s &= ~0x20;
-    ps2_wait_in(); outb(0x64, 0x60);
-    ps2_wait_in(); outb(0x60, s);
-    ps2_wait_in(); outb(0x64, 0xD4);
-    ps2_wait_in(); outb(0x60, 0xFF);
-    ps2_wait_in(); inb(0x60);
-    ps2_wait_in(); outb(0x64, 0xD4);
-    ps2_wait_in(); outb(0x60, 0xF4);
-    while (inb(0x64) & 0x01) inb(0x60);
+
+    ps2_ctl(0xAD);                       // disable keyboard port
+    ps2_ctl(0xA7);                       // disable mouse port
+    ps2_flush();
+    ps2_ctl(0x20);                       // read config
+    int cfg = ps2_read_wait();
+    uint8_t c = (cfg < 0) ? 0 : (uint8_t)cfg;
+    c |= 0x01 | 0x02 | 0x40;             // kbd IRQ1, mouse IRQ12, set-1 translation
+    c |= 0x10;                           // keyboard stays off until 0xAE below
+    c &= (uint8_t)~0x20;                 // mouse clock on (0xA8 does it too)
+    ps2_ctl(0x60);
+    ps2_wait_in(); outb(0x60, c);
+    ps2_ctl(0xA8);                       // enable mouse port
+
+    // Reset: ACK, BAT result (0xAA), device ID (0x00).
+    int r_ack = ps2_mouse_cmd(0xFF);
+    int r_bat = ps2_read_wait();
+    int r_id = ps2_read_wait();
 
     // Intellimouse wheel mode (4-byte packets): sample-rate magic 200/100/80,
-    // then GET ID. The device answers ACK (0xFA) then the ID byte — WAIT for
-    // each, in order: draining first would eat the ID, misdetect wheel mode
-    // while the device already switched to 4-byte packets, and permanently
-    // desync the stream (HANDOFF bug #25).
-    {
-        uint8_t rates[] = { 0xC8, 0x64, 0x50 }; // 200, 100, 80
-        for (int i = 0; i < 3; i++) {
-            ps2_mouse_cmd(0xF3);
-            while (inb(0x64) & 0x01) inb(0x60);          // ack
-            ps2_mouse_cmd(rates[i]);
-            while (inb(0x64) & 0x01) inb(0x60);          // ack
-        }
-        ps2_mouse_cmd(0xF2);                              // get device ID
-        (void)ps2_read_wait();                            // ack
-        int id = ps2_read_wait();
-        if (id == 0x03 || id == 0x04) mouse_has_wheel = 1;
-        serial_puts("[mse] wheel detect id=0x");
-        serial_putchar("0123456789ABCDEF"[(id >> 4) & 0xF]);
-        serial_putchar("0123456789ABCDEF"[id & 0xF]);
-        serial_puts(mouse_has_wheel ? " 4-byte mode ON\n" : " 3-byte mode\n");
+    // then GET ID: ACK then the ID byte (HANDOFF bug #25).
+    static const uint8_t rates[] = { 0xC8, 0x64, 0x50 }; // 200, 100, 80
+    for (int i = 0; i < 3; i++) {
+        (void)ps2_mouse_cmd(0xF3);
+        (void)ps2_mouse_cmd(rates[i]);
     }
-    // The magic sequence left the rate at 80 Hz: back to 200 Hz reports
-    // (smoother tracking). ACKs read in order, same rule as above.
-    ps2_mouse_cmd(0xF3); (void)ps2_read_wait();
-    ps2_mouse_cmd(0xC8); (void)ps2_read_wait();
+    (void)ps2_mouse_cmd(0xF2);           // get device ID (returns the ACK)
+    int id = ps2_read_wait();
+    if (id == 0x03 || id == 0x04) mouse_has_wheel = 1;
+    serial_puts("[mse] wheel detect id=0x");
+    serial_putchar("0123456789ABCDEF"[(id >> 4) & 0xF]);
+    serial_putchar("0123456789ABCDEF"[id & 0xF]);
+    serial_puts(mouse_has_wheel ? " 4-byte mode ON\n" : " 3-byte mode\n");
 
-    // Re-enable data reporting (sample-rate commands may have paused it).
-    ps2_mouse_cmd(0xF4);
-    while (inb(0x64) & 0x01) inb(0x60);
+    // The magic left the rate at 80 Hz: back to 200 Hz reports.
+    (void)ps2_mouse_cmd(0xF3);
+    (void)ps2_mouse_cmd(0xC8);
+    ps2_flush();
+    ps2_ctl(0x20);                       // read back what the controller kept
+    int cfg2 = ps2_read_wait();
+    // Reporting goes on last: no movement packet can sneak in front of a reply.
+    int r_en = ps2_mouse_cmd(0xF4);      // enable data reporting
+    ps2_ctl(0xAE);                       // re-enable keyboard port
+    serial_printf("[ps2] config was=0x%x now=0x%x reset=%x/%x/%x enable=%x\n",
+                  cfg & 0xFFFF, cfg2 & 0xFFFF, r_ack & 0xFFFF, r_bat & 0xFFFF,
+                  r_id & 0xFFFF, r_en & 0xFFFF);
+    ps2_flush();
 
     build_sprite();
     irq_register_handler(12, mouse_irq_handler);

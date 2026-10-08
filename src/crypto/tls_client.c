@@ -409,7 +409,7 @@ int tls_response_complete(const uint8_t* resp, uint32_t len) {
                     resp[rd+1] == '\n') complete = 1;
                 break;
             }
-            if (rd + size > len) break; // data runs off the end
+            if (size > len - rd) break; // data runs off the end (no u32 wrap)
             rd += size;
             if (rd + 1 < len && resp[rd] == '\r' &&
                 resp[rd+1] == '\n') rd += 2;
@@ -929,6 +929,10 @@ static int tls_decrypt_one(struct tls_state* st, uint8_t key[32], uint8_t iv[12]
     while (plen > 0 && pt[plen - 1] == 0) plen--;
     if (plen == 0) return -1;
     *ctype = pt[plen - 1];
+    // A PROTECTED change_cipher_spec is a protocol violation (RFC 8446 §5:
+    // MUST abort with unexpected_message) — only the plaintext middlebox-
+    // compat record above may be skipped.
+    if (*ctype == TLS_CT_CHANGE_CIPHER_SPEC) return -2;
     return plen - 1;
 }
 
@@ -1670,14 +1674,25 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             if (st->got_staple) {
                 x509_cert issuer;
                 int ocsp_rc;
-                if (cert_issuer(st->cert_body, st->cert_bl, &issuer) != 0) {
-                    tls_dbg("[tls] staple with unparsable issuer\n");
-                    st->fail_reason = TLS_FAIL_CERT;
-                    st->cert_detail = CV_ERR_OCSP;
-                    return TLS_STEP_ERR;
+                // The staple is checked against the flight's second cert —
+                // which must be PROVEN to be the leaf's issuer here. When
+                // the leaf anchors directly on a store root, cert_verify
+                // never looked at entry 1: an attacker holding a revoked
+                // Must-Staple leaf could append a cert of its own plus a
+                // "good" response signed by it, and the certID/signature
+                // checks would all pass against that stand-in. Unprovable
+                // issuer = unverifiable staple (soft-fail unless Must-Staple).
+                if (cert_issuer(st->cert_body, st->cert_bl, &issuer) != 0 ||
+                    issuer.subject.len != leaf.issuer.len ||
+                    memcmp(issuer.subject.p, leaf.issuer.p, leaf.issuer.len) != 0 ||
+                    cert_sig_verify(leaf.sig_alg, &issuer, leaf.tbs.p, leaf.tbs.len,
+                                    leaf.signature.p, leaf.signature.len) != 0) {
+                    tls_dbg("[tls] staple: flight has no verifiable leaf issuer\n");
+                    ocsp_rc = OCSP_ERR_RESPONDER;
+                } else {
+                    ocsp_rc = ocsp_check_staple(st->staple, st->staple_len,
+                                               &leaf, &issuer, x509_get_now());
                 }
-                ocsp_rc = ocsp_check_staple(st->staple, st->staple_len,
-                                           &leaf, &issuer, x509_get_now());
                 tls_dbg("[tls] OCSP staple verdict: %s\n",
                         ocsp_strerror(ocsp_rc));
                 // Policy (2026-10-07): a VERIFIED revoked/unknown status
@@ -1842,9 +1857,11 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             return TLS_STEP_ERR;
         }
         if (ctype == TLS_CT_CHANGE_CIPHER_SPEC) {
-            st->rec_have = 0;
+            // RFC 8446 §5: compat CCS is only legal before the peer's
+            // Finished; after the handshake it MUST abort the connection.
+            st->fail_reason = TLS_FAIL_PROTO;
             secure_zero(dec_pt, sizeof(dec_pt));
-            return TLS_STEP_AGAIN;
+            return TLS_STEP_ERR;
         }
         if (ctype == TLS_CT_HANDSHAKE) {
             // Post-handshake handshake message: the only legal one here is

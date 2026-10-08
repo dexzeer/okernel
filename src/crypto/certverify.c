@@ -16,6 +16,8 @@
 #ifndef KERNEL
 static uint8_t g_extra_trusted[32];
 static int g_extra_trusted_set = 0;
+static int g_extra_distrust_set = 0;
+static x509_time g_extra_distrust;
 #endif
 
 static int nc_pair_ok(const x509_cert* issuer, const x509_cert* subject);
@@ -135,30 +137,60 @@ static int cert_revoked(const x509_cert* certs, int ncerts) {
     return 0;
 }
 
-static int spki_in_roots(const x509_cert* cert) {
+// Root whose key `cert` carries: its store index, ROOT_EXTRA for the
+// host-test trust slot, or -1.
+#define ROOT_EXTRA (-2)
+static int spki_root_index(const x509_cert* cert) {
     uint8_t hash[32];
     sha256(cert->spki.p, cert->spki.len, hash);
     for (int i = 0; i < x509_root_count; i++) {
         const uint8_t* rh = x509_roots[i].spki_hash;
         uint8_t diff = 0;
         for (int j = 0; j < 32; j++) diff |= hash[j] ^ rh[j];
-        if (diff == 0) return 1;
+        if (diff == 0) return i;
     }
 #ifndef KERNEL
     if (g_extra_trusted_set) {
         uint8_t diff = 0;
         for (int j = 0; j < 32; j++) diff |= hash[j] ^ g_extra_trusted[j];
-        if (diff == 0) return 1;
+        if (diff == 0) return ROOT_EXTRA;
     }
 #endif
+    return -1;
+}
+
+// Mozilla's partial distrust (roots.h): a chain anchored at root `idx`
+// is refused when the leaf was issued after the root's distrust date.
+// Several store entries can share a key (re-issued root certificates):
+// the key is distrusted if ANY entry carrying it is.
+static int root_distrusts(int idx, const x509_cert* leaf) {
+#ifndef KERNEL
+    if (idx == ROOT_EXTRA)
+        return g_extra_distrust_set &&
+               x509_time_cmp(&leaf->not_before, &g_extra_distrust) > 0;
+#endif
+    if (idx < 0) return 0;
+    for (int i = 0; i < x509_root_count; i++) {
+        const x509_root* r = &x509_roots[i];
+        if (!r->has_distrust_after) continue;
+        if (i != idx && memcmp(r->spki_hash, x509_roots[idx].spki_hash, 32) != 0)
+            continue;
+        if (x509_time_cmp(&leaf->not_before, &r->distrust_after) > 0) return 1;
+    }
     return 0;
 }
 
 #ifndef KERNEL
 void cert_verify_trust_extra(const uint8_t* spki, uint32_t spki_len) {
+    g_extra_distrust_set = 0;
     if (!spki) { g_extra_trusted_set = 0; return; }
     sha256(spki, spki_len, g_extra_trusted);
     g_extra_trusted_set = 1;
+}
+
+void cert_verify_trust_extra_distrust(const x509_time* after) {
+    g_extra_distrust_set = after != 0;
+    if (after) g_extra_distrust = *after;
 }
 #endif
 
@@ -191,10 +223,13 @@ static int verify_sig(const x509_cert* cert, const x509_cert* issuer) {
 
 // Name-bound anchor (see roots.h): is `cert` issued by a trusted root?
 // Root and issuer names must match byte-exactly, key identifiers must
-// agree when both are present, the root must be fit to issue (CA,
-// keyCertSign, serverAuth if constrained, key strength) and the signature
-// must verify under its key. Several roots may share a name (re-keyed
-// roots): every candidate is tried.
+// agree when both are present, the root key must meet the strength floor
+// and the signature must verify under it. The root certificate's own
+// fields (validity, CA flags, KU) are NOT re-checked: a store root is a
+// trust anchor (RFC 5280 6.1.1 d — name + key), and the store holds only
+// roots Mozilla trusts for TLS server auth. Several roots may share a name
+// (re-keyed roots): every candidate is tried. Returns the root's store
+// index, or -1.
 static int root_issued(const x509_cert* cert) {
     static x509_cert root;   // static: x509_cert is large (kernel stacks)
     for (int i = 0; i < x509_root_count; i++) {
@@ -209,9 +244,9 @@ static int root_issued(const x509_cert* cert) {
         // parsed; the root's own certificate is not re-validated.
         if (x509_parse_spki(r->spki, r->spki_len, &root) != 0) continue;
         if (root.key_type == X509_KEY_RSA && root.rsa_n_len < 256) continue;
-        if (verify_sig(cert, &root) == 0) return 1;
+        if (verify_sig(cert, &root) == 0) return i;
     }
-    return 0;
+    return -1;
 }
 
 int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname) {
@@ -292,7 +327,7 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
     if (certs[0].has_eku && !certs[0].eku_server_auth)
         return CV_ERR_KEYUSE; // EKU present without serverAuth
 
-    if (spki_in_roots(&certs[0])) {
+    if (spki_root_index(&certs[0]) != -1) {
         // Pinned/self-rooted leaf (cryptoholes #5 — trust model note):
         // our "roots" are SPKI pins, not CA names. Hostname, validity,
         // key-strength, and KU/EKU were all enforced above; what remains
@@ -306,6 +341,7 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
         // same key) passes. Cross-signed intermediates anchor through
         // the walk below, not here.
         if (verify_sig(&certs[0], &certs[0]) != 0) return CV_ERR_CHAIN;
+        if (root_distrusts(spki_root_index(&certs[0]), &certs[0])) return CV_ERR_ROOT;
         // Local revocations apply to pinned leaves too.
         if (cert_revoked(certs, ncerts)) return CV_ERR_REVOKED;
         return CV_OK;
@@ -314,7 +350,9 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
     for (int i = 0; i < ncerts; i++) {
         // Anchored through the root store? certs[i] issued by a trusted
         // root (the usual case: the server did not send the root).
-        if (root_issued(&certs[i])) {
+        int ri = root_issued(&certs[i]);
+        if (ri >= 0) {
+            if (root_distrusts(ri, &certs[0])) return CV_ERR_ROOT;
             for (int a = 1; a <= i; a++)
                 for (int b = 0; b < a; b++)
                     if (nc_pair_ok(&certs[a], &certs[b]) != 0) return CV_ERR_CAFLAGS;
@@ -365,7 +403,9 @@ int cert_verify(const uint8_t* msg_body, uint32_t msg_len, const char* hostname)
         if (verify_sig(subject, issuer) != 0) return CV_ERR_CHAIN;
 
         // anchored? Name constraints apply before accepting (below).
-        if (spki_in_roots(issuer)) {
+        int ai = spki_root_index(issuer);
+        if (ai != -1) {
+            if (root_distrusts(ai, &certs[0])) return CV_ERR_ROOT;
             // issuer is certs[i+1]: its constraints (and every CA above
             // the leaf up to it — enforced pairwise as the walk descended
             // is NOT how RFC does it; constraints accumulate from ALL CAs
@@ -398,13 +438,19 @@ static int ci_byte(uint8_t c) {
     return c;
 }
 
-// DNS constraint match (RFC 5280 §4.2.1.10): equal, or subject ends with
-// "." + constraint. Empty constraint matches nothing.
+// DNS constraint match (RFC 5280 §4.2.1.10): "example.com" matches the
+// name itself and every subdomain (subject equal, or ending with "." +
+// constraint); the leading-dot form ".example.com" matches subdomains
+// only (subject ends with the constraint, dot included). Empty constraint
+// matches nothing. (The leading-dot form used to fall into the first
+// rule and never match anything — an EXCLUDED ".evil.com" subtree was
+// silently not enforced.)
 static int dns_constrained_match(const uint8_t* sub, uint32_t sl,
                                  const uint8_t* con, uint32_t cl) {
     if (cl == 0 || sl < cl) return 0;
     for (uint32_t i = 0; i < cl; i++)
         if (ci_byte(sub[sl - cl + i]) != ci_byte(con[i])) return 0;
+    if (con[0] == '.') return sl > cl;
     if (sl == cl) return 1;
     return sub[sl - cl - 1] == '.';
 }

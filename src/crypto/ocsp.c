@@ -319,7 +319,12 @@ int ocsp_check_staple(const uint8_t* resp, uint32_t resp_len,
                 leaf->serial.p, leaf->serial.len))
         return OCSP_ERR_CERTID;
     // certStatus CHOICE: [0] good (NULL-ish empty), [1] revoked, [2] unknown.
+    // The verdict is only REMEMBERED here: "revoked/unknown" is reported
+    // after the freshness and signature checks below, like "good" — an
+    // unsigned status is no status (tls_client hard-fails on STATUS_BAD,
+    // so it must mean a responder-signed answer).
     if (u >= single.content_len) return OCSP_ERR_PARSE;
+    int status_good = 0;
     {
         uint8_t ctag = single.content[u];
         if (ctag == 0x80) {
@@ -327,8 +332,16 @@ int ocsp_check_staple(const uint8_t* resp, uint32_t resp_len,
             if (u + 2 > single.content_len || single.content[u+1] != 0)
                 return OCSP_ERR_PARSE;
             u += 2;
-        } else if (ctag == 0xA1 || ctag == 0x82) {
-            return OCSP_ERR_STATUS_BAD; // revoked or unknown
+            status_good = 1;
+        } else if (ctag == 0xA1) {
+            der_node rinfo;              // revoked: RevokedInfo, skipped
+            if (der_expect(single.content, single.content_len, &u, 0xA1, &rinfo) != 0)
+                return OCSP_ERR_PARSE;
+        } else if (ctag == 0x82) {
+            // unknown: [2] IMPLICIT NULL
+            if (u + 2 > single.content_len || single.content[u+1] != 0)
+                return OCSP_ERR_PARSE;
+            u += 2;
         } else {
             return OCSP_ERR_PARSE;
         }
@@ -449,5 +462,5 @@ int ocsp_check_staple(const uint8_t* resp, uint32_t resp_len,
                 return OCSP_ERR_SIG;
         }
     }
-    return OCSP_OK;
+    return status_good ? OCSP_OK : OCSP_ERR_STATUS_BAD;
 }
