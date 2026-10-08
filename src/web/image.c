@@ -495,66 +495,73 @@ static void jreset(struct jdec* j) {
     if (j->pos + 1 < j->len) j->pos += 2;
 }
 
-// integer IDCT (stb_image-style fixed point), output with +128 level shift
-#define F2F_0_5411961 2217
-#define F2F_N1_847759 (-7568)
-#define F2F_0_7653668 3135
-#define F2F_1_1758756 4816
-#define F2F_0_2986313 1223
-#define F2F_2_0531198 8410
-#define F2F_3_0727110 12586
-#define F2F_1_5013211 6149
-#define F2F_N0_899976 (-3686)
-#define F2F_N2_562915 (-10498)
-#define F2F_N1_961570 (-8035)
-#define F2F_N0_390180 (-1598)
-
-#define IDCT_1D(s0, s1, s2, s3, s4, s5, s6, s7) \
-    int t0, t1, t2, t3, p1, p2, p3, p4, p5, x0, x1, x2, x3; \
-    p2 = s2; p3 = s6; \
-    p1 = (p2 + p3) * F2F_0_5411961; \
-    t2 = p1 + p3 * F2F_N1_847759; \
-    t3 = p1 + p2 * F2F_0_7653668; \
-    p2 = s0; p3 = s4; \
-    t0 = (p2 + p3) * 4096; \
-    t1 = (p2 - p3) * 4096; \
-    x0 = t0 + t3; x3 = t0 - t3; x1 = t1 + t2; x2 = t1 - t2; \
-    t0 = s7; t1 = s5; t2 = s3; t3 = s1; \
-    p3 = t0 + t2; p4 = t1 + t3; p1 = t0 + t3; p2 = t1 + t2; \
-    p5 = (p3 + p4) * F2F_1_1758756; \
-    t0 = t0 * F2F_0_2986313; t1 = t1 * F2F_2_0531198; \
-    t2 = t2 * F2F_3_0727110; t3 = t3 * F2F_1_5013211; \
-    p1 = p5 + p1 * F2F_N0_899976; p2 = p5 + p2 * F2F_N2_562915; \
-    p3 = p3 * F2F_N1_961570; p4 = p4 * F2F_N0_390180; \
-    t3 += p1 + p4; t2 += p2 + p3; t1 += p2 + p4; t0 += p1 + p3;
+// Inverse DCT, straight from the T.81 definition (A.3.3):
+//   s(y,x) = 1/4 sum_v sum_u C(u) C(v) S(v,u) cos((2x+1)u pi/16) cos((2y+1)v pi/16)
+// with C(0) = 1/sqrt(2), C(k>0) = 1. It is separable: an 8-point 1-D
+// transform s(x) = sum_u K(x,u) S(u), K(x,u) = C(u)/2 cos((2x+1)u pi/16),
+// over the columns, then over the rows. cos((2(7-x)+1)u pi/16) =
+// (-1)^u cos((2x+1)u pi/16), so for x < 4 the even-u terms (e) give both
+// s(x) and s(7-x) unchanged and the odd-u terms (o) with a sign flip:
+//   s(x) = e + o,  s(7-x) = e - o.
+// IDCT_K[x][u] = round(K(x,u) * 2^14), x = 0..3 (computed offline; the web
+// engine is integer-only).
+#define IDCT_KB 14
+static const int16_t IDCT_K[4][8] = {
+    {5793, 8035, 7568, 6811, 5793, 4551, 3135, 1598},
+    {5793, 6811, 3135, -1598, -5793, -8035, -7568, -4551},
+    {5793, 4551, -3135, -8035, -5793, 1598, 7568, 6811},
+    {5793, 1598, -7568, -4551, 5793, 6811, -3135, -8035},
+};
+#define IDCT_FB 8   // fraction bits kept between the column and row passes
 
 static uint8_t clamp8(int v) { return v < 0 ? 0 : v > 255 ? 255 : (uint8_t)v; }
 
+// d: dequantized coefficients, natural (row-major) order. Writes the 8x8
+// samples with the +128 level shift.
 static void idct_block(uint8_t* out, int stride, const int16_t* d) {
-    int val[64];
-    int* v = val;
-    for (int i = 0; i < 8; i++, d++, v++) {
-        if (!d[8] && !d[16] && !d[24] && !d[32] && !d[40] && !d[48] && !d[56]) {
-            int dc = d[0] * 4;
-            v[0] = v[8] = v[16] = v[24] = v[32] = v[40] = v[48] = v[56] = dc;
-        } else {
-            IDCT_1D(d[0], d[8], d[16], d[24], d[32], d[40], d[48], d[56])
-            x0 += 512; x1 += 512; x2 += 512; x3 += 512;
-            v[0] = (x0 + t3) >> 10; v[56] = (x0 - t3) >> 10;
-            v[8] = (x1 + t2) >> 10; v[48] = (x1 - t2) >> 10;
-            v[16] = (x2 + t1) >> 10; v[40] = (x2 - t1) >> 10;
-            v[24] = (x3 + t0) >> 10; v[32] = (x3 - t0) >> 10;
+    int32_t mid[64];
+    // columns: |S| <= 32768, |K| <= 8035 -> |sum of 8| < 2^31
+    for (int col = 0; col < 8; col++) {
+        const int16_t* in = d + col;
+        int ac = 0;
+        for (int v = 1; v < 8; v++) ac |= in[v * 8];
+        if (!ac) {   // DC only: flat column, K(x,0) is the same for every x
+            int32_t f = (int32_t)in[0] * IDCT_K[0][0];
+            f = (f + (1 << (IDCT_KB - IDCT_FB - 1))) >> (IDCT_KB - IDCT_FB);
+            for (int y = 0; y < 8; y++) mid[y * 8 + col] = f;
+            continue;
+        }
+        for (int y = 0; y < 4; y++) {
+            const int16_t* k = IDCT_K[y];
+            int32_t e = in[0] * k[0] + in[16] * k[2] + in[32] * k[4] + in[48] * k[6];
+            int32_t o = in[8] * k[1] + in[24] * k[3] + in[40] * k[5] + in[56] * k[7];
+            int32_t r = 1 << (IDCT_KB - IDCT_FB - 1);
+            mid[y * 8 + col] = (e + o + r) >> (IDCT_KB - IDCT_FB);
+            mid[(7 - y) * 8 + col] = (e - o + r) >> (IDCT_KB - IDCT_FB);
         }
     }
-    v = val;
-    for (int i = 0; i < 8; i++, v += 8, out += stride) {
-        IDCT_1D(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7])
-        x0 += 65536 + (128 << 17); x1 += 65536 + (128 << 17);
-        x2 += 65536 + (128 << 17); x3 += 65536 + (128 << 17);
-        out[0] = clamp8((x0 + t3) >> 17); out[7] = clamp8((x0 - t3) >> 17);
-        out[1] = clamp8((x1 + t2) >> 17); out[6] = clamp8((x1 - t2) >> 17);
-        out[2] = clamp8((x2 + t1) >> 17); out[5] = clamp8((x2 - t1) >> 17);
-        out[3] = clamp8((x3 + t0) >> 17); out[4] = clamp8((x3 - t0) >> 17);
+    // rows: 64-bit sums (a corrupt stream can push the columns far out of
+    // the range a real image produces)
+    const int sh = IDCT_KB + IDCT_FB;
+    const int64_t rnd = ((int64_t)1 << (sh - 1)) + ((int64_t)128 << sh);
+    for (int y = 0; y < 8; y++, out += stride) {
+        const int32_t* in = mid + y * 8;
+        if (!(in[1] | in[2] | in[3] | in[4] | in[5] | in[6] | in[7])) {   // flat row
+            int64_t a = ((int64_t)in[0] * IDCT_K[0][0] + rnd) >> sh;
+            uint8_t v = clamp8(a < -1 ? -1 : a > 256 ? 256 : (int)a);
+            for (int x = 0; x < 8; x++) out[x] = v;
+            continue;
+        }
+        for (int x = 0; x < 4; x++) {
+            const int16_t* k = IDCT_K[x];
+            int64_t e = (int64_t)in[0] * k[0] + (int64_t)in[2] * k[2] +
+                        (int64_t)in[4] * k[4] + (int64_t)in[6] * k[6];
+            int64_t o = (int64_t)in[1] * k[1] + (int64_t)in[3] * k[3] +
+                        (int64_t)in[5] * k[5] + (int64_t)in[7] * k[7];
+            int64_t a = (e + o + rnd) >> sh, b = (e - o + rnd) >> sh;
+            out[x] = clamp8(a < -1 ? -1 : a > 256 ? 256 : (int)a);
+            out[7 - x] = clamp8(b < -1 ? -1 : b > 256 ? 256 : (int)b);
+        }
     }
 }
 

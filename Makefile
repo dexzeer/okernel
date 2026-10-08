@@ -66,19 +66,22 @@ src/web/wjs_prelude.o: src/web/wjs_prelude.asm src/web/wjs_prelude.js
 
 # QuickJS (src/qjs, Fabrice Bellard, MIT) for page scripts: compiled
 # hosted-style (builtins on) against the freestanding libc shim in
-# src/qjs/libc (-nostdinc) + musl libm (src/qjs/libm); x87 doubles (the
+# src/qjs/libc (-nostdinc) + our libm (src/kmath.c); x87 doubles (the
 # kernel FNSAVEs per thread, wjs runs with 53-bit precision). libgcc
 # supplies the 64-bit division helpers. Same objects as tests/qjs/build.sh.
 GCC_INC := $(shell $(CC) -print-file-name=include)
 LIBGCC := $(shell $(CC) -m32 -print-libgcc-file-name)
-QJS_CFLAGS = -m32 -nostdinc -Isrc/qjs/libc -Isrc/qjs/libm -Isrc/qjs -isystem $(GCC_INC) \
+QJS_CFLAGS = -m32 -nostdinc -Isrc/qjs/libc -Isrc/qjs -isystem $(GCC_INC) \
              -fno-pic -fno-pie -O2 -fno-strict-aliasing -fwrapv -fno-stack-protector \
              -mno-sse -mno-sse2 -mno-mmx -mfpmath=387 -fno-asynchronous-unwind-tables \
              -D_GNU_SOURCE -DQJS_NO_ATOMICS -DCONFIG_VERSION=\"2026-06-04\" -DKERNEL -w -MMD -MP
-QJS_HEADERS := $(wildcard src/qjs/*.h) $(wildcard src/qjs/libc/*.h) $(wildcard src/qjs/libc/sys/*.h) \
-               $(wildcard src/qjs/libm/*.h)
+QJS_HEADERS := $(wildcard src/qjs/*.h) $(wildcard src/qjs/libc/*.h) $(wildcard src/qjs/libc/sys/*.h)
 QJS_OBJ = src/qjs/quickjs.o src/qjs/cutils.o src/qjs/libregexp.o src/qjs/libunicode.o src/qjs/dtoa.o \
-          src/qjs/qjs_libc.o $(patsubst %.c,%.o,$(wildcard src/qjs/libm/*.c))
+          src/qjs/qjs_libc.o src/kmath.o
+# kmath: computes in x87 extended precision (see the file header); the
+# kernel's -mno-sse flags keep every double on the x87 as it requires.
+src/kmath.o: src/kmath.c
+	$(CC) $(QJS_CFLAGS) -c $< -o $@
 src/qjs/qjs_libc.o: src/qjs/qjs_libc.c $(QJS_HEADERS)
 	$(CC) $(QJS_CFLAGS) -fno-tree-loop-distribute-patterns -c $< -o $@
 src/qjs/%.o: src/qjs/%.c $(QJS_HEADERS)
@@ -115,6 +118,7 @@ web-tests:
 	gcc -m32 -O2 -Isrc -Isrc/qjs -Itests/web -o build-host/t_webcss tests/web/test_css.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c $(WEB_HOST_LINK) && ./build-host/t_webcss | tail -n 2
 	gcc -m32 -O2 -Isrc -Isrc/qjs -Itests/web -o build-host/t_font tests/web/test_font.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c $(WEB_HOST_LINK) && ./build-host/t_font | tail -n 2
 	./build-host/wbrowse tests/web/js/basic.html 800 600 build-host/js-basic.ppm 3 | grep RESULT
+	gcc -m32 -O2 -Isrc -Itests/web -o build-host/t_idct tests/web/test_idct.c -lm && ./build-host/t_idct | tail -n 1
 	sh tests/qjs/build.sh tests/qjs/suite/test_language.js tests/qjs/suite/test_closure.js tests/qjs/suite/test_loop.js tests/qjs/suite/test_builtin.js tests/qjs/suite/test_bigint.js
 
 # ---- Host tests (no QEMU; run from repo root — suites load tests/fixtures/*) ----
@@ -132,6 +136,7 @@ host-tests:
 	mkdir -p build-host
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tls_crypto tests/test_tls_crypto.c src/crypto/sha256.c src/crypto/sha1.c src/crypto/sha512.c src/crypto/hmac.c src/crypto/hkdf.c src/crypto/aead.c src/crypto/chacha20.c src/crypto/poly1305.c src/crypto/x25519.c && ./build-host/t_tls_crypto | tail -n 2
 	gcc -m32 -O2 -Isrc -Isrc/crypto -o build-host/t_chachapoly tests/test_chachapoly.c src/crypto/chacha20.c src/crypto/poly1305.c && ./build-host/t_chachapoly | tail -n 3
+	gcc -m32 -O2 -mfpmath=387 -DKMATH_NO_STD_NAMES -o build-host/t_kmath tests/test_kmath.c src/kmath.c -lm && ./build-host/t_kmath 100000 | tail -n 1
 	gcc -m32 -O2 -Isrc -Isrc/crypto -o build-host/t_rng tests/test_rng.c src/crypto/rand.c src/crypto/chacha20.c src/crypto/sha256.c && ./build-host/t_rng | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_strict tests/test_crypto_strict.c $(HOST_CRYPTO_SRC) && ./build-host/t_strict | tail -n 2
 	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_edtext tests/test_editor_text.c src/editor.c src/textslot.c && ./build-host/t_edtext | tail -n 2

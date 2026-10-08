@@ -7,12 +7,12 @@ cd "$(dirname "$0")/../.."
 OUT=build-host/qjs-fs
 mkdir -p $OUT
 GI=$(gcc -print-file-name=include)
-F="-m32 -nostdinc -Isrc/qjs/libc -Isrc/qjs/libm -Isrc/qjs -isystem $GI -fno-pic -fno-pie -O2 \
+F="-m32 -nostdinc -Isrc/qjs/libc -Isrc/qjs -isystem $GI -fno-pic -fno-pie -O2 \
    -fno-strict-aliasing -fwrapv -fno-stack-protector -mno-sse -mno-sse2 -mno-mmx -mfpmath=387 \
    -fno-asynchronous-unwind-tables -D_GNU_SOURCE -DQJS_NO_ATOMICS -DCONFIG_VERSION=\"2026-06-04\" -w"
 OBJS=""
 for f in src/qjs/quickjs.c src/qjs/cutils.c src/qjs/libregexp.c src/qjs/libunicode.c src/qjs/dtoa.c \
-         src/qjs/qjs_libc.c src/qjs/libm/*.c src/string.c tests/qjs/fsrun.c; do
+         src/qjs/qjs_libc.c src/kmath.c src/string.c tests/qjs/fsrun.c; do
     o=$OUT/$(echo $f | tr / _ | sed 's/\.c$/.o/')
     X=""
     case $f in src/string.c) X="-ffreestanding -fno-builtin";; src/qjs/qjs_libc.c) X="-fno-tree-loop-distribute-patterns";; esac
