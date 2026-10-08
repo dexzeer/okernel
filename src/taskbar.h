@@ -3,9 +3,8 @@
 
 // Desktop taskbar (taskbar.c). TASKBAR_H itself lives in window.h.
 #define TB_HIT_NONE  (-1)
-#define TB_HIT_START (-2)   // the KAnarchy mark
 
-// Window id under (mx, my), TB_HIT_START, or TB_HIT_NONE.
+// Window id under (mx, my), or TB_HIT_NONE.
 int  taskbar_hit(int mx, int my);
 // Blit the (cached) bar, honoring the current clip — for damage repair.
 void taskbar_paint(void);

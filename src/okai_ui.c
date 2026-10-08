@@ -570,6 +570,11 @@ struct ui_cache {
     int hover;
     int spin;           // spinner phase drawn
     uint32_t geo_sig;   // last logged geometry
+    int partial;        // re-rendered under a clip smaller than the band (a
+                        // damage repair, e.g. the cursor erase): only that
+                        // rect shows the new state — the main loop must blit
+                        // the whole band (okai_ui_needs_paint) or hover
+                        // highlights stay half-drawn
 };
 static struct ui_cache cache[MAX_OKAIS];
 
@@ -888,6 +893,7 @@ int okai_ui_needs_paint(int id) {
     struct ui_cache* C = &cache[id];
     int mx, my;
     mouse_get_position(&mx, &my);
+    if (C->partial) return 1;
     if (hover_of(b, &L, mx, my) != C->hover) return 1;
     if (any_busy(id, b) && spinner_phase() != C->spin) return 1;
     if (!any_busy(id, b) && C->spin >= 0) return 1;  // drop the last spinner frame
@@ -925,10 +931,20 @@ void okai_ui_paint(int id) {
         C->hover = hover;
         C->spin = any_busy(id, b) ? spinner_phase() : -1;
         log_geometry(b, C, &L);
+        int cx0, cy0, cx1, cy1;
+        graphics_get_clip(&cx0, &cy0, &cx1, &cy1);
+        if (cx0 > L.x0 || cy0 > L.y0 || cx1 < L.x0 + L.w || cy1 < L.y0 + CHROME_PX)
+            C->partial = 1;
     }
     graphics_blit_pixels(L.x0, L.y0, C->px, L.w, CHROME_PX, L.w);
     draw_status(id, b, &L);
     if (b->show_security) draw_security_panel(b, &L);
+}
+
+// The main loop painted the band over every visible rect: any partial
+// (repair-clipped) render is now fully on screen.
+void okai_ui_painted_full(int id) {
+    if (id >= 0 && id < MAX_OKAIS) cache[id].partial = 0;
 }
 
 void okai_ui_forget(int id) {

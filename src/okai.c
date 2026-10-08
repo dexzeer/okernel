@@ -70,6 +70,7 @@ int okai_scripts_on = 1;
 // Chrome drawing + hit tests live in okai_ui.c.
 int  okai_ui_tab_width(struct okai* b);
 void okai_ui_paint(int id);
+void okai_ui_painted_full(int id);
 void okai_ui_forget(int id);
 
 static void okai_tab_reset(struct okai_tab* T);
@@ -2393,6 +2394,7 @@ void okai_paint_overlays_rects(int id, int rects[][4], int nr) {
         okai_ui_paint(id);
     }
     graphics_clip_reset();
+    okai_ui_painted_full(id);
 }
 
 int okai_find_by_win(int win_id) {
