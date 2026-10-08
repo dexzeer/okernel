@@ -18,6 +18,8 @@ void ui_path_fill(struct wsurf* s, uint32_t c);
 void ui_seg(const struct ui_pen* p, int32_t x0, int32_t y0, int32_t x1, int32_t y1, int caps);
 void ui_polyline(const struct ui_pen* p, const int32_t* pts, int n);
 void ui_arc(const struct ui_pen* p, int32_t cx, int32_t cy, int32_t rx, int32_t ry, int a0, int sweep);
+// Closed polygon in absolute WR units (1/256 px), added to the current path.
+void ui_poly(const int32_t* xy, int n);
 void ui_rrect(struct wsurf* s, int x, int y, int w, int h, int r, uint32_t c);
 int  ui_text_w(int px, int bold, const char* str, int len);
 // Text vertically centered on cy, clipped to maxw (fades into bg on overflow).

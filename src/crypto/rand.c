@@ -5,12 +5,23 @@
 #include "memwipe.h"
 #include <string.h>
 
+// Pool/key updates run with interrupts off. SAVE and RESTORE the flag —
+// never a bare sti: rand_stir_src is called from the keyboard IRQ (and the
+// handler runs after its EOI), so an unconditional sti re-enabled
+// interrupts mid-handler; the next scancode's IRQ then nested inside it and
+// keystrokes came out last-in-first-out ("abcdef" -> "fedcba").
 #ifdef KERNEL
-#define RNG_CLI() __asm__ volatile("cli" ::: "memory")
-#define RNG_STI() __asm__ volatile("sti" ::: "memory")
+static inline uint32_t rng_cli(void) {
+    uint32_t f;
+    __asm__ volatile("pushfl; popl %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void rng_sti(uint32_t f) {
+    if (f & 0x200) __asm__ volatile("sti" ::: "memory");
+}
 #else
-#define RNG_CLI() do {} while (0)
-#define RNG_STI() do {} while (0)
+static inline uint32_t rng_cli(void) { return 0; }
+static inline void rng_sti(uint32_t f) { (void)f; }
 #endif
 
 static uint8_t  rng_key[32];
@@ -112,7 +123,7 @@ static void rng_reseed(void) {
 }
 
 void rand_stir_src(const uint8_t entropy[32], int src) {
-    RNG_CLI();
+    uint32_t rng_if = rng_cli();
     src &= (RAND_SRC_RDSEED | RAND_SRC_RDRAND | RAND_SRC_INPUT |
             RAND_SRC_TIMER | RAND_SRC_BOOT); // 0x1F: no invented classes
     if (pool0_n < RNG_POOL_SLOTS) {
@@ -129,7 +140,7 @@ void rand_stir_src(const uint8_t entropy[32], int src) {
     pool_src_mask |= src;
     // Reseed when the fast pool fills; the pools then start over.
     if (pool0_n >= RNG_POOL_SLOTS) rng_reseed();
-    RNG_STI();
+    rng_sti(rng_if);
 }
 
 void rand_stir(const uint8_t entropy[32]) {
@@ -137,7 +148,7 @@ void rand_stir(const uint8_t entropy[32]) {
 }
 
 void rand_seed(const uint8_t entropy[32]) {
-    RNG_CLI();
+    uint32_t rng_if = rng_cli();
     // A seed is one BOOT-class sample plus an immediate reseed attempt
     // (which will not declare readiness — single class by construction).
     if (pool0_n < RNG_POOL_SLOTS) {
@@ -147,16 +158,16 @@ void rand_seed(const uint8_t entropy[32]) {
     }
     pool_src_mask |= RAND_SRC_BOOT;
     rng_reseed();
-    RNG_STI();
+    rng_sti(rng_if);
 }
 
 void rand_personalize(const uint8_t* data, uint32_t len) {
     // Domain separation only: folded straight into the key, never counted
     // toward readiness, never mistaken for entropy (the MAC lesson).
-    RNG_CLI();
+    uint32_t rng_if = rng_cli();
     for (uint32_t i = 0; i < len; i++) rng_key[i % 32] ^= data[i];
     rng_rekey();
-    RNG_STI();
+    rng_sti(rng_if);
 }
 
 // ---- x86 hardware RNG (opportunistic) ----
@@ -258,14 +269,14 @@ int rand_bytes(uint8_t* out, uint32_t len) {
     // stir (reseed) — safe and desirable. Counter exhaustion is reserved up
     // front so a call never partially succeeds then fails mid-stream.
     uint32_t nblocks = (len + 63u) / 64u;
-    RNG_CLI();
-    if (!rng_ready_flag) { RNG_STI(); return 0; }
+    uint32_t rng_if = rng_cli();
+    if (!rng_ready_flag) { rng_sti(rng_if); return 0; }
     // Counter-exhaustion guard (cryptoholes #9 — same discipline as the
     // TLS sequence guards): 2^32 blocks is unreachable in practice, but
     // a wrapped (key, nonce, counter) triple would repeat keystream, so
     // fail closed with wide margin rather than reason about it.
     if ((uint64_t)rng_counter + nblocks >= 0xFFFFFFF0ull) {
-        RNG_STI();
+        rng_sti(rng_if);
         return 0;
     }
     // Snapshot divergence: fresh RDTSC folded into the nonce per call, so
@@ -276,14 +287,14 @@ int rand_bytes(uint8_t* out, uint32_t len) {
         for (int i = 0; i < 8; i++)
             rng_nonce[i] ^= (uint8_t)((t >> (8 * i)) & 0xFF);
     }
-    RNG_STI();
+    rng_sti(rng_if);
     while (len > 0) {
         // Generate 64 bytes of keystream, use them, then rekey. Input
         // zeroed first (same cryptoholes #9 reason as rng_rekey: pure
         // keystream out, no stack-garbage mixing, MSan-clean).
         uint8_t block[64];
         memset(block, 0, sizeof(block));
-        RNG_CLI();
+        rng_if = rng_cli();
         chacha20_encrypt(rng_key, rng_nonce, rng_counter, block, block, 64);
         rng_counter++;
 
@@ -295,7 +306,7 @@ int rand_bytes(uint8_t* out, uint32_t len) {
 
         secure_zero(block, sizeof(block));
         rng_rekey();
-        RNG_STI();
+        rng_sti(rng_if);
         out += take;
         len -= take;
     }

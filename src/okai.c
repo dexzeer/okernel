@@ -2319,6 +2319,26 @@ static int okai_anim_step(int id) {
 
 // Loading state of a tab for the chrome spinner: 2 = main document in
 // flight, 1 = resources in flight, 0 = idle.
+// Does any browser window need the main loop to keep spinning (loading,
+// a coalesced render pending, a tab animation)? Otherwise the desktop may
+// halt until the next interrupt.
+int okai_tab_busy(int id, int tab);
+int okai_wants_cpu(void) {
+    for (int id = 0; id < MAX_OKAIS; id++) {
+        if (okais[id].win_id < 0) continue;
+        if (okai_is_animating(id)) return 1;
+        for (int t = 0; t < okais[id].tab_count; t++)
+            if (okai_tab_busy(id, t) || okais[id].tabs[t].render_pending) return 1;
+        // page JS with work due right now (js_pump runs it every iteration)
+        struct okai_tab* T = &okais[id].tabs[okais[id].active_tab];
+        if (T->doc && T->load_state == 1 && !T->closing) {
+            struct wjs* js = wdoc_js(T->doc);
+            if (js && wjs_next_due(js) == 0) return 1;
+        }
+    }
+    return 0;
+}
+
 int okai_tab_busy(int id, int tab) {
     if (id < 0 || id >= MAX_OKAIS || okais[id].win_id < 0) return 0;
     if (req_has_main(id, tab)) return 2;

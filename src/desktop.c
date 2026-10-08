@@ -332,10 +332,12 @@ void desktop_paint_rect_pub(int x, int y, int w, int h) {
 
 // Cursor compositor state: where the sprite was painted last frame.
 // The backbuffer is only ever "model + this one sprite".
-static int cursor_shown = 0;
-static int cursor_px = 0;
-static int cursor_py = 0;
 static int g_last_mouse_x = -1;
+static inline uint64_t rdtsc_now(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
 static int g_last_mouse_y = -1;
 
 // Icon visibility: dotfiles (/.pins, /.rngseed, ...) are system state, not
@@ -1524,7 +1526,10 @@ void kernel_main(uint32_t mboot_phys) {
     sti();
 
     // Main loop
+    static uint32_t main_loops = 0;
+    static uint64_t halted_cyc = 0, busy_t0 = 0;
     while (1) {
+        main_loops++;
         // Ring-3 entry drain: the shell (and fork) stage pid+eip+esp+window
         // into the entry run queue; here is plain ring-0 thread context, so
         // prepare (CR3+ESP0) + IRET below is safe. sys_exit resumes right
@@ -2232,30 +2237,6 @@ void kernel_main(uint32_t mboot_phys) {
         okai_poll();
 
 
-        // Erase last frame's cursor sprite — only if the sprite overlaps
-        // the dragged window's old footprint (avoids a full recomposite
-        // when the cursor is far away from the drag region)
-        if (cursor_shown) {
-            // During an active drag we know the old window rect; skip the
-            // erase when cursor is clearly outside it.  When not dragging
-            // (drag_win < 0) always erase unconditionally.
-            if (drag_win >= 0 && mb) {
-                struct window* dw = window_get(drag_win);
-                if (dw &&
-                    (cursor_px + CURSOR_W <= dw->x ||
-                     cursor_py + CURSOR_H <= dw->y ||
-                     cursor_px >= dw->x + dw->w ||
-                     cursor_py >= dw->y + dw->h)) {
-                    // cursor fully outside old window — skip expensive erase
-                } else {
-                    desktop_paint_rect(cursor_px, cursor_py, CURSOR_W, CURSOR_H);
-                }
-            } else {
-                desktop_paint_rect(cursor_px, cursor_py, CURSOR_W, CURSOR_H);
-            }
-            cursor_shown = 0;
-        }
-
         // ---- Window drag: blit, don't re-render ----
         // A move doesn't change the window's own pixels, and the dragged
         // window is focused (topmost), so copying its old rectangle to the
@@ -2341,10 +2322,8 @@ void kernel_main(uint32_t mboot_phys) {
             }
         }
 
-        // Keep the desktop live while the mouse moves: the cursor sprite is
-        // repainted every iteration, but window content only refreshes on a
-        // real redraw. Without this, moving the mouse leaves the desktop
-        // frozen at the 1-second idle throttle.
+        // Mouse movement since the last iteration (FPS accounting; hover
+        // state is polled by the chrome/taskbar themselves).
         int cmx, cmy;
         int cursor_moved = 0;
         mouse_get_position(&cmx, &cmy);
@@ -2484,7 +2463,16 @@ void kernel_main(uint32_t mboot_phys) {
             fps = frame_count;
             frame_count = 0;
             last_fps_tick = tick_count;
-            serial_printf("[fps] %u\n", fps); // 1Hz, headless perf ground truth
+            // loops = main-loop iterations; busy = share of CPU time NOT
+            // spent halted (per-frame cost / headroom).
+            uint64_t now = rdtsc_now();
+            uint64_t span = now - busy_t0;
+            // 32-bit math only (no __udivdi3): ~1 s of TSC >> 16 fits easily
+            uint32_t sp_k = (uint32_t)(span >> 16), ht_k = (uint32_t)(halted_cyc >> 16);
+            if (ht_k > sp_k) ht_k = sp_k;
+            unsigned busy = sp_k ? 100 - ht_k * 100 / sp_k : 100;
+            serial_printf("[fps] %u loops=%u busy=%u%%\n", fps, main_loops, busy); // 1Hz, headless perf ground truth
+            main_loops = 0; halted_cyc = 0; busy_t0 = now;
         }
         // Taskbar (window buttons, FPS chip, clock): state-gated — taskbar.c
         // re-renders its cached strip only when its signature changes (window
@@ -2492,23 +2480,29 @@ void kernel_main(uint32_t mboot_phys) {
         // Drawn before the cursor so the sprite sits on top.
         taskbar_update(fps);
 
-        // Cursor composited last. With the backbuffer now persistent, we erase
-        // the old sprite (restoring the underlying scene via desktop_paint_rect)
-        // and draw the new one only when it actually moved — or after a composite
-        // that may have overwritten its pixels. A static cursor costs zero work.
-        mouse_get_position(&cursor_px, &cursor_py);
-        if (cursor_shown && cursor_moved)
-            desktop_paint_rect(g_last_mouse_x, g_last_mouse_y, CURSOR_W, CURSOR_H);
-        mouse_paint_cursor(cursor_px, cursor_py);
-        if (cursor_moved) {
-            g_last_mouse_x = cmx;
-            g_last_mouse_y = cmy;
-        }
-        cursor_shown = 1;
+        // The cursor is not drawn here: it lives on the framebuffer only and
+        // is moved by the mouse IRQ (cursor.c); graphics_flush re-blends it
+        // over any rows it copies. Moving the mouse costs the scene nothing.
+        if (cursor_moved) { g_last_mouse_x = cmx; g_last_mouse_y = cmy; }
         // Honest FPS: count actually-presented frames (a composite or a cursor
         // movement), not main-loop spins.
         if (composed || cursor_moved) frame_count++;
 
         graphics_flush();
+        static int cursor_live = 0;
+        if (!cursor_live) { cursor_enable(); cursor_live = 1; }
+
+        // Idle: nothing composed, no mouse motion/buttons/wheel, no drag, no
+        // fetch in flight, no browser work -> halt until the next interrupt
+        // (timer <= 10 ms, keyboard, mouse). The cursor is IRQ-driven, so
+        // this costs no pointer latency. Busy-spinning here hammered the
+        // e1000's MMIO so hard that QEMU's timer starved and PIT ticks were
+        // lost (the kernel clock ran ~30% slow under TCG).
+        if (!composed && !cursor_moved && !mb && !wheel && drag_win < 0 && resize_win < 0 &&
+            fetch_free_slots() == FETCH_MAX && !okai_wants_cpu()) {
+            uint64_t h0 = rdtsc_now();
+            __asm__ volatile("hlt");
+            halted_cyc += rdtsc_now() - h0;
+        }
     }
 }

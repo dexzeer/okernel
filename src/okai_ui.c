@@ -536,6 +536,7 @@ void ui_arc(const struct ui_pen* p, int32_t cx, int32_t cy, int32_t rx, int32_t 
     arc(p, cx, cy, rx, ry, a0, sweep);
 }
 void ui_rrect(struct wsurf* s, int x, int y, int w, int h, int r, uint32_t c) { rrect(s, x, y, w, h, r, c); }
+void ui_poly(const int32_t* xy, int n) { poly_emit(xy, n); }
 int ui_text_w(int px, int bold, const char* str, int len) {
     if (len < 0) len = slen(str);
     return text_w(px, bold, str, len);

@@ -1,4 +1,5 @@
 #include "graphics.h"
+#include "cursor.h"
 #include "memory.h"
 #include "memlayout.h"
 #include "paging.h"
@@ -924,14 +925,23 @@ void graphics_fill(uint32_t color) {
     }
 }
 
+uint8_t* graphics_fb_base(void) { return framebuffer; }
+int graphics_fb_pitch(void) { return (int)fb_pitch; }
+
+// Copy dirty backbuffer rows to the framebuffer. Runs of dirty rows go out
+// as one memcpy (packed pitch) in chunks of <= FLUSH_CHUNK rows with
+// interrupts off; after each chunk the cursor (which lives only on the
+// framebuffer, cursor.c) is re-blended over the rows just copied. The mouse
+// IRQ moves the cursor between chunks, never inside one.
+#define FLUSH_CHUNK 48
 void graphics_flush(void) {
     if (!framebuffer || !backbuffer) return;
     for (int y = 0; y < SCREEN_H; y++) {
         if (!dirty_rows[y]) continue;
-        // Coalesce runs of dirty rows: one rep-movs per run when the
-        // framebuffer pitch is packed (it is with -vga std at 1920x1080).
         int y1 = y + 1;
-        while (y1 < SCREEN_H && dirty_rows[y1]) y1++;
+        while (y1 < SCREEN_H && y1 - y < FLUSH_CHUNK && dirty_rows[y1]) y1++;
+        uint32_t fl;
+        __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
         if (fb_pitch == SCREEN_W * 4) {
             memcpy(framebuffer + y * fb_pitch, backbuffer + y * SCREEN_W,
                    (unsigned)(y1 - y) * SCREEN_W * 4);
@@ -940,6 +950,8 @@ void graphics_flush(void) {
                 memcpy(framebuffer + r * fb_pitch, backbuffer + r * SCREEN_W, SCREEN_W * 4);
         }
         for (int r = y; r < y1; r++) dirty_rows[r] = 0;
+        cursor_fb_repair(y, y1);
+        if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
         y = y1 - 1;
     }
 }
