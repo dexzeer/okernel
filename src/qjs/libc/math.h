@@ -1,6 +1,6 @@
 #ifndef QJS_MATH_H
 #define QJS_MATH_H
-// Double-precision libm for QuickJS (implementations: src/qjs/libm, musl).
+// Double-precision libm (implementation: src/kmath.c, our own).
 
 typedef double double_t;
 typedef float float_t;
