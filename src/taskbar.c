@@ -1,13 +1,18 @@
 // Desktop taskbar: a dark frosted bar along the bottom edge.
 //
-// Left: the KAnarchy mark (opens a terminal). Middle: one button per window
-// (app icon + Noto Sans title, red pill under the focused one, grey pill
-// under the others). Right: FPS chip and the clock (CMOS RTC, UTC).
+// Left: one button per window (app icon + Noto Sans title, red pill under
+// the focused one, grey pill under the others). Right: FPS chip and the
+// clock (CMOS RTC, UTC). No launcher: KAnarchy does everything through the
+// terminal (Ctrl+Alt+T / `terminal` open more).
 //
 // Like the okai chrome, it is rendered into a cached 1920 x TASKBAR_H pixel
 // strip and re-rendered only when its state signature changes (window list,
-// focus, titles, hover, fps, clock minute); every other paint just blits the
-// strip. tb_layout() is the single source of geometry for drawing and for
+// focus, titles, hover, fps, clock minute). Only taskbar_update() (main
+// loop, unclipped) re-renders; taskbar_paint() (clipped damage repair, e.g.
+// the cursor erase) only blits the cached strip — re-rendering there would
+// put a new hover state on screen inside the repair rect only, and the full
+// blit would never follow (the signature already matches): stale half-lit
+// buttons. tb_layout() is the single source of geometry for drawing and for
 // taskbar_hit(); it is logged as `[taskbar] btn` lines for headless tests.
 #include "taskbar.h"
 #include "window.h"
@@ -23,7 +28,6 @@
 extern uint32_t tick_count;
 
 #define TB_BTN_H   36
-#define TB_START_W 40
 #define TB_BTN_MAX 220
 #define TB_BTN_MIN 52
 #define TB_GAP     4
@@ -37,19 +41,17 @@ extern uint32_t tick_count;
 struct tb_lay {
     int y, by;
     int n, id[MAX_WINDOWS], bx[MAX_WINDOWS], bw;
-    int start[4];
 };
 
 static void tb_layout(struct tb_lay* L) {
     L->y = SCREEN_H - TASKBAR_H;
     L->by = L->y + (TASKBAR_H - TB_BTN_H) / 2;
-    L->start[0] = 6; L->start[1] = L->by; L->start[2] = TB_START_W; L->start[3] = TB_BTN_H;
     L->n = 0;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         struct window* w = window_get(i);
         if (w && w->visible) L->id[L->n++] = i;
     }
-    int x0 = 6 + TB_START_W + 10, right = SCREEN_W - TB_TRAY_W;
+    int x0 = 6, right = SCREEN_W - TB_TRAY_W;
     int bw = L->n ? (right - x0) / L->n - TB_GAP : TB_BTN_MAX;
     if (bw > TB_BTN_MAX) bw = TB_BTN_MAX;
     if (bw < TB_BTN_MIN) bw = TB_BTN_MIN;
@@ -61,7 +63,6 @@ int taskbar_hit(int mx, int my) {
     struct tb_lay L;
     tb_layout(&L);
     if (my < L.y || my >= SCREEN_H) return TB_HIT_NONE;
-    if (mx >= L.start[0] && mx < L.start[0] + L.start[2]) return TB_HIT_START;
     for (int k = 0; k < L.n; k++)
         if (mx >= L.bx[k] && mx < L.bx[k] + L.bw) return L.id[k];
     return TB_HIT_NONE;
@@ -110,18 +111,6 @@ static void icon_app(struct wsurf* s, int app, int x, int y) {
     }
 }
 
-// The KAnarchy mark: red rounded square, white K.
-static void icon_mark(struct wsurf* s, int x, int y, int hover) {
-    ui_rrect(s, x, y, 28, 28, 7, hover ? 0x00F0384C : TB_RED);
-    struct ui_pen p;
-    ui_pen_at(&p, x, y, 300);
-    ui_path_begin();
-    ui_seg(&p, UI_U(10), UI_U(7), UI_U(10), UI_U(21), 1);
-    ui_seg(&p, UI_U(19), UI_U(7), UI_U(11.5), UI_U(14), 1);
-    ui_seg(&p, UI_U(13), UI_U(13), UI_U(19.5), UI_U(21), 1);
-    ui_path_fill(s, 0x00FFFFFF);
-}
-
 // ---- state + rendering ------------------------------------------------------
 
 static uint32_t* strip;          // SCREEN_W x TASKBAR_H
@@ -146,7 +135,6 @@ static void clock_poll(void) {
 
 static int hover_of(const struct tb_lay* L, int mx, int my) {
     if (my < L->by || my >= L->by + TB_BTN_H) return -1;
-    if (mx >= L->start[0] && mx < L->start[0] + L->start[2]) return 100;
     for (int k = 0; k < L->n; k++)
         if (mx >= L->bx[k] && mx < L->bx[k] + L->bw) return L->id[k];
     return -1;
@@ -190,9 +178,6 @@ static void render(const struct tb_lay* L, int hover) {
     for (int x = 0; x < SCREEN_W; x++) strip[x] = ws_blend(strip[x], 0xFFFFFF, 30); // top hairline
 
     int by = L->by - L->y;
-    // KAnarchy mark
-    if (hover == 100) ui_rrect(&s, L->start[0], by, L->start[2], TB_BTN_H, 6, 0x1CFFFFFFu);
-    icon_mark(&s, L->start[0] + (L->start[2] - 28) / 2, by + (TB_BTN_H - 28) / 2, hover == 100);
 
     // window buttons
     for (int k = 0; k < L->n; k++) {
@@ -250,7 +235,7 @@ static void log_geometry(const struct tb_lay* L) {
     g = mix(g, (uint32_t)L->bw);
     if (g == geo_sig) return;
     geo_sig = g;
-    serial_printf("[taskbar] start=%d,%d,%d,%d n=%d\n", L->start[0], L->start[1], L->start[2], L->start[3], L->n);
+    serial_printf("[taskbar] layout n=%d\n", L->n);
     for (int k = 0; k < L->n; k++)
         serial_printf("[taskbar] btn win=%d %d,%d,%d,%d\n", L->id[k], L->bx[k], L->by, L->bw, TB_BTN_H);
 }
@@ -278,7 +263,7 @@ static int refresh(void) {
 }
 
 void taskbar_paint(void) {
-    refresh();
+    if (!strip_valid) refresh();
     if (strip) graphics_blit_pixels(0, SCREEN_H - TASKBAR_H, strip, SCREEN_W, TASKBAR_H, SCREEN_W);
 }
 

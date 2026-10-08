@@ -2006,16 +2006,7 @@ void kernel_main(uint32_t mboot_phys) {
             if (my >= SCREEN_H - TASKBAR_H) {
                 int hit = taskbar_hit(mx, my);
                 clicked = 1;
-                if (hit == TB_HIT_START) {
-                    serial_puts("[taskbar] start\n");
-                    int nw = create_terminal();
-                    if (nw >= 0) {
-                        active_term_idx = term_count - 1;
-                        window_set_focus(nw);
-                        window_set_text_color(nw, 15, 0);
-                        shell_prompt(nw);
-                    }
-                } else if (hit >= 0) {
+                if (hit >= 0) {
                     struct window* w = window_get(hit);
                     if (w->minimized) serial_printf("[win] %d restored from taskbar\n", hit);
                     window_restore(hit);
@@ -2046,9 +2037,21 @@ void kernel_main(uint32_t mboot_phys) {
 
             // Check window buttons and title bars
             if (!clicked) {
-                for (int i = MAX_WINDOWS - 1; i >= 0; i--) {
+                // Topmost window first (by z, not slot index): with okai in
+                // slot 1 and the terminal in slot 0, an index-ordered scan gave
+                // clicks on the terminal's overlapping area — and its buttons —
+                // to the browser underneath, so typing went to okai.
+                int order[MAX_WINDOWS], no = 0;
+                for (int i = 0; i < MAX_WINDOWS; i++) {
                     struct window* w = window_get(i);
                     if (!w || !w->visible || w->minimized) continue;
+                    int k = no++;
+                    while (k > 0 && window_get(order[k - 1])->z < w->z) { order[k] = order[k - 1]; k--; }
+                    order[k] = i;
+                }
+                for (int oi = 0; oi < no; oi++) {
+                    int i = order[oi];
+                    struct window* w = window_get(i);
 
                     if (window_check_close_click(i, mx, my)) {
                         int tidx = find_term_idx(i);

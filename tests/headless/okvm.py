@@ -223,7 +223,7 @@ class OkVM:
         bar's layout changes). None if never logged."""
         pat = re.compile(r"\[taskbar\] btn win=%d (\d+),(\d+),(\d+),(\d+)" % win)
         for line in reversed(self.serial().splitlines()):
-            if "[taskbar] start=" in line:
+            if "[taskbar] layout " in line:
                 break                      # older layout: not current
             m = pat.search(line)
             if m:
