@@ -451,7 +451,15 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
         der_node ext_seq;
         if (der_expect(exts_wrap.content, exts_wrap.content_len, &x,
                        DER_TAG_SEQUENCE, &ext_seq) != 0) return -1;
+        if (x != exts_wrap.content_len) return -1; // exact [3] wrapper
         uint32_t e = 0;
+        // RFC 5280 §4.2: "A certificate MUST NOT include more than one
+        // instance of a particular extension." Duplicates are rejected, not
+        // resolved: a later EKU/BasicConstraints silently overriding an
+        // earlier one (or a second SAN/NameConstraints appending) is the
+        // classic setup for two parsers disagreeing on the same bytes.
+        der_node seen_oids[32];
+        uint32_t n_seen = 0;
         while (e < ext_seq.content_len) {
             der_node ext;
             if (der_expect(ext_seq.content, ext_seq.content_len, &e,
@@ -460,6 +468,11 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
             der_node ext_oid;
             if (der_expect(ext.content, ext.content_len, &g,
                            DER_TAG_OID, &ext_oid) != 0) return -1;
+            for (uint32_t k = 0; k < n_seen; k++)
+                if (der_content_eq(&seen_oids[k], ext_oid.content,
+                                   ext_oid.content_len)) return -1;
+            if (n_seen >= 32) return -1; // absurd count: fail, never go blind
+            seen_oids[n_seen++] = ext_oid;
             // critical BOOLEAN DEFAULT FALSE — optional. Strict DER
             // (review #19): present means exactly one byte, 0x00 or 0xFF.
             // Anything else is malformed (the old code treated any
@@ -476,6 +489,7 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
             der_node val;
             if (der_expect(ext.content, ext.content_len, &g,
                            DER_TAG_OCTET_STRING, &val) != 0) return -1;
+            if (g != ext.content_len) return -1; // OID, critical?, value: nothing else
             int ext_known = 0;
 
             if (oid_is(&ext_oid, OID_SUBJECT_ALT_NAME,
@@ -494,6 +508,7 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                 der_node names;
                 if (der_expect(val.content, val.content_len, &v,
                                DER_TAG_SEQUENCE, &names) != 0) return -1;
+                if (v != val.content_len) return -1; // exact ext value
                 uint32_t nn = 0;
                 while (nn < names.content_len) {
                     uint8_t tg = names.content[nn];
@@ -532,6 +547,7 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                 der_node bc;
                 if (der_expect(val.content, val.content_len, &v,
                                DER_TAG_SEQUENCE, &bc) != 0) return -1;
+                if (v != val.content_len) return -1; // exact ext value
                 if (bc.content_len == 0) {
                     out->is_ca = 0;   // cA DEFAULT FALSE
                 } else {
@@ -564,6 +580,7 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                                 out->path_len = (out->path_len << 8) | pv[k];
                         }
                     }
+                    if (b != bc.content_len) return -1; // nothing after pathLen
                 }
             } else if (oid_is(&ext_oid, OID_KEY_USAGE,
                               sizeof(OID_KEY_USAGE))) {
@@ -608,6 +625,7 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                     der_node ekus;
                     if (der_expect(val.content, val.content_len, &v,
                                    DER_TAG_SEQUENCE, &ekus) != 0) return -1;
+                    if (v != val.content_len) return -1; // exact ext value
                     out->has_eku = 1;
                     out->eku_server_auth = 0;
                     uint32_t q = 0;
@@ -638,6 +656,7 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                     der_node feats;
                     if (der_expect(val.content, val.content_len, &v,
                                    DER_TAG_SEQUENCE, &feats) != 0) return -1;
+                    if (v != val.content_len) return -1; // exact ext value
                     uint32_t q = 0;
                     while (q < feats.content_len) {
                         der_node fnum;
@@ -667,6 +686,7 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                     der_node ski;
                     if (der_expect(val.content, val.content_len, &v,
                                    DER_TAG_OCTET_STRING, &ski) != 0) return -1;
+                    if (v != val.content_len) return -1; // exact ext value
                     if (ski.content_len == 0) return -1;
                     out->ski = ski.content;
                     out->ski_len = ski.content_len;
@@ -683,6 +703,7 @@ int x509_parse(const uint8_t* der, uint32_t der_len, x509_cert* out) {
                     der_node akiseq;
                     if (der_expect(val.content, val.content_len, &v,
                                    DER_TAG_SEQUENCE, &akiseq) != 0) return -1;
+                    if (v != val.content_len) return -1; // exact ext value
                     uint32_t q = 0;
                     while (q < akiseq.content_len) {
                         uint8_t tag = akiseq.content[q];
@@ -939,6 +960,15 @@ int x509_hostname_match(const x509_cert* cert, const char* host) {
             while (*dot && *dot != '.') dot++;
             if (*dot != '.') continue;
             dot++;   // skip "."
+            // The wildcard must sit above at least two labels: "*.com" or
+            // "*.co" never covers a host (no CA may issue one, and a parser
+            // that accepted it would turn one mis-issuance into a TLD-wide
+            // key). The host's remainder must equal it, so it has two too.
+            {
+                int sdots = 0;
+                for (uint32_t k = 2; k < sl; k++) if (s[k] == '.') sdots++;
+                if (sdots == 0) continue;
+            }
             uint32_t rest = hl - (uint32_t)(dot - h);
             if (rest == sl - 2 && ci_eq(s + 2, dot, rest)) return 0;
         } else {

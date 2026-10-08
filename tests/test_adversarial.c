@@ -35,6 +35,9 @@
 #include "sha512.h"
 #include "certverify.h"
 #include "x509.h"
+#include "ocsp.h"
+#include "aes.h"
+#include "roots.h"
 
 static int failures = 0;
 static int passes = 0;
@@ -340,6 +343,10 @@ enum mock_mode {
     MOCK_FRAGMENT,     // flight split mid-Certificate (must DONE)
     MOCK_SH_SPLIT,     // ServerHello split across 2 records (must DONE)
     MOCK_APP_TRUNCATED, // valid flight+body, last app record cut (must ERR)
+    MOCK_ENC_CCS,      // PROTECTED change_cipher_spec mid-flight (must ERR)
+    MOCK_LATE_CCS,     // plaintext CCS after the handshake (must ERR)
+    MOCK_MS_FORGED_ISSUER, // pinned Must-Staple leaf + appended same-name CA
+                           // signing a "good" staple (must ERR, OCSP)
     MOCK_COUNT
 };
 
@@ -553,6 +560,10 @@ static int try_queue_body(const uint8_t* resp, uint32_t resp_len) {
         if (nrl == 0) { printf("    [tqb] NST enc_record returned 0\n"); return 0; }
         q_put(nrec, nrl);
     }
+    if (g_mode == MOCK_LATE_CCS) {
+        static const uint8_t ccs[6] = { TLS_CT_CHANGE_CIPHER_SPEC, 3, 3, 0, 1, 1 };
+        q_put(ccs, 6);
+    }
     uint32_t rl = enc_record(rec, sizeof(rec), g_s_ap_key, g_s_ap_iv,
                              &g_s_ap_seq, TLS_CT_APPDATA, resp, resp_len);
     if (rl == 0) { printf("    [tqb] enc_record returned 0\n"); return 0; }
@@ -708,7 +719,8 @@ static const char* mode_name(int m) {
         "MUSTSTAPLE", "MUSTSTAPLE_OK", "PRELOAD_OK", "PRELOAD_BAD",
         "SH_BIG",
         "SH_TRAIL", "SH_DUP", "EE_DUP", "EE_ALPN_H2", "FRAGMENT",
-        "SH_SPLIT", "APP_TRUNCATED"
+        "SH_SPLIT", "APP_TRUNCATED", "ENC_CCS", "LATE_CCS",
+        "MS_FORGED_ISSUER"
     };
     return names[m];
 }
@@ -809,8 +821,17 @@ static int mock_check_psk_offer(void) {
 // the CURRENT at_leaf (serial read at runtime — regen-safe). revoked != 0
 // marks the leaf revoked in a scratch index. Returns response bytes in out
 // (cap-checked), length via out_len. Mirrors sign_digest's system() style.
+static int mint_ocsp_ca(int revoked, const char* leaf_pem, const char* ca_pem,
+                        const char* ca_key, uint8_t* out, uint32_t cap,
+                        uint32_t* out_len);
 static int mint_ocsp(int revoked, const char* leaf_pem, uint8_t* out,
                      uint32_t cap, uint32_t* out_len) {
+    return mint_ocsp_ca(revoked, leaf_pem, "tests/adversarial/at_int.pem",
+                        "tests/adversarial/at_int.key", out, cap, out_len);
+}
+static int mint_ocsp_ca(int revoked, const char* leaf_pem, const char* ca_pem,
+                        const char* ca_key, uint8_t* out, uint32_t cap,
+                        uint32_t* out_len) {
     static char cmd[1024], serial[128];
     // Leaf serial (hex, no 0x) for the given leaf (PEM).
     snprintf(cmd, sizeof(cmd),
@@ -835,21 +856,22 @@ static int mint_ocsp(int revoked, const char* leaf_pem, uint8_t* out,
     fclose(f);
     // Responder bundle (cert + key) for -rsigner.
     snprintf(cmd, sizeof(cmd),
-             "cat tests/adversarial/at_int.key tests/adversarial/at_int.pem "
-             "> " SCRATCH_DIR "/ocsp_rsigner.pem 2>/dev/null");
+             "cat %s %s > " SCRATCH_DIR "/ocsp_rsigner.pem 2>/dev/null",
+             ca_key, ca_pem);
     if (system(cmd) != 0) return -1;
     // Request for the leaf, then the response.
     snprintf(cmd, sizeof(cmd),
-             "openssl ocsp -issuer tests/adversarial/at_int.pem "
+             "openssl ocsp -issuer %s "
              "-cert %s -reqout " SCRATCH_DIR "/ocsp_req.der "
-             "2>/dev/null", leaf_pem);
+             "2>/dev/null", ca_pem, leaf_pem);
     if (system(cmd) != 0) return -1;
     snprintf(cmd, sizeof(cmd),
              "openssl ocsp -index " SCRATCH_DIR "/ocsp_index "
-             "-CA tests/adversarial/at_int.pem "
+             "-CA %s "
              "-rsigner " SCRATCH_DIR "/ocsp_rsigner.pem "
              "-reqin " SCRATCH_DIR "/ocsp_req.der "
-             "-respout " SCRATCH_DIR "/ocsp_resp.der -ndays 7 2>/dev/null");
+             "-respout " SCRATCH_DIR "/ocsp_resp.der -ndays 7 2>/dev/null",
+             ca_pem);
     if (system(cmd) != 0) return -1;
     snprintf(cmd, sizeof(cmd), SCRATCH_DIR "/ocsp_resp.der");
     f = fopen(cmd, "rb");
@@ -930,7 +952,11 @@ static void mock_run(int mode, struct mock_result* res) {
     static int leaf_len, root_len;
     static uint8_t p384_root_der[4096];
     static int p384_root_len;
+    static uint8_t ms_self_der[4096];
+    static int ms_self_len;
     if (!loaded) {
+        ms_self_len = load("tests/adversarial/at_ms_self.der",
+                           ms_self_der, sizeof(ms_self_der));
         leaf_len = load("tests/adversarial/at_leaf.der", leaf_der, sizeof(leaf_der));
         root_len = load("tests/adversarial/at_root.der", root_der, sizeof(root_der));
         p384_root_len = load("tests/adversarial/at_p384_root.der",
@@ -942,8 +968,10 @@ static void mock_run(int mode, struct mock_result* res) {
     // P-256 root). Cheap per-run parse; keeps modes independent.
     {
         x509_cert rc;
-        const uint8_t* rd = (mode == MOCK_P384_VALID) ? p384_root_der : root_der;
-        int rl = (mode == MOCK_P384_VALID) ? p384_root_len : root_len;
+        const uint8_t* rd = (mode == MOCK_P384_VALID) ? p384_root_der
+                          : (mode == MOCK_MS_FORGED_ISSUER) ? ms_self_der : root_der;
+        int rl = (mode == MOCK_P384_VALID) ? p384_root_len
+               : (mode == MOCK_MS_FORGED_ISSUER) ? ms_self_len : root_len;
         if (rl > 0 && x509_parse(rd, (uint32_t)rl, &rc) == 0)
             cert_verify_trust_extra(rc.spki.p, rc.spki.len);
     }
@@ -981,7 +1009,8 @@ static void mock_run(int mode, struct mock_result* res) {
         // (Bisected 2026-09-11: mtime-clock +26h reds the good-staple
         // check as future-dated. Environmental, not a stack bug.)
         if (mode == MOCK_STAPLE || mode == MOCK_STAPLE_BAD ||
-            mode == MOCK_STAPLE_REVOKED || mode == MOCK_MUSTSTAPLE_OK) {
+            mode == MOCK_STAPLE_REVOKED || mode == MOCK_MUSTSTAPLE_OK ||
+            mode == MOCK_MS_FORGED_ISSUER) {
             time_t tt = time(0);
             struct tm* g = gmtime(&tt);
             n.year = 1900 + g->tm_year; n.month = g->tm_mon + 1;
@@ -1246,8 +1275,29 @@ static void mock_run(int mode, struct mock_result* res) {
         chain[2] = (mode == MOCK_P384_VALID)
             ? "tests/adversarial/at_p384_root.der"
             : "tests/adversarial/at_root.der";   // anchor terminates the path
-        cert_len = build_cert_msg(cert_msg, sizeof(cert_msg), chain, 3);
+        int nchain = 3;
+        if (mode == MOCK_MS_FORGED_ISSUER) {
+            chain[0] = "tests/adversarial/at_ms_self.der";
+            chain[1] = "tests/adversarial/at_evil_ca.der";
+            nchain = 2;
+        }
+        cert_len = build_cert_msg(cert_msg, sizeof(cert_msg), chain, nchain);
         if (cert_len == 0) { res->r = -3; return; }
+        if (mode == MOCK_MS_FORGED_ISSUER) {
+            static uint8_t forged[2048];
+            uint32_t flen = 0;
+            if (mint_ocsp_ca(0, "tests/adversarial/at_ms_self.pem",
+                             "tests/adversarial/at_evil_ca.pem",
+                             "tests/adversarial/at_evil_ca.key",
+                             forged, sizeof(forged), &flen) != 0) {
+                printf("    [mock] forged ocsp mint failed\n");
+                res->r = -3;
+                return;
+            }
+            cert_len = staple_patch(cert_msg, sizeof(cert_msg), cert_len,
+                                    forged, flen, 0);
+            if (cert_len == 0) { res->r = -3; return; }
+        }
         // STAPLE modes: graft a status_request extension onto entry 0.
         // STAPLE/STAPLE_REVOKED/STAPLE_STALE carry REAL openssl-minted
         // responses (good/revoked); STAPLE_BAD carries framing garbage.
@@ -1295,7 +1345,9 @@ static void mock_run(int mode, struct mock_result* res) {
                       mode == MOCK_PRELOAD_BAD);
         int is_p384 = (mode == MOCK_P384_VALID);
         int is_ms = (mode == MOCK_MUSTSTAPLE || mode == MOCK_MUSTSTAPLE_OK);
-        const char* leaf_key = is_rsa ? "tests/adversarial/at_rsa_leaf.key"
+        const char* leaf_key = (mode == MOCK_MS_FORGED_ISSUER)
+                             ? "tests/adversarial/at_ms_self.key"
+                             : is_rsa ? "tests/adversarial/at_rsa_leaf.key"
                              : is_p384 ? "tests/adversarial/at_p384_leaf.key"
                              : is_ms ? "tests/adversarial/at_ms_leaf.key"
                              : (mode == MOCK_PRELOAD_BAD)
@@ -1386,6 +1438,15 @@ static void mock_run(int mode, struct mock_result* res) {
             if (r1 == 0 || r2 == 0) { res->r = -3; return; }
             q_put(rec, r1 + r2); // [rec1][rec2] already contiguous
         } else {
+            if (mode == MOCK_ENC_CCS) {
+                // A CCS INSIDE the encryption (inner type 20): RFC 8446 §5
+                // says abort; the old client skipped it like the compat one.
+                uint8_t one = 0x01;
+                uint32_t cl = enc_record(rec, sizeof(rec), s_hs_key, s_hs_iv,
+                                         &s_seq, TLS_CT_CHANGE_CIPHER_SPEC, &one, 1);
+                if (cl == 0) { res->r = -3; return; }
+                q_put(rec, cl);
+            }
             rl = enc_record(rec, sizeof(rec), s_hs_key, s_hs_iv, &s_seq,
                             TLS_CT_HANDSHAKE, flight, fl);
             if (rl == 0) { res->r = -3; return; }
@@ -1402,7 +1463,9 @@ static void mock_run(int mode, struct mock_result* res) {
                           mode == MOCK_SH_SPLIT || mode == MOCK_APP_TRUNCATED ||
                           mode == MOCK_MUSTSTAPLE_OK ||
                           mode == MOCK_PRELOAD_OK || mode == MOCK_PRELOAD_BAD ||
-                          mode == MOCK_CLOSE_NOTIFY || mode == MOCK_APPDATA_BITFLIP);
+                          mode == MOCK_CLOSE_NOTIFY || mode == MOCK_APPDATA_BITFLIP ||
+                          mode == MOCK_ENC_CCS || mode == MOCK_LATE_CCS ||
+                          mode == MOCK_MS_FORGED_ISSUER);
         // TRUNCATED: cut the queue mid-flight-record (SH complete + 30B of
         // the encrypted flight). The client must ERR on the short close —
         // never DONE (partial bytes are not a page) and never spin: the
@@ -1609,7 +1672,22 @@ static void mock_section(void) {
     CHECK(res.r == TLS_STEP_DONE && res.out_len > 0 &&
           memcmp(res.out, "HTTP/1.1 200 OK", 15) == 0,
           "stapled Must-Staple leaf completes");
+    tls_pin_clear();
+    // Audit 2026-10-08: the staple's "issuer" must be PROVEN to have issued
+    // the leaf. Pinned self-signed Must-Staple leaf + an appended CA with
+    // the same NAME (own key) + a good staple that CA signed: every OCSP
+    // check passes against the stand-in, so only the binding stops it.
+    mock_run(MOCK_MS_FORGED_ISSUER, &res);
+    CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_CERT &&
+          res.cert_detail == CV_ERR_OCSP,
+          "Must-Staple: staple from an unproven issuer refused");
     tls_pin_clear(); // MS key above would refuse the at_leaf flights below
+    mock_run(MOCK_ENC_CCS, &res);
+    CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_PROTO,
+          "protected change_cipher_spec aborts (RFC 8446 s5)");
+    mock_run(MOCK_LATE_CCS, &res);
+    CHECK(res.r == TLS_STEP_ERR && res.fail_reason == TLS_FAIL_PROTO,
+          "change_cipher_spec after the handshake aborts");
     // Preloaded pins (cryptoholes follow-up): preloaded host + matching
     // key completes and pins; same host + different key fails PRELOAD
     // (cleared between so BAD exercises the preload path, not key-change).
@@ -2322,6 +2400,160 @@ static void name_section(void) {
     cert_verify_trust_extra(NULL, 0);
 }
 
+// ---- 2026-10-08 audit regressions (each check fails on the pre-audit code) ----
+static int verify_files(const char** files, int n, const char* host) {
+    static uint8_t flight[16384];
+    uint32_t fl = build_cert_msg(flight, sizeof(flight), files, n);
+    if (fl == 0) return -1000;
+    return cert_verify(flight, fl, host);
+}
+
+static void audit_section(void) {
+    printf("== 6. audit 2026-10-08 ==\n");
+    static uint8_t rder[4096];
+    int rn = load("tests/adversarial/at_root.der", rder, sizeof(rder));
+    x509_cert rc;
+    if (rn <= 0 || x509_parse(rder, (uint32_t)rn, &rc) != 0) {
+        CHECK(0, "audit anchor loads");
+        return;
+    }
+    cert_verify_trust_extra(rc.spki.p, rc.spki.len);
+    x509_time n, nx;
+    adv_clocks(&n, &nx);
+    x509_set_now(&n);
+
+    // Name constraints, leading-dot form (RFC 5280: subdomains only).
+    {
+        const char* x[3] = { "tests/adversarial/at_ncdot_xlf.der",
+                             "tests/adversarial/at_ncdot_xint.der",
+                             "tests/adversarial/at_root.der" };
+        CHECK(verify_files(x, 3, "www.bad.example.com") == CV_ERR_CAFLAGS,
+              "excluded .bad.example.com subtree enforced");
+        const char* p[3] = { "tests/adversarial/at_ncdot_pok.der",
+                             "tests/adversarial/at_ncdot_pint.der",
+                             "tests/adversarial/at_root.der" };
+        CHECK(verify_files(p, 3, "evil.example.com") == CV_OK,
+              "permitted .example.com admits a subdomain");
+        const char* b[3] = { "tests/adversarial/at_ncdot_pbad.der",
+                             "tests/adversarial/at_ncdot_pint.der",
+                             "tests/adversarial/at_root.der" };
+        CHECK(verify_files(b, 3, "example.com") == CV_ERR_CAFLAGS,
+              "permitted .example.com does not admit example.com itself");
+    }
+    // Duplicate extensions / trailing junk in an extension value.
+    {
+        const char* ctl[3] = { "tests/adversarial/at_dup_ctl.der",
+                               "tests/adversarial/at_int.der",
+                               "tests/adversarial/at_root.der" };
+        CHECK(verify_files(ctl, 3, "evil.example.com") == CV_OK,
+              "re-encoded control leaf verifies (DER surgery is sound)");
+        const char* dup[3] = { "tests/adversarial/at_dup_eku.der",
+                               "tests/adversarial/at_int.der",
+                               "tests/adversarial/at_root.der" };
+        CHECK(verify_files(dup, 3, "evil.example.com") == CV_ERR_PARSE,
+              "duplicate EKU extension rejected (no last-one-wins)");
+        const char* junk[3] = { "tests/adversarial/at_bc_junk.der",
+                                "tests/adversarial/at_int.der",
+                                "tests/adversarial/at_root.der" };
+        CHECK(verify_files(junk, 3, "evil.example.com") == CV_ERR_PARSE,
+              "trailing byte inside BasicConstraints rejected");
+    }
+    // Wildcards need two labels below them.
+    {
+        static x509_cert w;
+        memset(&w, 0, sizeof(w));
+        w.san[0].p = (const uint8_t*)"*.com"; w.san[0].len = 5;
+        w.san[1].p = (const uint8_t*)"*.example.com"; w.san[1].len = 13;
+        w.san_count = 1;
+        CHECK(x509_hostname_match(&w, "example.com") != 0,
+              "wildcard *.com matches nothing");
+        w.san_count = 2;
+        CHECK(x509_hostname_match(&w, "www.example.com") == 0 &&
+              x509_hostname_match(&w, "example.com") != 0 &&
+              x509_hostname_match(&w, "a.b.example.com") != 0,
+              "*.example.com: one label only");
+    }
+    // Partial distrust (Mozilla distrust-after) on the anchoring root.
+    {
+        const char* ch[3] = { "tests/adversarial/at_leaf.der",
+                              "tests/adversarial/at_int.der",
+                              "tests/adversarial/at_root.der" };
+        x509_time before = { 2000, 1, 1, 0, 0, 0 }, after = { 2099, 1, 1, 0, 0, 0 };
+        cert_verify_trust_extra_distrust(&before);
+        CHECK(verify_files(ch, 3, "evil.example.com") == CV_ERR_ROOT,
+              "leaf issued after the root's distrust date refused");
+        cert_verify_trust_extra_distrust(&after);
+        CHECK(verify_files(ch, 3, "evil.example.com") == CV_OK,
+              "leaf issued before the distrust date still verifies");
+        cert_verify_trust_extra_distrust(NULL);
+        // The generated store carries Mozilla's dates (Izenpe today).
+        int dated = 0;
+        for (int i = 0; i < x509_root_count; i++)
+            if (x509_roots[i].has_distrust_after &&
+                x509_roots[i].distrust_after.year >= 2020) dated++;
+        CHECK(dated >= 1, "root store carries distrust-after dates");
+    }
+    // OCSP: a revoked verdict only counts once the response is verified.
+    {
+        static uint8_t resp[2048], ld[4096], idr[4096];
+        uint32_t rl = 0;
+        int ln = load("tests/adversarial/at_leaf.der", ld, sizeof(ld));
+        int in = load("tests/adversarial/at_int.der", idr, sizeof(idr));
+        x509_cert leaf, iss;
+        if (mint_ocsp(1, "tests/adversarial/at_leaf.pem", resp, sizeof(resp), &rl) == 0 &&
+            ln > 0 && in > 0 && x509_parse(ld, (uint32_t)ln, &leaf) == 0 &&
+            x509_parse(idr, (uint32_t)in, &iss) == 0) {
+            time_t tt = time(0);
+            struct tm* g = gmtime(&tt);
+            x509_time wall = { 1900 + g->tm_year, g->tm_mon + 1, g->tm_mday,
+                               g->tm_hour, g->tm_min, g->tm_sec };
+            CHECK(ocsp_check_staple(resp, rl, &leaf, &iss, &wall) == OCSP_ERR_STATUS_BAD,
+                  "signed revoked staple -> revoked");
+            // Tamper with SIGNED bytes that keep the parse intact: the
+            // echoed request nonce (responseExtensions, id-pkix-ocsp-nonce)
+            // — the trailing bytes are openssl's embedded responder cert.
+            static const uint8_t nonce_oid[9] = { 0x2B,0x06,0x01,0x05,0x05,0x07,0x30,0x01,0x02 };
+            int at = -1;
+            for (uint32_t i = 0; i + 9 + 6 < rl; i++)
+                if (memcmp(resp + i, nonce_oid, 9) == 0) { at = (int)i; break; }
+            CHECK(at >= 0, "minted staple carries a nonce to tamper with");
+            if (at >= 0) {
+                resp[at + 9 + 5] ^= 0x01;    // OID | 04 len | 04 len | nonce...
+                CHECK(ocsp_check_staple(resp, rl, &leaf, &iss, &wall) == OCSP_ERR_SIG,
+                      "forged revoked staple -> signature error, not a verdict");
+            }
+        } else {
+            CHECK(0, "revoked staple mints");
+        }
+    }
+    // HTTP chunk sizes near 2^32 must not wrap the completeness walk.
+    {
+        static const char r1[] = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+                                 "ffffffff\r\nabc\r\n0\r\n\r\n";
+        CHECK(tls_response_complete((const uint8_t*)r1, sizeof(r1) - 1) == TLS_RESP_SHORT,
+              "chunk size 0xffffffff is short, not complete");
+    }
+    // AES-GCM: a forged record never touches the output buffer.
+    {
+        uint8_t key[16], nonce[12], pt[64], ct[64], tag[16], out[64];
+        for (int i = 0; i < 16; i++) key[i] = (uint8_t)(i * 7 + 1);
+        for (int i = 0; i < 12; i++) nonce[i] = (uint8_t)(i * 3);
+        for (int i = 0; i < 64; i++) pt[i] = (uint8_t)i;
+        aead_aes128gcm_encrypt(key, nonce, (const uint8_t*)"aad", 3, pt, 64, ct, tag);
+        memset(out, 0xEE, sizeof(out));
+        tag[5] ^= 0x40;
+        int bad = aead_aes128gcm_decrypt(key, nonce, (const uint8_t*)"aad", 3, ct, 64, tag, out);
+        int untouched = 1;
+        for (int i = 0; i < 64; i++) if (out[i] != 0xEE) untouched = 0;
+        CHECK(bad != 0 && untouched, "GCM: forged tag rejected, output untouched");
+        tag[5] ^= 0x40;
+        memcpy(out, ct, 64);                 // in-place decrypt
+        CHECK(aead_aes128gcm_decrypt(key, nonce, (const uint8_t*)"aad", 3, out, 64, tag, out) == 0 &&
+              memcmp(out, pt, 64) == 0, "GCM: in-place decrypt round-trips");
+    }
+    cert_verify_trust_extra(NULL, 0);
+}
+
 int main(void) {
     parser_fuzz_section();
     fuzz_section();
@@ -2331,6 +2563,7 @@ int main(void) {
     keyuse_section();
     pin_section();
     name_section();
+    audit_section();
     printf("\n%s: %d passed, %d failed\n",
            failures == 0 ? "ADVERSARIAL TESTS PASS" : "ADVERSARIAL TESTS FAIL",
            passes, failures);

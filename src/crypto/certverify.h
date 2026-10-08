@@ -46,6 +46,10 @@ int cert_sig_verify(int sig_alg, const x509_cert* issuer,
 // with -DKERNEL; host tests don't.
 #ifndef KERNEL
 void cert_verify_trust_extra(const uint8_t* spki, uint32_t spki_len);
+// Give the extra trust slot a distrust-after date (NULL clears it), so the
+// partial-distrust rule (roots.h) is testable with a root we hold the key
+// for. Cleared by every cert_verify_trust_extra call.
+void cert_verify_trust_extra_distrust(const x509_time* after);
 #endif
 
 // Parse just the leaf (first) certificate out of a Certificate message body.

@@ -268,7 +268,7 @@ int rand_bytes(uint8_t* out, uint32_t len) {
     // 64B block at a time; between blocks interrupts run and the timer may
     // stir (reseed) — safe and desirable. Counter exhaustion is reserved up
     // front so a call never partially succeeds then fails mid-stream.
-    uint32_t nblocks = (len + 63u) / 64u;
+    uint32_t nblocks = (len + 31u) / 32u;   // 32 output bytes per block
     uint32_t rng_if = rng_cli();
     if (!rng_ready_flag) { rng_sti(rng_if); return 0; }
     // Counter-exhaustion guard (cryptoholes #9 — same discipline as the
@@ -289,24 +289,25 @@ int rand_bytes(uint8_t* out, uint32_t len) {
     }
     rng_sti(rng_if);
     while (len > 0) {
-        // Generate 64 bytes of keystream, use them, then rekey. Input
-        // zeroed first (same cryptoholes #9 reason as rng_rekey: pure
-        // keystream out, no stack-garbage mixing, MSan-clean).
+        // Fast-key-erasure (Bernstein): each 64B keystream block's first
+        // half REPLACES the key, only the second half is output. The key
+        // that produced an output is gone before the output is used, and
+        // no output byte ever becomes key material. (The old loop output
+        // block[0..63] and then XORed block[0..31] — bytes the caller had
+        // just received, often published as a ClientHello random — into
+        // the key: "forward secrecy" mixing of public data.) Input zeroed
+        // first (cryptoholes #9: pure keystream, MSan-clean).
         uint8_t block[64];
         memset(block, 0, sizeof(block));
         rng_if = rng_cli();
         chacha20_encrypt(rng_key, rng_nonce, rng_counter, block, block, 64);
         rng_counter++;
-
-        uint32_t take = len < 64 ? len : 64;
-        memcpy(out, block, take);
-
-        // Forward secrecy: mix used keystream into key.
-        for (uint32_t i = 0; i < 32; i++) rng_key[i] ^= block[i];
-
-        secure_zero(block, sizeof(block));
-        rng_rekey();
+        memcpy(rng_key, block, 32);
         rng_sti(rng_if);
+
+        uint32_t take = len < 32 ? len : 32;
+        memcpy(out, block + 32, take);
+        secure_zero(block, sizeof(block));
         out += take;
         len -= take;
     }

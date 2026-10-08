@@ -51,6 +51,10 @@ static int alt_pressed = 0;  // 1 = Alt held (0x38, or 0xE0 0x38 right Alt)
 static int extended = 0; // 1 = received 0xE0 prefix
 
 static void keyboard_irq(void) {
+    // Only take a byte that is there and is the keyboard's (status bit 5 =
+    // it came from the mouse port: IRQ12's handler owns it).
+    uint8_t st = inb(0x64);
+    if (!(st & 0x01) || (st & 0x20)) return;
     uint8_t scancode = inb(0x60);
 
     // Entropy: keystroke arrival timing is the best interactive source on

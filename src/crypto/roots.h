@@ -2,6 +2,7 @@
 #define ROOTS_H
 
 #include <stdint.h>
+#include "x509.h"
 
 // Trust model (cryptoholes #5 — documented prominently): these are
 // SPKI PINS, not CA names. A chain anchors when a flight cert's public
@@ -24,9 +25,16 @@
 // re-validated). Without this, only servers that also sent the root (or a
 // cross-signed copy carrying its key) could be verified.
 //
+// Distrust-after (2026-10-08): Mozilla limits some roots instead of
+// removing them outright (CKA_NSS_SERVER_DISTRUST_AFTER): chains through
+// such a root are refused when the LEAF's notBefore is after the date
+// (certificates issued after the CA was distrusted). The store is
+// generated from certdata.txt itself so these dates and the server-auth
+// trust bits come with it (tools/gen_roots.py).
+//
 // One trusted root: raw SubjectPublicKeyInfo DER + its SHA-256 (matching
-// key) + display name + key type, and the full certificate DER with its
-// subject Name (for issuer matching).
+// key) + display name + key type, the full certificate DER with its
+// subject Name (for issuer matching), and the distrust-after date.
 typedef struct {
     const uint8_t* spki;
     uint32_t       spki_len;
@@ -39,6 +47,8 @@ typedef struct {
     uint32_t       subject_len;
     const uint8_t* ski;        // SubjectKeyIdentifier value (NULL if absent)
     uint32_t       ski_len;
+    int            has_distrust_after;
+    x509_time      distrust_after;   // leaves with notBefore after this: refused
 } x509_root;
 
 extern const x509_root x509_roots[];

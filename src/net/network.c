@@ -1274,7 +1274,11 @@ int http_dechunk(char* buf, int len) {
             else if (c >= 'a' && c <= 'f') v = c - 'a' + 10;
             else if (c >= 'A' && c <= 'F') v = c - 'A' + 10;
             else break;
-            size = size * 16 + v;
+            // Saturate instead of overflowing the int (the copy below is
+            // bounded by len either way). Bound the VALUE, not the digit
+            // count: Google zero-pads sizes to 8 digits ("00002a8f").
+            if (size > 0x07FFFFFF) size = 0x7FFFFFFF;
+            else size = size * 16 + v;
             digits++;
             rd++;
         }

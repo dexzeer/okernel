@@ -55,6 +55,10 @@ class OkVM:
                 cmd += ["-object", f"filter-dump,id=dump0,netdev=net0,file={os.path.join(OUTDIR, tag + '.pcap')}"]
         if disk:  # raw ATA disk image for the persistent-FS layer
             cmd += ["-hda", disk]
+        if os.environ.get("OKVM_TRACE"):  # QEMU trace events, e.g. OKVM_TRACE='ps2_*,serial_write' -> ~/okvm/<tag>.trace
+            cmd += ["-msg", "timestamp=on"]
+            for pat in os.environ["OKVM_TRACE"].split(","):   # file= on each: a bare -trace resets it
+                cmd += ["-trace", f"enable={pat},file={os.path.join(OUTDIR, tag + '.trace')}"]
         if os.environ.get("OKVM_ACCEL"):  # e.g. OKVM_ACCEL=kvm (needs /dev/kvm access)
             cmd += ["-accel", os.environ["OKVM_ACCEL"]]
         self.q = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,

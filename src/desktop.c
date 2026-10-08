@@ -1075,12 +1075,46 @@ static void shell_execute(int win_id, const char* input) {
     }
 }
 
-static void on_keypress(char c) {
+// Keystrokes are QUEUED by the keyboard IRQ and dispatched from the main
+// loop (2026-10-08). on_keypress used to run inside the IRQ: shell commands,
+// okai navigation (frees the document, cancels requests), page keydown/input
+// JS (QuickJS is not reentrant) and page scrolls (multi-MB memmoves) all
+// executed on top of whatever the main loop was doing — often okai_poll on
+// the very same document — and a busy page could swallow or garble a typed
+// URL. Single producer (IRQ1) / single consumer (main loop): head is only
+// written by the IRQ, tail only by the loop; a full queue drops the key.
+// Modifier state is sampled at press time and travels with the key (the
+// loop may dispatch it after Alt was already released).
+#define KEYQ_SIZE 256
+static volatile char key_q[KEYQ_SIZE];
+static volatile uint8_t key_alt[KEYQ_SIZE];
+static volatile uint32_t key_head, key_tail;
+
+static void on_key_irq(char c) {
+    if (key_head - key_tail >= KEYQ_SIZE) return;
+    key_q[key_head % KEYQ_SIZE] = c;
+    key_alt[key_head % KEYQ_SIZE] = (uint8_t)(keyboard_alt_held() != 0);
+    __asm__ volatile("" ::: "memory");   // slot written before it is published
+    key_head++;
+}
+
+static void on_keypress(char c, int alt);
+static void keys_dispatch(void) {
+    while (key_tail != key_head) {
+        char c = key_q[key_tail % KEYQ_SIZE];
+        int alt = key_alt[key_tail % KEYQ_SIZE];
+        __asm__ volatile("" ::: "memory");
+        key_tail++;
+        on_keypress(c, alt);
+    }
+}
+
+static void on_keypress(char c, int alt) {
     // Global hotkey: Ctrl+Alt+T opens a terminal from anywhere — editor,
     // browser, bare desktop with zero terminals. Ctrl+T arrives as 0x14
     // (driver control-code mapping); Alt is driver-tracked. Checked before
     // focus routing so the shell is never more than a chord away.
-    if (c == 0x14 && keyboard_alt_held()) {
+    if (c == 0x14 && alt) {
         int id = create_terminal();
         if (id >= 0) {
             window_set_focus(id);
@@ -1512,7 +1546,7 @@ void kernel_main(uint32_t mboot_phys) {
     // Init input
     mouse_init_fb();
     keyboard_init();
-    keyboard_set_callback(on_keypress);
+    keyboard_set_callback(on_key_irq);
     // Capture the main-loop thread's live ESP/EBP into pid 0 BEFORE sti:
     // the preemption stub saves/restores p->esp per thread, and process_init
     // ran one frame up (its ESP capture is stale by a frame). This is the
@@ -1530,6 +1564,7 @@ void kernel_main(uint32_t mboot_phys) {
     static uint64_t halted_cyc = 0, busy_t0 = 0;
     while (1) {
         main_loops++;
+        keys_dispatch();
         // Ring-3 entry drain: the shell (and fork) stage pid+eip+esp+window
         // into the entry run queue; here is plain ring-0 thread context, so
         // prepare (CR3+ESP0) + IRET below is safe. sys_exit resumes right
@@ -2501,7 +2536,13 @@ void kernel_main(uint32_t mboot_phys) {
         if (!composed && !cursor_moved && !mb && !wheel && drag_win < 0 && resize_win < 0 &&
             fetch_free_slots() == FETCH_MAX && !okai_wants_cpu()) {
             uint64_t h0 = rdtsc_now();
-            __asm__ volatile("hlt");
+            // A key queued after this iteration's dispatch must not sleep
+            // until the next timer tick: check with interrupts off, then
+            // "sti; hlt" (sti's one-instruction shadow makes the pair atomic
+            // — an IRQ in between still wakes the hlt).
+            __asm__ volatile("cli" ::: "memory");
+            if (key_head == key_tail) __asm__ volatile("sti; hlt" ::: "memory");
+            else __asm__ volatile("sti" ::: "memory");
             halted_cyc += rdtsc_now() - h0;
         }
     }

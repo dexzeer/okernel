@@ -505,8 +505,13 @@ int ec_verify(int alg,
     scalar_from_be(rb, rl, &c->nd, r);
     scalar_from_be(sb, sl, &c->nd, s);
     scalar_from_be(hash + skip, hash_len - skip, &c->nd, e);
-    if (cmp_fe(r, c->nd.m, c->nl) == 0) return -1;   // r == 0 invalid
-    if (cmp_fe(s, c->nd.m, c->nl) == 0) return -1;   // s == 0 invalid
+    // r, s in [1, n-1]: zero and >= n were rejected on the encodings above
+    // (strict_scalar_int / be_ge_order); re-assert on the limbs.
+    {
+        uint32_t rz = 0, sz = 0;
+        for (int i = 0; i < c->nl; i++) { rz |= r[i]; sz |= s[i]; }
+        if (rz == 0 || sz == 0) return -1;
+    }
 
     // sinv = s^-1 mod n (raw value).
     uint32_t sinv[EC_MAX_LIMBS];
