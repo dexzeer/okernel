@@ -106,6 +106,10 @@ void gdt_init(void) {
     serial_puts("[gdt] GDT + TSS initialized (user segments at 0x18/0x20)\n");
 }
 
+void gdt_load_ap(void) {
+    gdt_flush((uint32_t)&gp);
+}
+
 void tss_set_kernel_stack(uint32_t esp0) {
     kernel_tss.esp0 = esp0;
 }

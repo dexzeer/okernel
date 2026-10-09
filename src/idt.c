@@ -95,6 +95,14 @@ static void pic_remap(void) {
     outb(0xA1, 0x00);
 }
 
+void idt_set_vector(uint8_t vector, void (*handler)(void)) {
+    idt_set_gate(vector, (uint32_t)handler, 0x08, 0x8E);
+}
+
+void idt_load_ap(void) {
+    __asm__ volatile("lidt %0" : : "m"(idtp));
+}
+
 void idt_init(void) {
     idtp.limit = sizeof(idt) - 1;
     idtp.base  = (uint32_t)&idt;
@@ -309,6 +317,14 @@ void isr_handler(int int_num) {
             __asm__ volatile("" ::: "memory");
         }
         return; // Don't halt on syscall
+    }
+
+    {
+        // An exception on an application processor only parks that CPU
+        // (smp.c); weak so the text build, which has no SMP, links.
+        extern int smp_fault_hook(int vec, uint32_t* frame) __attribute__((weak));
+        if (smp_fault_hook)
+            smp_fault_hook(int_num, (uint32_t*)(__builtin_frame_address(0) + 16));
     }
 
     if (int_num == 13) {

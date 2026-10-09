@@ -24,7 +24,7 @@ LDFLAGS_HIGH = -m elf_i386 -T linker-high.ld
 # Common objects (no kernel.c, no desktop.c). ORDER: start.o FIRST — its
 # .text must land at 0xC0100030 (right after .multiboot) so _start's LOW
 # alias (phys 0x100030+0x30) is where GRUB jumps. isr.o second.
-ASM_OBJ = boot/start.o boot/isr.o
+ASM_OBJ = boot/start.o boot/isr.o boot/smp_stubs.o boot/ap_tramp.o
 COMMON_OBJ = src/gdt.o src/idt.o src/memory.o src/serial.o src/keyboard.o src/mouse.o src/string.o src/syscall.o
 
 # Text mode objects
@@ -87,7 +87,7 @@ src/kmath.o: src/kmath.c
 src/divdi3.o: src/divdi3.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
 src/userland_seed.o: $(USERLAND_GEN)
-DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
+DESKTOP_OBJ = src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
               src/font_data.o $(WEB_OBJ) $(OJS_OBJ) \
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/aes.o src/crypto/chacha20.o src/crypto/poly1305.o \
@@ -143,6 +143,7 @@ host-tests:
 	gcc -m32 -O2 -Isrc -Isrc/crypto -o build-host/t_rng tests/test_rng.c src/crypto/rand.c src/crypto/chacha20.c src/crypto/sha256.c && ./build-host/t_rng | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_strict tests/test_crypto_strict.c $(HOST_CRYPTO_SRC) && ./build-host/t_strict | tail -n 2
 	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_edtext tests/test_editor_text.c src/editor.c src/textslot.c && ./build-host/t_edtext | tail -n 2
+	gcc -m32 -O1 -fsanitize=address,undefined -Isrc -o build-host/t_acpi tests/test_acpi.c && ./build-host/t_acpi | tail -n 1
 	$(MAKE) web-tests
 	gcc -m32 -O2 -Isrc/crypto -o build-host/t_aes tests/test_aes.c src/crypto/aes.c && (python3 tests/aes_vectors.py 300 2>/dev/null | ./build-host/t_aes - || ./build-host/t_aes) | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_pki tests/test_pki.c $(HOST_CRYPTO_SRC) && ./build-host/t_pki | tail -n 2
@@ -273,3 +274,21 @@ clean:
 	rm -rf isodir
 
 -include $(wildcard $(ALL_C_OBJ:.o=.d))
+
+# ---- Test build: boot CPU forced into x2APIC mode, SMP self test at boot ----
+# Same kernel with only lapic.c / smp.c compiled differently. TCG cannot do
+# x2APIC; boot it under WHPX/KVM (tests/headless/smp_win.ps1).
+build-x2/lapic.o: src/lapic.c $(HEADERS)
+	mkdir -p build-x2
+	$(CC) $(CFLAGS) -DLAPIC_FORCE_X2APIC -c $< -o $@
+build-x2/smp.o: src/smp.c $(HEADERS)
+	mkdir -p build-x2
+	$(CC) $(CFLAGS) -DSMP_BOOT_SELFTEST -c $< -o $@
+kanarchy-x2apic.bin: $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o build-x2/lapic.o build-x2/smp.o linker-high.ld
+	$(LD) $(LDFLAGS_HIGH) -o $@ $(ASM_OBJ) $(COMMON_OBJ) $(filter-out src/lapic.o src/smp.o,$(DESKTOP_OBJ)) src/desktop.o build-x2/lapic.o build-x2/smp.o
+kanarchy-x2apic.iso: kanarchy-x2apic.bin
+	rm -rf isodir-x2
+	mkdir -p isodir-x2/boot/grub
+	cp kanarchy-x2apic.bin isodir-x2/boot/kanarchy.bin
+	printf 'set timeout=0\nset default=0\n\nmenuentry "KAnarchy OS" {\n    set gfxpayload=1920x1080x32\n    multiboot /boot/kanarchy.bin\n    boot\n}\n' > isodir-x2/boot/grub/grub.cfg
+	grub-mkrescue -o $@ isodir-x2 2>/dev/null

@@ -30,6 +30,9 @@ struct tss {
 } __attribute__((packed));
 
 void gdt_init(void);
+// Load the already-built GDT on an application processor. No TSS: an AP never
+// leaves ring 0.
+void gdt_load_ap(void);
 void tss_set_kernel_stack(uint32_t esp0);
 void tss_get_esp0(uint32_t *esp0, uint32_t *ss0);
 // enter_user_mode takes NO stack args: caller passes eip in EAX, esp in EDX
