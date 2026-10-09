@@ -22,6 +22,7 @@
 // nest deeper than the 256KB boot stack allows, and ojs recursion is
 // capped at 900KB of it.
 #include "okai.h"
+#include "prof.h"
 #include "window.h"
 #include "graphics.h"
 #include "theme.h"
@@ -173,7 +174,7 @@ static void job_entry(void* p) {
             if (j->scroll < 0) j->scroll = 0;
             j->h = wdoc_has_fixed(j->doc);
         }
-        wdoc_paint(j->doc, j->surf, j->scroll);
+        { PROF_BEGIN(PZ_PAINT); wdoc_paint(j->doc, j->surf, j->scroll); PROF_END(PZ_PAINT); }
         break;
     case JOB_HIT:
         j->result = wdoc_hit(j->doc, j->x, j->y, j->scroll, j->hit);
@@ -226,7 +227,13 @@ static void job_entry(void* p) {
     }
 }
 
+static void run_job_inner(struct job* j);
 static void run_job(struct job* j) {
+    PROF_BEGIN(PZ_JOB);
+    run_job_inner(j);
+    PROF_END(PZ_JOB);
+}
+static void run_job_inner(struct job* j) {
     if (!engine_stack) {
         engine_stack = (uint8_t*)kmalloc(ENGINE_STACK);
         if (engine_stack) {
@@ -1044,10 +1051,12 @@ static void scroll_to(int id, int ny) {
     if (!dy) return;
     int ady = dy < 0 ? -dy : dy;
     uint64_t c0 = rdtsc64();
+    PROF_BEGIN(PZ_SCROLL);
     T->js_scroll_evt = 1;
     if (T->has_fixed || ady >= ph * 3 / 4 || T->render_pending) {
         T->scroll_y = ny;
         okai_render_content(id);
+        PROF_END(PZ_SCROLL);
         return;
     }
     if (dy > 0) memmove(b->page_px, b->page_px + dy * pw, (uint32_t)(ph - dy) * pw * 4);
@@ -1065,6 +1074,7 @@ static void scroll_to(int id, int ny) {
     j.scroll = ny;
     run_job(&j);
     window_set_dirty(b->win_id);
+    PROF_END(PZ_SCROLL);
     serial_printf("[okai] scroll dy=%d in %dkcyc\n", dy, (int)((rdtsc64() - c0) >> 10));
 }
 

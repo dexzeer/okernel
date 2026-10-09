@@ -35,6 +35,9 @@
 #include "userland_seed.h"
 #include "acpi.h"
 #include "smp.h"
+#include "prof.h"
+#include "fpu.h"
+#include "simd.h"
 
 struct mboot_info {
     uint32_t flags;
@@ -912,6 +915,23 @@ static void shell_execute(int win_id, const char* input) {
             window_puts(win_id, rc == 0 ? "saved to disk\n" : "save FAILED\n");
         }
     }
+    else if (str_eq(cmd_buf, "simd")) {
+        // SSE2 helpers: correctness vs reference loops, FXSAVE round trip, copy throughput
+        struct smp_out o = { win_id };
+        simd_selftest(smp_out_line, &o);
+    }
+    else if (str_eq(cmd_buf, "gfxcheck")) {
+        // framebuffer == backbuffer outside the cursor? (damage tracking self check)
+        int fx, fy;
+        int bad = graphics_verify(&fx, &fy);
+        serial_printf("[gfx] verify: %d mismatching pixels (first at %d,%d)\n", bad, fx, fy);
+        window_puts(win_id, bad ? "gfxcheck: MISMATCH (see serial)\n" : "gfxcheck: framebuffer matches\n");
+    }
+    else if (str_eq(cmd_buf, "prof")) {
+        // "prof on|off": per-second cycle profile of the desktop loop on the serial log
+        prof_on = str_eq(args, "on");
+        window_puts(win_id, prof_on ? "profiler on (serial [prof] lines)\n" : "profiler off\n");
+    }
     else if (str_eq(cmd_buf, "smp")) {
         // "smp" lists the CPUs; "smp test" runs the job-system self test.
         struct smp_out o = { win_id };
@@ -1327,14 +1347,7 @@ void kernel_main(uint32_t mboot_phys) {
     // x87 FPU for ojs (okai page scripts): CR0.EM=0 (no emulation trap),
     // MP=1, NE=1 (native error reporting; every exception stays masked),
     // TS=0. Preemptive switches FNSAVE/FRSTOR per thread (process.c).
-    {
-        uint32_t cr0;
-        __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-        cr0 &= ~(0x4u | 0x8u);   // EM, TS
-        cr0 |= 0x2u | 0x20u;     // MP, NE
-        __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
-        __asm__ volatile("fninit");
-    }
+    fpu_init_cpu();   // also CR4.OSFXSR/OSXMMEXCPT when the CPU has SSE2 (see fpu.c)
     memory_init(mboot_phys);
 
     // mboot_info.framebuffer_addr is the uint64 at offset 88 (NOT 44: count
@@ -1586,7 +1599,7 @@ void kernel_main(uint32_t mboot_phys) {
     static uint64_t halted_cyc = 0, busy_t0 = 0;
     while (1) {
         main_loops++;
-        keys_dispatch();
+        { PROF_BEGIN(PZ_KEYS); keys_dispatch(); PROF_END(PZ_KEYS); }
         // Ring-3 entry drain: the shell (and fork) stage pid+eip+esp+window
         // into the entry run queue; here is plain ring-0 thread context, so
         // prepare (CR3+ESP0) + IRET below is safe. sys_exit resumes right
@@ -2291,7 +2304,7 @@ void kernel_main(uint32_t mboot_phys) {
         // Drive okai: main-document + sub-resource fetches over the single
         // global connection (okai_fetch_owner), coalesced page renders, and
         // the fetch-pill erase. See okai_poll().
-        okai_poll();
+        { PROF_BEGIN(PZ_OKAI); okai_poll(); PROF_END(PZ_OKAI); }
 
 
         // ---- Window drag: blit, don't re-render ----
@@ -2434,6 +2447,7 @@ void kernel_main(uint32_t mboot_phys) {
         // overlay never bleeds over a covering window, and that covering window
         // does NOT need a forced full repaint every frame (which tanked FPS when
         // a window sat over okai).
+        PROF_BEGIN(PZ_WINDOWS);
         {
             int vis[MAX_WINDOWS], nv = 0;
             for (int i = 0; i < MAX_WINDOWS; i++) {
@@ -2515,6 +2529,7 @@ void kernel_main(uint32_t mboot_phys) {
                 }
             }
         }
+        PROF_END(PZ_WINDOWS);
         // FPS: frames actually presented per second (serial is ground truth).
         if (tick_count - last_fps_tick >= 100) {
             fps = frame_count;
@@ -2529,13 +2544,14 @@ void kernel_main(uint32_t mboot_phys) {
             if (ht_k > sp_k) ht_k = sp_k;
             unsigned busy = sp_k ? 100 - ht_k * 100 / sp_k : 100;
             serial_printf("[fps] %u loops=%u busy=%u%%\n", fps, main_loops, busy); // 1Hz, headless perf ground truth
+            prof_report();
             main_loops = 0; halted_cyc = 0; busy_t0 = now;
         }
         // Taskbar (window buttons, FPS chip, clock): state-gated — taskbar.c
         // re-renders its cached strip only when its signature changes (window
         // set/focus/titles, hover, fps, clock minute) and blits it then.
         // Drawn before the cursor so the sprite sits on top.
-        taskbar_update(fps);
+        { PROF_BEGIN(PZ_TASKBAR); taskbar_update(fps); PROF_END(PZ_TASKBAR); }
 
         // The cursor is not drawn here: it lives on the framebuffer only and
         // is moved by the mouse IRQ (cursor.c); graphics_flush re-blends it
@@ -2545,7 +2561,7 @@ void kernel_main(uint32_t mboot_phys) {
         // movement), not main-loop spins.
         if (composed || cursor_moved) frame_count++;
 
-        graphics_flush();
+        { PROF_BEGIN(PZ_FLUSH); graphics_flush(); PROF_END(PZ_FLUSH); }
         static int cursor_live = 0;
         if (!cursor_live) { cursor_enable(); cursor_live = 1; }
 
@@ -2566,6 +2582,7 @@ void kernel_main(uint32_t mboot_phys) {
             if (key_head == key_tail) __asm__ volatile("sti; hlt" ::: "memory");
             else __asm__ volatile("sti" ::: "memory");
             halted_cyc += rdtsc_now() - h0;
+            if (prof_on) { prof_cyc[PZ_HALT] += rdtsc_now() - h0; prof_cnt[PZ_HALT]++; }
         }
     }
 }

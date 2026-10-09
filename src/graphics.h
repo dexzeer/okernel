@@ -105,6 +105,13 @@ uint32_t* graphics_get_buffer(void);
 
 // Mark a row as dirty for optimized flushing
 void graphics_mark_dirty(int y);
+// Debug self check: flush, then count pixels where the framebuffer differs from
+// the backbuffer outside the cursor sprite (0 = the damage tracking lost nothing).
+// *fx/*fy get the first mismatch (or -1).
+int graphics_verify(int* fx, int* fy);
+// Mark a rectangle (screen px) as changed. Every drawing primitive marks its own
+// damage; code that writes graphics_get_buffer() directly must call one of these.
+void graphics_mark_rect(int x, int y, int w, int h);
 
 // Clip rectangle
 void graphics_set_clip(int x, int y, int w, int h);

@@ -53,7 +53,7 @@ for label, n, x2 in configs:
         vm.type_string("smp test\n", delay=0.03)
         done = vm.wait_for(r"smp selftest: (ALL OK|FAILED)", timeout=120)
         log = vm.serial()
-        res = re.findall(r"\[smp\] ([ABCDE] [^\n]*)", log)
+        res = re.findall(r"\[smp\] ([ABCDEF] [^\n]*)", log)
         for r in res:
             print("    " + r.strip())
         passed = "smp selftest: ALL OK" in log

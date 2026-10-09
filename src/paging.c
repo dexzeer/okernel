@@ -39,6 +39,21 @@ static void map_4mb_high(uint32_t phys_base) {
     map_4mb_at(phys_base, PD_KERNEL_BASE + ((phys_base >> 22) & 0x3F), 0x03);
 }
 
+// Page attribute table: entries 0-7 are indexed by (PAT<<2 | PCD<<1 | PWT).
+// Power-on default is WB, WT, UC-, UC, WB, WT, UC-, UC; entry 1 (PWT alone,
+// otherwise write-through, which the kernel never asks for) becomes WC.
+// Every CPU must run with the same PAT, so APs call this too.
+static int pat_ok;
+int pat_init(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    if (!((d >> 16) & 1)) return 0;
+    wrmsr(0x277, 0x0007040600070106ULL);
+    pat_ok = 1;
+    return 1;
+}
+int pat_enabled(void) { return pat_ok; }
+
 void paging_init(uint32_t framebuffer_addr) {
     for (int i = 0; i < 1024; i++) page_directory[i] = 0;
 
@@ -82,11 +97,17 @@ void paging_init(uint32_t framebuffer_addr) {
     // Map framebuffer (typically 0xFD000000, ~8.3MB for 1920x1080x32).
     // Identity PD index (phys>>22): FB stays at its phys address, supervisor.
     if (framebuffer_addr) {
+        // Write-combining (PAT entry 1 = PWT) when the CPU has a PAT. On real
+        // hardware the video aperture lives in the PCI hole, which firmware
+        // leaves uncached: a write-back mapping then crawls (a full 1080p
+        // frame takes seconds), and combined writes are what the aperture is
+        // built for. PAT=WC overrides an MTRR of UC.
+        uint32_t fbf = pat_init() ? 0x0B : 0x03;
         uint32_t fb_base = framebuffer_addr & 0xFFC00000;
         for (int i = 0; i < 3; i++) {
             uint32_t base = fb_base + i * 0x00400000;
             if (!(page_directory[base >> 22] & 0x01))
-                map_4mb_at(base, base >> 22, 0x03);
+                map_4mb_at(base, base >> 22, fbf);
         }
     }
 

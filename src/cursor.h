@@ -10,6 +10,10 @@ void cursor_enable(void);            // show the sprite (after the first full fl
 // [y0, y1). Caller has interrupts disabled.
 void cursor_fb_repair(int y0, int y1);
 
+// Bounding box of the sprite currently on the framebuffer ([x0,x1) x [y0,y1));
+// 0 when it is not shown. Used by the display self check.
+int  cursor_rect(int* x0, int* y0, int* x1, int* y1);
+
 void mouse_get_position(int* x, int* y);
 int  mouse_get_x(void);
 int  mouse_get_y(void);

@@ -181,6 +181,13 @@ static void move_sprite(int hx, int hy) {
     fb_draw(cur_x, cur_y, 0, SCREEN_H);
 }
 
+int cursor_rect(int* x0, int* y0, int* x1, int* y1) {
+    if (!cur_on) return 0;
+    *x0 = cur_x + spr_x0; *x1 = cur_x + spr_x1;
+    *y0 = cur_y + spr_y0; *y1 = cur_y + spr_y1;
+    return 1;
+}
+
 void cursor_fb_repair(int y0, int y1) {
     if (!cur_on) return;
     if (cur_y + spr_y1 <= y0 || cur_y + spr_y0 >= y1) return;

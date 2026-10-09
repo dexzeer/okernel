@@ -1,3 +1,4 @@
+#include "fpu.h"
 #include "process.h"
 #include "sched.h"
 #include "memory.h"
@@ -532,7 +533,7 @@ void process_switch_to(uint32_t pid) {
         // thread context carry the story).
         // Outgoing x87 state into its PCB (FNSAVE also re-inits the FPU,
         // so a first-run thread sees a clean unit).
-        __asm__ volatile("fnsave %0" : "=m"(pv->fpu_state) :: "memory");
+        fpu_save(fpu_has_fxsave() ? (void*)pv->fx_state : (void*)pv->fpu_state);
         pv->fpu_valid = 1;
         context_switch(&pv->esp, nx->esp, next_cr3);
     switch_resume:
@@ -541,10 +542,10 @@ void process_switch_to(uint32_t pid) {
         {
             struct process *me = &processes[current_slot];
             if (me->fpu_valid) {
-                __asm__ volatile("frstor %0" :: "m"(me->fpu_state) : "memory");
+                fpu_restore(fpu_has_fxsave() ? (const void*)me->fx_state : (const void*)me->fpu_state);
                 me->fpu_valid = 0;
             } else {
-                __asm__ volatile("fninit" ::: "memory");
+                fpu_reset();
             }
         }
         // Woken thread lands here (same code path both directions):

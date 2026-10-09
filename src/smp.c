@@ -1,11 +1,13 @@
 #include "smp.h"
 #include "lapic.h"
+#include "fpu.h"
 #include "gdt.h"
 #include "idt.h"
 #include "io.h"
 #include "memlayout.h"
 #include "memory.h"
 #include "paging.h"
+#include "simd.h"
 #include "serial.h"
 #include "spinlock.h"
 #include <stdarg.h>
@@ -165,12 +167,8 @@ void smp_ap_entry(void) __attribute__((noreturn));
 void smp_ap_entry(void) {
     gdt_load_ap();
     idt_load_ap();
-    uint32_t cr0;                       // x87 as on the boot CPU: EM=0, MP, NE, TS=0
-    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-    cr0 &= ~(0x4u | 0x8u);
-    cr0 |= 0x2u | 0x20u;
-    __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
-    __asm__ volatile("fninit");
+    pat_init();                         // same page attribute table as the boot CPU
+    fpu_init_cpu();                     // x87 + SSE as on the boot CPU
     lapic_init(0);
     int idx = start_idx;
     cpus[idx].apic_id = lapic_id();
@@ -341,6 +339,21 @@ static void t_heap_fn(void* c, uint32_t i, uint32_t cpu) {
     kfree(p);
 }
 
+// SSE2 on every CPU: each item copies and fills a block through the XMM helpers
+// and verifies it (an AP without CR4.OSFXSR would take #UD and park).
+struct t_sse { uint8_t* src; uint8_t* dst; volatile uint32_t bad; };
+#define T_SSE_BLK 65536u
+static void t_sse_fn(void* c, uint32_t i, uint32_t cpu) {
+    struct t_sse* t = (struct t_sse*)c;
+    (void)cpu;
+    uint8_t* s = t->src + i * T_SSE_BLK;
+    uint8_t* d = t->dst + i * T_SSE_BLK;
+    simd_copy_stream(d, s, T_SSE_BLK - (i & 7));            // odd sizes too
+    for (uint32_t k = 0; k < T_SSE_BLK - (i & 7); k++) if (d[k] != s[k]) { __sync_fetch_and_add(&t->bad, 1); break; }
+    simd_fill32((uint32_t*)d, 0xA5A5A5A5u ^ i, T_SSE_BLK / 4);
+    for (uint32_t k = 0; k < T_SSE_BLK / 4; k++) if (((uint32_t*)d)[k] != (0xA5A5A5A5u ^ i)) { __sync_fetch_and_add(&t->bad, 1); break; }
+}
+
 static void t_nest_inner(void* c, uint32_t i, uint32_t cpu) { (void)c; (void)i; (void)cpu; __sync_fetch_and_add(&t_counter, 1); }
 static void t_nest_outer(void* c, uint32_t i, uint32_t cpu) {
     (void)c; (void)i; (void)cpu;
@@ -404,6 +417,20 @@ int smp_selftest(void (*out)(const char*, void*), void* ud) {
         kfmt(b, sizeof b, "D nested calls: %s (%u of 512)", t_counter == 512 ? "ok" : "FAIL", t_counter);
         out(b, ud);
         if (t_counter != 512) fails++;
+    }
+    // F: SSE2 on the other CPUs
+    {
+        const uint32_t N = 64;
+        struct t_sse t = { (uint8_t*)kmalloc(N * T_SSE_BLK), (uint8_t*)kmalloc(N * T_SSE_BLK), 0 };
+        if (t.src && t.dst) {
+            for (uint32_t k = 0; k < N * T_SSE_BLK; k++) t.src[k] = (uint8_t)(hash32(k) >> 8);
+            smp_parallel_for(t_sse_fn, &t, N, 1);
+            kfmt(b, sizeof b, "F sse2 on every cpu: %s (bad %u)", t.bad == 0 ? "ok" : "FAIL", t.bad);
+            out(b, ud);
+            if (t.bad) fails++;
+        }
+        if (t.src) kfree(t.src);
+        if (t.dst) kfree(t.dst);
     }
     // E: speed
     {
