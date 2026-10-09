@@ -20,6 +20,7 @@
 // and swallowed slow moves — |d| < 4 averaged to 0).
 #include "cursor.h"
 #include "graphics.h"
+#include "display.h"
 #include "ui_draw.h"
 #include "idt.h"
 #include "io.h"
@@ -47,7 +48,9 @@ static uint32_t spr_premul[SPR_W * SPR_H];   // premultiplied 0x00RRGGBB
 static uint8_t spr_alpha[SPR_W * SPR_H];
 static int spr_x0, spr_x1, spr_y0, spr_y1;   // tight bounds of alpha > 0
 
-static volatile int cur_on;                  // sprite live on the framebuffer
+static volatile int cur_on;                  // sprite live on the framebuffer (or hardware cursor shown)
+static const struct display_ops* hw;          // display backend with a hardware cursor, else NULL
+static int hw_cursor;                         // that cursor is defined and shown
 static int cur_x = -1000, cur_y = -1000;     // sprite top-left currently drawn
 
 // Arrow outline (px, tip at the origin), macOS-like proportions.
@@ -174,6 +177,7 @@ static void fb_draw(int sx, int sy, int ry0, int ry1) {
 }
 
 static void move_sprite(int hx, int hy) {
+    if (hw_cursor) { hw->cursor_move(hx, hy); return; }       // the GPU draws and moves it
     int nx = hx - HOT_X, ny = hy - HOT_Y;
     if (nx == cur_x && ny == cur_y) return;
     fb_restore(cur_x + spr_x0, cur_y + spr_y0, spr_x1 - spr_x0, spr_y1 - spr_y0);
@@ -182,14 +186,14 @@ static void move_sprite(int hx, int hy) {
 }
 
 int cursor_rect(int* x0, int* y0, int* x1, int* y1) {
-    if (!cur_on) return 0;
+    if (!cur_on || hw_cursor) return 0;
     *x0 = cur_x + spr_x0; *x1 = cur_x + spr_x1;
     *y0 = cur_y + spr_y0; *y1 = cur_y + spr_y1;
     return 1;
 }
 
 void cursor_fb_repair(int y0, int y1) {
-    if (!cur_on) return;
+    if (!cur_on || hw_cursor) return;
     if (cur_y + spr_y1 <= y0 || cur_y + spr_y0 >= y1) return;
     fb_draw(cur_x, cur_y, y0, y1);
 }
@@ -203,7 +207,41 @@ static void irq_restore(uint32_t f) {
     if (f & 0x200) __asm__ volatile("sti" ::: "memory");
 }
 
+void cursor_set_display(const struct display_ops* d) {
+    hw = (d && d->cursor_define && d->cursor_move && d->cursor_show) ? d : 0;
+}
+
+// Straight-alpha ARGB copy of the sprite for a hardware cursor.
+static int hw_cursor_init(void) {
+    static uint32_t argb[SPR_W * SPR_H];
+    for (int i = 0; i < SPR_W * SPR_H; i++) {
+        uint32_t a = spr_alpha[i], p = spr_premul[i], c = 0;
+        if (a) {
+            for (int sh = 0; sh < 24; sh += 8) {
+                uint32_t v = ((p >> sh) & 0xFF) * 255 / a;
+                c |= (v > 255 ? 255 : v) << sh;
+            }
+        }
+        argb[i] = (a << 24) | c;
+    }
+    if (hw->cursor_define(argb, SPR_W, SPR_H, HOT_X, HOT_Y) != 0) return 0;
+    return 1;
+}
+
 void cursor_enable(void) {
+    if (hw && !hw_cursor) {
+        uint32_t f = irq_save();
+        if (hw_cursor_init()) {
+            hw_cursor = 1;
+            cur_on = 1;
+            hw->cursor_show(1);
+            hw->cursor_move(mouse_x, mouse_y);
+        } else {
+            serial_puts("[cursor] hardware cursor setup failed: no pointer\n");
+        }
+        irq_restore(f);
+        return;
+    }
     uint32_t f = irq_save();
     if (!cur_on) {
         cur_on = 1;

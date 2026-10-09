@@ -6,6 +6,8 @@
 
 void mouse_init_fb(void);            // PS/2 init + sprite build + IRQ12
 void cursor_enable(void);            // show the sprite (after the first full flush)
+struct display_ops;
+void cursor_set_display(const struct display_ops* d);   // use its hardware cursor if it has one
 // graphics_flush() hook: redraw the sprite over freshly copied FB rows
 // [y0, y1). Caller has interrupts disabled.
 void cursor_fb_repair(int y0, int y1);

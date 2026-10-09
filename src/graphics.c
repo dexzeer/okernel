@@ -1,5 +1,6 @@
 #include "graphics.h"
 #include "simd.h"
+#include "display.h"
 #include "cursor.h"
 #include "memory.h"
 #include "memlayout.h"
@@ -18,6 +19,9 @@ static const uint32_t vga_palette[256] = {
     // Fill rest with greyscale for safety
     [16 ... 255] = 0x00808080,
 };
+
+// Active display backend (virtio-gpu / Intel GPU) or NULL = the GRUB framebuffer.
+static const struct display_ops* disp = 0;
 
 // Framebuffer and backbuffer
 static uint8_t* framebuffer = 0;
@@ -406,6 +410,13 @@ void graphics_init(uint32_t mboot_phys) {
 
     for (int i = 0; i < SCREEN_W * SCREEN_H; i++) backbuffer[i] = 0;
     mark_all();
+
+    // A GPU display backend replaces the framebuffer copy when one is present
+    // (virtio-gpu in a VM, the Intel integrated GPU on real hardware).
+    disp = vgpu_probe(backbuffer, SCREEN_W, SCREEN_H);
+    if (!disp) disp = i915_probe(backbuffer, SCREEN_W, SCREEN_H);
+    serial_printf("[gfx] display backend: %s\n", disp ? disp->name : "GRUB framebuffer");
+    cursor_set_display(disp);
 }
 
 void graphics_set_clip(int x, int y, int w, int h) {
@@ -958,47 +969,84 @@ void graphics_fill(uint32_t color) {
 uint8_t* graphics_fb_base(void) { return framebuffer; }
 int graphics_fb_pitch(void) { return (int)fb_pitch; }
 
-// Copy the damaged part of the backbuffer to the framebuffer. Runs of dirty rows
-// (at most FLUSH_CHUNK at a time, copied with interrupts off) go out as the union
-// of their dirty column spans; after each chunk the cursor (which lives only on
-// the framebuffer, cursor.c) is re-blended over the rows just copied. The mouse
-// IRQ moves the cursor between chunks, never inside one.
+// ---- presenting damage ---------------------------------------------------------
+
+const struct display_ops* graphics_display(void) { return disp; }
+
+// Software path: copy a rectangle of the backbuffer to the framebuffer in chunks
+// of at most FLUSH_CHUNK rows with interrupts off; after each chunk the software
+// cursor (which lives only on the framebuffer, cursor.c) is re-blended over the
+// rows just copied. The mouse IRQ moves it between chunks, never inside one.
 #define FLUSH_CHUNK 48
-void graphics_flush(void) {
-    if (!framebuffer || !backbuffer) return;
-    if (dirty_yhi <= dirty_ylo) return;                 // nothing to do: O(1)
-    int yend = dirty_yhi;
+static void fb_present(const struct display_rect* rects, int n) {
+    if (!framebuffer) return;
+    for (int i = 0; i < n; i++) {
+        int xa = rects[i].x, xb = rects[i].x + rects[i].w;
+        for (int y = rects[i].y; y < rects[i].y + rects[i].h; ) {
+            int y1 = y + FLUSH_CHUNK;
+            if (y1 > rects[i].y + rects[i].h) y1 = rects[i].y + rects[i].h;
+            uint32_t fl;
+            __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
+            if (xa == 0 && xb == SCREEN_W && fb_pitch == SCREEN_W * 4) {
+                simd_copy_stream(framebuffer + y * fb_pitch, backbuffer + y * SCREEN_W,
+                                 (unsigned)(y1 - y) * SCREEN_W * 4);
+            } else {
+                for (int r = y; r < y1; r++)
+                    simd_copy_stream(framebuffer + r * fb_pitch + xa * 4, backbuffer + r * SCREEN_W + xa,
+                                     (unsigned)(xb - xa) * 4);
+            }
+            cursor_fb_repair(y, y1);
+            if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
+            y = y1;
+        }
+    }
+}
+
+// Turn the per-row dirty spans into rectangles: each run of consecutive dirty
+// rows becomes one rectangle spanning the union of its rows' spans. Clears the
+// damage. More than MAXRECT runs collapse into one bounding box.
+#define MAXRECT 64
+static int collect_damage(struct display_rect* out) {
+    int n = 0, yend = dirty_yhi;
     for (int y = dirty_ylo; y < yend; y++) {
         if (dx0[y] >= dx1[y]) continue;
-        int xa = dx0[y], xb = dx1[y];
-        int y1 = y + 1;
-        while (y1 < yend && y1 - y < FLUSH_CHUNK && dx0[y1] < dx1[y1]) {
+        int xa = dx0[y], xb = dx1[y], y1 = y + 1;
+        while (y1 < yend && dx0[y1] < dx1[y1]) {
             if (dx0[y1] < xa) xa = dx0[y1];
             if (dx1[y1] > xb) xb = dx1[y1];
             y1++;
         }
-        uint32_t fl;
-        __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
-        if (xa == 0 && xb == SCREEN_W && fb_pitch == SCREEN_W * 4) {
-            simd_copy_stream(framebuffer + y * fb_pitch, backbuffer + y * SCREEN_W,
-                             (unsigned)(y1 - y) * SCREEN_W * 4);
-        } else {
-            for (int r = y; r < y1; r++)
-                simd_copy_stream(framebuffer + r * fb_pitch + xa * 4, backbuffer + r * SCREEN_W + xa,
-                                 (unsigned)(xb - xa) * 4);
-        }
         for (int r = y; r < y1; r++) { dx0[r] = SCREEN_W; dx1[r] = 0; }
-        cursor_fb_repair(y, y1);
-        if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
+        if (n == MAXRECT) {                              // out of slots: grow the last one
+            struct display_rect* l = &out[n - 1];
+            int lx1 = l->x + l->w > xb ? l->x + l->w : xb, ly1 = y1;
+            if (xa < l->x) l->x = xa;
+            l->w = lx1 - l->x; l->h = ly1 - l->y;
+        } else {
+            out[n].x = xa; out[n].y = y; out[n].w = xb - xa; out[n].h = y1 - y;
+            n++;
+        }
         y = y1 - 1;
     }
     dirty_ylo = SCREEN_H;
     dirty_yhi = 0;
+    return n;
+}
+
+void graphics_flush(void) {
+    if (!backbuffer) return;
+    if (dirty_yhi <= dirty_ylo) return;                 // nothing to do: O(1)
+    if (!disp && !framebuffer) return;
+    struct display_rect rects[MAXRECT];
+    int n = collect_damage(rects);
+    if (disp) disp->present(rects, n);
+    else fb_present(rects, n);
 }
 
 int graphics_verify(int* fx, int* fy) {
     if (fx) *fx = -1;
     if (fy) *fy = -1;
+    if (disp) { graphics_flush(); return 0; }           // no readable framebuffer: see graphics_block_hashes
     if (!framebuffer || !backbuffer) return 0;
     graphics_flush();
     int bad = 0;
@@ -1019,6 +1067,26 @@ int graphics_verify(int* fx, int* fy) {
         if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
     }
     return bad;
+}
+
+void graphics_row_hashes(int y, uint32_t* out) {
+    for (int c = 0; c < SCREEN_W / 64; c++) {
+        uint32_t hsh = 2166136261u;
+        const uint32_t* row = backbuffer + y * SCREEN_W + c * 64;
+        for (int x = 0; x < 64; x++) { hsh ^= row[x] & 0xFFFFFF; hsh *= 16777619u; }
+        out[c] = hsh;
+    }
+}
+
+void graphics_block_hashes(uint32_t* out) {
+    for (int b = 0; b < (SCREEN_H + 15) / 16; b++) {
+        uint32_t hsh = 2166136261u;
+        for (int y = b * 16; y < b * 16 + 16 && y < SCREEN_H; y++) {
+            const uint32_t* row = backbuffer + y * SCREEN_W;
+            for (int x = 0; x < SCREEN_W; x++) { hsh ^= row[x] & 0xFFFFFF; hsh *= 16777619u; }
+        }
+        out[b] = hsh;
+    }
 }
 
 void graphics_draw_bitmap(int x, int y, const uint8_t* bitmap, int bmp_w, int bmp_h, uint32_t fg, uint32_t bg, int scale) {

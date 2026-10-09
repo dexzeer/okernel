@@ -109,6 +109,14 @@ void graphics_mark_dirty(int y);
 // the backbuffer outside the cursor sprite (0 = the damage tracking lost nothing).
 // *fx/*fy get the first mismatch (or -1).
 int graphics_verify(int* fx, int* fy);
+// The display backend in use (NULL = the GRUB framebuffer).
+struct display_ops;
+const struct display_ops* graphics_display(void);
+// FNV-1a hash of each 16-row band of the backbuffer (68 values), for comparing
+// against what the host shows (screendump) when the screen is not readable.
+void graphics_block_hashes(uint32_t* out);
+// Hash of each 64-pixel column chunk of one row (30 values), to locate a difference.
+void graphics_row_hashes(int y, uint32_t* out);
 // Mark a rectangle (screen px) as changed. Every drawing primitive marks its own
 // damage; code that writes graphics_get_buffer() directly must call one of these.
 void graphics_mark_rect(int x, int y, int w, int h);

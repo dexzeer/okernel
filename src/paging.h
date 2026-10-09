@@ -16,6 +16,11 @@ int pat_enabled(void);
 // virtual address, never phys)
 void* paging_map(uint32_t phys_addr);
 
+// Uncached mapping of device registers (len bytes at phys), contiguous in
+// virtual memory. Boot-time only: process page directories copy the kernel half
+// when they are created.
+void* paging_map_mmio(uint32_t phys_addr, uint32_t len);
+
 // Low 0-1M DMA/VGA window: identity supervisor, virt == phys
 void* paging_map_low(uint32_t phys_addr);
 
