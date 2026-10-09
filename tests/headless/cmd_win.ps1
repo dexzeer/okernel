@@ -7,6 +7,7 @@ param(
     [string[]]$Cmd = @("smp test"),
     [string]$Until = "selftest: (ALL OK|FAILED)",
     [string]$Accel = "whpx",
+    [string]$Vga = "std",
     [int]$Cpus = 1,
     [string]$Cpu = "max",
     [int]$Timeout = 120,
@@ -23,7 +24,7 @@ New-Item -ItemType Directory -Force $out | Out-Null
 $log = Join-Path $out ("cmd_{0}_{1}.log" -f $Accel, $Port)
 Remove-Item $log -ErrorAction SilentlyContinue
 
-$qargs = @("-accel", $Accel, "-m", "512", "-smp", "$Cpus", "-cpu", $Cpu, "-cdrom", $iso, "-boot", "d", "-vga", "std",
+$qargs = @("-accel", $Accel, "-m", "512", "-smp", "$Cpus", "-cpu", $Cpu, "-cdrom", $iso, "-boot", "d", "-vga", $Vga,
           "-device", "e1000,netdev=net0", "-netdev", "user,id=net0",
           "-serial", "file:$log", "-display", "none", "-no-reboot",
           "-monitor", "tcp:127.0.0.1:$Port,server,nowait")

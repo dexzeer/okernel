@@ -37,6 +37,7 @@
 #include "smp.h"
 #include "prof.h"
 #include "fpu.h"
+#include "cursor.h"
 #include "simd.h"
 
 struct mboot_info {
@@ -597,6 +598,26 @@ static void shell_execute_run(int win_id, const char *rest) {
 
 static void shell_execute(int win_id, const char* input);
 
+static volatile int gfxsum_pending, gfxsum_y0, gfxsum_y1;
+static void gfxsum_report(void) {
+    static uint32_t hs[72];
+    graphics_block_hashes(hs);
+    int cx0 = 0, cy0 = 0, cx1 = 0, cy1 = 0;
+    int cr = cursor_rect(&cx0, &cy0, &cx1, &cy1);
+    serial_printf("[gfx] sum backend=%s cursor=%d,%d,%d,%d\n", graphics_display() ? "gpu" : "fb",
+                  cr ? cx0 : 0, cr ? cy0 : 0, cr ? cx1 : 0, cr ? cy1 : 0);
+    for (int b = 0; b < 68; b++) serial_printf("[gfx] blk %d %x\n", b, hs[b]);
+    int y1 = gfxsum_y1 > SCREEN_H ? SCREEN_H : gfxsum_y1;
+    for (int y = gfxsum_y0; y < y1; y++) {
+        uint32_t rh[30];
+        graphics_row_hashes(y, rh);
+        serial_printf("[gfx] row %d", y);
+        for (int c = 0; c < 30; c++) serial_printf(" %x", rh[c]);
+        serial_puts("\n");
+    }
+    serial_puts("[gfx] sum done\n");
+}
+
 // smp output: one line to the terminal and to the serial log.
 struct smp_out { int win; };
 static void smp_out_line(const char* line, void* ud) {
@@ -926,6 +947,20 @@ static void shell_execute(int win_id, const char* input) {
         int bad = graphics_verify(&fx, &fy);
         serial_printf("[gfx] verify: %d mismatching pixels (first at %d,%d)\n", bad, fx, fy);
         window_puts(win_id, bad ? "gfxcheck: MISMATCH (see serial)\n" : "gfxcheck: framebuffer matches\n");
+    }
+    else if (str_eq(cmd_buf, "gfxsum")) {
+        // Hash every 16-row band of the backbuffer (and, for "gfxsum Y0 Y1", the
+        // column chunks of those rows) to compare against a host screendump. Done
+        // by the main loop after the next flush so the command's own output and
+        // the new prompt are part of what is hashed.
+        gfxsum_pending = 1;
+        gfxsum_y0 = gfxsum_y1 = 0;
+        if (args[0] >= '0' && args[0] <= '9') {
+            int i = 0;
+            while (args[i] >= '0' && args[i] <= '9') gfxsum_y0 = gfxsum_y0 * 10 + (args[i++] - '0');
+            while (args[i] == ' ') i++;
+            while (args[i] >= '0' && args[i] <= '9') gfxsum_y1 = gfxsum_y1 * 10 + (args[i++] - '0');
+        }
     }
     else if (str_eq(cmd_buf, "prof")) {
         // "prof on|off": per-second cycle profile of the desktop loop on the serial log
@@ -2562,6 +2597,7 @@ void kernel_main(uint32_t mboot_phys) {
         if (composed || cursor_moved) frame_count++;
 
         { PROF_BEGIN(PZ_FLUSH); graphics_flush(); PROF_END(PZ_FLUSH); }
+        if (gfxsum_pending) { gfxsum_pending = 0; gfxsum_report(); }
         static int cursor_live = 0;
         if (!cursor_live) { cursor_enable(); cursor_live = 1; }
 

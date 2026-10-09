@@ -7,6 +7,7 @@
 #   powershell -ExecutionPolicy Bypass -File tests\headless\prof_win.ps1 [-Url ...] [-Cpus 1] [-Iso path]
 param(
     [string]$Accel = "whpx",
+    [string]$Vga = "std",
     [string]$Url = "https://en.wikipedia.org/wiki/Operating_system",
     [int]$Cpus = 1,
     [int]$ScrollKeys = 60,
@@ -22,7 +23,7 @@ New-Item -ItemType Directory -Force $out | Out-Null
 $log = Join-Path $out ("prof_{0}_{1}.log" -f $Accel, $Port)
 Remove-Item $log -ErrorAction SilentlyContinue
 
-$qargs = @("-accel", $Accel, "-m", "512", "-smp", "$Cpus", "-cdrom", $iso, "-boot", "d", "-vga", "std",
+$qargs = @("-accel", $Accel, "-m", "512", "-smp", "$Cpus", "-cdrom", $iso, "-boot", "d", "-vga", $Vga,
           "-device", "e1000,netdev=net0", "-netdev", "user,id=net0",
           "-serial", "file:$log", "-display", "none", "-no-reboot",
           "-monitor", "tcp:127.0.0.1:$Port,server,nowait")

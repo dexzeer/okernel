@@ -138,28 +138,44 @@ void paging_init(uint32_t framebuffer_addr) {
                   V2P((uint32_t)page_directory), 0u);
 }
 
-// Map a 4MB phys region into the kernel high MMIO window (0xC8000000+) and
-// return its HIGH virtual address. Never returns phys.
+// Kernel MMIO windows (0xF8000000+, 16 x 4MB): the pool paging_map and
+// paging_map_mmio draw from. Windows must be created before the first process
+// (page directories copy the kernel half at creation), i.e. during boot.
 #define MMIO_VBASE MMIO_VBASE_HI
+#define MMIO_WINDOWS 16
 static uint32_t mmio_next = MMIO_VBASE;
+static struct { uint32_t base; uint32_t flags; } mmio_win[MMIO_WINDOWS];
 
-void* paging_map(uint32_t phys_addr) {
+static void* map_windows(uint32_t phys_addr, uint32_t len, uint32_t flags) {
     uint32_t base = phys_addr & 0xFFC00000;
     uint32_t off = phys_addr & 0x003FFFFF;
-    // Reuse an existing window for this base if present
-    for (uint32_t v = MMIO_VBASE; v < mmio_next; v += 0x00400000) {
-        uint32_t pd = v >> 22;
-        uint32_t* pt = (uint32_t*)P2V_U32(page_directory[pd] & 0xFFFFF000);
-        if ((pt[0] & 0xFFC00000) == base)
-            return (void*)(v + off);
+    uint32_t n = (off + len + 0x003FFFFF) >> 22;
+    if (n == 0) n = 1;
+    if (n == 1) {                       // reuse an existing window of the same kind
+        for (uint32_t v = MMIO_VBASE, i = 0; v < mmio_next; v += 0x00400000, i++)
+            if (mmio_win[i].base == base && mmio_win[i].flags == flags)
+                return (void*)(v + off);
     }
-    if (mmio_next + 0x00400000 > MMIO_VBASE + 16 * 0x00400000) return 0;
+    if (mmio_next + n * 0x00400000 > MMIO_VBASE + MMIO_WINDOWS * 0x00400000) return 0;
     uint32_t vbase = mmio_next;
-    map_4mb_at(base, vbase >> 22, 0x03);
-    mmio_next += 0x00400000;
+    for (uint32_t k = 0; k < n; k++) {
+        map_4mb_at(base + k * 0x00400000, (vbase >> 22) + k, flags);
+        mmio_win[((vbase - MMIO_VBASE) >> 22) + k].base = base + k * 0x00400000;
+        mmio_win[((vbase - MMIO_VBASE) >> 22) + k].flags = flags;
+        if (!(page_directory[(vbase >> 22) + k] & 0x01)) return 0;      // out of page tables
+    }
+    mmio_next += n * 0x00400000;
     __asm__ volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax", "memory");
     return (void*)(vbase + off);
 }
+
+// Cached mapping of one 4MB phys region (RAM-like: ACPI tables). Returns a HIGH
+// virtual address, never phys.
+void* paging_map(uint32_t phys_addr) { return map_windows(phys_addr, 1, 0x03); }
+
+// Uncached (PCD|PWT) mapping of `len` bytes of device registers at phys_addr,
+// contiguous in virtual memory. Returns 0 when the pool is exhausted.
+void* paging_map_mmio(uint32_t phys_addr, uint32_t len) { return map_windows(phys_addr, len, 0x1B); }
 
 // Map the low 0-1M DMA/VGA window's virtual address for a phys < 1M.
 // Identity supervisor: virt == phys, valid after paging_init.
