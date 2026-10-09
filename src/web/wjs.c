@@ -30,7 +30,6 @@ void wjs_selq_forget(struct wdom* d);
 
 #define SCRIPT_BUDGET_MS 4000   // one script evaluation (the whole OS waits: keep it short)
 #define TASK_BUDGET_MS   1000   // one timer / event / callback
-#define REALM_MEM_LIMIT  (96u << 20)
 #define REALM_STACK_MAX  (900u << 10)
 #define MAX_SCRIPTS      256
 #define MAX_MODULES      512
@@ -125,7 +124,7 @@ static void prof_sample(ojs* J) {
     for (char* p = w; *p; p++) h = h * 33 + (unsigned char)*p;
     for (unsigned k = 0; k < PROF_N; k++) {
         unsigned i = (h + k) % PROF_N;
-        if (!prof[i].n) { strcpy(prof[i].where, w); prof[i].n = 1; break; }
+        if (!prof[i].n) { memcpy(prof[i].where, w, strlen(w) + 1); prof[i].n = 1; break; }
         if (!strcmp(prof[i].where, w)) { prof[i].n++; break; }
     }
     if (++prof_total == 1) atexit(prof_dump);
@@ -1131,6 +1130,10 @@ static void run_script(struct wjs* js, int idx) {
         free_text(&js->sc[idx]);
     }
     wjs_drain_jobs(js);
+#if !(defined(KERNEL) && KERNEL)
+    if (getenv("OJS_SCRIPTTIME"))   // host diagnostics: time per script (+ its microtasks)
+        fprintf(stderr, "[time] %6ums %.150s\n", (unsigned)(wjs_now() - (js->deadline - SCRIPT_BUDGET_MS)), fname);
+#endif
     js->deadline = 0;
     js->flags |= WJS_DIRTY;
     if (js->sc[idx].url) fire_script_event(js, node, 1);
@@ -1282,7 +1285,8 @@ struct wjs* wjs_new(struct wdoc* doc) {
     ojs* ctx = js->J;
     ojs_enter(ctx);
     ojs_set_opaque(ctx, js);
-    ojs_set_memory_limit(ctx, REALM_MEM_LIMIT);
+    ojs_set_memory_limit(ctx, wjs_sys_realm_limit());
+    ojs_set_memory_guard(ctx, wjs_sys_mem_ok, 0);
     ojs_set_stack_size(ctx, REALM_STACK_MAX);
     ojs_set_interrupt_handler(ctx, interrupt_cb, js);
     ojs_set_rejection_tracker(ctx, rejection_cb, js);

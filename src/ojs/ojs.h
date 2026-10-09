@@ -33,6 +33,9 @@ typedef uint64_t ojsv;
 ojs*  ojs_new(void);
 void  ojs_free(ojs* J);
 void  ojs_set_memory_limit(ojs* J, size_t bytes);
+// called before the realm takes more memory from the system (heap chunks,
+// large objects, ArrayBuffer storage); returning 0 refuses it (collect, then OOM)
+void  ojs_set_memory_guard(ojs* J, int (*guard)(size_t bytes, void* ud), void* ud);
 void  ojs_set_stack_size(ojs* J, size_t bytes);       // C stack the engine may use per entry
 // ojs_enter marks the C stack top for this entry: the frame of the
 // calling function, so values in its locals are scanned by the collector

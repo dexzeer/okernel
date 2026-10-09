@@ -37,7 +37,11 @@ Things to know
 * Inline caches (struct ic, per property/global site) are made on first use
   and dropped by every collection, so they never point at freed objects.
 * The realm memory limit (ojs_set_memory_limit) counts memory taken from the
-  system; an allocation that would pass it collects first.
+  system, ArrayBuffer storage included (gc_ext_alloc); an allocation that
+  would pass it collects first. ojs_set_memory_guard lets the embedder veto
+  growth (the kernel keeps a reserve free for itself).
+* A function can have more than 65536 constants (a big bundle's wrapper):
+  CONST has a u16 index and CONST_W a u32 one; all other const operands are u32.
 * Templates keep their script's source (toString, stack traces). A big script
   that needed UTF-16 is re-stored as UTF-8 after compiling (srctext.c), so it
   costs about its UTF-8 size, not twice that.

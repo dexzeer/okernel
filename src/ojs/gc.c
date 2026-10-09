@@ -85,7 +85,10 @@ static inline void page_set_owned(struct gc_heap* H, uintptr_t addr, int on) {
 
 // the realm's memory limit applies to what is taken from the system: free slots
 // and spare pages are always reusable
-static int over_limit(ojs* J, size_t bytes) { return J->mem_limit && J->heap_bytes + bytes > J->mem_limit; }
+static int over_limit(ojs* J, size_t bytes) {
+    if (J->mem_limit && J->heap_bytes + J->ext_bytes + bytes > J->mem_limit) return 1;
+    return J->mem_guard && !J->mem_guard(bytes, J->mem_guard_ud);
+}
 
 static struct page* page_new(ojs* J, int cls) {
     struct gc_heap* H = J->heap;
@@ -215,6 +218,28 @@ size_t gc_size_of(ojs* J, const void* p) {
     if (page_owned(H, (uintptr_t)p)) return gc_size(p);
     int i = large_find(H, (uintptr_t)p);
     return i >= 0 ? H->large[i].size : 0;
+}
+
+// ArrayBuffer storage lives outside the GC heap but counts against the limit,
+// and drives collections like any allocation (dead buffers are only freed by one)
+void* gc_ext_alloc(ojs* J, size_t n) {
+    if (!n) n = 1;
+    J->bytes_since_gc += n;
+    for (int tries = 0;; tries++) {
+        if (!over_limit(J, n)) {
+            void* p = ojs_sys_malloc(n);
+            if (p) { J->ext_bytes += n; memset(p, 0, n); return p; }
+        }
+        if (tries || J->gc_disabled || J->in_gc || !J->stack_top) return 0;
+        gc_collect(J);
+    }
+}
+
+void gc_ext_free(ojs* J, void* p, size_t n) {
+    if (!p) return;
+    if (!n) n = 1;
+    ojs_sys_free(p);
+    J->ext_bytes = J->ext_bytes >= n ? J->ext_bytes - n : 0;
 }
 
 void* gc_alloc(ojs* J, int type, size_t size) {

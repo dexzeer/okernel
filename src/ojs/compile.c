@@ -69,6 +69,7 @@ struct cfunc {
     struct funcinfo* fi;
     uint8_t* code; uint32_t len, cap;
     jv* consts; uint32_t nconsts, capconsts;
+    uint32_t* chash; uint32_t chcap;   // const index -> slot+1, once a function has many
     int nlocals, maxlocals;
     int sp, maxsp;
     struct cupv* upv; int nupv, capupv;
@@ -140,7 +141,8 @@ static void op(struct cfunc* c, int o, int d) {
 static void op8(struct cfunc* c, int o, uint32_t a, int d) { op(c, o, d); put8(c, a); }
 static void op16(struct cfunc* c, int o, uint32_t a, int d) { op(c, o, d); put16(c, a); }
 static void op32(struct cfunc* c, int o, uint32_t a, int d) { op(c, o, d); put32(c, a); }
-static void op16_16(struct cfunc* c, int o, uint32_t a, uint32_t b, int d) { op(c, o, d); put16(c, a); put16(c, b); }
+static void op16_32(struct cfunc* c, int o, uint32_t a, uint32_t b, int d) { op(c, o, d); put16(c, a); put32(c, b); }
+static void op32_32(struct cfunc* c, int o, uint32_t a, uint32_t b, int d) { op(c, o, d); put32(c, a); put32(c, b); }
 
 static uint32_t here(struct cfunc* c) { c->barrier = c->len; return c->len; }
 
@@ -184,11 +186,41 @@ static void patch_list(struct cfunc* c, struct patch* l, uint32_t target) {
 
 // ---------------------------------------------------------------- constants
 
-static uint32_t add_const(struct cfunc* c, jv v) {
+// constants are shared: the same atom or number (by its double bits) once per function
+static int const_same(jv x, jv v) {
+    if (!jv_is_num(v)) return x == v;
+    return jv_is_num(x) && jv_from_dbl_raw(jv_dbl(v)) == jv_from_dbl_raw(jv_dbl(x));
+}
+
+static uint32_t const_hash(jv v) {
+    uint64_t k = jv_is_num(v) ? (uint64_t)jv_from_dbl_raw(jv_dbl(v)) : (uint64_t)v;
+    return ((uint32_t)k ^ (uint32_t)(k >> 32) ^ (uint32_t)(k >> 47)) * 2654435761u;
+}
+
+// the index is made when a function passes 16 constants (a bundle's wrapper
+// function has tens of thousands: a linear search made compiling quadratic)
+static int const_index(struct cfunc* c, uint32_t cap) {
+    uint32_t* h = (uint32_t*)ojs_sys_malloc((size_t)cap * sizeof(uint32_t));
+    if (!h) return 0;
+    memset(h, 0, (size_t)cap * sizeof(uint32_t));
     for (uint32_t i = 0; i < c->nconsts; i++) {
-        jv x = c->consts[i];
-        if (x == v && !jv_is_num(v)) return i;
-        if (jv_is_num(v) && jv_is_num(x) && jv_from_dbl_raw(jv_dbl(v)) == jv_from_dbl_raw(jv_dbl(x))) return i;
+        uint32_t j = const_hash(c->consts[i]) & (cap - 1);
+        while (h[j]) j = (j + 1) & (cap - 1);
+        h[j] = i + 1;
+    }
+    ojs_sys_free(c->chash);
+    c->chash = h;
+    c->chcap = cap;
+    return 1;
+}
+
+static uint32_t add_const(struct cfunc* c, jv v) {
+    if (c->chash) {
+        for (uint32_t j = const_hash(v) & (c->chcap - 1); c->chash[j]; j = (j + 1) & (c->chcap - 1))
+            if (const_same(c->consts[c->chash[j] - 1], v)) return c->chash[j] - 1;
+    } else {
+        for (uint32_t i = 0; i < c->nconsts; i++)
+            if (const_same(c->consts[i], v)) return i;
     }
     if (c->nconsts >= c->capconsts) {
         uint32_t nc = c->capconsts ? c->capconsts * 2 : 16;
@@ -198,16 +230,29 @@ static uint32_t add_const(struct cfunc* c, jv v) {
         c->capconsts = nc;
     }
     c->consts[c->nconsts] = v;
-    return c->nconsts++;
+    c->nconsts++;
+    if (c->chash && c->nconsts * 2 <= c->chcap) {
+        uint32_t j = const_hash(v) & (c->chcap - 1);
+        while (c->chash[j]) j = (j + 1) & (c->chcap - 1);
+        c->chash[j] = c->nconsts;
+    } else if (c->nconsts >= 16 && !const_index(c, c->chcap ? c->chcap * 2 : 64)) {
+        c->failed = 1;
+        throw_oom(c->J);
+    }
+    return c->nconsts - 1;
 }
 
 static uint32_t atom_const(struct cfunc* c, struct str* a) { return add_const(c, jv_from_str(a)); }
 
+static void emit_const(struct cfunc* c, uint32_t k) {
+    if (k <= 0xFFFF) op16(c, OP_CONST, k, 1);
+    else op32(c, OP_CONST_W, k, 1);
+}
+
 static void push_const(struct cfunc* c, jv v) {
     if (jv_is_int(v) && jv_int(v) >= -128 && jv_int(v) <= 127) { op8(c, OP_INT8, (uint8_t)(int8_t)jv_int(v), 1); return; }
     if (jv_is_int(v)) { op32(c, OP_INT32, (uint32_t)jv_int(v), 1); return; }
-    uint32_t k = add_const(c, v);
-    op16(c, OP_CONST, k, 1);
+    emit_const(c, add_const(c, v));
 }
 
 static void push_str(struct cfunc* c, struct str* s) { push_const(c, jv_from_str(s)); }
@@ -311,6 +356,7 @@ static int upval_index(struct cfunc* c, struct decl* d) {
         index = (uint16_t)upval_index(p, d);
     }
     d->flags |= DF_CAPTURED;
+    if (c->nupv >= 65000) { cerr(c, 0, "too many captured variables"); return 0; }
     if (c->nupv >= c->capupv) {
         int nc = c->capupv ? c->capupv * 2 : 8;
         struct cupv* t = (struct cupv*)ojs_sys_realloc(c->upv, (size_t)nc * sizeof(struct cupv));
@@ -401,11 +447,11 @@ static void load_ref_static(struct cfunc* c, struct ref* r, uint32_t pos, int fo
     ref_kind(c, r);
     if (r->kind == R_LOCAL || (r->kind == R_WITH && r->d && r->d->scope->fn == c->fi && r->d->slot >= 0 &&
                                r->d->scope->kind != SC_MODULE && !(r->d->flags & 0x40))) {
-        if (r->tdz) op16_16(c, OP_GET_LOC_CHK, (uint32_t)r->d->slot, atom_const(c, r->name), 1);
+        if (r->tdz) op16_32(c, OP_GET_LOC_CHK, (uint32_t)r->d->slot, atom_const(c, r->name), 1);
         else op16(c, OP_GET_LOC, (uint32_t)r->d->slot, 1);
     } else if (r->d && r->kind != R_GLOBAL) {
         int ix = r->kind == R_UPVAL ? r->index : upval_index(c, r->d);
-        if (r->tdz) op16_16(c, OP_GET_UPV_CHK, (uint32_t)ix, atom_const(c, r->name), 1);
+        if (r->tdz) op16_32(c, OP_GET_UPV_CHK, (uint32_t)ix, atom_const(c, r->name), 1);
         else op16(c, OP_GET_UPV, (uint32_t)ix, 1);
     } else {
         op32(c, for_typeof ? OP_TYPEOF_GLOBAL : OP_GET_GLOBAL, atom_const(c, r->name), 1);
@@ -425,8 +471,8 @@ static void store_ref_static(struct cfunc* c, struct ref* r, uint32_t pos, int k
             return;
         }
         // const: TDZ check first (a ReferenceError beats the TypeError), then TypeError
-        if (r->d->scope->fn == c->fi && r->d->slot >= 0) op16_16(c, OP_GET_LOC_CHK, (uint32_t)r->d->slot, atom_const(c, r->name), 1);
-        else op16_16(c, OP_GET_UPV_CHK, (uint32_t)upval_index(c, r->d), atom_const(c, r->name), 1);
+        if (r->d->scope->fn == c->fi && r->d->slot >= 0) op16_32(c, OP_GET_LOC_CHK, (uint32_t)r->d->slot, atom_const(c, r->name), 1);
+        else op16_32(c, OP_GET_UPV_CHK, (uint32_t)upval_index(c, r->d), atom_const(c, r->name), 1);
         op(c, OP_POP, -1);
         op32(c, OP_CONST_ERROR, atom_const(c, r->name), 0);
         if (!keep) op(c, OP_POP, -1);
@@ -436,14 +482,14 @@ static void store_ref_static(struct cfunc* c, struct ref* r, uint32_t pos, int k
         r->d->scope->kind != SC_MODULE && !(r->d->flags & 0x40)) {
         uint32_t s = (uint32_t)r->d->slot;
         if (init) { op16(c, OP_INIT_LOC, s, 0); if (!keep) op(c, OP_POP, -1); return; }
-        if (r->tdz) { op16_16(c, OP_PUT_LOC_CHK, s, atom_const(c, r->name), 0); if (!keep) op(c, OP_POP, -1); return; }
+        if (r->tdz) { op16_32(c, OP_PUT_LOC_CHK, s, atom_const(c, r->name), 0); if (!keep) op(c, OP_POP, -1); return; }
         if (keep) op16(c, OP_SET_LOC, s, 0); else op16(c, OP_PUT_LOC, s, -1);
         return;
     }
     if (r->d && r->kind != R_GLOBAL) {
         uint32_t ix = r->kind == R_UPVAL ? (uint32_t)r->index : (uint32_t)upval_index(c, r->d);
         if (init) { op16(c, OP_INIT_UPV, ix, 0); if (!keep) op(c, OP_POP, -1); return; }
-        if (r->tdz) { op16_16(c, OP_PUT_UPV_CHK, ix, atom_const(c, r->name), 0); if (!keep) op(c, OP_POP, -1); return; }
+        if (r->tdz) { op16_32(c, OP_PUT_UPV_CHK, ix, atom_const(c, r->name), 0); if (!keep) op(c, OP_POP, -1); return; }
         if (keep) op16(c, OP_SET_UPV, ix, 0); else op16(c, OP_PUT_UPV, ix, -1);
         return;
     }
@@ -911,8 +957,8 @@ static void comp_call(struct cfunc* c, struct node* n) {
         int argc = comp_args(c, n->b, (n->flags & NF_HAS_SPREAD) != 0);
         uint32_t env = add_const(c, eval_env_descriptor(c, n->scope));   // visible bindings
         mark_call(c, n, f);
-        if (argc < 0) { op16(c, OP_EVAL_SPREAD, env, -2); }
-        else { op16_16(c, OP_EVAL, (uint32_t)argc, env, -(argc + 1)); }
+        if (argc < 0) { op32(c, OP_EVAL_SPREAD, env, -2); }
+        else { op16_32(c, OP_EVAL, (uint32_t)argc, env, -(argc + 1)); }
         return;
     }
     if (f->type == N_OPTCHAIN) {
@@ -1231,7 +1277,7 @@ static void comp_expr(struct cfunc* c, struct node* n) {
     case N_BIGINT: {
         jv b = bigint_literal(c->J, n->u.str);
         if (b == JV_EXC) { c->failed = 1; return; }
-        op16(c, OP_CONST, add_const(c, b), 1);
+        emit_const(c, add_const(c, b));
         return;
     }
     case N_TEMPLATE: comp_template(c, n); return;
@@ -1242,13 +1288,13 @@ static void comp_expr(struct cfunc* c, struct node* n) {
         if (tobj == JV_EXC) { c->failed = 1; return; }
         if (n->a->type == N_MEMBER || n->a->type == N_IDENT) comp_callee(c, n->a);
         else { comp_expr(c, n->a); op(c, OP_UNDEF, 1); }
-        op16(c, OP_CONST, add_const(c, tobj), 1);
+        emit_const(c, add_const(c, tobj));
         int argc = 1;
         for (struct node* e = n->c; e; e = e->next) { comp_expr(c, e); argc++; }
         emit_call(c, argc, 0);
         return;
     }
-    case N_REGEXP: op16_16(c, OP_REGEXP, atom_const(c, atom_str(c->J, n->u.str)), atom_const(c, atom_str(c->J, n->str2)), 1); return;
+    case N_REGEXP: op32_32(c, OP_REGEXP, atom_const(c, atom_str(c->J, n->u.str)), atom_const(c, atom_str(c->J, n->str2)), 1); return;
     case N_NULL: op(c, OP_NULL_, 1); return;
     case N_TRUE: op(c, OP_TRUE_, 1); return;
     case N_FALSE: op(c, OP_FALSE_, 1); return;
