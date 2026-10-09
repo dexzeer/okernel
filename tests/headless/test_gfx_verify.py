@@ -76,17 +76,22 @@ def check_gpu(label, tries=3):
 def check_fb(label):
     global ok
     n0 = len(re.findall(r"\[gfx\] verify:", vm.serial()))
-    vm.type_string("gfxcheck\n", delay=0.03)
-    t0 = time.time()
-    while time.time() - t0 < 20:
-        m = re.findall(r"\[gfx\] verify: (\d+) mismatching pixels \(first at (-?\d+),(-?\d+)\)", vm.serial())
-        if len(m) > n0:
-            bad, x, y = m[-1]
-            good = int(bad) == 0
-            print(f"    {'PASS' if good else 'FAIL'}  {label}: {bad} mismatches (first at {x},{y})", flush=True)
-            ok = ok and good
-            return
-        time.sleep(0.5)
+    for attempt in range(2):
+        # a second attempt opens a fresh (focused) terminal first: under a loaded host QEMU
+        # drops queued keys (16-byte PS/2 buffer), and the first try may have typed elsewhere
+        if attempt:
+            vm.mon("sendkey ctrl-alt-t", 0.3); time.sleep(2)
+        vm.type_string("gfxcheck\n", delay=0.03)
+        t0 = time.time()
+        while time.time() - t0 < 12:
+            m = re.findall(r"\[gfx\] verify: (\d+) mismatching pixels \(first at (-?\d+),(-?\d+)\)", vm.serial())
+            if len(m) > n0:
+                bad, x, y = m[-1]
+                good = int(bad) == 0
+                print(f"    {'PASS' if good else 'FAIL'}  {label}: {bad} mismatches (first at {x},{y})", flush=True)
+                ok = ok and good
+                return
+            time.sleep(0.5)
     print(f"    FAIL  {label}: gfxcheck did not answer", flush=True)
     ok = False
 

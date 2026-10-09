@@ -29,8 +29,10 @@ static struct window windows[MAX_WINDOWS];
 // kfree is a no-op on the bump heap, and per-frame reallocs during a
 // resize drag would burn it down fast. ALL content indexing must use
 // CONTENT_COLS_MAX as the row stride, never content_w.
-#define CONTENT_COLS_MAX ((SCREEN_W - 2 * WIN_BORDER) / CONTENT_GW)
-#define CONTENT_ROWS_MAX ((SCREEN_H - WIN_TITLE_H - 2 * WIN_BORDER) / CONTENT_GH)
+// (sized for 1920x1080 whatever the screen is: terminal cell grids are static tables;
+// a window larger than that on a bigger screen just gets no more cells)
+#define CONTENT_COLS_MAX ((1920 - 2 * WIN_BORDER) / CONTENT_GW)
+#define CONTENT_ROWS_MAX ((1080 - WIN_TITLE_H - 2 * WIN_BORDER) / CONTENT_GH)
 #define CONTENT_CELLS_MAX (CONTENT_COLS_MAX * CONTENT_ROWS_MAX)
 
 // Per-window scrollback: lines pushed off the top of the content grid when it

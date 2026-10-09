@@ -39,6 +39,8 @@
 #include "fpu.h"
 #include "cursor.h"
 #include "simd.h"
+#include "i915.h"
+#include "display.h"
 
 struct mboot_info {
     uint32_t flags;
@@ -941,6 +943,14 @@ static void shell_execute(int win_id, const char* input) {
         struct smp_out o = { win_id };
         simd_selftest(smp_out_line, &o);
     }
+    else if (str_eq(cmd_buf, "gpu")) {
+        // read-only report on the display hardware: Intel graphics registers (pipes,
+        // planes, cursor, GTT entry of the scanout buffer) and the active backend
+        struct smp_out o = { win_id };
+        const struct display_ops* d = graphics_display();
+        smp_out_line(d ? d->name : "display: GRUB framebuffer (no GPU backend)", &o);
+        if (!i915_report(smp_out_line, &o) && !d) smp_out_line("(nothing to report)", &o);
+    }
     else if (str_eq(cmd_buf, "gfxcheck")) {
         // framebuffer == backbuffer outside the cursor? (damage tracking self check)
         int fx, fy;
@@ -1390,9 +1400,12 @@ void kernel_main(uint32_t mboot_phys) {
     // vbe_mode_info/garbage as fb (0x90 class) and paging maps nothing.
     uint32_t mboot_flags = *(volatile uint32_t*)(mboot_phys + 0);
     uint64_t mboot_fb = *(volatile uint64_t*)(mboot_phys + 88);
-    uint32_t fb_addr = 0;
+    uint32_t fb_addr = 0, fb_bytes = 0;
     if (mboot_flags & (1 << 12)) {
         fb_addr = (uint32_t)mboot_fb;
+        // pitch (96) x height (104): how much address space the mapping must cover
+        fb_bytes = *(volatile uint32_t*)(mboot_phys + 96) * *(volatile uint32_t*)(mboot_phys + 104);
+        if (fb_bytes > 48u * 1024 * 1024) fb_bytes = 48u * 1024 * 1024;
     }
     serial_printf("[boot] mboot phys=%x flags=%x fb=%x\n",
                   mboot_phys, mboot_flags, fb_addr);
@@ -1400,7 +1413,7 @@ void kernel_main(uint32_t mboot_phys) {
     // statics (page_directory at phys ~0x2C00000, processes, bitmap tail)
     // live at phys 1M-14M. process_init's first .bss touch faults without
     // the full map (CR2=0xC0xxxxxx class, e=0002). FB addr 0 = still map.
-    paging_init(fb_addr);
+    paging_init(fb_addr, fb_bytes);
     acpi_init(mboot_phys);   // needs the paging windows; reads GRUB's memory map
     process_init();
 
@@ -1492,6 +1505,12 @@ void kernel_main(uint32_t mboot_phys) {
         if (wimage_decode(wp_jpg, (int)(wp_jpg_end - wp_jpg), 0, &ww, &wh, &wpx) &&
             ww == SCREEN_W && wh == SCREEN_H) {
             graphics_set_wallpaper(wpx);
+        } else if (wpx && ww > 0 && wh > 0) {
+            // the wallpaper is authored at 1920x1080: fit it to this screen
+            uint32_t* fit = graphics_scale_to_screen(wpx, ww, wh);
+            kfree(wpx);
+            if (fit) graphics_set_wallpaper(fit);
+            else serial_puts("[gfx] wallpaper scale failed\n");
         } else {
             serial_puts("[gfx] wallpaper decode failed\n");
             if (wpx) kfree(wpx);
@@ -1517,8 +1536,12 @@ void kernel_main(uint32_t mboot_phys) {
     // Create main terminal: a plain shell, just the prompt (no banner).
     // 72x24 cells (12x24 content glyphs), left of the wallpaper emblem and
     // below the first desktop-icon row.
+    // 24 rows on a 1080p screen; fewer where the screen is shorter (stay above the taskbar)
+    int term_rows = (SCREEN_H - TASKBAR_H - 128 - WIN_TITLE_H - 2 * WIN_BORDER - 8) / CONTENT_GH;
+    if (term_rows > 24) term_rows = 24;
+    if (term_rows < 8) term_rows = 8;
     term_wins[0] = window_create("Terminal", 16, 128, 72 * CONTENT_GW + 2 * WIN_BORDER,
-                                 24 * CONTENT_GH + WIN_TITLE_H + 2 * WIN_BORDER);
+                                 term_rows * CONTENT_GH + WIN_TITLE_H + 2 * WIN_BORDER);
     window_set_close_button(term_wins[0], 1);
     window_set_minimize_button(term_wins[0], 1);
     window_set_terminal(term_wins[0], 1);

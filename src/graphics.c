@@ -35,7 +35,7 @@ static uint32_t* backbuffer = 0;
 // page was loading) and a flush with damage copies only the touched columns.
 static int16_t* dx0 = 0;
 static int16_t* dx1 = 0;
-static int dirty_ylo = SCREEN_H, dirty_yhi = 0;      // rows [lo, hi) may be dirty
+static int dirty_ylo = 0, dirty_yhi = 0;            // rows [lo, hi) may be dirty (set up in graphics_init)
 
 static inline void mark_span(int y, int xa, int xb) {
     if (xa < dx0[y]) dx0[y] = (int16_t)xa;
@@ -49,7 +49,8 @@ static void mark_all(void) {
 }
 
 // Clip rectangle
-static int clip_x0 = 0, clip_y0 = 0, clip_x1 = SCREEN_W, clip_y1 = SCREEN_H;
+int gfx_w = 1920, gfx_h = 1080;
+static int clip_x0 = 0, clip_y0 = 0, clip_x1 = 1920, clip_y1 = 1080;   // reset to the real size in graphics_init
 
 // Main font bitmap (ASCII 32-126) is in src/font_data.c (Terminus 16x32).
 
@@ -382,6 +383,25 @@ void graphics_init(uint32_t mboot_phys) {
                       (uint32_t)dfb, dpitch, dw, dh, dbpp, flags);
     }
 
+    // The mode the bootloader set. Everything sizes itself from gfx_w/gfx_h; only
+    // 32 bits per pixel is supported (what GRUB gives us with gfxpayload ...x32).
+    if (flags & (1 << 12)) {
+        uint32_t mw = *(volatile uint32_t*)(mboot_phys + 100);
+        uint32_t mh = *(volatile uint32_t*)(mboot_phys + 104);
+        uint32_t mp = *(volatile uint32_t*)(mboot_phys + 96);
+        uint8_t mbpp = *(volatile uint8_t*)(mboot_phys + 108);
+        uint8_t mtype = *(volatile uint8_t*)(mboot_phys + 109);
+        if (mtype == 1 && mbpp == 32 && mw >= 640 && mh >= 480 && mw <= SCREEN_W_MAX && mh <= SCREEN_H_MAX &&
+            mp >= mw * 4) {
+            gfx_w = (int)mw; gfx_h = (int)mh;
+        } else {
+            serial_printf("[gfx] unsupported framebuffer mode %dx%d bpp=%d type=%d pitch=%d - assuming 1920x1080\n",
+                          mw, mh, mbpp, mtype, mp);
+        }
+    }
+    clip_x0 = 0; clip_y0 = 0; clip_x1 = SCREEN_W; clip_y1 = SCREEN_H;
+    dirty_ylo = SCREEN_H; dirty_yhi = 0;
+
     if (flags & (1 << 12)) {
         uint64_t fb = *(volatile uint64_t*)(mboot_phys + 88);
         // FB is identity-mapped by paging_init (PD phys>>22, supervisor):
@@ -399,6 +419,7 @@ void graphics_init(uint32_t mboot_phys) {
         framebuffer = (uint8_t*)paging_map_low(0xA0000);
         fb_pitch = SCREEN_W * 4;
     }
+    serial_printf("[gfx] screen %dx%d pitch %d\n", SCREEN_W, SCREEN_H, (int)fb_pitch);
 
     backbuffer = (uint32_t*)kmalloc(SCREEN_W * SCREEN_H * sizeof(uint32_t));
     dx0 = (int16_t*)kmalloc(SCREEN_H * sizeof(int16_t));
@@ -934,6 +955,41 @@ void graphics_set_wallpaper(uint32_t* px) {
     if (cached_wallpaper) kfree(cached_wallpaper);
     cached_wallpaper = px;
     wallpaper_cached = 1;
+}
+
+// Resample an image to cover the screen (scale to fill, centre-crop), bilinear in
+// 8.8 fixed point. Returns a new SCREEN_W x SCREEN_H buffer (kmalloc) or 0.
+uint32_t* graphics_scale_to_screen(const uint32_t* src, int sw, int sh) {
+    if (sw <= 0 || sh <= 0) return 0;
+    uint32_t* dst = (uint32_t*)kmalloc((uint32_t)SCREEN_W * SCREEN_H * 4);
+    if (!dst) return 0;
+    // scale factor src px per dst px, 16.16: the larger of the two so the image covers
+    uint32_t fx = ((uint32_t)sw << 16) / (uint32_t)SCREEN_W;
+    uint32_t fy = ((uint32_t)sh << 16) / (uint32_t)SCREEN_H;
+    uint32_t f = fx < fy ? fx : fy;                     // smaller step = more magnification = covers
+    int cropx = (int)(((uint32_t)sw << 16) - f * (uint32_t)SCREEN_W) / 2;   // centred, 16.16
+    int cropy = (int)(((uint32_t)sh << 16) - f * (uint32_t)SCREEN_H) / 2;
+    for (int y = 0; y < SCREEN_H; y++) {
+        int sy64 = cropy + (int)f * y;
+        int sy = (int)(sy64 >> 16); unsigned wy = (unsigned)((sy64 >> 8) & 0xFF);
+        if (sy >= sh - 1) { sy = sh - 2 < 0 ? 0 : sh - 2; wy = sh > 1 ? 255 : 0; }
+        const uint32_t* r0 = src + sy * sw;
+        const uint32_t* r1 = sh > 1 ? r0 + sw : r0;
+        for (int x = 0; x < SCREEN_W; x++) {
+            int sx64 = cropx + (int)f * x;
+            int sx = (int)(sx64 >> 16); unsigned wx = (unsigned)((sx64 >> 8) & 0xFF);
+            if (sx >= sw - 1) { sx = sw - 2 < 0 ? 0 : sw - 2; wx = sw > 1 ? 255 : 0; }
+            int sx1 = sw > 1 ? sx + 1 : sx;
+            uint32_t a = r0[sx], b = r0[sx1], c = r1[sx], d = r1[sx1], out = 0;
+            for (int sh8 = 0; sh8 < 24; sh8 += 8) {
+                unsigned va = (a >> sh8) & 0xFF, vb = (b >> sh8) & 0xFF, vc = (c >> sh8) & 0xFF, vd = (d >> sh8) & 0xFF;
+                unsigned top = va * (256 - wx) + vb * wx, bot = vc * (256 - wx) + vd * wx;
+                out |= (((top * (256 - wy) + bot * wy) >> 16) & 0xFF) << sh8;
+            }
+            dst[y * SCREEN_W + x] = out;
+        }
+    }
+    return dst;
 }
 
 const uint32_t* graphics_wallpaper(void) { return wallpaper_cached ? cached_wallpaper : 0; }

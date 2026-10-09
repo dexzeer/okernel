@@ -3,8 +3,14 @@
 
 #include <stdint.h>
 
-#define SCREEN_W 1920
-#define SCREEN_H 1080
+// Screen size: the mode the bootloader set (multiboot framebuffer info), read once
+// in graphics_init. Everything sizes itself from these; 1920x1080 is only the
+// value used before graphics_init and the mode the wallpaper is authored for.
+extern int gfx_w, gfx_h;
+#define SCREEN_W gfx_w
+#define SCREEN_H gfx_h
+#define SCREEN_W_MAX 4096     // largest mode accepted (static tables use these)
+#define SCREEN_H_MAX 2304
 
 // Main font: Terminus 16x32 (tools/bdf2font.py from terminus-font ter-u32n.bdf),
 // rendered 1:1 (FONT_SCALE 1) so glyphs are crisp, not upscaled/pixelated.
@@ -142,6 +148,7 @@ void graphics_cache_wallpaper(const unsigned char* pixels, const unsigned char* 
 // Adopt a SCREEN_W x SCREEN_H heap buffer of 0x??RRGGBB pixels as the wallpaper.
 void graphics_set_wallpaper(uint32_t* px);
 void graphics_blit_wallpaper(void);
+uint32_t* graphics_scale_to_screen(const uint32_t* src, int sw, int sh);   // cover-fit resample, new buffer
 const uint32_t* graphics_wallpaper(void); // SCREEN_W x SCREEN_H or NULL
 void graphics_blit_wallpaper_rect(int x, int y, int w, int h);
 

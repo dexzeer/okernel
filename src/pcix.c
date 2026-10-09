@@ -105,13 +105,18 @@ uint32_t pcix_bar(struct pci_loc l, int idx, int* is_mem, int* above4g) {
 
 uint32_t pcix_bar_size(struct pci_loc l, int idx) {
     uint8_t off = (uint8_t)(0x10 + 4 * idx);
+    // Memory decode is off and the BAR holds all-ones for a moment: no interrupt
+    // handler may touch the device (or the framebuffer behind it) in between.
+    uint32_t fl;
+    __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
     uint16_t cmd = pcix_read16(l, 0x04);
-    pcix_write16(l, 0x04, cmd & ~0x0003);                   // decode off while probing
+    pcix_write16(l, 0x04, cmd & ~0x0003);
     uint32_t orig = pcix_read32(l, off);
     pcix_write32(l, off, 0xFFFFFFFF);
     uint32_t v = pcix_read32(l, off);
     pcix_write32(l, off, orig);
     pcix_write16(l, 0x04, cmd);
+    if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
     if (orig & 1) v &= 0xFFFFFFFCu; else v &= 0xFFFFFFF0u;
     return v ? (~v + 1) : 0;
 }
