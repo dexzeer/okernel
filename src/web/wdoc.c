@@ -562,7 +562,7 @@ static void collect_images(struct wdoc* d) {
 }
 
 // Does the document need a script realm? (<script> elements or inline
-// on* handlers.) Pages without either never pay for a QuickJS context.
+// on* handlers.) Pages without either never pay for a script realm.
 static int doc_wants_scripts(struct wdoc* d) {
     struct wdom* dom = d->d;
     for (int el = dom->n[0].first; el >= 0; el = wdom_next(dom, el, 0)) {

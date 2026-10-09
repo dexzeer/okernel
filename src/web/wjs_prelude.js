@@ -2423,7 +2423,7 @@ accessor(G, 'event', () => undefined);
 Object.setPrototypeOf(G, Window.prototype);
 defineHandlers(G);
 // ---------------------------------------------------------------- Intl (en-US, UTC)
-// QuickJS ships no Intl: a compact en-US implementation of the parts pages
+// ojs ships no Intl: a compact en-US implementation of the parts pages
 // use (dates, relative times, numbers, plurals, lists).
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 const WDAYS = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -2603,7 +2603,17 @@ class Locale {
     toString() { return this.baseName; }
     maximize() { return this; } minimize() { return this; }
 }
-G.Intl = { DateTimeFormat, RelativeTimeFormat, NumberFormat, PluralRules, Collator, ListFormat, Segmenter, DisplayNames, Locale,
+// ECMA-402: DateTimeFormat, NumberFormat and Collator also work when called without new
+const callableCtor = C => {
+    const F = function (locales, options) { return new C(locales, options); };
+    F.prototype = C.prototype;
+    hidden(C.prototype, 'constructor', F);
+    Object.defineProperty(F, 'name', { value: C.name });
+    hidden(F, 'supportedLocalesOf', l => [].concat(l || []));
+    return F;
+};
+G.Intl = { DateTimeFormat: callableCtor(DateTimeFormat), RelativeTimeFormat, NumberFormat: callableCtor(NumberFormat), PluralRules,
+    Collator: callableCtor(Collator), ListFormat, Segmenter, DisplayNames, Locale,
     getCanonicalLocales: l => [].concat(l || []), supportedValuesOf: () => [] };
 Date.prototype.toLocaleDateString = function (l, o) {
     o = o || {};
@@ -2620,6 +2630,42 @@ Date.prototype.toLocaleString = function (l, o) {
     return this.toLocaleDateString() + ', ' + this.toLocaleTimeString();
 };
 Number.prototype.toLocaleString = function (l, o) { return new NumberFormat(l, o).format(this); };
+
+// ---------------------------------------------------------------- ES additions
+// Array.fromAsync (ES2026): async iterables, sync iterables (values awaited) and
+// array-likes; `this` may be a constructor, like Array.from
+if (typeof Array.fromAsync !== 'function') {
+    const isCtor = C => { try { Reflect.construct(String, [], C); return true; } catch (_) { return false; } };
+    const put = (A, k, v) => Object.defineProperty(A, k, { value: v, writable: true, enumerable: true, configurable: true });
+    const fromAsync = async function fromAsync(items, mapfn = undefined, thisArg = undefined) {
+        const C = this, mapping = mapfn !== undefined;
+        if (mapping && typeof mapfn !== 'function') throw new TypeError('Array.fromAsync: mapper is not a function');
+        const asyncIt = items == null ? undefined : items[Symbol.asyncIterator];
+        const syncIt = asyncIt == null && items != null ? items[Symbol.iterator] : undefined;
+        if (asyncIt != null || syncIt != null) {
+            const A = isCtor(C) ? new C() : [];
+            let k = 0;
+            const it = asyncIt != null ? asyncIt.call(items) : syncIt.call(items);
+            const source = asyncIt != null ? { [Symbol.asyncIterator]: () => it } : { [Symbol.iterator]: () => it };
+            for await (const v of source) {
+                put(A, k, mapping ? await mapfn.call(thisArg, v, k) : v);
+                k++;
+            }
+            A.length = k;
+            return A;
+        }
+        const arrayLike = Object(items);
+        const len = Math.min(Math.max(Math.trunc(Number(arrayLike.length)) || 0, 0), Number.MAX_SAFE_INTEGER);
+        const A = isCtor(C) ? new C(len) : new Array(len);
+        for (let k = 0; k < len; k++) {
+            const v = await arrayLike[k];
+            put(A, k, mapping ? await mapfn.call(thisArg, v, k) : v);
+        }
+        A.length = len;
+        return A;
+    };
+    hidden(Array, 'fromAsync', fromAsync);
+}
 
 // lifecycle: listeners added after the event already fired still run once
 let dclFired = false, loadFired = false;

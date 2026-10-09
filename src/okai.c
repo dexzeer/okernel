@@ -12,14 +12,14 @@
 // viewport into a per-window pixel surface that the window system blits
 // (window_set_pixels); okai paints only its chrome as an overlay.
 //
-// Page scripts (QuickJS, src/web/wjs*.c) run inside the document: okai
+// Page scripts (ojs, src/ojs + src/web/wjs*.c) run inside the document: okai
 // fetches their sources and fetch()/XHR requests through the same queue,
 // pumps the realm (wjs_run: scripts, timers, frames, lifecycle events) from
 // okai_poll, dispatches DOM events for clicks/keys/forms/scroll before
 // applying default actions, and honors script navigation/scroll/focus.
 //
 // All engine work runs on a dedicated 2MB stack (call_on_stack): real pages
-// nest deeper than the 256KB boot stack allows, and QuickJS recursion is
+// nest deeper than the 256KB boot stack allows, and ojs recursion is
 // capped at 900KB of it.
 #include "okai.h"
 #include "window.h"
@@ -101,7 +101,7 @@ static int url_is_http(const char* u) { return iprefix(u, "http:") || iprefix(u,
 
 extern void call_on_stack(void (*fn)(void*), void* arg, void* stack_top);
 
-#define ENGINE_STACK (2u << 20) // layout peaks ~20KB; QuickJS may use up to 900KB
+#define ENGINE_STACK (2u << 20) // layout peaks ~20KB; ojs may use up to 900KB
 #define STACK_FILL 0x5AC4F00Du
 static uint8_t* engine_stack;
 static int in_engine;
@@ -513,7 +513,7 @@ static void store_cookies(const char* url, const char* r, int len) {
     }
 }
 
-extern long long time(long long* t);   // qjs_libc: RTC + ticks
+extern long long time(long long* t);   // kclock.c: RTC + ticks
 static long long okai_epoch(void) { return time(0); }
 
 // Default a web URL to HTTPS unless the user typed an explicit scheme.

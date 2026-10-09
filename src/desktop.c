@@ -1078,7 +1078,7 @@ static void shell_execute(int win_id, const char* input) {
 // Keystrokes are QUEUED by the keyboard IRQ and dispatched from the main
 // loop (2026-10-08). on_keypress used to run inside the IRQ: shell commands,
 // okai navigation (frees the document, cancels requests), page keydown/input
-// JS (QuickJS is not reentrant) and page scrolls (multi-MB memmoves) all
+// JS (the ojs realm is not reentrant) and page scrolls (multi-MB memmoves) all
 // executed on top of whatever the main loop was doing — often okai_poll on
 // the very same document — and a busy page could swallow or garble a typed
 // URL. Single producer (IRQ1) / single consumer (main loop): head is only
@@ -1307,7 +1307,7 @@ void kernel_main(uint32_t mboot_phys) {
     serial_init();
     gdt_init();
     idt_init();
-    // x87 FPU for QuickJS (okai page scripts): CR0.EM=0 (no emulation trap),
+    // x87 FPU for ojs (okai page scripts): CR0.EM=0 (no emulation trap),
     // MP=1, NE=1 (native error reporting; every exception stays masked),
     // TS=0. Preemptive switches FNSAVE/FRSTOR per thread (process.c).
     {

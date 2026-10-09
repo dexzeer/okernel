@@ -55,8 +55,8 @@ WEB_OBJ = src/web/wdom.o src/web/html5.o src/web/charset.o src/web/wurl.o \
           src/web/lay_grid.o src/web/lay_table.o src/web/lay_dl.o \
           src/web/paint.o src/web/raster.o src/web/font.o src/web/svg.o src/web/image.o \
           src/web/wdoc.o src/web/fontdata.o src/web/callstack.o \
-          src/web/wjs.o src/web/wjs_dom.o src/web/wjs_prelude.o src/web/wcookie.o
-WEB_HEADERS := $(wildcard src/web/*.h) src/qjs/quickjs.h
+          src/web/wjs.o src/web/wjs_dom.o src/web/wjs_sys.o src/web/wjs_prelude.o src/web/wcookie.o
+WEB_HEADERS := $(wildcard src/web/*.h) $(wildcard src/ojs/*.h)
 src/wallpaper.o: src/wallpaper.asm tools/wallpaper/wallpaper.jpg
 	$(AS) $(ASFLAGS) $< -o $@
 src/web/fontdata.o: src/web/fontdata.asm $(wildcard fonts/*.ttf)
@@ -64,31 +64,31 @@ src/web/fontdata.o: src/web/fontdata.asm $(wildcard fonts/*.ttf)
 src/web/wjs_prelude.o: src/web/wjs_prelude.asm src/web/wjs_prelude.js
 	$(AS) $(ASFLAGS) $< -o $@
 
-# QuickJS (src/qjs, Fabrice Bellard, MIT) for page scripts: compiled
-# hosted-style (builtins on) against the freestanding libc shim in
-# src/qjs/libc (-nostdinc) + our libm (src/kmath.c); x87 doubles (the
-# kernel FNSAVEs per thread, wjs runs with 53-bit precision). libgcc
-# supplies the 64-bit division helpers. Same objects as tests/qjs/build.sh.
-GCC_INC := $(shell $(CC) -print-file-name=include)
-LIBGCC := $(shell $(CC) -m32 -print-libgcc-file-name)
-QJS_CFLAGS = -m32 -nostdinc -Isrc/qjs/libc -Isrc/qjs -isystem $(GCC_INC) \
-             -fno-pic -fno-pie -O2 -fno-strict-aliasing -fwrapv -fno-stack-protector \
-             -mno-sse -mno-sse2 -mno-mmx -mfpmath=387 -fno-asynchronous-unwind-tables \
-             -D_GNU_SOURCE -DQJS_NO_ATOMICS -DCONFIG_VERSION=\"2026-06-04\" -DKERNEL -w -MMD -MP
-QJS_HEADERS := $(wildcard src/qjs/*.h) $(wildcard src/qjs/libc/*.h) $(wildcard src/qjs/libc/sys/*.h)
-QJS_OBJ = src/qjs/quickjs.o src/qjs/cutils.o src/qjs/libregexp.o src/qjs/libunicode.o src/qjs/dtoa.o \
-          src/qjs/qjs_libc.o src/kmath.o
-# kmath: computes in x87 extended precision (see the file header); the
-# kernel's -mno-sse flags keep every double on the x87 as it requires.
+# ojs (src/ojs): our JavaScript engine for page scripts (see src/ojs/README).
+# x87 doubles only (-mno-sse: the kernel FNSAVEs per thread and each realm runs
+# at 53-bit precision); our libm (src/kmath.c), our 64-bit division helpers
+# (src/divdi3.c - no libgcc), the realm clock (src/kclock.c). vm.c is the
+# interpreter: GCC copies its dispatch jump into every instruction.
+OJS_CFLAGS = -m32 -ffreestanding -fno-pic -fno-pie -mno-red-zone -O2 -fno-strict-aliasing \
+             -fno-stack-protector -mno-sse -mno-sse2 -mno-mmx -mfpmath=387 \
+             -fno-asynchronous-unwind-tables -DKERNEL -Isrc -MMD -MP \
+             -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
+OJS_SRC = gc str obj util conv num unicode unicode_data lex parse compile ops vm realm b_object b_function \
+          b_error b_iter b_array b_string b_number b_global b_promise generator b_map b_proxy b_typed bigint \
+          b_json b_date re b_regexp module api srctext
+OJS_OBJ = $(patsubst %,src/ojs/%.o,$(OJS_SRC)) src/kmath.o src/kclock.o src/divdi3.o
+src/ojs/vm.o: src/ojs/vm.c
+	$(CC) $(OJS_CFLAGS) --param max-goto-duplication-insns=64 -c $< -o $@
+src/ojs/%.o: src/ojs/%.c
+	$(CC) $(OJS_CFLAGS) -c $< -o $@
+# kmath: computes in x87 extended precision (see the file header)
 src/kmath.o: src/kmath.c
-	$(CC) $(QJS_CFLAGS) -c $< -o $@
-src/qjs/qjs_libc.o: src/qjs/qjs_libc.c $(QJS_HEADERS)
-	$(CC) $(QJS_CFLAGS) -fno-tree-loop-distribute-patterns -c $< -o $@
-src/qjs/%.o: src/qjs/%.c $(QJS_HEADERS)
-	$(CC) $(QJS_CFLAGS) -c $< -o $@
+	$(CC) $(OJS_CFLAGS) -c $< -o $@
+src/divdi3.o: src/divdi3.c
+	$(CC) $(OJS_CFLAGS) -c $< -o $@
 src/userland_seed.o: $(USERLAND_GEN)
 DESKTOP_OBJ = src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
-              src/font_data.o $(WEB_OBJ) $(QJS_OBJ) \
+              src/font_data.o $(WEB_OBJ) $(OJS_OBJ) \
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/aes.o src/crypto/chacha20.o src/crypto/poly1305.o \
              src/crypto/x25519.o src/crypto/tls_record.o src/crypto/tls_handshake.o \
@@ -109,17 +109,18 @@ WEB_HOST_SRC = src/web/wdom.c src/web/html5.c src/web/charset.c src/web/css_valu
                src/web/css_select.c src/web/css_style.c src/web/wurl.c src/web/font.c src/web/raster.c \
                src/web/lay_tree.c src/web/lay_main.c src/web/lay_inline.c src/web/lay_flex.c src/web/lay_grid.c \
                src/web/lay_table.c src/web/lay_dl.c src/web/paint.c src/web/svg.c src/web/wdoc.c src/web/image.c src/cjk.c src/web/wcookie.c
-WEB_HOST_LINK = build-host/fontdata.o build-host/wjs_prelude.o build-host/qjs-host_O2/quickjs.o \
-                build-host/qjs-host_O2/cutils.o build-host/qjs-host_O2/libregexp.o \
-                build-host/qjs-host_O2/libunicode.o build-host/qjs-host_O2/dtoa.o -lm
+# the ojs objects tests/web/build.sh made (globbed when the recipe runs)
+WEB_HOST_LINK = build-host/fontdata.o build-host/wjs_prelude.o build-host/ojs-web-nopie_O2/*.o -lm
+WEB_HOST_CC = gcc -m32 -fno-pie -fno-pic -no-pie -O2 -Isrc -Itests/web
 web-tests:
 	mkdir -p build-host
 	sh tests/web/build.sh
-	gcc -m32 -O2 -Isrc -Isrc/qjs -Itests/web -o build-host/t_webcss tests/web/test_css.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c $(WEB_HOST_LINK) && ./build-host/t_webcss | tail -n 2
-	gcc -m32 -O2 -Isrc -Isrc/qjs -Itests/web -o build-host/t_font tests/web/test_font.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c $(WEB_HOST_LINK) && ./build-host/t_font | tail -n 2
+	$(WEB_HOST_CC) -o build-host/t_webcss tests/web/test_css.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_LINK) && ./build-host/t_webcss | tail -n 2
+	$(WEB_HOST_CC) -o build-host/t_font tests/web/test_font.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_LINK) && ./build-host/t_font | tail -n 2
 	./build-host/wbrowse tests/web/js/basic.html 800 600 build-host/js-basic.ppm 3 | grep RESULT
 	gcc -m32 -O2 -Isrc -Itests/web -o build-host/t_idct tests/web/test_idct.c -lm && ./build-host/t_idct | tail -n 1
-	sh tests/qjs/build.sh tests/qjs/suite/test_language.js tests/qjs/suite/test_closure.js tests/qjs/suite/test_loop.js tests/qjs/suite/test_builtin.js tests/qjs/suite/test_bigint.js
+	gcc -m32 -O2 -o build-host/t_divdi3 tests/test_divdi3.c && ./build-host/t_divdi3 2000000
+	sh tests/ojs/build.sh && ./build-host/ojs_run tests/ojs/smoke.js | tail -n 1
 
 # ---- Host tests (no QEMU; run from repo root — suites load tests/fixtures/*) ----
 # Offline must-pass: tls_crypto, css, subres, pki, adversarial (fast -O2 build;
@@ -215,7 +216,7 @@ kanarchy-text.iso: kanarchy-text.bin
 desktop: kanarchy-desktop.iso
 
 kanarchy-desktop.bin: $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o linker-high.ld
-	$(LD) $(LDFLAGS_HIGH) -o $@ $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o $(LIBGCC)
+	$(LD) $(LDFLAGS_HIGH) -o $@ $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o
 
 kanarchy-desktop.iso: kanarchy-desktop.bin
 	rm -rf isodir
@@ -247,7 +248,7 @@ HEADERS := $(wildcard src/*.h) $(wildcard src/net/*.h) $(wildcard src/crypto/*.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 src/web/%.o: src/web/%.c $(HEADERS) $(WEB_HEADERS)
-	$(CC) $(CFLAGS) -Isrc/qjs -Wno-unused-parameter -c $< -o $@
+	$(CC) $(CFLAGS) -Wno-unused-parameter -c $< -o $@
 
 src/okai.o: src/okai.c $(HEADERS) $(WEB_HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@

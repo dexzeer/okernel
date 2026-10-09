@@ -82,7 +82,7 @@ char* wdoc_data_url(const char* url, int len, int* out_len, char* mime, int mime
 #define WDOC_RK_SCRIPT 2
 #define WDOC_RK_REQ    3   // fetch()/XMLHttpRequest
 struct wjs;
-// Run page scripts (QuickJS) for the next wdoc_load. Off by default.
+// Run page scripts (ojs) for the next wdoc_load. Off by default.
 void wdoc_set_scripting(struct wdoc* d, int on);
 struct wjs* wdoc_js(struct wdoc* d);     // NULL when scripting is off (see wjs.h)
 void wdoc_set_scroll(struct wdoc* d, int y);   // shell scroll (window.scrollY)
