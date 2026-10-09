@@ -5,7 +5,7 @@
 
 // Set up the high-half kernel map (kernel high at 0xC0000000, user low
 // private) plus framebuffer/MMIO supervisor mappings
-void paging_init(uint32_t framebuffer_addr);
+void paging_init(uint32_t framebuffer_addr, uint32_t fb_bytes);
 
 // Program the page attribute table (entry 1 = write-combining) on the calling
 // CPU. Returns 0 on CPUs without a PAT. Every CPU must call it (smp.c does).

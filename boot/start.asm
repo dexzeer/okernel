@@ -7,6 +7,10 @@ FLAGS    equ MBALIGN | MEMINFO ; text build: stay in VGA text mode
 %else
 FLAGS    equ MBALIGN | MEMINFO | VIDEO
 %endif
+%ifndef VID_W
+%define VID_W 1920            ; mode requested from the bootloader (GRUB falls back to its own
+%define VID_H 1080            ; choice when the display lacks it; the kernel adapts, see graphics_init)
+%endif
 MAGIC    equ 0x1BADB002        ; multiboot magic number
 CHECKSUM equ -(MAGIC + FLAGS)
 
@@ -30,8 +34,8 @@ align 4
     dd 0    ; unused
     ; Video: linear graphics, 1920x1080, 32bpp
     dd 0    ; mode_type = 0 (linear)
-    dd 1920 ; width
-    dd 1080 ; height
+    dd VID_W ; width
+    dd VID_H ; height
     dd 32   ; bpp
 %endif
 

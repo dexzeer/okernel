@@ -144,6 +144,7 @@ host-tests:
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_strict tests/test_crypto_strict.c $(HOST_CRYPTO_SRC) && ./build-host/t_strict | tail -n 2
 	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_edtext tests/test_editor_text.c src/editor.c src/textslot.c && ./build-host/t_edtext | tail -n 2
 	gcc -m32 -O1 -fsanitize=address,undefined -Isrc -o build-host/t_acpi tests/test_acpi.c && ./build-host/t_acpi | tail -n 1
+	gcc -m32 -O1 -fsanitize=address,undefined -o build-host/t_i915 tests/test_i915.c src/i915.c && ./build-host/t_i915 | tail -n 1
 	$(MAKE) web-tests
 	gcc -m32 -O2 -Isrc/crypto -o build-host/t_aes tests/test_aes.c src/crypto/aes.c && (python3 tests/aes_vectors.py 300 2>/dev/null | ./build-host/t_aes - || ./build-host/t_aes) | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_pki tests/test_pki.c $(HOST_CRYPTO_SRC) && ./build-host/t_pki | tail -n 2
@@ -297,3 +298,35 @@ kanarchy-x2apic.iso: kanarchy-x2apic.bin
 	cp kanarchy-x2apic.bin isodir-x2/boot/kanarchy.bin
 	printf 'set timeout=0\nset default=0\n\nmenuentry "KAnarchy OS" {\n    set gfxpayload=1920x1080x32\n    multiboot /boot/kanarchy.bin\n    boot\n}\n' > isodir-x2/boot/grub/grub.cfg
 	grub-mkrescue -o $@ isodir-x2 2>/dev/null
+
+# ---- Test build: ask the bootloader for another video mode ----
+#   make kanarchy-res.iso VID_W=1366 VID_H=768
+# (the kernel adapts to whatever mode GRUB hands over; tests/headless/test_resolution.py)
+VID_W ?= 1920
+VID_H ?= 1080
+build-res/start.o: boot/start.asm
+	mkdir -p build-res
+	$(AS) $(ASFLAGS) -DVID_W=$(VID_W) -DVID_H=$(VID_H) $< -o $@
+kanarchy-res.bin: build-res/start.o $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o linker-high.ld
+	$(LD) $(LDFLAGS_HIGH) -o $@ build-res/start.o $(filter-out boot/start.o,$(ASM_OBJ)) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o
+kanarchy-res.iso: kanarchy-res.bin
+	rm -rf isodir-res
+	mkdir -p isodir-res/boot/grub
+	cp kanarchy-res.bin isodir-res/boot/kanarchy.bin
+	printf 'set timeout=0\nset default=0\n\nmenuentry "KAnarchy OS" {\n    set gfxpayload=$(VID_W)x$(VID_H)x32\n    multiboot /boot/kanarchy.bin\n    boot\n}\n' > isodir-res/boot/grub/grub.cfg
+	grub-mkrescue -o $@ isodir-res 2>/dev/null
+
+# ---- Test build: the Intel graphics probe pointed at QEMU's standard VGA (vendor
+# 1234) with a forced generation, so the PCI/BAR/MMIO/report code runs without an
+# Intel GPU. tests/headless/test_i915_probe.py
+build-i915/i915.o: src/i915.c $(HEADERS)
+	mkdir -p build-i915
+	$(CC) $(CFLAGS) -DI915_TEST_VENDOR=0x1234 -DI915_TEST_GEN=9 -c $< -o $@
+kanarchy-i915test.bin: $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o build-i915/i915.o linker-high.ld
+	$(LD) $(LDFLAGS_HIGH) -o $@ $(ASM_OBJ) $(COMMON_OBJ) $(filter-out src/i915.o,$(DESKTOP_OBJ)) src/desktop.o build-i915/i915.o
+kanarchy-i915test.iso: kanarchy-i915test.bin
+	rm -rf isodir-i915
+	mkdir -p isodir-i915/boot/grub
+	cp kanarchy-i915test.bin isodir-i915/boot/kanarchy.bin
+	printf 'set timeout=0\nset default=0\n\nmenuentry "KAnarchy OS" {\n    set gfxpayload=1920x1080x32\n    multiboot /boot/kanarchy.bin\n    boot\n}\n' > isodir-i915/boot/grub/grub.cfg
+	grub-mkrescue -o $@ isodir-i915 2>/dev/null

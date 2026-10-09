@@ -13,7 +13,7 @@
 static uint32_t page_directory[1024] __attribute__((aligned(4096)));
 // 32 tables for high kernel map (0–128M phys), 1 for low 0-1M window,
 // up to 4 for framebuffer+MMIO, spares for paging_map/paging_map_user
-static uint32_t page_tables[96][1024] __attribute__((aligned(4096)));
+static uint32_t page_tables[112][1024] __attribute__((aligned(4096)));
 static int pt_count = 0;
 
 extern uint32_t boot_pd[1024];
@@ -21,7 +21,7 @@ extern uint32_t boot_pd[1024];
 // Map one 4MB phys window at an explicit PD index (high kernel map)
 static void map_4mb_at(uint32_t phys_base, uint32_t pd_index, uint32_t flags) {
     if (page_directory[pd_index] & 0x01) return;
-    if (pt_count >= 96) return;
+    if (pt_count >= 112) return;
 
     uint32_t* pt = page_tables[pt_count];
     uint32_t pt_phys = V2P((uint32_t)pt);
@@ -54,7 +54,7 @@ int pat_init(void) {
 }
 int pat_enabled(void) { return pat_ok; }
 
-void paging_init(uint32_t framebuffer_addr) {
+void paging_init(uint32_t framebuffer_addr, uint32_t fb_bytes) {
     for (int i = 0; i < 1024; i++) page_directory[i] = 0;
 
     // Full low identity 0-128M (supervisor) + high kernel alias of the same.
@@ -63,7 +63,7 @@ void paging_init(uint32_t framebuffer_addr) {
     // Per-process user isolation (clearing low PD 1-767) is Priority 3.
     for (uint32_t addr = 0; addr < 0x08000000; addr += 0x00400000) {
         uint32_t pd = addr >> 22;
-        if (pt_count < 96) {
+        if (pt_count < 112) {
             uint32_t* pt = page_tables[pt_count];
             uint32_t pt_phys = V2P((uint32_t)pt);
             for (int i = 0; i < 1024; i++)
@@ -104,7 +104,11 @@ void paging_init(uint32_t framebuffer_addr) {
         // built for. PAT=WC overrides an MTRR of UC.
         uint32_t fbf = pat_init() ? 0x0B : 0x03;
         uint32_t fb_base = framebuffer_addr & 0xFFC00000;
-        for (int i = 0; i < 3; i++) {
+        // 4MB windows covering the whole frame buffer (at least 3 = 12MB, the old fixed size)
+        uint32_t nwin = ((framebuffer_addr & 0x003FFFFF) + fb_bytes + 0x003FFFFF) >> 22;
+        if (nwin < 3) nwin = 3;
+        if (nwin > 12) nwin = 12;
+        for (uint32_t i = 0; i < nwin; i++) {
             uint32_t base = fb_base + i * 0x00400000;
             if (!(page_directory[base >> 22] & 0x01))
                 map_4mb_at(base, base >> 22, fbf);

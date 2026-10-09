@@ -36,3 +36,9 @@ tests/web/corpus/
 tests/web/out/
 isodir-x2/
 build-x2/
+isodir-res/
+build-res/
+kanarchy-res.*
+isodir-i915/
+build-i915/
+kanarchy-i915test.*
