@@ -93,6 +93,10 @@ struct process {
     // a thread with no saved image starts from FNINIT.
     uint8_t fpu_state[108];
     uint32_t fpu_valid;
+    // Full FP/SSE context (FXSAVE image: x87 + MXCSR + XMM0-7), 16-aligned by
+    // the attribute. Replaces fpu_state above on CPUs with FXSR (see fpu.c);
+    // fpu_valid covers both.
+    uint8_t fx_state[512] __attribute__((aligned(16)));
 };
 
 // Initialize the process table

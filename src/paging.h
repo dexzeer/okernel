@@ -7,6 +7,11 @@
 // private) plus framebuffer/MMIO supervisor mappings
 void paging_init(uint32_t framebuffer_addr);
 
+// Program the page attribute table (entry 1 = write-combining) on the calling
+// CPU. Returns 0 on CPUs without a PAT. Every CPU must call it (smp.c does).
+int pat_init(void);
+int pat_enabled(void);
+
 // Map a physical address into the kernel high MMIO window (returns HIGH
 // virtual address, never phys)
 void* paging_map(uint32_t phys_addr);

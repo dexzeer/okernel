@@ -1,4 +1,5 @@
 #include "graphics.h"
+#include "simd.h"
 #include "cursor.h"
 #include "memory.h"
 #include "memlayout.h"
@@ -23,8 +24,25 @@ static uint8_t* framebuffer = 0;
 static uint32_t fb_pitch = 0;
 static uint32_t* backbuffer = 0;
 
-// Dirty row tracking
-static uint8_t* dirty_rows = 0;
+// Damage tracking. Per row, the dirty span [dx0, dx1) (clean when dx0 >= dx1:
+// the idle encoding is dx0 = SCREEN_W, dx1 = 0, so min/max updates just work),
+// plus the row range that may hold damage, so a flush with nothing to do is O(1)
+// (it used to scan 1080 flags on every main-loop spin: 2/3 of all cycles while a
+// page was loading) and a flush with damage copies only the touched columns.
+static int16_t* dx0 = 0;
+static int16_t* dx1 = 0;
+static int dirty_ylo = SCREEN_H, dirty_yhi = 0;      // rows [lo, hi) may be dirty
+
+static inline void mark_span(int y, int xa, int xb) {
+    if (xa < dx0[y]) dx0[y] = (int16_t)xa;
+    if (xb > dx1[y]) dx1[y] = (int16_t)xb;
+    if (y < dirty_ylo) dirty_ylo = y;
+    if (y >= dirty_yhi) dirty_yhi = y + 1;
+}
+static void mark_all(void) {
+    for (int y = 0; y < SCREEN_H; y++) { dx0[y] = 0; dx1[y] = SCREEN_W; }
+    dirty_ylo = 0; dirty_yhi = SCREEN_H;
+}
 
 // Clip rectangle
 static int clip_x0 = 0, clip_y0 = 0, clip_x1 = SCREEN_W, clip_y1 = SCREEN_H;
@@ -366,6 +384,9 @@ void graphics_init(uint32_t mboot_phys) {
         // use the PHYS address directly, NOT paging_map's MMIO window
         // (that double-maps 0xFD000000 -> 0xC8000000+ and the flush wrote to
         // the wrong window = black 640x480 screendump despite 1080p mode).
+        if (fb >> 32)
+            serial_printf("[gfx] framebuffer at %x:%x is above 4GB; this 32-bit kernel cannot map it\n",
+                          (uint32_t)(fb >> 32), (uint32_t)fb);
         framebuffer = (uint8_t*)(uint32_t)fb;
         fb_pitch = *(volatile uint32_t*)(mboot_phys + 96);
         serial_printf("[gfx] using identity FB %x pitch=%d\n",
@@ -376,14 +397,15 @@ void graphics_init(uint32_t mboot_phys) {
     }
 
     backbuffer = (uint32_t*)kmalloc(SCREEN_W * SCREEN_H * sizeof(uint32_t));
-    dirty_rows = (uint8_t*)kmalloc(SCREEN_H * sizeof(uint8_t));
-    if (!backbuffer || !dirty_rows) {
+    dx0 = (int16_t*)kmalloc(SCREEN_H * sizeof(int16_t));
+    dx1 = (int16_t*)kmalloc(SCREEN_H * sizeof(int16_t));
+    if (!backbuffer || !dx0 || !dx1) {
         serial_puts("[gfx] backbuffer alloc failed\n");
         return;
     }
 
     for (int i = 0; i < SCREEN_W * SCREEN_H; i++) backbuffer[i] = 0;
-    for (int i = 0; i < SCREEN_H; i++) dirty_rows[i] = 1;
+    mark_all();
 }
 
 void graphics_set_clip(int x, int y, int w, int h) {
@@ -408,7 +430,7 @@ void graphics_clip_reset(void) {
 void putpixel(int x, int y, uint32_t color) {
     if (x >= clip_x0 && x < clip_x1 && y >= clip_y0 && y < clip_y1) {
         backbuffer[y * SCREEN_W + x] = color;
-        dirty_rows[y] = 1;
+        mark_span(y, x, x + 1);
     }
 }
 
@@ -424,7 +446,7 @@ void rect_fill(int x, int y, int w, int h, uint32_t color) {
     int y1 = y + h < clip_y1 ? y + h : clip_y1;
     if (x0 >= x1 || y0 >= y1) return;
     for (int j = y0; j < y1; j++) {
-        dirty_rows[j] = 1;
+        mark_span(j, x0, x1);
         fill32(backbuffer + j * SCREEN_W + x0, color, x1 - x0);
     }
 }
@@ -462,7 +484,7 @@ void hline(int x, int y, int len, uint32_t color) {
     if (x + len > clip_x1) len = clip_x1 - x;
     if (len <= 0) return;
     fill32(backbuffer + y * SCREEN_W + x, color, len);
-    dirty_rows[y] = 1;
+    mark_span(y, x, x + len);
 }
 
 void vline(int x, int y, int len, uint32_t color) {
@@ -673,7 +695,7 @@ void draw_char_sized(int x, int y, char c, uint32_t fg, uint32_t bg, int tw, int
     int ix1 = x + tw < clip_x1 ? x + tw : clip_x1;
     int iy1 = y + th < clip_y1 ? y + th : clip_y1;
     if (ix0 >= ix1 || iy0 >= iy1) return;
-    for (int yy = iy0; yy < iy1; yy++) dirty_rows[yy] = 1;
+    for (int yy = iy0; yy < iy1; yy++) mark_span(yy, ix0, ix1);
     if (tw == gw && th == gh) {
         // 1:1 native blit (all 16x32 chrome text): raw bitmap copy.
         for (int row = iy0 - y; row < iy1 - y; row++) {
@@ -783,7 +805,7 @@ void draw_char_cell(int x, int y, char c, uint32_t fg, uint32_t bg,
         int ix1 = x + tw < clip_x1 ? x + tw : clip_x1;
         int iy1 = y + th < clip_y1 ? y + th : clip_y1;
         if (ix0 < ix1 && iy0 < iy1) {
-            for (int yy = iy0; yy < iy1; yy++) dirty_rows[yy] = 1;
+            for (int yy = iy0; yy < iy1; yy++) mark_span(yy, ix0, ix1);
             for (int row = iy0 - y; row < iy1 - y; row++) {
                 uint32_t* dst = backbuffer + (y + row) * SCREEN_W + ix0;
                 for (int col = ix0 - x; col < ix1 - x; col++) {
@@ -810,7 +832,14 @@ void draw_char_cell(int x, int y, char c, uint32_t fg, uint32_t bg,
 uint32_t* graphics_get_buffer(void) { return backbuffer; }
 
 void graphics_mark_dirty(int y) {
-    if (y >= 0 && y < SCREEN_H) dirty_rows[y] = 1;
+    if (y >= 0 && y < SCREEN_H) mark_span(y, 0, SCREEN_W);
+}
+
+void graphics_mark_rect(int x, int y, int w, int h) {
+    int xa = x < 0 ? 0 : x, ya = y < 0 ? 0 : y;
+    int xb = x + w > SCREEN_W ? SCREEN_W : x + w, yb = y + h > SCREEN_H ? SCREEN_H : y + h;
+    if (xa >= xb) return;
+    for (int r = ya; r < yb; r++) mark_span(r, xa, xb);
 }
 
 void graphics_write_pixel(int x, int y, uint32_t color) {
@@ -826,9 +855,9 @@ void graphics_blit_pixels(int x, int y, const uint32_t* src, int w, int h, int s
     int y1 = y + h < clip_y1 ? y + h : clip_y1;
     if (x0 >= x1 || y0 >= y1) return;
     for (int j = y0; j < y1; j++) {
-        dirty_rows[j] = 1;
-        memcpy(backbuffer + j * SCREEN_W + x0, src + (j - y) * stride + (x0 - x),
-               (uint32_t)(x1 - x0) * 4);
+        mark_span(j, x0, x1);
+        simd_copy(backbuffer + j * SCREEN_W + x0, src + (j - y) * stride + (x0 - x),
+                  (uint32_t)(x1 - x0) * 4);
     }
 }
 
@@ -852,10 +881,11 @@ void graphics_blit_rect(int sx, int sy, int w, int h, int dx, int dy) {
         // handles the same-row overlap (dx != 0, dy == 0)
         int xs = x0 > -dx ? x0 : -dx;
         int xe = x1 < SCREEN_W - dx ? x1 : SCREEN_W - dx;
-        if (xs < xe)
+        if (xs < xe) {
             memmove(backbuffer + ny * SCREEN_W + xs + dx, backbuffer + y * SCREEN_W + xs,
                     (unsigned)(xe - xs) * 4);
-        dirty_rows[ny] = 1;
+            mark_span(ny, xs + dx, xe + dx);
+        }
     }
 }
 
@@ -899,8 +929,8 @@ const uint32_t* graphics_wallpaper(void) { return wallpaper_cached ? cached_wall
 
 void graphics_blit_wallpaper(void) {
     if (!wallpaper_cached || !cached_wallpaper) return;
-    memcpy(backbuffer, cached_wallpaper, SCREEN_W * SCREEN_H * 4);
-    for (int y = 0; y < SCREEN_H; y++) dirty_rows[y] = 1;
+    simd_copy(backbuffer, cached_wallpaper, SCREEN_W * SCREEN_H * 4);
+    mark_all();
 }
 
 void graphics_blit_wallpaper_rect(int x, int y, int w, int h) {
@@ -911,9 +941,9 @@ void graphics_blit_wallpaper_rect(int x, int y, int w, int h) {
     if (y + h > SCREEN_H) h = SCREEN_H - y;
     if (w <= 0 || h <= 0) return;
     for (int yy = y; yy < y + h; yy++) {
-        memcpy(backbuffer + yy * SCREEN_W + x, cached_wallpaper + yy * SCREEN_W + x,
-               (unsigned)w * 4);
-        dirty_rows[yy] = 1;
+        simd_copy(backbuffer + yy * SCREEN_W + x, cached_wallpaper + yy * SCREEN_W + x,
+                  (unsigned)w * 4);
+        mark_span(yy, x, x + w);
     }
 }
 
@@ -921,39 +951,74 @@ void graphics_fill(uint32_t color) {
     for (int y = 0; y < SCREEN_H; y++) {
         uint32_t* dst = backbuffer + y * SCREEN_W;
         for (int x = 0; x < SCREEN_W; x++) dst[x] = color;
-        dirty_rows[y] = 1;
     }
+    mark_all();
 }
 
 uint8_t* graphics_fb_base(void) { return framebuffer; }
 int graphics_fb_pitch(void) { return (int)fb_pitch; }
 
-// Copy dirty backbuffer rows to the framebuffer. Runs of dirty rows go out
-// as one memcpy (packed pitch) in chunks of <= FLUSH_CHUNK rows with
-// interrupts off; after each chunk the cursor (which lives only on the
-// framebuffer, cursor.c) is re-blended over the rows just copied. The mouse
+// Copy the damaged part of the backbuffer to the framebuffer. Runs of dirty rows
+// (at most FLUSH_CHUNK at a time, copied with interrupts off) go out as the union
+// of their dirty column spans; after each chunk the cursor (which lives only on
+// the framebuffer, cursor.c) is re-blended over the rows just copied. The mouse
 // IRQ moves the cursor between chunks, never inside one.
 #define FLUSH_CHUNK 48
 void graphics_flush(void) {
     if (!framebuffer || !backbuffer) return;
-    for (int y = 0; y < SCREEN_H; y++) {
-        if (!dirty_rows[y]) continue;
+    if (dirty_yhi <= dirty_ylo) return;                 // nothing to do: O(1)
+    int yend = dirty_yhi;
+    for (int y = dirty_ylo; y < yend; y++) {
+        if (dx0[y] >= dx1[y]) continue;
+        int xa = dx0[y], xb = dx1[y];
         int y1 = y + 1;
-        while (y1 < SCREEN_H && y1 - y < FLUSH_CHUNK && dirty_rows[y1]) y1++;
+        while (y1 < yend && y1 - y < FLUSH_CHUNK && dx0[y1] < dx1[y1]) {
+            if (dx0[y1] < xa) xa = dx0[y1];
+            if (dx1[y1] > xb) xb = dx1[y1];
+            y1++;
+        }
         uint32_t fl;
         __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
-        if (fb_pitch == SCREEN_W * 4) {
-            memcpy(framebuffer + y * fb_pitch, backbuffer + y * SCREEN_W,
-                   (unsigned)(y1 - y) * SCREEN_W * 4);
+        if (xa == 0 && xb == SCREEN_W && fb_pitch == SCREEN_W * 4) {
+            simd_copy_stream(framebuffer + y * fb_pitch, backbuffer + y * SCREEN_W,
+                             (unsigned)(y1 - y) * SCREEN_W * 4);
         } else {
             for (int r = y; r < y1; r++)
-                memcpy(framebuffer + r * fb_pitch, backbuffer + r * SCREEN_W, SCREEN_W * 4);
+                simd_copy_stream(framebuffer + r * fb_pitch + xa * 4, backbuffer + r * SCREEN_W + xa,
+                                 (unsigned)(xb - xa) * 4);
         }
-        for (int r = y; r < y1; r++) dirty_rows[r] = 0;
+        for (int r = y; r < y1; r++) { dx0[r] = SCREEN_W; dx1[r] = 0; }
         cursor_fb_repair(y, y1);
         if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
         y = y1 - 1;
     }
+    dirty_ylo = SCREEN_H;
+    dirty_yhi = 0;
+}
+
+int graphics_verify(int* fx, int* fy) {
+    if (fx) *fx = -1;
+    if (fy) *fy = -1;
+    if (!framebuffer || !backbuffer) return 0;
+    graphics_flush();
+    int bad = 0;
+    for (int y = 0; y < SCREEN_H; y++) {
+        uint32_t fl;
+        __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
+        int cx0 = 0, cy0 = 0, cx1 = 0, cy1 = 0;
+        int has = cursor_rect(&cx0, &cy0, &cx1, &cy1) && y >= cy0 && y < cy1;
+        const uint32_t* f = (const uint32_t*)(framebuffer + y * fb_pitch);
+        const uint32_t* b = backbuffer + y * SCREEN_W;
+        for (int x = 0; x < SCREEN_W; x++) {
+            if (has && x >= cx0 && x < cx1) continue;
+            if ((f[x] & 0xFFFFFF) != (b[x] & 0xFFFFFF)) {
+                if (!bad && fx) { *fx = x; if (fy) *fy = y; }
+                bad++;
+            }
+        }
+        if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
+    }
+    return bad;
 }
 
 void graphics_draw_bitmap(int x, int y, const uint8_t* bitmap, int bmp_w, int bmp_h, uint32_t fg, uint32_t bg, int scale) {

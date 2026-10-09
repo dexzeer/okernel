@@ -27,7 +27,7 @@ foreach ($case in @(@{iso="kanarchy-x2apic.iso"; mode="x2APIC"}, @{iso="kanarchy
     $self = if ($case.iso -like "*x2apic*") { $text -match "smp selftest: ALL OK" } else { $true }
     $pass = ($mode -eq $case.mode) -and ($run -eq $Cpus) -and (-not $fault) -and (-not $exc) -and $self
     Write-Host ("{0}: mode={1} cpus={2} fault={3} exception={4} selftest={5} -> {6}" -f $case.iso,$mode,$run,$fault,$exc,$self,$(if ($pass) {"PASS"} else {"FAIL"}))
-    Get-Content $log | Select-String "\[smp\] [A-E] |speedup|selftest" | ForEach-Object { "    " + $_.Line }
+    Get-Content $log | Select-String "\[smp\] [A-F] |speedup|selftest" | ForEach-Object { "    " + $_.Line }
     if (-not $pass) { $ok = $false }
 }
 if ($ok) { Write-Host "SMP_WHPX PASS"; exit 0 } else { Write-Host "SMP_WHPX FAIL"; exit 1 }
