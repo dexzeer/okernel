@@ -53,6 +53,10 @@ class OkVM:
             cmd += ["-device", "e1000,netdev=net0", "-netdev", "user,id=net0"]
             if os.environ.get("OKVM_PCAP"):   # packet capture: ~/okvm/<tag>.pcap
                 cmd += ["-object", f"filter-dump,id=dump0,netdev=net0,file={os.path.join(OUTDIR, tag + '.pcap')}"]
+        if os.environ.get("OKVM_CPU"):  # e.g. OKVM_CPU=max (x2APIC, SSE4, ...)
+            cmd += ["-cpu", os.environ["OKVM_CPU"]]
+        if os.environ.get("OKVM_SMP"):  # e.g. OKVM_SMP=4 or 4,cores=2,threads=2
+            cmd += ["-smp", os.environ["OKVM_SMP"]]
         if disk:  # raw ATA disk image for the persistent-FS layer
             cmd += ["-hda", disk]
         if os.environ.get("OKVM_TRACE"):  # QEMU trace events, e.g. OKVM_TRACE='ps2_*,serial_write' -> ~/okvm/<tag>.trace

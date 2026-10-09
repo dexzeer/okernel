@@ -33,6 +33,8 @@
 #include "pfs.h"
 #include "ata.h"
 #include "userland_seed.h"
+#include "acpi.h"
+#include "smp.h"
 
 struct mboot_info {
     uint32_t flags;
@@ -592,6 +594,15 @@ static void shell_execute_run(int win_id, const char *rest) {
 
 static void shell_execute(int win_id, const char* input);
 
+// smp output: one line to the terminal and to the serial log.
+struct smp_out { int win; };
+static void smp_out_line(const char* line, void* ud) {
+    struct smp_out* o = (struct smp_out*)ud;
+    serial_printf("[smp] %s\n", line);
+    window_puts(o->win, line);
+    window_put_char(o->win, '\n');
+}
+
 // Int to string helper
 static void put_uint(char* buf, uint32_t val) {
     if (val == 0) { buf[0] = '0'; buf[1] = 0; return; }
@@ -900,6 +911,12 @@ static void shell_execute(int win_id, const char* input) {
             int rc = pfs_sync_file(args);
             window_puts(win_id, rc == 0 ? "saved to disk\n" : "save FAILED\n");
         }
+    }
+    else if (str_eq(cmd_buf, "smp")) {
+        // "smp" lists the CPUs; "smp test" runs the job-system self test.
+        struct smp_out o = { win_id };
+        if (str_eq(args, "test")) smp_selftest(smp_out_line, &o);
+        else smp_describe(smp_out_line, &o);
     }
     else if (str_eq(cmd_buf, "locktest")) {
         // Exercise spinlock/mutex primitives (no SMP needed) — serial PASS/FAIL.
@@ -1336,6 +1353,7 @@ void kernel_main(uint32_t mboot_phys) {
     // live at phys 1M-14M. process_init's first .bss touch faults without
     // the full map (CR2=0xC0xxxxxx class, e=0002). FB addr 0 = still map.
     paging_init(fb_addr);
+    acpi_init(mboot_phys);   // needs the paging windows; reads GRUB's memory map
     process_init();
 
     // Syscall ABI hooks (syscall.c is COMMON so text links too; the
@@ -1443,6 +1461,10 @@ void kernel_main(uint32_t mboot_phys) {
     outb(0x43, 0x36);            // channel 0, mode 3, 16-bit binary
     outb(0x40, 0x9C);            // divisor lo  (1193182 / 100 = 11932 = 0x2E9C)
     outb(0x40, 0x2E);            // divisor hi
+
+    // Wake the other CPUs (they only run smp_parallel_for jobs). Interrupts are
+    // still off; the PIT is programmed, so the boot CPU's tick is unaffected.
+    smp_init();
 
     // Create main terminal: a plain shell, just the prompt (no banner).
     // 72x24 cells (12x24 content glyphs), left of the wallpaper emblem and

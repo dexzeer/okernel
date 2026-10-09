@@ -1,6 +1,7 @@
 #include "memory.h"
 #include "memlayout.h"
 #include "serial.h"
+#include "spinlock.h"
 #include <stdint.h>
 
 // Multiboot header flags
@@ -27,6 +28,21 @@ static uint8_t bitmap[BITMAP_SIZE];
 
 static uint32_t total_pages = 0;
 static uint32_t used_pages = 0;
+
+// Locks for SMP: the other CPUs run jobs that may call kmalloc/kfree. IRQs go
+// off first so an interrupt handler on the same CPU cannot spin on a lock its
+// own interrupted code holds.
+static spinlock_t pmm_lock = SPINLOCK_INIT;
+static spinlock_t heap_lock = SPINLOCK_INIT;
+
+static inline uint32_t irq_save(void) {
+    uint32_t f;
+    __asm__ volatile("pushfl; popl %0; cli" : "=r"(f) :: "memory");
+    return f;
+}
+static inline void irq_restore(uint32_t f) {
+    __asm__ volatile("pushl %0; popfl" :: "r"(f) : "memory", "cc");
+}
 
 static void bitmap_set(uint32_t page) {
     bitmap[page / 8] |= (1 << (page % 8));
@@ -147,22 +163,32 @@ void memory_init(uint32_t mboot_phys) {
 }
 
 uint32_t pmm_alloc_page(void) {
+    uint32_t fl = irq_save();
+    spin_lock(&pmm_lock);
     for (uint32_t i = 0; i < total_pages; i++) {
         if (!bitmap_test(i)) {
             bitmap_set(i);
             used_pages++;
+            spin_unlock(&pmm_lock);
+            irq_restore(fl);
             return i * PAGE_SIZE;
         }
     }
+    spin_unlock(&pmm_lock);
+    irq_restore(fl);
     return 0; // Out of memory
 }
 
 void pmm_free_page(uint32_t addr) {
     uint32_t page = addr / PAGE_SIZE;
+    uint32_t fl = irq_save();
+    spin_lock(&pmm_lock);
     if (page < total_pages && bitmap_test(page)) {
         bitmap_clear(page);
         used_pages--;
     }
+    spin_unlock(&pmm_lock);
+    irq_restore(fl);
 }
 
 uint32_t pmm_get_total_pages(void) { return total_pages; }
@@ -208,15 +234,6 @@ static uint32_t heap_used = 0, heap_peak = 0;
 
 #define HB_SIZE(b) ((b)->size & ~15u)
 #define HB_NEXT_BLK(b) ((struct hblock*)((uint8_t*)(b) + HB_SIZE(b)))
-
-static inline uint32_t irq_save(void) {
-    uint32_t f;
-    __asm__ volatile("pushfl; popl %0; cli" : "=r"(f) :: "memory");
-    return f;
-}
-static inline void irq_restore(uint32_t f) {
-    __asm__ volatile("pushl %0; popfl" :: "r"(f) : "memory", "cc");
-}
 
 static int hb_bin(uint32_t sz) {
     // sz >= 32. Classes: exact 16-byte steps up to 256, then 4 per power of 2.
@@ -301,10 +318,10 @@ void* kmalloc(uint32_t size) {
     uint32_t need = (size + HB_HDR + HB_ALIGN - 1) & ~(HB_ALIGN - 1);
     if (need < HB_MIN) need = HB_MIN;
 
-    uint32_t fl = irq_save();
+    uint32_t fl = irq_save(); spin_lock(&heap_lock);
     struct hblock* b = hb_find(need);
     if (!b) {
-        irq_restore(fl);
+        spin_unlock(&heap_lock); irq_restore(fl);
         serial_printf("[diag] kmalloc FAIL size=%u used=%u\n", size, heap_used);
         return 0;
     }
@@ -325,7 +342,7 @@ void* kmalloc(uint32_t size) {
     b->magic = HB_MAGIC_U;
     heap_used += HB_SIZE(b);
     if (heap_used > heap_peak) heap_peak = heap_used;
-    irq_restore(fl);
+    spin_unlock(&heap_lock); irq_restore(fl);
     return (uint8_t*)b + HB_HDR;
 }
 
@@ -345,9 +362,9 @@ uint32_t ksize(void* ptr) {
 
 void kfree(void* ptr) {
     if (!ptr) return;
-    uint32_t fl = irq_save();
+    uint32_t fl = irq_save(); spin_lock(&heap_lock);
     if (!hb_valid(ptr)) {
-        irq_restore(fl);
+        spin_unlock(&heap_lock); irq_restore(fl);
         serial_printf("[diag] kfree: bad or double free %x\n", (uint32_t)ptr);
         return;
     }
@@ -374,7 +391,7 @@ void kfree(void* ptr) {
         b = p;
     }
     hb_insert(b);
-    irq_restore(fl);
+    spin_unlock(&heap_lock); irq_restore(fl);
 }
 
 void* kcalloc(uint32_t n, uint32_t size) {
@@ -405,7 +422,7 @@ void* krealloc(void* ptr, uint32_t size) {
 
 void heap_stats(uint32_t* total, uint32_t* used, uint32_t* peak, uint32_t* largest_free) {
     if (heap_start == 0) heap_init();
-    uint32_t fl = irq_save();
+    uint32_t fl = irq_save(); spin_lock(&heap_lock);
     if (total) *total = heap_end - heap_start;
     if (used) *used = heap_used;
     if (peak) *peak = heap_peak;
@@ -416,5 +433,5 @@ void heap_stats(uint32_t* total, uint32_t* used, uint32_t* peak, uint32_t* large
                 if (HB_SIZE(b) > big) big = HB_SIZE(b);
         *largest_free = big;
     }
-    irq_restore(fl);
+    spin_unlock(&heap_lock); irq_restore(fl);
 }

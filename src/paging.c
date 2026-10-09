@@ -2,6 +2,7 @@
 #include "memlayout.h"
 #include "memory.h"
 #include "serial.h"
+#include "lapic.h"
 #include <stdint.h>
 
 // High-half kernel page tables. The kernel links at 0xC0100000 (phys 1MB),
@@ -12,7 +13,7 @@
 static uint32_t page_directory[1024] __attribute__((aligned(4096)));
 // 32 tables for high kernel map (0–128M phys), 1 for low 0-1M window,
 // up to 4 for framebuffer+MMIO, spares for paging_map/paging_map_user
-static uint32_t page_tables[80][1024] __attribute__((aligned(4096)));
+static uint32_t page_tables[96][1024] __attribute__((aligned(4096)));
 static int pt_count = 0;
 
 extern uint32_t boot_pd[1024];
@@ -20,7 +21,7 @@ extern uint32_t boot_pd[1024];
 // Map one 4MB phys window at an explicit PD index (high kernel map)
 static void map_4mb_at(uint32_t phys_base, uint32_t pd_index, uint32_t flags) {
     if (page_directory[pd_index] & 0x01) return;
-    if (pt_count >= 80) return;
+    if (pt_count >= 96) return;
 
     uint32_t* pt = page_tables[pt_count];
     uint32_t pt_phys = V2P((uint32_t)pt);
@@ -47,7 +48,7 @@ void paging_init(uint32_t framebuffer_addr) {
     // Per-process user isolation (clearing low PD 1-767) is Priority 3.
     for (uint32_t addr = 0; addr < 0x08000000; addr += 0x00400000) {
         uint32_t pd = addr >> 22;
-        if (pt_count < 80) {
+        if (pt_count < 96) {
             uint32_t* pt = page_tables[pt_count];
             uint32_t pt_phys = V2P((uint32_t)pt);
             for (int i = 0; i < 1024; i++)
@@ -94,6 +95,20 @@ void paging_init(uint32_t framebuffer_addr) {
         uint32_t base = 0xFEB80000 & 0xFFC00000;
         if (!(page_directory[base >> 22] & 0x01))
             map_4mb_at(base, base >> 22, 0x03);
+    }
+
+    // Local APIC + I/O APIC + HPET live in 0xFEC00000-0xFEFFFFFF. Uncached
+    // (PCD|PWT) and identity-mapped; done here, before any process exists, so
+    // every address space copies the entry. A relocated APIC base gets its own
+    // window.
+    {
+        uint32_t wins[2] = { 0xFEC00000u, lapic_phys_base() };
+        for (int i = 0; i < 2; i++) {
+            if (!wins[i]) continue;
+            uint32_t base = wins[i] & 0xFFC00000;
+            if (!(page_directory[base >> 22] & 0x01))
+                map_4mb_at(base, base >> 22, 0x1B);
+        }
     }
 
     // Switch from the boot PD (0-4M low+high) to the full map
