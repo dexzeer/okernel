@@ -114,6 +114,7 @@ struct funcinfo {
     int nparams;
     uint32_t flags;
     struct funcinfo* children;  // nested functions (compile order)
+    struct funcinfo* last_child;// its tail (a bundle's wrapper has tens of thousands)
     struct funcinfo* next_sibling;
     struct ftempl* tmpl;        // compiler output
     struct node* class_node;    // the class whose constructor / field initializer this is

@@ -85,7 +85,7 @@ static void comp_class(struct cfunc* c, struct node* cls, struct str* inferred) 
     ct->src_end = cls->end;
     // CLASS: [heritage?] -> [ctor, proto]
     op(c, OP_CLASS, has_heritage ? 1 : 2);
-    put16(c, add_const(c, jv_from_ptr(ct)));
+    put32(c, add_const(c, jv_from_ptr(ct)));
     put8(c, (uint32_t)has_heritage);
     // methods and accessors, computed keys in order
     i = 0;
@@ -150,7 +150,7 @@ static void comp_class(struct cfunc* c, struct node* cls, struct str* inferred) 
         struct ftempl* ft = compile_class_init(c, cls, holder->a->u.fn, 0, keydecls, methdecls);
         if (!ft) { c->failed = 1; return; }
         op8(c, OP_PICK, 0, 1);                        // home: proto
-        op16(c, OP_CLOSURE, add_const(c, jv_from_ptr(ft)), 1);
+        op32(c, OP_CLOSURE, add_const(c, jv_from_ptr(ft)), 1);
         op(c, OP_SET_HOME, -1);
         op(c, OP_CLASS_FIELDS, -1);                   // [ctor, proto, fn] -> [ctor, proto]
     }
@@ -159,7 +159,7 @@ static void comp_class(struct cfunc* c, struct node* cls, struct str* inferred) 
         struct ftempl* st = compile_class_init(c, cls, holder->b->u.fn, 1, keydecls, methdecls);
         if (!st) { c->failed = 1; return; }
         op8(c, OP_PICK, 1, 1);                        // home: ctor
-        op16(c, OP_CLOSURE, add_const(c, jv_from_ptr(st)), 1);
+        op32(c, OP_CLOSURE, add_const(c, jv_from_ptr(st)), 1);
         op(c, OP_SET_HOME, -1);                       // [ctor, proto, fn]
         op8(c, OP_PICK, 2, 1);                        // this = ctor
         op16(c, OP_CALL, 0, -1);
@@ -205,7 +205,7 @@ static void global_decls(struct cfunc* c, struct scope* s, int is_eval) {
     for (struct decl* d = s->decls; d; d = d->next) if (d->kind == D_VAR) v[k++] = jv_from_str(d->name);
     for (struct decl* d = s->decls; d; d = d->next) if (d->kind == D_FUNC && !(d->flags & DF_LEX_FUNC)) v[k++] = jv_from_str(d->name);
     names->elen = (uint32_t)k;
-    op16(c, OP_CHECK_GLOBAL_DECLS, add_const(c, jv_from_obj(names)), 0);
+    op32(c, OP_CHECK_GLOBAL_DECLS, add_const(c, jv_from_obj(names)), 0);
     // functions (the last declaration of a name wins), then vars, then lexical bindings
     for (struct decl* d = s->decls; d; d = d->next) {
         if (d->kind != D_FUNC || (d->flags & DF_LEX_FUNC) || !d->node) continue;

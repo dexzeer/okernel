@@ -109,6 +109,9 @@ ojsv    wjs_wrap(struct wjs* js, int node);      // OJS_NULL for -1
 int     wjs_node_of(struct wjs* js, ojsv v);
 int     wjs_grow_nodes(struct wjs* js);
 ojsv*   wjs_grow_roots(struct wjs* js, ojsv** arr, int cap, int nc);
+// wjs_sys.c: per-realm memory limit, and the kernel-reserve guard
+size_t  wjs_sys_realm_limit(void);
+int     wjs_sys_mem_ok(size_t bytes, void* ud);
 // DOM natives (wjs_dom.c): install on the natives object
 void    wjs_dom_install(struct wjs* js, ojsv natives);
 // mutation side effects (inserted subtree: scripts, styles, images)

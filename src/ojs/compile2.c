@@ -9,7 +9,7 @@ static struct scope* outer_scope(struct node* cls) {
 
 static void throw_err(struct cfunc* c, int kind, const char* msg) {
     op(c, OP_THROW_ERR, 0);
-    put16(c, atom_const(c, atom_cstr(c->J, msg)));
+    put32(c, atom_const(c, atom_cstr(c->J, msg)));
     put8(c, (uint32_t)kind);
 }
 
@@ -897,7 +897,7 @@ static void comp_function_node(struct cfunc* c, struct node* fn) {
     struct funcinfo* fi = fn->u.fn;
     struct ftempl* t = compile_func(c->J, c->P, fi, c);
     if (!t) { c->failed = 1; return; }
-    op16(c, OP_CLOSURE, add_const(c, jv_from_ptr(t)), 1);
+    op32(c, OP_CLOSURE, add_const(c, jv_from_ptr(t)), 1);
 }
 
 // Annex B.3.3: sloppy block functions that can also be vars of the function
@@ -1307,6 +1307,7 @@ static struct ftempl* finish_template(struct cfunc* c) {
     }
     ojs_sys_free(c->code);
     ojs_sys_free(c->consts);
+    ojs_sys_free(c->chash);
     ojs_sys_free(c->upv);
     ojs_sys_free(c->lines);
     fi->tmpl = t;

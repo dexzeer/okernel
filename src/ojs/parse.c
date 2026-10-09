@@ -868,13 +868,15 @@ static void rescope(struct node* n, struct scope* olds, struct scope* news,
                 fi->depth = newf->depth + 1;
                 // move from oldf->children to newf->children
                 struct funcinfo** pp = &oldf->children;
-                while (*pp && *pp != fi) pp = &(*pp)->next_sibling;
+                struct funcinfo* prev = 0;
+                while (*pp && *pp != fi) { prev = *pp; pp = &(*pp)->next_sibling; }
                 if (*pp) {
                     *pp = fi->next_sibling;
+                    if (oldf->last_child == fi) oldf->last_child = prev;
                     fi->next_sibling = 0;
-                    struct funcinfo** q = &newf->children;
-                    while (*q) q = &(*q)->next_sibling;
-                    *q = fi;
+                    if (newf->last_child) newf->last_child->next_sibling = fi;
+                    else newf->children = fi;
+                    newf->last_child = fi;
                 }
             }
             if (fi->param_scope && fi->param_scope->parent == olds) fi->param_scope->parent = news;

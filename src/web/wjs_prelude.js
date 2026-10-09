@@ -312,6 +312,7 @@ const Comment = sub('Comment', CharacterData, function Comment(data) {
     return W.createComment(data === undefined ? '' : String(data));
 });
 const CDATASection = sub('CDATASection', Text);
+sub('ProcessingInstruction', CharacterData);   // never created from HTML; feature checks read its prototype
 const Element = sub('Element', Node);
 const DocumentFragment = sub('DocumentFragment', Node, function DocumentFragment() {
     if (!new.target) illegal();
@@ -1032,6 +1033,14 @@ G.Image = function Image(w, h) {
     return img;
 };
 G.Image.prototype = HI;
+G.Audio = function Audio(src) {
+    if (!new.target) illegal();
+    const a = document.createElement('audio');
+    a.setAttribute('preload', 'auto');
+    if (src !== undefined) a.src = src;
+    return a;
+};
+G.Audio.prototype = HTMLAudioElement.prototype;
 
 // forms
 function controlValue(el) {
@@ -2258,9 +2267,14 @@ const navigator = {
     connection: { effectiveType: '3g', downlink: 1, rtt: 300, saveData: false, addEventListener() {}, removeEventListener() {} },
     userActivation: { hasBeenActive: true, isActive: false },
     locks: { request(name, opts, cb) { cb = typeof opts === 'function' ? opts : cb; return Promise.resolve().then(() => cb({ name })); } },
-    getBattery() { return Promise.reject(new DOMException('not supported', 'NotSupportedError')); },
+    getBattery() { return Promise.resolve(battery); },   // a desktop: on mains power
     getGamepads() { return []; }
 };
+const BatteryManager = sub('BatteryManager', EventTarget);
+const battery = Object.create(BatteryManager.prototype);
+for (const [k, v] of [['charging', true], ['chargingTime', 0], ['dischargingTime', Infinity], ['level', 1]])
+    accessor(BatteryManager.prototype, k, function () { return v; });
+for (const k of ['onchargingchange', 'onchargingtimechange', 'ondischargingtimechange', 'onlevelchange']) battery[k] = null;
 const screen = { width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, availLeft: 0, availTop: 0,
     colorDepth: 24, pixelDepth: 24, orientation: { type: 'landscape-primary', angle: 0, addEventListener() {}, removeEventListener() {} } };
 const performance = Object.assign(new EventTarget(), {

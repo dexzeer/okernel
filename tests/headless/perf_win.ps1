@@ -32,7 +32,7 @@ $p = Start-Process -FilePath $Qemu -ArgumentList $qargs -PassThru -WindowStyle H
 
 function Send-Keys([string]$s) {
     $map = @{ ' '='spc'; '/'='slash'; '.'='dot'; ':'='shift-semicolon'; '-'='minus'; "`n"='ret';
-              '='='equal'; '_'='shift-minus'; '?'='shift-slash'; '&'='shift-7'; '%'='shift-5'; "`e"='esc' }
+              '='='equal'; '_'='shift-minus'; '?'='shift-slash'; '&'='shift-7'; '%'='shift-5'; ([string][char]27)='esc' }   # ESC: "`e" is only an escape in PowerShell 7 (5.1 reads a plain e)
     $c = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $Port)
     $w = New-Object System.IO.StreamWriter($c.GetStream())
     foreach ($ch in $s.ToCharArray()) {
@@ -68,7 +68,7 @@ try {
     $act = [regex]'\[okai\] (fetch|sub-res)|\[tls-net\]|\[http\]|parse: count='
     foreach ($u in $Urls) {
         $pos = (Read-Log).Length
-        Send-Keys "`e"; Start-Sleep -Milliseconds 200   # Esc: leave any focused page field
+        Send-Keys ([string][char]27); Start-Sleep -Milliseconds 200   # Esc: leave any focused page field
         Send-Keys "g"; Start-Sleep -Milliseconds 400
         Send-Keys ($u + "`n")
         $nav = $null; $doc = $null; $rend = $null; $last = [DateTime]::Now; $buf = ""; $fetches = 0

@@ -106,7 +106,7 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         [OP_NOP] = &&L_OP_NOP, [OP_DEBUGGER] = &&L_OP_DEBUGGER, [OP_NOP_END] = &&L_OP_NOP_END,
         [OP_LINE] = &&L_OP_LINE, [OP_UNDEF] = &&L_OP_UNDEF, [OP_NULL_] = &&L_OP_NULL_, [OP_TRUE_] = &&L_OP_TRUE_,
         [OP_FALSE_] = &&L_OP_FALSE_, [OP_HOLE] = &&L_OP_HOLE, [OP_INT8] = &&L_OP_INT8, [OP_INT32] = &&L_OP_INT32,
-        [OP_CONST] = &&L_OP_CONST, [OP_DUP] = &&L_OP_DUP, [OP_DUP2] = &&L_OP_DUP2, [OP_POP] = &&L_OP_POP,
+        [OP_CONST] = &&L_OP_CONST, [OP_CONST_W] = &&L_OP_CONST_W, [OP_DUP] = &&L_OP_DUP, [OP_DUP2] = &&L_OP_DUP2, [OP_POP] = &&L_OP_POP,
         [OP_SWAP] = &&L_OP_SWAP, [OP_ROT3L] = &&L_OP_ROT3L, [OP_ROT3R] = &&L_OP_ROT3R, [OP_ROT4R] = &&L_OP_ROT4R,
         [OP_PICK] = &&L_OP_PICK, [OP_NIP] = &&L_OP_NIP, [OP_INSERT] = &&L_OP_INSERT, [OP_GET_LOC] = &&L_OP_GET_LOC,
         [OP_SET_LOC] = &&L_OP_SET_LOC, [OP_PUT_LOC] = &&L_OP_PUT_LOC, [OP_INIT_LOC] = &&L_OP_INIT_LOC,
@@ -192,6 +192,7 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         case OP_INT8: L_OP_INT8: PUSH(jv_from_int((int8_t)*pc)); pc++; break;
         case OP_INT32: L_OP_INT32: PUSH(jv_from_int((int32_t)rd32(pc))); pc += 4; break;
         case OP_CONST: L_OP_CONST: PUSH(consts[rd16(pc)]); pc += 2; break;
+        case OP_CONST_W: L_OP_CONST_W: PUSH(consts[rd32(pc)]); pc += 4; break;
         case OP_DUP: L_OP_DUP: a = TOP; PUSH(a); break;
         case OP_DUP2: L_OP_DUP2: a = sp[-2]; b = sp[-1]; PUSH(a); PUSH(b); break;
         case OP_POP: L_OP_POP: sp--; break;
@@ -216,17 +217,19 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         case OP_INIT_LOC: L_OP_INIT_LOC: locals[rd16(pc)] = TOP; pc += 2; break;
         case OP_HOLE_LOC: L_OP_HOLE_LOC: locals[rd16(pc)] = JV_HOLE; pc += 2; break;
         case OP_GET_LOC_CHK: L_OP_GET_LOC_CHK: {
-            uint16_t s = rd16(pc), nm = rd16(pc + 2);
-            pc += 4;
+            uint16_t s = rd16(pc);
+            uint32_t nm = rd32(pc + 2);
+            pc += 6;
             a = locals[s];
-            if (a == JV_HOLE) { SYNC(); tdz_error(J, nm == 0xFFFF ? JV_UNDEFINED : consts[nm]); goto exception; }
+            if (a == JV_HOLE) { SYNC(); tdz_error(J, consts[nm]); goto exception; }
             PUSH(a);
             break;
         }
         case OP_PUT_LOC_CHK: L_OP_PUT_LOC_CHK: {
-            uint16_t s = rd16(pc), nm = rd16(pc + 2);
-            pc += 4;
-            if (locals[s] == JV_HOLE) { SYNC(); tdz_error(J, nm == 0xFFFF ? JV_UNDEFINED : consts[nm]); goto exception; }
+            uint16_t s = rd16(pc);
+            uint32_t nm = rd32(pc + 2);
+            pc += 6;
+            if (locals[s] == JV_HOLE) { SYNC(); tdz_error(J, consts[nm]); goto exception; }
             locals[s] = TOP;
             break;
         }
@@ -235,17 +238,19 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         case OP_PUT_UPV: L_OP_PUT_UPV: *upv[rd16(pc)]->loc = POP(); pc += 2; break;
         case OP_INIT_UPV: L_OP_INIT_UPV: *upv[rd16(pc)]->loc = TOP; pc += 2; break;
         case OP_GET_UPV_CHK: L_OP_GET_UPV_CHK: {
-            uint16_t s = rd16(pc), nm = rd16(pc + 2);
-            pc += 4;
+            uint16_t s = rd16(pc);
+            uint32_t nm = rd32(pc + 2);
+            pc += 6;
             a = *upv[s]->loc;
-            if (a == JV_HOLE) { SYNC(); tdz_error(J, nm == 0xFFFF ? JV_UNDEFINED : consts[nm]); goto exception; }
+            if (a == JV_HOLE) { SYNC(); tdz_error(J, consts[nm]); goto exception; }
             PUSH(a);
             break;
         }
         case OP_PUT_UPV_CHK: L_OP_PUT_UPV_CHK: {
-            uint16_t s = rd16(pc), nm = rd16(pc + 2);
-            pc += 4;
-            if (*upv[s]->loc == JV_HOLE) { SYNC(); tdz_error(J, nm == 0xFFFF ? JV_UNDEFINED : consts[nm]); goto exception; }
+            uint16_t s = rd16(pc);
+            uint32_t nm = rd32(pc + 2);
+            pc += 6;
+            if (*upv[s]->loc == JV_HOLE) { SYNC(); tdz_error(J, consts[nm]); goto exception; }
             *upv[s]->loc = TOP;
             break;
         }
@@ -321,8 +326,8 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         }
         case OP_CHECK_GLOBAL_DECLS: L_OP_CHECK_GLOBAL_DECLS: {
             SYNC();
-            jv names = consts[rd16(pc)];
-            pc += 2;
+            jv names = consts[rd32(pc)];
+            pc += 4;
             CHECKI(global_check_decls(J, jv_obj(names)));
             break;
         }
@@ -816,9 +821,10 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             break;
         }
         case OP_EVAL: L_OP_EVAL: case OP_EVAL_SPREAD: L_OP_EVAL_SPREAD: {
-            uint16_t argc = 0, envk;
-            if (opc == OP_EVAL) { argc = rd16(pc); envk = rd16(pc + 2); pc += 4; }
-            else { envk = rd16(pc); pc += 2; }
+            uint16_t argc = 0;
+            uint32_t envk;
+            if (opc == OP_EVAL) { argc = rd16(pc); envk = rd32(pc + 2); pc += 6; }
+            else { envk = rd32(pc); pc += 4; }
             SYNC();
             jv* args;
             int n;
@@ -856,9 +862,9 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             pending = POP();
             goto unwind;
         case OP_THROW_ERR: L_OP_THROW_ERR: {
-            uint16_t k = rd16(pc);
-            uint8_t kind = pc[2];
-            pc += 3;
+            uint32_t k = rd32(pc);
+            uint8_t kind = pc[4];
+            pc += 5;
             SYNC();
             throw_error(J, kind, "%S", jv_str(consts[k]));
             goto exception;
@@ -980,8 +986,8 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             break;
         }
         case OP_CLOSURE: L_OP_CLOSURE: {
-            jv tv = consts[rd16(pc)];
-            pc += 2;
+            jv tv = consts[rd32(pc)];
+            pc += 4;
             SYNC();
             struct func* fn = closure_new(J, (struct ftempl*)JV_PTR(tv), f, 0);
             if (!fn) goto exception;
@@ -995,9 +1001,9 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             break;
         }
         case OP_CLASS: L_OP_CLASS: {   // [heritage?] -> [ctor, proto]
-            jv tv = consts[rd16(pc)];
-            uint8_t has_her = pc[2];
-            pc += 3;
+            jv tv = consts[rd32(pc)];
+            uint8_t has_her = pc[4];
+            pc += 5;
             SYNC();
             jv her = has_her ? TOP : JV_UNDEFINED;
             jv proto;
@@ -1139,8 +1145,8 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
 
         // ---- misc
         case OP_REGEXP: L_OP_REGEXP: {
-            jv p = consts[rd16(pc)], fl = consts[rd16(pc + 2)];
-            pc += 4;
+            jv p = consts[rd32(pc)], fl = consts[rd32(pc + 4)];
+            pc += 8;
             SYNC();
             v = regexp_create(J, p, fl);
             CHECK(v);

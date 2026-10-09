@@ -817,12 +817,9 @@ static struct funcinfo* new_funcinfo(struct parser* P, uint32_t flags, uint32_t 
         fi->depth = P->F->depth + 1;
         if (P->F->flags & FI_STRICT) fi->flags |= FI_STRICT;
         // link as a child (compile order)
-        if (!P->F->children) P->F->children = fi;
-        else {
-            struct funcinfo* c = P->F->children;
-            while (c->next_sibling) c = c->next_sibling;
-            c->next_sibling = fi;
-        }
+        if (P->F->last_child) P->F->last_child->next_sibling = fi;
+        else P->F->children = fi;
+        P->F->last_child = fi;
     }
     return fi;
 }

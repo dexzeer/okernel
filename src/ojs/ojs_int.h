@@ -146,6 +146,8 @@ struct gch {
 struct ojs;   // runtime + realm (one per page)
 typedef struct ojs ojs;
 
+void* gc_ext_alloc(ojs* J, size_t n);                   // zeroed ArrayBuffer storage, NULL at the limit
+void  gc_ext_free(ojs* J, void* p, size_t n);
 void* gc_alloc(ojs* J, int type, size_t size);          // zeroed; NULL + OOM exception on failure
 void  gc_collect(ojs* J);
 size_t gc_size(const void* p);                           // allocation size of a gc object
@@ -402,6 +404,9 @@ struct ojs {
     struct gc_heap* heap;
     size_t mem_limit;
     size_t bytes_since_gc, gc_threshold, heap_bytes;
+    size_t ext_bytes;           // ArrayBuffer storage (outside the GC heap, inside the limit)
+    int (*mem_guard)(size_t bytes, void* ud);   // embedder veto on taking more memory
+    void* mem_guard_ud;
     int gc_disabled;            // during init / sensitive sections
     uint32_t gc_stress, gc_stress_n;   // testing: collect every gc_stress allocations
     int in_gc;

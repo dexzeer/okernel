@@ -89,6 +89,7 @@ void ojs_free(ojs* J) {
 }
 
 void ojs_set_memory_limit(ojs* J, size_t bytes) { J->mem_limit = bytes; }
+void ojs_set_memory_guard(ojs* J, int (*guard)(size_t, void*), void* ud) { J->mem_guard = guard; J->mem_guard_ud = ud; }
 void ojs_set_stack_size(ojs* J, size_t bytes) { J->stack_limit = bytes; }
 
 void ojs_enter_frame(ojs* J, void* frame) {

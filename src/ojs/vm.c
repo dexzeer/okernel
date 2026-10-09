@@ -23,6 +23,9 @@ int instance_of(ojs* J, jv o, jv c);
 #define FMT_HH 4
 #define FMT_AH 6
 #define FMT_HB 3
+#define FMT_HA 6
+#define FMT_AB 5
+#define FMT_AA 8
 #define FMT_AW 8
 
 static const uint8_t OP_SIZES[OP__COUNT] = {

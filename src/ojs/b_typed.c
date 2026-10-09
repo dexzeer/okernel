@@ -35,7 +35,7 @@ struct abuf {
 
 static void abuf_finalize(ojs* J, struct obj* o) {
     struct abuf* b = (struct abuf*)o;
-    if (b->data) ojs_sys_free(b->data);
+    gc_ext_free(J, b->data, b->max);
     b->data = 0;
 }
 
@@ -44,9 +44,8 @@ static struct abuf* abuf_new(ojs* J, struct obj* proto, uint32_t len, uint32_t m
     if (!b) return 0;
     uint32_t alloc = resizable ? max : len;
     if (alloc) {
-        b->data = (uint8_t*)ojs_sys_malloc(alloc);
+        b->data = (uint8_t*)gc_ext_alloc(J, alloc);
         if (!b->data) { throw_range(J, "Array buffer allocation failed"); return 0; }
-        memset(b->data, 0, alloc);
     }
     b->len = len;
     b->max = resizable ? max : len;
@@ -176,7 +175,7 @@ static jv abuf_transfer(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     if (!nb) return JV_EXC;
     uint32_t n = newlen < b->len ? newlen : b->len;
     if (n) memcpy(nb->data, b->data, n);
-    if (b->data) ojs_sys_free(b->data);
+    gc_ext_free(J, b->data, b->max);
     b->data = 0;
     b->len = 0;
     b->max = 0;
@@ -187,9 +186,10 @@ static jv abuf_transfer(ojs* J, jv this_v, int argc, jv* argv, int magic) {
 int ojs_detach_buffer(ojs* J, jv v) {
     if (!jv_is_obj(v) || obj_class(jv_obj(v)) != OC_ARRAYBUFFER) return -1;
     struct abuf* b = (struct abuf*)jv_obj(v);
-    if (b->data) ojs_sys_free(b->data);
+    gc_ext_free(J, b->data, b->max);
     b->data = 0;
     b->len = 0;
+    b->max = 0;
     b->detached = 1;
     return 0;
 }
