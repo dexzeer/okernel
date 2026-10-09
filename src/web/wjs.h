@@ -1,7 +1,7 @@
 #ifndef WEB_WJS_H
 #define WEB_WJS_H
 
-// Page scripting (QuickJS realm per document). Owned by wdoc; the shell
+// Page scripting (one ojs realm per document). Owned by wdoc; the shell
 // talks to it through the wdoc_js_* API in wdoc.h.
 
 #include <stdint.h>

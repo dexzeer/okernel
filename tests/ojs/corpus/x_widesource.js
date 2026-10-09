@@ -1,0 +1,179 @@
+// libs:
+// a big script with non-latin-1 text and surrogate pairs (ojs keeps its source as
+// compact UTF-8 once compiled): function sources, error lines and callee names
+function f0(a, b) { var s = " "; if (s.length > 1000) throw new Error("big"); return s.length + 0; /* —   */ }
+/* filler 中文 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz */
+function f1(a, b) { var s = "🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 1; /* —  */ }
+function f2(a, b) { var s = "🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 2; /* —  */ }
+function f3(a, b) { var s = "😀"; if (s.length > 1000) throw new Error("big"); return s.length + 3; /* — 😀 */ }
+function f4(a, b) { var s = "😀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 4; /* — 😀 */ }
+function f5(a, b) { var s = "🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 5; /* —  */ }
+function f6(a, b) { var s = "…"; if (s.length > 1000) throw new Error("big"); return s.length + 6; /* — … */ }
+function f7(a, b) { var s = "🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 7; /* —  */ }
+function f8(a, b) { var s = "🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 8; /* —  */ }
+function f9(a, b) { var s = "…"; if (s.length > 1000) throw new Error("big"); return s.length + 9; /* — … */ }
+function f10(a, b) { var s = "xxx🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 10; /* — xxx */ }
+function f11(a, b) { var s = "🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 11; /* —  */ }
+function f12(a, b) { var s = "éé"; if (s.length > 1000) throw new Error("big"); return s.length + 12; /* — éé */ }
+function f13(a, b) { var s = "😀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 13; /* — 😀 */ }
+function f14(a, b) { var s = "😀🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 14; /* — 😀 */ }
+function f15(a, b) { var s = "…"; if (s.length > 1000) throw new Error("big"); return s.length + 15; /* — … */ }
+function f16(a, b) { var s = " 🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 16; /* —   */ }
+function f17(a, b) { var s = "😀🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 17; /* — 😀 */ }
+function f18(a, b) { var s = "  "; if (s.length > 1000) throw new Error("big"); return s.length + 18; /* —    */ }
+function f19(a, b) { var s = " 🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 19; /* —   */ }
+function f20(a, b) { var s = "🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 20; /* —  */ }
+function f21(a, b) { var s = "  "; if (s.length > 1000) throw new Error("big"); return s.length + 21; /* —    */ }
+function f22(a, b) { var s = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 22; /* — xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx */ }
+function f23(a, b) { var s = "🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 23; /* —  */ }
+function f24(a, b) { var s = "😀"; if (s.length > 1000) throw new Error("big"); return s.length + 24; /* — 😀 */ }
+function f25(a, b) { var s = " 🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 25; /* —   */ }
+function f26(a, b) { var s = "🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 26; /* —  */ }
+function f27(a, b) { var s = "éé"; if (s.length > 1000) throw new Error("big"); return s.length + 27; /* — éé */ }
+function f28(a, b) { var s = "😀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 28; /* — 😀 */ }
+function f29(a, b) { var s = "😀🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 29; /* — 😀 */ }
+function f30(a, b) { var s = "…"; if (s.length > 1000) throw new Error("big"); return s.length + 30; /* — … */ }
+function f31(a, b) { var s = "…🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 31; /* — … */ }
+function f32(a, b) { var s = "…🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 32; /* — … */ }
+function f33(a, b) { var s = "…"; if (s.length > 1000) throw new Error("big"); return s.length + 33; /* — … */ }
+function f34(a, b) { var s = "  🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 34; /* —    */ }
+function f35(a, b) { var s = "xxxxxxxxxxxxxxx🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 35; /* — xxxxxxxxxxxxxxx */ }
+function f36(a, b) { var s = "éé"; if (s.length > 1000) throw new Error("big"); return s.length + 36; /* — éé */ }
+function f37(a, b) { var s = "🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 37; /* —  */ }
+/* filler 中文 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz */
+function f38(a, b) { var s = "😀🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 38; /* — 😀 */ }
+function f39(a, b) { var s = "  "; if (s.length > 1000) throw new Error("big"); return s.length + 39; /* —    */ }
+function f40(a, b) { var s = "  🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 40; /* —    */ }
+function f41(a, b) { var s = "🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 41; /* —  */ }
+function f42(a, b) { var s = "😀"; if (s.length > 1000) throw new Error("big"); return s.length + 42; /* — 😀 */ }
+function f43(a, b) { var s = " 🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 43; /* —   */ }
+function f44(a, b) { var s = " 🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 44; /* —   */ }
+function f45(a, b) { var s = "…"; if (s.length > 1000) throw new Error("big"); return s.length + 45; /* — … */ }
+function f46(a, b) { var s = "éé🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 46; /* — éé */ }
+function f47(a, b) { var s = "xxxx🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 47; /* — xxxx */ }
+function f48(a, b) { var s = "😀"; if (s.length > 1000) throw new Error("big"); return s.length + 48; /* — 😀 */ }
+function f49(a, b) { var s = "  🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 49; /* —    */ }
+function f50(a, b) { var s = "😀🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 50; /* — 😀 */ }
+function f51(a, b) { var s = "😀"; if (s.length > 1000) throw new Error("big"); return s.length + 51; /* — 😀 */ }
+function f52(a, b) { var s = "🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 52; /* —  */ }
+function f53(a, b) { var s = "  🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 53; /* —    */ }
+function f54(a, b) { var s = "éé"; if (s.length > 1000) throw new Error("big"); return s.length + 54; /* — éé */ }
+function f55(a, b) { var s = "🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 55; /* —  */ }
+function f56(a, b) { var s = "éé🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 56; /* — éé */ }
+function f57(a, b) { var s = "éé"; if (s.length > 1000) throw new Error("big"); return s.length + 57; /* — éé */ }
+function f58(a, b) { var s = "  🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 58; /* —    */ }
+function f59(a, b) { var s = "éé🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 59; /* — éé */ }
+function f60(a, b) { var s = ""; if (s.length > 1000) throw new Error("big"); return s.length + 60; /* —  */ }
+function f61(a, b) { var s = "  🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 61; /* —    */ }
+function f62(a, b) { var s = "😀🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 62; /* — 😀 */ }
+function f63(a, b) { var s = "…"; if (s.length > 1000) throw new Error("big"); return s.length + 63; /* — … */ }
+function f64(a, b) { var s = " 🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 64; /* —   */ }
+function f65(a, b) { var s = " 🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 65; /* —   */ }
+function f66(a, b) { var s = "…"; if (s.length > 1000) throw new Error("big"); return s.length + 66; /* — … */ }
+function f67(a, b) { var s = "xxxxxxxxxxxxxxxxxxxxxxxxx🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 67; /* — xxxxxxxxxxxxxxxxxxxxxxxxx */ }
+function f68(a, b) { var s = "🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 68; /* —  */ }
+function f69(a, b) { var s = "…"; if (s.length > 1000) throw new Error("big"); return s.length + 69; /* — … */ }
+function f70(a, b) { var s = "😀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 70; /* — 😀 */ }
+function f71(a, b) { var s = " 🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 71; /* —   */ }
+function f72(a, b) { var s = "xxxxxxxxxxxxxxxxxxxxxxxxxxx"; if (s.length > 1000) throw new Error("big"); return s.length + 72; /* — xxxxxxxxxxxxxxxxxxxxxxxxxxx */ }
+function f73(a, b) { var s = "  🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 73; /* —    */ }
+function f74(a, b) { var s = "  🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 74; /* —    */ }
+/* filler 中文 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz */
+function f75(a, b) { var s = " "; if (s.length > 1000) throw new Error("big"); return s.length + 75; /* —   */ }
+function f76(a, b) { var s = "🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 76; /* —  */ }
+function f77(a, b) { var s = " 🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 77; /* —   */ }
+function f78(a, b) { var s = "éé"; if (s.length > 1000) throw new Error("big"); return s.length + 78; /* — éé */ }
+function f79(a, b) { var s = "🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 79; /* —  */ }
+function f80(a, b) { var s = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 80; /* — xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx */ }
+function f81(a, b) { var s = " "; if (s.length > 1000) throw new Error("big"); return s.length + 81; /* —   */ }
+function f82(a, b) { var s = "  🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 82; /* —    */ }
+function f83(a, b) { var s = " 🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 83; /* —   */ }
+function f84(a, b) { var s = "😀"; if (s.length > 1000) throw new Error("big"); return s.length + 84; /* — 😀 */ }
+function f85(a, b) { var s = "😀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 85; /* — 😀 */ }
+function f86(a, b) { var s = "  🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 86; /* —    */ }
+function f87(a, b) { var s = "éé"; if (s.length > 1000) throw new Error("big"); return s.length + 87; /* — éé */ }
+function f88(a, b) { var s = "😀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 88; /* — 😀 */ }
+function f89(a, b) { var s = "…🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 89; /* — … */ }
+function f90(a, b) { var s = "…"; if (s.length > 1000) throw new Error("big"); return s.length + 90; /* — … */ }
+function f91(a, b) { var s = "…🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 91; /* — … */ }
+function f92(a, b) { var s = "🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 92; /* —  */ }
+function f93(a, b) { var s = "éé"; if (s.length > 1000) throw new Error("big"); return s.length + 93; /* — éé */ }
+function f94(a, b) { var s = "🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 94; /* —  */ }
+function f95(a, b) { var s = "🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 95; /* —  */ }
+function f96(a, b) { var s = "…"; if (s.length > 1000) throw new Error("big"); return s.length + 96; /* — … */ }
+function f97(a, b) { var s = "🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 97; /* —  */ }
+function f98(a, b) { var s = "😀🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 98; /* — 😀 */ }
+function f99(a, b) { var s = ""; if (s.length > 1000) throw new Error("big"); return s.length + 99; /* —  */ }
+function f100(a, b) { var s = "😀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 100; /* — 😀 */ }
+function f101(a, b) { var s = "😀🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 101; /* — 😀 */ }
+function f102(a, b) { var s = "  "; if (s.length > 1000) throw new Error("big"); return s.length + 102; /* —    */ }
+function f103(a, b) { var s = "🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 103; /* —  */ }
+function f104(a, b) { var s = "xxxx🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 104; /* — xxxx */ }
+function f105(a, b) { var s = "😀"; if (s.length > 1000) throw new Error("big"); return s.length + 105; /* — 😀 */ }
+function f106(a, b) { var s = " 🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 106; /* —   */ }
+function f107(a, b) { var s = "  🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 107; /* —    */ }
+function f108(a, b) { var s = "😀"; if (s.length > 1000) throw new Error("big"); return s.length + 108; /* — 😀 */ }
+function f109(a, b) { var s = "…🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 109; /* — … */ }
+function f110(a, b) { var s = "🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 110; /* —  */ }
+function f111(a, b) { var s = "…"; if (s.length > 1000) throw new Error("big"); return s.length + 111; /* — … */ }
+/* filler 中文 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz */
+function f112(a, b) { var s = "  🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 112; /* —    */ }
+function f113(a, b) { var s = " 🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 113; /* —   */ }
+function f114(a, b) { var s = "éé"; if (s.length > 1000) throw new Error("big"); return s.length + 114; /* — éé */ }
+function f115(a, b) { var s = "éé🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 115; /* — éé */ }
+function f116(a, b) { var s = "…🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 116; /* — … */ }
+function f117(a, b) { var s = "😀"; if (s.length > 1000) throw new Error("big"); return s.length + 117; /* — 😀 */ }
+function f118(a, b) { var s = " 🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 118; /* —   */ }
+function f119(a, b) { var s = "  🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 119; /* —    */ }
+function f120(a, b) { var s = "éé"; if (s.length > 1000) throw new Error("big"); return s.length + 120; /* — éé */ }
+function f121(a, b) { var s = "🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 121; /* —  */ }
+function f122(a, b) { var s = "  🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 122; /* —    */ }
+function f123(a, b) { var s = "éé"; if (s.length > 1000) throw new Error("big"); return s.length + 123; /* — éé */ }
+function f124(a, b) { var s = "😀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 124; /* — 😀 */ }
+function f125(a, b) { var s = " 🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 125; /* —   */ }
+function f126(a, b) { var s = "xxxxxxxxxxxxxxxxxxxxxx"; if (s.length > 1000) throw new Error("big"); return s.length + 126; /* — xxxxxxxxxxxxxxxxxxxxxx */ }
+function f127(a, b) { var s = "😀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 127; /* — 😀 */ }
+function f128(a, b) { var s = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 128; /* — xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx */ }
+function f129(a, b) { var s = "  "; if (s.length > 1000) throw new Error("big"); return s.length + 129; /* —    */ }
+function f130(a, b) { var s = " 🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 130; /* —   */ }
+function f131(a, b) { var s = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 131; /* — xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx */ }
+function f132(a, b) { var s = "xxxxxxxxxxxx"; if (s.length > 1000) throw new Error("big"); return s.length + 132; /* — xxxxxxxxxxxx */ }
+function f133(a, b) { var s = "xxxxxxxxxxxxxxx🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 133; /* — xxxxxxxxxxxxxxx */ }
+function f134(a, b) { var s = "éé🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 134; /* — éé */ }
+function f135(a, b) { var s = " "; if (s.length > 1000) throw new Error("big"); return s.length + 135; /* —   */ }
+function f136(a, b) { var s = "…🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 136; /* — … */ }
+function f137(a, b) { var s = "éé🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 137; /* — éé */ }
+function f138(a, b) { var s = ""; if (s.length > 1000) throw new Error("big"); return s.length + 138; /* —  */ }
+function f139(a, b) { var s = "…🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 139; /* — … */ }
+function f140(a, b) { var s = " 🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 140; /* —   */ }
+function f141(a, b) { var s = "  "; if (s.length > 1000) throw new Error("big"); return s.length + 141; /* —    */ }
+function f142(a, b) { var s = "xxxxxxxxxxxxxxxxxxxxxxxxxxxx🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 142; /* — xxxxxxxxxxxxxxxxxxxxxxxxxxxx */ }
+function f143(a, b) { var s = "  🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 143; /* —    */ }
+function f144(a, b) { var s = " "; if (s.length > 1000) throw new Error("big"); return s.length + 144; /* —   */ }
+function f145(a, b) { var s = " 🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 145; /* —   */ }
+function f146(a, b) { var s = " 🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 146; /* —   */ }
+function f147(a, b) { var s = " "; if (s.length > 1000) throw new Error("big"); return s.length + 147; /* —   */ }
+function f148(a, b) { var s = "😀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 148; /* — 😀 */ }
+/* filler 中文 zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz */
+function f149(a, b) { var s = "…🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 149; /* — … */ }
+function f150(a, b) { var s = "xxxxxxxxxxxxxxxxxxxxxx"; if (s.length > 1000) throw new Error("big"); return s.length + 150; /* — xxxxxxxxxxxxxxxxxxxxxx */ }
+function f151(a, b) { var s = "xxxxx🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 151; /* — xxxxx */ }
+function f152(a, b) { var s = "…🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 152; /* — … */ }
+function f153(a, b) { var s = "…"; if (s.length > 1000) throw new Error("big"); return s.length + 153; /* — … */ }
+function f154(a, b) { var s = "…🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 154; /* — … */ }
+function f155(a, b) { var s = "  🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 155; /* —    */ }
+function f156(a, b) { var s = "xxxxx"; if (s.length > 1000) throw new Error("big"); return s.length + 156; /* — xxxxx */ }
+function f157(a, b) { var s = "…🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 157; /* — … */ }
+function f158(a, b) { var s = "éé🚀🚀"; if (s.length > 1000) throw new Error("big"); return s.length + 158; /* — éé */ }
+function f159(a, b) { var s = "éé"; if (s.length > 1000) throw new Error("big"); return s.length + 159; /* — éé */ }
+var out = [];
+for (var i = 0; i < 160; i += 7) out.push(eval("f" + i).toString());
+function thrower() {
+  "😀"; return nope.x;
+}
+try { thrower(); } catch (e) { out.push(e.message, (e.stack.split("\n")[1].match(/:(\d+):\d+\)?$/) || [])[1]); }
+var obj = { a: {} };
+try { obj.a.missing("…"); } catch (e) { out.push(e.message); }
+try { new obj.a.Ctor(); } catch (e) { out.push(e.message); }
+out.push((function été() { return "🚀" }).toString());
+console.log(out.join("\n"));

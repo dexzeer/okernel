@@ -1,4 +1,4 @@
-// Page scripting: one QuickJS runtime + context per document.
+// Page scripting: one ojs realm (src/ojs, our own engine) per document.
 //
 //  * The Web API lives in JS (wjs_prelude.js, embedded) on top of the C
 //    natives here and in wjs_dom.c.
@@ -8,10 +8,10 @@
 //    then DOMContentLoaded; async/dynamic scripts run as they arrive; the
 //    load event fires once scripts, stylesheets and images have settled.
 //  * Module graphs are fetched ahead of evaluation (static imports are
-//    scanned from source) because QuickJS loads modules synchronously.
+//    found by compiling each fetched module) because loading is synchronous.
 //  * Every entry from the shell sets a time budget (interrupt handler),
-//    the x87 control word (53-bit doubles) and, in the kernel, an abort
-//    trap: a QuickJS assertion kills only this realm, never the OS.
+//    the x87 control word (53-bit doubles) and the collector's stack top
+//    (ojs_enter in the entry function itself, so its locals are scanned).
 
 #include "wjs_int.h"
 #include "wurl.h"
@@ -20,23 +20,18 @@
 
 #if !(defined(KERNEL) && KERNEL)
 #include <time.h>
+#include <stdlib.h>
+#include <stdio.h>
 #endif
 
 extern const char wjs_prelude_src[];
 extern const uint32_t wjs_prelude_len;
 void wjs_selq_forget(struct wdom* d);
 
-#if defined(KERNEL) && KERNEL
-void qjs_abort_jmp_set(void** jb);
-#define ABORT_TRAP_SET(j) qjs_abort_jmp_set(j)
-#else
-#define ABORT_TRAP_SET(j) ((void)(j))
-#endif
-
 #define SCRIPT_BUDGET_MS 4000   // one script evaluation (the whole OS waits: keep it short)
 #define TASK_BUDGET_MS   1000   // one timer / event / callback
-#define JS_MEM_LIMIT     (96u << 20)
-#define JS_STACK_MAX     (900u << 10)
+#define REALM_MEM_LIMIT  (96u << 20)
+#define REALM_STACK_MAX  (900u << 10)
 #define MAX_SCRIPTS      256
 #define MAX_MODULES      512
 
@@ -90,41 +85,71 @@ void wjs_logf(struct wjs* js, int level, const char* s, int len) {
 
 // ---- realm entry guard ------------------------------------------------------------------
 
-static int enter(struct wjs* js) {
-    if (!js || js->dead || !js->ctx) return 0;
+static int enter_ok(struct wjs* js) {
+    if (!js || js->dead || !js->J) return 0;
 #if defined(__i386__)
     uint16_t cw = 0x027F;   // x87: 53-bit precision (IEEE doubles), exceptions masked
     __asm__ volatile("fldcw %0" :: "m"(cw));
 #endif
-    JS_UpdateStackTop(js->rt);
     return 1;
 }
 
-static void aborted(struct wjs* js) {
-    js->dead = 1;
-    ABORT_TRAP_SET(0);
-    wjs_logf(0, 3, "QuickJS internal error: scripts disabled for this page", 54);
-}
-
-#define GUARD(js, ret)                                         \
-    do {                                                       \
-        if (!enter(js)) return ret;                            \
-        if (__builtin_setjmp((js)->jmp)) { aborted(js); return ret; } \
-        ABORT_TRAP_SET((js)->jmp);                             \
+// GUARD / UNGUARD bracket every entry from the shell: ojs_enter must expand
+// in the entry function so the collector scans that function's locals
+#define GUARD(js, ret)                       \
+    do {                                     \
+        if (!enter_ok(js)) return ret;       \
+        ojs_enter((js)->J);                  \
     } while (0)
-#define UNGUARD() ABORT_TRAP_SET(0)
+#define UNGUARD(js) ojs_leave((js)->J)
 
-static int interrupt_cb(JSRuntime* rt, void* op) {
-    (void)rt;
+#if !(defined(KERNEL) && KERNEL)
+// host diagnostics: OJS_JSPROF=1 samples the running JS function at every interrupt
+// check (every few thousand loop iterations / calls) and prints the hottest at exit
+#define PROF_N 4096
+static struct { char where[120]; unsigned n; } prof[PROF_N];
+static unsigned prof_total;
+static void prof_dump(void) {
+    for (int r = 0; r < 30; r++) {
+        int best = -1;
+        for (int i = 0; i < PROF_N; i++) if (prof[i].n && (best < 0 || prof[i].n > prof[best].n)) best = i;
+        if (best < 0) break;
+        fprintf(stderr, "[prof] %5.1f%% %s\n", 100.0 * prof[best].n / (prof_total ? prof_total : 1), prof[best].where);
+        prof[best].n = 0;
+    }
+}
+static void prof_sample(ojs* J) {
+    char w[120];
+    if (!ojs_where(J, w, sizeof w)) return;
+    unsigned h = 5381;
+    for (char* p = w; *p; p++) h = h * 33 + (unsigned char)*p;
+    for (unsigned k = 0; k < PROF_N; k++) {
+        unsigned i = (h + k) % PROF_N;
+        if (!prof[i].n) { strcpy(prof[i].where, w); prof[i].n = 1; break; }
+        if (!strcmp(prof[i].where, w)) { prof[i].n++; break; }
+    }
+    if (++prof_total == 1) atexit(prof_dump);
+}
+#endif
+
+static int interrupt_cb(ojs* J, void* op) {
+    (void)J;
     struct wjs* js = (struct wjs*)op;
+#if !(defined(KERNEL) && KERNEL)
+    static int prof_on = -1;
+    if (prof_on < 0) prof_on = getenv("OJS_JSPROF") != 0;
+    if (prof_on) prof_sample(J);
+    static int nobudget = -1;   // host diagnostics: OJS_NOBUDGET=1 lets scripts run to completion
+    if (nobudget < 0) nobudget = getenv("OJS_NOBUDGET") != 0;
+    if (nobudget) return 0;
+#endif
     if (js->deadline && wjs_now() > js->deadline) { js->interrupted = 1; return 1; }
     return 0;
 }
 
 void wjs_drain_jobs(struct wjs* js) {
-    JSContext* c;
     for (int i = 0; i < 100000; i++) {
-        int r = JS_ExecutePendingJob(js->rt, &c);
+        int r = ojs_run_job(js->J);
         if (r == 0) break;
         if (r < 0) wjs_report_exception(js, "promise job");
         if (js->interrupted) break;
@@ -132,8 +157,8 @@ void wjs_drain_jobs(struct wjs* js) {
 }
 
 void wjs_report_exception(struct wjs* js, const char* where) {
-    JSContext* ctx = js->ctx;
-    JSValue e = JS_GetException(ctx);
+    ojs* ctx = js->J;
+    ojsv e = ojs_take_exception(ctx);
     js->nerrors++;
     if (js->interrupted) {
         char m[160];
@@ -143,48 +168,46 @@ void wjs_report_exception(struct wjs* js, const char* where) {
         for (const char* b = where; *b && n < 150; b++) m[n++] = *b;
         wjs_logf(js, 3, m, n);
         js->interrupted = 0;
-        JS_FreeValue(ctx, e);
+        // where it was stopped (the error's stack: the busy loop is in the first frames)
+        if (ojs_is_object(e)) {
+            ojsv st = ojs_get(ctx, e, "stack");
+            char* s = ojs_is_string(st) ? ojs_to_cstring(ctx, st, 0) : 0;
+            if (s) {
+                int sl = (int)strlen(s);
+                wjs_logf(js, 3, s, sl > 600 ? 600 : sl);
+                ojs_free_cstring(ctx, s);
+            } else ojs_take_exception(ctx);
+        }
         return;
     }
-    JSValue args[2] = { e, JS_NewString(ctx, where) };
-    JSValue r = JS_IsUndefined(js->h_report) ? JS_EXCEPTION : JS_Call(ctx, js->h_report, JS_UNDEFINED, 2, args);
-    if (JS_IsException(r)) {
-        JS_FreeValue(ctx, JS_GetException(ctx));
-        const char* s = JS_ToCString(ctx, e);
-        if (s) { wjs_logf(js, 3, s, (int)strlen(s)); JS_FreeCString(ctx, s); }
+    ojsv args[2] = { e, ojs_string(ctx, where) };
+    ojsv r = ojs_is_undefined(js->h_report) ? OJS_EXCEPTION : ojs_call(ctx, js->h_report, OJS_UNDEFINED, 2, args);
+    if (ojs_is_exception(r)) {
+        ojs_take_exception(ctx);
+        char* s = ojs_describe(ctx, e);
+        if (s) { wjs_logf(js, 3, s, (int)strlen(s)); ojs_free_cstring(ctx, s); }
     }
-    JS_FreeValue(ctx, r);
-    JS_FreeValue(ctx, args[0]);
-    JS_FreeValue(ctx, args[1]);
 }
 
-static void rejection_cb(JSContext* ctx, JSValueConst promise, JSValueConst reason, JS_BOOL handled, void* op) {
+static void rejection_cb(ojs* ctx, ojsv promise, ojsv reason, int handled, void* op) {
     (void)promise;
     struct wjs* js = (struct wjs*)op;
     if (handled) return;
-    const char* s = JS_ToCString(ctx, reason);
     char m[400];
     int n = 0;
     const char* a = "Uncaught (in promise) ";
     while (*a) m[n++] = *a++;
-    if (s) { for (const char* b = s; *b && n < 390; b++) m[n++] = *b; JS_FreeCString(ctx, s); }
-    if (JS_IsObject(reason)) {
-        JSValue st = JS_GetPropertyStr(ctx, reason, "stack");
-        const char* ss = JS_ToCString(ctx, st);
-        if (ss && n < 380) { m[n++] = '\n'; for (const char* b = ss; *b && n < 398; b++) m[n++] = *b; }
-        if (ss) JS_FreeCString(ctx, ss);
-        JS_FreeValue(ctx, st);
-    }
+    char* s = ojs_describe(ctx, reason);   // errors: "Name: message" + stack
+    if (s) { for (const char* b = s; *b && n < 398; b++) m[n++] = *b; ojs_free_cstring(ctx, s); }
     js->nerrors++;
     wjs_logf(js, 3, m, n);
 }
 
-// call a hook with the guard already held; frees args
-static JSValue call_hook(struct wjs* js, JSValue fn, int argc, JSValue* argv, int budget) {
+// call a hook with the guard already held
+static ojsv call_hook(struct wjs* js, ojsv fn, int argc, ojsv* argv, int budget) {
     if (budget) js->deadline = wjs_now() + budget;
-    JSValue r = JS_Call(js->ctx, fn, JS_UNDEFINED, argc, argv);
-    for (int i = 0; i < argc; i++) JS_FreeValue(js->ctx, argv[i]);
-    if (JS_IsException(r)) wjs_report_exception(js, "callback");
+    ojsv r = ojs_call(js->J, fn, OJS_UNDEFINED, argc, argv);
+    if (ojs_is_exception(r)) wjs_report_exception(js, "callback");
     wjs_drain_jobs(js);
     js->deadline = 0;
     return r;
@@ -192,38 +215,38 @@ static JSValue call_hook(struct wjs* js, JSValue fn, int argc, JSValue* argv, in
 
 // ---- natives: environment ------------------------------------------------------------
 
-#define JSX(ctx) ((struct wjs*)JS_GetContextOpaque(ctx))
-#define NATIVE(name) static JSValue name(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv)
+#define JSX(ctx) ((struct wjs*)ojs_get_opaque(ctx))
+#define NATIVE(name) static ojsv name(ojs* ctx, ojsv this_val, int argc, ojsv* argv)
 
 NATIVE(n_log) {
     (void)this_val;
     struct wjs* js = JSX(ctx);
     int32_t lvl = 1;
-    if (argc > 0) JS_ToInt32(ctx, &lvl, argv[0]);
+    if (argc > 0) ojs_to_int32(ctx, &lvl, argv[0]);
     size_t l;
-    const char* s = JS_ToCStringLen(ctx, &l, argc > 1 ? argv[1] : JS_UNDEFINED);
-    if (!s) return JS_EXCEPTION;
+    const char* s = ojs_to_cstring(ctx, argc > 1 ? argv[1] : OJS_UNDEFINED, &l);
+    if (!s) return OJS_EXCEPTION;
     if (lvl >= 3) js->nerrors++;
     wjs_logf(js, lvl, s, (int)l);
-    JS_FreeCString(ctx, s);
-    return JS_UNDEFINED;
+    ojs_free_cstring(ctx, (char*)s);
+    return OJS_UNDEFINED;
 }
 NATIVE(n_now) {
     (void)this_val; (void)argc; (void)argv;
     struct wjs* js = JSX(ctx);
-    return JS_NewInt32(ctx, wjs_now() - js->t0);
+    return ojs_int(wjs_now() - js->t0);
 }
 NATIVE(n_resolve) {
     (void)this_val;
     struct wjs* js = JSX(ctx);
     size_t l;
-    const char* s = JS_ToCStringLen(ctx, &l, argc > 0 ? argv[0] : JS_UNDEFINED);
-    if (!s) return JS_EXCEPTION;
+    const char* s = ojs_to_cstring(ctx, argc > 0 ? argv[0] : OJS_UNDEFINED, &l);
+    if (!s) return OJS_EXCEPTION;
     const char* base = wdoc_base(js->doc);
     const char* b2 = 0;
-    if (argc > 1 && !JS_IsNull(argv[1]) && !JS_IsUndefined(argv[1])) {
-        b2 = JS_ToCString(ctx, argv[1]);
-        if (!b2) { JS_FreeCString(ctx, s); return JS_EXCEPTION; }
+    if (argc > 1 && !ojs_is_null(argv[1]) && !ojs_is_undefined(argv[1])) {
+        b2 = ojs_to_cstring(ctx, argv[1], 0);
+        if (!b2) { ojs_free_cstring(ctx, (char*)s); return OJS_EXCEPTION; }
         base = b2;
     }
     char out[4096];
@@ -232,143 +255,128 @@ NATIVE(n_resolve) {
     int pl = (int)l;
     while (pl > 0 && (unsigned char)p[0] <= 32) { p++; pl--; }
     while (pl > 0 && (unsigned char)p[pl - 1] <= 32) pl--;
-    JSValue r = JS_NULL;
+    ojsv r = OJS_NULL;
     if (w_ieq_prefix(p, pl, "data:") || w_ieq_prefix(p, pl, "blob:") || w_ieq_prefix(p, pl, "javascript:") ||
         w_ieq_prefix(p, pl, "about:") || w_ieq_prefix(p, pl, "mailto:") || w_ieq_prefix(p, pl, "tel:"))
-        r = JS_NewStringLen(ctx, p, pl);
+        r = ojs_string_len(ctx, p, pl);
     else if (wurl_resolve(base, p, pl, out, sizeof out) > 0)
-        r = JS_NewString(ctx, out);
-    if (b2) JS_FreeCString(ctx, b2);
-    JS_FreeCString(ctx, s);
+        r = ojs_string(ctx, out);
+    if (b2) ojs_free_cstring(ctx, (char*)b2);
+    ojs_free_cstring(ctx, (char*)s);
     return r;
 }
-NATIVE(n_doc_url) { (void)this_val; (void)argc; (void)argv; return JS_NewString(ctx, wdoc_url(JSX(ctx)->doc)); }
-NATIVE(n_base_url) { (void)this_val; (void)argc; (void)argv; return JS_NewString(ctx, wdoc_base(JSX(ctx)->doc)); }
-NATIVE(n_referrer) { (void)this_val; (void)argc; (void)argv; return JS_NewString(ctx, ""); }
+NATIVE(n_doc_url) { (void)this_val; (void)argc; (void)argv; return ojs_string(ctx, wdoc_url(JSX(ctx)->doc)); }
+NATIVE(n_base_url) { (void)this_val; (void)argc; (void)argv; return ojs_string(ctx, wdoc_base(JSX(ctx)->doc)); }
+NATIVE(n_referrer) { (void)this_val; (void)argc; (void)argv; return ojs_string(ctx, ""); }
 NATIVE(n_navigate) {
     (void)this_val;
     struct wjs* js = JSX(ctx);
-    const char* s = JS_ToCString(ctx, argc > 0 ? argv[0] : JS_UNDEFINED);
-    if (!s) return JS_EXCEPTION;
+    const char* s = ojs_to_cstring(ctx, argc > 0 ? argv[0] : OJS_UNDEFINED, 0);
+    if (!s) return OJS_EXCEPTION;
     w_free(js->nav_url);
     int n = (int)strlen(s);
     js->nav_url = (char*)w_malloc(n + 1);
     if (js->nav_url) memcpy(js->nav_url, s, n + 1);
-    js->nav_replace = argc > 1 && JS_ToBool(ctx, argv[1]);
+    js->nav_replace = argc > 1 && ojs_to_bool(ctx, argv[1]);
     js->flags |= WJS_NAV;
-    JS_FreeCString(ctx, s);
-    return JS_UNDEFINED;
+    ojs_free_cstring(ctx, (char*)s);
+    return OJS_UNDEFINED;
 }
 NATIVE(n_push_url) {
     (void)this_val;
     struct wjs* js = JSX(ctx);
-    const char* s = JS_ToCString(ctx, argc > 0 ? argv[0] : JS_UNDEFINED);
-    if (!s) return JS_EXCEPTION;
+    const char* s = ojs_to_cstring(ctx, argc > 0 ? argv[0] : OJS_UNDEFINED, 0);
+    if (!s) return OJS_EXCEPTION;
     wdoc_set_url(js->doc, s);
     js->flags |= WJS_URL;
-    JS_FreeCString(ctx, s);
-    return JS_UNDEFINED;
+    ojs_free_cstring(ctx, (char*)s);
+    return OJS_UNDEFINED;
 }
 NATIVE(n_history_go) {
     (void)this_val;
     struct wjs* js = JSX(ctx);
     int32_t n = 0;
-    if (argc > 0) JS_ToInt32(ctx, &n, argv[0]);
+    if (argc > 0) ojs_to_int32(ctx, &n, argv[0]);
     js->hist_delta = n;
     js->flags |= WJS_NAV;
-    return JS_UNDEFINED;
+    return OJS_UNDEFINED;
 }
 NATIVE(n_fetch) {
     (void)this_val;
     struct wjs* js = JSX(ctx);
-    const char* url = JS_ToCString(ctx, argc > 0 ? argv[0] : JS_UNDEFINED);
-    const char* method = JS_ToCString(ctx, argc > 1 ? argv[1] : JS_UNDEFINED);
-    const char* headers = JS_ToCString(ctx, argc > 2 ? argv[2] : JS_UNDEFINED);
+    const char* url = ojs_to_cstring(ctx, argc > 0 ? argv[0] : OJS_UNDEFINED, 0);
+    const char* method = ojs_to_cstring(ctx, argc > 1 ? argv[1] : OJS_UNDEFINED, 0);
+    const char* headers = ojs_to_cstring(ctx, argc > 2 ? argv[2] : OJS_UNDEFINED, 0);
     size_t bl = 0;
-    const char* body = (argc > 3 && !JS_IsNull(argv[3]) && !JS_IsUndefined(argv[3])) ? JS_ToCStringLen(ctx, &bl, argv[3]) : 0;
+    const char* body = (argc > 3 && !ojs_is_null(argv[3]) && !ojs_is_undefined(argv[3])) ? ojs_to_cstring(ctx, argv[3], &bl) : 0;
     int id = -1;
     if (url && method && headers) id = wdoc_res_request(js->doc, url, method, headers, body, (int)bl);
     if (id >= 0) js->flags |= WJS_FETCH;
-    if (url) JS_FreeCString(ctx, url);
-    if (method) JS_FreeCString(ctx, method);
-    if (headers) JS_FreeCString(ctx, headers);
-    if (body) JS_FreeCString(ctx, body);
-    return JS_NewInt32(ctx, id);
+    if (url) ojs_free_cstring(ctx, (char*)url);
+    if (method) ojs_free_cstring(ctx, (char*)method);
+    if (headers) ojs_free_cstring(ctx, (char*)headers);
+    if (body) ojs_free_cstring(ctx, (char*)body);
+    return ojs_int(id);
 }
 NATIVE(n_store) {
     (void)this_val;
     struct wjs* js = JSX(ctx);
     int32_t area = 0, op = 0;
-    if (argc > 0) JS_ToInt32(ctx, &area, argv[0]);
-    if (argc > 1) JS_ToInt32(ctx, &op, argv[1]);
+    if (argc > 0) ojs_to_int32(ctx, &area, argv[0]);
+    if (argc > 1) ojs_to_int32(ctx, &op, argv[1]);
     return wjs_store_op(js, area, op, argv + 2, argc > 2 ? argc - 2 : 0);
 }
 NATIVE(n_cookie) {
     (void)this_val;
-    return wjs_cookie_op(JSX(ctx), argc > 0 ? argv[0] : JS_UNDEFINED, argc > 0);
+    return wjs_cookie_op(JSX(ctx), argc > 0 ? argv[0] : OJS_UNDEFINED, argc > 0);
 }
 NATIVE(n_random) {
     (void)this_val;
-    size_t off, len, bpe;
-    if (argc < 1) return JS_UNDEFINED;
-    JSValue buf = JS_GetTypedArrayBuffer(ctx, argv[0], &off, &len, &bpe);
-    if (JS_IsException(buf)) return buf;
-    size_t sz;
-    uint8_t* p = JS_GetArrayBuffer(ctx, &sz, buf);
-    if (p && off + len <= sz) {
+    if (argc < 1) return OJS_UNDEFINED;
+    size_t len;
+    uint8_t* p = ojs_bytes(ctx, argv[0], &len);
+    if (p) {
         if (len > 65536) len = 65536;
-        if (wjs_host.random) wjs_host.random(p + off, (int)len);
-        else fallback_random(p + off, (int)len);
+        if (wjs_host.random) wjs_host.random(p, (int)len);
+        else fallback_random(p, (int)len);
     }
-    JS_FreeValue(ctx, buf);
-    return JS_UNDEFINED;
+    return OJS_UNDEFINED;
 }
 NATIVE(n_utf8enc) {
     (void)this_val;
     size_t l;
-    const char* s = JS_ToCStringLen(ctx, &l, argc > 0 ? argv[0] : JS_UNDEFINED);
-    if (!s) return JS_EXCEPTION;
-    JSValue ab = JS_NewArrayBufferCopy(ctx, (const uint8_t*)s, l);
-    JS_FreeCString(ctx, s);
-    if (JS_IsException(ab)) return ab;
-    JSValue u8 = JS_NewTypedArray(ctx, 1, &ab, JS_TYPED_ARRAY_UINT8);
-    JS_FreeValue(ctx, ab);
+    char* s = ojs_to_cstring(ctx, argc > 0 ? argv[0] : OJS_UNDEFINED, &l);
+    if (!s) return OJS_EXCEPTION;
+    ojsv u8 = ojs_uint8array_copy(ctx, s, l);
+    ojs_free_cstring(ctx, s);
     return u8;
 }
 NATIVE(n_utf8dec) {
     (void)this_val;
-    size_t off, len, bpe, sz;
-    if (argc < 1) return JS_NewString(ctx, "");
-    JSValue buf = JS_GetTypedArrayBuffer(ctx, argv[0], &off, &len, &bpe);
-    if (JS_IsException(buf)) return buf;
-    uint8_t* p = JS_GetArrayBuffer(ctx, &sz, buf);
-    JSValue r;
-    if (!p || off + len > sz) r = JS_NewString(ctx, "");
-    else {
-        const char* s = (const char*)p + off;
-        if (len >= 3 && (uint8_t)s[0] == 0xEF && (uint8_t)s[1] == 0xBB && (uint8_t)s[2] == 0xBF) { s += 3; len -= 3; }
-        r = JS_NewStringLen(ctx, s, len);
-    }
-    JS_FreeValue(ctx, buf);
-    return r;
+    if (argc < 1) return ojs_string(ctx, "");
+    size_t len;
+    const char* s = (const char*)ojs_bytes(ctx, argv[0], &len);
+    if (!s) return ojs_string(ctx, "");
+    if (len >= 3 && (uint8_t)s[0] == 0xEF && (uint8_t)s[1] == 0xBB && (uint8_t)s[2] == 0xBF) { s += 3; len -= 3; }
+    return ojs_string_len(ctx, s, len);
 }
 
-static const JSCFunctionListEntry env_funcs[] = {
-    JS_CFUNC_DEF("log", 2, n_log),
-    JS_CFUNC_DEF("now", 0, n_now),
-    JS_CFUNC_DEF("resolve", 2, n_resolve),
-    JS_CFUNC_DEF("docURL", 0, n_doc_url),
-    JS_CFUNC_DEF("baseURL", 0, n_base_url),
-    JS_CFUNC_DEF("referrer", 0, n_referrer),
-    JS_CFUNC_DEF("navigate", 2, n_navigate),
-    JS_CFUNC_DEF("pushURL", 2, n_push_url),
-    JS_CFUNC_DEF("historyGo", 1, n_history_go),
-    JS_CFUNC_DEF("fetch", 4, n_fetch),
-    JS_CFUNC_DEF("store", 4, n_store),
-    JS_CFUNC_DEF("cookie", 1, n_cookie),
-    JS_CFUNC_DEF("random", 1, n_random),
-    JS_CFUNC_DEF("utf8enc", 1, n_utf8enc),
-    JS_CFUNC_DEF("utf8dec", 1, n_utf8dec),
+static const struct ojs_func_entry env_funcs[] = {
+    { "log", n_log, 2 },
+    { "now", n_now, 0 },
+    { "resolve", n_resolve, 2 },
+    { "docURL", n_doc_url, 0 },
+    { "baseURL", n_base_url, 0 },
+    { "referrer", n_referrer, 0 },
+    { "navigate", n_navigate, 2 },
+    { "pushURL", n_push_url, 2 },
+    { "historyGo", n_history_go, 1 },
+    { "fetch", n_fetch, 4 },
+    { "store", n_store, 4 },
+    { "cookie", n_cookie, 1 },
+    { "random", n_random, 1 },
+    { "utf8enc", n_utf8enc, 1 },
+    { "utf8dec", n_utf8dec, 1 },
 };
 
 // ---- storage (per origin, shared by every tab of the session) ---------------------------
@@ -407,42 +415,42 @@ static void kv_del(int i) {
     kv_tab[i] = kv_tab[--kv_n];
 }
 
-JSValue wjs_store_op(struct wjs* js, int area, int op, JSValueConst* argv, int argc) {
-    JSContext* ctx = js->ctx;
+ojsv wjs_store_op(struct wjs* js, int area, int op, ojsv* argv, int argc) {
+    ojs* ctx = js->J;
     char origin[256];
     origin_of(js, origin, sizeof origin);
     if (op == 5 || op == 4) {   // length / key(i)
         int count = 0;
         int32_t want = -1;
-        if (op == 4 && argc > 0) JS_ToInt32(ctx, &want, argv[0]);
+        if (op == 4 && argc > 0) ojs_to_int32(ctx, &want, argv[0]);
         for (int i = 0; i < kv_n; i++)
             if (kv_tab[i].area == area && !strcmp(kv_tab[i].origin, origin)) {
-                if (op == 4 && count == want) return JS_NewString(ctx, kv_tab[i].key);
+                if (op == 4 && count == want) return ojs_string(ctx, kv_tab[i].key);
                 count++;
             }
-        return op == 5 ? JS_NewInt32(ctx, count) : JS_NULL;
+        return op == 5 ? ojs_int(count) : OJS_NULL;
     }
     if (op == 3) {   // clear
         for (int i = kv_n - 1; i >= 0; i--)
             if (kv_tab[i].area == area && !strcmp(kv_tab[i].origin, origin)) kv_del(i);
-        return JS_UNDEFINED;
+        return OJS_UNDEFINED;
     }
-    const char* key = JS_ToCString(ctx, argc > 0 ? argv[0] : JS_UNDEFINED);
-    if (!key) return JS_EXCEPTION;
+    const char* key = ojs_to_cstring(ctx, argc > 0 ? argv[0] : OJS_UNDEFINED, 0);
+    if (!key) return OJS_EXCEPTION;
     int i = kv_find(origin, area, key);
-    JSValue r = JS_UNDEFINED;
-    if (op == 0) r = i >= 0 ? JS_NewString(ctx, kv_tab[i].val) : JS_NULL;
+    ojsv r = OJS_UNDEFINED;
+    if (op == 0) r = i >= 0 ? ojs_string(ctx, kv_tab[i].val) : OJS_NULL;
     else if (op == 2) { if (i >= 0) kv_del(i); }
     else if (op == 1) {
         size_t vl;
-        const char* v = JS_ToCStringLen(ctx, &vl, argc > 1 ? argv[1] : JS_UNDEFINED);
-        if (!v) { JS_FreeCString(ctx, key); return JS_EXCEPTION; }
+        const char* v = ojs_to_cstring(ctx, argc > 1 ? argv[1] : OJS_UNDEFINED, &vl);
+        if (!v) { ojs_free_cstring(ctx, (char*)key); return OJS_EXCEPTION; }
         int kl = (int)strlen(key);
         int grow = (int)vl + (i >= 0 ? -(int)strlen(kv_tab[i].val) : kl);
         if (kv_bytes + grow > KV_MAX_BYTES) {
-            JS_FreeCString(ctx, v);
-            JS_FreeCString(ctx, key);
-            return JS_ThrowTypeError(ctx, "QuotaExceededError: storage is full");
+            ojs_free_cstring(ctx, (char*)v);
+            ojs_free_cstring(ctx, (char*)key);
+            return ojs_throw_type_error(ctx, "QuotaExceededError: storage is full");
         }
         if (i >= 0) {
             char* nv = dupn(v, (int)vl);
@@ -463,27 +471,27 @@ JSValue wjs_store_op(struct wjs* js, int area, int op, JSValueConst* argv, int a
                 else { w_free(e->origin); w_free(e->key); w_free(e->val); }
             }
         }
-        JS_FreeCString(ctx, v);
+        ojs_free_cstring(ctx, (char*)v);
     }
-    JS_FreeCString(ctx, key);
+    ojs_free_cstring(ctx, (char*)key);
     return r;
 }
 
 // document.cookie: the shared jar (src/web/wcookie.c) the HTTP fetcher
 // also uses, so script-set cookies reach the server and vice versa.
-JSValue wjs_cookie_op(struct wjs* js, JSValueConst setv, int set) {
-    JSContext* ctx = js->ctx;
+ojsv wjs_cookie_op(struct wjs* js, ojsv setv, int set) {
+    ojs* ctx = js->J;
     if (!set) {
         static char buf[8192];
         int n = wcookie_doc(wdoc_url(js->doc), buf, sizeof buf);
-        return JS_NewStringLen(ctx, buf, n);
+        return ojs_string_len(ctx, buf, n);
     }
     size_t l;
-    const char* s = JS_ToCStringLen(ctx, &l, setv);
-    if (!s) return JS_EXCEPTION;
+    const char* s = ojs_to_cstring(ctx, setv, &l);
+    if (!s) return OJS_EXCEPTION;
     wcookie_set_doc(wdoc_url(js->doc), s, (int)l);
-    JS_FreeCString(ctx, s);
-    return JS_UNDEFINED;
+    ojs_free_cstring(ctx, (char*)s);
+    return OJS_UNDEFINED;
 }
 
 // ---- modules -----------------------------------------------------------------------------
@@ -521,51 +529,51 @@ static int mod_add(struct wjs* js, const char* url, int dynamic_only) {
 
 // import map lookup ("imports": exact keys, then the longest "prefix/" key)
 static int importmap_resolve(struct wjs* js, const char* spec, char* out, int cap) {
-    if (!js->importmap) return 0;
-    JSContext* ctx = js->ctx;
-    JSValue m = JS_ParseJSON(ctx, js->importmap, strlen(js->importmap), "<importmap>");
-    if (!JS_IsObject(m)) { JS_FreeValue(ctx, m); return 0; }
-    JSValue imports = JS_GetPropertyStr(ctx, m, "imports");
+    if (!js->importmap || !js->J) return 0;
+    ojs* ctx = js->J;
+    ojsv m = ojs_parse_json(ctx, js->importmap, strlen(js->importmap));
+    if (ojs_is_exception(m)) { ojs_take_exception(ctx); return 0; }
+    if (!ojs_is_object(m)) return 0;
+    ojsv imports = ojs_get(ctx, m, "imports");
+    if (ojs_is_exception(imports)) { ojs_take_exception(ctx); return 0; }
     int ok = 0;
-    if (JS_IsObject(imports)) {
-        JSValue v = JS_GetPropertyStr(ctx, imports, spec);
-        if (JS_IsString(v)) {
-            const char* t = JS_ToCString(ctx, v);
-            if (t) { ok = wurl_resolve(wdoc_base(js->doc), t, (int)strlen(t), out, cap) > 0; JS_FreeCString(ctx, t); }
+    if (ojs_is_object(imports)) {
+        ojsv v = ojs_get(ctx, imports, spec);
+        if (ojs_is_exception(v)) { ojs_take_exception(ctx); return 0; }
+        if (ojs_is_string(v)) {
+            char* t = ojs_to_cstring(ctx, v, 0);
+            if (t) { ok = wurl_resolve(wdoc_base(js->doc), t, (int)strlen(t), out, cap) > 0; ojs_free_cstring(ctx, t); }
         } else {
-            JSPropertyEnum* props;
-            uint32_t np;
+            ojsv keys = ojs_own_keys(ctx, imports);
             int best = 0;
-            if (!JS_GetOwnPropertyNames(ctx, &props, &np, imports, JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY)) {
-                for (uint32_t k = 0; k < np; k++) {
-                    const char* key = JS_AtomToCString(ctx, props[k].atom);
-                    int kl = key ? (int)strlen(key) : 0;
-                    if (key && kl > best && key[kl - 1] == '/' && !strncmp(spec, key, kl)) {
-                        JSValue pv = JS_GetProperty(ctx, imports, props[k].atom);
-                        const char* t = JS_ToCString(ctx, pv);
-                        if (t) {
-                            char tmp[2048];
-                            int tl = (int)strlen(t);
-                            int rest = (int)strlen(spec) - kl;
-                            if (tl + rest < (int)sizeof tmp) {
-                                memcpy(tmp, t, tl);
-                                memcpy(tmp + tl, spec + kl, rest);
-                                tmp[tl + rest] = 0;
-                                if (wurl_resolve(wdoc_base(js->doc), tmp, tl + rest, out, cap) > 0) { ok = 1; best = kl; }
-                            }
-                            JS_FreeCString(ctx, t);
+            ojsv nk = ojs_is_exception(keys) ? OJS_EXCEPTION : ojs_get(ctx, keys, "length");
+            int32_t np = 0;
+            if (!ojs_is_exception(nk)) ojs_to_int32(ctx, &np, nk);
+            for (int32_t k = 0; k < np; k++) {
+                ojsv kv = ojs_get_index(ctx, keys, (uint32_t)k);
+                char* key = ojs_is_exception(kv) ? 0 : ojs_to_cstring(ctx, kv, 0);
+                int kl = key ? (int)strlen(key) : 0;
+                if (key && kl > best && key[kl - 1] == '/' && !strncmp(spec, key, kl)) {
+                    ojsv pv = ojs_get(ctx, imports, key);
+                    char* t = ojs_is_exception(pv) ? 0 : ojs_to_cstring(ctx, pv, 0);
+                    if (t) {
+                        char tmp[2048];
+                        int tl = (int)strlen(t);
+                        int rest = (int)strlen(spec) - kl;
+                        if (tl + rest < (int)sizeof tmp) {
+                            memcpy(tmp, t, tl);
+                            memcpy(tmp + tl, spec + kl, rest);
+                            tmp[tl + rest] = 0;
+                            if (wurl_resolve(wdoc_base(js->doc), tmp, tl + rest, out, cap) > 0) { ok = 1; best = kl; }
                         }
-                        JS_FreeValue(ctx, pv);
+                        ojs_free_cstring(ctx, t);
                     }
-                    if (key) JS_FreeCString(ctx, key);
                 }
-                JS_FreePropertyEnum(ctx, props, np);
+                if (key) ojs_free_cstring(ctx, key);
             }
+            if (ojs_has_exception(ctx)) ojs_take_exception(ctx);
         }
-        JS_FreeValue(ctx, v);
     }
-    JS_FreeValue(ctx, imports);
-    JS_FreeValue(ctx, m);
     return ok;
 }
 
@@ -707,39 +715,36 @@ static void on_import(struct wjs* js, const char* base, const char* spec, int le
     if (resolve_spec(js, base, spec, len, url, sizeof url)) mod_add(js, url, 0);
 }
 
-static void set_import_meta(JSContext* ctx, JSValueConst func_val, const char* url);
+static void set_import_meta(struct wjs* js, ojsv module, const char* url);
 
 // Compile a fetched module (COMPILE_ONLY registers it by name, so linking
-// later finds it without our loader) and queue the modules it requests.
-// QuickJS's parser gives the exact static import list; minified bundles
-// defeat any text scanner.
+// later finds it through the loader) and queue the modules it requests:
+// the compiler gives the exact static import list.
 static void mod_compile_deps(struct wjs* js, int i) {
-    JSContext* ctx = js->ctx;
+    ojs* ctx = js->J;
     js->mods[i].scanned = 1;
     char* url = dupn(js->mods[i].url, (int)strlen(js->mods[i].url));
     if (!url) return;
-    if (!JS_FindLoadedModule(ctx, url)) {
+    ojsv md = ojs_find_module(ctx, url);
+    if (ojs_is_undefined(md)) {
         js->deadline = wjs_now() + SCRIPT_BUDGET_MS;
-        JSValue fv = JS_Eval(ctx, js->mods[i].text, js->mods[i].len, url,
-                             JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY | JS_EVAL_FLAG_NO_RESOLVE);
+        md = ojs_eval(ctx, js->mods[i].text, js->mods[i].len, url, OJS_EVAL_MODULE | OJS_EVAL_COMPILE_ONLY);
         js->deadline = 0;
-        if (JS_IsException(fv)) {
+        if (ojs_is_exception(md)) {
             wjs_report_exception(js, url);
             js->mods[i].state = SS_FAILED;
             w_free(url);
             return;
         }
-        set_import_meta(ctx, fv, url);
-        JS_FreeValue(ctx, fv);   // ctx->loaded_modules keeps it
+        set_import_meta(js, md, url);
     }
-    JSModuleDef* md = JS_FindLoadedModule(ctx, url);
-    int n = md ? JS_GetModuleRequestCount(md) : 0;
+    int n = ojs_module_request_count(ctx, md);
     for (int k = 0; k < n; k++) {
-        const char* spec = JS_AtomToCString(ctx, JS_GetModuleRequest(md, k));
+        char* spec = ojs_module_request(ctx, md, k);
         if (!spec) continue;
         char dep[2048];
         if (resolve_spec(js, url, spec, (int)strlen(spec), dep, sizeof dep)) mod_add(js, dep, 0);
-        JS_FreeCString(ctx, spec);
+        ojs_free_cstring(ctx, spec);
     }
     w_free(url);
 }
@@ -765,33 +770,31 @@ static int mods_outstanding_ex(struct wjs* js, int compile) {
     return out;
 }
 
-static int mods_outstanding(struct wjs* js) { return mods_outstanding_ex(js, js->ctx && !js->dead); }
+static int mods_outstanding(struct wjs* js) { return mods_outstanding_ex(js, js->J && !js->dead); }
 
-static char* mod_normalize(JSContext* ctx, const char* base_name, const char* name, void* op) {
+static int is_http(const char* s) {
+    return s && (w_ieq_prefix(s, (int)strlen(s), "http:") || w_ieq_prefix(s, (int)strlen(s), "https:"));
+}
+
+// module hook: specifier -> module name (absolute URL)
+static char* mod_resolve(ojs* ctx, const char* referrer, const char* name, void* op) {
     struct wjs* js = (struct wjs*)op;
     char url[2048];
-    const char* base = (base_name && (w_ieq_prefix(base_name, (int)strlen(base_name), "http:") ||
-                                      w_ieq_prefix(base_name, (int)strlen(base_name), "https:")))
-                       ? base_name : wdoc_base(js->doc);
+    const char* base = is_http(referrer) ? referrer : wdoc_base(js->doc);
     if (!resolve_spec(js, base, name, (int)strlen(name), url, sizeof url)) {
-        JS_ThrowTypeError(ctx, "Failed to resolve module specifier \"%s\"", name);
+        ojs_throw_type_error(ctx, "Failed to resolve module specifier \"%s\"", name);
         return 0;
     }
-    int n = (int)strlen(url);
-    char* r = (char*)js_malloc(ctx, n + 1);
-    if (r) memcpy(r, url, n + 1);
-    return r;
+    return dupn(url, (int)strlen(url));
 }
 
 // import(): load now if the module (and every static dep) is fetched,
 // otherwise fetch it and park the promise until wjs_run can finish it.
-static int dyn_import_hook(JSContext* ctx, const char* basename, const char* spec, JSValueConst* rf,
-                           JSValueConst attrs, void* op) {
+static int dyn_import_hook(ojs* ctx, const char* referrer, const char* spec, ojsv resolve, ojsv reject, void* op) {
+    (void)ctx;
     struct wjs* js = (struct wjs*)op;
     char url[2048];
-    const char* base = (basename && (w_ieq_prefix(basename, (int)strlen(basename), "http:") ||
-                                     w_ieq_prefix(basename, (int)strlen(basename), "https:")))
-                       ? basename : wdoc_base(js->doc);
+    const char* base = is_http(referrer) ? referrer : wdoc_base(js->doc);
     if (!resolve_spec(js, base, spec, (int)strlen(spec), url, sizeof url)) return 0;
     int m = mod_find(js, url);
     if (m >= 0 && js->mods[m].state != SS_FETCH && mods_outstanding(js) == 0) return 0;
@@ -804,25 +807,27 @@ static int dyn_import_hook(JSContext* ctx, const char* basename, const char* spe
         js->dyn = n;
         js->capdyn = nc;
     }
+    if (js->ndyn * 2 + 2 > js->capdynv) {
+        int nc = js->capdynv ? js->capdynv * 2 : 32;
+        if (!wjs_grow_roots(js, &js->dyn_vals, js->capdynv, nc)) return 0;
+        js->capdynv = nc;
+    }
     struct wjs_dyn* p = &js->dyn[js->ndyn];
-    p->basename = dupn(basename ? basename : "", basename ? (int)strlen(basename) : 0);
+    p->basename = dupn(referrer ? referrer : "", referrer ? (int)strlen(referrer) : 0);
     p->spec = dupn(spec, (int)strlen(spec));
     if (!p->basename || !p->spec) { w_free(p->basename); w_free(p->spec); return 0; }
     p->mod = m;
-    p->resolve = JS_DupValue(ctx, rf[0]);
-    p->reject = JS_DupValue(ctx, rf[1]);
-    p->attrs = JS_DupValue(ctx, attrs);
+    p->slot = js->ndyn;
+    js->dyn_vals[js->ndyn * 2] = resolve;
+    js->dyn_vals[js->ndyn * 2 + 1] = reject;
     js->ndyn++;
     js->flags |= WJS_FETCH;
     return 1;
 }
 
-static void dyn_free(JSContext* ctx, struct wjs_dyn* p) {
+static void dyn_free(struct wjs_dyn* p) {
     w_free(p->basename);
     w_free(p->spec);
-    JS_FreeValue(ctx, p->resolve);
-    JS_FreeValue(ctx, p->reject);
-    JS_FreeValue(ctx, p->attrs);
 }
 
 static int dyn_ready_ex(struct wjs* js, struct wjs_dyn* p, int compile) {
@@ -836,40 +841,54 @@ static void dyn_run(struct wjs* js) {
         struct wjs_dyn* p = &js->dyn[i];
         if (!dyn_ready(js, p)) { i++; continue; }
         struct wjs_dyn q = *p;
-        js->dyn[i] = js->dyn[--js->ndyn];
-        JSValue rf[2] = { q.resolve, q.reject };
+        ojsv res = js->dyn_vals[i * 2], rej = js->dyn_vals[i * 2 + 1];
+        int last = --js->ndyn;
+        js->dyn[i] = js->dyn[last];
+        js->dyn_vals[i * 2] = js->dyn_vals[last * 2];
+        js->dyn_vals[i * 2 + 1] = js->dyn_vals[last * 2 + 1];
+        js->dyn_vals[last * 2] = js->dyn_vals[last * 2 + 1] = OJS_UNDEFINED;
         js->deadline = wjs_now() + SCRIPT_BUDGET_MS;
-        JS_LoadModuleDeferred(js->ctx, q.basename, q.spec, rf, q.attrs);
+        ojs_finish_dynamic_import(js->J, q.basename, q.spec, res, rej);
         wjs_drain_jobs(js);
         js->deadline = 0;
         js->flags |= WJS_DIRTY;
-        dyn_free(js->ctx, &q);
+        dyn_free(&q);
     }
 }
 
-static void set_import_meta(JSContext* ctx, JSValueConst func_val, const char* url) {
-    JSModuleDef* m = (JSModuleDef*)JS_VALUE_GET_PTR(func_val);
-    JSValue meta = JS_GetImportMeta(ctx, m);
-    if (JS_IsException(meta)) { JS_FreeValue(ctx, JS_GetException(ctx)); return; }
-    JS_SetPropertyStr(ctx, meta, "url", JS_NewString(ctx, url));
-    JS_FreeValue(ctx, meta);
+static void set_import_meta(struct wjs* js, ojsv module, const char* url) {
+    ojs* ctx = js->J;
+    ojsv meta = ojs_module_meta(ctx, module);
+    if (ojs_is_exception(meta)) { ojs_take_exception(ctx); return; }
+    if (ojs_set(ctx, meta, "url", ojs_string(ctx, url)) < 0) ojs_take_exception(ctx);
 }
 
-static JSModuleDef* mod_loader(JSContext* ctx, const char* name, void* op) {
+// module hook: compile a module the graph needs (it was fetched ahead)
+static ojsv mod_load(ojs* ctx, const char* name, void* op) {
     struct wjs* js = (struct wjs*)op;
     int i = mod_find(js, name);
     if (i < 0 || js->mods[i].state != SS_READY) {
         if (i < 0) mod_add(js, name, 1);   // fetch it for a later import() retry
-        JS_ThrowReferenceError(ctx, "could not load module '%s' (not fetched)", name);
-        return 0;
+        return ojs_throw_reference_error(ctx, "could not load module '%s' (not fetched)", name);
     }
     struct wjs_mod* m = &js->mods[i];
-    JSValue fv = JS_Eval(ctx, m->text, m->len, name, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-    if (JS_IsException(fv)) return 0;
-    set_import_meta(ctx, fv, name);
-    JSModuleDef* md = (JSModuleDef*)JS_VALUE_GET_PTR(fv);
-    JS_FreeValue(ctx, fv);
+    ojsv md = ojs_eval(ctx, m->text, m->len, name, OJS_EVAL_MODULE | OJS_EVAL_COMPILE_ONLY);
+    if (ojs_is_exception(md)) return md;
+    set_import_meta(js, md, name);
     return md;
+}
+
+// evaluate a compiled module graph root; errors are reported
+static void run_module(struct wjs* js, ojsv md, const char* fname) {
+    ojs* ctx = js->J;
+    ojsv p = ojs_run_compiled(ctx, md);
+    if (ojs_is_exception(p)) { wjs_report_exception(js, fname); return; }
+    wjs_drain_jobs(js);
+    ojsv why;
+    if (ojs_promise_state(ctx, p, &why) == 2) {
+        ojs_throw(ctx, why);
+        wjs_report_exception(js, fname);
+    }
 }
 
 // ---- scripts --------------------------------------------------------------------------
@@ -1029,8 +1048,8 @@ static void free_text(struct wjs_script* s) { w_free(s->text); s->text = 0; s->l
 
 static void fire_script_event(struct wjs* js, int node, int ok) {
     if (node < 0) return;
-    JSValue a[2] = { wjs_wrap(js, node), JS_NewBool(js->ctx, ok) };
-    JS_FreeValue(js->ctx, call_hook(js, js->h_script, 2, a, TASK_BUDGET_MS));
+    ojsv a[2] = { wjs_wrap(js, node), ojs_bool(ok) };
+    call_hook(js, js->h_script, 2, a, TASK_BUDGET_MS);
 }
 
 static int module_ready_ex(struct wjs* js, struct wjs_script* s, int compile) {
@@ -1061,7 +1080,7 @@ static void run_script(struct wjs* js, int idx) {
         fire_script_event(js, s->node, 0);
         return;
     }
-    JSContext* ctx = js->ctx;
+    ojs* ctx = js->J;
     int node = s->node;
     s->state = SS_DONE;
     js->nscripts_run++;
@@ -1088,9 +1107,8 @@ static void run_script(struct wjs* js, int idx) {
         char* text = s->text;
         int len = s->len;
         s->text = 0;
-        JSValue r = text ? JS_Eval(ctx, text, len, fname, JS_EVAL_TYPE_GLOBAL) : JS_UNDEFINED;
-        if (JS_IsException(r)) wjs_report_exception(js, fname);
-        JS_FreeValue(ctx, r);
+        ojsv r = text ? ojs_eval(ctx, text, len, fname, OJS_EVAL_SCRIPT) : OJS_UNDEFINED;
+        if (ojs_is_exception(r)) wjs_report_exception(js, fname);
         w_free(text);
         js->current_script = prev;
         js->current_index = prev_i;
@@ -1100,30 +1118,14 @@ static void run_script(struct wjs* js, int idx) {
         int m = s->url ? -2 - s->res : -1;
         if (m >= 0 && m < js->nmod) { text = js->mods[m].text; len = js->mods[m].len; }
         // an external root was compiled on arrival: link + run that module
-        JSModuleDef* pre = s->url ? JS_FindLoadedModule(ctx, s->url) : 0;
-        if (pre) {
-            JSValue fv = JS_DupValue(ctx, JS_MKPTR(JS_TAG_MODULE, pre));
-            if (JS_ResolveModule(ctx, fv) < 0) {
-                JS_FreeValue(ctx, fv);
-                wjs_report_exception(js, fname);
-            } else {
-                JSValue r = JS_EvalFunction(ctx, fv);
-                if (JS_IsException(r)) wjs_report_exception(js, fname);
-                JS_FreeValue(ctx, r);
-            }
-        } else if (text) {
-            JSValue fv = JS_Eval(ctx, text, len, fname, JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY);
-            if (JS_IsException(fv)) wjs_report_exception(js, fname);
+        ojsv pre = s->url ? ojs_find_module(ctx, s->url) : OJS_UNDEFINED;
+        if (!ojs_is_undefined(pre)) run_module(js, pre, fname);
+        else if (text) {
+            ojsv md = ojs_eval(ctx, text, len, fname, OJS_EVAL_MODULE | OJS_EVAL_COMPILE_ONLY);
+            if (ojs_is_exception(md)) wjs_report_exception(js, fname);
             else {
-                set_import_meta(ctx, fv, s->url ? s->url : wdoc_url(js->doc));
-                if (JS_ResolveModule(ctx, fv) < 0) {
-                    JS_FreeValue(ctx, fv);
-                    wjs_report_exception(js, fname);
-                } else {
-                    JSValue r = JS_EvalFunction(ctx, fv);
-                    if (JS_IsException(r)) wjs_report_exception(js, fname);
-                    JS_FreeValue(ctx, r);
-                }
+                set_import_meta(js, md, s->url ? s->url : wdoc_url(js->doc));
+                run_module(js, md, fname);
             }
         }
         free_text(&js->sc[idx]);
@@ -1264,96 +1266,75 @@ struct wjs* wjs_new(struct wdoc* doc) {
     js->submit_btn = -1;
     js->next_due = -1;
     js->t0 = wjs_now();
-    js->hooks = JS_UNDEFINED;
-    JSValue* hv[] = { &js->h_dispatch, &js->h_ui, &js->h_fetch, &js->h_nextdue, &js->h_rundue, &js->h_frame,
-                      &js->h_dcl, &js->h_load, &js->h_script, &js->h_image, &js->h_proto, &js->h_report,
-                      &js->h_mo, &js->h_click, &js->h_ready, &js->proto_svg, &js->proto_svgroot,
-                      &js->proto_math, &js->proto_text, &js->proto_comment, &js->proto_doc, &js->proto_frag };
-    for (unsigned i = 0; i < sizeof hv / sizeof hv[0]; i++) *hv[i] = JS_UNDEFINED;
+    js->hooks = OJS_UNDEFINED;
+    ojsv* hv[] = { &js->hooks, &js->h_dispatch, &js->h_ui, &js->h_fetch, &js->h_nextdue, &js->h_rundue, &js->h_frame,
+                   &js->h_dcl, &js->h_load, &js->h_script, &js->h_image, &js->h_proto, &js->h_report,
+                   &js->h_mo, &js->h_click, &js->h_ready, &js->proto_svg, &js->proto_svgroot,
+                   &js->proto_math, &js->proto_text, &js->proto_comment, &js->proto_doc, &js->proto_frag };
+    for (unsigned i = 0; i < sizeof hv / sizeof hv[0]; i++) *hv[i] = OJS_UNDEFINED;
     if (!wjs_grow_nodes(js)) { w_free(js); return 0; }
 #if defined(__i386__)
     uint16_t cw = 0x027F;
     __asm__ volatile("fldcw %0" :: "m"(cw));
 #endif
-    if (__builtin_setjmp(js->jmp)) {
-        js->dead = 1;
-        ABORT_TRAP_SET(0);
-        wjs_logf(0, 3, "QuickJS internal error during realm setup", 41);
-        return js;
+    js->J = ojs_new();
+    if (!js->J) { js->dead = 1; wjs_logf(0, 3, "script realm: out of memory", 27); return js; }
+    ojs* ctx = js->J;
+    ojs_enter(ctx);
+    ojs_set_opaque(ctx, js);
+    ojs_set_memory_limit(ctx, REALM_MEM_LIMIT);
+    ojs_set_stack_size(ctx, REALM_STACK_MAX);
+    ojs_set_interrupt_handler(ctx, interrupt_cb, js);
+    ojs_set_rejection_tracker(ctx, rejection_cb, js);
+#if !(defined(KERNEL) && KERNEL)
+    if (getenv("OJS_GCSTRESS")) ojs_set_gc_stress(ctx, (uint32_t)atoi(getenv("OJS_GCSTRESS")));   // host GC-root testing
+#endif
+    struct ojs_module_hooks mh = { mod_resolve, mod_load, dyn_import_hook, js };
+    ojs_set_module_hooks(ctx, &mh);
+    if (wjs_host.random) {
+        uint64_t seed;
+        wjs_host.random((uint8_t*)&seed, sizeof seed);
+        ojs_set_random_seed(ctx, seed);
     }
-    ABORT_TRAP_SET(js->jmp);
-    js->rt = JS_NewRuntime();
-    if (!js->rt) { js->dead = 1; UNGUARD(); return js; }
-    JS_SetMemoryLimit(js->rt, JS_MEM_LIMIT);
-    JS_SetMaxStackSize(js->rt, JS_STACK_MAX);
-    JS_UpdateStackTop(js->rt);
-    JS_SetInterruptHandler(js->rt, interrupt_cb, js);
-    JS_SetHostPromiseRejectionTracker(js->rt, rejection_cb, js);
-    JS_SetModuleLoaderFunc(js->rt, mod_normalize, mod_loader, js);
-    JS_SetDynamicImportHook(js->rt, dyn_import_hook);
-    if (!wjs_class_id) JS_NewClassID(&wjs_class_id);
-    JSClassDef cd;
-    memset(&cd, 0, sizeof cd);
-    cd.class_name = "Node";
-    JS_NewClass(js->rt, wjs_class_id, &cd);
-    js->ctx = JS_NewContext(js->rt);
-    if (!js->ctx) { js->dead = 1; UNGUARD(); return js; }
-    JS_SetContextOpaque(js->ctx, js);
-    JSContext* ctx = js->ctx;
-    JSValue natives = JS_NewObject(ctx);
-    JS_SetPropertyFunctionList(ctx, natives, env_funcs, sizeof env_funcs / sizeof env_funcs[0]);
+    // roots: every value slot of struct wjs, and the arrays grown before the realm existed
+    for (unsigned i = 0; i < sizeof hv / sizeof hv[0]; i++) ojs_add_root(ctx, hv[i]);
+    ojs_add_root_range(ctx, js->node_obj, js->node_cap);
+    int cls = ojs_host_class(ctx, "Node");
+    if (!wjs_class_id) wjs_class_id = cls;
+    ojsv natives = ojs_object(ctx);
+    ojs_set_functions(ctx, natives, env_funcs, (int)(sizeof env_funcs / sizeof env_funcs[0]));
     wjs_dom_install(js, natives);
     js->deadline = wjs_now() + SCRIPT_BUDGET_MS;
-    // The prelude is compiled once per boot; later realms load its bytecode
-    // (parsing 2k lines of JS per page is the dominant realm setup cost).
-    static uint8_t* prelude_bc;
-    static size_t prelude_bc_len;
-    JSValue code;
-    if (prelude_bc) code = JS_ReadObject(ctx, prelude_bc, prelude_bc_len, JS_READ_OBJ_BYTECODE);
+    // the prelude evaluates to a function(W, global) that returns the hooks
+    ojsv fn = ojs_eval(ctx, wjs_prelude_src, wjs_prelude_len, "<okai-prelude>", OJS_EVAL_SCRIPT);
+    ojsv hooks = OJS_UNDEFINED;
+    if (ojs_is_exception(fn)) wjs_report_exception(js, "prelude compile");
     else {
-        code = JS_Eval(ctx, wjs_prelude_src, wjs_prelude_len, "<okai-prelude>",
-                       JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
-        if (!JS_IsException(code)) {
-            size_t n;
-            uint8_t* bc = JS_WriteObject(ctx, &n, code, JS_WRITE_OBJ_BYTECODE);
-            if (bc) {
-                uint8_t* keep = (uint8_t*)w_malloc(n);   // lives for the boot
-                if (keep) { memcpy(keep, bc, n); prelude_bc = keep; prelude_bc_len = n; }
-                js_free(ctx, bc);
-            }
-        }
+        ojsv args[2] = { natives, ojs_global(ctx) };
+        hooks = ojs_call(ctx, fn, OJS_UNDEFINED, 2, args);
+        if (ojs_is_exception(hooks)) { wjs_report_exception(js, "prelude"); hooks = OJS_UNDEFINED; }
     }
-    JSValue fn = JS_IsException(code) ? code : JS_EvalFunction(ctx, code);
-    JSValue hooks = JS_UNDEFINED;
-    if (JS_IsException(fn)) wjs_report_exception(js, "prelude compile");
-    else {
-        JSValue g = JS_GetGlobalObject(ctx);
-        JSValue args[2] = { natives, g };
-        hooks = JS_Call(ctx, fn, JS_UNDEFINED, 2, args);
-        JS_FreeValue(ctx, g);
-        if (JS_IsException(hooks)) { wjs_report_exception(js, "prelude"); hooks = JS_UNDEFINED; }
-    }
+    wjs_drain_jobs(js);
     js->deadline = 0;
-    JS_FreeValue(ctx, fn);
-    JS_FreeValue(ctx, natives);
-    if (!JS_IsObject(hooks)) {
+    if (!ojs_is_object(hooks)) {
         wjs_logf(js, 3, "prelude failed: scripts disabled", 32);
-        UNGUARD();
+        ojs_leave(ctx);
         js->dead = 1;   // realm unusable; free it later without running anything
         return js;
     }
     js->hooks = hooks;
-    struct { JSValue* slot; const char* name; } hk[] = {
+    struct { ojsv* slot; const char* name; } hk[] = {
         { &js->h_dispatch, "dispatch" }, { &js->h_ui, "uiEvent" }, { &js->h_fetch, "onFetch" },
         { &js->h_nextdue, "nextDue" }, { &js->h_rundue, "runDue" }, { &js->h_frame, "runFrame" },
         { &js->h_dcl, "fireDCL" }, { &js->h_load, "fireLoad" }, { &js->h_script, "scriptEvent" },
         { &js->h_image, "imageEvent" }, { &js->h_proto, "protoFor" }, { &js->h_report, "report" },
         { &js->h_mo, "moChildList" }, { &js->h_click, "dispatchClick" }, { &js->h_ready, "setReady" } };
     for (unsigned i = 0; i < sizeof hk / sizeof hk[0]; i++) {
-        JS_FreeValue(ctx, *hk[i].slot);   // setProtoFor may have filled one already
-        *hk[i].slot = JS_GetPropertyStr(ctx, hooks, hk[i].name);
+        ojsv v = ojs_get(ctx, hooks, hk[i].name);
+        if (ojs_is_exception(v)) { ojs_take_exception(ctx); v = OJS_UNDEFINED; }
+        if (!ojs_is_undefined(v) || ojs_is_undefined(*hk[i].slot)) *hk[i].slot = v;   // setProtoFor may have filled one
     }
-    UNGUARD();
+    ojs_leave(ctx);
     return js;
 }
 
@@ -1362,33 +1343,33 @@ int wjs_ok(struct wjs* js) { return js && !js->dead; }
 void wjs_free(struct wjs* js) {
     if (!js) return;
     wjs_selq_forget(js->d);
-    if (!js->dead && js->ctx && enter(js)) {
-        if (!__builtin_setjmp(js->jmp)) {
-            ABORT_TRAP_SET(js->jmp);
-            JSContext* ctx = js->ctx;
-            for (int i = 0; i < js->ndyn; i++) dyn_free(ctx, &js->dyn[i]);
-            js->ndyn = 0;
-            for (int i = 0; i < js->node_cap; i++) JS_FreeValue(ctx, js->node_obj[i]);
-            for (int i = 0; i < js->proto_cap; i++) JS_FreeValue(ctx, js->proto_html[i]);
-            JSValue* hv[] = { &js->hooks, &js->h_dispatch, &js->h_ui, &js->h_fetch, &js->h_nextdue, &js->h_rundue,
-                              &js->h_frame, &js->h_dcl, &js->h_load, &js->h_script, &js->h_image, &js->h_proto,
-                              &js->h_report, &js->h_mo, &js->h_click, &js->h_ready, &js->proto_svg,
-                              &js->proto_svgroot, &js->proto_math, &js->proto_text, &js->proto_comment,
-                              &js->proto_doc, &js->proto_frag };
-            for (unsigned i = 0; i < sizeof hv / sizeof hv[0]; i++) JS_FreeValue(ctx, *hv[i]);
-            JS_FreeContext(ctx);
-            JS_FreeRuntime(js->rt);
-        } else {
-            wjs_logf(0, 3, "QuickJS teardown error (realm leaked)", 37);
+#if !(defined(KERNEL) && KERNEL)
+    if (js->J && getenv("OJS_GCSTATS")) {   // host: where the realm's memory went
+        ojs_gc(js->J);
+        struct ojs_stats st;
+        ojs_get_stats(js->J, &st);
+        fprintf(stderr, "[gc] heap %zuKB live %zuKB collections %d (%.0fms) allocated %lluKB\n", st.heap_bytes >> 10, st.live_bytes >> 10, st.gc_count, st.gc_ms, st.total_alloc >> 10);
+        const char* names = OJS_STATS_TYPES;
+        for (int i = 0; i < 16 && *names; i++) {
+            int l = 0;
+            while (names[l] && names[l] != ' ') l++;
+            if (st.live_by_type[i] >= 1024) fprintf(stderr, "  %.*s %zuKB\n", l, names, st.live_by_type[i] >> 10);
+            names += l;
+            while (*names == ' ') names++;
         }
-        ABORT_TRAP_SET(0);
     }
+#endif
+    // the realm owns every value; freeing it releases them all at once
+    if (js->J) ojs_free(js->J);
+    js->J = 0;
+    for (int i = 0; i < js->ndyn; i++) dyn_free(&js->dyn[i]);
     for (int i = 0; i < js->nsc; i++) { w_free(js->sc[i].url); w_free(js->sc[i].text); }
     w_free(js->sc);
     for (int i = 0; i < js->nmod; i++) { w_free(js->mods[i].url); w_free(js->mods[i].text); }
     w_free(js->mods);
     w_free(js->importmap);
     w_free(js->dyn);
+    w_free(js->dyn_vals);
     w_free(js->node_obj);
     w_free(js->node_flags);
     w_free(js->proto_html);
@@ -1431,17 +1412,17 @@ void wjs_resource_done(struct wjs* js, int res, int status, const char* headers,
     }
     // a fetch()/XHR request
     GUARD(js, );
-    JSContext* ctx = js->ctx;
-    JSValue a[6];
-    a[0] = JS_NewInt32(ctx, res);
-    a[1] = JS_NewInt32(ctx, status);
-    a[2] = JS_NewString(ctx, status == 200 ? "OK" : "");
-    a[3] = JS_NewString(ctx, headers ? headers : "");
-    a[4] = (body && len >= 0) ? JS_NewArrayBufferCopy(ctx, (const uint8_t*)body, len) : JS_NULL;
-    a[5] = JS_NewString(ctx, final_url ? final_url : "");
-    JS_FreeValue(ctx, call_hook(js, js->h_fetch, 6, a, TASK_BUDGET_MS));
+    ojs* ctx = js->J;
+    ojsv a[6];
+    a[0] = ojs_int(res);
+    a[1] = ojs_int(status);
+    a[2] = ojs_string(ctx, status == 200 ? "OK" : "");
+    a[3] = ojs_string(ctx, headers ? headers : "");
+    a[4] = (body && len >= 0) ? ojs_arraybuffer_copy(ctx, body, (size_t)len) : OJS_NULL;
+    a[5] = ojs_string(ctx, final_url ? final_url : "");
+    call_hook(js, js->h_fetch, 6, a, TASK_BUDGET_MS);
     js->flags |= WJS_DIRTY;
-    UNGUARD();
+    UNGUARD(js);
 }
 
 void wjs_image_done(struct wjs* js, int slot, int ok) {
@@ -1450,11 +1431,11 @@ void wjs_image_done(struct wjs* js, int slot, int ok) {
     struct wdom* d = js->d;
     for (int el = d->n[0].first; el >= 0; el = wdom_next(d, el, 0)) {
         if (!wdom_is(d, el, T_img) || wdoc_img_node_slot(js->doc, el) != slot) continue;
-        if (el >= js->node_cap || JS_IsUndefined(js->node_obj[el])) continue;   // no script holds it
-        JSValue a[2] = { wjs_wrap(js, el), JS_NewBool(js->ctx, ok) };
-        JS_FreeValue(js->ctx, call_hook(js, js->h_image, 2, a, TASK_BUDGET_MS));
+        if (el >= js->node_cap || ojs_is_undefined(js->node_obj[el])) continue;   // no script holds it
+        ojsv a[2] = { wjs_wrap(js, el), ojs_bool(ok) };
+        call_hook(js, js->h_image, 2, a, TASK_BUDGET_MS);
     }
-    UNGUARD();
+    UNGUARD(js);
 }
 
 static int any_script_pending(struct wjs* js) {
@@ -1488,8 +1469,8 @@ int wjs_run(struct wjs* js, int budget_ms) {
     // scripts in order, then DOMContentLoaded
     if (blocking_done && !js->interactive && !over) {
         js->interactive = 1;
-        JSValue a[1] = { JS_NewString(js->ctx, "interactive") };
-        JS_FreeValue(js->ctx, call_hook(js, js->h_ready, 1, a, TASK_BUDGET_MS));
+        ojsv a[1] = { ojs_string(js->J, "interactive") };
+        call_hook(js, js->h_ready, 1, a, TASK_BUDGET_MS);
     }
     if (blocking_done) {
         while (js->next_defer < js->nsc && !over) {
@@ -1502,7 +1483,7 @@ int wjs_run(struct wjs* js, int budget_ms) {
         }
         if (js->next_defer >= js->nsc && !js->dcl_fired && !over) {
             js->dcl_fired = 1;
-            JS_FreeValue(js->ctx, call_hook(js, js->h_dcl, 0, 0, TASK_BUDGET_MS * 2));
+            call_hook(js, js->h_dcl, 0, 0, TASK_BUDGET_MS * 2);
             js->flags |= WJS_DIRTY;
         }
     }
@@ -1518,25 +1499,23 @@ int wjs_run(struct wjs* js, int budget_ms) {
     // 4. timers (one at a time, microtasks in between), animation frames
     if (js->dcl_fired || !any_script_pending(js)) {
         for (int k = 0; k < 256 && !over; k++) {
-            JSValue a[1] = { JS_NewInt32(js->ctx, wjs_now() - js->t0) };
-            JSValue r = call_hook(js, js->h_rundue, 1, a, TASK_BUDGET_MS);
-            int ran = JS_ToBool(js->ctx, r);
-            JS_FreeValue(js->ctx, r);
+            ojsv a[1] = { ojs_int(wjs_now() - js->t0) };
+            ojsv r = call_hook(js, js->h_rundue, 1, a, TASK_BUDGET_MS);
+            int ran = ojs_to_bool(js->J, r);
             if (!ran) break;
             js->flags |= WJS_DIRTY;
             if (wjs_now() - start > budget_ms) over = 1;
         }
         if (!over) {
-            JSValue a[1] = { JS_NewInt32(js->ctx, wjs_now() - js->t0) };
-            JSValue r = call_hook(js, js->h_frame, 1, a, TASK_BUDGET_MS);
-            if (JS_ToBool(js->ctx, r)) js->flags |= WJS_DIRTY;
-            JS_FreeValue(js->ctx, r);
+            ojsv a[1] = { ojs_int(wjs_now() - js->t0) };
+            ojsv r = call_hook(js, js->h_frame, 1, a, TASK_BUDGET_MS);
+            if (ojs_to_bool(js->J, r)) js->flags |= WJS_DIRTY;
         }
     }
     // 5. load
     if (js->dcl_fired && !js->load_fired && !over && !any_script_pending(js) && !wdoc_pending_load(js->doc)) {
         js->load_fired = 1;
-        JS_FreeValue(js->ctx, call_hook(js, js->h_load, 0, 0, TASK_BUDGET_MS * 2));
+        call_hook(js, js->h_load, 0, 0, TASK_BUDGET_MS * 2);
         js->flags |= WJS_DIRTY;
         char st[160], line[220];
         wjs_stats(js, st, sizeof st);
@@ -1551,15 +1530,14 @@ int wjs_run(struct wjs* js, int budget_ms) {
     }
     // cache the next wake-up
     {
-        JSValue r = call_hook(js, js->h_nextdue, 0, 0, TASK_BUDGET_MS);
+        ojsv r = call_hook(js, js->h_nextdue, 0, 0, TASK_BUDGET_MS);
         int32_t due = -1;
-        JS_ToInt32(js->ctx, &due, r);
-        JS_FreeValue(js->ctx, r);
+        ojs_to_int32(js->J, &due, r);
         js->next_due = due;
         if (over || (js->nsc && js->next_block < js->nsc && ready_to_run(js, &js->sc[js->next_block])))
             js->next_due = 0;
     }
-    UNGUARD();
+    UNGUARD(js);
     int f = js->flags;
     js->flags = 0;
     return f;
@@ -1587,20 +1565,18 @@ int wjs_event(struct wjs* js, int node, const char* type, int x, int y, int butt
     if (prevented) *prevented = 0;
     if (!js || js->dead) return 0;
     GUARD(js, 0);
-    JSContext* ctx = js->ctx;
-    JSValue a[6] = { node >= 0 ? wjs_wrap(js, node) : JS_NULL, JS_NewString(ctx, type), JS_NewInt32(ctx, x),
-                     JS_NewInt32(ctx, y), JS_NewInt32(ctx, button), JS_NewInt32(ctx, key) };
-    JSValue r = call_hook(js, js->h_ui, 6, a, TASK_BUDGET_MS);
-    if (prevented && JS_IsBool(r) && !JS_ToBool(ctx, r)) *prevented = 1;
-    JS_FreeValue(ctx, r);
+    ojs* ctx = js->J;
+    ojsv a[6] = { node >= 0 ? wjs_wrap(js, node) : OJS_NULL, ojs_string(ctx, type), ojs_int(x),
+                     ojs_int(y), ojs_int(button), ojs_int(key) };
+    ojsv r = call_hook(js, js->h_ui, 6, a, TASK_BUDGET_MS);
+    if (prevented && ojs_is_bool(r) && !ojs_to_bool(ctx, r)) *prevented = 1;
     {
-        JSValue r2 = call_hook(js, js->h_nextdue, 0, 0, TASK_BUDGET_MS);
+        ojsv r2 = call_hook(js, js->h_nextdue, 0, 0, TASK_BUDGET_MS);
         int32_t due = -1;
-        JS_ToInt32(ctx, &due, r2);
-        JS_FreeValue(ctx, r2);
+        ojs_to_int32(ctx, &due, r2);
         js->next_due = due;
     }
-    UNGUARD();
+    UNGUARD(js);
     int f = js->flags;
     js->flags = 0;
     return f;
@@ -1683,20 +1659,20 @@ int wjs_take_history(struct wjs* js, int* delta) {
 
 void wjs_stats(struct wjs* js, char* out, int cap) {
     if (!js) { if (cap) out[0] = 0; return; }
-    JSMemoryUsage mu;
-    int heap_kb = 0;
-    if (!js->dead && js->rt) { JS_ComputeMemoryUsage(js->rt, &mu); heap_kb = (int)(mu.malloc_size >> 10); }
-    int vals[5] = { js->nsc, js->nscripts_run, js->nerrors, js->nmod, heap_kb };
-    const char* names[5] = { "scripts=", " ran=", " errors=", " modules=", " heap=" };
+    // heap: memory the realm holds; live: what survived its last collection
+    struct ojs_stats st;
+    memset(&st, 0, sizeof st);
+    if (js->J) ojs_get_stats(js->J, &st);
+    int vals[7] = { js->nsc, js->nscripts_run, js->nerrors, js->nmod, (int)(st.heap_bytes >> 10), (int)(st.live_bytes >> 10), st.gc_count };
+    const char* names[7] = { "scripts=", " ran=", " errors=", " modules=", " heap=", "KB live=", "KB gcs=" };
     int n = 0;
-    for (int k = 0; k < 5 && n < cap - 16; k++) {
+    for (int k = 0; k < 7 && n < cap - 16; k++) {
         for (const char* p = names[k]; *p && n < cap - 16; p++) out[n++] = *p;
         int v = vals[k];
         char d[12]; int dl = 0;
         do { d[dl++] = (char)('0' + v % 10); v /= 10; } while (v);
-        while (dl) out[n++] = d[--dl];
+        while (dl && n < cap - 4) out[n++] = d[--dl];
     }
-    if (n < cap - 4) { out[n++] = 'K'; out[n++] = 'B'; }
     if (js->dead && n < cap - 8) { memcpy(out + n, " dead", 5); n += 5; }
     out[n] = 0;
 }

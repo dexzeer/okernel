@@ -1,0 +1,57 @@
+ojs - okernel's JavaScript engine
+=================================
+
+Written from scratch for okernel (no third-party code). It runs page scripts
+for the okai browser (src/web/wjs*.c embeds it, one realm per document) and
+builds the same on the host for testing (tests/ojs/build.sh).
+
+Layout
+------
+  ojs.h            embedding API (values, eval/call, objects, roots, modules)
+  ojs_int.h        internal types: values, strings, objects, shapes, intrinsics
+  gc.c             heap: size-class pages + large blocks, non-moving mark-sweep
+                   with a conservative scan of the C stack and of VM frames
+  str.c            strings (latin-1 / UTF-16, ropes), atoms, string builder
+  obj.c            ordinary objects: shapes (shared transitions, dictionaries),
+                   fast elements, property definitions
+  lex.c parse.c parse_stmt.c   source -> AST (scopes, early errors)
+  compile*.c       AST -> bytecode (per-function templates, line tables)
+  vm.c vm_run.c vm_helpers.c   the interpreter (direct-threaded, inline caches)
+  realm.c b_*.c generator.c module.c   the built-ins, generators/async, modules
+  re.c b_regexp.c  regular expressions (backtracking matcher, v-mode sets)
+  num.c bigint.c   number <-> string (exact), BigInt
+  srctext.c        compact (UTF-8) source text kept for compiled functions
+  unicode.c unicode_data.c     Unicode tables; unicode_data.c is generated
+                   from the Unicode Character Database by tools/gen_unicode.py
+                   (data, not code)
+
+Things to know
+--------------
+* Values are NaN-boxed 64-bit words (ojsv). No reference counting: the
+  collector scans the C stack between ojs_enter() and the current frame, and
+  the VM value stack conservatively; C heap memory holding values must be
+  registered (ojs_add_root / ojs_add_root_range).
+* x87 only, like the kernel: double -> int conversions go through the IEEE
+  bits (d2i64, dtoi32, jv_number) because a C cast changes the x87 rounding
+  mode twice per conversion.
+* Inline caches (struct ic, per property/global site) are made on first use
+  and dropped by every collection, so they never point at freed objects.
+* The realm memory limit (ojs_set_memory_limit) counts memory taken from the
+  system; an allocation that would pass it collects first.
+* Templates keep their script's source (toString, stack traces). A big script
+  that needed UTF-16 is re-stored as UTF-8 after compiling (srctext.c), so it
+  costs about its UTF-8 size, not twice that.
+* 64-bit division in the kernel comes from src/divdi3.c (no libgcc).
+
+Tests
+-----
+  sh tests/ojs/build.sh                 host build -> build-host/ojs_run
+  ./build-host/ojs_run tests/ojs/smoke.js           (prints ALL OK)
+  python3 tests/ojs/run262.py -j8 test/language     test262 (~/test262)
+  python3 tests/ojs/corpus/run_corpus.py            real libraries, node vs ojs
+  OJS_GCSTRESS=N   collect every N allocations (any runner)
+  OJS_GCSTATS=1    heap / live bytes by type at exit
+  OJS_DUMP=1       bytecode listing
+  OJS_MEMLIMIT=MB  realm limit in ojs_run (like a page)
+The corpus downloads third-party libraries into build-host/corpus-lib as test
+input only; they are never part of the kernel.

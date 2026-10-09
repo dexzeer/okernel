@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""okai page-script test (QuickJS), offline: local fixture server on :8001.
+"""okai page-script test (ojs), offline: local fixture server on :8001.
 
   1. tests/web/js/basic.html: 37 DOM/event/layout/storage/custom-element
      checks run inside the kernel realm -> "[js] RESULT ALLPASS"

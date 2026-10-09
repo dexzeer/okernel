@@ -336,7 +336,7 @@ static int hb_valid(void* ptr) {
     return b->magic == HB_MAGIC_U && (b->size & HB_USED);
 }
 
-// Usable bytes of a live block (QuickJS memory accounting); 0 if invalid.
+// Usable bytes of a live block; 0 if invalid.
 uint32_t ksize(void* ptr) {
     if (!ptr || !hb_valid(ptr)) return 0;
     struct hblock* b = (struct hblock*)((uint8_t*)ptr - HB_HDR);

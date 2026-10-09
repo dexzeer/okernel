@@ -8,7 +8,7 @@
 #include "wdom.h"
 #include "wdoc_int.h"
 #include "wcommon.h"
-#include "quickjs.h"
+#include "../ojs/ojs.h"
 
 // script record
 enum { SK_CLASSIC, SK_MODULE };
@@ -39,7 +39,7 @@ struct wjs_dyn {
     char* basename;
     char* spec;
     int mod;             // module map index
-    JSValue resolve, reject, attrs;
+    int slot;            // index of its resolve/reject pair in js->dyn_vals
 };
 
 // node flags
@@ -52,18 +52,18 @@ struct wjs_dyn {
 struct wjs {
     struct wdoc* doc;
     struct wdom* d;
-    JSRuntime* rt;
-    JSContext* ctx;
-    JSValue hooks;           // object returned by the prelude
-    JSValue h_dispatch, h_ui, h_fetch, h_nextdue, h_rundue, h_frame, h_dcl, h_load,
-            h_script, h_image, h_proto, h_report, h_mo, h_click, h_ready;
+    ojs* J;                  // the realm (NULL: not created / failed)
+    // values below are GC roots (registered in wjs_new)
+    ojsv hooks;              // object returned by the prelude
+    ojsv h_dispatch, h_ui, h_fetch, h_nextdue, h_rundue, h_frame, h_dcl, h_load,
+         h_script, h_image, h_proto, h_report, h_mo, h_click, h_ready;
     int interactive;         // readyState "interactive" reached (parsing done)
-    JSValue* node_obj;       // wrapper per node (JS_UNDEFINED = none yet)
+    ojsv* node_obj;          // wrapper per node (OJS_UNDEFINED = none yet); a root range
     uint8_t* node_flags;
     int node_cap;
-    JSValue* proto_html;     // cached prototype per HTML tag atom
+    ojsv* proto_html;        // cached prototype per HTML tag atom (root range)
     int proto_cap;
-    JSValue proto_svg, proto_svgroot, proto_math, proto_text, proto_comment, proto_doc, proto_frag;
+    ojsv proto_svg, proto_svgroot, proto_math, proto_text, proto_comment, proto_doc, proto_frag;
     int frag_atom;           // atom naming fragment pseudo-elements (unused: WN_FRAG)
     // scripts
     struct wjs_script* sc;
@@ -76,6 +76,8 @@ struct wjs {
     char* importmap;         // raw "imports" JSON object text (or NULL)
     struct wjs_dyn* dyn;     // deferred dynamic imports
     int ndyn, capdyn;
+    ojsv* dyn_vals;          // resolve/reject pairs of parked imports (root range)
+    int capdynv;
     // template element -> content fragment
     int* tpl_map;            // pairs
     int ntpl, captpl;
@@ -98,18 +100,17 @@ struct wjs {
     int submit_form, submit_btn;
     // stats
     int nlog, nerrors, nscripts_run;
-    // abort recovery (kernel): __builtin_setjmp buffer
-    void* jmp[5];
 };
 
-extern JSClassID wjs_class_id;
+extern int wjs_class_id;     // host class of node wrappers
 
 // wrappers
-JSValue wjs_wrap(struct wjs* js, int node);      // new reference; JS_NULL for -1
-int     wjs_node_of(struct wjs* js, JSValueConst v);
+ojsv    wjs_wrap(struct wjs* js, int node);      // OJS_NULL for -1
+int     wjs_node_of(struct wjs* js, ojsv v);
 int     wjs_grow_nodes(struct wjs* js);
+ojsv*   wjs_grow_roots(struct wjs* js, ojsv** arr, int cap, int nc);
 // DOM natives (wjs_dom.c): install on the natives object
-void    wjs_dom_install(struct wjs* js, JSValue natives);
+void    wjs_dom_install(struct wjs* js, ojsv natives);
 // mutation side effects (inserted subtree: scripts, styles, images)
 void    wjs_inserted(struct wjs* js, int node);
 void    wjs_removed(struct wjs* js, int parent, int node);
@@ -123,8 +124,8 @@ void    wjs_drain_jobs(struct wjs* js);
 int     wjs_now(void);
 void    wjs_logf(struct wjs* js, int level, const char* s, int len);
 // storage / cookies (wjs.c)
-JSValue wjs_store_op(struct wjs* js, int area, int op, JSValueConst* argv, int argc);
-JSValue wjs_cookie_op(struct wjs* js, JSValueConst setv, int set);
+ojsv    wjs_store_op(struct wjs* js, int area, int op, ojsv* argv, int argc);
+ojsv    wjs_cookie_op(struct wjs* js, ojsv setv, int set);
 
 // small helpers
 static inline int wjs_str_eq(const char* s, int n, const char* lit) {

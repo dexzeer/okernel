@@ -1,0 +1,25 @@
+# name  url — third-party libraries used only as test input (downloaded into
+# build-host/corpus-lib by run_corpus.py; never part of the kernel)
+acorn.js https://cdn.jsdelivr.net/npm/acorn@8.14.0/dist/acorn.js
+babel.js https://cdn.jsdelivr.net/npm/@babel/standalone@7.26.2/babel.min.js
+prettier.js https://cdn.jsdelivr.net/npm/prettier@3.3.3/standalone.js
+prettier-babel.js https://cdn.jsdelivr.net/npm/prettier@3.3.3/plugins/babel.js
+prettier-estree.js https://cdn.jsdelivr.net/npm/prettier@3.3.3/plugins/estree.js
+lodash.js https://cdn.jsdelivr.net/npm/lodash@4.17.21/lodash.min.js
+moment.js https://cdn.jsdelivr.net/npm/moment@2.30.1/moment.min.js
+marked.js https://cdn.jsdelivr.net/npm/marked@12.0.0/marked.min.js
+terser.js https://cdn.jsdelivr.net/npm/terser@5.31.0/dist/bundle.min.js
+typescript.js https://cdn.jsdelivr.net/npm/typescript@5.6.3/lib/typescript.js
+esprima.js https://cdn.jsdelivr.net/npm/esprima@4.0.1/dist/esprima.js
+handlebars.js https://cdn.jsdelivr.net/npm/handlebars@4.7.8/dist/handlebars.min.js
+pako.js https://cdn.jsdelivr.net/npm/pako@2.1.0/dist/pako.min.js
+cryptojs.js https://cdn.jsdelivr.net/npm/crypto-js@4.2.0/crypto-js.js
+jsyaml.js https://cdn.jsdelivr.net/npm/js-yaml@4.1.0/dist/js-yaml.min.js
+decimal.js https://cdn.jsdelivr.net/npm/decimal.js@10.4.3/decimal.min.js
+corejs.js https://cdn.jsdelivr.net/npm/core-js-bundle@3.39.0/minified.js
+react.js https://cdn.jsdelivr.net/npm/react@18.3.1/umd/react.production.min.js
+reactdomserver.js https://cdn.jsdelivr.net/npm/react-dom@18.3.1/umd/react-dom-server-legacy.browser.production.min.js
+ramda.js https://cdn.jsdelivr.net/npm/ramda@0.30.1/dist/ramda.min.js
+immutable.js https://cdn.jsdelivr.net/npm/immutable@4.3.7/dist/immutable.min.js
+rxjs.js https://cdn.jsdelivr.net/npm/rxjs@7.8.1/dist/bundles/rxjs.umd.min.js
+d3.js https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js
