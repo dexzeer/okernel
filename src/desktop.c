@@ -40,6 +40,7 @@
 #include "cursor.h"
 #include "simd.h"
 #include "i915.h"
+#include "audio.h"
 #include "display.h"
 
 struct mboot_info {
@@ -943,6 +944,19 @@ static void shell_execute(int win_id, const char* input) {
         struct smp_out o = { win_id };
         simd_selftest(smp_out_line, &o);
     }
+    else if (str_eq(cmd_buf, "audio")) {
+        struct smp_out o = { win_id };
+        audio_describe(smp_out_line, &o);
+    }
+    else if (str_eq(cmd_buf, "beep")) {
+        // beep [hz] [ms]: a test tone through the HD Audio output
+        int hz = 440, ms = 1000, i = 0;
+        if (args[0] >= '0' && args[0] <= '9') { hz = 0; while (args[i] >= '0' && args[i] <= '9') hz = hz * 10 + (args[i++] - '0'); }
+        while (args[i] == ' ') i++;
+        if (args[i] >= '0' && args[i] <= '9') { ms = 0; while (args[i] >= '0' && args[i] <= '9') ms = ms * 10 + (args[i++] - '0'); }
+        if (!audio_ready()) window_puts(win_id, "no audio output\n");
+        else { audio_beep(hz, ms); window_puts(win_id, "beep done\n"); }
+    }
     else if (str_eq(cmd_buf, "gpu")) {
         // read-only report on the display hardware: Intel graphics registers (pipes,
         // planes, cursor, GTT entry of the scanout buffer) and the active backend
@@ -1315,6 +1329,7 @@ static void on_keypress(char c, int alt) {
 
 static void on_timer(void) {
     tick_count++;
+    audio_tick();           // HD Audio play position (no-op without audio)
     // Scheduler tick FIRST (cheap, runs at IRQ): count down the running
     // user process's slice and round-robin on expiry. No-op when only the
     // kernel idle process exists — zero behavior change for existing flows.
@@ -1532,6 +1547,7 @@ void kernel_main(uint32_t mboot_phys) {
     // Wake the other CPUs (they only run smp_parallel_for jobs). Interrupts are
     // still off; the PIT is programmed, so the boot CPU's tick is unaffected.
     smp_init();
+    audio_init();      // HD Audio output (QEMU: -device intel-hda -device hda-output); failure leaves the system silent
 
     // Create main terminal: a plain shell, just the prompt (no banner).
     // 72x24 cells (12x24 content glyphs), left of the wallpaper emblem and
