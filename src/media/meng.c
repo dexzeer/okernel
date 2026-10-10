@@ -409,6 +409,19 @@ int meng_buffered(const struct meng* m, int index, double* start, double* end) {
     return n;
 }
 
+int meng_sb_buffered(const struct meng* m, int sb, int index, double* start, double* end) {
+    if (sb < 0 || sb >= m->nsb) return 0;
+    int kinds = m->sb[sb].kinds;
+    if (kinds == 3) return meng_buffered(m, index, start, end);
+    struct range r[MAX_RANGES];
+    int n = kinds == 1 ? (m->a_present ? pq_ranges(&m->aq, r, MAX_RANGES, m->delay_ns) : 0)
+                       : (m->v_present ? pq_ranges(&m->vq, r, MAX_RANGES, 0) : 0);
+    if (index < 0 || index >= n) return 0;
+    *start = r[index].s / 1e9;
+    *end = r[index].e / 1e9;
+    return n;
+}
+
 // seconds of data ahead of t in the range containing it (negative if there is none)
 static double ahead_of(const struct meng* m, int64_t t) {
     struct range r[MAX_RANGES];

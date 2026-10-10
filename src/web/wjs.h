@@ -28,6 +28,7 @@ struct wjs_host {
 extern struct wjs_host wjs_host;
 
 int  wjs_now(void);                          // ms (host clock)
+void wjs_debug_eval(struct wjs* js, const char* src);   // host builds only
 struct wjs* wjs_new(struct wdoc* doc);
 void wjs_free(struct wjs* js);
 int  wjs_ok(struct wjs* js);                 // realm alive (not aborted/OOM)

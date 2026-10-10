@@ -53,6 +53,7 @@ struct hp {
     int len, pos;
     int tstate;
     int raw_tag;             // atom whose end tag ends RCDATA/RAWTEXT/script
+    int in_frag, frag_ctx;   // fragment parsing: the context element's tag (the stack's bottom html is only a placeholder)
     struct wbuf chars;       // pending character data
     struct wbuf vals;        // attribute values of the current token
     struct wbuf misc;        // comment/doctype scratch
@@ -505,6 +506,7 @@ static void reset_mode(struct hp* p) {
         int last = (i == 0);
         if (N(el).ns != NS_HTML) { if (last) { p->mode = M_IN_BODY; return; } continue; }
         int t = N(el).tag;
+        if (last && p->in_frag) t = p->frag_ctx;     // fragment case: the context element stands for the root
         if (t == T_select) {
             for (int j = i - 1; j > 0; j--) {
                 if (is_html(p, p->stack[j], T_template)) break;
@@ -2124,6 +2126,8 @@ void whtml_parse_fragment_ctx(struct wdom* d, int parent, int ctx_tag, const cha
     else if (ctx_tag == T_plaintext) p->tstate = TS_PLAINTEXT;
     p->head = -2; // "head" already seen
     p->frameset_ok = 0;
+    p->in_frag = 1;
+    p->frag_ctx = ctx_tag;
     run(p);
     hp_free(p);
     w_free(p);

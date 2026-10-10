@@ -1298,7 +1298,10 @@ function mst(el) {
     }
     return s;
 }
-function fire(el, type) { try { dispatch(el, new Event(type)); } catch (e) { report(e, type); } }
+function fire(el, type) {
+    if (type !== 'timeupdate' && type !== 'progress' && el instanceof HTMLMediaElement) mlog('event ' + type + ' t=' + (+el.currentTime || 0).toFixed(2) + ' rs=' + el.readyState + ' size=' + el.videoWidth + 'x' + el.videoHeight);
+    try { dispatch(el, new Event(type)); } catch (e) { report(e, type); }
+}
 function mediaKick() {
     if (!mediaTimer) mediaTimer = addTimer(mediaTick, 40, [], true);
 }
@@ -1631,7 +1634,7 @@ class SourceBuffer extends EventTarget {
     get buffered() {
         if (this._removed) throw new DOMException('This SourceBuffer has been removed from the parent media source.', 'InvalidStateError');
         const el = this._ms._el, s = el && MS.get(el);
-        return new TimeRanges(s && s.id ? W.mediaBuffered(s.id) : []);
+        return new TimeRanges(s && s.id ? W.mediaBuffered(s.id, this._idx) : []);
     }
     _check() {
         if (this._removed) throw new DOMException('This SourceBuffer has been removed from the parent media source.', 'InvalidStateError');

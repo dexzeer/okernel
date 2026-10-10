@@ -1,0 +1,33 @@
+<!doctype html><html><head></head><body>
+<script>
+// Fragment parsing with a template / element context: the insertion mode after </template> (or any
+// reset) must come from the context element, not from "before head" (YouTube's Polymer templates
+// start with comments and contain nested <template>s: they grew <head>/<body> elements).
+const bad = [];
+const names = n => Array.from(n.childNodes).map(c => c.nodeName).join(',');
+const cases = [
+    ['<!--c--><div>a</div>', '#comment,DIV'],
+    ['<!--c--><tp-x></tp-x>', '#comment,TP-X'],
+    ['<!--c--><style>x{}</style><div>a</div>', '#comment,STYLE,DIV'],
+    ['<!--c-->text<b>b</b>', '#comment,#text,B'],
+    ['<!--a--><!--b--><template><i>q</i></template><p>z</p>', '#comment,#comment,TEMPLATE,P'],
+    ['<template><i>q</i></template><template></template><span>s</span>', 'TEMPLATE,TEMPLATE,SPAN'],
+    ['<div><template><b></b></template><p>x</p></div>', 'DIV'],
+    ['<body><p>a</p></body>', 'P'],
+    ['<head><title>t</title></head><p>a</p>', 'TITLE,P'],
+];
+for (const [html, want] of cases) {
+    for (const ctx of ['template', 'div']) {
+        const e = document.createElement(ctx);
+        e.innerHTML = html;
+        const got = names(ctx === 'template' ? e.content : e);
+        if (got !== want) bad.push(ctx + ' ' + JSON.stringify(html) + ' -> ' + got + ' (want ' + want + ')');
+    }
+}
+const t = document.createElement('template');
+t.innerHTML = '<div><template><b></b></template><p>x</p></div>';
+const inner = t.content.firstChild;
+if (names(inner) !== 'TEMPLATE,P') bad.push('nested: ' + names(inner));
+if (document.querySelectorAll('body').length !== 1 || document.querySelectorAll('head').length !== 1) bad.push('extra html/head/body in the page');
+console.log('RESULT ' + (bad.length ? 'FAIL ' + bad.join(' | ') : 'ALLPASS'));
+</script></body></html>
