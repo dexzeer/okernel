@@ -45,9 +45,9 @@ what entries 2-5 do (picture, black screen, message, reboot).
 
 ## Known limits on such a machine
 
-* The keyboard works if it is PS/2; this laptop's touchpad is I2C and has no driver yet (use a USB mouse) (almost all laptops, also under UEFI: the embedded
-  controller emulates it).
-* No Wi-Fi, no USB mouse/keyboard, no hard disk access, no sound codecs tested: the network driver is for an Intel
+* The built-in keyboard works (PS/2, also under UEFI: the embedded controller emulates it). This laptop's touchpad is
+  I2C and has no driver yet: use a USB mouse. USB keyboards are not supported.
+* No Wi-Fi, no hard disk access, no sound codecs tested: the network driver is for an Intel
   e1000 card, which a laptop will not have. The browser will not reach the internet.
 * The kernel needs no SSE2 and runs on a Pentium III or later; 256 MB of RAM or more. Under UEFI the memory map
   of the firmware is used (holes included); a framebuffer above 4 GB cannot be used by this 32-bit kernel.
