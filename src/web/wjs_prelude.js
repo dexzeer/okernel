@@ -1253,21 +1253,30 @@ for (const [k, v] of [['MEDIA_ERR_ABORTED', 1], ['MEDIA_ERR_NETWORK', 2], ['MEDI
     MediaError.prototype[k] = v;
 }
 
-// what the engine can decode: Opus audio and VP9 video in WebM
+// what the engine can decode: Opus and AAC-LC audio, VP9 and H.264 video, in WebM (Opus, VP9) and MP4
 function parseMime(mime) {
     const m = /^\s*([a-z]+)\/([a-z0-9.+-]+)\s*(?:;\s*codecs\s*=\s*(?:"([^"]*)"|'([^']*)'|([^;\s]*)))?\s*(?:;.*)?$/i.exec(String(mime));
     if (!m) return null;
     const codecs = (m[3] !== undefined ? m[3] : m[4] !== undefined ? m[4] : m[5] !== undefined ? m[5] : null);
     return { type: m[1].toLowerCase(), sub: m[2].toLowerCase(), codecs: codecs === null ? null : codecs.split(',').map(c => c.trim().toLowerCase()).filter(Boolean) };
 }
-function mimeKinds(mime) {      // bit 0 audio (Opus), bit 1 video (VP9); 0 = unsupported
+function mimeKinds(mime) {      // bit 0 audio, bit 1 video; 0 = unsupported
     const p = parseMime(mime);
-    if (!p || (p.type !== 'video' && p.type !== 'audio') || p.sub !== 'webm') return 0;
+    if (!p || (p.type !== 'video' && p.type !== 'audio')) return 0;
+    const webm = p.sub === 'webm', mp4 = p.sub === 'mp4' || (p.type === 'audio' && p.sub === 'x-m4a');
+    if (!webm && !mp4) return 0;
     if (p.codecs === null) return p.type === 'audio' ? 1 : 3;
     let k = 0;
     for (const c of p.codecs) {
         if (c === 'opus') k |= 1;
         else if (c === 'vp9' || /^vp09(\.|$)/.test(c)) { if (p.type === 'audio') return 0; k |= 2; }
+        else if (mp4 && /^mp4a\.40\.0?(2|5)$/.test(c)) k |= 1;                           // AAC-LC (HE-AAC plays without SBR)
+        else if (mp4 && /^avc[13]\.[0-9a-f]{6}$/.test(c)) {                               // H.264: Baseline, Main, High (8-bit 4:2:0)
+            const prof = parseInt(c.substr(5, 2), 16);
+            if (prof !== 66 && prof !== 77 && prof !== 100) return 0;
+            if (p.type === 'audio') return 0;
+            k |= 2;
+        }
         else return 0;
     }
     return k;
@@ -1380,7 +1389,7 @@ function mediaLoad(el) {
         return r.arrayBuffer();
     }).then(buf => {
         if (s.gen !== gen) return;
-        if (W.mediaAppend(s.id, sb, buf) < 0) { mediaFail(el, s, 4, 'DEMUXER_ERROR_COULD_NOT_OPEN: not a playable WebM (Opus/VP9) file'); return; }
+        if (W.mediaAppend(s.id, sb, buf) < 0) { mediaFail(el, s, 4, 'DEMUXER_ERROR_COULD_NOT_OPEN: not a playable WebM/MP4 file (Opus, AAC, VP9, H.264)'); return; }
         W.mediaEos(s.id);
         s.netState = 1;
         fire(el, 'progress');

@@ -343,7 +343,7 @@ static int cursor_peek(struct mp4_demux* d, int ti, struct pend* o) {
     int key = 1;
     if (tb->n_stss) key = tb->stss_i < tb->n_stss && rd32(tb->stss + 8 + (size_t)tb->stss_i * 4) == tb->sample_idx + 1;
     o->off = tb->cur_off; o->size = size; o->track = ti;
-    o->dts = tb->dts; o->dur = delta; o->pts = tb->dts + cto - tb->elst_media_time; o->key = (uint8_t)key;
+    o->dts = tb->dts - tb->elst_media_time; o->dur = delta; o->pts = tb->dts + cto - tb->elst_media_time; o->key = (uint8_t)key;
     return 1;
 }
 
@@ -444,7 +444,7 @@ static int parse_moof(struct mp4_demux* d, const uint8_t* p, size_t len, uint64_
                 if (rflags & 0x800) { cto = (int32_t)rd32(r); r += 4; }
                 struct pend s;
                 s.off = off; s.size = size; s.track = ti;
-                s.dts = tb->frag_dts; s.dur = dur; s.pts = tb->frag_dts + cto - tb->elst_media_time;
+                s.dts = tb->frag_dts - tb->elst_media_time; s.dur = dur; s.pts = tb->frag_dts + cto - tb->elst_media_time;
                 s.key = (uint8_t)!(fl & 0x00010000);
                 if (q_push(d, &s) < 0) return -1;
                 tb->frag_dts += dur;
