@@ -1107,9 +1107,7 @@ static void shell_execute(int win_id, const char* input) {
     }
     else if (str_eq(cmd_buf, "reboot")) {
         window_puts(win_id, "Rebooting...\n");
-        while (inb(0x64) & 0x02);
-        outb(0x64, 0xFE);
-        while (1) { __asm__ volatile("hlt"); }
+        acpi_pm_reboot(acpi_get_pm());               // ACPI reset register, keyboard controller, PCI reset, triple fault
     }
     else if (str_eq(cmd_buf, "ps")) {
         window_puts(win_id, "PID  STATE\n");
@@ -1156,8 +1154,8 @@ static void shell_execute(int win_id, const char* input) {
     }
     else if (str_eq(cmd_buf, "shutdown")) {
         window_puts(win_id, "Shutting down...\n");
-        outw(0x604, 0x2000);
-        outw(0xB004, 0x2000);
+        acpi_pm_poweroff(acpi_get_pm());             // ACPI S5; the emulator ports are its fallback
+        window_puts(win_id, "Power-off did not work: hold the power button.\n");
         while (1) { __asm__ volatile("hlt"); }
     }
     else {

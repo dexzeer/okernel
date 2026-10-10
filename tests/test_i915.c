@@ -28,6 +28,8 @@ int main(void) {
         CHECK(g.gen == ids[i].gen, "id %04x: gen %d, want %d (%s)", ids[i].id, g.gen, ids[i].gen, g.name);
     }
     CHECK(i915_classify(0x1234).gen == 0, "unknown id must stay unknown");
+    CHECK(i915_display_base(0x22B1) == 0x180000 && i915_display_base(0x0F31) == 0x180000 && i915_display_base(0x1912) == 0 &&
+          i915_display_base(0x0166) == 0, "Valleyview/Cherryview display registers sit at BAR0 + 0x180000");
     CHECK(strstr(i915_classify(0x1912).name, "Skylake") != 0, "name");
     CHECK(strstr(i915_classify(0x9A49).name, "Tiger") != 0, "name");
 

@@ -86,6 +86,9 @@ int acpi_parse_madt(const uint8_t* t, uint32_t len, struct acpi_info* out) {
 #include "serial.h"
 
 static struct acpi_info info;
+static struct acpi_pm pm_info;
+
+const struct acpi_pm* acpi_get_pm(void) { return &pm_info; }
 
 const struct acpi_info* acpi_get(void) { return &info; }
 
@@ -210,7 +213,23 @@ void acpi_init(uint32_t mboot_phys) {
         if (esz == 8 && rd32(rt + o + 4) != 0) continue;           // above 4GB
         uint32_t tl = 0;
         uint8_t* t = read_table(addr, "APIC", &tl);
-        if (!t) continue;
+        if (!t) {
+            t = read_table(addr, "FACP", &tl);
+            if (t) {
+                if (acpi_parse_fadt(t, tl, &pm_info)) {
+                    uint32_t dl = 0;
+                    uint8_t* d = pm_info.dsdt ? read_table(pm_info.dsdt, "DSDT", &dl) : 0;
+                    if (d) { pm_info.have_s5 = acpi_find_s5(d, dl, &pm_info.slp_typa, &pm_info.slp_typb); kfree(d); }
+                    serial_printf("[acpi] power: PM1a %x PM1b %x smi %x/%x%s sleep_ctl %x S5 %s (%x,%x) reset %s\n",
+                                  pm_info.pm1a_cnt, pm_info.pm1b_cnt, pm_info.smi_cmd, pm_info.acpi_enable,
+                                  pm_info.hw_reduced ? " HW-reduced" : "", pm_info.sleep_ctl_port,
+                                  pm_info.have_s5 ? "found" : "MISSING", pm_info.slp_typa, pm_info.slp_typb,
+                                  pm_info.reset_ok ? "reg" : "none");
+                }
+                kfree(t);
+            }
+            continue;
+        }
         if (!info.madt) acpi_parse_madt(t, tl, &info);
         kfree(t);
     }

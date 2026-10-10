@@ -28,7 +28,7 @@ ASM_OBJ = boot/start.o boot/isr.o boot/smp_stubs.o boot/ap_tramp.o
 COMMON_OBJ = src/gdt.o src/idt.o src/memory.o src/serial.o src/keyboard.o src/mouse.o src/string.o src/syscall.o
 
 # Text mode objects
-TEXT_OBJ = src/vga.o src/shell.o src/terminal.o src/hwinfo.o src/i915.o src/pcix.o src/text_stubs.o
+TEXT_OBJ = src/vga.o src/shell.o src/terminal.o src/hwinfo.o src/i915.o src/pcix.o src/acpi_pm.o src/text_stubs.o
 
 # Text boot keeps VGA text mode: start.asm built WITHOUT the multiboot
 # video request (desktop start.o asks GRUB for 1920x1080x32, which would
@@ -92,7 +92,7 @@ MEDIA_OBJ = $(patsubst %,src/media/%.o,$(MEDIA_SRC))
 src/media/%.o: src/media/%.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
 src/userland_seed.o: $(USERLAND_GEN)
-DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) src/hda.o src/pcix.o src/virtio.o src/vgpu.o src/i915.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
+DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) src/hda.o src/pcix.o src/acpi_pm.o src/virtio.o src/vgpu.o src/i915.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
               src/font_data.o $(WEB_OBJ) $(OJS_OBJ) \
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/aes.o src/crypto/chacha20.o src/crypto/poly1305.o \
@@ -392,7 +392,7 @@ build-fbtext/start.o: boot/start.asm
 build-fbtext/%.o: src/%.c $(HEADERS)
 	mkdir -p build-fbtext
 	$(CC) $(CFLAGS) -DFBTEXT -c $< -o $@
-kanarchy-fbtext.bin: build-fbtext/start.o boot/isr.o $(COMMON_OBJ) build-fbtext/vga.o build-fbtext/terminal.o build-fbtext/kernel.o build-fbtext/fbtext.o src/shell.o src/hwinfo.o src/i915.o src/pcix.o src/text_stubs.o src/font_data.o
+kanarchy-fbtext.bin: build-fbtext/start.o boot/isr.o $(COMMON_OBJ) build-fbtext/vga.o build-fbtext/terminal.o build-fbtext/kernel.o build-fbtext/fbtext.o src/shell.o src/hwinfo.o src/i915.o src/pcix.o src/acpi_pm.o src/text_stubs.o src/font_data.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
 laptop: kanarchy-laptop.iso

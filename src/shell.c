@@ -70,7 +70,7 @@ static void cmd_help(void) {
     terminal_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
     terminal_puts("Hardware report:\n");
     terminal_set_color(VGA_WHITE, VGA_BLACK);
-    terminal_puts("  cpu | memmap | acpi | pci [page] | pcidump B:D.F | gpu | all\n");
+    terminal_puts("  cpu | memmap | acpi | pci [page] | pcidump B:D.F | gpu | input | all\n");
 }
 
 static void cmd_clear(void) {
@@ -174,20 +174,14 @@ static void cmd_about(void) {
 static void cmd_reboot(void) {
     terminal_set_color(VGA_LIGHT_GREY, VGA_BLACK);
     terminal_puts("Rebooting...\n");
-    // Wait for keyboard controller to be ready, then reset CPU
-    while (inb(0x64) & 0x02);
-    outb(0x64, 0xFE);
+    hwinfo_reboot();
     while (1) { __asm__ volatile("hlt"); }
 }
 
 static void cmd_shutdown(void) {
     terminal_set_color(VGA_LIGHT_GREY, VGA_BLACK);
     terminal_puts("Shutting down...\n");
-    // QEMU/Bochs ACPI power-off
-    outw(0x604, 0x2000);
-    // Fallback: try APM
-    outw(0xB004, 0x2000);
-    while (1) { __asm__ volatile("hlt"); }
+    hwinfo_poweroff();
 }
 
 void shell_init(void) {
@@ -240,6 +234,7 @@ void shell_execute(const char* input) {
     else if (str_is(cmd_buf, "pci")) hwinfo_pci(args && args[0] >= '1' && args[0] <= '9' ? args[0] - '0' : 1);
     else if (str_is(cmd_buf, "pcidump")) hwinfo_pcidump(args);
     else if (str_is(cmd_buf, "gpu")) hwinfo_gpu();
+    else if (str_is(cmd_buf, "input")) hwinfo_input();
     else if (str_is(cmd_buf, "all")) hwinfo_all();
     else if (cmd_buf[0] == 'a' && cmd_buf[1] == 'b' && cmd_buf[2] == 'o' && cmd_buf[3] == 'u' && cmd_buf[4] == 't' && cmd_buf[5] == 0) {
         cmd_about();
