@@ -470,6 +470,22 @@ static void i2c_probe_regs(uint32_t base) {
     pf("    LPSS clock %x  resets %x  general %x\n", r[0x200 / 4], r[0x204 / 4], r[0x208 / 4]);
 }
 
+// Look for DesignWare I2C blocks (component type register 0xFC = "DW" 0x44570140) in MMIO space. Reads one dword per
+// 4KB page and skips the graphics device and the PCI config window; an unclaimed address reads all ones.
+void hwinfo_i2c_scan(void) {
+    head("I2C controller scan");
+    int n = 0;
+    for (uint64_t a = 0x7D000000ull; a < 0xFEC00000ull; a += 0x1000) {
+        if ((a >= 0x80000000ull && a < 0x81000000ull) || (a >= 0x90000000ull && a < 0xA0000000ull) || (a >= 0xE0000000ull && a < 0xF0000000ull)) continue;
+        volatile uint32_t* r = (volatile uint32_t*)(uint32_t)a;
+        if (r[0xFC / 4] != 0x44570140u) continue;
+        pf("DesignWare I2C at %x:\n", (uint32_t)a);
+        i2c_probe_regs((uint32_t)a);
+        if (++n >= 12) break;
+    }
+    pf("%u block(s) found\n", (uint32_t)n);
+}
+
 void hwinfo_i2c(void) {
     head("I2C touchpad");
     aml_collect();
@@ -534,6 +550,35 @@ void hwinfo_i2c(void) {
                     if (t[h + 4] == 0x0D) while (k < 11 && t[h + 5 + k] >= 0x20 && t[h + 5 + k] < 0x7F) { b[k] = (char)t[h + 5 + k]; k++; }
                     b[k] = 0;
                     pf("  _HID %s\n", b);
+                }
+                {   // the base is 0 in the template: firmware or an AML field fills it in. Show what the scope refers to.
+                    out("  names in the scope:");
+                    char seen[48][4]; int nseen = 0;
+                    for (uint32_t j = nstart + 4; j + 4 <= end && nseen < 48; j++) {
+                        int ok = 1;
+                        for (int k = 0; k < 4; k++) { uint8_t c = t[j + k]; if (!((c >= 'A' && c <= 'Z') || c == '_' || (k && c >= '0' && c <= '9'))) ok = 0; }
+                        if (!ok) continue;
+                        uint8_t pc = t[j - 1];
+                        if ((pc >= 'A' && pc <= 'Z') || pc == '_' || (pc >= '0' && pc <= '9')) continue;
+                        int dup = 0;
+                        for (int k = 0; k < nseen; k++) if (!memcmp(seen[k], t + j, 4)) dup = 1;
+                        if (dup) continue;
+                        memcpy(seen[nseen++], t + j, 4);
+                        pf(" %c%c%c%c", t[j], t[j + 1], t[j + 2], t[j + 3]);
+                    }
+                    out("\n");
+                    int c = find_bytes(t, end, nstart + 4, "_CRS", 4);
+                    if (c >= 0) {
+                        pf("  _CRS at +%x:", (uint32_t)c);
+                        for (int k = 4; k < 100 && (uint32_t)(c + k) < end; k++) pf(" %02x", (uint32_t)t[c + k]);
+                        out("\n");
+                    }
+                    int sp = find_bytes(t, end, nstart + 4, "_PS0", 4);
+                    if (sp >= 0) {
+                        pf("  _PS0 at +%x:", (uint32_t)sp);
+                        for (int k = 4; k < 64 && (uint32_t)(sp + k) < end; k++) pf(" %02x", (uint32_t)t[sp + k]);
+                        out("\n");
+                    }
                 }
                 for (uint32_t j = nstart + 4; j + 12 <= end; j++) {                       // Memory32Fixed(ReadWrite, base, len)
                     if (t[j] == 0x86 && t[j + 1] == 0x09 && t[j + 2] == 0x00) {

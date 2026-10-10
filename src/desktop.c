@@ -34,6 +34,7 @@
 #include "ata.h"
 #include "userland_seed.h"
 #include "acpi.h"
+#include "xhci.h"
 #include "smp.h"
 #include "prof.h"
 #include "fpu.h"
@@ -1152,6 +1153,12 @@ static void shell_execute(int win_id, const char* input) {
         // Runs in keyboard-IRQ context — never iret here, only stage.
         shell_execute_run(win_id, args);
     }
+    else if (str_eq(cmd_buf, "usb")) {
+        char ub[96];
+        xhci_status(ub, sizeof ub);
+        window_puts(win_id, ub);
+        window_puts(win_id, "\n");
+    }
     else if (str_eq(cmd_buf, "shutdown")) {
         window_puts(win_id, "Shutting down...\n");
         acpi_pm_poweroff(acpi_get_pm());             // ACPI S5; the emulator ports are its fallback
@@ -1663,6 +1670,7 @@ void kernel_main(uint32_t mboot_phys) {
 
     // Init input
     mouse_init_fb();
+    xhci_init(mboot_phys);      // USB controller + a USB mouse (laptops without a PS/2 pointer); fail-safe
     keyboard_init();
     keyboard_set_callback(on_key_irq);
     // Capture the main-loop thread's live ESP/EBP into pid 0 BEFORE sti:
@@ -2100,6 +2108,7 @@ void kernel_main(uint32_t mboot_phys) {
         }
         // Poll network for incoming packets
         e1000_poll();
+        xhci_poll();      // USB mouse reports and hot-plug (polled; nothing interrupts for it)
         net_poll();
         fetch_poll();     // drive the HTTP/HTTPS fetch engine (parallel, keep-alive)
         // Persist TOFU pins on change (write-through VFS, same as editor).

@@ -28,6 +28,9 @@ On a UEFI machine the menu starts on entry 1b by itself after 30 seconds.
    photograph each result: `pci`, `memmap`, `acpi`, and `pcidump 0:2.0` (the Intel graphics chip, if `pci` lists it
    as 00:02.0). `all` prints everything (Page Up / Page Down scroll).
 2. **Desktop 1366x768** - the real thing at the panel's size. Try this second.
+2n. **Desktop 1366x768, USB driver off** - the same as 2 without the USB controller driver, in case 2 hangs at boot.
+   A **USB mouse** works in the desktop entries (plug it in before or after boot). The shell command `usb` says whether
+   the controller started and how many mouse reports arrived.
 3. **Desktop 1280x800**, 4. **1024x768**, 5. **let the video firmware choose** - fallbacks if 2 shows nothing or a
    scrambled picture. If a mode is not usable the screen shows a one-line message and the machine stops (BIOS) or
    GRUB says it could not set the mode; reboot and pick another entry.
@@ -42,7 +45,7 @@ what entries 2-5 do (picture, black screen, message, reboot).
 
 ## Known limits on such a machine
 
-* Keyboard and touchpad work only if the laptop's own are PS/2 (almost all laptops, also under UEFI: the embedded
+* The keyboard works if it is PS/2; this laptop's touchpad is I2C and has no driver yet (use a USB mouse) (almost all laptops, also under UEFI: the embedded
   controller emulates it).
 * No Wi-Fi, no USB mouse/keyboard, no hard disk access, no sound codecs tested: the network driver is for an Intel
   e1000 card, which a laptop will not have. The browser will not reach the internet.

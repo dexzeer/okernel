@@ -16,6 +16,10 @@ void cursor_fb_repair(int y0, int y1);
 // 0 when it is not shown. Used by the display self check.
 int  cursor_rect(int* x0, int* y0, int* x1, int* y1);
 
+// Pointer motion from a non-PS/2 driver (USB mouse): dx/dy in screen pixels (positive = right/down), wheel positive =
+// down/toward the tail like the PS/2 path, buttons bit0 left, bit1 right, bit2 middle. Safe from the main loop.
+void mouse_inject(int dx, int dy, int wheel, int buttons);
+
 void mouse_get_position(int* x, int* y);
 int  mouse_get_x(void);
 int  mouse_get_y(void);
