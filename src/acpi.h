@@ -2,6 +2,7 @@
 #define ACPI_H
 
 #include <stdint.h>
+#include "acpi_pm.h"
 
 // ACPI table discovery (RSDP -> RSDT/XSDT -> MADT). Desktop kernel only.
 // We only read what SMP and interrupt routing need: the CPU list (local APIC
@@ -46,6 +47,8 @@ struct acpi_info {
 // Find and parse the tables. mboot_phys lets us search the firmware memory map
 // (UEFI keeps the RSDP outside the legacy BIOS area). Call after paging_init.
 void acpi_init(uint32_t mboot_phys);
+// Power-off / reset facts gathered from the FADT and the DSDT's _S5_ object (valid == 0 when missing).
+const struct acpi_pm* acpi_get_pm(void);
 const struct acpi_info* acpi_get(void);
 
 // Copy `len` bytes of physical memory (any address below 4GB) into dst.

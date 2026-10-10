@@ -41,6 +41,13 @@ struct i915_gen i915_classify(uint16_t id) {
     return g;
 }
 
+// Valleyview (Bay Trail 0F30-0F33) and Cherryview (Cherry Trail/Braswell 22B0-22B3) put the whole display engine
+// 0x180000 bytes into BAR0; every other generation has it at offset 0. (The first `gpu` from a real Cherry Trail
+// laptop read all pipes as 0 because of this.)
+uint32_t i915_display_base(uint16_t id) {
+    return ((id & 0xFFF0) == 0x0F30 || (id & 0xFFF0) == 0x22B0) ? 0x180000u : 0;
+}
+
 // Plane control register: display plane A..C control (DSPCNTR on gen<=8,
 // PLANE_CTL on gen>=9). Bit 31 enables the plane in both.
 int i915_plane_enabled(uint8_t gen, uint32_t ctl) { (void)gen; return (ctl >> 31) & 1; }
@@ -193,8 +200,10 @@ int i915_report(void (*out)(const char*, void*), void* ud) {
         line(out, ud, "GRUB framebuffer at %x (%s), aperture offset %x", fb, where, fb - I.bar2);
     }
     if (!I.mmio) { out("registers not mapped: no further data", ud); return 1; }
+    uint32_t dbase = i915_display_base(I.did);
+    if (dbase) line(out, ud, "display registers at BAR0 + %x (Valleyview/Cherryview layout)", dbase);
     for (int p = 0; p < 3; p++) {
-        uint32_t base = (uint32_t)p * 0x1000;
+        uint32_t base = dbase + (uint32_t)p * 0x1000;
         uint32_t conf = rd(0x70008 + base), src = rd(0x6001C + base);
         uint32_t htot = rd(0x60000 + base), vtot = rd(0x6000C + base);
         uint32_t pctl = rd(0x70180 + base), pstr = rd(0x70188 + base), psurf = rd(0x7019C + base);

@@ -11,6 +11,7 @@
 #include "i915.h"
 #include "string.h"
 #include "display.h"
+#include "acpi_pm.h"
 const struct display_ops* i915_probe(uint32_t* backbuffer, int w, int h);
 #include <stdarg.h>
 
@@ -140,35 +141,297 @@ void hwinfo_memmap(void) {
 // ---- ACPI ------------------------------------------------------------------------------------
 static int sum_ok(const uint8_t* p, uint32_t n) { uint8_t s = 0; while (n--) s = (uint8_t)(s + *p++); return s == 0; }
 
-void hwinfo_acpi(void) {
-    head("ACPI");
+// ---- ACPI tables (also on UEFI, where the RSDP is not in the BIOS areas) ----------------------
+// The RSDP of a UEFI machine sits in an "ACPI reclaim"/"ACPI NVS" region of the bootloader's memory map.
+static uint32_t find_rsdp(void) {
     uint32_t ebda = (uint32_t)(*(volatile uint16_t*)0x40E) << 4;
-    uint32_t rsdp = 0;
-    for (int pass = 0; pass < 2 && !rsdp; pass++) {
+    for (int pass = 0; pass < 2; pass++) {
         uint32_t lo = pass == 0 ? ebda : 0xE0000, hi = pass == 0 ? ebda + 1024 : 0x100000;
         if (pass == 0 && (ebda < 0x80000 || ebda > 0xA0000)) continue;
         for (uint32_t p = lo; p + 20 <= hi; p += 16)
-            if (!memcmp((const void*)p, "RSD PTR ", 8) && sum_ok((const uint8_t*)p, 20)) { rsdp = p; break; }
+            if (!memcmp((const void*)p, "RSD PTR ", 8) && sum_ok((const uint8_t*)p, 20)) return p;
     }
+    uint32_t flags = *(volatile uint32_t*)(g_mboot + 0);
+    if (!(flags & (1u << 6))) return 0;
+    uint32_t len = *(volatile uint32_t*)(g_mboot + 44), addr = *(volatile uint32_t*)(g_mboot + 48);
+    for (int want = 3; want <= 4; want++)                      // reclaim first, then NVS
+        for (uint32_t off = 0; off + 24 <= len;) {
+            volatile uint8_t* e = (volatile uint8_t*)(addr + off);
+            uint32_t esz = *(volatile uint32_t*)e;
+            uint64_t base = *(volatile uint64_t*)(e + 4), rl = *(volatile uint64_t*)(e + 12);
+            uint32_t type = *(volatile uint32_t*)(e + 20);
+            if (esz < 20) break;
+            off += esz + 4;
+            if ((int)type != want || base >= 0xFFFFF000ull) continue;
+            uint32_t b = (uint32_t)base, n = rl > 0x1000000ull ? 0x1000000u : (uint32_t)rl;
+            for (uint32_t p = (b + 15) & ~15u; p + 20 <= b + n; p += 16)
+                if (!memcmp((const void*)p, "RSD PTR ", 8) && sum_ok((const uint8_t*)p, 20)) return p;
+        }
+    return 0;
+}
+
+// the table at a physical address when it is reachable (below 4GB) and plausible
+static const uint8_t* table_at(uint64_t a, const char* sig) {
+    if (a < 0x1000 || a >= 0xFFFFF000ull) return 0;
+    const uint8_t* t = (const uint8_t*)(uint32_t)a;
+    if (sig && memcmp(t, sig, 4)) return 0;
+    uint32_t l = *(const uint32_t*)(t + 4);
+    return l >= 36 && l < 0x400000 ? t : 0;
+}
+
+// Tables listed by the RSDT/XSDT, up to max; returns the count.
+static int acpi_tables(const uint8_t** out_t, int max) {
+    uint32_t rsdp = find_rsdp();
+    if (!rsdp) return 0;
+    const uint8_t* r = (const uint8_t*)rsdp;
+    int n = 0;
+    uint64_t xs = r[15] >= 2 ? *(const uint64_t*)(r + 24) : 0;
+    const uint8_t* x = xs ? table_at(xs, "XSDT") : 0;
+    if (x) {
+        uint32_t l = *(const uint32_t*)(x + 4);
+        for (uint32_t i = 36; i + 8 <= l && n < max; i += 8) {
+            const uint8_t* t = table_at(*(const uint64_t*)(x + i), 0);
+            if (t) out_t[n++] = t;
+        }
+        return n;
+    }
+    const uint8_t* rs = table_at(*(const uint32_t*)(r + 16), "RSDT");
+    if (!rs) return 0;
+    uint32_t l = *(const uint32_t*)(rs + 4);
+    for (uint32_t i = 36; i + 4 <= l && n < max; i += 4) {
+        const uint8_t* t = table_at(*(const uint32_t*)(rs + i), 0);
+        if (t) out_t[n++] = t;
+    }
+    return n;
+}
+
+static int build_pm(struct acpi_pm* pm);
+
+void hwinfo_acpi(void) {
+    head("ACPI");
+    uint32_t rsdp = find_rsdp();
     if (!rsdp) { pf("no RSDP found\n"); return; }
     const uint8_t* r = (const uint8_t*)rsdp;
     char oem[7];
     for (int i = 0; i < 6; i++) oem[i] = (char)r[9 + i];
     oem[6] = 0;
-    uint32_t rsdt = *(const uint32_t*)(r + 16);
-    pf("RSDP at %x, revision %u, OEM %s, RSDT %x\n", rsdp, (uint32_t)r[15], oem, rsdt);
-    if (rsdt < 0x1000 || rsdt > 0xFFFF0000u) return;
-    const uint8_t* t = (const uint8_t*)rsdt;
-    uint32_t tlen = *(const uint32_t*)(t + 4);
-    if (tlen < 36 || tlen > 4096) { pf("RSDT length %u looks wrong\n", tlen); return; }
+    pf("RSDP at %x, revision %u, OEM %s, RSDT %x\n", rsdp, (uint32_t)r[15], oem, *(const uint32_t*)(r + 16));
+    const uint8_t* tabs[48];
+    int n = acpi_tables(tabs, 48);
+    if (!n) { pf("no readable RSDT/XSDT\n"); return; }
     out("tables:");
-    for (uint32_t i = 36; i + 4 <= tlen; i += 4) {
-        uint32_t tp = *(const uint32_t*)(t + i);
-        if (tp < 0x1000 || tp > 0xFFFF0000u) continue;
-        const char* sg = (const char*)tp;
-        pf(" %c%c%c%c", sg[0], sg[1], sg[2], sg[3]);
-    }
+    for (int i = 0; i < n; i++) { const char* sg = (const char*)tabs[i]; pf(" %c%c%c%c", sg[0], sg[1], sg[2], sg[3]); }
     out("\n");
+    struct acpi_pm pm;
+    if (build_pm(&pm))
+        pf("power: PM1a %x PM1b %x  smi %x/%x%s  S5 %s (%x,%x)  reset %s\n", pm.pm1a_cnt, pm.pm1b_cnt, pm.smi_cmd, (uint32_t)pm.acpi_enable,
+           pm.hw_reduced ? "  HW-reduced" : "", pm.have_s5 ? "found" : "MISSING", (uint32_t)pm.slp_typa, (uint32_t)pm.slp_typb, pm.reset_ok ? "reg" : "none");
+    else
+        pf("power: no usable FADT\n");
+}
+
+// Power facts from the firmware tables (FADT + the DSDT's _S5_), for `acpi`, shutdown and reboot.
+static int build_pm(struct acpi_pm* pm) {
+    pm->have_s5 = 0; pm->slp_typa = pm->slp_typb = 0;
+    const uint8_t* tabs[48];
+    int n = acpi_tables(tabs, 48);
+    pm->valid = 0;
+    for (int i = 0; i < n; i++) {
+        if (memcmp(tabs[i], "FACP", 4)) continue;
+        if (!acpi_parse_fadt(tabs[i], *(const uint32_t*)(tabs[i] + 4), pm)) return 0;
+        const uint8_t* d = pm->dsdt ? table_at(pm->dsdt, "DSDT") : 0;
+        if (d) pm->have_s5 = acpi_find_s5(d, *(const uint32_t*)(d + 4), &pm->slp_typa, &pm->slp_typb);
+        return 1;
+    }
+    return 0;
+}
+
+void hwinfo_poweroff(void) {
+    struct acpi_pm pm;
+    build_pm(&pm);
+    acpi_pm_poweroff(&pm);
+    pf("Power-off did not work: hold the power button.\n");
+    for (;;) __asm__ volatile("hlt");
+}
+
+void hwinfo_reboot(void) {
+    struct acpi_pm pm;
+    build_pm(&pm);
+    acpi_pm_reboot(&pm);
+}
+
+// ---- which input devices does the firmware describe? -------------------------------------------
+// Scans the AML of the DSDT/SSDTs for _HID/_CID names (a string "ELAN0501" or a compressed EISA id "PNP0303").
+#define MAX_HID 80
+static char hid_list[MAX_HID][12];
+static int hid_n;
+
+static void hid_add(const char* s) {
+    for (int i = 0; i < hid_n; i++) if (!strcmp(hid_list[i], s)) return;
+    if (hid_n < MAX_HID) { strncpy(hid_list[hid_n], s, 11); hid_list[hid_n][11] = 0; hid_n++; }
+}
+
+static void scan_aml(const uint8_t* t) {
+    uint32_t len = *(const uint32_t*)(t + 4);
+    for (uint32_t i = 36; i + 12 < len; i++) {
+        if (t[i] != '_' || !((t[i + 1] == 'H' && t[i + 2] == 'I' && t[i + 3] == 'D') || (t[i + 1] == 'C' && t[i + 2] == 'I' && t[i + 3] == 'D'))) continue;
+        uint32_t p = i + 4;
+        char s[12];
+        if (t[p] == 0x0D) {                                      // string
+            p++;
+            int k = 0;
+            while (k < 11 && t[p + k] >= 0x20 && t[p + k] < 0x7F) { s[k] = (char)t[p + k]; k++; }
+            s[k] = 0;
+            if (k >= 6) hid_add(s);
+        } else if (t[p] == 0x0C) {                               // dword: compressed EISA id
+            uint8_t b0 = t[p + 1], b1 = t[p + 2], b2 = t[p + 3], b3 = t[p + 4];
+            static const char hx[] = "0123456789ABCDEF";
+            s[0] = (char)(((b0 >> 2) & 0x1F) + 64);
+            s[1] = (char)((((b0 & 3) << 3) | (b1 >> 5)) + 64);
+            s[2] = (char)((b1 & 0x1F) + 64);
+            s[3] = hx[b2 >> 4]; s[4] = hx[b2 & 15]; s[5] = hx[b3 >> 4]; s[6] = hx[b3 & 15]; s[7] = 0;
+            if (s[0] >= 'A' && s[0] <= 'Z' && s[1] >= 'A' && s[1] <= 'Z' && s[2] >= 'A' && s[2] <= 'Z') hid_add(s);
+        }
+    }
+}
+
+static int starts(const char* s, const char* pre) { while (*pre) if (*s++ != *pre++) return 0; return 1; }
+
+static int is_pointing(const char* s) {
+    static const char* const pre[] = { "PNP0F", "PNP0C50", "ACPI0C50", "MSFT0001", "SYNA", "ELAN", "ALPS", "CYAP", "FTE", "DLL0", "HID", "PNP0303", "PNP030B", "PNP0320", "MSFT0002", 0 };
+    for (int i = 0; pre[i]; i++) if (starts(s, pre[i])) return 1;
+    return 0;
+}
+
+static void input_acpi(void) {
+    head("Input devices described by ACPI");
+    const uint8_t* tabs[48];
+    int n = acpi_tables(tabs, 48);
+    if (!n) { pf("no ACPI tables found\n"); return; }
+    hid_n = 0;
+    int nscan = 0;
+    for (int i = 0; i < n; i++) {
+        const char* sg = (const char*)tabs[i];
+        if (!memcmp(sg, "FACP", 4)) {                              // the DSDT hangs off the FADT
+            const uint8_t* d = table_at(*(const uint32_t*)(tabs[i] + 40), "DSDT");
+            if (!d && *(const uint32_t*)(tabs[i] + 4) >= 148) d = table_at(*(const uint64_t*)(tabs[i] + 140), "DSDT");
+            if (d) { scan_aml(d); nscan++; }
+        } else if (!memcmp(sg, "SSDT", 4)) { scan_aml(tabs[i]); nscan++; }
+    }
+    pf("%u tables, %u scanned, %u device ids\n", (uint32_t)n, (uint32_t)nscan, (uint32_t)hid_n);
+    out("mouse/touchpad/keyboard/hid: ");
+    int any = 0;
+    for (int i = 0; i < hid_n; i++) if (is_pointing(hid_list[i])) { pf("%s ", hid_list[i]); any = 1; }
+    if (!any) out("(none)");
+    out("\nall ids: ");
+    for (int i = 0; i < hid_n; i++) pf("%s ", hid_list[i]);
+    out("\n");
+}
+
+// ---- PS/2 controller and the pointing device ----------------------------------------------------
+// Interrupts are off while this runs and time comes from PIT channel 0 (reprogrammed to a plain 65536 count).
+static uint32_t pit_last, pit_acc;
+static uint32_t pit_ms(void) {
+    outb(0x43, 0x00);
+    uint32_t lo = inb(0x40), hi = inb(0x40), c = lo | (hi << 8);
+    pit_acc += (pit_last - c) & 0xFFFF;
+    pit_last = c;
+    return pit_acc / 1193;
+}
+static void pit_start(void) {
+    outb(0x43, 0x34); outb(0x40, 0); outb(0x40, 0);             // channel 0, mode 2, count 65536
+    pit_acc = 0;
+    outb(0x43, 0x00);
+    uint32_t lo = inb(0x40), hi = inb(0x40);
+    pit_last = lo | (hi << 8);
+}
+
+static uint32_t last_wait_ms;
+static int kbc_in_wait(void) {                                  // input buffer empty: we may write
+    uint32_t t0 = pit_ms();
+    while (inb(0x64) & 2) if (pit_ms() - t0 > 200) return 0;
+    return 1;
+}
+static int kbc_read(uint32_t timeout_ms) {                       // output byte, or -1
+    uint32_t t0 = pit_ms();
+    for (;;) {
+        if (inb(0x64) & 1) { last_wait_ms = pit_ms() - t0; return inb(0x60); }
+        if (pit_ms() - t0 > timeout_ms) { last_wait_ms = timeout_ms; return -1; }
+    }
+}
+static void kbc_cmd(uint8_t c) { kbc_in_wait(); outb(0x64, c); }
+static void kbc_data(uint8_t d) { kbc_in_wait(); outb(0x60, d); }
+static void kbc_flush(void) { for (int i = 0; i < 64 && (inb(0x64) & 1); i++) (void)inb(0x60); }
+static int aux_cmd(uint8_t b) { kbc_cmd(0xD4); kbc_data(b); return kbc_read(300); }
+
+static const char* hexs(int v) {
+    static char b[4][5];
+    static int k;
+    char* s = b[k++ & 3];
+    if (v < 0) { s[0] = '-'; s[1] = '-'; s[2] = 0; return s; }
+    s[0] = "0123456789abcdef"[(v >> 4) & 15]; s[1] = "0123456789abcdef"[v & 15]; s[2] = 0;
+    return s;
+}
+
+static void input_ps2(void) {
+    head("PS/2 controller and pointing device");
+    uint32_t fl;
+    __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
+    pit_start();
+    uint32_t st = inb(0x64);
+    pf("status port 0x64 = %02x%s\n", st, st == 0xFF ? "  (0xFF: there may be no PS/2 controller at all)" : "");
+    kbc_flush();
+    kbc_cmd(0x20);
+    int cfg = kbc_read(200);
+    pf("controller config byte: %s  (bit1 = mouse irq, bit5 = mouse clock off, bit6 = translation)\n", hexs(cfg));
+    kbc_cmd(0xAD); kbc_cmd(0xA7); kbc_flush();
+    kbc_cmd(0xA9);
+    int at = kbc_read(200);
+    pf("mouse port self-test: %s  (00 = ok)\n", hexs(at));
+    kbc_cmd(0xA8);
+    int a = aux_cmd(0xFF), bat = -1, id = -1;
+    uint32_t w_ack = last_wait_ms, w_bat = 0, w_id = 0;
+    if (a == 0xFA) { bat = kbc_read(1500); w_bat = last_wait_ms; id = kbc_read(500); w_id = last_wait_ms; }
+    pf("mouse reset: ack %s (%u ms)  self-test %s (%u ms)  id %s (%u ms)   [fa aa 00 = a PS/2 mouse]\n",
+       hexs(a), w_ack, hexs(bat), w_bat, hexs(id), w_id);
+    if (a == 0xFA && bat == 0xAA) {
+        int r = aux_cmd(0xF2);
+        int did = r == 0xFA ? kbc_read(200) : -1;
+        pf("device id: %s\n", hexs(did));
+        // Synaptics identify: resolution 0 four times, then a status request. The middle byte 47 = Synaptics.
+        for (int i = 0; i < 4; i++) { aux_cmd(0xE8); aux_cmd(0x00); }
+        int rs = aux_cmd(0xE9);
+        int s0 = rs == 0xFA ? kbc_read(200) : -1;
+        int s1 = kbc_read(200), s2 = kbc_read(200);
+        pf("status request: %s %s %s  %s\n", hexs(s0), hexs(s1), hexs(s2), s1 == 0x47 ? "(a Synaptics touchpad)" : "");
+        kbc_flush();
+        int en = aux_cmd(0xF4);
+        pf("enable reporting: %s\n", hexs(en));
+        terminal_set_color(VGA_YELLOW, VGA_BLACK);
+        out(">>> MOVE YOUR FINGER ON THE TOUCHPAD AND PRESS ITS BUTTONS FOR 10 SECONDS <<<\n");
+        terminal_set_color(VGA_WHITE, VGA_BLACK);
+        int cnt = 0;
+        uint8_t first[18];
+        uint32_t t0 = pit_ms();
+        while (pit_ms() - t0 < 10000) {
+            if (inb(0x64) & 1) { uint8_t v = inb(0x60); if (cnt < 18) first[cnt] = v; cnt++; }
+        }
+        pf("received %u bytes:", (uint32_t)cnt);
+        for (int i = 0; i < cnt && i < 18; i++) pf(" %s", hexs(first[i]));
+        out(cnt ? "\n" : "  (nothing: not a PS/2 touchpad, or it needs another mode)\n");
+        aux_cmd(0xF5);
+    }
+    kbc_flush();
+    kbc_cmd(0x60);
+    kbc_data(cfg >= 0 ? (uint8_t)cfg : 0x47);                    // put the controller back as it was
+    kbc_cmd(0xAE);
+    kbc_flush();
+    __asm__ volatile("pushl %0; popfl" :: "r"(fl) : "memory", "cc");
+}
+
+void hwinfo_input(void) {
+    input_acpi();
+    input_ps2();
 }
 
 // ---- PCI -------------------------------------------------------------------------------------

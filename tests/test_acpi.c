@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "../src/acpi.c"
+#include "../src/acpi_pm.c"
 
 static int fails;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL line %d: ", __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
@@ -141,6 +142,59 @@ int main(void) {
             fails++; printf("FAIL fuzz counts out of range\n");
         }
         free(t);
+    }
+
+    // ---- power management: FADT + _S5_
+    {
+        uint8_t f[276];
+        memset(f, 0, sizeof f);
+        memcpy(f, "FACP", 4); f[4] = 276 & 255; f[5] = 276 >> 8;
+        f[40] = 0x00; f[41] = 0x00; f[42] = 0x00; f[43] = 0x7A;        // DSDT 0x7A000000
+        f[48] = 0xB2; f[49] = 0x00; f[52] = 0xA0;                       // SMI_CMD 0xB2, ACPI_ENABLE 0xA0
+        f[64] = 0x04; f[65] = 0x18;                                     // PM1a_CNT_BLK 0x1804
+        f[68] = 0x00;
+        f[112] = 0; f[113] = 0x04;                                      // flags: RESET_REG_SUP (bit 10)
+        f[116] = 1; f[120] = 0xCF9 & 255; f[121] = 0xCF9 >> 8; f[128] = 0x06;
+        struct acpi_pm pm;
+        CHECK(acpi_parse_fadt(f, 276, &pm) == 1 && pm.valid, "fadt parsed");
+        CHECK(pm.pm1a_cnt == 0x1804 && pm.pm1b_cnt == 0 && pm.smi_cmd == 0xB2 && pm.acpi_enable == 0xA0, "fadt ports");
+        CHECK(pm.dsdt == 0x7A000000u, "dsdt address");
+        CHECK(pm.reset_ok && pm.reset_port == 0xCF9 && pm.reset_value == 6, "reset register");
+        CHECK(!pm.hw_reduced, "not hw-reduced");
+        CHECK(acpi_parse_fadt(f, 60, &pm) == 0, "short fadt rejected");
+        f[64] = f[65] = 0;
+        CHECK(acpi_parse_fadt(f, 276, &pm) == 0, "no PM1a and not hw-reduced: unusable");
+        f[112] = 0; f[113] = 0x00; f[114] = 0x10;                       // flags bit 20: HW_REDUCED_ACPI
+        f[244] = 1; f[248] = 0x80; f[249] = 0x18;                       // SLEEP_CONTROL_REG io 0x1880
+        CHECK(acpi_parse_fadt(f, 276, &pm) == 1 && pm.hw_reduced && pm.sleep_ctl_port == 0x1880, "hw-reduced sleep control");
+
+        uint8_t a[64], ta = 9, tb = 9;
+        // Name(_S5_, Package(){ 5, 5, 0, 0 }) with byte prefixes
+        static const uint8_t s5[] = { 0x08, '_', 'S', '5', '_', 0x12, 0x0A, 0x04, 0x0A, 0x05, 0x0A, 0x05, 0x00, 0x00 };
+        memset(a, 0xFF, sizeof a);
+        memcpy(a + 10, s5, sizeof s5);
+        CHECK(acpi_find_s5(a, sizeof a, &ta, &tb) && ta == 5 && tb == 5, "S5 with byte prefixes: %u %u", ta, tb);
+        // values 0 and 1 as ZeroOp/OneOp, name behind a root prefix
+        static const uint8_t s5b[] = { 0x08, 0x5C, '_', 'S', '5', '_', 0x12, 0x06, 0x04, 0x01, 0x00, 0x00, 0x00 };
+        memset(a, 0xFF, sizeof a);
+        memcpy(a + 3, s5b, sizeof s5b);
+        ta = tb = 9;
+        CHECK(acpi_find_s5(a, sizeof a, &ta, &tb) && ta == 1 && tb == 0, "S5 with Zero/One ops: %u %u", ta, tb);
+        memset(a, 0xFF, sizeof a);
+        CHECK(!acpi_find_s5(a, sizeof a, &ta, &tb), "no S5");
+        CHECK(!acpi_find_s5(a, 5, &ta, &tb), "tiny buffer");
+        memcpy(a + 10, s5, 8);                                           // truncated right after the package op
+        for (uint32_t l = 0; l < sizeof a; l++) { (void)acpi_find_s5(a, l, &ta, &tb); }   // never reads past len (ASan)
+        // fuzz
+        for (int it = 0; it < 20000; it++) {
+            uint8_t g[48];
+            for (int i = 0; i < 48; i++) g[i] = (uint8_t)rand();
+            if (rand() & 1) memcpy(g + (rand() % 30), s5, 6 + rand() % 8);
+            (void)acpi_find_s5(g, (uint32_t)(rand() % 49), &ta, &tb);
+            uint8_t ff[300];
+            for (int i = 0; i < 300; i++) ff[i] = (uint8_t)rand();
+            (void)acpi_parse_fadt(ff, (uint32_t)(rand() % 301), &pm);
+        }
     }
 
     printf(fails ? "FAILED %d\n" : "ALL OK\n", fails);

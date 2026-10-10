@@ -20,6 +20,9 @@ struct i915_gen {
 // Classify a device id (pure function; the only part tested on the host).
 struct i915_gen i915_classify(uint16_t device_id);
 
+// Offset of the display engine registers inside BAR0 (0x180000 on Valleyview/Cherryview, else 0).
+uint32_t i915_display_base(uint16_t device_id);
+
 // Decode helpers for the report (pure functions, host-tested).
 const char* i915_plane_format(uint8_t gen, uint32_t plane_ctl);
 int i915_plane_enabled(uint8_t gen, uint32_t plane_ctl);
