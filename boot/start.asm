@@ -3,9 +3,15 @@ MBALIGN  equ 1 << 0            ; align loaded modules on page boundaries
 MEMINFO  equ 1 << 1            ; provide memory map
 VIDEO    equ 1 << 2            ; provide video mode info
 %ifdef TEXTMODE
+%ifdef FBTEXT
+FLAGS    equ MBALIGN | MEMINFO | VIDEO ; text kernel drawing on a framebuffer (UEFI has no VGA text)
+%define HASVIDEO
+%else
 FLAGS    equ MBALIGN | MEMINFO ; text build: stay in VGA text mode
+%endif
 %else
 FLAGS    equ MBALIGN | MEMINFO | VIDEO
+%define HASVIDEO
 %endif
 %ifndef VID_W
 %define VID_W 1920            ; mode requested from the bootloader (GRUB falls back to its own
@@ -26,7 +32,7 @@ align 4
     dd MAGIC
     dd FLAGS
     dd CHECKSUM
-%ifndef TEXTMODE
+%ifdef HASVIDEO
     dd 0    ; unused
     dd 0    ; unused
     dd 0    ; unused

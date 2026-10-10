@@ -384,11 +384,23 @@ $(eval $(call LAPTOP_RULE,1366x768,1366,768))
 $(eval $(call LAPTOP_RULE,1280x800,1280,800))
 $(eval $(call LAPTOP_RULE,1024x768,1024,768))
 $(eval $(call LAPTOP_RULE,auto,0,0))
+# Text-mode kernel for UEFI machines: no VGA text memory there, so the 80x25 cells are drawn on the GOP framebuffer
+# (src/fbtext.c). Only vga/terminal/kernel see -DFBTEXT; the multiboot header asks GRUB for its automatic mode.
+build-fbtext/start.o: boot/start.asm
+	mkdir -p build-fbtext
+	$(AS) $(ASFLAGS) -DTEXTMODE -DFBTEXT -DVID_W=0 -DVID_H=0 $< -o $@
+build-fbtext/%.o: src/%.c $(HEADERS)
+	mkdir -p build-fbtext
+	$(CC) $(CFLAGS) -DFBTEXT -c $< -o $@
+kanarchy-fbtext.bin: build-fbtext/start.o boot/isr.o $(COMMON_OBJ) build-fbtext/vga.o build-fbtext/terminal.o build-fbtext/kernel.o build-fbtext/fbtext.o src/shell.o src/hwinfo.o src/i915.o src/pcix.o src/text_stubs.o src/font_data.o
+	$(LD) $(LDFLAGS) -o $@ $^
+
 laptop: kanarchy-laptop.iso
-kanarchy-laptop.iso: kanarchy-text.bin build-laptop/kanarchy-1366x768.bin build-laptop/kanarchy-1280x800.bin build-laptop/kanarchy-1024x768.bin build-laptop/kanarchy-auto.bin boot/laptop-grub.cfg
+kanarchy-laptop.iso: kanarchy-text.bin kanarchy-fbtext.bin build-laptop/kanarchy-1366x768.bin build-laptop/kanarchy-1280x800.bin build-laptop/kanarchy-1024x768.bin build-laptop/kanarchy-auto.bin boot/laptop-grub.cfg
 	rm -rf isodir-laptop
 	mkdir -p isodir-laptop/boot/grub
 	cp kanarchy-text.bin isodir-laptop/boot/kanarchy-text.bin
+	cp kanarchy-fbtext.bin isodir-laptop/boot/kanarchy-fbtext.bin
 	for m in 1366x768 1280x800 1024x768 auto; do cp build-laptop/kanarchy-$$m.bin isodir-laptop/boot/kanarchy-$$m.bin; done
 	cp boot/laptop-grub.cfg isodir-laptop/boot/grub/grub.cfg
 	grub-mkrescue -o $@ isodir-laptop 2>/dev/null

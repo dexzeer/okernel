@@ -3,7 +3,7 @@
 #include "io.h"
 #include <stdint.h>
 
-static uint16_t* const VGA_BUFFER = (uint16_t*)0xB8000;
+static uint16_t* const VGA_BUFFER = VGA_TEXT_BASE;
 
 #define STATUS_ROW 0
 #define CONTENT_START 1
@@ -26,6 +26,10 @@ static uint16_t make_entry(char c, uint8_t color) {
 }
 
 static void update_hw_cursor(int x, int y) {
+#ifdef FBTEXT
+    fbtext_set_cursor(x, y);        // also redraws the cells that changed
+    return;
+#endif
     uint16_t pos = y * TERM_WIDTH + x;
     outb(0x3D4, 0x0F);
     outb(0x3D5, (uint8_t)(pos & 0xFF));
@@ -34,6 +38,10 @@ static void update_hw_cursor(int x, int y) {
 }
 
 static void cursor_enable(uint8_t cursor_start, uint8_t cursor_end) {
+#ifdef FBTEXT
+    (void)cursor_start; (void)cursor_end;
+    return;
+#endif
     outb(0x3D4, 0x0A);
     uint8_t cur = (inb(0x3D5) & 0xC0) | cursor_start;
     outb(0x3D5, cur);
