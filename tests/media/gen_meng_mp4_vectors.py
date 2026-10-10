@@ -39,4 +39,6 @@ run("-f", "lavfi", "-i", VIDEO, "-f", "lavfi", "-i", music(48000, 2), *H264, "-c
     "-movflags", "+faststart", p("meng_av.mp4"))
 run("-f", "lavfi", "-i", music(48000, 2), "-c:a", "aac", "-b:a", "96k", "-aac_pns", "0",
     "-movflags", "frag_keyframe+empty_moov+default_base_moof", p("meng_aac_frag.mp4"))
+run("-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:duration=10", "-f", "lavfi", "-i", music(48000, 2).replace(":d=3", ":d=10"), *H264,
+    "-c:a", "aac", "-b:a", "96k", "-aac_pns", "0", "-movflags", "+faststart", p("meng_av_long.mp4"))
 print("ok")
