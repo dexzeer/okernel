@@ -392,6 +392,7 @@ struct oreq {
     int https;
     int redirects, retried;
     int cors;                  // script request (fetch/XHR): send Origin cross-origin
+    int as_get;                // a redirect turned the request into a bodyless GET
     int h;                     // fetch handle, -1 = none
     char url[OKAI_URL_LEN];
 };
@@ -420,6 +421,7 @@ static struct oreq* req_new(int bi, int tab, struct wdoc* doc, int sub_id, const
         q->https = url_is_https(url);
         q->redirects = q->retried = 0;
         q->cors = 0;
+        q->as_get = 0;
         q->h = -1;
         scopy(q->url, url, OKAI_URL_LEN);
         return q;
@@ -436,15 +438,30 @@ static void req_free(struct oreq* q) {
 // Start the GET for q->url. top: the page a resource belongs to (cookie
 // SameSite context), NULL for a top-level navigation. 0 = started, -1 = no
 // host in the URL, -2 = the fetch engine is full (try again later).
+// Request headers a page may not set (the browser owns them).
+static int header_forbidden(const char* n, int nl) {
+    static const char* const bad[] = { "host", "content-length", "connection", "keep-alive", "transfer-encoding",
+        "te", "upgrade", "cookie", "cookie2", "origin", "user-agent", "accept-encoding", "referer", "expect",
+        "date", "dnt", "via", "trailer", 0 };
+    for (int i = 0; bad[i]; i++) {
+        int l = (int)strlen(bad[i]);
+        if (l == nl && w_ieq_n(n, bad[i], l)) return 1;
+    }
+    if (nl >= 4 && w_ieq_n(n, "sec-", 4)) return 1;
+    if (nl >= 6 && w_ieq_n(n, "proxy-", 6)) return 1;
+    return 0;
+}
+
 static int req_fetch(struct oreq* q, const char* top) {
     char host[128];
     static char path[OKAI_URL_LEN];
-    static char cookie_hdr[NET_EXTRA_MAX];
+    static char cookie_hdr[NET_EXTRA_MAX + 8192];
     if (wurl_host(q->url, host, sizeof host) <= 0) return -1;
     if (wurl_path(q->url, path, sizeof path) <= 0) { path[0] = '/'; path[1] = 0; }
     int port = wurl_port(q->url);
     if (port < 0) port = 0;
     struct fetch_opts o;
+    memset(&o, 0, sizeof o);
     o.gzip = 1;
     o.accept_html = top == 0;
     o.extra = 0;
@@ -469,6 +486,36 @@ static int req_fetch(struct oreq* q, const char* top) {
             for (int k = 0; oa[k] && n < NET_EXTRA_MAX - 3; k++) cookie_hdr[n++] = oa[k];
             cookie_hdr[n++] = '\r';
             cookie_hdr[n++] = '\n';
+        }
+    }
+    // fetch()/XHR: the page's method, headers and body (a redirect may have turned it into a GET)
+    static char method[12];
+    o.method = 0;
+    o.body = 0;
+    o.body_len = 0;
+    o.own_accept = 0;
+    if (q->doc && q->sub_id >= 0 && !q->as_get) {
+        const char *m = "GET", *hs = 0, *bd = 0;
+        int bl = 0;
+        if (wdoc_fetch_info(q->doc, q->sub_id, &m, &hs, &bd, &bl) == WDOC_RK_REQ) {
+            scopy(method, m, sizeof method);
+            if (strcmp(method, "GET")) o.method = method;
+            if (bd && bl > 0 && strcmp(method, "GET") && strcmp(method, "HEAD")) { o.body = (const uint8_t*)bd; o.body_len = (uint32_t)bl; }
+            while (hs && *hs) {
+                const char* e = hs;
+                while (*e && *e != '\r' && *e != '\n') e++;
+                const char* colon = hs;
+                while (colon < e && *colon != ':') colon++;
+                int nl = (int)(colon - hs);
+                if (colon < e && nl > 0 && !header_forbidden(hs, nl) && n + (e - hs) + 2 < (int)sizeof cookie_hdr - 1) {
+                    for (const char* p = hs; p < e; p++) cookie_hdr[n++] = *p;
+                    cookie_hdr[n++] = '\r';
+                    cookie_hdr[n++] = '\n';
+                    if (nl == 6 && w_ieq_n(hs, "accept", 6)) o.own_accept = 1;
+                }
+                hs = e;
+                while (*hs == '\r' || *hs == '\n') hs++;
+            }
         }
     }
     cookie_hdr[n] = 0;
@@ -1157,8 +1204,8 @@ static int start_next_sub(int bi, int ti) {
                      (kind == WDOC_RK_IMG && T->sub_img >= OKAI_MAX_IMG_FETCH) ||
                      (kind == WDOC_RK_SCRIPT && T->sub_js >= OKAI_MAX_JS_FETCH) ||
                      (kind == WDOC_RK_REQ && T->sub_req >= OKAI_MAX_REQ_FETCH);
-        // the network layer speaks GET only (POST bodies are not sent yet)
-        int unsupported = kind == WDOC_RK_REQ && strcmp(method, "GET") && strcmp(method, "HEAD");
+        // every method goes out except the ones browsers forbid
+        int unsupported = kind == WDOC_RK_REQ && (!strcmp(method, "CONNECT") || !strcmp(method, "TRACE") || !strcmp(method, "TRACK"));
         if (capped || unsupported) {
             if (unsupported) serial_printf("[okai] %s request not supported: %s\n", method, url);
             sub_fail(T, id, url);
@@ -1317,6 +1364,12 @@ static int sub_done(struct okai_tab* T, struct oreq* q, int st, char* resp, int 
             if (wurl_resolve(q->url, ri.location, (int)strlen(ri.location), abs, sizeof abs) > 0 &&
                 url_is_http(abs)) {
                 q->redirects++;
+                if (kind == WDOC_RK_REQ && (status == 303 || ((status == 301 || status == 302) && !q->as_get))) {
+                    const char *m = "GET", *hs = 0, *bd = 0;
+                    int bl = 0;
+                    wdoc_fetch_info(T->doc, rid, &m, &hs, &bd, &bl);
+                    if (strcmp(m, "GET") && strcmp(m, "HEAD")) q->as_get = 1;     // POST -> GET (303 for any method)
+                }
                 scopy(q->url, abs, OKAI_URL_LEN);
                 serial_printf("[okai] sub-res redirect -> %s\n", abs);
                 return 1;
@@ -1535,6 +1588,7 @@ static int req_reissue(const struct oreq* cur, const char* top) {
     q->redirects = cur->redirects;
     q->retried = cur->retried;
     q->cors = cur->cors;
+    q->as_get = cur->as_get;
     if (req_fetch(q, top) != 0) { q->used = 0; return 0; }
     return 1;
 }

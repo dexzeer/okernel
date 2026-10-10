@@ -887,6 +887,15 @@ int tcp_send(int s, const uint8_t* data, uint32_t len) {
     return 0;
 }
 
+uint32_t tcp_send_space(int s) {
+    struct tcp_sock* c = sock_get(s);
+    if (!c || c->state != TCP_STATE_ESTABLISHED || c->failed) return 0;
+    uint32_t room = TCP_RTX_CAP - c->rtx_len;
+    uint32_t win = c->peer_win > c->rtx_len ? c->peer_win - c->rtx_len : 0;
+    if (!win && !c->rtx_len) win = TCP_SEG_MAX;       // nothing in flight: one segment keeps the persist timer going
+    return room < win ? room : win;
+}
+
 int tcp_recv(int s, uint8_t* buf, uint32_t cap) {
     struct tcp_sock* c = sock_get(s);
     if (!c) return -1;

@@ -2176,17 +2176,19 @@ function runFrame(now) {
 // ---------------------------------------------------------------- fetch / XHR
 const PENDING = new Map();    // request id -> handler(status, statusText, headersRaw, body:ArrayBuffer, url)
 function startRequest(method, url, headers, body, handler) {
-    let bodyStr = null;
+    let bodyStr = null, ctype = null;      // bodyStr: a string, or the bytes of an ArrayBuffer / view
     if (body !== null && body !== undefined) {
-        if (typeof body === 'string') bodyStr = body;
-        else if (body instanceof URLSearchParams) bodyStr = body.toString();
-        else if (body instanceof FormData) bodyStr = body._urlencoded();
-        else if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) bodyStr = new TextDecoder().decode(body);
-        else if (body instanceof Blob) bodyStr = body._text();
-        else bodyStr = String(body);
+        if (typeof body === 'string') { bodyStr = body; ctype = 'text/plain;charset=UTF-8'; }
+        else if (body instanceof URLSearchParams) { bodyStr = body.toString(); ctype = 'application/x-www-form-urlencoded;charset=UTF-8'; }
+        else if (body instanceof FormData) { bodyStr = body._urlencoded(); ctype = 'application/x-www-form-urlencoded;charset=UTF-8'; }
+        else if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) bodyStr = body;
+        else if (body instanceof Blob) { bodyStr = body._text(); if (body.type) ctype = body.type; }
+        else { bodyStr = String(body); ctype = 'text/plain;charset=UTF-8'; }
     }
     const hs = [];
-    for (const [k, v] of headers) hs.push(k + ': ' + v);
+    let hasType = false;
+    for (const [k, v] of headers) { hs.push(k + ': ' + v); if (k.toLowerCase() === 'content-type') hasType = true; }
+    if (ctype && !hasType) hs.push('Content-Type: ' + ctype);
     const id = W.fetch(String(url), String(method).toUpperCase(), hs.join('\r\n'), bodyStr);
     if (id < 0) { setTimeout(() => handler(0, '', '', null, url), 0); return; }
     PENDING.set(id, handler);

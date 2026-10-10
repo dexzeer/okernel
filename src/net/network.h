@@ -106,6 +106,8 @@ int  tcp_state(int s);                               // TCP_STATE_*
 // Queue + send (retransmitted until ACKed). 0 ok, -1 not established /
 // flight buffer full.
 int  tcp_send(int s, const uint8_t* data, uint32_t len);
+// Bytes tcp_send() will take right now (send buffer and the peer's window): large requests are fed in pieces.
+uint32_t tcp_send_space(int s);
 // >0 bytes copied, 0 nothing buffered yet, -1 end of stream (peer FIN,
 // reset or give-up) once every buffered byte has been read.
 int  tcp_recv(int s, uint8_t* buf, uint32_t cap);

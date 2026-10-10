@@ -23,6 +23,8 @@ struct tls_client_io {
     int (*send)(const uint8_t* buf, uint32_t len, void* user);
     int (*recv)(uint8_t* buf, uint32_t cap, uint32_t timeout_ms, void* user);
     void* user;
+    // Optional: bytes send() will take right now (flow control for large requests); NULL = any.
+    uint32_t (*send_space)(void* user);
 };
 
 // Resumable client state. tls_client_run() is a thin synchronous wrapper that
@@ -158,6 +160,7 @@ struct tls_state {
     uint8_t rec_buf[TLS_RECORD_MAX_PAYLOAD + 5];
     uint32_t rec_have;
     uint32_t rec_pl;
+    uint32_t req_off;       // request bytes already sent (application phase)
 
     // Handshake-message reassembly (RFC 8446 §5.1: messages may fragment
     // across records). Decrypted HANDSHAKE payloads accumulate here;

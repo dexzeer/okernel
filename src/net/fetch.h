@@ -20,9 +20,13 @@ struct fetch_opts {
     int gzip;            // Accept-Encoding: gzip
     int accept_html;     // navigation Accept header (see NET_ACCEPT_HTML)
     const char* extra;   // extra header lines ("Name: value\r\n"...), or NULL
+    const char* method;  // NULL = GET
+    const uint8_t* body; // request body (copied), with body_len bytes; Content-Length is added
+    uint32_t body_len;
+    int own_accept;      // `extra` carries its own Accept header: do not send the default one
 };
 
-// Start a GET. port 0 = scheme default. Returns a handle, or -1 when every
+// Start a request (GET unless o->method says otherwise). port 0 = scheme default. Returns a handle, or -1 when every
 // slot is busy (call again later) or the arguments are unusable.
 int   fetch_begin(const char* host, const char* path, uint16_t port, int https,
                   const struct fetch_opts* o);
