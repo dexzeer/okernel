@@ -108,7 +108,7 @@ static uint8_t* engine_stack;
 static int in_engine;
 
 enum { JOB_LOAD, JOB_FETCH_DONE, JOB_PAINT, JOB_HIT, JOB_RECT, JOB_ANCHOR, JOB_INFLATE, JOB_LINKS,
-       JOB_JS_RUN, JOB_JS_EVENT, JOB_ELEM_AT, JOB_FREE };
+       JOB_JS_RUN, JOB_JS_EVENT, JOB_ELEM_AT, JOB_FREE, JOB_MEDIA };
 
 struct job {
     int op;
@@ -131,6 +131,8 @@ struct job {
     const char* final_url;    // JOB_FETCH_DONE: URL after redirects
     const char* type;         // JOB_JS_EVENT: event type
     int button, key;          // JOB_JS_EVENT
+    struct wjs_rect* rects;   // JOB_MEDIA: frames that changed (page px), count in nrects
+    int nrects;
 };
 
 static void job_entry(void* p) {
@@ -159,6 +161,11 @@ static void job_entry(void* p) {
     case JOB_ELEM_AT:
         j->result = wdoc_hit_element(j->doc, j->x, j->y);
         break;
+    case JOB_MEDIA: {
+        struct wjs* js = wdoc_js(j->doc);
+        j->result = js ? wjs_media_poll(js, j->rects, j->len, &j->nrects) : 0;
+        break;
+    }
     case JOB_FREE:
         wdoc_free(j->doc);
         break;
@@ -1471,6 +1478,55 @@ static void js_pump(void) {
     }
 }
 
+// Media sessions (<video>/<audio>): playback is driven from here, not from page scripts. New
+// video frames are painted straight into the page surface (only the video's rectangle) and
+// pushed to the screen as a dirty rectangle.
+#define MEDIA_RECTS 8
+static void media_pump(void) {
+    static struct wjs_rect rects[MEDIA_RECTS];
+    for (int bi = 0; bi < MAX_OKAIS; bi++) {
+        struct okai* b = okai_get(bi);
+        if (!b) continue;
+        for (int ti = 0; ti < b->tab_count; ti++) {
+            struct okai_tab* T = &b->tabs[ti];
+            if (!T->doc || T->load_state != 1 || T->closing) continue;
+            struct wjs* js = wdoc_js(T->doc);
+            if (!js || !wjs_media_active(js)) {
+                if (!js || !wjs_media_any(js)) continue;
+            }
+            struct job j;
+            memset(&j, 0, sizeof j);
+            j.op = JOB_MEDIA;
+            j.doc = T->doc;
+            j.rects = rects;
+            j.len = MEDIA_RECTS;
+            run_job(&j);
+            if (j.result) request_render(T, 0);
+            if (ti != b->active_tab || !b->page_px || !T->first_paint || T->render_pending) continue;
+            for (int k = 0; k < j.nrects; k++) {
+                int x0 = rects[k].x, x1 = rects[k].x + rects[k].w;
+                int y0 = rects[k].y - (rects[k].fixed ? 0 : T->scroll_y), y1 = y0 + rects[k].h;
+                if (x0 < 0) x0 = 0;
+                if (y0 < 0) y0 = 0;
+                if (x1 > b->page_w) x1 = b->page_w;
+                if (y1 > b->page_h) y1 = b->page_h;
+                if (x0 >= x1 || y0 >= y1) continue;
+                struct wsurf s;
+                surf_of(b, &s);
+                s.cx0 = x0; s.cx1 = x1; s.cy0 = y0; s.cy1 = y1;
+                struct job p;
+                memset(&p, 0, sizeof p);
+                p.op = JOB_PAINT;
+                p.doc = T->doc;
+                p.surf = &s;
+                p.scroll = T->scroll_y;
+                run_job(&p);
+                window_dirty_pixels(b->win_id, x0, y0, x1 - x0, y1 - y0);
+            }
+        }
+    }
+}
+
 // Re-issue a request record for cur.url (redirect / retry / fallback).
 // Returns 1 if it is in flight again.
 static int req_reissue(const struct oreq* cur, const char* top) {
@@ -1649,6 +1705,7 @@ void okai_poll(void) {
             }
         }
     js_pump();
+    media_pump();
     // Coalesced renders (active tabs only; others render on switch).
     for (int bi = 0; bi < MAX_OKAIS; bi++) {
         struct okai* b = okai_get(bi);
@@ -2339,6 +2396,10 @@ int okai_wants_cpu(void) {
         if (okai_is_animating(id)) return 1;
         for (int t = 0; t < okais[id].tab_count; t++)
             if (okai_tab_busy(id, t) || okais[id].tabs[t].render_pending) return 1;
+        for (int t = 0; t < okais[id].tab_count; t++) {
+            struct okai_tab* MT = &okais[id].tabs[t];
+            if (MT->doc && MT->load_state == 1 && !MT->closing && wjs_media_active(wdoc_js(MT->doc))) return 1;
+        }
         // page JS with work due right now (js_pump runs it every iteration)
         struct okai_tab* T = &okais[id].tabs[okais[id].active_tab];
         if (T->doc && T->load_state == 1 && !T->closing) {

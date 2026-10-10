@@ -135,6 +135,11 @@ void wpaint_image(struct wsurf* s, const struct wimg* im, int dx, int dy, int dw
     int x1 = W_MIN(dx + dw, s->cx1), y1 = W_MIN(dy + dh, s->cy1);
     if (x0 >= x1 || y0 >= y1) return;
     int sw = im->w, sh = im->h;
+    if (im->opaque && alpha == 255 && sw == dw && sh == dh) {        // video frame at its own size: copy rows
+        for (int y = y0; y < y1; y++)
+            memcpy(s->px + y * s->stride + x0, im->px + (y - dy) * sw + (x0 - dx), (size_t)(x1 - x0) * 4);
+        return;
+    }
     for (int y = y0; y < y1; y++) {
         uint32_t* row = s->px + y * s->stride;
         // source rows covered by this destination row (16.16)

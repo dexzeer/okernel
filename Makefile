@@ -55,7 +55,7 @@ WEB_OBJ = src/web/wdom.o src/web/html5.o src/web/charset.o src/web/wurl.o \
           src/web/lay_grid.o src/web/lay_table.o src/web/lay_dl.o \
           src/web/paint.o src/web/raster.o src/web/font.o src/web/svg.o src/web/image.o \
           src/web/wdoc.o src/web/fontdata.o src/web/callstack.o \
-          src/web/wjs.o src/web/wjs_dom.o src/web/wjs_sys.o src/web/wjs_prelude.o src/web/wcookie.o
+          src/web/wjs.o src/web/wjs_dom.o src/web/wjs_media.o src/web/wjs_sys.o src/web/wjs_prelude.o src/web/wcookie.o
 WEB_HEADERS := $(wildcard src/web/*.h) $(wildcard src/ojs/*.h)
 src/wallpaper.o: src/wallpaper.asm tools/wallpaper/wallpaper.jpg
 	$(AS) $(ASFLAGS) $< -o $@

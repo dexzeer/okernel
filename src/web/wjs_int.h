@@ -49,6 +49,8 @@ struct wjs_dyn {
 
 #define WJS_LOG_MAX 400
 
+struct wmedia;               // media sessions (wjs_media.c)
+
 struct wjs {
     struct wdoc* doc;
     struct wdom* d;
@@ -98,6 +100,7 @@ struct wjs {
     int focus_set;
     int hist_delta;
     int submit_form, submit_btn;
+    struct wmedia* media;    // WM_MAX sessions, lazily allocated
     // stats
     int nlog, nerrors, nscripts_run;
 };
@@ -114,6 +117,9 @@ size_t  wjs_sys_realm_limit(void);
 int     wjs_sys_mem_ok(size_t bytes, void* ud);
 // DOM natives (wjs_dom.c): install on the natives object
 void    wjs_dom_install(struct wjs* js, ojsv natives);
+// media natives + teardown (wjs_media.c)
+void    wjs_media_install(struct wjs* js, ojsv natives);
+void    wjs_media_free(struct wjs* js);
 // mutation side effects (inserted subtree: scripts, styles, images)
 void    wjs_inserted(struct wjs* js, int node);
 void    wjs_removed(struct wjs* js, int parent, int node);

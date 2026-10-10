@@ -5,7 +5,7 @@
 #include "surface.h"
 
 // Decoded image: straight (non-premultiplied) ARGB pixels.
-struct wimg { int w, h; const uint32_t* px; };
+struct wimg { int w, h; const uint32_t* px; int opaque; };   // opaque: every pixel has alpha 0xFF
 
 struct wpaint_env {
     const struct wstyleset* ss;          // gradients

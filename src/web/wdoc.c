@@ -35,6 +35,7 @@ struct wdimg {
     int w, h;
     int svg_scale;          // rendered at N x the intrinsic size (crisper)
     uint32_t* px;
+    int ext;                // px belongs to someone else (a <video> frame): never freed
     int state;              // 0 pending, 1 ok, 2 failed
     int res;
     char url[512];
@@ -386,6 +387,7 @@ static const struct wimg* paint_img(void* ctx, int id) {
     tmp.w = d->img[id].w;
     tmp.h = d->img[id].h;
     tmp.px = d->img[id].px;
+    tmp.opaque = d->img[id].ext;       // video frames carry alpha 0xFF
     return &tmp;
 }
 
@@ -409,7 +411,7 @@ static void doc_clear(struct wdoc* d) {
     if (d->L) wlay_free(d->L);
     if (d->ss) css_set_free(d->ss);
     if (d->d) wdom_free(d->d);
-    for (int i = 0; i < d->nimg; i++) w_free(d->img[i].px);
+    for (int i = 0; i < d->nimg; i++) if (!d->img[i].ext) w_free(d->img[i].px);
     w_free(d->img);
     for (int i = 0; i < d->nres; i++) {
         w_free(d->res[i].url);
@@ -557,7 +559,7 @@ static void collect_images(struct wdoc* d) {
             const char* poster = wdom_attr_s(dom, el, "poster", &pl);
             slot = (poster && wurl_resolve(d->base, poster, pl, abs, sizeof abs) > 0) ? img_slot(d, abs) : -1;
         }
-        if (slot != -2) d->node_img[el] = slot;
+        if (slot != -2 && !(d->node_img[el] >= 0 && d->img[d->node_img[el]].ext)) d->node_img[el] = slot;
     }
 }
 
@@ -989,6 +991,62 @@ void wdoc_viewport_get(struct wdoc* d, int* vw, int* vh, int* scroll, int* docw,
     *scroll = d->scroll_y;
     *docw = d->L ? wlay_doc_width(d->L) : d->vw;
     *doch = d->L ? wlay_doc_height(d->L) : d->vh;
+}
+
+// ---- <video> frames ---------------------------------------------------------------------
+// A video element owns an "external" image slot: its pixels are the media engine's frame
+// buffer (ARGB, opaque), republished with every new frame. Returns 1 when the size changed
+// (the layout must be redone), 0 when only the pixels did.
+int wdoc_video_set(struct wdoc* d, int node, const uint32_t* px, int w, int h) {
+    if (!d->d || node < 0 || node >= d->d->nn || w < 0 || h < 0) return 0;
+    if (!node_img_grow(d)) return 0;
+    int slot = d->node_img[node];
+    if (slot < 0 || !d->img[slot].ext) {
+        if (d->nimg >= MAX_IMAGES) return 0;
+        if (d->nimg >= d->capimg) {
+            int nc = d->capimg ? d->capimg * 2 : 32;
+            struct wdimg* n = (struct wdimg*)w_realloc(d->img, nc * sizeof(struct wdimg));
+            if (!n) return 0;
+            d->img = n;
+            d->capimg = nc;
+        }
+        slot = d->nimg++;
+        memset(&d->img[slot], 0, sizeof d->img[slot]);
+        d->img[slot].res = -1;
+        d->img[slot].ext = 1;
+        d->node_img[node] = slot;
+        d->layout_dirty = 1;
+    }
+    struct wdimg* im = &d->img[slot];
+    int changed = im->state != 1 || im->w != w || im->h != h;
+    im->px = (uint32_t*)px;
+    im->w = w;
+    im->h = h;
+    im->state = 1;
+    if (changed) d->layout_dirty = 1;
+    return changed;
+}
+
+// Where the frame of a video element is painted: page px (before scrolling), the rectangle
+// of its DI_IMAGE item. 0 when it is not in the display list (not laid out / display:none).
+int wdoc_video_dest(struct wdoc* d, int node, int* x, int* y, int* w, int* h, int* fixed) {
+    if (!d->d || node < 0 || node >= d->node_img_cap || !d->node_img) return 0;
+    int slot = d->node_img[node];
+    if (slot < 0 || !d->img[slot].ext) return 0;
+    wdoc_update(d);
+    if (!d->L) return 0;
+    const struct ditem* it;
+    int n = wlay_items(d->L, &it);
+    for (int i = 0; i < n; i++) {
+        if (it[i].kind != DI_IMAGE || it[i].a != slot) continue;
+        *x = LU_ROUND(it[i].x);
+        *y = LU_ROUND(it[i].y);
+        *w = LU_ROUND(it[i].x + it[i].w) - *x;
+        *h = LU_ROUND(it[i].y + it[i].h) - *y;
+        *fixed = it[i].fixed;
+        return 1;
+    }
+    return 0;
 }
 
 int wdoc_img_node_slot(struct wdoc* d, int node) {
