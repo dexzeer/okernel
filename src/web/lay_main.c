@@ -957,9 +957,19 @@ struct wlayout* wlay_run(struct wdom* d, struct wstyleset* ss, int vw, int vh,
     // replaced: intrinsic image sizes
     for (int i = 0; i < L->nb; i++) {
         struct lbox* b = &L->b[i];
-        if (b->kind == LB_REPLACED && (b->rk == RK_IMG || b->rk == RK_VIDEO) && imgs && imgs->for_node) {
+        if (b->kind == LB_REPLACED && (b->rk == RK_IMG || b->rk == RK_VIDEO || b->rk == RK_CANVAS) && imgs && imgs->for_node) {
             int w = 0, h = 0;
             b->img = imgs->for_node(imgs->ctx, b->node, &w, &h);
+            b->iw = w;
+            b->ih = h;
+        }
+        if (b->kind == LB_REPLACED && b->rk == RK_CANVAS && b->img < 0 && b->node >= 0) {
+            // a canvas nobody has drawn on: the width / height attributes (default 300 x 150)
+            int vl, w = 300, h = 150;
+            const char* v = wdom_attr(L->d, b->node, A_width, &vl);
+            if (v) { int n = 0, k = 0; while (k < vl && v[k] >= '0' && v[k] <= '9' && n < 100000) n = n * 10 + (v[k++] - '0'); if (k) w = n; }
+            v = wdom_attr(L->d, b->node, A_height, &vl);
+            if (v) { int n = 0, k = 0; while (k < vl && v[k] >= '0' && v[k] <= '9' && n < 100000) n = n * 10 + (v[k++] - '0'); if (k) h = n; }
             b->iw = w;
             b->ih = h;
         }

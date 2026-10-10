@@ -387,7 +387,7 @@ static const struct wimg* paint_img(void* ctx, int id) {
     tmp.w = d->img[id].w;
     tmp.h = d->img[id].h;
     tmp.px = d->img[id].px;
-    tmp.opaque = d->img[id].ext;       // video frames carry alpha 0xFF
+    tmp.opaque = d->img[id].ext == 1;  // video frames carry alpha 0xFF (canvas bitmaps, ext == 2, do not)
     return &tmp;
 }
 
@@ -997,7 +997,7 @@ void wdoc_viewport_get(struct wdoc* d, int* vw, int* vh, int* scroll, int* docw,
 // A video element owns an "external" image slot: its pixels are the media engine's frame
 // buffer (ARGB, opaque), republished with every new frame. Returns 1 when the size changed
 // (the layout must be redone), 0 when only the pixels did.
-int wdoc_video_set(struct wdoc* d, int node, const uint32_t* px, int w, int h) {
+static int ext_set(struct wdoc* d, int node, const uint32_t* px, int w, int h, int kind) {
     if (!d->d || node < 0 || node >= d->d->nn || w < 0 || h < 0) return 0;
     if (!node_img_grow(d)) return 0;
     int slot = d->node_img[node];
@@ -1013,11 +1013,12 @@ int wdoc_video_set(struct wdoc* d, int node, const uint32_t* px, int w, int h) {
         slot = d->nimg++;
         memset(&d->img[slot], 0, sizeof d->img[slot]);
         d->img[slot].res = -1;
-        d->img[slot].ext = 1;
+        d->img[slot].ext = kind;
         d->node_img[node] = slot;
         d->layout_dirty = 1;
     }
     struct wdimg* im = &d->img[slot];
+    im->ext = kind;
     int changed = im->state != 1 || im->w != w || im->h != h;
     im->px = (uint32_t*)px;
     im->w = w;
@@ -1025,6 +1026,18 @@ int wdoc_video_set(struct wdoc* d, int node, const uint32_t* px, int w, int h) {
     im->state = 1;
     if (changed) d->layout_dirty = 1;
     return changed;
+}
+
+int wdoc_video_set(struct wdoc* d, int node, const uint32_t* px, int w, int h) { return ext_set(d, node, px, w, h, 1); }
+// A <canvas> bitmap (straight ARGB with alpha), same slot mechanism.
+int wdoc_canvas_set(struct wdoc* d, int node, const uint32_t* px, int w, int h) { return ext_set(d, node, px, w, h, 2); }
+
+// The decoded pixels of an <img> (straight ARGB) for drawImage; 0 until the image has loaded.
+const uint32_t* wdoc_img_pixels(struct wdoc* d, int node, int* w, int* h) {
+    int slot = wdoc_img_node_slot(d, node);
+    if (slot < 0 || slot >= d->nimg || d->img[slot].state != 1 || !d->img[slot].px) return 0;
+    *w = d->img[slot].w; *h = d->img[slot].h;
+    return d->img[slot].px;
 }
 
 // Where the frame of a video element is painted: page px (before scrolling), the rectangle

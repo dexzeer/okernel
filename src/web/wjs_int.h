@@ -52,6 +52,7 @@ struct wjs_dyn {
 #define WJS_REJ_MAX 32           // unhandled-rejection candidates held until the microtask queue is empty
 
 struct wmedia;               // media sessions (wjs_media.c)
+struct wcvs;                 // canvases (wjs_canvas.c)
 
 struct wjs {
     struct wdoc* doc;
@@ -106,6 +107,7 @@ struct wjs {
     int hist_delta;
     int submit_form, submit_btn;
     struct wmedia* media;    // WM_MAX sessions, lazily allocated
+    struct wcvs* canvas;     // 2D canvases (wjs_canvas.c), lazily allocated
     // stats
     int nlog, nerrors, nscripts_run;
 };
@@ -125,6 +127,12 @@ void    wjs_dom_install(struct wjs* js, ojsv natives);
 // media natives + teardown (wjs_media.c)
 void    wjs_media_install(struct wjs* js, ojsv natives);
 void    wjs_media_free(struct wjs* js);
+const uint32_t* wjs_media_frame(struct wjs* js, int sess, int* w, int* h);   // current video frame of a session (ARGB), or NULL
+// canvas natives + teardown + publishing (wjs_canvas.c)
+void    wjs_canvas_install(struct wjs* js, ojsv natives);
+void    wjs_canvas_free(struct wjs* js);
+int     wjs_canvas_poll(struct wjs* js, struct wjs_rect* out, int max, int* n);
+int     wjs_canvas_pending(struct wjs* js);
 // mutation side effects (inserted subtree: scripts, styles, images)
 void    wjs_inserted(struct wjs* js, int node);
 void    wjs_removed(struct wjs* js, int parent, int node);

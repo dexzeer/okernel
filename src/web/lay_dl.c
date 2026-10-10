@@ -215,7 +215,7 @@ static void emit_replaced(struct wlayout* L, int bi) {
     int32_t ch = b->h - b->b[0] - b->b[2] - b->p[0] - b->p[2];
     if (s->visibility) return;
     switch (b->rk) {
-    case RK_IMG: case RK_VIDEO:
+    case RK_IMG: case RK_VIDEO: case RK_CANVAS:
         if (b->img >= 0 && b->iw > 0 && b->ih > 0 && cw > 0 && ch > 0) {
             int32_t dx = cx, dy = cy, dw = cw, dh = ch;
             if (s->object_fit == OF_CONTAIN || s->object_fit == OF_COVER || s->object_fit == OF_SCALE_DOWN) {

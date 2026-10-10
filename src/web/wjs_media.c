@@ -217,10 +217,23 @@ void wjs_media_free(struct wjs* js) {
 // Largest frame the engine is asked to produce (4 bytes a pixel).
 #define MAX_OUT_PX (2048 * 1152)
 
+const uint32_t* wjs_media_frame(struct wjs* js, int sess, int* w, int* h) {
+    if (!js || !js->media || sess < 1 || sess > WM_MAX || !js->media[sess - 1].m) return 0;
+    const struct meng_frame* f = meng_get_frame(js->media[sess - 1].m);
+    if (!f || !f->px) return 0;
+    *w = f->w; *h = f->h;
+    return f->px;
+}
+
 int wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout) {
     int relayout = 0, n = 0;
     if (nout) *nout = 0;
-    if (!js || js->dead || !js->media) return 0;
+    if (!js || js->dead) return 0;
+    if (!js->media) {
+        relayout = wjs_canvas_poll(js, out, max, &n);
+        if (nout) *nout = n;
+        return relayout;
+    }
     for (int i = 0; i < WM_MAX; i++) {
         struct wmedia* s = &js->media[i];
         if (!s->m) continue;
@@ -250,11 +263,13 @@ int wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout) {
             if (wdoc_video_set(js->doc, s->node, 0, vw, vh)) relayout = 1;
         }
     }
+    { int cn = 0; if (wjs_canvas_poll(js, out + n, max - n, &cn)) relayout = 1; n += cn; }
     if (nout) *nout = n;
     return relayout;
 }
 
 int wjs_media_any(struct wjs* js) {
+    if (js && !js->dead && js->canvas && wjs_canvas_pending(js)) return 1;
     if (!js || js->dead || !js->media) return 0;
     for (int i = 0; i < WM_MAX; i++) if (js->media[i].m) return 1;
     return 0;
@@ -262,6 +277,7 @@ int wjs_media_any(struct wjs* js) {
 
 // Does any session need the main loop to keep spinning?
 int wjs_media_active(struct wjs* js) {
+    if (js && !js->dead && js->canvas && wjs_canvas_pending(js)) return 1;
     if (!js || js->dead || !js->media) return 0;
     for (int i = 0; i < WM_MAX; i++) {
         struct wmedia* s = &js->media[i];

@@ -1,0 +1,31 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>canvas scene</title></head>
+<body style="margin:0;background:#fff">
+<canvas id="c" width="400" height="300" style="display:block"></canvas>
+<script>
+const c = document.getElementById('c'), g = c.getContext('2d');
+g.fillStyle = '#fff'; g.fillRect(0, 0, 400, 300);
+g.fillStyle = '#cc2222'; g.fillRect(20, 20, 100, 60);
+g.fillStyle = 'rgba(0,0,255,0.5)'; g.fillRect(70, 40, 100, 60);
+g.beginPath(); g.arc(250, 70, 40, 0, Math.PI * 2); g.fillStyle = '#22aa44'; g.fill();
+g.lineWidth = 6; g.strokeStyle = '#000'; g.stroke();
+function zig(y, col, cap, join) {
+    g.beginPath(); g.moveTo(30, y); g.lineTo(70, y - 30); g.lineTo(110, y + 20); g.lineTo(150, y - 20);
+    g.lineWidth = 14; g.lineCap = cap; g.lineJoin = join; g.strokeStyle = col; g.stroke();
+}
+zig(150, '#cc2222', 'butt', 'miter'); zig(200, 'rgba(0,0,255,0.5)', 'round', 'round'); zig(250, '#22aa44', 'square', 'bevel');
+g.beginPath(); g.moveTo(180, 150); g.lineTo(380, 150); g.lineWidth = 4; g.lineCap = 'butt'; g.setLineDash([12, 6]); g.strokeStyle = '#000'; g.stroke(); g.setLineDash([]);
+let lg = g.createLinearGradient(180, 0, 380, 0);
+lg.addColorStop(0, '#f00'); lg.addColorStop(0.5, '#ff0'); lg.addColorStop(1, '#00f');
+g.fillStyle = lg; g.fillRect(180, 170, 200, 40);
+let rg = g.createRadialGradient(280, 250, 0, 280, 250, 40);
+rg.addColorStop(0, '#f00'); rg.addColorStop(0.5, '#ff0'); rg.addColorStop(1, '#00f');
+g.fillStyle = rg; g.fillRect(180, 220, 200, 70);
+// transforms + clip
+g.save(); g.translate(60, 100); g.rotate(0.4); g.fillStyle = '#884488'; g.fillRect(0, 0, 40, 25); g.restore();
+g.save(); g.beginPath(); g.arc(340, 40, 25, 0, Math.PI * 2); g.clip(); g.fillStyle = '#ff8800'; g.fillRect(300, 0, 100, 100); g.fillStyle = '#003366'; g.fillRect(320, 30, 60, 20); g.restore();
+// evenodd star
+g.beginPath(); for (let i = 0; i < 5; i++) { const a = -Math.PI / 2 + i * 4 * Math.PI / 5; g.lineTo(130 + 28 * Math.cos(a), 105 + 28 * Math.sin(a)); } g.closePath(); g.fillStyle = '#006'; g.fill('evenodd');
+console.log('RESULT done');
+</script>
+</body></html>
