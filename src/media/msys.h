@@ -23,6 +23,7 @@ double cos(double);
 double exp(double);
 double log(double);
 double floor(double);
+static inline int abs(int x) { return x < 0 ? -x : x; }
 #define MEDIA_ALLOC(n) kcalloc(1, (n))
 #define MEDIA_FREE(p)  kfree(p)
 #define MEDIA_REALLOC(p, n) krealloc((p), (n))

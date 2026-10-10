@@ -14,6 +14,9 @@ FFPROBE = os.environ.get("FFPROBE", "ffprobe")
 
 VIDEO = "testsrc2=size=320x180:rate=30:duration=3"
 VIDEO_BIG = "testsrc2=size=640x360:rate=30:duration=2"
+VIDEO_LONG = "testsrc2=size=320x180:rate=30:duration=10"
+MUSIC_LONG = ("aevalsrc='0.3*sin(2*PI*261.6*t)+0.2*sin(2*PI*329.6*t)|0.3*sin(2*PI*392*t)+0.1*(random(0)-0.5)':"
+              "s=48000:d=10")
 AUDIO = "sine=frequency=440:sample_rate=48000:duration=3"
 MUSIC = ("aevalsrc='0.3*sin(2*PI*261.6*t)+0.2*sin(2*PI*329.6*t)|0.3*sin(2*PI*392*t)+0.1*(random(0)-0.5)':"
          "s=48000:d=3")
@@ -24,6 +27,7 @@ OPUS = ["-c:a", "libopus", "-b:a", "96k", "-application", "audio"]
 # name: (inputs, codec args, muxer args)
 CASES = {
     "av":         ([VIDEO, MUSIC], VP9 + OPUS, []),
+    "av_long":    ([VIDEO_LONG, MUSIC_LONG], VP9 + OPUS, []),
     "video_only": ([VIDEO], VP9, []),
     "audio_only": ([MUSIC], OPUS, []),
     "live":       ([VIDEO, MUSIC], VP9 + OPUS, ["-live", "1"]),
