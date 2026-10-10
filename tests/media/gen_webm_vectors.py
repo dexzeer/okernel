@@ -33,6 +33,10 @@ CASES = {
     "opus_60ms":  ([MUSIC], ["-c:a", "libopus", "-b:a", "64k", "-frame_duration", "60"], []),
 }
 
+# Opus vectors (gen_opus_vectors.py) remuxed into WebM unchanged: the kernel's playback can then
+# be compared with the RFC reference decoder's output for the very same packets.
+REMUX = ["celt_fb_st", "celt_fb_mono", "celt_ld_st_12k", "celt_2_5ms", "celt_10ms"]
+
 def P(path):
     if FFMPEG.lower().endswith(".exe"):
         return subprocess.check_output(["wslpath", "-w", path]).decode().strip()
@@ -57,4 +61,14 @@ def main():
             f.write(probe.replace("\r", ""))
         print(f"{name:16s} {os.path.getsize(out):8d} bytes  {len(probe.splitlines()):4d} packets")
 
+def remux():
+    for name in REMUX:
+        ogg = os.path.join(VEC, f"opus_{name}.ogg")
+        if not os.path.exists(ogg):
+            continue
+        out = os.path.join(VEC, f"webm_remux_{name}.webm")
+        subprocess.run([FFMPEG, "-y", "-v", "error", "-i", P(ogg), "-c", "copy", P(out)], check=True)
+        print(f"{'remux_' + name:16s} {os.path.getsize(out):8d} bytes")
+
 main()
+remux()
