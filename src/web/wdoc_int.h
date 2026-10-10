@@ -32,6 +32,8 @@ int  wdoc_img_node_slot(struct wdoc* d, int node);
 // <video> frames (see wdoc.c): publish the engine's frame buffer for an element / find where
 // it is painted (page px, unscrolled; *fixed = pinned to the viewport).
 int  wdoc_video_set(struct wdoc* d, int node, const uint32_t* px, int w, int h);
+int  wdoc_canvas_set(struct wdoc* d, int node, const uint32_t* px, int w, int h);
+const uint32_t* wdoc_img_pixels(struct wdoc* d, int node, int* w, int* h);
 int  wdoc_video_dest(struct wdoc* d, int node, int* x, int* y, int* w, int* h, int* fixed);
 int  wdoc_hit_element(struct wdoc* d, int x, int y);   // topmost element at viewport point
 int  wdoc_focus_node(struct wdoc* d);
