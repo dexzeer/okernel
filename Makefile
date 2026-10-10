@@ -87,7 +87,7 @@ src/kmath.o: src/kmath.c
 src/divdi3.o: src/divdi3.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
 # Media decoders (src/media): doubles/floats on the x87 like ojs, libm from src/kmath.c.
-MEDIA_SRC = ec opus_packet celt celt_tables opus_dec
+MEDIA_SRC = ec opus_packet celt celt_tables opus_dec webm
 MEDIA_OBJ = $(patsubst %,src/media/%.o,$(MEDIA_SRC))
 src/media/%.o: src/media/%.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
@@ -170,6 +170,12 @@ media-tests:
 	@test -d tests/media/vec || { echo "no test vectors: run tests/media/gen_opus_vectors.py (needs ffmpeg + the RFC reference decoder)"; exit 1; }
 	@set -e; for f in tests/media/vec/opus_*.bit; do n=$${f%.bit}; ASAN_OPTIONS=detect_leaks=0 ./build-host/t_opus $$n.bit $$n.ref | tail -n 1 | sed "s|^|$$n: |"; done
 	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_celt_fuzz 50000 1 tests/media/vec/opus_celt_fb_st.bit tests/media/vec/opus_celt_ld_st_12k.bit tests/media/vec/opus_celt_2_5ms.bit | tail -n 1
+	gcc -m32 -O1 -fsanitize=address,undefined -o build-host/t_webm tests/media/test_webm.c src/media/webm.c -lm
+	gcc -m32 -O1 -fsanitize=address,undefined -o build-host/t_webm_unit tests/media/test_webm_unit.c src/media/webm.c -lm
+	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_webm_fuzz tests/media/fuzz_webm.c src/media/webm.c -lm
+	@set -e; for f in tests/media/vec/webm_*.webm; do n=$${f%.webm}; ASAN_OPTIONS=detect_leaks=0 ./build-host/t_webm $$n.webm $$n.pkts | tail -n 1 | sed "s|^|$$n: |"; done
+	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_webm_unit | tail -n 1
+	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_webm_fuzz 20000 1 tests/media/vec/webm_av.webm tests/media/vec/webm_live.webm tests/media/vec/webm_audio_only.webm | tail -n 1
 
 # Sanitizer run of the adversarial suite (review P0 infra): every parser,
 # flight, and mock path under ASan+UBSan. Slow (~10 min, RSA-heavy) — run

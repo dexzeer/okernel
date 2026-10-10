@@ -13,6 +13,7 @@
 #include <math.h>
 #define MEDIA_ALLOC(n) calloc(1, (n))
 #define MEDIA_FREE(p)  free(p)
+#define MEDIA_REALLOC(p, n) realloc((p), (n))
 #else
 #include "../string.h"
 #include "../memory.h"
@@ -24,6 +25,7 @@ double log(double);
 double floor(double);
 #define MEDIA_ALLOC(n) kcalloc(1, (n))
 #define MEDIA_FREE(p)  kfree(p)
+#define MEDIA_REALLOC(p, n) krealloc((p), (n))
 #endif
 
 #endif
