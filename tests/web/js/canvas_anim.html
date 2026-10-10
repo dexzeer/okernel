@@ -1,0 +1,16 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>canvas anim</title></head>
+<body style="margin:0;background:#fff">
+<canvas id="c" width="300" height="200" style="display:block"></canvas>
+<script>
+const g = document.getElementById('c').getContext('2d');
+let n = 0;
+function frame() {
+    g.clearRect(0, 0, 300, 200);
+    g.fillStyle = '#123'; g.fillRect(0, 0, 300, 200);
+    g.save(); g.translate(150, 100); g.rotate(n * 0.1); g.fillStyle = '#f80'; g.fillRect(-40, -40, 80, 80); g.restore();
+    if (++n < 400) requestAnimationFrame(frame); else console.log('RESULT frames=' + n);
+}
+requestAnimationFrame(frame);
+</script>
+</body></html>

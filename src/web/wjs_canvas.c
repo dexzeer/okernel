@@ -11,6 +11,7 @@
 double sqrt(double);
 double fabs(double);
 double floor(double);
+double ceil(double);
 #else
 #include <math.h>
 #endif

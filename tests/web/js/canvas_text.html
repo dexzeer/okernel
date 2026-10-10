@@ -1,0 +1,23 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>canvas text</title></head>
+<body style="margin:0;background:#fff">
+<canvas id="c" width="500" height="260" style="display:block"></canvas>
+<script>
+const c = document.getElementById('c'), g = c.getContext('2d');
+g.fillStyle = '#fff'; g.fillRect(0, 0, 500, 260);
+g.fillStyle = '#000';
+g.font = '20px sans-serif'; g.fillText('Hello, canvas! 0123', 10, 30);
+g.font = 'bold 24px serif'; g.fillText('Bold serif text', 10, 65);
+g.font = 'italic 18px monospace'; g.fillText('monospace italic', 10, 95);
+g.textAlign = 'center'; g.font = '16px sans-serif'; g.fillText('centered', 250, 125); g.textAlign = 'right'; g.fillText('right', 490, 125); g.textAlign = 'left';
+g.strokeStyle = '#f00'; g.beginPath(); g.moveTo(0, 150.5); g.lineTo(500, 150.5); g.stroke();
+for (const [i, b] of ['top', 'middle', 'alphabetic', 'bottom'].entries()) { g.textBaseline = b; g.fillStyle = '#006'; g.font = '14px sans-serif'; g.fillText(b, 10 + i * 100, 150); }
+g.textBaseline = 'alphabetic';
+g.save(); g.translate(250, 220); g.rotate(-0.3); g.fillStyle = '#a00'; g.font = '22px sans-serif'; g.fillText('rotated text', 0, 0); g.restore();
+g.fillStyle = '#080'; g.font = '30px sans-serif'; g.fillText('squeezed to fit', 10, 200, 120);
+const lg = g.createLinearGradient(0, 220, 200, 220); lg.addColorStop(0, '#f00'); lg.addColorStop(1, '#00f');
+g.fillStyle = lg; g.font = 'bold 28px sans-serif'; g.fillText('gradient', 10, 245);
+const m = g.measureText('Hello, canvas!');
+console.log('RESULT width=' + m.width.toFixed(1));
+</script>
+</body></html>
