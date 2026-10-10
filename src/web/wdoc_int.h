@@ -29,6 +29,10 @@ void wdoc_viewport_get(struct wdoc* d, int* vw, int* vh, int* scroll, int* docw,
 // <img> natural size + state (0 loading, 1 ok, 2 failed); 0 if no image
 int  wdoc_img_info(struct wdoc* d, int node, int* w, int* h, int* state);
 int  wdoc_img_node_slot(struct wdoc* d, int node);
+// <video> frames (see wdoc.c): publish the engine's frame buffer for an element / find where
+// it is painted (page px, unscrolled; *fixed = pinned to the viewport).
+int  wdoc_video_set(struct wdoc* d, int node, const uint32_t* px, int w, int h);
+int  wdoc_video_dest(struct wdoc* d, int node, int* x, int* y, int* w, int* h, int* fixed);
 int  wdoc_hit_element(struct wdoc* d, int x, int y);   // topmost element at viewport point
 int  wdoc_focus_node(struct wdoc* d);
 int  wdoc_pending_load(struct wdoc* d);                 // CSS/images still loading

@@ -1308,6 +1308,7 @@ struct wjs* wjs_new(struct wdoc* doc) {
     ojsv natives = ojs_object(ctx);
     ojs_set_functions(ctx, natives, env_funcs, (int)(sizeof env_funcs / sizeof env_funcs[0]));
     wjs_dom_install(js, natives);
+    wjs_media_install(js, natives);
     js->deadline = wjs_now() + SCRIPT_BUDGET_MS;
     // the prelude evaluates to a function(W, global) that returns the hooks
     ojsv fn = ojs_eval(ctx, wjs_prelude_src, wjs_prelude_len, "<okai-prelude>", OJS_EVAL_SCRIPT);
@@ -1364,6 +1365,7 @@ void wjs_free(struct wjs* js) {
     }
 #endif
     // the realm owns every value; freeing it releases them all at once
+    wjs_media_free(js);
     if (js->J) ojs_free(js->J);
     js->J = 0;
     for (int i = 0; i < js->ndyn; i++) dyn_free(&js->dyn[i]);

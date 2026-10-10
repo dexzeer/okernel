@@ -275,8 +275,14 @@ again:
                 if (follow > 0 && nav[0] != '#') { snprintf(next_url, sizeof next_url, "%s", nav); break; }
             }
         }
+        if (js) {                                   // <video>/<audio>: the shell's main loop drives playback
+            struct wjs_rect rr[8];
+            int nn;
+            wjs_media_poll(js, rr, 8, &nn);
+        }
         if (id >= 0) continue;
         int due = js ? wjs_next_due(js) : -1;
+        if (js && wjs_media_active(js)) due = 5;
         if (now_ms() > deadline) break;
         if (due < 0) break;
         if (due > 0) usleep((due > 50 ? 50 : due) * 1000);

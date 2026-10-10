@@ -55,6 +55,15 @@ int  wjs_take_scroll(struct wjs* js, int* y);
 int  wjs_take_focus(struct wjs* js, int* node);
 // Tab keeps a history count for history.length/back(); -1/+1 requests.
 int  wjs_take_history(struct wjs* js, int* delta);
+// Media (<video>/<audio>): advance every playing session and publish new video frames. Meant
+// for the shell's main loop, outside any script run. Returns 1 when a video changed size (the
+// document needs a new layout); frames that only changed pixels come back as rectangles in page
+// px (unscrolled; fixed = pinned to the viewport), at most `max`, count in *nout.
+struct wjs_rect { int x, y, w, h, fixed; };
+int  wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout);
+int  wjs_media_active(struct wjs* js);       // something is playing: keep the main loop running
+int  wjs_media_any(struct wjs* js);          // sessions exist (loading, paused...): poll them now and then
+
 // Stats line for diagnostics ("scripts=.. errors=.. heap=..KB").
 void wjs_stats(struct wjs* js, char* out, int cap);
 

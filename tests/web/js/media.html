@@ -1,0 +1,18 @@
+<!doctype html>
+<html><head><title>media</title></head>
+<body style="margin:0;background:#fff">
+<video id="v" src="../../media/vec/webm_av.webm" muted style="width:320px;height:180px;display:block"></video>
+<script>
+const v = document.getElementById('v');
+const evs = ['loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'canplaythrough', 'playing', 'play', 'pause', 'ended', 'seeking', 'seeked', 'durationchange', 'error', 'resize', 'waiting', 'emptied'];
+for (const e of evs) v.addEventListener(e, () => console.log('EV ' + e + ' t=' + v.currentTime.toFixed(2) + ' rs=' + v.readyState + (v.error ? ' err=' + v.error.code + ' ' + v.error.message : '')));
+v.addEventListener('canplay', () => { if (v.paused) v.play().then(() => console.log('play() resolved')); }, { once: true });
+v.addEventListener('ended', () => {
+    const q = v.getVideoPlaybackQuality();
+    console.log('RESULT dur=' + v.duration.toFixed(2) + ' size=' + v.videoWidth + 'x' + v.videoHeight + ' frames=' + q.totalVideoFrames +
+        ' buffered=' + v.buffered.length + ' err=' + v.error);
+});
+console.log('canPlayType webm/vp9+opus: ' + v.canPlayType('video/webm; codecs="vp9, opus"') + ' mp4/avc: [' + v.canPlayType('video/mp4; codecs="avc1.42E01E"') + ']');
+console.log('MediaSource.isTypeSupported: ' + MediaSource.isTypeSupported('video/webm; codecs="vp9"') + ' ' + MediaSource.isTypeSupported('audio/webm; codecs="opus"') + ' ' + MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"'));
+</script>
+</body></html>
