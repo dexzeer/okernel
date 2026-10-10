@@ -24,6 +24,14 @@ VOICE = ("aevalsrc='0.30*sin(2*PI*(150+40*sin(2*PI*0.6*t))*t)*(0.6+0.4*sin(2*PI*
 PERC = ("aevalsrc='0.5*sin(2*PI*220*t)*exp(-8*mod(t,0.25))+0.3*sin(2*PI*1760*t)*exp(-30*mod(t,0.5))"
         "+0.2*(random(0)-0.5)*exp(-20*mod(t+0.1,0.5))':s=48000:d=4")
 
+# decorrelated stereo "music": chords on both channels, different noise floors, a bright
+# decaying click train on the right only
+MUSIC = ("aevalsrc='0.25*sin(2*PI*261.6*t)+0.2*sin(2*PI*329.6*t)+0.2*sin(2*PI*392*t)"
+         "+0.12*(random(0)-0.5)*(0.5+0.5*sin(2*PI*2*t))"
+         "|0.25*sin(2*PI*220*t)+0.2*sin(2*PI*277*t)+0.15*sin(2*PI*440*t)"
+         "+0.12*(random(1)-0.5)*(0.5+0.5*sin(2*PI*1.5*t))+0.25*sin(2*PI*3000*t)*exp(-6*mod(t,0.4))':s=48000:d=4")
+NOISE = "aevalsrc='0.4*(random(0)-0.5)*(0.3+0.7*sin(2*PI*0.7*t)*sin(2*PI*0.7*t))':s=48000:d=4"
+
 # name: (source, extra ffmpeg args)
 CASES = {
     "celt_fb_st":     (PERC,  "-ac 2 -application audio -b:a 128k"),
@@ -35,6 +43,14 @@ CASES = {
     "celt_5ms":       (PERC,  "-ac 2 -application lowdelay -frame_duration 5 -b:a 96k"),
     "celt_10ms":      (PERC,  "-ac 2 -application audio -frame_duration 10 -b:a 96k"),
     "celt_cbr":       (PERC,  "-ac 2 -application audio -vbr off -b:a 96k"),
+    "celt_ld_st_12k": (MUSIC, "-ac 2 -application lowdelay -b:a 12k"),
+    "celt_ld_st_24k": (MUSIC, "-ac 2 -application lowdelay -b:a 24k"),
+    "celt_ld_st_48k": (MUSIC, "-ac 2 -application lowdelay -b:a 48k"),
+    "celt_ld_st_256k": (MUSIC, "-ac 2 -application lowdelay -b:a 256k"),
+    "celt_ld_mono_8k": (NOISE, "-ac 1 -application lowdelay -b:a 8k"),
+    "celt_ld_mono_64k": (NOISE, "-ac 1 -application lowdelay -b:a 64k"),
+    "celt_ld_st_10ms_24k": (MUSIC, "-ac 2 -application lowdelay -frame_duration 10 -b:a 24k"),
+    "celt_ld_st_5ms_32k": (MUSIC, "-ac 2 -application lowdelay -frame_duration 5 -b:a 32k"),
     "silk_nb":        (VOICE, "-ac 1 -application voip -cutoff 4000 -b:a 10k"),
     "silk_mb":        (VOICE, "-ac 1 -application voip -cutoff 6000 -b:a 14k"),
     "silk_wb":        (VOICE, "-ac 1 -application voip -cutoff 8000 -b:a 20k"),
