@@ -48,6 +48,7 @@ CASES = {
     "p12":        ("testsrc", 160, 96, 8, "yuv420p12le", ["-b:v", "300k", "-profile:v", "2"]),
     "hq":         ("mandel", 320, 180, 20, "yuv420p", ["-crf", "12", "-b:v", "0", "-auto-alt-ref", "1", "-lag-in-frames", "8"]),
     "lq":         ("mandel", 320, 180, 20, "yuv420p", ["-crf", "58", "-b:v", "0", "-auto-alt-ref", "1", "-lag-in-frames", "8"]),
+    "p720":       ("mandel", 1280, 720, 30, "yuv420p", ["-b:v", "2500k", "-auto-alt-ref", "1", "-lag-in-frames", "8", "-tile-columns", "2"]),
     "slow":       ("testsrc", 320, 180, 30, "yuv420p", ["-b:v", "300k", "-cpu-used", "0", "-auto-alt-ref", "1", "-lag-in-frames", "25"]),
 }
 
