@@ -14,8 +14,10 @@ check() {  # page pattern...
     done
 }
 check media.html 'EV loadedmetadata' 'EV playing' 'play() resolved' 'EV ended' 'RESULT dur=3.01 size=320x180 frames=90 ' 'probably'
+check mediamp4.html 'EV loadedmetadata' 'EV playing' 'play() resolved' 'EV ended' 'RESULT dur=3.0[0-9] size=320x180 frames=90 ' 'mp4/avc: \[probably\]'
 check streams.html 'RESULT ALLPASS'
 check mse.html 'SB video buffered=1 end=3.0 audio buffered=0 element buffered=1' 'sourceopen readyState=open' 'EV loadedmetadata' 'EV seeked' 'EV ended' 'RESULT dur=3.00 size=320x180 frames=1[0-9][0-9] seeked=true'
+check msemp4.html 'sourceopen readyState=open' 'EV loadedmetadata' 'EV seeked' 'EV ended' 'RESULT dur=3.00 size=320x180 frames=1[0-9][0-9] seeked=true'
 kill "$(cat /tmp/test_media_srv.pid)" 2>/dev/null
 [ $fail = 0 ] && echo "test_media: PASS" || echo "test_media: FAIL"
 exit $fail

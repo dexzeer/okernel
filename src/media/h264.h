@@ -32,7 +32,8 @@ struct h264_pic {
 };
 
 // The callback receives every decoded picture (decoding order) with one reference the receiver
-// owns: release it with h264_pic_unref().
+// owns: release it with h264_pic_unref(). The descriptor itself is only valid during the callback; a
+// receiver that keeps the picture copies the struct (the reference travels in `priv`).
 typedef void (*h264_out_fn)(void* user, struct h264_pic* pic);
 
 struct h264_dec* h264_new(void);

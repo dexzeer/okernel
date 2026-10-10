@@ -298,6 +298,140 @@ static void test_video(void) {
     free(yuv);
 }
 
+
+// ---- MP4: H.264 with B frames, AAC (resampled), fragmented -------------------------------------
+
+static void test_mp4_video(const char* mp4, const char* yuvname, long chunk, int first_frame) {
+    printf("mp4 video %s (H.264, chunks of %ld)\n", mp4, chunk);
+    long n, yn;
+    uint8_t* file = slurp(mp4, &n);
+    uint8_t* yuv = slurp(yuvname, &yn);
+    const int W = 320, H = 180, FS = W * H * 3 / 2;
+    reset_card();
+    struct meng* m = meng_new(&env);
+    int sb = meng_sb_add(m, 3);
+    feed_all(m, sb, file, n, chunk, 0);
+    meng_end_of_stream(m);
+    for (int i = 0; i < 5; i++) step(m);
+    CHECK(meng_has_video(m) && !meng_has_audio(m), "tracks");
+    CHECK(meng_get_frame(m) != 0, "no first frame while paused");
+    CHECK(frame_matches(meng_get_frame(m), yuv, W, H) == 0, "first frame differs");
+    meng_play(m);
+    for (int i = 0; i < 60; i++) step(m);                       // 0.6 s
+    CHECK(meng_frames_decoded(m) >= 17, "decoded only %u frames in 0.6 s", meng_frames_decoded(m));
+    meng_pause(m);
+    double tp = meng_current_time(m);
+    int idx = (int)(tp * 30 + 0.001) - first_frame;                // yuv index of the frame on screen (the stream may start a frame or two after 0)
+    if (idx < 0) idx = 0;
+    int bad = frame_matches(meng_get_frame(m), yuv + (long)idx * FS, W, H);
+    int bad2 = frame_matches(meng_get_frame(m), yuv + (long)(idx > 0 ? idx - 1 : 0) * FS, W, H);
+    CHECK(bad == 0 || bad2 == 0, "paused frame is neither %d nor %d (%d / %d wrong pixels)", idx, idx - 1, bad, bad2);
+    meng_seek(m, 1.7);
+    for (int i = 0; i < 30; i++) step(m);
+    int want = (int)(1.7 * 30 + 0.001) - first_frame;
+    int bw = frame_matches(meng_get_frame(m), yuv + (long)want * FS, W, H);
+    int bw1 = frame_matches(meng_get_frame(m), yuv + (long)(want - 1) * FS, W, H);
+    CHECK(bw == 0 || bw1 == 0, "frame after the seek is neither %d nor %d (%d / %d wrong pixels)", want, want - 1, bw, bw1);
+    CHECK(!meng_seeking(m), "still seeking");
+    meng_seek(m, 0.0);
+    meng_play(m);
+    uint32_t shown0 = meng_frames_shown(m), dropped0 = meng_frames_dropped(m);
+    for (int i = 0; i < 6000 && !meng_ended(m); i++) step(m);
+    CHECK(meng_ended(m), "video did not end (t=%.2f)", meng_current_time(m));
+    CHECK(meng_frames_shown(m) - shown0 >= 85, "only %u frames shown in a full play", meng_frames_shown(m) - shown0);
+    CHECK(meng_frames_dropped(m) == dropped0, "%u frames dropped at real-time speed", meng_frames_dropped(m) - dropped0);
+    meng_free(m);
+    free(file);
+    free(yuv);
+}
+
+// cubic interpolation of the reference at a fractional frame position
+static double interp_ref(const int16_t* ref, long frames, double pos, int ch) {
+    long i = (long)floor(pos);
+    double f = pos - i;
+    if (i < 1 || i + 2 >= frames) return 0;
+    double p0 = ref[(i - 1) * 2 + ch], p1 = ref[i * 2 + ch], p2 = ref[(i + 1) * 2 + ch], p3 = ref[(i + 2) * 2 + ch];
+    return p1 + 0.5 * f * (p2 - p0 + f * (2 * p0 - 5 * p1 + 4 * p2 - p3 + f * (3 * (p1 - p2) + p3 - p0)));
+}
+
+static void test_mp4_audio(const char* mp4, const char* refname, int in_rate) {
+    printf("mp4 audio %s (AAC, resampled to 48 kHz)\n", mp4);
+    long n, rn;
+    uint8_t* file = slurp(mp4, &n);
+    int16_t* ref = (int16_t*)slurp(refname, &rn);
+    long rframes = rn / 4;
+    reset_card();
+    struct meng* m = meng_new(&env);
+    int sb = meng_sb_add(m, 3);
+    feed_all(m, sb, file, n, 7000, 0);
+    meng_end_of_stream(m);
+    meng_play(m);
+    for (int i = 0; i < 6000 && !meng_ended(m); i++) step(m);
+    CHECK(meng_ended(m), "did not end (t=%.2f)", meng_current_time(m));
+    CHECK(meng_has_audio(m) && !meng_has_video(m), "track detection");
+    CHECK(first_wr_set, "nothing was played");
+    if (getenv("MENG_DEBUG")) {                                     // absolute alignment against the analytic signal (left channel)
+        double bestc = -1, bestd = 0;
+        for (double d = -60; d <= 60; d += 0.1) {
+            double sxy = 0, sxx = 0, syy = 0;
+            for (long k = 9600; k < 9600 + 9600; k++) {
+                double t = (k + d) / 48000.0, want = in_rate == 44100 ? 0.3 * sin(2 * M_PI * 261.6 * t) + 0.2 * sin(2 * M_PI * 1320 * t)
+                                                                      : 0.3 * sin(2 * M_PI * 330 * t) + 0.1 * sin(2 * M_PI * 1760 * t);
+                double got = timeline[(first_wr + k) * 2];
+                sxy += got * want; sxx += got * got; syy += want * want;
+            }
+            double c = sxy / sqrt(sxx * syy);
+            if (c > bestc) { bestc = c; bestd = d; }
+        }
+        printf("  analytic alignment: media time of timeline frame k is (k %+.2f)/48000, correlation %.4f\n", bestd, bestc);
+    }
+    double delay = 0;                                               // ffmpeg's resampler output is aligned with its input
+    double best = -1e9;
+    double best_o = 0;
+    for (double o = -2; o <= 2; o += 0.1) {                  // the references are aligned to within a fraction of a frame
+        double s = 0, e = 0;
+        for (long k = 4800; k < 4800 + 4800; k++)
+            for (int c = 0; c < 2; c++) {
+                double r = interp_ref(ref, rframes, k + delay + o, c), d = timeline[(first_wr + k) * 2 + c] - r;
+                s += r * r; e += d * d;
+            }
+        double sn = e > 0 ? 10 * log10(s / e) : 200;
+        if (sn > best) { best = sn; best_o = o; }
+    }
+    double s = 0, e = 0;
+    for (long k = 4800; k < 4800 + 2 * 48000; k++)
+        for (int c = 0; c < 2; c++) {
+            double r = interp_ref(ref, rframes, k + delay + best_o, c), d = timeline[(first_wr + k) * 2 + c] - r;
+            s += r * r; e += d * d;
+        }
+    double snr = e > 0 ? 10 * log10(s / e) : 200;
+    CHECK(fabs(best_o) <= 1.0, "the audio is %.1f frames off the reference", best_o);
+    CHECK(snr > 40, "audio is %.1f dB from the reference", snr);
+    printf("  SNR %.1f dB, offset %.1f frames, %lld frames played\n", snr, best_o, (long long)wr_pos);
+    meng_free(m);
+    free(file);
+    free(ref);
+}
+
+static void test_mp4_av(void) {
+    printf("mp4 audio + video together\n");
+    long n;
+    uint8_t* file = slurp("meng_av.mp4", &n);
+    reset_card();
+    struct meng* m = meng_new(&env);
+    int sb = meng_sb_add(m, 3);
+    feed_all(m, sb, file, n, 9000, 0);
+    meng_end_of_stream(m);
+    CHECK(meng_has_audio(m) && meng_has_video(m), "tracks");
+    meng_play(m);
+    for (int i = 0; i < 6000 && !meng_ended(m); i++) step(m);
+    CHECK(meng_ended(m), "did not end (t=%.2f)", meng_current_time(m));
+    CHECK(meng_frames_shown(m) >= 80, "%u frames shown", meng_frames_shown(m));
+    CHECK(meng_audio_frames(m) >= 2 * 48000, "%u audio frames", meng_audio_frames(m));
+    meng_free(m);
+    free(file);
+}
+
 static void test_buffered_and_remove(void) {
     printf("buffered ranges, remove, starving\n");
     long n;
@@ -336,6 +470,11 @@ int main(int argc, char** argv) {
     test_seek_audio();
     test_video();
     test_buffered_and_remove();
+    test_mp4_video("meng_h264.mp4", "meng_h264.yuv", 6000, 0);
+    test_mp4_video("meng_h264_frag.mp4", "meng_h264.yuv", 3333, 2);
+    test_mp4_audio("meng_aac44.mp4", "meng_aac44.ref", 44100);
+    test_mp4_audio("meng_aac24_mono.mp4", "meng_aac24_mono.ref", 24000);
+    test_mp4_av();
     printf("test_meng: %s\n", failures ? "FAIL" : "PASS");
     return failures != 0;
 }

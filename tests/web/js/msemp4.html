@@ -1,0 +1,49 @@
+<!doctype html>
+<html><head><title>mse mp4</title></head>
+<body style="margin:0;background:#fff">
+<video id="v" muted style="width:320px;height:180px;display:block"></video>
+<script>
+// MediaSource with separate audio and video source buffers, appended in 16 KB pieces (like a DASH player).
+const v = document.getElementById('v');
+const log = m => console.log(m);
+const evs = ['loadstart', 'loadedmetadata', 'loadeddata', 'canplay', 'playing', 'pause', 'ended', 'seeking', 'seeked', 'durationchange', 'error', 'waiting', 'emptied'];
+for (const e of evs) v.addEventListener(e, () => log('EV ' + e + ' t=' + v.currentTime.toFixed(2) + ' rs=' + v.readyState + (v.error ? ' err=' + v.error.code + ' ' + v.error.message : '')));
+const ms = new MediaSource();
+ms.addEventListener('sourceopen', () => log('sourceopen readyState=' + ms.readyState));
+ms.addEventListener('sourceended', () => log('sourceended'));
+v.src = URL.createObjectURL(ms);
+function feed(sb, buf, done) {
+    let off = 0;
+    sb.addEventListener('updateend', next);
+    function next() {
+        if (off >= buf.byteLength) { sb.removeEventListener('updateend', next); done(); return; }
+        const n = Math.min(16384, buf.byteLength - off);
+        sb.appendBuffer(buf.slice(off, off + n));
+        off += n;
+    }
+    next();
+}
+ms.addEventListener('sourceopen', () => {
+    const vs = ms.addSourceBuffer('video/mp4; codecs="avc1.64001e"');
+    const as = ms.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+    Promise.all([fetch('../../media/vec/meng_h264_frag.mp4').then(r => r.arrayBuffer()), fetch('../../media/vec/meng_aac_frag.mp4').then(r => r.arrayBuffer())]).then(([vb, ab]) => {
+        let left = 2;
+        const fin = () => { if (--left === 0) { ms.duration = 3; ms.endOfStream(); log('buffered ' + v.buffered.length + ' ' + v.buffered.start(0).toFixed(2) + '-' + v.buffered.end(0).toFixed(2) + ' dur=' + v.duration); v.play(); } };
+        // each SourceBuffer reports its own ranges: with only video appended, the video buffer is full
+        // and the audio one empty (the element's own `buffered` covers the tracks that have data)
+        feed(vs, vb, () => {
+            log('SB video buffered=' + vs.buffered.length + ' end=' + (vs.buffered.length ? vs.buffered.end(0).toFixed(1) : 'none') +
+                ' audio buffered=' + as.buffered.length + ' element buffered=' + v.buffered.length);
+            fin();
+            feed(as, ab, fin);
+        });
+    });
+}, { once: true });
+let seeked = false;
+v.addEventListener('timeupdate', () => { if (!seeked && v.currentTime > 1.2) { seeked = true; log('seeking back to 0.5'); v.currentTime = 0.5; } });
+v.addEventListener('ended', () => {
+    const q = v.getVideoPlaybackQuality();
+    log('RESULT dur=' + v.duration.toFixed(2) + ' size=' + v.videoWidth + 'x' + v.videoHeight + ' frames=' + q.totalVideoFrames + ' seeked=' + seeked);
+});
+</script>
+</body></html>

@@ -10,7 +10,7 @@
 #include <string.h>
 #include "../../src/media/mp4.h"
 
-struct pkt { int stream; double pts, dts; long size; int key; uint32_t crc; };
+struct pkt { int stream; double pts, dts; long size; int key; uint32_t crc; int has_dts; };
 
 static uint32_t crc32_update(uint32_t crc, const uint8_t* p, size_t n) {
     crc = ~crc;
@@ -85,7 +85,8 @@ int main(int argc, char** argv) {
         char flags[8] = "", pts[32], dts[32], dur[32], crc[32] = "";
         if (sscanf(line, "%d,%31[^,],%31[^,],%31[^,],%ld,%7[^,],CRC32:%31[0-9a-fA-F]", &p->stream, pts, dts, dur, &p->size, flags, crc) < 7) continue;
         p->pts = strcmp(pts, "N/A") ? atof(pts) : 0;
-        p->dts = strcmp(dts, "N/A") ? atof(dts) : 0;
+        p->has_dts = strcmp(dts, "N/A") != 0;
+        p->dts = p->has_dts ? atof(dts) : 0;
         p->key = flags[0] == 'K';
         p->crc = (uint32_t)strtoul(crc, 0, 16);
         nwant++;
@@ -103,7 +104,7 @@ int main(int argc, char** argv) {
                 while (wi < nwant && want[wi].stream != s) wi++;
                 if (gi >= ngot || wi >= nwant) break;
                 const struct pkt* g = &got[gi]; const struct pkt* w = &want[wi];
-                if (g->size != w->size || g->key != w->key || g->crc != w->crc || fabs(g->pts - w->pts) > 0.0015) {
+                if (g->size != w->size || g->key != w->key || g->crc != w->crc || fabs(g->pts - w->pts) > 0.0015 || (w->has_dts && fabs(g->dts - w->dts) > 0.0015)) {
                     printf("  mode %d stream %d: got size %ld key %d crc %08x pts %.4f dts %.4f; want size %ld key %d crc %08x pts %.4f dts %.4f\n",
                            mode, s, g->size, g->key, g->crc, g->pts, g->dts, w->size, w->key, w->crc, w->pts, w->dts);
                     diffs++;
