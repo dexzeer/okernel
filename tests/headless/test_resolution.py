@@ -18,6 +18,8 @@ root = okvm.PROJECT
 ok = True
 
 def build(w, h):
+    if os.environ.get("RES_ISO"):          # a prebuilt test ISO (make kanarchy-w1366.iso: a 1366-wide geometry inside QEMU's framebuffer)
+        return os.path.join(root, os.environ["RES_ISO"])
     subprocess.run(["make", "-B", "build-res/start.o", f"VID_W={w}", f"VID_H={h}"], cwd=root, check=True, stdout=subprocess.DEVNULL)
     if os.path.exists(os.path.join(root, "kanarchy-res.bin")):
         os.unlink(os.path.join(root, "kanarchy-res.bin"))
@@ -38,7 +40,7 @@ for mode in modes:
         sw, sh = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
         dw, dh, _ = vm.dump()
         print(f"  requested {mode}: kernel screen {sw}x{sh}, screendump {dw}x{dh}", flush=True)
-        if (sw, sh) != (dw, dh) or sw == 0:
+        if ((sw, sh) != (dw, dh) and not os.environ.get("RES_ISO")) or sw == 0 or (os.environ.get("RES_ISO") and (sw, sh) != (w, h)):
             print("    FAIL  screen size mismatch"); good = False
         vm.type_string("okai\n", delay=0.03)
         vm.wait_for("home rendered", timeout=40)

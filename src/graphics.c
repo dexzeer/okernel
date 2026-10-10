@@ -391,12 +391,26 @@ void graphics_init(uint32_t mboot_phys) {
         uint32_t mp = *(volatile uint32_t*)(mboot_phys + 96);
         uint8_t mbpp = *(volatile uint8_t*)(mboot_phys + 108);
         uint8_t mtype = *(volatile uint8_t*)(mboot_phys + 109);
+#ifdef GFX_TEST_W
+        // test build: pretend the panel is GFX_TEST_W x GFX_TEST_H (e.g. 1366 wide, not a multiple of 8) with a tight pitch, drawn
+        // into the top of whatever bigger framebuffer QEMU gave us
+        mw = GFX_TEST_W; mh = GFX_TEST_H; mp = GFX_TEST_W * 4; mbpp = 32; mtype = 1;
+        *(volatile uint32_t*)(mboot_phys + 96) = mp;
+#endif
         if (mtype == 1 && mbpp == 32 && mw >= 640 && mh >= 480 && mw <= SCREEN_W_MAX && mh <= SCREEN_H_MAX &&
             mp >= mw * 4) {
             gfx_w = (int)mw; gfx_h = (int)mh;
         } else {
-            serial_printf("[gfx] unsupported framebuffer mode %dx%d bpp=%d type=%d pitch=%d - assuming 1920x1080\n",
+            // Not a 32-bit linear framebuffer (a text mode, or 16/24 bits): drawing 1920x1080 pixels into it would scribble over
+            // memory. Say so where the screen can show it (VGA text) and stop.
+            serial_printf("[gfx] unsupported framebuffer mode %dx%d bpp=%d type=%d pitch=%d - stopping\n",
                           mw, mh, mbpp, mtype, mp);
+            static const char msg[] = "KAnarchy: this video mode is not supported (needs 32 bits per pixel). Reboot and pick another menu entry.";
+            if (mtype == 2) {
+                volatile uint16_t* t = (volatile uint16_t*)0xB8000;
+                for (int i = 0; msg[i]; i++) t[i] = (uint16_t)(0x4F00 | (uint8_t)msg[i]);
+            }
+            for (;;) __asm__ volatile("cli; hlt");
         }
     }
     clip_x0 = 0; clip_y0 = 0; clip_x1 = SCREEN_W; clip_y1 = SCREEN_H;

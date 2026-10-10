@@ -28,7 +28,7 @@ ASM_OBJ = boot/start.o boot/isr.o boot/smp_stubs.o boot/ap_tramp.o
 COMMON_OBJ = src/gdt.o src/idt.o src/memory.o src/serial.o src/keyboard.o src/mouse.o src/string.o src/syscall.o
 
 # Text mode objects
-TEXT_OBJ = src/vga.o src/shell.o src/terminal.o
+TEXT_OBJ = src/vga.o src/shell.o src/terminal.o src/hwinfo.o src/i915.o src/pcix.o src/text_stubs.o
 
 # Text boot keeps VGA text mode: start.asm built WITHOUT the multiboot
 # video request (desktop start.o asks GRUB for 1920x1080x32, which would
@@ -103,7 +103,7 @@ DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) src/hda.o src/pcix.o src/virtio.o src/vgp
              src/crypto/certverify.o src/rtc.o \
              src/net/fetch.o
 
-.PHONY: all text desktop clean run debug host-tests host-tests-asan media-tests diff-oracle diff-test tls-interop web-tests
+.PHONY: laptop all text desktop clean run debug host-tests host-tests-asan media-tests diff-oracle diff-test tls-interop web-tests
 
 # ---- Web engine host tests (src/web) ----
 # Offline must-pass: CSS cascade unit tests, font engine. With the corpus
@@ -355,6 +355,43 @@ kanarchy-res.iso: kanarchy-res.bin
 	cp kanarchy-res.bin isodir-res/boot/kanarchy.bin
 	printf 'set timeout=0\nset default=0\n\nmenuentry "KAnarchy OS" {\n    set gfxpayload=$(VID_W)x$(VID_H)x32\n    multiboot /boot/kanarchy.bin\n    boot\n}\n' > isodir-res/boot/grub/grub.cfg
 	grub-mkrescue -o $@ isodir-res 2>/dev/null
+
+# ---- Test build: a 1366x768 geometry inside QEMU's framebuffer (QEMU's VGA has no 1366-wide mode):
+# exercises a width that is not a multiple of 8 and a tight pitch. tests/headless/test_odd_width.py
+build-w1366/graphics.o: src/graphics.c $(HEADERS)
+	mkdir -p build-w1366
+	$(CC) $(CFLAGS) -DGFX_TEST_W=1366 -DGFX_TEST_H=768 -c $< -o $@
+kanarchy-w1366.bin: $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o build-w1366/graphics.o linker-high.ld
+	$(LD) $(LDFLAGS_HIGH) -o $@ $(ASM_OBJ) $(COMMON_OBJ) $(filter-out src/graphics.o,$(DESKTOP_OBJ)) src/desktop.o build-w1366/graphics.o
+kanarchy-w1366.iso: kanarchy-w1366.bin
+	rm -rf isodir-w1366
+	mkdir -p isodir-w1366/boot/grub
+	cp kanarchy-w1366.bin isodir-w1366/boot/kanarchy.bin
+	printf 'set timeout=0\nset default=0\n\nmenuentry "KAnarchy OS" {\n    set gfxpayload=1920x1080x32\n    multiboot /boot/kanarchy.bin\n    boot\n}\n' > isodir-w1366/boot/grub/grub.cfg
+	grub-mkrescue -o $@ isodir-w1366 2>/dev/null
+
+# ---- Laptop image: one USB/CD image for an old BIOS laptop (LAPTOP.md). GRUB cannot override the video mode a
+# multiboot header asks for, so every resolution is its own kernel image (only start.o differs), next to the
+# text-mode kernel with the hardware report.
+define LAPTOP_RULE
+build-laptop/start-$(1).o: boot/start.asm
+	mkdir -p build-laptop
+	$(AS) $(ASFLAGS) -DVID_W=$(2) -DVID_H=$(3) $$< -o $$@
+build-laptop/kanarchy-$(1).bin: build-laptop/start-$(1).o $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o linker-high.ld
+	$(LD) $(LDFLAGS_HIGH) -o $$@ build-laptop/start-$(1).o $(filter-out boot/start.o,$(ASM_OBJ)) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o
+endef
+$(eval $(call LAPTOP_RULE,1366x768,1366,768))
+$(eval $(call LAPTOP_RULE,1280x800,1280,800))
+$(eval $(call LAPTOP_RULE,1024x768,1024,768))
+$(eval $(call LAPTOP_RULE,auto,0,0))
+laptop: kanarchy-laptop.iso
+kanarchy-laptop.iso: kanarchy-text.bin build-laptop/kanarchy-1366x768.bin build-laptop/kanarchy-1280x800.bin build-laptop/kanarchy-1024x768.bin build-laptop/kanarchy-auto.bin boot/laptop-grub.cfg
+	rm -rf isodir-laptop
+	mkdir -p isodir-laptop/boot/grub
+	cp kanarchy-text.bin isodir-laptop/boot/kanarchy-text.bin
+	for m in 1366x768 1280x800 1024x768 auto; do cp build-laptop/kanarchy-$$m.bin isodir-laptop/boot/kanarchy-$$m.bin; done
+	cp boot/laptop-grub.cfg isodir-laptop/boot/grub/grub.cfg
+	grub-mkrescue -o $@ isodir-laptop 2>/dev/null
 
 # ---- Test build: the Intel graphics probe pointed at QEMU's standard VGA (vendor
 # 1234) with a forced generation, so the PCI/BAR/MMIO/report code runs without an
