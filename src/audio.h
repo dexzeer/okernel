@@ -19,6 +19,8 @@ int audio_ready(void);
 // Queue interleaved stereo frames (L,R,L,R...). Non-blocking: returns how many
 // frames were accepted (fewer than asked when the ring is full).
 uint32_t audio_write(const int16_t* frames, uint32_t nframes);
+// Drop everything queued but not yet played (pause, seek).
+void audio_flush(void);
 // Frames that can be queued right now.
 uint32_t audio_space(void);
 // Frames queued but not yet played.

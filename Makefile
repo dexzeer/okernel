@@ -87,7 +87,7 @@ src/kmath.o: src/kmath.c
 src/divdi3.o: src/divdi3.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
 # Media decoders (src/media): doubles/floats on the x87 like ojs, libm from src/kmath.c.
-MEDIA_SRC = ec opus_packet celt celt_tables opus_dec webm vp9 vp9_recon vp9_lf vp9_tables
+MEDIA_SRC = ec opus_packet celt celt_tables opus_dec webm vp9 vp9_recon vp9_lf vp9_tables meng
 MEDIA_OBJ = $(patsubst %,src/media/%.o,$(MEDIA_SRC))
 src/media/%.o: src/media/%.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
@@ -178,6 +178,8 @@ media-tests:
 	@set -e; for f in tests/media/vec/vp9_*.webm; do n=$${f%.webm}; ASAN_OPTIONS=detect_leaks=0 ./build-host/t_vp9 $$n.webm $$n.yuv | tail -n 1 | sed "s|^|$$n: |"; done
 	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_vp9_fuzz tests/media/fuzz_vp9.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/webm.c -lm
 	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_vp9_fuzz 400 1 tests/media/vec/vp9_inter.webm tests/media/vec/vp9_intra.webm tests/media/vec/vp9_tiles.webm tests/media/vec/vp9_aq3.webm tests/media/vec/vp9_yuv422.webm tests/media/vec/vp9_yuv440.webm tests/media/vec/vp9_p10.webm tests/media/vec/vp9_odd.webm | tail -n 1
+	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -o build-host/t_meng tests/media/test_meng.c src/media/meng.c src/media/webm.c src/media/opus_dec.c src/media/opus_packet.c src/media/celt.c src/media/celt_tables.c src/media/ec.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_lf.c src/media/vp9_tables.c -lm
+	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_meng tests/media/vec | tail -n 1
 	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_webm_unit | tail -n 1
 	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_webm_fuzz 20000 1 tests/media/vec/webm_av.webm tests/media/vec/webm_live.webm tests/media/vec/webm_audio_only.webm | tail -n 1
 
