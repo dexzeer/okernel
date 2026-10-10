@@ -1,0 +1,21 @@
+<!doctype html><html><body><script>
+// The built-in web API (JS in the prelude) must not show its source: scripts probe Function.prototype.toString
+// for "[native code]" to detect hooked or emulated APIs (YouTube's attestation does).
+const bad = [];
+const check = (name, f) => {
+    let s; try { s = Function.prototype.toString.call(f); } catch (e) { bad.push(name + ' threw ' + e); return; }
+    if (!/^function [\w$ .]*\(\) \{ \[native code\] \}$/.test(s)) bad.push(name + ': ' + s.slice(0, 60));
+};
+const names = { fetch, 'XHR.send': XMLHttpRequest.prototype.send, createElement: document.createElement, setTimeout, getComputedStyle,
+    getAttribute: Element.prototype.getAttribute, appendChild: Node.prototype.appendChild, Event, Response, Headers, URL, Blob,
+    addEventListener: EventTarget.prototype.addEventListener, 'localStorage.getItem': localStorage.getItem, atob, requestAnimationFrame,
+    'performance.now': performance.now, MutationObserver, MediaSource, HTMLMediaElement, 'video.play': HTMLMediaElement.prototype.play,
+    'Date.now': Date.now, 'Math.max': Math.max, Promise, 'console.log': console.log, DOMParser, ReadableStream };
+for (const k in names) check(k, names[k]);
+const d = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+check('innerHTML getter', d.get); check('innerHTML setter', d.set);
+// user code keeps its source
+function mine(a) { return a + 1; }
+if (Function.prototype.toString.call(mine) !== 'function mine(a) { return a + 1; }') bad.push('user function lost its source');
+console.log('RESULT ' + (bad.length ? 'FAIL ' + bad.join(' | ') : 'ALLPASS'));
+</script></body></html>

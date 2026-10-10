@@ -29,7 +29,7 @@ extern const uint32_t wjs_prelude_len;
 void wjs_selq_forget(struct wdom* d);
 
 #define SCRIPT_BUDGET_MS 4000   // one script evaluation (the whole OS waits: keep it short)
-#define TASK_BUDGET_MS   1000   // one timer / event / callback
+#define TASK_BUDGET_MS   3000   // one timer / event / callback / promise job (killing a half-run job corrupts a framework's state: only a runaway loop should hit this)
 #define REALM_STACK_MAX  (900u << 10)
 #define MAX_SCRIPTS      256
 #define MAX_MODULES      512
@@ -59,7 +59,10 @@ static void fallback_random(uint8_t* out, int n) {
 }
 
 void wjs_logf(struct wjs* js, int level, const char* s, int len) {
-    if (js) {
+    if (js && level == 4) {              // engine trace lines (the prelude's [media]/[net] notes): their own budget
+        if (js->ndbg++ >= WJS_DBG_MAX) return;
+        level = 1;
+    } else if (js) {
         if (js->nlog == WJS_LOG_MAX) {
             if (wjs_host.log) wjs_host.log("[js] (further console output suppressed)\n");
             else w_log("[js] (further console output suppressed)\n");
@@ -147,14 +150,32 @@ static int interrupt_cb(ojs* J, void* op) {
 }
 
 static void flush_rejections(struct wjs* js);
+// Every promise job gets its own time budget (a framework's initial render is thousands of chained jobs: one
+// budget for the whole checkpoint killed the page's state half-way). A checkpoint that runs longer than
+// DRAIN_BUDGET_MS yields to the shell with jobs still queued; wjs_next_due() reports "now" until they are done.
+#define DRAIN_BUDGET_MS 3000
 void wjs_drain_jobs(struct wjs* js) {
-    for (int i = 0; i < 100000; i++) {
+    int armed = js->deadline != 0;
+    int start = wjs_now();
+    int yielded = 0;
+    for (int i = 0; i < 1000000; i++) {
+        int t0 = wjs_now();
+        if (armed) js->deadline = t0 + TASK_BUDGET_MS;
         int r = ojs_run_job(js->J);
+        if (wjs_now() - t0 > 250) {
+            static int nslow;
+            if (nslow++ < 30) w_log("[js] slow promise job: %dms\n", wjs_now() - t0);
+        }
         if (r == 0) break;
         if (r < 0) wjs_report_exception(js, "promise job");
         if (js->interrupted) break;
+        if (armed && wjs_now() - start > DRAIN_BUDGET_MS) { yielded = 1; break; }
     }
-    if (js->nrej && !js->interrupted) flush_rejections(js);
+    if (yielded) {
+        static int nlogged;
+        if (nlogged++ < 20) w_log("[js] microtask checkpoint yielded after %dms\n", wjs_now() - start);
+    }
+    if (js->nrej && !js->interrupted && !yielded) flush_rejections(js);
 }
 
 void wjs_report_exception(struct wjs* js, const char* where) {
@@ -258,7 +279,7 @@ NATIVE(n_log) {
     size_t l;
     const char* s = ojs_to_cstring(ctx, argc > 1 ? argv[1] : OJS_UNDEFINED, &l);
     if (!s) return OJS_EXCEPTION;
-    if (lvl >= 3) js->nerrors++;
+    if (lvl == 3) js->nerrors++;
     wjs_logf(js, lvl, s, (int)l);
     ojs_free_cstring(ctx, (char*)s);
     return OJS_UNDEFINED;
@@ -1352,7 +1373,7 @@ struct wjs* wjs_new(struct wdoc* doc) {
     wjs_media_install(js, natives);
     js->deadline = wjs_now() + SCRIPT_BUDGET_MS;
     // the prelude evaluates to a function(W, global) that returns the hooks
-    ojsv fn = ojs_eval(ctx, wjs_prelude_src, wjs_prelude_len, "<okai-prelude>", OJS_EVAL_SCRIPT);
+    ojsv fn = ojs_eval(ctx, wjs_prelude_src, wjs_prelude_len, "<okai-prelude>", OJS_EVAL_SCRIPT | OJS_EVAL_HIDE_SOURCE);
     ojsv hooks = OJS_UNDEFINED;
     if (ojs_is_exception(fn)) wjs_report_exception(js, "prelude compile");
     else {
@@ -1502,6 +1523,12 @@ int wjs_run(struct wjs* js, int budget_ms) {
     GUARD(js, 0);
     int start = wjs_now();
     int over = 0;
+    if (ojs_jobs_pending(js->J)) {      // a microtask checkpoint that yielded to the shell earlier
+        js->deadline = wjs_now() + TASK_BUDGET_MS;
+        wjs_drain_jobs(js);
+        js->deadline = 0;
+        if (ojs_jobs_pending(js->J)) over = 1;
+    }
     // 1. parser-blocking scripts, in document order
     while (js->next_block < js->nsc && !over) {
         struct wjs_script* s = &js->sc[js->next_block];
@@ -1581,7 +1608,7 @@ int wjs_run(struct wjs* js, int budget_ms) {
         int32_t due = -1;
         ojs_to_int32(js->J, &due, r);
         js->next_due = due;
-        if (over || (js->nsc && js->next_block < js->nsc && ready_to_run(js, &js->sc[js->next_block])))
+        if (over || ojs_jobs_pending(js->J) || (js->nsc && js->next_block < js->nsc && ready_to_run(js, &js->sc[js->next_block])))
             js->next_due = 0;
     }
     UNGUARD(js);
@@ -1592,6 +1619,7 @@ int wjs_run(struct wjs* js, int budget_ms) {
 
 int wjs_next_due(struct wjs* js) {
     if (!js || js->dead) return -1;
+    if (js->J && ojs_jobs_pending(js->J)) return 0;
     // fetched modules wait to be compiled (dependency discovery) in wjs_run
     for (int i = 0; i < js->nmod; i++) if (js->mods[i].state == SS_READY && !js->mods[i].scanned) return 0;
     // a script became ready (fetched) since the last run?

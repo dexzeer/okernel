@@ -265,7 +265,9 @@ int wjs_media_active(struct wjs* js) {
     if (!js || js->dead || !js->media) return 0;
     for (int i = 0; i < WM_MAX; i++) {
         struct wmedia* s = &js->media[i];
-        if (s->m && (!meng_paused(s->m) || meng_seeking(s->m))) return 1;
+        // playing with data (or seeking): poll every pass of the main loop. A session waiting for data has
+        // nothing to do until script appends some, so the loop may sleep to the next tick (wjs_media_any).
+        if (s->m && ((!meng_paused(s->m) && meng_ready_state(s->m) >= MENG_FUTURE) || meng_seeking(s->m))) return 1;
     }
     return 0;
 }

@@ -1274,7 +1274,6 @@ function mimeKinds(mime) {      // bit 0 audio (Opus), bit 1 video (VP9); 0 = un
 }
 methods(HM, {
     canPlayType(t) {
-        mlog('canPlayType ' + t);
         const p = parseMime(t);
         if (!p) return '';
         const k = mimeKinds(t);
@@ -1333,7 +1332,7 @@ function mediaSession(el, s) {
     return s.id;
 }
 let mlogN = 0;
-function mlog(m) { if (mlogN++ < 400) W.log(1, '[media] ' + m); }
+function mlog(m) { if (mlogN++ < 1500) W.log(4, '[media] ' + m); }
 function mediaFail(el, s, code, msg) {
     mlog('ERROR ' + code + ' ' + msg);
     s.error = new MediaError(code, msg);
@@ -1697,7 +1696,7 @@ class MediaSource extends EventTarget {
         this.sourceBuffers = new SourceBufferList();
         this.activeSourceBuffers = new SourceBufferList();
     }
-    static isTypeSupported(t) { const k = mimeKinds(t); mlog('isTypeSupported ' + t + ' -> ' + (k !== 0)); return k !== 0; }
+    static isTypeSupported(t) { return mimeKinds(t) !== 0; }
     _objUrl() {
         if (!this._url) { this._url = 'blob:' + location.origin + '/' + crypto.randomUUID(); OBJURLS.set(this._url, this); }
         return this._url;
@@ -2204,10 +2203,13 @@ function startRequest(method, url, headers, body, handler) {
     const id = W.fetch(String(url), String(method).toUpperCase(), hs.join('\r\n'), bodyStr);
     if (id < 0) { setTimeout(() => handler(0, '', '', null, url), 0); return; }
     PENDING.set(id, handler);
+    if (/\/videoplayback/.test(url)) { PTIME.set(id, W.now()); mlog('request ' + id + ' ' + method + ' videoplayback' + (bodyStr && bodyStr.byteLength !== undefined ? ' body=' + bodyStr.byteLength : '')); }
 }
+const PTIME = new Map();
 // C: a request finished
 function onFetch(id, status, statusText, headersRaw, body, url) {
     const h = PENDING.get(id);
+    if (PTIME.has(id)) { mlog('response ' + id + ' status=' + status + ' bytes=' + (body ? body.byteLength : -1) + ' in ' + (W.now() - PTIME.get(id)) + 'ms' + (h ? '' : ' (nobody waiting)')); PTIME.delete(id); }
     if (!h) return;
     PENDING.delete(id);
     h(status, statusText, headersRaw, body, url);
@@ -2495,7 +2497,7 @@ function fetch(input, init) {
         try { req = new Request(input, init); } catch (e) { reject(e); return; }
         if (req.signal.aborted) { reject(req.signal.reason); return; }
         let done = false;
-        req.signal.addEventListener('abort', () => { if (!done) { done = true; reject(req.signal.reason); } });
+        req.signal.addEventListener('abort', () => { if (!done) { done = true; if (/videoplayback/.test(req.url)) mlog('fetch aborted'); reject(req.signal.reason); } });
         if (/^data:/i.test(req.url)) {
             const m = /^data:([^,]*?)(;base64)?,(.*)$/is.exec(req.url);
             if (!m) { reject(new TypeError('Failed to fetch')); return; }

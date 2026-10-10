@@ -361,6 +361,19 @@ uint8_t* ojs_bytes(ojs* J, ojsv v, size_t* len) { (void)J; size_t l = 0; uint8_t
 
 // ---------------------------------------------------------------- scripts
 
+// OJS_EVAL_HIDE_SOURCE: forget the source text of every function template of one compile, so that
+// Function.prototype.toString answers "function name() { [native code] }" like a built-in
+static void hide_source(struct ftempl* t, int depth) {
+    if (!t || depth > 200) return;
+    t->source = 0;
+    t->srct = 0;
+    t->src_end = t->src_start;
+    for (uint32_t i = 0; i < t->nconsts; i++) {
+        jv v = t->consts[i];
+        if (JV_TAG(v) == TAG_PTR && ((struct gch*)JV_PTR(v))->type == GT_FTEMPL) hide_source((struct ftempl*)JV_PTR(v), depth + 1);
+    }
+}
+
 ojsv ojs_eval(ojs* J, const char* src, size_t len, const char* filename, int flags) {
     struct str* s = str_from_utf8(J, src, len);
     if (!s) return JV_EXC;
@@ -382,7 +395,8 @@ ojsv ojs_eval(ojs* J, const char* src, size_t len, const char* filename, int fla
     struct ftempl* t = compile_script(J, &P);
     parse_free(&P);
     if (!t) return JV_EXC;
-    srctext_compact(J, t, 0, s);   // big UTF-16 sources live on as UTF-8
+    if (flags & OJS_EVAL_HIDE_SOURCE) hide_source(t, 0);
+    if (!(flags & OJS_EVAL_HIDE_SOURCE)) srctext_compact(J, t, 0, s);   // big UTF-16 sources live on as UTF-8
 #ifndef KERNEL
     {
         extern char* getenv(const char*);
@@ -408,6 +422,7 @@ ojsv ojs_parse_json(ojs* J, const char* src, size_t len) {
 }
 
 int ojs_run_job(ojs* J) { return run_one_job(J); }
+int ojs_jobs_pending(ojs* J) { return J->jobs_head != 0; }
 
 int ojs_promise_state(ojs* J, ojsv p, ojsv* result) {
     (void)J;
