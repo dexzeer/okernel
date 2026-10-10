@@ -7,6 +7,7 @@
 #include "shell.h"
 #include "serial.h"
 #include "io.h"
+#include "hwinfo.h"
 
 static char input_buf[256];
 static int input_len = 0;
@@ -68,6 +69,14 @@ void kernel_main(uint32_t mboot_addr) {
     terminal_puts("Type 'terminal' to open a new terminal.\n");
     terminal_puts("Page Up/Down or Arrow Keys to scroll.\n");
     terminal_puts("Home = jump to bottom.\n\n");
+
+    hwinfo_init(mboot_addr);
+    terminal_set_color(VGA_LIGHT_GREEN, VGA_BLACK);
+    terminal_puts("Hardware report:  cpu  memmap  acpi  pci [page]  pcidump B:D.F  gpu  all\n\n");
+    terminal_set_color(VGA_WHITE, VGA_BLACK);
+    hwinfo_cpu();
+    hwinfo_gpu();
+    terminal_puts("\n");
 
     shell_init();
     keyboard_init();

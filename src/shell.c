@@ -3,7 +3,13 @@
 #include "terminal.h"
 #include "memory.h"
 #include "io.h"
+#include "hwinfo.h"
 #include <stdint.h>
+
+static int str_is(const char* a, const char* b) {
+    while (*a && *a == *b) { a++; b++; }
+    return *a == *b;
+}
 
 static void cmd_list(void) {
     terminal_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
@@ -61,6 +67,10 @@ static void cmd_help(void) {
     terminal_puts("  reboot    - reboot the system\n");
     terminal_puts("  shutdown  - power off the system\n");
     terminal_puts("  about     - about KAnarchy\n");
+    terminal_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
+    terminal_puts("Hardware report:\n");
+    terminal_set_color(VGA_WHITE, VGA_BLACK);
+    terminal_puts("  cpu | memmap | acpi | pci [page] | pcidump B:D.F | gpu | all\n");
 }
 
 static void cmd_clear(void) {
@@ -224,6 +234,13 @@ void shell_execute(const char* input) {
     else if (cmd_buf[0] == 's' && cmd_buf[1] == 'w' && cmd_buf[2] == 'i' && cmd_buf[3] == 't' && cmd_buf[4] == 'c' && cmd_buf[5] == 'h' && cmd_buf[6] == 0) {
         cmd_switch(args);
     }
+    else if (str_is(cmd_buf, "cpu")) hwinfo_cpu();
+    else if (str_is(cmd_buf, "memmap")) hwinfo_memmap();
+    else if (str_is(cmd_buf, "acpi")) hwinfo_acpi();
+    else if (str_is(cmd_buf, "pci")) hwinfo_pci(args && args[0] >= '1' && args[0] <= '9' ? args[0] - '0' : 1);
+    else if (str_is(cmd_buf, "pcidump")) hwinfo_pcidump(args);
+    else if (str_is(cmd_buf, "gpu")) hwinfo_gpu();
+    else if (str_is(cmd_buf, "all")) hwinfo_all();
     else if (cmd_buf[0] == 'a' && cmd_buf[1] == 'b' && cmd_buf[2] == 'o' && cmd_buf[3] == 'u' && cmd_buf[4] == 't' && cmd_buf[5] == 0) {
         cmd_about();
     }
