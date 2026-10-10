@@ -307,14 +307,20 @@ NATIVE(n_fetch) {
     const char* method = ojs_to_cstring(ctx, argc > 1 ? argv[1] : OJS_UNDEFINED, 0);
     const char* headers = ojs_to_cstring(ctx, argc > 2 ? argv[2] : OJS_UNDEFINED, 0);
     size_t bl = 0;
-    const char* body = (argc > 3 && !ojs_is_null(argv[3]) && !ojs_is_undefined(argv[3])) ? ojs_to_cstring(ctx, argv[3], &bl) : 0;
+    const char* body = 0;
+    int raw = 0;                // body bytes of an ArrayBuffer / view (binary), not a string
+    if (argc > 3 && !ojs_is_null(argv[3]) && !ojs_is_undefined(argv[3])) {
+        uint8_t* p = ojs_bytes(ctx, argv[3], &bl);
+        if (p) { body = (const char*)p; raw = 1; }
+        else body = ojs_to_cstring(ctx, argv[3], &bl);
+    }
     int id = -1;
     if (url && method && headers) id = wdoc_res_request(js->doc, url, method, headers, body, (int)bl);
     if (id >= 0) js->flags |= WJS_FETCH;
     if (url) ojs_free_cstring(ctx, (char*)url);
     if (method) ojs_free_cstring(ctx, (char*)method);
     if (headers) ojs_free_cstring(ctx, (char*)headers);
-    if (body) ojs_free_cstring(ctx, (char*)body);
+    if (body && !raw) ojs_free_cstring(ctx, (char*)body);
     return ojs_int(id);
 }
 NATIVE(n_store) {

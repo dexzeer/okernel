@@ -940,6 +940,12 @@ void tls_state_set_now_ms(struct tls_state* st, uint64_t now_ms) {
     if (st) st->now_ms = now_ms;
 }
 
+// The request goes out as application data, at most TLS_REQ_CHUNK bytes per record and one record
+// per tls_state_step() call, so a large POST body never needs more than a few KB of send buffer
+// at a time (the first step of the application phase starts it; req_off tracks the progress).
+#define TLS_REQ_CHUNK 4096
+#define TLS_REQ_MAX (1u << 20)
+
 int tls_state_reuse(struct tls_state* st, const struct tls_client_io* io,
                     const uint8_t* request, uint32_t request_len,
                     uint8_t* out, uint32_t out_cap) {
@@ -949,17 +955,14 @@ int tls_state_reuse(struct tls_state* st, const struct tls_client_io* io,
     if (!st || st->phase != TLS_PH_RECV_BODY || st->fail_reason != TLS_FAIL_NONE ||
         st->saw_close || st->rec_have != 0)
         return -1;
-    if (request_len == 0 || request_len > TLS_RECORD_MAX_PAYLOAD - 256) return -1;
+    if (request_len == 0 || request_len > TLS_REQ_MAX) return -1;
     st->request = request;
     st->request_len = request_len;
     st->out = out;
     st->out_cap = out_cap;
     st->out_len = 0;
-    if (send_aead(st->suite, st->c_ap_key, st->c_ap_iv, &st->c_ap_seq,
-                  TLS_CT_APPDATA, request, request_len, io) != 0) {
-        st->fail_reason = TLS_FAIL_PROTO;
-        return -1;
-    }
+    (void)io;
+    st->req_off = 0;                     // the next steps send it
     return 0;
 }
 
@@ -1800,15 +1803,22 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         secure_zero(fin_msg, sizeof(fin_msg));
 
         st->c_ap_seq = 0; st->s_ap_seq = 0;
-        if (send_aead(st->suite, st->c_ap_key, st->c_ap_iv, &st->c_ap_seq,
-                      TLS_CT_APPDATA, st->request, st->request_len, io) != 0)
-            return TLS_STEP_ERR;
-
+        st->req_off = 0;
         st->phase = TLS_PH_RECV_BODY;
         return TLS_STEP_AGAIN;
     }
 
     case TLS_PH_RECV_BODY: {
+        if (st->req_off < st->request_len) {          // the request is still going out
+            uint32_t n = st->request_len - st->req_off;
+            if (n > TLS_REQ_CHUNK) n = TLS_REQ_CHUNK;
+            if (io->send_space && io->send_space(io->user) < n + 64) return TLS_STEP_AGAIN;
+            if (send_aead(st->suite, st->c_ap_key, st->c_ap_iv, &st->c_ap_seq, TLS_CT_APPDATA,
+                          st->request + st->req_off, n, io) != 0)
+                return TLS_STEP_ERR;
+            st->req_off += n;
+            return TLS_STEP_AGAIN;
+        }
         int r = tls_recv_record_st(st, io);
         if (r == 0) return TLS_STEP_AGAIN;
         if (r < 0) {

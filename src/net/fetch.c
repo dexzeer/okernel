@@ -63,6 +63,7 @@ struct fslot {
     int fail_reason, fail_detail, offer_unaccepted, saw_close;
     int reused, stale_retried;
     uint32_t t_start;
+    uint32_t req_off;       // plain HTTP: request bytes handed to TCP so far
 };
 
 static struct fconn conns[CONN_MAX];
@@ -72,6 +73,11 @@ static uint32_t slot_seq;
 static int io_send(const uint8_t* buf, uint32_t len, void* user) {
     struct fconn* c = (struct fconn*)user;
     return tcp_send(c->sock, buf, len) == 0 ? 0 : -1;
+}
+
+static uint32_t io_send_space(void* user) {
+    struct fconn* c = (struct fconn*)user;
+    return tcp_send_space(c->sock);
 }
 
 static int io_recv(uint8_t* buf, uint32_t cap, uint32_t timeout_ms, void* user) {
@@ -244,6 +250,21 @@ static void tls_bind_out(struct fconn* c, struct fslot* s) {
     c->tls->out_cap = s->resp_cap ? s->resp_cap - 1 : 0;
 }
 
+// Plain HTTP: hand the rest of the request to TCP as far as the send buffer / peer window allow.
+// 1 = all sent, 0 = more to go (call again), -1 = failed.
+static int http_push(struct fconn* c, struct fslot* s) {
+    while (s->req_off < s->req_len) {
+        uint32_t sp = tcp_send_space(c->sock);
+        if (!sp) return tcp_failed(c->sock) ? -1 : 0;
+        uint32_t n = s->req_len - s->req_off;
+        if (n > sp) n = sp;
+        if (tcp_send(c->sock, s->req + s->req_off, n) != 0) return -1;
+        s->req_off += n;
+        c->t_progress = tick_count;
+    }
+    return 1;
+}
+
 static void conn_start_request(struct fconn* c, struct fslot* s) {
     if (c->https) {
         if (conn_tls(c) != 0 || resp_reserve(s, RESP_HEADROOM) != 0) {
@@ -255,8 +276,9 @@ static void conn_start_request(struct fconn* c, struct fslot* s) {
         tls_state_set_now_ms(c->tls, (uint64_t)tick_count * 10);
         serial_printf("[tls-net] TCP established, handshake... (%s)\n", s->what);
     } else {
-        if (tcp_send(c->sock, s->req, s->req_len) != 0) { slot_fail(s, c, 0, "send failed"); return; }
-        serial_printf("[http] sending GET to %s\n", s->what);
+        s->req_off = 0;
+        if (http_push(c, s) < 0) { slot_fail(s, c, 0, "send failed"); return; }
+        serial_printf("[http] sending request to %s\n", s->what);
     }
     c->st = CN_RUN;
     c->t0 = c->t_progress = tick_count;
@@ -271,8 +293,10 @@ static void conn_run(struct fconn* c) {
             int avail = tcp_rx_avail(c->sock);
             int phase = c->tls->phase;
             uint32_t before = c->tls->out_len;
+            uint32_t req_before = c->tls->req_off;
             tls_bind_out(c, s);
             int r = tls_state_step(c->tls, &c->io);
+            if (c->tls->req_off != req_before) c->t_progress = tick_count;      // a big request is going out
             s->resp_len = c->tls->out_len;
             if (r == TLS_STEP_ERR) {
                 slot_fail(s, c, c->tls->fail_reason ? c->tls->fail_reason : TLS_FAIL_PROTO, "tls");
@@ -298,6 +322,7 @@ static void conn_run(struct fconn* c) {
             if ((uint32_t)(tick_count - t0) >= STEP_TICKS) break;
         }
     } else {
+        if (s->req_off < s->req_len && http_push(c, s) < 0) { slot_fail(s, c, 0, "send failed"); return; }
         for (int iter = 0; iter < 64; iter++) {
             if (resp_reserve(s, 16384) != 0) { slot_fail(s, c, 0, "response too large"); return; }
             int n = tcp_recv(c->sock, (uint8_t*)s->resp + s->resp_len, s->resp_cap - 1 - s->resp_len);
@@ -390,7 +415,8 @@ static int slot_assign(int si) {
                  tls_state_reuse(c->tls, &c->io, s->req, s->req_len,
                                  (uint8_t*)s->resp, s->resp_cap - 1) == 0;
         } else {
-            ok = tcp_send(c->sock, s->req, s->req_len) == 0;
+            s->req_off = 0;
+            ok = http_push(c, s) >= 0;
         }
         if (!ok) { conn_close(c, 1); continue; }
         c->st = CN_RUN;
@@ -427,6 +453,7 @@ static int slot_assign(int si) {
     c->t0 = c->t_progress = tick_count;
     c->io.send = io_send;
     c->io.recv = io_recv;
+    c->io.send_space = io_send_space;
     c->io.user = c;
     s->conn = free_i;
     s->st = SL_RUN;
@@ -476,12 +503,16 @@ int fetch_begin(const char* host, const char* path, uint16_t port, int https,
     // Request: GET path HTTP/1.1, Host (with a non-default port), UA,
     // Accept, Accept-Encoding, extra headers. No "Connection: close" —
     // HTTP/1.1 keeps the connection for the next request.
-    uint32_t cap = (uint32_t)strlen(path) + (uint32_t)strlen(host) + 512 +
-                   (o && o->extra ? (uint32_t)strlen(o->extra) : 0);
+    const char* method = o && o->method && o->method[0] ? o->method : "GET";
+    uint32_t blen = o && o->body ? o->body_len : 0;
+    if (blen > (1u << 20)) return -1;
+    uint32_t cap = (uint32_t)strlen(path) + (uint32_t)strlen(host) + (uint32_t)strlen(method) + 512 +
+                   (o && o->extra ? (uint32_t)strlen(o->extra) : 0) + blen;
     s->req = (uint8_t*)kmalloc(cap);
     if (!s->req) return -1;
     uint32_t n = 0;
-    put(s->req, &n, cap, "GET ");
+    put(s->req, &n, cap, method);
+    put(s->req, &n, cap, " ");
     put(s->req, &n, cap, path);
     put(s->req, &n, cap, " HTTP/1.1\r\nHost: ");
     put(s->req, &n, cap, host);
@@ -497,10 +528,26 @@ int fetch_begin(const char* host, const char* path, uint16_t port, int https,
         put(s->req, &n, cap, pb);
     }
     put(s->req, &n, cap, "\r\nUser-Agent: okernel/0.4\r\n");
-    put(s->req, &n, cap, o && o->accept_html ? NET_ACCEPT_HTML : "Accept: */*\r\n");
+    if (!(o && o->own_accept)) put(s->req, &n, cap, o && o->accept_html ? NET_ACCEPT_HTML : "Accept: */*\r\n");
     if (o && o->gzip) put(s->req, &n, cap, "Accept-Encoding: gzip\r\n");
     if (o && o->extra) put(s->req, &n, cap, o->extra);
+    if (blen || !strcmp(method, "POST") || !strcmp(method, "PUT") || !strcmp(method, "PATCH")) {
+        char cl[40];
+        int k = 0;
+        const char* pre = "Content-Length: ";
+        while (*pre) cl[k++] = *pre++;
+        char t[12];
+        int tn = 0;
+        uint32_t v = blen;
+        do { t[tn++] = (char)('0' + v % 10); v /= 10; } while (v);
+        while (tn) cl[k++] = t[--tn];
+        cl[k++] = '\r';
+        cl[k++] = '\n';
+        cl[k] = 0;
+        put(s->req, &n, cap, cl);
+    }
     put(s->req, &n, cap, "\r\n");
+    if (blen && n + blen <= cap) { memcpy(s->req + n, o->body, blen); n += blen; }
     s->req_len = n;
     {   // log name: host + path prefix
         int k = 0;

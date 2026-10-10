@@ -114,15 +114,18 @@ WEB_HOST_SRC = src/web/wdom.c src/web/html5.c src/web/charset.c src/web/css_valu
                src/web/css_select.c src/web/css_style.c src/web/wurl.c src/web/font.c src/web/raster.c \
                src/web/lay_tree.c src/web/lay_main.c src/web/lay_inline.c src/web/lay_flex.c src/web/lay_grid.c \
                src/web/lay_table.c src/web/lay_dl.c src/web/paint.c src/web/svg.c src/web/wdoc.c src/web/image.c src/cjk.c src/web/wcookie.c
+# media engine sources the script realm links (wjs_media.c)
+WEB_HOST_MEDIA = src/web/wjs_media.c src/media/meng.c src/media/webm.c src/media/opus_dec.c src/media/opus_packet.c src/media/celt.c src/media/celt_tables.c src/media/ec.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_lf.c src/media/vp9_tables.c
 # the ojs objects tests/web/build.sh made (globbed when the recipe runs)
 WEB_HOST_LINK = build-host/fontdata.o build-host/wjs_prelude.o build-host/ojs-web-nopie_O2/*.o -lm
 WEB_HOST_CC = gcc -m32 -fno-pie -fno-pic -no-pie -O2 -Isrc -Itests/web
 web-tests:
 	mkdir -p build-host
 	sh tests/web/build.sh
-	$(WEB_HOST_CC) -o build-host/t_webcss tests/web/test_css.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_LINK) && ./build-host/t_webcss | tail -n 2
-	$(WEB_HOST_CC) -o build-host/t_font tests/web/test_font.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_LINK) && ./build-host/t_font | tail -n 2
+	$(WEB_HOST_CC) -o build-host/t_webcss tests/web/test_css.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_webcss | tail -n 2
+	$(WEB_HOST_CC) -o build-host/t_font tests/web/test_font.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_font | tail -n 2
 	./build-host/wbrowse tests/web/js/basic.html 800 600 build-host/js-basic.ppm 3 | grep RESULT
+	sh tests/web/test_media.sh
 	gcc -m32 -O2 -Isrc -Itests/web -o build-host/t_idct tests/web/test_idct.c -lm && ./build-host/t_idct | tail -n 1
 	gcc -m32 -O2 -o build-host/t_divdi3 tests/test_divdi3.c && ./build-host/t_divdi3 2000000
 	sh tests/ojs/build.sh && ./build-host/ojs_run tests/ojs/smoke.js | tail -n 1 | grep 'ALL OK'
