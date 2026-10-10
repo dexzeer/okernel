@@ -6,7 +6,7 @@
 
 // Multiboot header flags
 #define MULTIBOOT_MAGIC 0x2BADB002
-#define MULTIBOOT_FLAG_MEM (1 << 1)
+#define MULTIBOOT_FLAG_MEM (1 << 0)   // mem_lower/mem_upper valid (bit 1 is the boot device, which GRUB on UEFI does not set)
 
 // Multiboot info structure (partial)
 struct multiboot_info {
@@ -73,60 +73,59 @@ void memory_init(uint32_t mboot_phys) {
 
     serial_printf("[mem] mboot phys=%x flags=%x\n", mboot_phys, mboot_flags);
 
-    uint32_t mem_upper_kb = mboot_upper;
-    if (!(mboot_flags & MULTIBOOT_FLAG_MEM)) {
-        serial_puts("[mem] no memory info from multiboot\n");
-        // Assume 1MB-16MB if no info
-        mem_upper_kb = 15 * 1024; // KB above 1MB
-    }
-
-    // Total memory = lower (< 1MB) + upper (> 1MB)
-    // We only manage upper memory (> 1MB) for simplicity
-    uint32_t mem_upper_bytes = mem_upper_kb * 1024;
-
-    total_pages = mem_upper_bytes / PAGE_SIZE;
-
-    // Cap to bitmap size
-    if (total_pages > BITMAP_SIZE * 8) {
-        total_pages = BITMAP_SIZE * 8;
-    }
-
-    serial_puts("[mem] upper memory: ");
-    // Print in decimal
-    uint32_t mb = mem_upper_bytes / (1024 * 1024);
-    serial_putchar('0' + (mb / 100));
-    serial_putchar('0' + ((mb / 10) % 10));
-    serial_putchar('0' + (mb % 10));
-    serial_puts(" MB\n");
-
-    // Mark pages below 1MB as used (BIOS, IVT, BDA, etc.)
-    uint32_t reserved_pages = 1024 * 1024 / PAGE_SIZE; // 256 pages
-    for (uint32_t i = 0; i < reserved_pages && i < total_pages; i++) {
-        bitmap_set(i);
-    }
-
-    // Mark pages used by kernel (from 1MB to end of kernel).
-    // _kernel_* are HIGH linked: convert to phys before page math, or the
-    // 0xC01xxxxx vaddr overflows the 32K-entry bitmap (786K pages).
+    // Where the kernel image ends (the _kernel_* symbols are HIGH linked: convert to phys before page math, or the
+    // 0xC01xxxxx vaddr overflows the bitmap).
     extern uint32_t _kernel_start;
     extern uint32_t _kernel_end;
-    uint32_t kernel_start = V2P((uint32_t)&_kernel_start);
-    uint32_t kernel_end = V2P((uint32_t)&_kernel_end);
-
-    // Align to page boundaries
-    kernel_start = kernel_start & ~(PAGE_SIZE - 1);
-    kernel_end = (kernel_end + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-
-    uint32_t kernel_start_page = kernel_start / PAGE_SIZE;
+    uint32_t kernel_start = (IS_HIGH(&_kernel_start) ? V2P((uint32_t)&_kernel_start) : (uint32_t)&_kernel_start) & ~(PAGE_SIZE - 1);   // the text kernel is linked low
+    uint32_t kernel_end = ((IS_HIGH(&_kernel_end) ? V2P((uint32_t)&_kernel_end) : (uint32_t)&_kernel_end) + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     uint32_t kernel_end_page = kernel_end / PAGE_SIZE;
+    (void)kernel_start;
 
-    for (uint32_t i = kernel_start_page; i < kernel_end_page && i < total_pages; i++) {
-        bitmap_set(i);
-    }
-
-    // Mark all pages ABOVE the kernel as FREE
-    for (uint32_t i = kernel_end_page; i < total_pages; i++) {
-        bitmap_clear(i);
+    // The bootloader's memory map (multiboot flag bit 6) is the truth: UEFI firmware leaves ACPI/reserved holes right
+    // above 1MB, so "mem_upper" (the one contiguous run at 1MB) can be a few MB on a machine with gigabytes. Only
+    // usable (type 1) pages above the kernel image are freed; everything else stays marked used. Without a map, fall
+    // back to mem_upper. Memory above MAX_RAM_PAGES has no kernel virtual address and is left alone.
+    total_pages = 0;
+    uint32_t map_len = (mboot_flags & (1u << 6)) ? *(volatile uint32_t*)(mp + 44) : 0;
+    uint32_t map_addr = (mboot_flags & (1u << 6)) ? *(volatile uint32_t*)(mp + 48) : 0;
+    if (map_len) {
+        uint32_t nreg = 0;
+        for (uint32_t off = 0; off + 24 <= map_len; ) {
+            volatile uint8_t* e = (volatile uint8_t*)(map_addr + off);
+            uint32_t esz = *(volatile uint32_t*)e;
+            uint64_t base = *(volatile uint64_t*)(e + 4);
+            uint64_t len = *(volatile uint64_t*)(e + 12);
+            uint32_t type = *(volatile uint32_t*)(e + 20);
+            if (esz < 20) break;
+            off += esz + 4;
+            if (type != 1 || len == 0) continue;
+            uint64_t end = base + len;
+            uint64_t cap = (uint64_t)MAX_RAM_PAGES * PAGE_SIZE;
+            if (end > cap) end = cap;
+            uint64_t lo = base < kernel_end ? kernel_end : base;
+            if (lo < 0x100000) lo = 0x100000;
+            lo = (lo + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+            end &= ~(uint64_t)(PAGE_SIZE - 1);
+            if (end <= lo) continue;
+            for (uint32_t pg = (uint32_t)(lo / PAGE_SIZE); pg < (uint32_t)(end / PAGE_SIZE); pg++) bitmap_clear(pg);
+            if (end / PAGE_SIZE > total_pages) total_pages = (uint32_t)(end / PAGE_SIZE);
+            nreg++;
+        }
+        serial_printf("[mem] memory map: %u usable region(s), top %u MB\n", nreg, (total_pages * PAGE_SIZE) >> 20);
+        // keep the bootloader's own structures (info block, map) out of the allocator
+        for (uint32_t a = mp & ~(PAGE_SIZE - 1); a < mp + 128; a += PAGE_SIZE) if (a / PAGE_SIZE < total_pages) bitmap_set(a / PAGE_SIZE);
+        for (uint32_t a = map_addr & ~(PAGE_SIZE - 1); a < map_addr + map_len; a += PAGE_SIZE) if (a / PAGE_SIZE < total_pages) bitmap_set(a / PAGE_SIZE);
+    } else {
+        uint32_t mem_upper_kb = mboot_upper;
+        if (!(mboot_flags & MULTIBOOT_FLAG_MEM)) {
+            serial_puts("[mem] no memory info from multiboot\n");
+            mem_upper_kb = 15 * 1024;                       // assume 1MB-16MB
+        }
+        total_pages = (mem_upper_kb * 1024) / PAGE_SIZE;
+        if (total_pages > MAX_RAM_PAGES) total_pages = MAX_RAM_PAGES;
+        for (uint32_t i = kernel_end_page; i < total_pages; i++) bitmap_clear(i);
+        serial_printf("[mem] upper memory: %u MB\n", (total_pages * PAGE_SIZE) >> 20);
     }
 
     used_pages = 0;
@@ -274,8 +273,19 @@ void heap_init(void) {
     // Size from RAM: everything above the kernel minus a reserve for the
     // PMM (user pages, page tables, stacks). 128MB RAM keeps ~1/6 back; the
     // high alias ends at 0xF8000000 (see paging_init), which caps us too.
-    uint32_t avail = total_pages > start_page ? total_pages - start_page : 0;
-    uint32_t reserve = total_pages / 6;
+    // With memory-map holes the region right after the kernel may be small: use the largest free run above it.
+    uint32_t run_start = 0, run_len = 0, free_pages = 0;
+    for (uint32_t i = start_page; i < total_pages; ) {
+        if (bitmap_test(i)) { i++; continue; }
+        uint32_t j2 = i;
+        while (j2 < total_pages && !bitmap_test(j2)) j2++;
+        free_pages += j2 - i;
+        if (j2 - i > run_len) { run_len = j2 - i; run_start = i; }
+        i = j2;
+    }
+    if (run_len) start_page = run_start;
+    uint32_t avail = run_len;
+    uint32_t reserve = free_pages / 6;
     if (reserve < 4096) reserve = 4096;               // >= 16MB for the PMM
     uint32_t pages = avail > reserve ? avail - reserve : avail / 2;
     if (pages > (768u << 8)) pages = 768u << 8;       // <= 768MB

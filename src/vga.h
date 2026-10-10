@@ -3,6 +3,17 @@
 
 #include <stdint.h>
 
+// FBTEXT build (text kernel booted by UEFI, no VGA text memory): the cells live in RAM and fbtext.c draws them
+#ifdef FBTEXT
+extern uint16_t fbtext_mem[80 * 25];
+void fbtext_init(uint32_t mboot);
+void fbtext_set_cursor(int x, int y);
+void fbtext_present(void);
+#define VGA_TEXT_BASE (fbtext_mem)
+#else
+#define VGA_TEXT_BASE ((uint16_t*)0xB8000)
+#endif
+
 #define VGA_WIDTH  80
 #define VGA_HEIGHT 25
 

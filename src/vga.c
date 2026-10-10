@@ -1,7 +1,7 @@
 #include "vga.h"
 #include "io.h"
 
-static uint16_t* vga_buffer = (uint16_t*)0xB8000;
+static uint16_t* vga_buffer = VGA_TEXT_BASE;
 static int cursor_x = 0;
 static int cursor_y = 0;
 static uint8_t current_color = 0;
@@ -9,6 +9,10 @@ static uint8_t current_color = 0;
 // Update the hardware cursor position
 static void update_cursor(void) {
     uint16_t pos = cursor_y * VGA_WIDTH + cursor_x;
+#ifdef FBTEXT
+    fbtext_set_cursor(cursor_x, cursor_y);
+    return;
+#endif
     outb(0x3D4, 0x0F);
     outb(0x3D5, (uint8_t)(pos & 0xFF));
     outb(0x3D4, 0x0E);
@@ -31,7 +35,7 @@ static void scroll(void) {
 }
 
 void vga_init(void) {
-    vga_buffer = (uint16_t*)0xB8000;
+    vga_buffer = VGA_TEXT_BASE;
     current_color = vga_entry_color(VGA_WHITE, VGA_BLACK);
     vga_clear();
 }

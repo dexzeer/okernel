@@ -46,7 +46,10 @@ void kernel_main(uint32_t mboot_addr) {
     gdt_init();
     idt_init();
 
-    uint16_t* vga = (uint16_t*)0xB8000;
+#ifdef FBTEXT
+    fbtext_init(mboot_addr);
+#endif
+    uint16_t* vga = VGA_TEXT_BASE;
     for (int i = 0; i < 80 * 25; i++) vga[i] = 0x0F00;
 
     memory_init(mboot_addr);
