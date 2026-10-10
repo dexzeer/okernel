@@ -366,7 +366,17 @@ static int tr_avail4(struct h264_dec* d, int blk) {      // top-right block avai
 }
 
 // Reconstruct an Intra macroblock into the frame: prediction + residual
-static void recon_intra(struct h264_dec* d) {
+// which neighbours a prediction mode needs (bit 0 left, 1 top, 2 top-left): streams that use a mode
+// without them are invalid, and reading the missing samples would leave the picture
+static int mode_need4(int mode) {
+    static const uint8_t need[9] = {2, 1, 0, 2, 7, 7, 7, 2, 1};
+    return need[mode];
+}
+static int need_ok(int need, int al, int at, int atl) {
+    return !((need & 1 && !al) || (need & 2 && !at) || (need & 4 && !atl));
+}
+
+static int recon_intra(struct h264_dec* d) {
     struct h264_mbcur* m = &d->m;
     struct h264_frame* f = d->cur;
     int stride = f->stride[0];
@@ -379,6 +389,7 @@ static void recon_intra(struct h264_dec* d) {
             int at = by > 0 || d->iav_b;
             int atl = (bx > 0 && by > 0) ? 1 : (bx > 0 ? d->iav_b : (by > 0 ? d->iav_a : d->iav_d));
             int atr = tr_avail4(d, b);
+            if (m->ipm[by * 4 + bx] > 8 || !need_ok(mode_need4(m->ipm[by * 4 + bx]), al, at, atl)) return H264_ERR_INVALID;
             h264_intra4x4_pred(dst, stride, m->ipm[by * 4 + bx], al, at, atr, atl);
             if (m->nz_luma & (1u << b)) h264_idct4_add(dst, stride, m->coef[b]);
         }
@@ -390,15 +401,18 @@ static void recon_intra(struct h264_dec* d) {
             int at = by > 0 || d->iav_b;
             int atl = (bx > 0 && by > 0) ? 1 : (bx > 0 ? d->iav_b : (by > 0 ? d->iav_a : d->iav_d));
             int atr = b8 == 0 ? d->iav_b : b8 == 1 ? d->iav_c : b8 == 2 ? 1 : 0;
+            if (m->ipm[by * 8 + bx * 2] > 8 || !need_ok(mode_need4(m->ipm[by * 8 + bx * 2]), al, at, atl)) return H264_ERR_INVALID;
             h264_intra8x8_pred(dst, stride, m->ipm[by * 8 + bx * 2], al, at, atr, atl);
             if (m->nz_luma & (1u << (b8 * 4))) h264_idct8_add(dst, stride, m->coef[b8 * 4]);
         }
     } else {                                                 // I16
+        if (!need_ok(m->i16_mode == 0 ? 2 : m->i16_mode == 1 ? 1 : m->i16_mode == 3 ? 7 : 0, d->iav_a, d->iav_b, d->iav_d)) return H264_ERR_INVALID;
         h264_intra16_pred(base, stride, m->i16_mode, d->iav_a, d->iav_b, d->iav_d);
         i16_dc_to_blocks(d);
         for (int b = 0; b < 16; b++)
             if (m->nz_luma & (1u << b)) h264_idct4_add(base + blk_y[b] * 4 * stride + blk_x[b] * 4, stride, m->coef[b]);
     }
+    if (!need_ok(m->chroma_mode == 1 ? 1 : m->chroma_mode == 2 ? 2 : m->chroma_mode == 3 ? 7 : 0, d->iav_a, d->iav_b, d->iav_d)) return H264_ERR_INVALID;
     for (int c = 0; c < 2; c++) {
         int cs = f->stride[1 + c];
         uint8_t* cb = f->plane[1 + c] + (size_t)d->mby * 8 * cs + d->mbx * 8;
@@ -406,6 +420,7 @@ static void recon_intra(struct h264_dec* d) {
     }
     chroma_dc_to_blocks(d, 1);
     add_chroma_residual(d);
+    return 0;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -531,9 +546,9 @@ static int decode_intra_mb(struct h264_dec* d, int v /* mb_type as I-slice value
         d->last_dqp_nonzero = 0;
     }
     finish_mbinfo(d, m->kind);
-    recon_intra(d);
+    int rc = recon_intra(d);
     clear_coefs(m);
-    return 0;
+    return rc;
 }
 
 // ---------------------------------------------------------------------------------------------
