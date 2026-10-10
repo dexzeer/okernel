@@ -14,7 +14,8 @@ param(
     [string]$Qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe",
     [int]$Port = 45454,
     [string]$Iso = "",
-    [int]$Mem = 512
+    [int]$Mem = 512,
+    [string]$Shot = ""     # screendump (PPM) of the last page once it settled
 )
 $ErrorActionPreference = "Stop"
 $Urls = @($Urls | ForEach-Object { $_ -split "," } | Where-Object { $_ })
@@ -93,6 +94,11 @@ try {
         }
         $f = { param($x) if ($x -and $nav) { "{0:N1}s" -f ($x - $nav).TotalSeconds } else { "-" } }
         "SUMMARY {0,-48} doc={1} first_render={2} settled={3} fetches={4}" -f $u, (& $f $doc), (& $f $rend), (& $f $last), $fetches
+    }
+    if ($Shot) {
+        $c = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $Port)
+        $w = New-Object System.IO.StreamWriter($c.GetStream())
+        $w.Write("screendump $Shot`n"); $w.Flush(); Start-Sleep -Seconds 2; $c.Close()
     }
     $bad = (Read-Log) -split "`n" | Where-Object { $_ -match "PAGE FAULT|\[ISR\] Exception|kmalloc FAIL" } | Select-Object -First 3
     "faults: $bad"

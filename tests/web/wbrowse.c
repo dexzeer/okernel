@@ -301,6 +301,7 @@ again:
         if (due > 0) usleep((due > 50 ? 50 : due) * 1000);
     }
     double t2 = now_ms();
+    if (js && getenv("WB_EVAL")) { int el; char* es = slurp(getenv("WB_EVAL"), &el); if (es) { es = realloc(es, (size_t)el + 1); es[el] = 0; wjs_debug_eval(js, es); free(es); } }   // WB_EVAL=file.js: run in the page after the load
     wdoc_update(d);
     int dh = wdoc_height(d);
     int hh = vh;

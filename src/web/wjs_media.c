@@ -156,7 +156,8 @@ NATIVE(n_media_buffered) {
     ojsv a = ojs_array(ctx);
     double st, en;
     uint32_t k = 0;
-    for (int i = 0; meng_buffered(s->m, i, &st, &en); i++) {
+    int sb = argc > 1 && !ojs_is_undefined(argv[1]) ? (int)num(ctx, argc, argv, 1, -1) : -1;
+    for (int i = 0; sb >= 0 ? meng_sb_buffered(s->m, sb, i, &st, &en) : meng_buffered(s->m, i, &st, &en); i++) {
         ojs_set_index(ctx, a, k++, ojs_number(st));
         ojs_set_index(ctx, a, k++, ojs_number(en));
     }
@@ -194,7 +195,7 @@ static const struct ojs_func_entry media_funcs[] = {
     { "mediaVolume", n_media_volume, 3 },
     { "mediaRate", n_media_rate, 2 },
     { "mediaState", n_media_state, 1 },
-    { "mediaBuffered", n_media_buffered, 1 },
+    { "mediaBuffered", n_media_buffered, 2 },
     { "mediaBytes", n_media_bytes, 1 },
     { "mediaTime", n_media_time, 1 },
     { "mediaBind", n_media_bind, 2 },

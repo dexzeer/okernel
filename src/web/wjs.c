@@ -1723,3 +1723,17 @@ void wjs_stats(struct wjs* js, char* out, int cap) {
     if (js->dead && n < cap - 8) { memcpy(out + n, " dead", 5); n += 5; }
     out[n] = 0;
 }
+
+#if !(defined(KERNEL) && KERNEL)
+// Host diagnostics (tests/web/wbrowse.c, WB_EVAL): run a snippet in the page's realm and log its result.
+void wjs_debug_eval(struct wjs* js, const char* src) {
+    if (!js || !js->J) return;
+    ojs* ctx = js->J;
+    js->deadline = 0;
+    ojsv r = ojs_eval(ctx, src, strlen(src), "<eval>", OJS_EVAL_SCRIPT);
+    if (ojs_is_exception(r)) { wjs_report_exception(js, "<eval>"); return; }
+    char* s = ojs_describe(ctx, r);
+    if (s) { wjs_logf(js, 1, s, (int)strlen(s)); ojs_free_cstring(ctx, s); }
+    wjs_drain_jobs(js);
+}
+#endif

@@ -74,6 +74,8 @@ int    meng_has_audio(const struct meng* m);
 int    meng_has_video(const struct meng* m);
 // Buffered time ranges (those with data for every present track), in seconds.
 int    meng_buffered(const struct meng* m, int index, double* start, double* end);
+// The same for one source buffer: a video-only buffer reports the video ranges, an audio-only one the audio ranges.
+int    meng_sb_buffered(const struct meng* m, int sb, int index, double* start, double* end);
 // Counters for the embedder to turn into events.
 uint32_t meng_frames_decoded(const struct meng* m);
 uint32_t meng_frames_shown(const struct meng* m);
