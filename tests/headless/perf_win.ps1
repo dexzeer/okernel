@@ -15,7 +15,8 @@ param(
     [int]$Port = 45454,
     [string]$Iso = "",
     [int]$Mem = 512,
-    [string]$Shot = ""     # screendump (PPM) of the last page once it settled
+    [string]$Shot = "",    # screendump (PPM) of the last page once it settled
+    [string]$AudioWav = "" # record what the guest plays (HD Audio) into this WAV
 )
 $ErrorActionPreference = "Stop"
 $Urls = @($Urls | ForEach-Object { $_ -split "," } | Where-Object { $_ })
@@ -30,6 +31,7 @@ $qargs = @("-accel", $Accel, "-m", "$Mem", "-cdrom", $iso, "-boot", "d", "-vga",
           "-device", "e1000,netdev=net0", "-netdev", "user,id=net0",
           "-serial", "file:$log", "-display", "none", "-no-reboot",
           "-monitor", "tcp:127.0.0.1:$Port,server,nowait")
+if ($AudioWav) { $qargs += @("-audiodev", "wav,id=a0,path=$AudioWav", "-device", "intel-hda", "-device", "hda-output,audiodev=a0") }
 $p = Start-Process -FilePath $Qemu -ArgumentList $qargs -PassThru -WindowStyle Hidden
 
 function Send-Keys([string]$s) {
