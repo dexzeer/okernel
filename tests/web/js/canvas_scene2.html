@@ -1,0 +1,45 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>canvas scene 2</title></head>
+<body style="margin:0;background:#fff">
+<canvas id="c" width="500" height="360" style="display:block"></canvas>
+<script>
+const c = document.getElementById('c'), g = c.getContext('2d');
+g.fillStyle = '#eee'; g.fillRect(0, 0, 500, 360);
+// round rects, ellipse, arcTo, quadratic, Path2D from SVG data
+g.fillStyle = '#3366cc'; g.beginPath(); g.roundRect(10, 10, 100, 60, [20, 5, 20, 5]); g.fill();
+g.strokeStyle = '#cc3366'; g.lineWidth = 3; g.beginPath(); g.ellipse(170, 40, 40, 22, 0.5, 0, Math.PI * 2); g.stroke();
+g.beginPath(); g.moveTo(230, 70); g.arcTo(290, 70, 290, 10, 25); g.lineTo(290, 10); g.strokeStyle = '#000'; g.lineWidth = 2; g.stroke();
+g.beginPath(); g.moveTo(310, 70); g.quadraticCurveTo(340, 0, 370, 70); g.strokeStyle = '#008800'; g.lineWidth = 4; g.stroke();
+g.fillStyle = '#aa5500'; g.fill(new Path2D('M390 70 L420 10 L450 70 Z M400 60 L420 25 L440 60 Z'), 'evenodd');
+g.save(); g.translate(460, 40); g.fillStyle = '#7733aa'; g.fill(new Path2D('M0 -25 C 25 -25 25 25 0 25 C -25 25 -25 -25 0 -25 Z')); g.restore();
+// composite operations
+const ops = ['source-over', 'source-in', 'source-out', 'source-atop', 'destination-over', 'destination-in', 'destination-out', 'destination-atop', 'lighter', 'xor', 'multiply', 'screen'];
+ops.forEach((op, i) => {
+    const x = 10 + (i % 6) * 80, y = 90 + Math.floor(i / 6) * 70;
+    g.save(); g.beginPath(); g.rect(x, y, 70, 60); g.clip();
+    g.fillStyle = '#e04040'; g.fillRect(x + 5, y + 5, 40, 40);
+    g.globalCompositeOperation = op; g.fillStyle = '#4060e0'; g.fillRect(x + 25, y + 15, 40, 40);
+    g.restore();
+});
+// patterns, image data
+const pc = document.createElement('canvas'); pc.width = 16; pc.height = 16; const pg = pc.getContext('2d');
+pg.fillStyle = '#fc0'; pg.fillRect(0, 0, 8, 8); pg.fillStyle = '#06c'; pg.fillRect(8, 8, 8, 8);
+g.fillStyle = g.createPattern(pc, 'repeat'); g.fillRect(10, 230, 120, 60);
+const id = g.createImageData(40, 40);
+for (let y = 0; y < 40; y++) for (let x = 0; x < 40; x++) { const o = (y * 40 + x) * 4; id.data[o] = x * 6; id.data[o + 1] = y * 6; id.data[o + 2] = 128; id.data[o + 3] = 255; }
+g.putImageData(id, 150, 235);
+const back = g.getImageData(160, 245, 2, 2);
+g.drawImage(pc, 200, 230, 48, 48);
+g.drawImage(pc, 0, 0, 8, 8, 260, 230, 48, 48);
+// shadow, alpha, transform skew, dashed round caps
+g.save(); g.shadowColor = 'rgba(0,0,0,0.5)'; g.shadowBlur = 8; g.shadowOffsetX = 5; g.shadowOffsetY = 5; g.fillStyle = '#ff8844'; g.fillRect(330, 235, 60, 40); g.restore();
+g.save(); g.globalAlpha = 0.4; g.fillStyle = '#000'; g.fillRect(400, 235, 40, 40); g.fillRect(420, 255, 40, 40); g.restore();
+g.save(); g.transform(1, 0.3, -0.3, 1, 0, 0); g.fillStyle = '#00aa88'; g.fillRect(40, 300, 60, 30); g.restore();
+g.setLineDash([1, 8]); g.lineCap = 'round'; g.lineWidth = 6; g.strokeStyle = '#444'; g.beginPath(); g.moveTo(130, 330); g.lineTo(300, 330); g.stroke();
+g.setLineDash([]);
+g.save(); g.strokeStyle = '#222'; g.lineWidth = 10; g.lineJoin = 'miter'; g.miterLimit = 2; g.beginPath(); g.moveTo(320, 340); g.lineTo(340, 300); g.lineTo(360, 340); g.stroke(); g.restore();
+const conic = g.createConicGradient(0, 440, 320); conic.addColorStop(0, '#f00'); conic.addColorStop(0.33, '#0f0'); conic.addColorStop(0.66, '#00f'); conic.addColorStop(1, '#f00');
+g.fillStyle = conic; g.beginPath(); g.arc(440, 320, 30, 0, Math.PI * 2); g.fill();
+console.log('RESULT back=' + Array.from(back.data).join(',') + ' png=' + c.toDataURL().length);
+</script>
+</body></html>
