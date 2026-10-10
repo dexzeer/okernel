@@ -1655,13 +1655,18 @@ static int read_partition(struct vp9_dec* d, int r, int c, int bsize, int has_ro
 }
 
 static void decode_partition(struct vp9_dec* d, int r, int c, int bsize) {
-    if (r >= d->mi_rows || c >= d->mi_cols) return;
+    if (r >= d->mi_rows || c >= d->mi_cols || d->corrupt) return;
     int num8x8 = vp9_num_8x8_wide[bsize];
     int half = num8x8 >> 1;
     int has_rows = (r + half) < d->mi_rows;
     int has_cols = (c + half) < d->mi_cols;
     int partition = read_partition(d, r, c, bsize, has_rows, has_cols);
     int subsize = subsize_lookup[partition][bsize];
+    // 7.4.3: the chroma block of an 8x8-or-larger block must exist (not so in some 4:2:2 / 4:4:0 shapes)
+    if (subsize >= BLOCK_8X8 && vp9_ss_size[subsize][d->subsampling_x][d->subsampling_y] == BLOCK_INVALID) {
+        d->corrupt = 1;
+        return;
+    }
     if (subsize < BLOCK_8X8 || partition == PARTITION_NONE) {
         decode_block(d, r, c, subsize);
     } else if (partition == PARTITION_HORZ) {
@@ -1765,8 +1770,11 @@ struct vp9_dec* vp9_dec_new(void) {
     struct vp9_dec* d = (struct vp9_dec*)MEDIA_ALLOC(sizeof *d);
     if (!d) return 0;
     if (!tables_ready) init_tables();
+    d->max_pixels = 36 * 1000 * 1000;
     return d;
 }
+
+void vp9_dec_set_limit(struct vp9_dec* d, int max_pixels) { d->max_pixels = max_pixels; }
 
 void vp9_dec_reset(struct vp9_dec* d) {
     for (int i = 0; i < NUM_REF_FRAMES; i++) {
@@ -1822,6 +1830,7 @@ static int decode_frame(struct vp9_dec* d, const uint8_t* data, size_t sz, vp9_o
         }
         return 1;
     }
+    if ((int64_t)d->frame_width * d->frame_height > d->max_pixels) return VP9_ERR_UNSUPPORTED;
     // trailing_bits
     size_t hdr_bytes = (r.pos + 7) >> 3;
     if (d->header_size_in_bytes == 0 || hdr_bytes + d->header_size_in_bytes > sz) return VP9_ERR_INVALID;
@@ -1832,6 +1841,9 @@ static int decode_frame(struct vp9_dec* d, const uint8_t* data, size_t sz, vp9_o
             // references must match the colour format of the frame
             if (rb->subx != d->subsampling_x || rb->suby != d->subsampling_y || rb->bit_depth != d->bit_depth)
                 return VP9_ERR_INVALID;
+            // 5.16: a reference may be at most 2x larger or 16x smaller than the frame
+            d->ref_ok[i] = 2 * d->frame_width >= rb->width && 2 * d->frame_height >= rb->height &&
+                           d->frame_width <= 16 * rb->width && d->frame_height <= 16 * rb->height;
         }
     }
 
@@ -1855,8 +1867,11 @@ static int decode_frame(struct vp9_dec* d, const uint8_t* data, size_t sz, vp9_o
     if (bd_init(&d->bd, data + hdr_bytes, d->header_size_in_bytes) < 0) return VP9_ERR_INVALID;
     read_compressed_header(d);
     memset(d->mi, 0, (size_t)d->mi_cols * d->mi_rows * sizeof(struct mi));
+    d->bad_ref = 0;
+    d->corrupt = 0;
     rc = decode_tiles(d, data + hdr_bytes + d->header_size_in_bytes, sz - hdr_bytes - d->header_size_in_bytes);
     if (rc < 0) return rc;
+    if (d->bad_ref || d->corrupt) return VP9_ERR_INVALID;
 
     // refresh_probs
     if (!d->error_resilient_mode && !d->frame_parallel_decoding_mode) {
