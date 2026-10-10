@@ -48,6 +48,7 @@ struct wjs_dyn {
 #define NF_IMGEVT  0x04  // load/error already fired for this <img>
 
 #define WJS_LOG_MAX 400
+#define WJS_DBG_MAX 1500          // engine trace lines (W.log level 4)
 #define WJS_REJ_MAX 32           // unhandled-rejection candidates held until the microtask queue is empty
 
 struct wmedia;               // media sessions (wjs_media.c)
@@ -62,6 +63,7 @@ struct wjs {
          h_script, h_image, h_proto, h_report, h_mo, h_click, h_ready;
     ojsv rej[2 * WJS_REJ_MAX]; // rejected promises with no handler yet: {promise, reason} pairs (a root range)
     int nrej;
+    int ndbg;                // trace lines written so far (WJS_DBG_MAX)
     int interactive;         // readyState "interactive" reached (parsing done)
     ojsv* node_obj;          // wrapper per node (OJS_UNDEFINED = none yet); a root range
     uint8_t* node_flags;

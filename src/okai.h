@@ -17,7 +17,7 @@
 #define OKAI_MAX_CSS_FETCH 24  // external stylesheets fetched per page
 #define OKAI_MAX_IMG_FETCH 32  // images fetched per page (rest stay blank)
 #define OKAI_MAX_JS_FETCH  160 // script/module sources fetched per page
-#define OKAI_MAX_REQ_FETCH 64  // fetch()/XHR requests per page
+#define OKAI_MAX_REQ_FETCH 20000 // fetch()/XHR requests per page (a media player makes one per few seconds, plus pings: only a runaway loop should hit this)
 
 // Where the Home button, the '+' new tab, and `okai` with no argument go.
 // okai:home is an INTERNAL page (no network).

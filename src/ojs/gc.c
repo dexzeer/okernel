@@ -41,6 +41,7 @@ struct page {
     uint16_t cls;
     uint16_t swept;
     struct page* next;          // all pages of this class
+    struct page* anext;         // pages of this class with free objects (the allocation stack)
     struct gch* free;           // free list (linked through the object body)
     uint8_t* data;              // first object
 };
@@ -56,7 +57,7 @@ struct large {
 struct gc_heap {
     uint32_t owned[(1u << (32 - PAGE_SHIFT)) / 32];   // page bitmap over 4 GB
     struct page* pages[NCLASSES];        // class -> page list
-    struct page* avail[NCLASSES];        // class -> first page with free objects (hint)
+    struct page* avail[NCLASSES];        // class -> stack of pages with free objects (linked by anext)
     struct chunk* chunks;
     struct page* spare;                  // carved, unused pages
     struct large* large;
@@ -132,23 +133,25 @@ static struct page* page_new(ojs* J, int cls) {
     }
     p->next = H->pages[cls];
     H->pages[cls] = p;
+    p->anext = H->avail[cls];
+    H->avail[cls] = p;
     page_set_owned(H, (uintptr_t)p, 1);
     return p;
 }
 
+// O(1): the class keeps a stack of the pages that still have free objects (rebuilt by the sweep). Scanning
+// the page list for one made every allocation O(pages) once the older pages were full.
 static void* alloc_small(ojs* J, int cls) {
     struct gc_heap* H = J->heap;
     struct page* p = H->avail[cls];
-    while (p && !p->free) p = p->next;
     if (!p) {
-        for (p = H->pages[cls]; p && !p->free; p = p->next) {}
-        if (!p) p = page_new(J, cls);
+        p = page_new(J, cls);
         if (!p) return 0;
     }
-    H->avail[cls] = p;
     struct gch* g = p->free;
     p->free = *(struct gch**)(g + 1);
     p->nfree--;
+    if (!p->free) H->avail[cls] = p->anext;      // exhausted: pop
     return g;
 }
 
@@ -425,6 +428,7 @@ static size_t sweep(ojs* J) {
     for (int i = 0; i < GT_COUNT; i++) H->live_by_type[i] = 0;
     for (int c = 0; c < NCLASSES; c++) {
         struct page** pp = &H->pages[c];
+        struct page** atail = &H->avail[c];
         H->avail[c] = 0;
         while (*pp) {
             struct page* p = *pp;
@@ -455,6 +459,7 @@ static size_t sweep(ojs* J) {
                 H->spare = p;
                 continue;
             }
+            if (p->free) { *atail = p; atail = &p->anext; p->anext = 0; }
             pp = &p->next;
         }
     }

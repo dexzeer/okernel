@@ -139,11 +139,13 @@ uint8_t* ojs_bytes(ojs* J, ojsv v, size_t* len);
 #define OJS_EVAL_MODULE       1
 #define OJS_EVAL_COMPILE_ONLY 0x10   // return the compiled script/module, do not run it
 #define OJS_EVAL_STRICT       0x20
+#define OJS_EVAL_HIDE_SOURCE  0x40   // functions of this script stringify as "function f() { [native code] }" (the host's built-in web API)
 ojsv  ojs_eval(ojs* J, const char* src, size_t len, const char* filename, int flags);
 ojsv  ojs_run_compiled(ojs* J, ojsv compiled);   // compiled script: run; module: link + evaluate
 ojsv  ojs_parse_json(ojs* J, const char* src, size_t len);
 // microtasks: 1 ran one job, 0 queue empty, -1 the job threw (exception pending)
 int   ojs_run_job(ojs* J);
+int   ojs_jobs_pending(ojs* J);              // 1 when promise jobs are queued
 
 // ---- modules
 // The host maps specifiers to URLs and supplies source text. A module

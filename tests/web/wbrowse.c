@@ -107,7 +107,7 @@ static int http_get(const char* url, const char* method, const char* req_headers
         char bodyarg[700] = "";
         if (body && strcmp(method, "GET")) {
             char rq[600];
-            snprintf(rq, sizeof rq, "%s/req.body", cdir);
+            snprintf(rq, sizeof rq, "%s/post_%s.bin", cdir, key);   // kept: the request bodies of a session can be inspected
             FILE* bf = fopen(rq, "wb");
             if (bf) { fwrite(body, 1, blen, bf); fclose(bf); }
             snprintf(bodyarg, sizeof bodyarg, " --data-binary @%s", rq);
