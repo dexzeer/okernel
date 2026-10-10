@@ -86,6 +86,11 @@ src/kmath.o: src/kmath.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
 src/divdi3.o: src/divdi3.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
+# Media decoders (src/media): doubles/floats on the x87 like ojs, libm from src/kmath.c.
+MEDIA_SRC = ec opus_packet celt celt_tables opus_dec
+MEDIA_OBJ = $(patsubst %,src/media/%.o,$(MEDIA_SRC))
+src/media/%.o: src/media/%.c
+	$(CC) $(OJS_CFLAGS) -c $< -o $@
 src/userland_seed.o: $(USERLAND_GEN)
 DESKTOP_OBJ = src/hda.o src/pcix.o src/virtio.o src/vgpu.o src/i915.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
               src/font_data.o $(WEB_OBJ) $(OJS_OBJ) \
@@ -161,7 +166,9 @@ media-tests:
 	mkdir -p build-host
 	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -o build-host/t_celt tests/media/test_celt.c src/media/celt.c src/media/celt_tables.c src/media/ec.c src/media/opus_packet.c -lm
 	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_celt_fuzz tests/media/fuzz_celt.c src/media/celt.c src/media/celt_tables.c src/media/ec.c -lm
-	@set -e; for f in tests/media/vec/opus_celt_*.bit; do n=$${f%.bit}; ASAN_OPTIONS=detect_leaks=0 ./build-host/t_celt $$n.bit $$n.ref | tail -n 1 | sed "s|^|$$n: |"; done
+	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -o build-host/t_opus tests/media/test_opus.c src/media/opus_dec.c src/media/opus_packet.c src/media/celt.c src/media/celt_tables.c src/media/ec.c -lm
+	@test -d tests/media/vec || { echo "no test vectors: run tests/media/gen_opus_vectors.py (needs ffmpeg + the RFC reference decoder)"; exit 1; }
+	@set -e; for f in tests/media/vec/opus_*.bit; do n=$${f%.bit}; ASAN_OPTIONS=detect_leaks=0 ./build-host/t_opus $$n.bit $$n.ref | tail -n 1 | sed "s|^|$$n: |"; done
 	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_celt_fuzz 50000 1 tests/media/vec/opus_celt_fb_st.bit tests/media/vec/opus_celt_ld_st_12k.bit tests/media/vec/opus_celt_2_5ms.bit | tail -n 1
 
 # Sanitizer run of the adversarial suite (review P0 infra): every parser,
