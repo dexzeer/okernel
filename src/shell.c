@@ -235,7 +235,7 @@ void shell_execute(const char* input) {
     else if (str_is(cmd_buf, "pcidump")) hwinfo_pcidump(args);
     else if (str_is(cmd_buf, "gpu")) hwinfo_gpu();
     else if (str_is(cmd_buf, "input")) hwinfo_input();
-    else if (str_is(cmd_buf, "i2c")) hwinfo_i2c();
+    else if (str_is(cmd_buf, "i2c")) { if (args && args[0] == 's') hwinfo_i2c_scan(); else hwinfo_i2c(); }
     else if (str_is(cmd_buf, "all")) hwinfo_all();
     else if (cmd_buf[0] == 'a' && cmd_buf[1] == 'b' && cmd_buf[2] == 'o' && cmd_buf[3] == 'u' && cmd_buf[4] == 't' && cmd_buf[5] == 0) {
         cmd_about();

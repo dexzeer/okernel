@@ -277,6 +277,25 @@ static void mouse_process_packet(void) {
     if (cur_on) move_sprite(mouse_x, mouse_y);  // IRQ context: IF=0
 }
 
+void mouse_inject(int dx, int dy, int wheel, int buttons) {
+    uint32_t f = irq_save();
+    mouse_buttons = buttons & 7;
+    int x = mouse_x + dx, y = mouse_y + dy;
+    if (x < 0) x = 0;
+    if (x >= SCREEN_W) x = SCREEN_W - 1;
+    if (y < 0) y = 0;
+    if (y >= SCREEN_H) y = SCREEN_H - 1;
+    mouse_x = x; mouse_y = y;
+    mouse_scroll += wheel;
+    mse_pkt_count++;
+    if (mouse_buttons != mse_prev_buttons) {
+        serial_printf("[mse] btn=%d x=%d y=%d pkts=%u\n", mouse_buttons, mouse_x, mouse_y, mse_pkt_count);
+        mse_prev_buttons = (uint8_t)mouse_buttons;
+    }
+    if (cur_on) move_sprite(mouse_x, mouse_y);
+    irq_restore(f);
+}
+
 static void mouse_irq_handler(void) {
     uint8_t status = inb(0x64);
     if (!(status & 0x01)) return;
