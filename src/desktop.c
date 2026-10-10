@@ -41,6 +41,7 @@
 #include "simd.h"
 #include "i915.h"
 #include "audio.h"
+#include "mplay.h"
 #include "display.h"
 
 struct mboot_info {
@@ -956,6 +957,16 @@ static void shell_execute(int win_id, const char* input) {
         if (args[i] >= '0' && args[i] <= '9') { ms = 0; while (args[i] >= '0' && args[i] <= '9') ms = ms * 10 + (args[i++] - '0'); }
         if (!audio_ready()) window_puts(win_id, "no audio output\n");
         else { audio_beep(hz, ms); window_puts(win_id, "beep done\n"); }
+    }
+    else if (str_eq(cmd_buf, "play")) {
+        // play <url>: a WebM file with Opus audio, over HTTP(S), through the HD Audio output
+        if (!args[0]) window_puts(win_id, "usage: play http://host/file.webm\n");
+        else if (mplay_start(args) == 0) window_puts(win_id, "playing (see serial for progress)\n");
+        else window_puts(win_id, "play: could not start\n");
+    }
+    else if (str_eq(cmd_buf, "stopplay")) {
+        mplay_stop();
+        window_puts(win_id, "stopped\n");
     }
     else if (str_eq(cmd_buf, "gpu")) {
         // read-only report on the display hardware: Intel graphics registers (pipes,
@@ -2379,6 +2390,7 @@ void kernel_main(uint32_t mboot_phys) {
         // global connection (okai_fetch_owner), coalesced page renders, and
         // the fetch-pill erase. See okai_poll().
         { PROF_BEGIN(PZ_OKAI); okai_poll(); PROF_END(PZ_OKAI); }
+        mplay_poll();
 
 
         // ---- Window drag: blit, don't re-render ----
@@ -2647,7 +2659,7 @@ void kernel_main(uint32_t mboot_phys) {
         // e1000's MMIO so hard that QEMU's timer starved and PIT ticks were
         // lost (the kernel clock ran ~30% slow under TCG).
         if (!composed && !cursor_moved && !mb && !wheel && drag_win < 0 && resize_win < 0 &&
-            fetch_free_slots() == FETCH_MAX && !okai_wants_cpu()) {
+            fetch_free_slots() == FETCH_MAX && !okai_wants_cpu() && !mplay_wants_cpu()) {
             uint64_t h0 = rdtsc_now();
             // A key queued after this iteration's dispatch must not sleep
             // until the next timer tick: check with interrupts off, then
