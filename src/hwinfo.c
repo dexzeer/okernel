@@ -429,6 +429,137 @@ static void input_ps2(void) {
     __asm__ volatile("pushl %0; popfl" :: "r"(fl) : "memory", "cc");
 }
 
+// ---- I2C-HID touchpad: what ACPI says and whether its controller answers ------------------------
+// Read-only. The touchpad (e.g. SYNA3602 with compatible id PNP0C50) sits on an Intel LPSS DesignWare I2C controller.
+// Its _CRS holds an I2cSerialBus descriptor (slave address, speed, the controller's ACPI path); the controller is
+// another ACPI device whose _CRS has a Memory32Fixed range. We pattern-scan the AML instead of interpreting it.
+static const uint8_t* aml_t[32];
+static int aml_n;
+
+static void aml_collect(void) {
+    const uint8_t* tabs[48];
+    int n = acpi_tables(tabs, 48);
+    aml_n = 0;
+    for (int i = 0; i < n && aml_n < 32; i++) {
+        const char* sg = (const char*)tabs[i];
+        if (!memcmp(sg, "FACP", 4)) {
+            const uint8_t* d = table_at(*(const uint32_t*)(tabs[i] + 40), "DSDT");
+            if (!d && *(const uint32_t*)(tabs[i] + 4) >= 148) d = table_at(*(const uint64_t*)(tabs[i] + 140), "DSDT");
+            if (d) aml_t[aml_n++] = d;
+        } else if (!memcmp(sg, "SSDT", 4)) aml_t[aml_n++] = tabs[i];
+    }
+}
+
+static int find_bytes(const uint8_t* t, uint32_t len, uint32_t from, const void* pat, uint32_t pl) {
+    for (uint32_t i = from; i + pl <= len; i++)
+        if (t[i] == ((const uint8_t*)pat)[0] && !memcmp(t + i, pat, pl)) return (int)i;
+    return -1;
+}
+
+static uint32_t aml_u32(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+
+// a DesignWare I2C block: component type register 0xFC reads "DW" 0x44570140
+static void i2c_probe_regs(uint32_t base) {
+    volatile uint32_t* r = (volatile uint32_t*)base;
+    uint32_t ctype = r[0xFC / 4], cver = r[0xF8 / 4];
+    pf("    regs at %x: COMP_TYPE %x COMP_VERSION %x %s\n", base, ctype, cver,
+       ctype == 0x44570140u ? "(DesignWare I2C)" : ctype == 0xFFFFFFFFu ? "(reads all ones: powered off or clock gated)" : "(not a DesignWare I2C?)");
+    if (ctype == 0xFFFFFFFFu) return;
+    pf("    IC_CON %x  IC_TAR %x  IC_ENABLE %x  IC_STATUS %x  ENABLE_STATUS %x  SS %x/%x  FS %x/%x\n", r[0x00], r[0x04 / 4], r[0x6C / 4], r[0x70 / 4], r[0x9C / 4],
+       r[0x14 / 4], r[0x18 / 4], r[0x1C / 4], r[0x20 / 4]);
+    pf("    LPSS clock %x  resets %x  general %x\n", r[0x200 / 4], r[0x204 / 4], r[0x208 / 4]);
+}
+
+void hwinfo_i2c(void) {
+    head("I2C touchpad");
+    aml_collect();
+    if (!aml_n) { pf("no AML tables\n"); return; }
+    char src[40] = "";
+    int found = 0;
+    for (int ti = 0; ti < aml_n && !found; ti++) {
+        const uint8_t* t = aml_t[ti];
+        uint32_t len = *(const uint32_t*)(t + 4);
+        int hid = -1;
+        static const char* const ids[] = { "SYNA3602", "SYNA", "ELAN", "ALPS", "CYAP", "MSFT0001", 0 };   // known touchpad ids, best first
+        for (int k = 0; ids[k] && hid < 0; k++) hid = find_bytes(t, len, 36, ids[k], (uint32_t)strlen(ids[k]));
+        if (hid < 0) continue;
+        pf("touchpad id %c%c%c%c%c%c%c%c in %c%c%c%c at +%x\n", t[hid], t[hid + 1], t[hid + 2], t[hid + 3], t[hid + 4], t[hid + 5], t[hid + 6], t[hid + 7],
+           t[0], t[1], t[2], t[3], (uint32_t)hid);
+        // I2cSerialBusV2: 8E len(2) rev 00 type=01 flags tsflags(2) tsrev=01 tdlen=0006 speed(4) addr(2) source\0
+        for (uint32_t j = (uint32_t)hid; j + 40 < len && j < (uint32_t)hid + 1500; j++) {
+            const uint8_t* d = t + j;
+            if (d[0] != 0x8E || d[3] != 0x01 || d[5] != 0x01 || d[9] != 0x01 || d[10] != 0x06 || d[11] != 0x00) continue;
+            uint32_t speed = aml_u32(d + 12);
+            uint32_t addr = d[16] | ((uint32_t)d[17] << 8);
+            int k = 0;
+            while (k < 39 && d[18 + k] >= 0x20 && d[18 + k] < 0x7F) { src[k] = (char)d[18 + k]; k++; }
+            src[k] = 0;
+            pf("  I2C slave address %x (%s-bit), %u Hz, controller \"%s\"\n", addr & 0x3FF, (d[7] & 1) ? "10" : "7", speed, src);
+            found = 1;
+            break;
+        }
+        if (!found) pf("  no I2cSerialBus descriptor within 1500 bytes of the id\n");
+        // the HID descriptor register: _DSM (GUID 3CDFF6F7-4267-4555-AD05-B30A3D8938DE) usually returns 0x0001/0x0020
+        static const uint8_t guid[16] = { 0xF7, 0xF6, 0xDF, 0x3C, 0x67, 0x42, 0x55, 0x45, 0xAD, 0x05, 0xB3, 0x0A, 0x3D, 0x89, 0x38, 0xDE };
+        int g = find_bytes(t, len, hid > 1500 ? (uint32_t)hid - 1500 : 36, guid, 16);
+        if (g >= 0) {
+            out("  HID-I2C _DSM follows the GUID: ");
+            for (int k = 16; k < 64 && (uint32_t)(g + k) < len; k++) pf("%02x ", (uint32_t)t[g + k]);
+            out("\n");
+        } else out("  no HID-I2C _DSM GUID near the id\n");
+    }
+    if (!found) { pf("no touchpad described\n"); }
+    // the controller: a Device() named like the last four characters of the path
+    if (src[0]) {
+        int sl = (int)strlen(src);
+        const char* nm = src + (sl >= 4 ? sl - 4 : 0);
+        int dev_found = 0;
+        for (int ti = 0; ti < aml_n; ti++) {
+            const uint8_t* t = aml_t[ti];
+            uint32_t len = *(const uint32_t*)(t + 4);
+            for (uint32_t i = 36; i + 12 < len; i++) {
+                if (t[i] != 0x5B || t[i + 1] != 0x82) continue;                         // DeviceOp
+                uint32_t p = i + 2, lead = t[p], cnt = (lead >> 6) & 3;
+                uint32_t pk = cnt == 0 ? (lead & 0x3F) : (lead & 0x0F);
+                for (uint32_t k = 0; k < cnt; k++) pk |= (uint32_t)t[p + 1 + k] << (4 + 8 * k);
+                uint32_t nstart = p + 1 + cnt;
+                if (memcmp(t + nstart, nm, 4)) continue;
+                dev_found = 1;
+                uint32_t end = p + pk;
+                if (end > len) end = len;
+                pf("controller device %s in %c%c%c%c at +%x (scope length %u)\n", nm, t[0], t[1], t[2], t[3], i, pk);
+                int h = find_bytes(t, end, nstart + 4, "_HID", 4);
+                if (h >= 0) {
+                    char b[12]; int k = 0;
+                    if (t[h + 4] == 0x0D) while (k < 11 && t[h + 5 + k] >= 0x20 && t[h + 5 + k] < 0x7F) { b[k] = (char)t[h + 5 + k]; k++; }
+                    b[k] = 0;
+                    pf("  _HID %s\n", b);
+                }
+                for (uint32_t j = nstart + 4; j + 12 <= end; j++) {                       // Memory32Fixed(ReadWrite, base, len)
+                    if (t[j] == 0x86 && t[j + 1] == 0x09 && t[j + 2] == 0x00) {
+                        uint32_t base = aml_u32(t + j + 4), mlen = aml_u32(t + j + 8);
+                        pf("  Memory32Fixed %x length %x\n", base, mlen);
+                        if (base && base != 0xFFFFFFFFu && mlen >= 0x1000 && base < 0xFFFF0000u) i2c_probe_regs(base);
+                    }
+                }
+            }
+        }
+        if (!dev_found) pf("controller device %s not found in the AML\n", nm);
+    }
+    // LPSS I2C controllers that the firmware exposes as PCI devices
+    int npci = 0;
+    for (uint16_t d = 0x22C1; d <= 0x22C7; d++) {
+        struct pci_loc l;
+        if (!pcix_find_id(0x8086, d, 0, &l)) continue;
+        int is_mem, above;
+        uint32_t bar = pcix_bar(l, 0, &is_mem, &above);
+        pf("PCI I2C controller 8086:%x at %02x:%02x.%u BAR0 %x\n", (uint32_t)d, l.bus, l.dev, l.fn, bar);
+        if (bar && bar != 0xFFFFFFFFu) i2c_probe_regs(bar);
+        npci++;
+    }
+    if (!npci) pf("no 8086:22C1-22C7 PCI I2C controllers (ACPI mode)\n");
+}
+
 void hwinfo_input(void) {
     input_acpi();
     input_ps2();

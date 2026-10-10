@@ -75,7 +75,7 @@ void kernel_main(uint32_t mboot_addr) {
 
     hwinfo_init(mboot_addr);
     terminal_set_color(VGA_LIGHT_GREEN, VGA_BLACK);
-    terminal_puts("Hardware report:  cpu  memmap  acpi  pci [page]  pcidump B:D.F  gpu  input  all\n\n");
+    terminal_puts("Hardware report:  cpu  memmap  acpi  pci [page]  pcidump B:D.F  gpu  input  i2c  all\n\n");
     terminal_set_color(VGA_WHITE, VGA_BLACK);
     hwinfo_cpu();
     hwinfo_gpu();

@@ -70,7 +70,7 @@ static void cmd_help(void) {
     terminal_set_color(VGA_LIGHT_CYAN, VGA_BLACK);
     terminal_puts("Hardware report:\n");
     terminal_set_color(VGA_WHITE, VGA_BLACK);
-    terminal_puts("  cpu | memmap | acpi | pci [page] | pcidump B:D.F | gpu | input | all\n");
+    terminal_puts("  cpu | memmap | acpi | pci [page] | pcidump B:D.F | gpu | input | i2c | all\n");
 }
 
 static void cmd_clear(void) {
@@ -235,6 +235,7 @@ void shell_execute(const char* input) {
     else if (str_is(cmd_buf, "pcidump")) hwinfo_pcidump(args);
     else if (str_is(cmd_buf, "gpu")) hwinfo_gpu();
     else if (str_is(cmd_buf, "input")) hwinfo_input();
+    else if (str_is(cmd_buf, "i2c")) hwinfo_i2c();
     else if (str_is(cmd_buf, "all")) hwinfo_all();
     else if (cmd_buf[0] == 'a' && cmd_buf[1] == 'b' && cmd_buf[2] == 'o' && cmd_buf[3] == 'u' && cmd_buf[4] == 't' && cmd_buf[5] == 0) {
         cmd_about();

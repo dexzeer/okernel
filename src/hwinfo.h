@@ -12,6 +12,7 @@ void hwinfo_pci(int page);
 void hwinfo_pcidump(const char* bdf);
 void hwinfo_gpu(void);
 void hwinfo_input(void);
+void hwinfo_i2c(void);
 void hwinfo_poweroff(void);       // ACPI S5; does not return
 void hwinfo_reboot(void);
 void hwinfo_all(void);
