@@ -1274,6 +1274,7 @@ function mimeKinds(mime) {      // bit 0 audio (Opus), bit 1 video (VP9); 0 = un
 }
 methods(HM, {
     canPlayType(t) {
+        mlog('canPlayType ' + t);
         const p = parseMime(t);
         if (!p) return '';
         const k = mimeKinds(t);
@@ -1328,13 +1329,17 @@ function mediaSession(el, s) {
     mediaKick();
     return s.id;
 }
+let mlogN = 0;
+function mlog(m) { if (mlogN++ < 400) W.log(1, '[media] ' + m); }
 function mediaFail(el, s, code, msg) {
+    mlog('ERROR ' + code + ' ' + msg);
     s.error = new MediaError(code, msg);
     s.netState = 3;
     fire(el, 'error');
 }
 function mediaLoad(el) {
     const s = mst(el);
+    mlog('load ' + (W.getAttr(el, 'src') || '(sources)'));
     const hadSession = s.id !== 0 || s.currentSrc !== '';
     mediaTeardown(el, s);
     for (const p of s.promises.splice(0)) p.reject(new DOMException('The play() request was interrupted by a new load request.', 'AbortError'));
@@ -1460,6 +1465,7 @@ function mediaTick() {
     mediaStopTimer();
 }
 function mediaSeek(el, s, t) {
+    mlog('seek ' + t);
     if (!s.id) { s.ct = t; return; }
     if (!(t === t)) return;
     const d = s.dur;
@@ -1554,6 +1560,7 @@ methods(HM, {
     load() { mediaLoad(this); },
     play() {
         const s = mst(this);
+        mlog('play()');
         if (!s.id && !s.currentSrc) {
             const hasSrc = W.getAttr(this, 'src') !== null || W.query(this, 'source', true).length;
             if (hasSrc) mediaLoad(this);
@@ -1647,6 +1654,7 @@ class SourceBuffer extends EventTarget {
         this._check();
         if (!(data instanceof ArrayBuffer || ArrayBuffer.isView(data))) throw new TypeError("Failed to execute 'appendBuffer' on 'SourceBuffer': The provided value is not of type 'ArrayBuffer'.");
         const ms = this._ms;
+        mlog('appendBuffer sb ' + this._idx + ' ' + data.byteLength + ' bytes');
         this._op(() => {
             const el = ms._el, s = el && MS.get(el);
             if (!s || !s.id) return false;
@@ -1686,7 +1694,7 @@ class MediaSource extends EventTarget {
         this.sourceBuffers = new SourceBufferList();
         this.activeSourceBuffers = new SourceBufferList();
     }
-    static isTypeSupported(t) { return mimeKinds(t) !== 0; }
+    static isTypeSupported(t) { const k = mimeKinds(t); mlog('isTypeSupported ' + t + ' -> ' + (k !== 0)); return k !== 0; }
     _objUrl() {
         if (!this._url) { this._url = 'blob:' + location.origin + '/' + crypto.randomUUID(); OBJURLS.set(this._url, this); }
         return this._url;
@@ -1726,6 +1734,7 @@ class MediaSource extends EventTarget {
         if (!s || !s.id) throw new DOMException('The MediaSource is not attached.', 'InvalidStateError');
         const idx = W.mediaAddSb(s.id, kinds);
         if (idx < 0) throw new DOMException('Cannot add another SourceBuffer.', 'QuotaExceededError');
+        mlog('addSourceBuffer ' + mime + ' -> sb ' + idx);
         const sb = new SourceBuffer(this, idx, String(mime));
         this.sourceBuffers._a.push(sb);
         this.activeSourceBuffers._a.push(sb);
@@ -2294,6 +2303,118 @@ class AbortController {
         dispatch(s, ev);
     }
 }
+class ReadableStreamDefaultReader {
+    constructor(st) {
+        if (st._reader) throw new TypeError('ReadableStream is locked');
+        hidden(this, '_st', st);
+        st._reader = this;
+        hidden(this, 'closed', new Promise((res, rej) => { this._cres = res; this._crej = rej; }));
+        this.closed.catch(() => {});
+        if (st._state === 'closed') this._cres(); else if (st._state === 'errored') this._crej(st._err);
+    }
+    read() {
+        const st = this._st;
+        if (!st) return Promise.reject(new TypeError('This readable stream reader has been released'));
+        return st._read();
+    }
+    cancel(reason) { return this._st ? this._st._cancel(reason) : Promise.reject(new TypeError('released')); }
+    releaseLock() { if (this._st) { this._st._reader = null; this._st = null; } }
+}
+class ReadableStream {
+    constructor(src, strategy) {
+        src = src || {};
+        hidden(this, '_q', []); hidden(this, '_waiters', []); hidden(this, '_state', 'readable'); hidden(this, '_err', undefined);
+        hidden(this, '_reader', null); hidden(this, '_src', src); hidden(this, '_pulling', false); hidden(this, '_again', false);
+        hidden(this, '_hwm', strategy && strategy.highWaterMark !== undefined ? +strategy.highWaterMark : 1);
+        const st = this;
+        hidden(this, '_ctl', {
+            enqueue(chunk) {
+                if (st._state !== 'readable') throw new TypeError('The stream is not in a state that permits enqueue');
+                const w = st._waiters.shift();
+                if (w) w.res({ value: chunk, done: false }); else st._q.push(chunk);
+            },
+            close() {
+                if (st._state !== 'readable') return;
+                st._state = 'closed';
+                for (const w of st._waiters.splice(0)) w.res({ value: undefined, done: true });
+                if (st._reader) st._reader._cres();
+            },
+            error(e) { st._fail(e); },
+            get desiredSize() { return st._state === 'readable' ? st._hwm - st._q.length : st._state === 'closed' ? 0 : null; },
+        });
+        let started;
+        try { started = src.start ? src.start(this._ctl) : undefined; } catch (e) { this._fail(e); return; }
+        Promise.resolve(started).then(() => this._pull(), e => this._fail(e));
+    }
+    _fail(e) {
+        if (this._state !== 'readable') return;
+        this._state = 'errored'; this._err = e; this._q.length = 0;
+        for (const w of this._waiters.splice(0)) w.rej(e);
+        if (this._reader) this._reader._crej(e);
+    }
+    _pull() {
+        if (this._state !== 'readable' || !this._src.pull) return;
+        if (this._pulling) { this._again = true; return; }
+        if (this._q.length >= this._hwm && !this._waiters.length) return;
+        this._pulling = true;
+        let r;
+        try { r = this._src.pull(this._ctl); } catch (e) { this._pulling = false; this._fail(e); return; }
+        Promise.resolve(r).then(() => {
+            this._pulling = false;
+            if (this._again) { this._again = false; this._pull(); }
+            else if (this._waiters.length || this._q.length < this._hwm) this._pull();
+        }, e => { this._pulling = false; this._fail(e); });
+    }
+    _read() {
+        if (this._q.length) {
+            const v = this._q.shift();
+            this._pull();
+            return Promise.resolve({ value: v, done: false });
+        }
+        if (this._state === 'closed') return Promise.resolve({ value: undefined, done: true });
+        if (this._state === 'errored') return Promise.reject(this._err);
+        return new Promise((res, rej) => { this._waiters.push({ res, rej }); this._pull(); });
+    }
+    get locked() { return !!this._reader; }
+    getReader() { return new ReadableStreamDefaultReader(this); }
+    cancel(reason) {
+        if (this._reader) return Promise.reject(new TypeError('Cannot cancel a locked stream'));
+        return this._cancel(reason);
+    }
+    _cancel(reason) {
+        if (this._state === 'closed') return Promise.resolve();
+        if (this._state === 'errored') return Promise.reject(this._err);
+        this._state = 'closed'; this._q.length = 0;
+        for (const w of this._waiters.splice(0)) w.res({ value: undefined, done: true });
+        if (this._reader) this._reader._cres();
+        try { return Promise.resolve(this._src.cancel ? this._src.cancel(reason) : undefined).then(() => undefined); }
+        catch (e) { return Promise.reject(e); }
+    }
+    tee() {
+        const r = this.getReader();
+        const ctls = [];
+        const cancelled = [false, false];
+        const mk = i => new ReadableStream({
+            start(c) { ctls[i] = c; },
+            pull() {
+                return r.read().then(x => {
+                    if (x.done) { for (let j = 0; j < 2; j++) if (!cancelled[j]) ctls[j].close(); return; }
+                    for (let j = 0; j < 2; j++) if (!cancelled[j]) ctls[j].enqueue(x.value);
+                });
+            },
+            cancel() { cancelled[i] = true; if (cancelled[0] && cancelled[1]) return r.cancel(); },
+        });
+        return [mk(0), mk(1)];
+    }
+    [Symbol.asyncIterator]() {
+        const r = this.getReader();
+        return { next: () => r.read(), return: () => { r.releaseLock(); return Promise.resolve({ done: true, value: undefined }); }, [Symbol.asyncIterator]() { return this; } };
+    }
+    static from(it) {
+        const i = it[Symbol.asyncIterator] ? it[Symbol.asyncIterator]() : it[Symbol.iterator]();
+        return new ReadableStream({ pull(c) { return Promise.resolve(i.next()).then(x => x.done ? c.close() : c.enqueue(x.value)); } });
+    }
+}
 class Response {
     constructor(body, init) {
         init = init || {};
@@ -2307,7 +2428,30 @@ class Response {
         this.bodyUsed = false;
     }
     get ok() { return this.status >= 200 && this.status < 300; }
-    get body() { return null; }
+    get body() {
+        if (this._body === null) return null;
+        if (!this._stream) {
+            const self = this;
+            const b = this._body;
+            const bytes = typeof b === 'string' ? new TextEncoder().encode(b)
+                : b instanceof Blob ? new TextEncoder().encode(b._s)
+                : b instanceof ArrayBuffer ? new Uint8Array(b)
+                : ArrayBuffer.isView(b) ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength)
+                : new TextEncoder().encode(String(b));
+            let pos = 0;
+            hidden(this, '_stream', new ReadableStream({
+                pull(c) {
+                    self.bodyUsed = true;
+                    if (pos >= bytes.length) { c.close(); return; }
+                    const n = Math.min(65536, bytes.length - pos);
+                    c.enqueue(bytes.slice(pos, pos + n));
+                    pos += n;
+                    if (pos >= bytes.length) c.close();
+                },
+            }, { highWaterMark: 0 }));
+        }
+        return this._stream;
+    }
     _consume() {
         if (this.bodyUsed) return Promise.reject(new TypeError('body stream already read'));
         this.bodyUsed = true;
@@ -2953,7 +3097,7 @@ const win = {
     AnimationEvent, TransitionEvent, PromiseRejectionEvent, TouchEvent, CompositionEvent, ClipboardEvent,
     EventTarget, DOMException, Node, Element, CharacterData, Text, Comment, Document, HTMLDocument, DocumentFragment,
     URL, URLSearchParams, Location, History, Headers, Request, Response, Blob, File, FormData, AbortController, AbortSignal,
-    MediaSource, SourceBuffer, SourceBufferList, TimeRanges, MediaError,
+    MediaSource, SourceBuffer, SourceBufferList, TimeRanges, MediaError, ReadableStream, ReadableStreamDefaultReader,
     XMLHttpRequest, TextEncoder, TextDecoder, Storage, MutationObserver, MutationRecord, IntersectionObserver, ResizeObserver,
     CustomElementRegistry, MediaQueryList, PerformanceObserver, Range, TreeWalker, NodeIterator: TreeWalker, NodeFilter,
     DOMParser, XMLSerializer, FontFace, BroadcastChannel, MessageChannel, WebSocket,

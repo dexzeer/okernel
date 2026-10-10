@@ -146,6 +146,7 @@ static int interrupt_cb(ojs* J, void* op) {
     return 0;
 }
 
+static void flush_rejections(struct wjs* js);
 void wjs_drain_jobs(struct wjs* js) {
     for (int i = 0; i < 100000; i++) {
         int r = ojs_run_job(js->J);
@@ -153,6 +154,7 @@ void wjs_drain_jobs(struct wjs* js) {
         if (r < 0) wjs_report_exception(js, "promise job");
         if (js->interrupted) break;
     }
+    if (js->nrej && !js->interrupted) flush_rejections(js);
 }
 
 void wjs_report_exception(struct wjs* js, const char* where) {
@@ -188,10 +190,41 @@ void wjs_report_exception(struct wjs* js, const char* where) {
     }
 }
 
+static void report_rejection(struct wjs* js, ojs* ctx, ojsv reason);
+
+// A rejected promise is reported only if it still has no handler once the microtask queue has drained (the
+// HTML "unhandled rejection" rule): `p.then(ok, err)` right after Promise.reject(e) is handled.
 static void rejection_cb(ojs* ctx, ojsv promise, ojsv reason, int handled, void* op) {
-    (void)promise;
     struct wjs* js = (struct wjs*)op;
-    if (handled) return;
+    if (handled) {
+        for (int i = 0; i < js->nrej; i++)
+            if (js->rej[2 * i] == promise) {
+                js->nrej--;
+                js->rej[2 * i] = js->rej[2 * js->nrej];
+                js->rej[2 * i + 1] = js->rej[2 * js->nrej + 1];
+                js->rej[2 * js->nrej] = js->rej[2 * js->nrej + 1] = OJS_UNDEFINED;
+                break;
+            }
+        return;
+    }
+    if (js->nrej < WJS_REJ_MAX) {
+        js->rej[2 * js->nrej] = promise;
+        js->rej[2 * js->nrej + 1] = reason;
+        js->nrej++;
+        return;
+    }
+    report_rejection(js, ctx, reason);
+}
+
+static void flush_rejections(struct wjs* js) {
+    ojsv rs[WJS_REJ_MAX];
+    int n = js->nrej;
+    for (int i = 0; i < n; i++) { rs[i] = js->rej[2 * i + 1]; js->rej[2 * i] = js->rej[2 * i + 1] = OJS_UNDEFINED; }
+    js->nrej = 0;
+    for (int i = 0; i < n; i++) report_rejection(js, js->J, rs[i]);   // rs[] is on the C stack: scanned conservatively
+}
+
+static void report_rejection(struct wjs* js, ojs* ctx, ojsv reason) {
     char m[400];
     int n = 0;
     const char* a = "Uncaught (in promise) ";
@@ -1276,6 +1309,7 @@ struct wjs* wjs_new(struct wdoc* doc) {
     js->next_due = -1;
     js->t0 = wjs_now();
     js->hooks = OJS_UNDEFINED;
+    for (int i = 0; i < 2 * WJS_REJ_MAX; i++) js->rej[i] = OJS_UNDEFINED;
     ojsv* hv[] = { &js->hooks, &js->h_dispatch, &js->h_ui, &js->h_fetch, &js->h_nextdue, &js->h_rundue, &js->h_frame,
                    &js->h_dcl, &js->h_load, &js->h_script, &js->h_image, &js->h_proto, &js->h_report,
                    &js->h_mo, &js->h_click, &js->h_ready, &js->proto_svg, &js->proto_svgroot,
@@ -1309,6 +1343,7 @@ struct wjs* wjs_new(struct wdoc* doc) {
     // roots: every value slot of struct wjs, and the arrays grown before the realm existed
     for (unsigned i = 0; i < sizeof hv / sizeof hv[0]; i++) ojs_add_root(ctx, hv[i]);
     ojs_add_root_range(ctx, js->node_obj, js->node_cap);
+    ojs_add_root_range(ctx, js->rej, 2 * WJS_REJ_MAX);
     int cls = ojs_host_class(ctx, "Node");
     if (!wjs_class_id) wjs_class_id = cls;
     ojsv natives = ojs_object(ctx);

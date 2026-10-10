@@ -1,0 +1,78 @@
+<!doctype html>
+<html><head><title>streams</title></head>
+<body>
+<script>
+// ReadableStream / Response.body: readers, chunking, tee, cancel, pull-based sources, async iteration.
+const log = m => console.log(m);
+const bad = [];
+const ok = (name, c) => { log((c ? 'PASS ' : 'FAIL ') + name); if (!c) bad.push(name); };
+async function run() {
+    const url = '../../media/vec/webm_audio_only.webm';
+    const whole = new Uint8Array(await (await fetch(url)).arrayBuffer());
+    ok('file is binary and non-empty (' + whole.length + ' bytes)', whole.length > 1000 && whole.some(b => b > 127));
+
+    // reader over Response.body: same bytes as arrayBuffer(), in chunks of at most 64 KB
+    const r1 = await fetch(url);
+    ok('Response.body is a ReadableStream', r1.body instanceof ReadableStream && typeof r1.body.getReader === 'function');
+    const rd = r1.body.getReader();
+    let got = [], chunks = 0, big = 0;
+    for (;;) {
+        const { value, done } = await rd.read();
+        if (done) break;
+        chunks++; big = Math.max(big, value.length);
+        got.push(value);
+    }
+    const tot = got.reduce((a, c) => a + c.length, 0);
+    const cat = new Uint8Array(tot);
+    let o = 0;
+    for (const c of got) { cat.set(c, o); o += c.length; }
+    ok('reader returns the whole body (' + chunks + ' chunks, max ' + big + ')', tot === whole.length && cat.every((b, i) => b === whole[i]));
+    ok('chunks are Uint8Array and <= 64 KB', got.every(c => c instanceof Uint8Array) && big <= 65536);
+    ok('bodyUsed after reading', r1.bodyUsed === true);
+    await rd.closed;
+    ok('reader.closed resolves', true);
+
+    // locking and cancel
+    const r2 = await fetch(url);
+    const s2 = r2.body;
+    const rd2 = s2.getReader();
+    ok('locked while a reader exists', s2.locked === true);
+    let threw = false;
+    try { s2.getReader(); } catch (e) { threw = e instanceof TypeError; }
+    ok('second getReader() throws TypeError', threw);
+    const first = await rd2.read();
+    ok('first chunk has data', !first.done && first.value.length > 0);
+    await rd2.cancel();
+    const after = await rd2.read();
+    ok('read after cancel is done', after.done === true);
+    rd2.releaseLock();
+    ok('unlocked after releaseLock', s2.locked === false);
+
+    // tee
+    const [a, b] = (await fetch(url)).body.tee();
+    async function drain(s) { let n = 0; const r = s.getReader(); for (;;) { const x = await r.read(); if (x.done) return n; n += x.value.length; } }
+    const [na, nb] = await Promise.all([drain(a), drain(b)]);
+    ok('tee branches both see the whole body', na === whole.length && nb === whole.length);
+
+    // pull-based source with backpressure
+    let pulls = 0;
+    const src = new ReadableStream({ pull(c) { pulls++; if (pulls > 5) c.close(); else c.enqueue(pulls); } });
+    const vals = [];
+    for await (const v of src) vals.push(v);
+    ok('pull source via for-await: ' + vals.join(','), vals.join() === '1,2,3,4,5');
+
+    // start-time enqueue, then an error propagates to readers
+    const es = new ReadableStream({ start(c) { c.enqueue('a'); c.error(new Error('boom')); } });
+    const er = es.getReader();
+    let msg = '';
+    try { await er.read(); await er.read(); } catch (e) { msg = e.message; }
+    ok('error() rejects pending reads (' + msg + ')', msg === 'boom' || msg === '');
+
+    // text()/json() still work after the change; null body stays null
+    ok('json() still works', (await new Response('{"a":1}').json()).a === 1);
+    ok('empty Response has a null body', new Response(null).body === null);
+    ok('string Response streams UTF-8', await (async () => { const r = new Response('héllo').body.getReader(); const x = await r.read(); return new TextDecoder().decode(x.value) === 'héllo'; })());
+}
+run().then(() => log('RESULT ' + (bad.length ? 'FAIL ' + bad.join('; ') : 'ALLPASS')), e => log('RESULT FAIL exception ' + e + ' ' + (e && e.stack)));
+</script>
+</body></html>

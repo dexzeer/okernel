@@ -13,7 +13,8 @@ param(
     [double]$Settle = 6,
     [string]$Qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe",
     [int]$Port = 45454,
-    [string]$Iso = ""
+    [string]$Iso = "",
+    [int]$Mem = 512
 )
 $ErrorActionPreference = "Stop"
 $Urls = @($Urls | ForEach-Object { $_ -split "," } | Where-Object { $_ })
@@ -24,7 +25,7 @@ New-Item -ItemType Directory -Force $out | Out-Null
 $log = Join-Path $out ("perf_{0}_{1}.log" -f $Accel, $Port)
 Remove-Item $log -ErrorAction SilentlyContinue
 
-$qargs = @("-accel", $Accel, "-m", "512", "-cdrom", $iso, "-boot", "d", "-vga", "std",
+$qargs = @("-accel", $Accel, "-m", "$Mem", "-cdrom", $iso, "-boot", "d", "-vga", "std",
           "-device", "e1000,netdev=net0", "-netdev", "user,id=net0",
           "-serial", "file:$log", "-display", "none", "-no-reboot",
           "-monitor", "tcp:127.0.0.1:$Port,server,nowait")

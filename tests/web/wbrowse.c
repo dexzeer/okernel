@@ -55,7 +55,7 @@ struct resp { char* body; int len; int status; char* headers; char final_url[204
 
 // GET through curl (cached). Returns 0 on transport failure.
 static const char* g_top_url;   // page URL for cookie SameSite context (NULL = navigation)
-static int http_get(const char* url, const char* method, const char* req_headers, const char* body, struct resp* r) {
+static int http_get(const char* url, const char* method, const char* req_headers, const char* body, int blen, struct resp* r) {
     static char cookie[4096];
     int cl = wcookie_header(url, g_top_url, cookie, sizeof cookie);
     if (cl && strchr(cookie, '\'')) { cl = 0; cookie[0] = 0; }   // keep the shell quoting simple
@@ -70,17 +70,29 @@ static int http_get(const char* url, const char* method, const char* req_headers
     }
     char key[64], bpath[700], hpath[700], mpath[700];
     char kin[8192];
-    snprintf(kin, sizeof kin, "%s %s %s %s", method, url, body ? body : "", cookie);
-    snprintf(key, sizeof key, "%016llx", fnv(kin));
+    snprintf(kin, sizeof kin, "o3 %s %s %s %s", method, url, cookie, g_top_url ? g_top_url : "");
+    unsigned long long kh = fnv(kin);
+    for (int bi = 0; body && bi < blen; bi++) { kh ^= (unsigned char)body[bi]; kh *= 1099511628211ULL; }
+    snprintf(key, sizeof key, "%016llx", kh);
     snprintf(bpath, sizeof bpath, "%s/%s.body", cdir, key);
     snprintf(hpath, sizeof hpath, "%s/%s.hdr", cdir, key);
     snprintf(mpath, sizeof mpath, "%s/%s.meta", cdir, key);
     struct stat st;
+    if (!strncmp(url, "http://127.0.0.1", 16) || !strncmp(url, "http://localhost", 16)) unlink(mpath);   // local test servers are never cached
     if (stat(mpath, &st) != 0) {
         if (getenv("WB_OFFLINE")) return 0;
         char cmd[12000];
         char hdrargs[8192] = "";
         int hn = cl ? snprintf(hdrargs, sizeof hdrargs, " -H 'Cookie: %s'", cookie) : 0;
+        if (g_top_url) {    // a cross-origin request carries the page's Origin (servers answer Access-Control-Allow-Origin only for it)
+            char to[300], uo[300];
+            int tn = 0, un = 0, sl = 0;
+            for (const char* q = g_top_url; *q && tn < 299; q++) { if (*q == '/' && ++sl == 3) break; to[tn++] = *q; }
+            to[tn] = 0; sl = 0;
+            for (const char* q = url; *q && un < 299; q++) { if (*q == '/' && ++sl == 3) break; uo[un++] = *q; }
+            uo[un] = 0;
+            if (strcmp(to, uo) && !strchr(to, '\'')) hn += snprintf(hdrargs + hn, sizeof hdrargs - hn, " -H 'Origin: %s'", to);
+        }
         if (req_headers && req_headers[0]) {
             const char* p = req_headers;
             int n = hn;
@@ -97,7 +109,7 @@ static int http_get(const char* url, const char* method, const char* req_headers
             char rq[600];
             snprintf(rq, sizeof rq, "%s/req.body", cdir);
             FILE* bf = fopen(rq, "wb");
-            if (bf) { fwrite(body, 1, strlen(body), bf); fclose(bf); }
+            if (bf) { fwrite(body, 1, blen, bf); fclose(bf); }
             snprintf(bodyarg, sizeof bodyarg, " --data-binary @%s", rq);
         }
         snprintf(cmd, sizeof cmd,
@@ -203,7 +215,7 @@ int main(int argc, char** argv) {
 again:
     g_top_url = 0;
     if (!strncmp(start, "http://", 7) || !strncmp(start, "https://", 8)) {
-        if (!http_get(start, "GET", 0, 0, &page) || !page.body) { fprintf(stderr, "fetch failed: %s\n", start); return 1; }
+        if (!http_get(start, "GET", 0, 0, 0, &page) || !page.body) { fprintf(stderr, "fetch failed: %s\n", start); return 1; }
         html = page.body;
         len = page.len;
         snprintf(url, sizeof url, "%s", page.final_url);
@@ -247,7 +259,7 @@ again:
                 ok = r.body != 0;
                 r.status = ok ? 200 : 0;
                 snprintf(r.final_url, sizeof r.final_url, "%s", rurl);
-            } else { tf = now_ms(); ok = http_get(rurl, method, hdrs, body, &r); }
+            } else { tf = now_ms(); ok = http_get(rurl, method, hdrs, body, blen, &r); }
             double tg = now_ms();
             if (ok && r.body) {
                 if (!quiet && getenv("WB_NET")) printf("[net] %d %s (%d bytes)\n", r.status, rurl, r.len);
@@ -284,6 +296,7 @@ again:
         int due = js ? wjs_next_due(js) : -1;
         if (js && wjs_media_active(js)) due = 5;
         if (now_ms() > deadline) break;
+        if (due < 0 && wdoc_pending(d) > 0) due = 1;    // a request queued by the script that just ran
         if (due < 0) break;
         if (due > 0) usleep((due > 50 ? 50 : due) * 1000);
     }
