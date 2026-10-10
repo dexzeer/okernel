@@ -214,6 +214,10 @@ struct vp9_dec {
     // size tracking for compute_image_size
     int have_last_size, last_width, last_height, last_show_frame;
     int alloc_mi_cols, alloc_mi_rows;
+    int max_pixels;
+    int ref_ok[REFS_PER_FRAME];   // reference sizes within the legal scaling range
+    int corrupt;                  // the bitstream broke a conformance rule; the frame is dropped
+    int bad_ref;                  // a block used a reference outside it
     int seg_map_dirty;          // PrevSegmentIds must be cleared before the next use
 
     // probabilities

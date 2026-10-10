@@ -294,7 +294,9 @@ void vp9_predict_inter(struct vp9_dec* d, int plane, int x, int y, int w, int h,
         int cmv_r = vp9_clip3(to_top - spel_top, to_bottom + spel_bottom, (2 * mvr) >> sub_y);
         int cmv_c = vp9_clip3(to_left - spel_left, to_right + spel_right, (2 * mvc) >> sub_x);
         // 8.5.2.3 scaling
-        struct vp9_buf* ref = d->ref[d->ref_frame_idx[d->ref_frame[ref_list] - LAST_FRAME]];
+        int ref_i = d->ref_frame[ref_list] - LAST_FRAME;
+        if (ref_i < 0 || ref_i >= REFS_PER_FRAME || !d->ref_ok[ref_i]) { d->bad_ref = 1; return; }
+        struct vp9_buf* ref = d->ref[d->ref_frame_idx[ref_i]];
         int x_scale = (int)(((int64_t)ref->width << REF_SCALE_SHIFT) / d->frame_width);
         int y_scale = (int)(((int64_t)ref->height << REF_SCALE_SHIFT) / d->frame_height);
         int base_x = (int)(((int64_t)x * x_scale) >> REF_SCALE_SHIFT);

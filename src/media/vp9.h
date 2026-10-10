@@ -24,6 +24,8 @@ struct vp9_dec;
 
 struct vp9_dec* vp9_dec_new(void);
 void vp9_dec_free(struct vp9_dec* d);
+// Largest frame accepted, in luma samples (default 36 million, about 8K UHD).
+void vp9_dec_set_limit(struct vp9_dec* d, int max_pixels);
 // Forget all references (after a seek). The next frame must be a key frame.
 void vp9_dec_reset(struct vp9_dec* d);
 
