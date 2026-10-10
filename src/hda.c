@@ -447,6 +447,24 @@ uint32_t audio_queued(void) {
     return q > RESYNC_MARGIN ? (q - RESYNC_MARGIN) / 4 : 0;   // real audio only
 }
 
+// Drop everything queued (seek, pause): the writer restarts just ahead of the read pointer and
+// the audio that was queued behind it is silenced before the hardware reaches it.
+void audio_flush(void) {
+    if (!H.ready) return;
+    uint64_t pl = played_abs();
+    uint64_t wr = H.wr_abs;
+    set_wr(pl + RESYNC_MARGIN);
+    uint64_t lo = pl;
+    if (wr > pl + RING_BYTES) wr = pl + RING_BYTES;
+    while (lo < wr) {
+        uint32_t off = (uint32_t)lo & (RING_BYTES - 1);
+        uint32_t chunk = RING_BYTES - off;
+        if (chunk > wr - lo) chunk = (uint32_t)(wr - lo);
+        memset(H.ring + off, 0, chunk);
+        lo += chunk;
+    }
+}
+
 uint32_t audio_space(void) {
     if (!H.ready) return 0;
     uint32_t q = queued_bytes();

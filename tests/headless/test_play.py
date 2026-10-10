@@ -99,7 +99,7 @@ for lag_try in range(max(0, nz[0] - 2400), nz[0] + 2400):
     e = float(np.sum((a - seg) ** 2))
     if best is None or e < best[0]: best = (e, lag_try)
 lag = best[1]
-m = re.search(r"\[play\] done: \d+ packets, (\d+) frames played", log)
+m = re.search(r"\[play\] done: (\d+) frames played", log)
 played = int(m.group(1)) if m else len(ref)
 # the player trims the end padding the container asks for; the reference may keep it
 n_cmp = min(len(ref), len(rec) - lag, played)
