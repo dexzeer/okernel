@@ -40,6 +40,22 @@ CASES = {
     "slices":          ("testsrc2", 8, "128x96", x264("main", "keyint=30:bframes=2:slices=4")),
     "high_all":        ("mandelbrot", 24, "192x128", x264("high", "keyint=24:bframes=3:ref=4:8x8dct=1:weightp=2:b-pyramid=normal")),
     "odd_crop":        ("testsrc2", 6, "130x98", x264("high", "keyint=30:bframes=2")),
+    # more of the toolbox
+    "cqm_jvt":         ("mandelbrot", 10, "160x112", x264("high", "keyint=30:bframes=2:cqm=jvt:8x8dct=1")),
+    "cqm_flat_cavlc":  ("mandelbrot", 10, "160x112", x264("high", "keyint=30:bframes=2:cqm=flat:cabac=0:8x8dct=1")),
+    "constrained":     ("testsrc2", 12, "128x96", x264("main", "keyint=30:bframes=2:constrained-intra=1")),
+    "qp_extremes":     ("mandelbrot", 8, "160x112", x264("high", "keyint=30:bframes=2:qp=4")),
+    "qp_high":         ("mandelbrot", 8, "160x112", x264("high", "keyint=30:bframes=2:qp=45")),
+    "aq_mbtree":       ("mandelbrot", 20, "192x128", x264("high", "keyint=60:bframes=3:aq-mode=2:rc-lookahead=20:crf=24")),
+    "me_far":          ("testsrc2", 16, "256x160", x264("high", "keyint=60:bframes=2:me=tesa:merange=64:subme=9:ref=3")),
+    "bframes16":       ("testsrc2", 40, "128x96", x264("high", "keyint=100:bframes=16:b-adapt=2:ref=6:b-pyramid=strict")),
+    "slices8_cavlc":   ("testsrc2", 10, "192x128", x264("main", "keyint=30:bframes=2:cabac=0:slices=8")),
+    "multi_idr":       ("testsrc2", 24, "128x96", x264("high", "keyint=6:bframes=2:ref=3")),
+    "no_deblock_p":    ("testsrc2", 12, "128x96", x264("main", "keyint=30:bframes=2:deblock=-1,-1:no-deblock=1")),
+    "deblock_strong":  ("testsrc2", 12, "128x96", x264("main", "keyint=30:bframes=2:deblock=6,6")),
+    "partitions_all":  ("mandelbrot", 12, "160x112", x264("high", "keyint=30:bframes=2:partitions=all:subme=7")),
+    "direct_auto":     ("testsrc2", 20, "128x96", x264("main", "keyint=60:bframes=3:direct=auto:b-adapt=2")),
+    "big":             ("mandelbrot", 6, "640x368", x264("high", "keyint=30:bframes=2:ref=3")),
 }
 
 
