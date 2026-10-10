@@ -48,6 +48,7 @@ struct wjs_dyn {
 #define NF_IMGEVT  0x04  // load/error already fired for this <img>
 
 #define WJS_LOG_MAX 400
+#define WJS_REJ_MAX 32           // unhandled-rejection candidates held until the microtask queue is empty
 
 struct wmedia;               // media sessions (wjs_media.c)
 
@@ -59,6 +60,8 @@ struct wjs {
     ojsv hooks;              // object returned by the prelude
     ojsv h_dispatch, h_ui, h_fetch, h_nextdue, h_rundue, h_frame, h_dcl, h_load,
          h_script, h_image, h_proto, h_report, h_mo, h_click, h_ready;
+    ojsv rej[2 * WJS_REJ_MAX]; // rejected promises with no handler yet: {promise, reason} pairs (a root range)
+    int nrej;
     int interactive;         // readyState "interactive" reached (parsing done)
     ojsv* node_obj;          // wrapper per node (OJS_UNDEFINED = none yet); a root range
     uint8_t* node_flags;
