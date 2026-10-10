@@ -98,7 +98,7 @@ DESKTOP_OBJ = src/hda.o src/pcix.o src/virtio.o src/vgpu.o src/i915.o src/fpu.o 
              src/crypto/certverify.o src/rtc.o \
              src/net/fetch.o
 
-.PHONY: all text desktop clean run debug host-tests host-tests-asan diff-oracle diff-test tls-interop web-tests
+.PHONY: all text desktop clean run debug host-tests host-tests-asan media-tests diff-oracle diff-test tls-interop web-tests
 
 # ---- Web engine host tests (src/web) ----
 # Offline must-pass: CSS cascade unit tests, font engine. With the corpus
@@ -153,6 +153,16 @@ host-tests:
 	gcc -m32 -O1 -fsanitize=address,undefined -Isrc/crypto -Isrc -o build-host/t_dechunk tests/test_dechunk.c build-host/dechunk_fn.c $(HOST_CRYPTO_SRC) && ./build-host/t_dechunk | tail -n 1
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_adv tests/test_adversarial.c $(HOST_CRYPTO_SRC) && timeout 300 ./build-host/t_adv | tail -n 3
 	-gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tls_live tests/test_tls_client.c $(HOST_CRYPTO_SRC) && timeout 60 ./build-host/t_tls_live | tail -n 3; echo "(tls_client_test: needs internet; SKIP if unreachable)"
+
+# Media decoders (src/media) against the RFC 6716 reference decoder's output; the vectors
+# are checked in (tests/media/vec), regenerate with tests/media/gen_opus_vectors.py.
+# -mfpmath=387 matches what the kernel executes (x87, no SSE).
+media-tests:
+	mkdir -p build-host
+	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -o build-host/t_celt tests/media/test_celt.c src/media/celt.c src/media/celt_tables.c src/media/ec.c src/media/opus_packet.c -lm
+	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_celt_fuzz tests/media/fuzz_celt.c src/media/celt.c src/media/celt_tables.c src/media/ec.c -lm
+	@set -e; for f in tests/media/vec/opus_celt_*.bit; do n=$${f%.bit}; ASAN_OPTIONS=detect_leaks=0 ./build-host/t_celt $$n.bit $$n.ref | tail -n 1 | sed "s|^|$$n: |"; done
+	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_celt_fuzz 50000 1 tests/media/vec/opus_celt_fb_st.bit tests/media/vec/opus_celt_ld_st_12k.bit tests/media/vec/opus_celt_2_5ms.bit | tail -n 1
 
 # Sanitizer run of the adversarial suite (review P0 infra): every parser,
 # flight, and mock path under ASan+UBSan. Slow (~10 min, RSA-heavy) — run
