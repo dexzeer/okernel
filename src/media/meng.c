@@ -18,6 +18,7 @@
 #define VIDEO_LEAD_NS 20000000LL        // decode a frame this long before it is due
 #define VIDEO_BUDGET_TICKS 3            // ~30 ms of video work per poll
 #define GAP_NS 250000000LL              // a hole longer than this ends a buffered range
+#define SHOW_AT_LEAST_TICKS 15            // while decoding falls behind, still present a frame every 150 ms
 #define SLOP_NS 1000000LL               // audio alignment tolerance
 #define NS_NUM 62500                    // 1e9 / 48000 = 62500 / 3 ns per audio frame
 #define NS_DEN 3
@@ -105,6 +106,7 @@ struct meng {
     struct vp9_image last_img;          // the image behind the current frame (valid until the next decode)
     int have_last_img;
     uint32_t v_decoded, v_shown, v_dropped;
+    uint32_t v_last_show;               // tick of the last presented frame (a backlog never starves the picture)
     uint32_t a_frames_out;
 
     int ready_state;
@@ -660,6 +662,7 @@ static void on_image(void* u, const struct vp9_image* img) {
     m->last_img = *img;
     m->have_last_img = 1;
     m->v_shown++;
+    m->v_last_show = m->env.ticks();
 }
 
 static uint32_t vq_live(const struct meng* m, uint32_t i) {
@@ -705,6 +708,7 @@ static void video_pump(struct meng* m, int64_t now) {
         if (now + VIDEO_LEAD_NS < pk->pts_ns) break;                        // not due yet
         uint32_t nx = vq_live(m, m->vq.next + 1);
         m->skip_present = nx < m->vq.n && m->vq.pk[nx].pts_ns <= now + VIDEO_LEAD_NS;
+        if (m->skip_present && m->env.ticks() - m->v_last_show >= SHOW_AT_LEAST_TICKS) m->skip_present = 0;
         video_decode_one(m);
         if (m->env.ticks() - t0 >= VIDEO_BUDGET_TICKS) break;
         now = clock_now(m);
