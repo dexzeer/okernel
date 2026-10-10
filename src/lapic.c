@@ -147,7 +147,9 @@ void lapic_ipi_startup(uint32_t dest, uint8_t page) { lapic_ipi(dest, 0x4600u | 
 void pit_delay_us(uint32_t us) {
     while (us) {
         uint32_t chunk = us > 50000 ? 50000 : us;
-        uint32_t count = chunk * 1193u + (chunk * 182u) / 1000u;
+        // PIT clock = 1,193,182 Hz: 1.193182 counts per microsecond (chunk <= 50000
+        // keeps the product in 32 bits and the count within the 16-bit counter)
+        uint32_t count = (chunk * 1193u) / 1000u + (chunk * 182u) / 1000000u;
         if (count == 0) count = 1;
         outb(0x61, (uint8_t)((inb(0x61) & 0xFD) | 0x01));      // gate on, speaker off
         outb(0x43, 0xB0);
