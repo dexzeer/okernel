@@ -26,12 +26,20 @@ struct opus_packet {
 // Parse the TOC and frame layout (section 3). Returns 0 or -1 for a malformed packet.
 int opus_parse_packet(const uint8_t* data, int len, struct opus_packet* out);
 
+enum {
+    OPUS_ERR_BAD_ARG = -1,
+    OPUS_ERR_INVALID_PACKET = -4,
+    OPUS_ERR_INTERNAL = -3,
+    OPUS_ERR_UNSUPPORTED = -5,        // SILK / hybrid frame (not implemented yet): the frame is silence
+};
+
 struct opus_dec;
 struct opus_dec* opus_dec_new(int channels);          // channels: 1 or 2 (output)
 void opus_dec_free(struct opus_dec* d);
-// Decode one packet. pcm gets nframes*channels int16 samples (capacity max_frames
-// per channel). data == 0 or len == 0 asks for packet-loss concealment of
-// `plc_frames` frames. Returns samples per channel, or a negative error.
+void opus_dec_reset(struct opus_dec* d);              // after a seek
+// Decode one packet. pcm gets nframes * channels int16 samples; max_frames is its capacity
+// in samples per channel (at least 120). data == 0 or len <= 0 conceals one lost 20 ms
+// frame. Returns samples per channel, or a negative OPUS_ERR_*.
 int opus_decode(struct opus_dec* d, const uint8_t* data, int len, int16_t* pcm, int max_frames);
 
 #endif
