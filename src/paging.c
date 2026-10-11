@@ -146,7 +146,8 @@ void paging_init(uint32_t framebuffer_addr, uint32_t fb_bytes) {
 // paging_map_mmio draw from. Windows must be created before the first process
 // (page directories copy the kernel half at creation), i.e. during boot.
 #define MMIO_VBASE MMIO_VBASE_HI
-#define MMIO_WINDOWS 16
+#define MMIO_WINDOWS 16          // the last one is the probe window (paging_probe_window), not part of the pool
+#define MMIO_POOL (MMIO_WINDOWS - 1)
 static uint32_t mmio_next = MMIO_VBASE;
 static struct { uint32_t base; uint32_t flags; } mmio_win[MMIO_WINDOWS];
 
@@ -160,7 +161,7 @@ static void* map_windows(uint32_t phys_addr, uint32_t len, uint32_t flags) {
             if (mmio_win[i].base == base && mmio_win[i].flags == flags)
                 return (void*)(v + off);
     }
-    if (mmio_next + n * 0x00400000 > MMIO_VBASE + MMIO_WINDOWS * 0x00400000) return 0;
+    if (mmio_next + n * 0x00400000 > MMIO_VBASE + MMIO_POOL * 0x00400000) return 0;
     uint32_t vbase = mmio_next;
     for (uint32_t k = 0; k < n; k++) {
         map_4mb_at(base + k * 0x00400000, (vbase >> 22) + k, flags);
@@ -176,6 +177,21 @@ static void* map_windows(uint32_t phys_addr, uint32_t len, uint32_t flags) {
 // Cached mapping of one 4MB phys region (RAM-like: ACPI tables). Returns a HIGH
 // virtual address, never phys.
 void* paging_map(uint32_t phys_addr) { return map_windows(phys_addr, 1, 0x03); }
+
+// A scratch 4MB window (the last MMIO slot) that can be re-pointed at any 4MB-aligned physical block, to read device
+// registers in address space nobody has mapped (hunting for an ACPI-mode controller). Boot time only: page directories
+// copy the kernel half when a process is created. paging_probe_window(0) unmaps it again.
+void* paging_probe_window(uint32_t phys4mb) {
+    uint32_t idx = (MMIO_VBASE >> 22) + MMIO_WINDOWS - 1;
+    static int ours;                                       // 1 once we have put our own entry there
+    if (!ours) {
+        if (page_directory[idx] & 1) return 0;             // something else (an identity-mapped framebuffer) lives there
+        ours = 1;
+    }
+    page_directory[idx] = phys4mb ? ((phys4mb & 0xFFC00000) | 0x9B) : 0;     // P | RW | PWT | PCD | PS
+    __asm__ volatile("invlpg (%0)" :: "r"(idx << 22) : "memory");
+    return phys4mb ? (void*)(idx << 22) : 0;
+}
 
 // Uncached (PCD|PWT) mapping of `len` bytes of device registers at phys_addr,
 // contiguous in virtual memory. Returns 0 when the pool is exhausted.

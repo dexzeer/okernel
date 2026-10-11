@@ -1,0 +1,436 @@
+// I2C-HID touchpad glue (see i2chid.h): ACPI lookup, controller hunt, bring-up, polling.
+#include "i2chid.h"
+#include <stdarg.h>
+#include "acpi.h"
+#include "cursor.h"
+#include "devlog.h"
+#include "dwi2c.h"
+#include "graphics.h"
+#include "hid.h"
+#include "hidi2c.h"
+#include "i2caml.h"
+#include "lapic.h"
+#include "memlayout.h"
+#include "memory.h"
+#include "paging.h"
+#include "pcix.h"
+#include "ptp.h"
+#include "string.h"
+
+extern uint32_t tick_count;           // 100 Hz since boot (desktop.c)
+
+#define tlog(...) devlog('t', __VA_ARGS__)
+static inline uint64_t rdtsc(void) { uint32_t lo, hi; __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi)); return ((uint64_t)hi << 32) | lo; }
+#define MAXDEV 4
+#define MAXBLK 12
+#define MAXRNG 96
+
+static struct rng { uint32_t lo, hi; } RNG[MAXRNG];     // [lo, hi) address ranges the scan skips
+static int nrng;
+
+static struct {
+    int state;                         // 0 nothing to do, 1 searching, 2 running, 3 failed
+    struct i2c_hid_dev dev[MAXDEV];
+    int ndev, cur;
+    uint32_t blk[MAXBLK];              // physical bases of the DesignWare blocks found
+    int nblk;
+    uint32_t base;                     // the one the touchpad answered on
+    volatile uint8_t* regs;
+    struct dwi2c dw;
+    struct hidi2c h;
+    struct hid_ptr lay[HID_MAXRPT];
+    int nptr, ids;
+    struct hid_touch touch;
+    int have_touch;
+    struct ptp ptp;
+    uint32_t reports, errors, empty, unmatched, last_tick, fails;
+    int button;
+    int logged;
+    int paused;                        // `touchpad off`
+} T;
+
+static int cmdline_has(uint32_t mboot, const char* word) {
+    uint32_t flags = *(volatile uint32_t*)(mboot + 0);
+    if (!(flags & (1u << 2))) return 0;
+    const char* c = (const char*)P2V_U32(*(volatile uint32_t*)(mboot + 16));
+    uint32_t wl = (uint32_t)strlen(word);
+    for (int i = 0; c[i] && i < 512; i++)
+        if (!strncmp(c + i, word, wl) && (i == 0 || c[i - 1] == ' ') && (c[i + wl] == 0 || c[i + wl] == ' ')) return 1;
+    return 0;
+}
+
+// ---- address ranges the scan must not read ------------------------------------------------------
+static void rng_add(uint32_t lo, uint32_t hi) {
+    if (hi <= lo || nrng >= MAXRNG) return;
+    RNG[nrng].lo = lo; RNG[nrng].hi = hi; nrng++;
+}
+
+static int rng_has(uint32_t a) {
+    for (int i = 0; i < nrng; i++) if (a >= RNG[i].lo && a < RNG[i].hi) return 1;
+    return 0;
+}
+
+static void collect_ranges(uint32_t mboot) {
+    nrng = 0;
+    uint32_t flags = *(volatile uint32_t*)(mboot + 0);
+    if (flags & (1u << 6)) {                                          // RAM, ACPI tables, NVS from the firmware map
+        uint32_t mlen = *(volatile uint32_t*)(mboot + 44), maddr = *(volatile uint32_t*)(mboot + 48);
+        for (uint32_t o = 0; o + 24 <= mlen && o < 4096; ) {
+            const volatile uint32_t* e = (const volatile uint32_t*)P2V_U32(maddr + o);
+            uint32_t esz = e[0], base = e[1], baseh = e[2], rl = e[3], rlh = e[4], type = e[5];
+            if (esz < 20) break;
+            if ((type == 1 || type == 3 || type == 4) && baseh == 0) {
+                uint32_t hi = (rlh || base + rl < base) ? 0xFFFFFFFFu : base + rl;
+                rng_add(base, hi);
+            }
+            o += esz + 4;
+        }
+    }
+    rng_add(0xE0000000u, 0xF0000000u);                                // the usual PCI config window
+    struct pci_loc l;
+    if (cmdline_has(mboot, "i2cbars")) return;                        // test option: scan the PCI BARs too (QEMU device models)
+    for (int n = 0; n < 96 && pcix_find_class(0xFF, 0, n, &l); n++) {
+        if (pcix_read32(l, 0) == 0xFFFFFFFFu) continue;
+        int ht = pcix_read8(l, 0x0E) & 0x7F;
+        int nb = ht == 0 ? 6 : ht == 1 ? 2 : 0;
+        for (int b = 0; b < nb; b++) {
+            uint32_t raw = pcix_read32(l, (uint8_t)(0x10 + 4 * b));
+            if (raw & 1) continue;                                    // I/O BAR
+            int is64 = ((raw >> 1) & 3) == 2;
+            int mem, above;
+            uint32_t base = pcix_bar(l, b, &mem, &above);
+            uint32_t size = base ? pcix_bar_size(l, b) : 0;
+            if (base && !above && size) rng_add(base, base + size < base ? 0xFFFFFFFFu : base + size);
+            if (is64) b++;
+        }
+    }
+}
+
+// ---- register access ------------------------------------------------------------------------------
+static uint32_t mm_rd(void* c, uint32_t off) { return *(volatile uint32_t*)((uint8_t*)c + off); }
+static void mm_wr(void* c, uint32_t off, uint32_t v) { *(volatile uint32_t*)((uint8_t*)c + off) = v; }
+static void us_delay(uint32_t us) { pit_delay_us(us); }
+static void ms_delay(uint32_t ms) { while (ms--) pit_delay_us(1000); }
+static int bus_xfer(void* ctx, int addr, const uint8_t* w, int wl, uint8_t* r, int rl) {
+    (void)ctx;
+    return dw_xfer(&T.dw, addr, w, wl, r, rl);
+}
+
+// ---- the controller hunt ----------------------------------------------------------------------------
+// Reads one dword per 4 KB page of the PCI hole (not RAM, not a PCI BAR, not the config window) through the scratch window
+// and records every page whose component type register reads "DesignWare I2C".
+static int try_block(uint32_t phys);
+static int bring_up_device(void);
+
+static void scan_for_controllers(void) {
+    uint32_t pages = 0;
+    uint32_t t0 = (uint32_t)(rdtsc() >> 20);
+    T.nblk = 0;
+    for (uint32_t w = 0x40000000u; w < 0xFEC00000u && T.nblk < MAXBLK; w += 0x400000u) {
+        int any = 0;
+        for (uint32_t p = 0; p < 0x400000u && !any; p += 0x1000) if (!rng_has(w + p)) any = 1;
+        if (!any) continue;
+        volatile uint32_t* v = (volatile uint32_t*)paging_probe_window(w);
+        if (!v) { tlog("scan: no probe window available"); return; }
+        for (uint32_t p = 0; p < 0x400000u; p += 0x1000) {
+            if (rng_has(w + p)) continue;
+            pages++;
+            if (v[(p + 0xFC) / 4] == DW_COMP_TYPE && T.nblk < MAXBLK) {
+                uint32_t phys = w + p;
+                T.blk[T.nblk++] = phys;
+                tlog("  DesignWare I2C block at %x", phys);
+                if (try_block(phys) && bring_up_device()) { T.state = 2; goto done; }      // found the touchpad: stop looking
+            }
+        }
+    }
+done:
+    paging_probe_window(0);
+    tlog("scan: %u pages read in %u Mcycles, %d DesignWare I2C block(s)", pages, (uint32_t)(rdtsc() >> 20) - t0, T.nblk);
+}
+
+static void hexline(const char* what, const uint8_t* b, int n) {
+    char s[40]; int k = 0;
+    for (int i = 0; i < n && i < 12; i++) { s[k++] = "0123456789abcdef"[b[i] >> 4]; s[k++] = "0123456789abcdef"[b[i] & 15]; s[k++] = ' '; }
+    s[k] = 0;
+    tlog("%s %s", what, s);
+}
+
+// LPSS wrapper registers at +0x800: reset release (+0x804, bits 0-1) and the clock gate (+0x800, bit 0)
+static void lpss_kick(volatile uint8_t* regs) {
+    uint32_t rst = mm_rd((void*)regs, 0x804), clk = mm_rd((void*)regs, 0x800);
+    tlog("  LPSS clock %x resets %x general %x", clk, rst, mm_rd((void*)regs, 0x808));
+    if ((rst & 3) != 3) mm_wr((void*)regs, 0x804, rst | 3);
+    if (!(clk & 1) && clk != 0xFFFFFFFFu) mm_wr((void*)regs, 0x800, clk | 1);
+    ms_delay(2);
+}
+
+// Does the touchpad answer on the controller block at `phys`? Two passes: as the firmware left it, then after the LPSS kick.
+static int try_block(uint32_t phys) {
+    volatile uint8_t* regs = (volatile uint8_t*)paging_map_mmio(phys, 0x1000);
+    if (!regs) { tlog("block %x: cannot map", phys); return 0; }
+    T.dw.rd = mm_rd; T.dw.wr = mm_wr; T.dw.delay_us = us_delay; T.dw.ctx = (void*)regs;
+    if (!dw_present(&T.dw)) { tlog("block %x: not a DesignWare I2C now (type %x)", phys, mm_rd((void*)regs, 0xFC)); return 0; }
+    tlog("block %x: version %x param %x enable-status %x", phys, mm_rd((void*)regs, 0xF8), mm_rd((void*)regs, 0xF4), mm_rd((void*)regs, 0x9C));
+    T.regs = regs;
+    T.h.bus.xfer = bus_xfer; T.h.bus.delay_ms = ms_delay; T.h.bus.ctx = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        if (pass == 1) lpss_kick(regs);
+        if (dw_setup(&T.dw, 0) < 0) { tlog("  controller will not switch off (pass %d)", pass); continue; }
+        for (int d = 0; d < T.ndev; d++) {
+            const struct i2c_hid_dev* dev = &T.dev[d];
+            static const uint16_t fallback[] = { 0x0020, 0x0001, 0x0000, 0x0002, 0x0010, 0x0030, 0x0100 };
+            uint16_t cand[8 + 7];
+            int nc = 0;
+            for (int i = 0; i < dev->nreg; i++) cand[nc++] = dev->reg[i];
+            for (unsigned i = 0; i < sizeof fallback / sizeof fallback[0]; i++) {
+                int dup = 0;
+                for (int k = 0; k < nc; k++) if (cand[k] == fallback[i]) dup = 1;
+                if (!dup) cand[nc++] = fallback[i];
+            }
+            T.h.addr = dev->addr;
+            int firstrc = 0;
+            for (int i = 0; i < nc; i++) {
+                int rc = hidi2c_get_desc(&T.h, cand[i]);
+                if (i == 0) firstrc = rc;
+                if (rc == -1) break;                                   // the bus is not answering at all: no point trying more registers
+                if (rc == 0) {
+                    tlog("  %s at %x on block %x: HID descriptor at register %x (pass %d)", dev->hid, dev->addr, phys, cand[i], pass);
+                    T.cur = d; T.base = phys;
+                    return 1;
+                }
+            }
+            tlog("  addr %x: no HID descriptor (first try rc %d, abort %x, pass %d)", dev->addr, firstrc, T.dw.last_abort, pass);
+        }
+    }
+    return 0;
+}
+
+static void try_all_blocks(void) {
+    for (int i = 0; i < T.nblk; i++) {
+        if (try_block(T.blk[i]) && bring_up_device()) { T.state = 2; return; }
+    }
+    if (T.state != 2) T.state = 3;
+}
+
+// The device answered: power it, reset it, read and parse its report descriptor, choose the report format.
+static int bring_up_device(void) {
+    struct hidi2c* h = &T.h;
+    tlog("  desc: vendor %x product %x version %x, report desc %u bytes, input reg %x max %u, command reg %x",
+         h->vid, h->pid, h->ver, h->rdesc_len, h->in_reg, h->max_in, h->cmd_reg);
+    int r = hidi2c_power(h, 1);
+    if (r < 0) tlog("  power on: bus error %d", r);
+    r = hidi2c_reset(h);
+    tlog("  reset: %s", r == 0 ? "acknowledged" : r > 0 ? "no answer (carrying on)" : "bus error");
+    uint8_t* rd = (uint8_t*)kmalloc(h->rdesc_len);
+    if (!rd) { tlog("  out of memory"); return 0; }
+    int n = hidi2c_report_desc(h, rd, h->rdesc_len);
+    if (n < 0) { tlog("  report descriptor read failed (%d)", n); kfree(rd); return 0; }
+    hexline("  rd[0..]:", rd, n);
+    T.nptr = hid_parse_pointer(rd, n, T.lay, HID_MAXRPT, &T.ids);
+    int tids = 0;
+    T.have_touch = hid_parse_touch(rd, n, &T.touch, &tids);
+    if (T.have_touch) T.ids = T.ids || tids;
+    for (int i = 0; i < T.nptr; i++)
+        tlog("  mouse report id %d: %s x%d@%d y%d@%d btn%d len %d", T.lay[i].id, T.lay[i].absolute ? "abs" : "rel", T.lay[i].x.bits, T.lay[i].x.off,
+             T.lay[i].y.bits, T.lay[i].y.off, T.lay[i].btn[0].bits ? 1 : 0, T.lay[i].bytes);
+    if (T.have_touch) {
+        tlog("  touchpad report id %d: %d finger(s) x%d..%d y%d..%d len %d count %d button %d mode-feature %d", T.touch.id, T.touch.nf,
+             T.touch.f[0].x.lmin, T.touch.f[0].x.lmax, T.touch.f[0].y.lmin, T.touch.f[0].y.lmax, T.touch.bytes, T.touch.count.bits, T.touch.button.bits,
+             T.touch.mode.bits);
+        int xr = T.touch.f[0].x.lmax - T.touch.f[0].x.lmin, yr = T.touch.f[0].y.lmax - T.touch.f[0].y.lmin;
+        ptp_init(&T.ptp, xr > 0 ? xr : 1000, yr > 0 ? yr : 600, SCREEN_W);
+        uint8_t mr[16];
+        int ml = hid_touch_mode_report(&T.touch, tids, mr, sizeof mr);
+        if (ml) {
+            int rc = hidi2c_set_feature(h, tids ? mr[0] : 0, mr + (tids ? 1 : 0), ml - (tids ? 1 : 0));
+            tlog("  Input Mode = touchpad: %s (%d)", rc == 0 ? "sent" : "failed", rc);
+        }
+    }
+    kfree(rd);
+    if (!T.nptr && !T.have_touch) { tlog("  neither a mouse nor a touchpad report in the descriptor"); return 0; }
+    // try the fast bus speed; keep it only when the descriptor still reads back
+    if (dw_setup(&T.dw, 1) == 0) {
+        if (hidi2c_get_desc(h, h->desc_reg) != 0) { tlog("  fast mode failed: back to standard"); dw_setup(&T.dw, 0); }
+        else tlog("  bus in fast mode");
+    }
+    T.fails = 0;
+    tlog("  touchpad running");
+    return 1;
+}
+
+// ---- what the AML says about the controller (shown by `touchpad aml` when the hunt fails) -------------
+#define alog(...) devlog('a', __VA_ARGS__)
+
+static void hexlog(const char* what, const uint8_t* b, uint32_t n) {
+    for (uint32_t o = 0; o < n; o += 20) {
+        char s[64]; int k = 0;
+        for (uint32_t i = o; i < o + 20 && i < n; i++) { s[k++] = "0123456789abcdef"[b[i] >> 4]; s[k++] = "0123456789abcdef"[b[i] & 15]; }
+        s[k] = 0;
+        alog("%s%x %s", what, o, s);
+    }
+}
+
+static int find_nm(const uint8_t* t, uint32_t from, uint32_t end, const char* pat) {
+    for (uint32_t i = from; i + 4 <= end; i++)
+        if (t[i] == (uint8_t)pat[0] && t[i + 1] == (uint8_t)pat[1] && t[i + 2] == (uint8_t)pat[2] && t[i + 3] == (uint8_t)pat[3]) return (int)i;
+    return -1;
+}
+
+static void dump_ctrl_aml(const char* path) {
+    int sl = (int)strlen(path);
+    const char* nm = path + (sl >= 4 ? sl - 4 : 0);
+    uint8_t* tabs[24];
+    uint32_t lens[24];
+    int nt = acpi_aml_tables(tabs, lens, 24);
+    int nop = 0;
+    for (int ti = 0; ti < nt; ti++) {
+        const uint8_t* t = tabs[ti];
+        uint32_t len = lens[ti];
+        for (uint32_t i = 36; i + 12 < len; i++) {
+            if (t[i] != 0x5B) continue;
+            if (t[i + 1] == 0x80 && nop < 14 && i + 14 < len) {                 // OperationRegion(name, space, offset, length)
+                const uint8_t* q = t + i + 2;
+                uint8_t space = q[4];
+                if (space == 0 || space == 2) {
+                    uint32_t off = 0, o = 0;
+                    if (q[5] == 0x0C) { off = (uint32_t)q[6] | ((uint32_t)q[7] << 8) | ((uint32_t)q[8] << 16) | ((uint32_t)q[9] << 24); o = 1; }
+                    else if (q[5] == 0x0B) { off = (uint32_t)q[6] | ((uint32_t)q[7] << 8); o = 1; }
+                    else if (q[5] == 0x0A) { off = q[6]; o = 1; }
+                    if (o) { alog("OpRegion %c%c%c%c %s offset %x", q[0], q[1], q[2], q[3], space == 0 ? "mem" : "pcicfg", off); nop++; }
+                }
+                continue;
+            }
+            if (t[i + 1] != 0x82) continue;                                     // DeviceOp
+            uint32_t p = i + 2, lead = t[p], cnt = (lead >> 6) & 3;
+            uint32_t pk = cnt == 0 ? (lead & 0x3F) : (lead & 0x0F);
+            for (uint32_t k = 0; k < cnt; k++) pk |= (uint32_t)t[p + 1 + k] << (4 + 8 * k);
+            uint32_t nstart = p + 1 + cnt, end = p + pk;
+            if (end > len || memcmp(t + nstart, nm, 4)) continue;
+            alog("device %s: %u bytes of AML", nm, pk);
+            int c = find_nm(t, nstart + 4, end, "_CRS");
+            if (c >= 0) hexlog("_CRS ", t + c + 4, end - (uint32_t)(c + 4) > 60 ? 60 : end - (uint32_t)(c + 4));
+            int ps = find_nm(t, nstart + 4, end, "_PS0");
+            if (ps >= 0) hexlog("_PS0 ", t + ps + 4, end - (uint32_t)(ps + 4) > 60 ? 60 : end - (uint32_t)(ps + 4));
+            int st = find_nm(t, nstart + 4, end, "_STA");
+            if (st >= 0) hexlog("_STA ", t + st + 4, end - (uint32_t)(st + 4) > 24 ? 24 : end - (uint32_t)(st + 4));
+        }
+        kfree(tabs[ti]);
+    }
+}
+
+// ---- entry points -------------------------------------------------------------------------------
+void i2chid_init(uint32_t mboot_phys) {
+    if (cmdline_has(mboot_phys, "noi2c")) { tlog("disabled (noi2c)"); return; }
+    uint8_t* tabs[24];
+    uint32_t lens[24];
+    int nt = acpi_aml_tables(tabs, lens, 24);
+    T.ndev = 0;
+    for (int i = 0; i < nt; i++) {
+        if (T.ndev < MAXDEV) T.ndev += i2caml_find(tabs[i], lens[i], T.dev + T.ndev, MAXDEV - T.ndev);
+        kfree(tabs[i]);
+    }
+    if (!T.ndev) return;                                                // nothing to look for: stay out of the way
+    for (int i = 0; i < T.ndev; i++) {
+        const struct i2c_hid_dev* d = &T.dev[i];
+        tlog("ACPI: %s at I2C address %x, %u Hz, controller %s", d->hid, d->addr, d->speed, d->ctrl);
+        char rs[48]; int k = 0;
+        for (int j = 0; j < d->nreg && k < 40; j++) { rs[k++] = "0123456789abcdef"[(d->reg[j] >> 4) & 15]; rs[k++] = "0123456789abcdef"[d->reg[j] & 15]; rs[k++] = ' '; }
+        rs[k] = 0;
+        tlog("  _DSM register candidates: %s", k ? rs : "none");
+    }
+    T.state = 1;
+    collect_ranges(mboot_phys);
+    scan_for_controllers();                       // each block found is tried at once
+    if (T.state != 2) {
+        T.state = 3;
+        tlog("the touchpad did not answer on any controller block (`touchpad aml` shows what the AML says)");
+        dump_ctrl_aml(T.dev[0].ctrl);
+    }
+}
+
+void i2chid_retry(void) {
+    if (!T.ndev) { tlog("no I2C-HID device in ACPI"); return; }
+    if (T.state == 2) { tlog("already running"); return; }
+    T.state = 1;
+    try_all_blocks();
+}
+
+static void process(const uint8_t* b, int n, uint32_t now) {
+    if (T.have_touch) {
+        struct hid_contact c[HID_MAXFINGER];
+        int nc, count, button;
+        if (hid_touch_decode(&T.touch, T.ids, b, n, c, &nc, &count, &button)) {
+            struct ptp_out o;
+            T.button = button;
+            ptp_report(&T.ptp, now, c, nc, count, button, &o);
+            if (o.changed) mouse_inject(o.dx, o.dy, o.wheel, o.buttons);
+            return;
+        }
+    }
+    for (int i = 0; i < T.nptr; i++) {
+        int rx, ry, w, bt;
+        if (!hid_decode(&T.lay[i], T.ids, b, n, &rx, &ry, &w, &bt)) continue;
+        if (T.lay[i].absolute) {
+            int cx, cy;
+            mouse_get_position(&cx, &cy);
+            rx = (int)(((uint32_t)rx * (uint32_t)(SCREEN_W - 1)) / 65535u) - cx;
+            ry = (int)(((uint32_t)ry * (uint32_t)(SCREEN_H - 1)) / 65535u) - cy;
+        }
+        mouse_inject(rx, ry, -w, bt);
+        return;
+    }
+    T.unmatched++;
+}
+
+void i2chid_enable(int on) { T.paused = !on; tlog(on ? "polling on" : "polling off"); }
+
+void i2chid_poll(void) {
+    if (T.state != 2 || T.paused) return;
+    uint32_t t = tick_count;
+    if (t == T.last_tick) return;
+    T.last_tick = t;
+    static uint8_t buf[HIDI2C_MAXREPORT];
+    int n = hidi2c_input(&T.h, buf, sizeof buf);
+    uint32_t now = t * 10;
+    if (n > 0) {
+        T.reports++;
+        T.fails = 0;
+        if (T.logged < 3) { T.logged++; hexline("report:", buf, n); }
+        process(buf, n, now);
+    } else if (n == 0) {
+        T.empty++;
+        if (T.have_touch) {
+            struct ptp_out o;
+            ptp_idle(&T.ptp, now, T.button, &o);
+            if (o.changed) mouse_inject(o.dx, o.dy, o.wheel, o.buttons);
+        }
+    } else {
+        T.errors++;
+        if (T.errors <= 3) tlog("input read error %d (abort %x)", n, T.dw.last_abort);
+        if (n == -1 && ++T.fails >= 20) { tlog("bus stuck: touchpad polling stopped"); T.state = 3; }
+    }
+}
+
+static int sfmt(char* buf, int cap, int at, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    char line[100];
+    int n = devlog_fmt(line, sizeof line, fmt, ap);
+    va_end(ap);
+    for (int i = 0; i < n && at < cap - 2; i++) buf[at++] = line[i];
+    if (at < cap - 1) buf[at++] = '\n';
+    buf[at] = 0;
+    return at;
+}
+
+void i2chid_aml(char* buf, int cap) {
+    buf[0] = 0;
+    devlog_tail('a', buf, cap, 0, 24);
+}
+
+void i2chid_status(char* buf, int cap) {
+    buf[0] = 0;
+    const char* st = T.state == 2 ? (T.paused ? "paused (touchpad on)" : "running") : T.state == 1 ? "searching" : T.state == 3 ? "NOT WORKING" : "no I2C-HID device in ACPI";
+    int at = sfmt(buf, cap, 0, "touchpad: %s, reports %u, empty polls %u, errors %u, unmatched %u", st, T.reports, T.empty, T.errors, T.unmatched);
+    devlog_tail('t', buf, cap, at, 22);
+}

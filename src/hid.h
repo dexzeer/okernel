@@ -3,8 +3,11 @@
 
 #include <stdint.h>
 
-// HID report descriptor parser for pointing devices (mice, trackballs, tablets in mouse mode). Pure code: no kernel
-// dependencies, host-tested with fuzzing (tests/test_hid.c). Written from the USB HID 1.11 specification (section 6.2.2).
+// HID report descriptor parser for pointing devices (mice, trackballs, tablets in mouse mode) and touchpads
+// (Windows Precision Touchpad reports). Pure code: no kernel dependencies, host-tested with fuzzing
+// (tests/test_hid.c, tests/test_touch.c). Written from the USB HID 1.11 specification (section 6.2.2) and the
+// Windows Precision Touchpad report layout (usage page 0x0D: Touch Pad 5, Finger 0x22, Tip Switch 0x42, Contact
+// Identifier 0x51, Contact Count 0x54).
 //
 // hid_parse_pointer() walks the descriptor and returns, for every input report that belongs to a top-level Generic
 // Desktop Mouse or Pointer collection and carries X and Y, where the fields sit in the report.
@@ -38,5 +41,38 @@ int32_t hid_get(const uint8_t* r, int len, int off, int bits, int sign);
 // (relative motion, or the absolute position scaled 0..65535 over the field's logical range).
 int hid_decode(const struct hid_ptr* p, int uses_ids, const uint8_t* r, int len,
                int* rx, int* ry, int* wheel, int* buttons);
+
+// ---- touchpads ----------------------------------------------------------------------------------
+#define HID_MAXFINGER 5
+
+struct hid_finger {
+    struct hid_fld tip, id, x, y;
+};
+
+struct hid_touch {
+    uint8_t id;                       // report id (0 = none)
+    uint16_t bytes;                   // whole report including the id byte
+    int nf;                           // finger blocks in one report
+    struct hid_finger f[HID_MAXFINGER];
+    struct hid_fld count;             // contact count (report level)
+    struct hid_fld button;            // the click button of a clickpad (usage page 9, button 1)
+    struct hid_fld mode;              // the Input Mode feature (usage 0x52) that switches mouse emulation to touchpad reports
+    uint8_t mode_id;                  // its report id
+    uint16_t mode_bytes;              // size of that feature report without the id byte
+};
+
+// The input report of a top-level Touch Pad collection (the last one wins when there are several). Returns 1 when found.
+int hid_parse_touch(const uint8_t* d, int n, struct hid_touch* out, int* uses_ids);
+
+// Builds the feature report that puts the touchpad into Precision Touchpad mode (Input Mode = 3). Returns its length
+// (the id byte first when uses_ids), 0 when the device has no such feature.
+int hid_touch_mode_report(const struct hid_touch* t, int uses_ids, uint8_t* out, int cap);
+
+struct hid_contact { int tip, id, x, y; };
+
+// Decodes a report into at most HID_MAXFINGER contacts; *count = the contact count field (0 when absent), *button = click.
+// Returns 1 when the report belongs to the layout.
+int hid_touch_decode(const struct hid_touch* t, int uses_ids, const uint8_t* r, int len,
+                     struct hid_contact* c, int* nc, int* count, int* button);
 
 #endif

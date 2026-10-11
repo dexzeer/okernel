@@ -116,7 +116,7 @@ static void fuzz(void) {
             n = lens[s];
             memcpy(buf, seeds[s], (size_t)n);
             int muts = 1 + (int)(RND() % 6);
-            for (int m = 0; m < muts; m++) buf[RND() % n] = (uint8_t)RND();
+            for (int m = 0; m < muts; m++) { int pos = (int)(RND() % (unsigned)n); buf[pos] = (uint8_t)RND(); }
         }
         struct hid_ptr p[HID_MAXRPT]; int ids;
         int c = hid_parse_pointer(buf, n, p, HID_MAXRPT, &ids);

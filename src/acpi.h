@@ -55,6 +55,9 @@ const struct acpi_info* acpi_get(void);
 // Returns 0 when the range cannot be mapped.
 int acpi_phys_read(uint32_t phys, void* dst, uint32_t len);
 
+// Copies of the DSDT and the SSDTs (AML) read from physical memory; returns the count. Caller kfrees each table.
+int acpi_aml_tables(uint8_t** out, uint32_t* lens, int max);
+
 // Pure parsers (no hardware access), exposed so the host tests can feed them
 // crafted tables: validates checksums and fills `out` from a MADT image.
 int acpi_checksum_ok(const void* p, uint32_t len);
