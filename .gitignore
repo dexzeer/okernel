@@ -42,3 +42,5 @@ kanarchy-res.*
 isodir-i915/
 build-i915/
 kanarchy-i915test.*
+wifi_secret.txt
+wifi_usb_test.log
