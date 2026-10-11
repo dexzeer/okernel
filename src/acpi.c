@@ -242,4 +242,31 @@ void acpi_init(uint32_t mboot_phys) {
                   info.nioapic, info.noverride, info.madt ? "" : " (no MADT)");
 }
 
+// Copies of the DSDT and every SSDT (AML), for drivers that look up device descriptions. Caller kfrees each table.
+int acpi_aml_tables(uint8_t** out, uint32_t* lens, int max) {
+    int n = 0;
+    if (!info.found || max <= 0) return 0;
+    uint8_t rd[36];
+    if (!acpi_phys_read(info.rsdp_phys, rd, 36)) return 0;
+    uint32_t root = 0, esz = 4, rlen = 0;
+    if (info.revision >= 2 && rd32(rd + 28) == 0 && rd32(rd + 24)) { root = rd32(rd + 24); esz = 8; }
+    uint8_t* rt = root ? read_table(root, "XSDT", &rlen) : 0;
+    if (!rt) { root = rd32(rd + 16); esz = 4; rt = read_table(root, "RSDT", &rlen); }
+    if (!rt) return 0;
+    if (pm_info.dsdt) {
+        uint32_t l = 0;
+        uint8_t* d = read_table(pm_info.dsdt, "DSDT", &l);
+        if (d) { out[n] = d; lens[n] = l; n++; }
+    }
+    for (uint32_t o = 36; o + esz <= rlen && n < max; o += esz) {
+        uint32_t addr = rd32(rt + o);
+        if (esz == 8 && rd32(rt + o + 4) != 0) continue;
+        uint32_t l = 0;
+        uint8_t* t = read_table(addr, "SSDT", &l);
+        if (t) { out[n] = t; lens[n] = l; n++; }
+    }
+    kfree(rt);
+    return n;
+}
+
 #endif

@@ -8,6 +8,7 @@
 #include "xhci.h"
 #include <stdarg.h>
 #include "cursor.h"
+#include "devlog.h"
 #include "graphics.h"
 #include "hid.h"
 #include "lapic.h"
@@ -160,63 +161,8 @@ static inline void wr64(volatile uint8_t* b, uint32_t off, uint32_t phys) { wr32
 static void delay_us(uint32_t us) { pit_delay_us(us); }
 static void delay_ms(uint32_t ms) { while (ms--) pit_delay_us(1000); }
 
-// ---- the on-screen log ----------------------------------------------------------------------------
-#define LOGN 40
-#define LOGW 72
-static char LOG[LOGN][LOGW];
-static int log_n;
-
-// %d %u %x (width, 0-padding) %s %c; returns the length written (always terminated)
-static int fmt_to(char* out, int cap, const char* fmt, va_list ap) {
-    char* o = out;
-    char* end = out + cap - 1;
-    for (const char* p = fmt; *p && o < end; p++) {
-        if (*p != '%') { *o++ = *p; continue; }
-        p++;
-        int zero = 0, width = 0;
-        if (*p == '0') { zero = 1; p++; }
-        while (*p >= '0' && *p <= '9') { width = width * 10 + (*p - '0'); p++; }
-        char c = *p;
-        if (!c) break;
-        if (c == 's') {
-            const char* s = va_arg(ap, const char*);
-            while (s && *s && o < end) *o++ = *s++;
-        } else if (c == 'c') {
-            *o++ = (char)va_arg(ap, int);
-        } else if (c == 'd' || c == 'u' || c == 'x') {
-            uint32_t v;
-            int neg = 0;
-            if (c == 'd') { int d = va_arg(ap, int); if (d < 0) { neg = 1; v = (uint32_t)(-d); } else v = (uint32_t)d; }
-            else v = va_arg(ap, uint32_t);
-            uint32_t base = c == 'x' ? 16 : 10;
-            char t[12];
-            int k = 0;
-            if (!v) t[k++] = '0';
-            while (v) { t[k++] = "0123456789abcdef"[v % base]; v /= base; }
-            if (neg && o < end) *o++ = '-';
-            for (int i = k; i < width && o < end; i++) *o++ = zero ? '0' : ' ';
-            while (k && o < end) *o++ = t[--k];
-        } else {
-            *o++ = c;
-        }
-    }
-    *o = 0;
-    return (int)(o - out);
-}
-
-static void xlog(const char* fmt, ...) {
-    char line[LOGW];
-    va_list ap;
-    va_start(ap, fmt);
-    fmt_to(line, LOGW, fmt, ap);
-    va_end(ap);
-    char* slot = LOG[log_n % LOGN];
-    for (int i = 0; i < LOGW; i++) slot[i] = line[i];
-    log_n++;
-    serial_puts("[xhci] ");
-    serial_puts(line);
-    serial_puts("\n");
-}
+#define xlog(...) devlog('u', __VA_ARGS__)
+#define fmt_to devlog_fmt
 
 // ---- memory ---------------------------------------------------------------------------------------
 // physically contiguous, zeroed memory with an alignment (the heap lives in the high alias, so phys = V2P)
@@ -1027,6 +973,5 @@ void xhci_status(char* buf, int cap) {
                           E[i].reports, E[i].errors, E[i].unmatched);
     }
     at = sadd(buf, cap, at, "log:");
-    int first = log_n > 14 ? log_n - 14 : 0;
-    for (int i = first; i < log_n; i++) at = sadd(buf, cap, at, "%s", LOG[i % LOGN]);
+    devlog_tail('u', buf, cap, at, 14);
 }

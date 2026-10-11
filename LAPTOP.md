@@ -28,9 +28,16 @@ On a UEFI machine the menu starts on entry 1b by itself after 30 seconds.
    photograph each result: `pci`, `memmap`, `acpi`, and `pcidump 0:2.0` (the Intel graphics chip, if `pci` lists it
    as 00:02.0). `all` prints everything (Page Up / Page Down scroll).
 2. **Desktop 1366x768** - the real thing at the panel's size. Try this second.
-2n. **Desktop 1366x768, USB driver off** - the same as 2 without the USB controller driver, in case 2 hangs at boot.
-   A **USB mouse** works in the desktop entries (plug it in before or after boot). The shell command `usb` says whether
-   the controller started and how many mouse reports arrived.
+2m. **Desktop 1366x768, touchpad scan off** - the same as 2 without the touchpad hunt (see below), in case 2 hangs at boot.
+2n. **Desktop 1366x768, USB and touchpad drivers off** - the same as 2 with both drivers off, in case 2 and 2m hang.
+   A **USB mouse** (any ordinary mouse, trackball or wireless receiver, also behind a USB 2 hub) works in the desktop
+   entries; plug it in before or after boot. In the desktop, the shell command `usb` prints the controller, every
+   connected port, what each device is, and the driver's log; `usb rescan` tries the ports again; `usb selftest`
+   checks the error recovery.
+   The **touchpad** (I2C): at boot the kernel finds it in the ACPI tables, hunts for the I2C controller (about a second)
+   and starts it when it answers. The shell command `touchpad` shows what happened (`touchpad aml` shows what the firmware
+   tables say about the controller, `touchpad retry` tries again). One finger moves the pointer, two fingers scroll, a
+   tap clicks, a two-finger tap right-clicks.
 3. **Desktop 1280x800**, 4. **1024x768**, 5. **let the video firmware choose** - fallbacks if 2 shows nothing or a
    scrambled picture. If a mode is not usable the screen shows a one-line message and the machine stops (BIOS) or
    GRUB says it could not set the mode; reboot and pick another entry.
@@ -43,10 +50,14 @@ On a UEFI machine the menu starts on entry 1b by itself after 30 seconds.
 Photos of: entry 1b as it appears at boot, `pci`, `acpi`, `memmap`, `pcidump 0:2.0`, and the screen of entry 6; and
 what entries 2-5 do (picture, black screen, message, reboot).
 
+From the desktop (entry 2): the output of `usb` (with a USB mouse plugged in) and of `touchpad`; if `touchpad` says
+"NOT WORKING", also `touchpad aml`.
+
 ## Known limits on such a machine
 
 * The built-in keyboard works (PS/2, also under UEFI: the embedded controller emulates it). This laptop's touchpad is
-  I2C and has no driver yet: use a USB mouse. USB keyboards are not supported.
+  I2C: the driver for it is new and has only been tested against a software model of the controller (the real thing
+  decides); a USB mouse is the fallback. USB keyboards are not supported.
 * No Wi-Fi, no hard disk access, no sound codecs tested: the network driver is for an Intel
   e1000 card, which a laptop will not have. The browser will not reach the internet.
 * The kernel needs no SSE2 and runs on a Pentium III or later; 256 MB of RAM or more. Under UEFI the memory map
