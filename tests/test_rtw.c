@@ -18,6 +18,7 @@ static int fails = 0;
 // ---- kernel services the driver uses --------------------------------------------------------------------------------
 uint32_t tick_count;
 void pit_delay_us(uint32_t us) { tick_count += us / 10000; (void)us; }
+int rand_bytes(uint8_t* o, uint32_t n) { (void)o; (void)n; return 0; }          // not seeded: the driver falls back to its own mixing
 void* kmalloc(uint32_t n) { return malloc(n); }
 void kfree(void* p) { free(p); }
 int devlog_fmt(char* out, int cap, const char* fmt, va_list ap);
@@ -39,6 +40,7 @@ static uint8_t dmem_img[0x10000], imem_img[0x20000], emem_img[0x20000];
 static uint32_t dl_sa, dl_da;
 static uint8_t last_page[8192]; static int last_page_len;
 static int bulk_calls, wl_present = 1, nout = 3;
+static uint8_t last_tx[2600]; static int last_tx_len, last_tx_ep;
 static const uint8_t* rx_q[8]; static int rx_len[8], rx_n, rx_i;
 
 static uint32_t rd32m(uint32_t a) { return (uint32_t)regs[a] | ((uint32_t)regs[a + 1] << 8) | ((uint32_t)regs[a + 2] << 16) | ((uint32_t)regs[a + 3] << 24); }
@@ -103,6 +105,7 @@ int xhci_wl_bulk_out(int ep, const void* data, uint32_t len) {
     if (len < 48) return -1;
     uint32_t w0 = (uint32_t)d[0] | (d[1] << 8) | (d[2] << 16) | ((uint32_t)d[3] << 24), w1 = (uint32_t)d[4] | (d[5] << 8) | (d[6] << 16) | ((uint32_t)d[7] << 24);
     uint32_t qsel = (w1 >> 8) & 0x1f;
+    memcpy(last_tx, d, len < sizeof last_tx ? len : sizeof last_tx); last_tx_len = (int)len; last_tx_ep = ep;
     CHECK((w0 & 0xffff) == len - 48 || qsel == 19);
     uint16_t x = 0;
     for (int i = 0; i < 16; i++) x ^= (uint16_t)(d[2 * i] | (d[2 * i + 1] << 8));
@@ -145,7 +148,7 @@ static int put_beacon(uint8_t* out, const char* ssid, int ch, const uint8_t* bss
     f[n++] = 0x64; f[n++] = 0; f[n++] = 0x11 | (rsn ? 0x10 : 0); f[n++] = 0;
     f[n++] = 0; f[n++] = (uint8_t)strlen(ssid); memcpy(f + n, ssid, strlen(ssid)); n += (int)strlen(ssid);
     f[n++] = 3; f[n++] = 1; f[n++] = (uint8_t)ch;
-    if (rsn) { f[n++] = 48; f[n++] = 2; f[n++] = 1; f[n++] = 0; }
+    if (rsn) { static const uint8_t r[] = { 48, 20, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 4, 1, 0, 0, 0x0f, 0xac, 2, 0, 0 }; memcpy(f + n, r, sizeof r); n += (int)sizeof r; }
     f[n++] = 0xde; f[n++] = 0xad; f[n++] = 0xbe; f[n++] = 0xef;                         // FCS
     uint32_t w0 = (uint32_t)n | (4u << 16) | (1u << 26);                                 // length, 32 bytes of PHY status, PHY status present
     d[0] = (uint8_t)w0; d[1] = (uint8_t)(w0 >> 8); d[2] = (uint8_t)(w0 >> 16); d[3] = (uint8_t)(w0 >> 24);
@@ -217,6 +220,32 @@ int main(void) {
     CHECK(R.rx_frames == 2);
     rtw_command("status", out, sizeof out);
     CHECK(strstr(out, "02:11:22:33:44:55"));
+
+    // transmitting: a management frame and a data frame, as the hardware wants them described
+    uint8_t mf[40] = { 0xB0, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0, 0, 1 };
+    memcpy(mf + 10, mac, 6); memcpy(mf + 16, b1, 6);
+    CHECK(rtw_tx_frame(mf, 30, 0) == 0);
+    {
+        uint32_t w0 = (uint32_t)last_tx[0] | (last_tx[1] << 8) | (last_tx[2] << 16) | ((uint32_t)last_tx[3] << 24);
+        uint32_t w1 = (uint32_t)last_tx[4] | (last_tx[5] << 8) | (last_tx[6] << 16) | ((uint32_t)last_tx[7] << 24);
+        uint32_t w3 = (uint32_t)last_tx[12] | (last_tx[13] << 8) | (last_tx[14] << 16) | ((uint32_t)last_tx[15] << 24);
+        uint32_t w4 = (uint32_t)last_tx[16] | (last_tx[17] << 8), w8 = (uint32_t)last_tx[32] | (last_tx[33] << 8);
+        CHECK((w0 & 0xffff) == 30 && ((w0 >> 16) & 0xff) == 48 && (w0 & (1u << 26)) && (w0 & (1u << 31)));      // size, payload offset, last segment, no queue sequence
+        CHECK(((w1 >> 8) & 0x1f) == 18);                                                                         // management queue
+        CHECK((w3 & (1u << 8)) && (w3 & (1u << 10)) && (w4 & 0x7f) == 4);                                        // fixed 6 Mbit/s
+        CHECK(w8 & (1u << 15));                                                                                  // hardware sequence numbers
+        CHECK(last_tx_len == 48 + 30 && !memcmp(last_tx + 48, mf, 30));
+    }
+    uint8_t df[60] = { 0x08, 0x01, 0, 0, 0xaa, 0xbb, 0xcc, 0, 0, 1 };
+    df[22] = 0x50; df[23] = 0x07;                                                                                // sequence number 0x075
+    CHECK(rtw_tx_frame(df, 60, 1) == 0);
+    {
+        uint32_t w1 = (uint32_t)last_tx[4] | (last_tx[5] << 8) | (last_tx[6] << 16) | ((uint32_t)last_tx[7] << 24);
+        uint32_t w4 = (uint32_t)last_tx[16], w9 = (uint32_t)last_tx[36] | (last_tx[37] << 8) | (last_tx[38] << 16);
+        CHECK(((w1 >> 8) & 0x1f) == 0 && (w4 & 0x7f) == 8);                                                      // TID 0, 24 Mbit/s
+        CHECK(((w9 >> 12) & 0xfff) == 0x075);
+    }
+    CHECK(rtw_tx_frame(df, 5, 1) < 0 && rtw_tx_frame(df, 5000, 1) < 0);
 
     // no adapter: a clean failure
     wl_present = 0;

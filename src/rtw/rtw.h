@@ -17,4 +17,10 @@ int rtw_start(void);
 void rtw_poll(void);
 void rtw_command(const char* args, char* buf, int cap);
 
+// For the network stack: the adapter as a network interface.
+int rtw_net_up(void);                                   // associated and keyed
+const uint8_t* rtw_net_mac(void);
+int rtw_net_send(const uint8_t* eth, int len);          // one Ethernet frame; 0 = sent
+void rtw_net_set_rx(void (*cb)(const uint8_t* eth, int len));
+
 #endif

@@ -1166,6 +1166,19 @@ static void shell_execute(int win_id, const char* input) {
         else { if (args[0] && str_eq(args, "retry")) i2chid_retry(); i2chid_status(tb, sizeof tb); }
         window_puts(win_id, tb);
     }
+    else if (str_eq(cmd_buf, "dhcp")) {
+        static char nb[400];
+        net_dhcp();
+        (void)nb;
+        window_puts(win_id, "dhcp: asking the router (`ipconfig` shows the result)\n");
+        serial_puts("[dhcp] requested from the shell\n");
+    }
+    else if (str_eq(cmd_buf, "ipconfig")) {
+        static char nb[400];
+        net_status(nb, sizeof nb);
+        window_puts(win_id, nb);
+        serial_puts(nb);
+    }
     else if (str_eq(cmd_buf, "wifi")) {
         static char wb[2048];
         if (args[0] && str_eq(args, "log")) { wb[0] = 0; devlog_tail('w', wb, sizeof wb, 0, 24); }

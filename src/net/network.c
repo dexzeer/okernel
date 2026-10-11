@@ -3,13 +3,33 @@
 #include "../memory.h"
 #include "../crypto/tls_client.h" // http_parse_framing (shared framing)
 #include "e1000.h"
+#include "../rtw/rtw.h"
+#include "../devlog.h"
+#include <stdarg.h>
 #include "../io.h"
 #include "../serial.h"
 
 static uint8_t our_ip[4] = {10, 0, 2, 15};    // QEMU user-mode default
 static uint8_t gateway_ip[4] = {10, 0, 2, 2};  // QEMU user-mode gateway
 static uint8_t dns_server_ip[4] = {10, 0, 2, 3}; // QEMU SLIRP DNS
+static uint8_t netmask[4] = {255, 255, 255, 0};
 static uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+// ---- the network interface: the e1000 (QEMU) or, when its link is up, the Wi-Fi adapter ----------------------------------
+static int nic_wifi;
+static uint8_t* nic_mac(void) { return nic_wifi ? (uint8_t*)rtw_net_mac() : e1000_get_mac(); }
+static int nic_send(uint8_t* f, uint32_t len) { return nic_wifi ? rtw_net_send(f, (int)len) : e1000_send(f, len); }
+
+// is this address on our subnet? (otherwise the gateway is the next hop)
+static int on_link(const uint8_t* ip) {
+    for (int i = 0; i < 4; i++) if ((ip[i] & netmask[i]) != (our_ip[i] & netmask[i])) return 0;
+    return 1;
+}
+static uint8_t* next_hop(uint8_t* ip) { return on_link(ip) ? ip : gateway_ip; }
+static void dhcp_input(const uint8_t* d, int len);
+static void handle_packet(uint8_t* data, uint32_t len);
+static void wifi_watch(void);
+static void dhcp_poll(void);
 static const char hex[] = "0123456789abcdef";
 
 // ARP cache (4 entries)
@@ -153,7 +173,7 @@ void arp_send_request(uint8_t* target_ip) {
     serial_putchar('\n');
 
     uint8_t frame[ETH_FRAME_MAX];
-    uint8_t* mac = e1000_get_mac();
+    uint8_t* mac = nic_mac();
 
     // Ethernet header
     struct eth_header* eth = (struct eth_header*)frame;
@@ -176,7 +196,7 @@ void arp_send_request(uint8_t* target_ip) {
     int total = sizeof(struct eth_header) + sizeof(struct arp_header);
     while (total < ETH_FRAME_MIN) frame[total++] = 0;
 
-    e1000_send(frame, total);
+    nic_send(frame, total);
 }
 
 static void handle_arp(uint8_t* data, uint32_t len) {
@@ -228,7 +248,7 @@ static void handle_arp(uint8_t* data, uint32_t len) {
             arp->target_ip[2] == our_ip[2] && arp->target_ip[3] == our_ip[3]) {
 
             uint8_t frame[ETH_FRAME_MAX];
-            uint8_t* mac = e1000_get_mac();
+            uint8_t* mac = nic_mac();
 
             struct eth_header* eth = (struct eth_header*)frame;
             build_eth_header(eth, arp->sender_mac, mac, 0x0806);
@@ -248,7 +268,7 @@ static void handle_arp(uint8_t* data, uint32_t len) {
             int total = sizeof(struct eth_header) + sizeof(struct arp_header);
             while (total < ETH_FRAME_MIN) frame[total++] = 0;
 
-            e1000_send(frame, total);
+            nic_send(frame, total);
             serial_puts("[arp] replied to request\n");
         }
     }
@@ -274,7 +294,7 @@ void icmp_send_ping(uint8_t* target_ip, uint16_t id, uint16_t seq) {
     ping_pending = 0;
 
     uint8_t frame[ETH_FRAME_MAX];
-    uint8_t* mac = e1000_get_mac();
+    uint8_t* mac = nic_mac();
 
     // Ethernet header
     struct eth_header* eth = (struct eth_header*)frame;
@@ -304,17 +324,18 @@ void icmp_send_ping(uint8_t* target_ip, uint16_t id, uint16_t seq) {
     icmp->checksum = net_checksum(icmp, sizeof(struct icmp_header));
 
     int total = sizeof(struct eth_header) + sizeof(struct ip_header) + sizeof(struct icmp_header);
-    e1000_send(frame, total);
+    nic_send(frame, total);
     serial_puts("[icmp] echo request sent to gateway\n");
 }
 
 void udp_send(uint8_t* dst_ip, uint16_t src_port, uint16_t dst_port, uint8_t* data, uint16_t len) {
     uint8_t frame[ETH_FRAME_MAX];
-    uint8_t* mac = e1000_get_mac();
+    uint8_t* mac = nic_mac();
 
     uint8_t target_mac[6];
-    if (!arp_resolve(dst_ip, target_mac)) {
-        arp_send_request(dst_ip);
+    uint8_t* hop = next_hop(dst_ip);
+    if (!arp_resolve(hop, target_mac)) {
+        arp_send_request(hop);
         return;
     }
 
@@ -346,7 +367,7 @@ void udp_send(uint8_t* dst_ip, uint16_t src_port, uint16_t dst_port, uint8_t* da
     }
 
     int total = sizeof(struct eth_header) + sizeof(struct ip_header) + sizeof(struct udp_header) + len;
-    e1000_send(frame, total);
+    nic_send(frame, total);
 }
 
 // Encode a domain name into DNS format (labels)
@@ -515,8 +536,9 @@ static void dns_notify(struct dns_ent* e) {
 
 static void dns_send_query(struct dns_ent* e) {
     uint8_t target_mac[6];
-    if (!arp_resolve(dns_server_ip, target_mac)) {
-        arp_send_request(dns_server_ip);
+    uint8_t* dns_hop = next_hop(dns_server_ip);
+    if (!arp_resolve(dns_hop, target_mac)) {
+        arp_send_request(dns_hop);
         e->sent_tick = 0;              // net_poll sends once ARP resolves
         return;
     }
@@ -700,7 +722,7 @@ static uint32_t tcp_rx_free(const struct tcp_sock* c) {
 }
 
 static int tcp_is_local(const uint8_t* ip) {
-    return (ip[0] & 0xF0) == (our_ip[0] & 0xF0) && ip[1] == our_ip[1] && ip[2] == our_ip[2];
+    return on_link(ip);
 }
 
 // TCP checksum over pseudo-header + segment (big-endian 16-bit words).
@@ -725,7 +747,7 @@ static void tcp_send_one(struct tcp_sock* c, uint32_t seq_num, uint32_t ack_num,
 
     uint8_t frame[ETH_FRAME_MAX];
     struct eth_header* eth = (struct eth_header*)frame;
-    build_eth_header(eth, target_mac, e1000_get_mac(), 0x0800);
+    build_eth_header(eth, target_mac, nic_mac(), 0x0800);
 
     uint16_t tcp_hdr_len = (flags & 0x02) ? 24 : 20;
     struct ip_header* ip = (struct ip_header*)(frame + sizeof(struct eth_header));
@@ -768,7 +790,7 @@ static void tcp_send_one(struct tcp_sock* c, uint32_t seq_num, uint32_t ack_num,
     tcp[16] = (uint8_t)(cksum >> 8);
     tcp[17] = (uint8_t)cksum;
 
-    e1000_send(frame, (uint32_t)(sizeof(struct eth_header) + sizeof(struct ip_header) + tcp_hdr_len + data_len));
+    nic_send(frame, (uint32_t)(sizeof(struct eth_header) + sizeof(struct ip_header) + tcp_hdr_len + data_len));
     if (flags & 0x10) c->ack_pending = 0;   // this segment carried the ACK
 }
 
@@ -1314,9 +1336,165 @@ void net_set_event_callback(void (*cb)(const char* msg)) {
     net_event_callback = cb;
 }
 
+// ---- DHCP client (RFC 2131) ----------------------------------------------------------------------------------------------------------
+// Used on the Wi-Fi link: discover, request, bind; the address, mask, gateway and DNS server come from the router.
+enum { DH_OFF, DH_DISCOVER, DH_REQUEST, DH_BOUND };
+static struct {
+    int state;
+    uint32_t xid, t_sent, tries, t_bound, lease_s;
+    uint8_t offer_ip[4], server_ip[4];
+} dh;
+
+static void dhcp_send(int msg_type) {
+    uint8_t frame[400];
+    for (int i = 0; i < (int)sizeof frame; i++) frame[i] = 0;
+    uint8_t* mac = nic_mac();
+    struct eth_header* eth = (struct eth_header*)frame;
+    build_eth_header(eth, broadcast_mac, mac, 0x0800);
+    struct ip_header* ip = (struct ip_header*)(frame + sizeof(struct eth_header));
+    uint8_t* udp = (uint8_t*)ip + sizeof(struct ip_header);
+    uint8_t* d = udp + 8;
+    d[0] = 1; d[1] = 1; d[2] = 6; d[3] = 0;
+    d[4] = (uint8_t)(dh.xid >> 24); d[5] = (uint8_t)(dh.xid >> 16); d[6] = (uint8_t)(dh.xid >> 8); d[7] = (uint8_t)dh.xid;
+    d[10] = 0x80;                                                  // broadcast flag: the router answers to everybody
+    for (int i = 0; i < 6; i++) d[28 + i] = mac[i];
+    d[236] = 0x63; d[237] = 0x82; d[238] = 0x53; d[239] = 0x63;
+    int n = 240;
+    d[n++] = 53; d[n++] = 1; d[n++] = (uint8_t)msg_type;
+    d[n++] = 61; d[n++] = 7; d[n++] = 1; for (int i = 0; i < 6; i++) d[n++] = mac[i];
+    d[n++] = 12; d[n++] = 8; { const char* h = "kanarchy"; for (int i = 0; i < 8; i++) d[n++] = (uint8_t)h[i]; }
+    if (msg_type == 3) {
+        d[n++] = 50; d[n++] = 4; for (int i = 0; i < 4; i++) d[n++] = dh.offer_ip[i];
+        d[n++] = 54; d[n++] = 4; for (int i = 0; i < 4; i++) d[n++] = dh.server_ip[i];
+    }
+    d[n++] = 55; d[n++] = 4; d[n++] = 1; d[n++] = 3; d[n++] = 6; d[n++] = 51;       // mask, router, DNS, lease time
+    d[n++] = 255;
+    if (n < 300) n = 300;
+    uint16_t ulen = (uint16_t)(8 + n), tot = (uint16_t)(20 + ulen);
+    ip->version_ihl = 0x45; ip->tos = 0;
+    ip->total_length = (uint16_t)((tot >> 8) | ((tot & 0xFF) << 8));
+    ip->id = 0; ip->flags_frag = 0; ip->ttl = 64; ip->protocol = 17;
+    for (int i = 0; i < 4; i++) { ip->src_ip[i] = 0; ip->dst_ip[i] = 255; }
+    ip->checksum = ip_checksum(ip);
+    udp[0] = 0; udp[1] = 68; udp[2] = 0; udp[3] = 67;
+    udp[4] = (uint8_t)(ulen >> 8); udp[5] = (uint8_t)ulen; udp[6] = udp[7] = 0;
+    nic_send(frame, (uint32_t)(sizeof(struct eth_header) + tot));
+    dh.t_sent = tick_count ? tick_count : 1;
+}
+
+static void dhcp_start(void) {
+    uint8_t* mac = nic_mac();
+    dh.xid = tick_count * 2654435761u ^ (uint32_t)((mac[2] << 24) | (mac[3] << 16) | (mac[4] << 8) | mac[5]);
+    dh.state = DH_DISCOVER; dh.tries = 1;
+    devlog('w', "dhcp: asking for an address");
+    dhcp_send(1);
+}
+
+static void dhcp_input(const uint8_t* d, int len) {
+    if (dh.state != DH_DISCOVER && dh.state != DH_REQUEST) return;
+    if (len < 241 || d[0] != 2) return;
+    uint8_t* mac = nic_mac();
+    uint32_t xid = ((uint32_t)d[4] << 24) | ((uint32_t)d[5] << 16) | ((uint32_t)d[6] << 8) | d[7];
+    if (xid != dh.xid) return;
+    for (int i = 0; i < 6; i++) if (d[28 + i] != mac[i]) return;
+    if (d[236] != 0x63 || d[237] != 0x82 || d[238] != 0x53 || d[239] != 0x63) return;
+    int type = 0;
+    uint8_t mask[4] = {0}, router[4] = {0}, dns[4] = {0}, server[4] = {0};
+    int have_mask = 0, have_router = 0, have_dns = 0, have_server = 0;
+    uint32_t lease = 0;
+    for (int p = 240; p < len;) {
+        int code = d[p];
+        if (code == 255) break;
+        if (code == 0) { p++; continue; }
+        if (p + 1 >= len) break;
+        int l = d[p + 1];
+        if (p + 2 + l > len) break;
+        const uint8_t* v = d + p + 2;
+        if (code == 53 && l >= 1) type = v[0];
+        else if (code == 1 && l >= 4) { for (int i = 0; i < 4; i++) mask[i] = v[i]; have_mask = 1; }
+        else if (code == 3 && l >= 4) { for (int i = 0; i < 4; i++) router[i] = v[i]; have_router = 1; }
+        else if (code == 6 && l >= 4) { for (int i = 0; i < 4; i++) dns[i] = v[i]; have_dns = 1; }
+        else if (code == 54 && l >= 4) { for (int i = 0; i < 4; i++) server[i] = v[i]; have_server = 1; }
+        else if (code == 51 && l >= 4) lease = ((uint32_t)v[0] << 24) | ((uint32_t)v[1] << 16) | ((uint32_t)v[2] << 8) | v[3];
+        p += 2 + l;
+    }
+    if (type == 2 && dh.state == DH_DISCOVER && have_server) {                    // offer: ask for it
+        for (int i = 0; i < 4; i++) { dh.offer_ip[i] = d[16 + i]; dh.server_ip[i] = server[i]; }
+        dh.state = DH_REQUEST; dh.tries = 1;
+        dhcp_send(3);
+    } else if (type == 5 && dh.state == DH_REQUEST) {                             // acknowledgement: configure
+        for (int i = 0; i < 4; i++) our_ip[i] = d[16 + i];
+        if (have_mask) for (int i = 0; i < 4; i++) netmask[i] = mask[i];
+        if (have_router) for (int i = 0; i < 4; i++) gateway_ip[i] = router[i];
+        if (have_dns) for (int i = 0; i < 4; i++) dns_server_ip[i] = dns[i];
+        arp_cache_count = 0;
+        dh.state = DH_BOUND; dh.t_bound = tick_count; dh.lease_s = lease ? lease : 3600;
+        devlog('w', "dhcp: address %d.%d.%d.%d mask %d.%d.%d.%d gateway %d.%d.%d.%d dns %d.%d.%d.%d lease %u s",
+               our_ip[0], our_ip[1], our_ip[2], our_ip[3], netmask[0], netmask[1], netmask[2], netmask[3], gateway_ip[0], gateway_ip[1], gateway_ip[2], gateway_ip[3],
+               dns_server_ip[0], dns_server_ip[1], dns_server_ip[2], dns_server_ip[3], dh.lease_s);
+        arp_send_request(gateway_ip);
+    } else if (type == 6) {                                                       // refused: start over
+        dh.state = DH_OFF;
+        dhcp_start();
+    }
+}
+
+static int dh_force;                       // `dhcp` on the e1000: lets the client be tested under QEMU
+void net_dhcp(void) { dh_force = 1; dhcp_start(); }
+static void dhcp_poll(void) {
+    if (!nic_wifi && !dh_force) return;
+    uint32_t t = tick_count;
+    if (dh.state == DH_DISCOVER || dh.state == DH_REQUEST) {
+        uint32_t wait = 200u << (dh.tries > 4 ? 4 : dh.tries - 1);                // 2 s, 4 s, 8 s, 16 s ...
+        if (t - dh.t_sent > wait) {
+            if (++dh.tries > 8) { dh.state = DH_OFF; devlog('w', "dhcp: no answer from the router"); return; }
+            if (dh.state == DH_DISCOVER) dhcp_send(1); else dhcp_send(3);
+        }
+    } else if (dh.state == DH_BOUND && t - dh.t_bound > dh.lease_s * 50u) {       // half the lease: renew by asking again
+        dhcp_start();
+    } else if (dh.state == DH_OFF && t - dh.t_sent > 3000) {
+        dhcp_start();
+    }
+}
+
+// the interface settings, for the shell
+static int fmtv(char* b, int cap, const char* f, ...) {
+    va_list ap;
+    va_start(ap, f);
+    int n = devlog_fmt(b, cap, f, ap);
+    va_end(ap);
+    return n;
+}
+int net_status(char* buf, int cap) {
+    int n = fmtv(buf, cap, "interface: %s\naddress %d.%d.%d.%d  mask %d.%d.%d.%d\ngateway %d.%d.%d.%d  dns %d.%d.%d.%d\n", nic_wifi ? "Wi-Fi" : "e1000",
+                 our_ip[0], our_ip[1], our_ip[2], our_ip[3], netmask[0], netmask[1], netmask[2], netmask[3],
+                 gateway_ip[0], gateway_ip[1], gateway_ip[2], gateway_ip[3], dns_server_ip[0], dns_server_ip[1], dns_server_ip[2], dns_server_ip[3]);
+    return n;
+}
+
+static void wifi_rx(const uint8_t* e, int len) { handle_packet((uint8_t*)e, (uint32_t)len); }
+
+// the Wi-Fi link came up or went down: switch the interface and (re)start DHCP
+static void wifi_watch(void) {
+    int up = rtw_net_up();
+    if (up && !nic_wifi) {
+        nic_wifi = 1;
+        for (int i = 0; i < 4; i++) our_ip[i] = 0;
+        arp_cache_count = 0;
+        dh.state = DH_OFF;
+        dhcp_start();
+    } else if (!up && nic_wifi) {
+        nic_wifi = 0;
+        dh.state = DH_OFF;
+        devlog('w', "network: the Wi-Fi link is down");
+    }
+}
+
 // Timers and retries (called from the main loop right after e1000_poll, so
 // the ACKs owed for the batch just received go out together).
 void net_poll(void) {
+    wifi_watch();
+    dhcp_poll();
     tcp_poll();
     dns_poll();
 
@@ -1359,7 +1537,7 @@ static void handle_ip(uint8_t* data, uint32_t len) {
             arp_resolve(ip->dst_ip, target_mac);
 
             uint8_t frame[ETH_FRAME_MAX];
-            uint8_t* mac = e1000_get_mac();
+            uint8_t* mac = nic_mac();
             struct eth_header* eth = (struct eth_header*)frame;
             build_eth_header(eth, target_mac, mac, 0x0800);
 
@@ -1373,7 +1551,7 @@ static void handle_ip(uint8_t* data, uint32_t len) {
                 ((struct ip_header*)(frame + sizeof(struct eth_header)))->dst_ip[i] = ip->dst_ip[i];
             }
 
-            e1000_send(frame, total);
+            nic_send(frame, total);
             serial_puts("[icmp] replied to ping\n");
         } else if (icmp->type == 0) { // Echo reply
             serial_puts("[icmp] got ping reply!\n");
@@ -1402,6 +1580,9 @@ static void handle_ip(uint8_t* data, uint32_t len) {
         uint16_t src_port = ((udp->src_port >> 8) & 0xFF) | ((udp->src_port & 0xFF) << 8);
         uint16_t udp_len = ((udp->length >> 8) & 0xFF) | ((udp->length & 0xFF) << 8);
 
+        if (dst_port == 68 && src_port == 67 && udp_len > 8) {                  // DHCP reply
+            dhcp_input(data + sizeof(struct eth_header) + sizeof(struct ip_header) + sizeof(struct udp_header), (int)udp_len - 8);
+        }
         if (src_port == 53 && udp_len > 8) { // DNS response (server replies from port 53)
             uint8_t* dns_data = data + sizeof(struct eth_header) + sizeof(struct ip_header) + sizeof(struct udp_header);
             uint16_t dns_len = udp_len - 8;
@@ -1446,6 +1627,7 @@ void net_init(void) {
     e1000_init();
     serial_puts("[net] net_init done\n");
     e1000_set_rx_callback(handle_packet);
+    rtw_net_set_rx(wifi_rx);
 
     serial_puts("[net] IP: ");
     for (int i = 0; i < 4; i++) {

@@ -15,6 +15,9 @@ void e1000_poll(void);
 // Get MAC address
 uint8_t* e1000_get_mac(void);
 
+// 1 when an e1000 was found
+int e1000_present(void);
+
 // Register callback for received packets
 typedef void (*e1000_rx_callback_t)(uint8_t* data, uint32_t len);
 void e1000_set_rx_callback(e1000_rx_callback_t cb);
