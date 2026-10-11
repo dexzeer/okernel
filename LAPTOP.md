@@ -65,9 +65,10 @@ moving, using the keyboard) and of `touchpad`; if `touchpad` says "NOT WORKING",
 
 ## Known limits on such a machine
 
-* The built-in keyboard works (PS/2, also under UEFI: the embedded controller emulates it). This laptop's touchpad is
-  I2C: the driver for it is new and has only been tested against a software model of the controller (the real thing
-  decides); a USB mouse is the fallback. USB keyboards are not supported.
+* The built-in keyboard works (PS/2, also under UEFI: the embedded controller emulates it). This laptop's I2C touchpad
+  (Synaptics SYNA3602) works since 2026-10-11 (moves the pointer; polled at 100 Hz, so it starts about 3 s after boot),
+  and so does a USB mouse (also behind a hub). Scrolling, taps and clicks are implemented but their feel is untuned.
+  USB keyboards are not supported.
 * No Wi-Fi, no hard disk access, no sound codecs tested: the network driver is for an Intel
   e1000 card, which a laptop will not have. The browser will not reach the internet.
 * The kernel needs no SSE2 and runs on a Pentium III or later; 256 MB of RAM or more. Under UEFI the memory map
