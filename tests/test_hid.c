@@ -1,0 +1,138 @@
+// Host test for the HID pointer report descriptor parser (src/hid.c): real descriptor shapes, decoding, fuzzing.
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "../src/hid.h"
+
+static int fails = 0;
+#define CHECK(c) do { if (!(c)) { printf("FAIL line %d: %s\n", __LINE__, #c); fails++; } } while (0)
+
+static const uint8_t boot_mouse[] = {
+    0x05,0x01,0x09,0x02,0xA1,0x01,0x09,0x01,0xA1,0x00,0x05,0x09,0x19,0x01,0x29,0x03,0x15,0x00,0x25,0x01,0x95,0x03,0x75,0x01,
+    0x81,0x02,0x95,0x01,0x75,0x05,0x81,0x01,0x05,0x01,0x09,0x30,0x09,0x31,0x09,0x38,0x15,0x81,0x25,0x7F,0x75,0x08,0x95,0x03,
+    0x81,0x06,0xC0,0xC0 };
+
+// gaming mouse: report id 1 = 5 buttons + 16 bit X/Y + wheel + AC Pan, report id 2 = vendor, report id 3 = keyboard-ish
+static const uint8_t gaming[] = {
+    0x05,0x01,0x09,0x02,0xA1,0x01,0x85,0x01,0x09,0x01,0xA1,0x00,0x05,0x09,0x19,0x01,0x29,0x05,0x15,0x00,0x25,0x01,0x95,0x05,
+    0x75,0x01,0x81,0x02,0x95,0x01,0x75,0x03,0x81,0x01,0x05,0x01,0x09,0x30,0x09,0x31,0x16,0x01,0x80,0x26,0xFF,0x7F,0x75,0x10,
+    0x95,0x02,0x81,0x06,0x09,0x38,0x15,0x81,0x25,0x7F,0x75,0x08,0x95,0x01,0x81,0x06,0x05,0x0C,0x0A,0x38,0x02,0x95,0x01,0x81,
+    0x06,0xC0,0xC0,
+    0x06,0x00,0xFF,0x09,0x01,0xA1,0x01,0x85,0x02,0x09,0x02,0x75,0x08,0x95,0x07,0x81,0x02,0xC0,
+    0x05,0x01,0x09,0x06,0xA1,0x01,0x85,0x03,0x05,0x07,0x19,0xE0,0x29,0xE7,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x08,0x81,0x02,0xC0 };
+
+static const uint8_t tablet[] = {
+    0x05,0x01,0x09,0x02,0xA1,0x01,0x09,0x01,0xA1,0x00,0x05,0x09,0x19,0x01,0x29,0x03,0x15,0x00,0x25,0x01,0x95,0x03,0x75,0x01,
+    0x81,0x02,0x95,0x01,0x75,0x05,0x81,0x01,0x05,0x01,0x09,0x30,0x09,0x31,0x15,0x00,0x26,0xFF,0x7F,0x35,0x00,0x46,0xFF,0x7F,
+    0x75,0x10,0x95,0x02,0x81,0x02,0x05,0x01,0x09,0x38,0x15,0x81,0x25,0x7F,0x35,0x00,0x45,0x00,0x75,0x08,0x95,0x01,0x81,0x06,
+    0xC0,0xC0 };
+
+static const uint8_t keyboard[] = {
+    0x05,0x01,0x09,0x06,0xA1,0x01,0x05,0x07,0x19,0xE0,0x29,0xE7,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x08,0x81,0x02,0x95,0x01,
+    0x75,0x08,0x81,0x01,0x95,0x05,0x75,0x01,0x05,0x08,0x19,0x01,0x29,0x05,0x91,0x02,0x95,0x01,0x75,0x03,0x91,0x01,0x95,0x06,
+    0x75,0x08,0x15,0x00,0x25,0x65,0x05,0x07,0x19,0x00,0x29,0x65,0x81,0x00,0xC0 };
+
+// extended (32 bit) usages for X and Y, a Push/Pop around the sizes
+static const uint8_t extended[] = {
+    0x05,0x01,0x09,0x02,0xA1,0x01,0x09,0x01,0xA1,0x00,0xA4,0x75,0x08,0x95,0x02,0x15,0x81,0x25,0x7F,0x0B,0x30,0x00,0x01,0x00,
+    0x0B,0x31,0x00,0x01,0x00,0x81,0x06,0xB4,0x05,0x09,0x19,0x01,0x29,0x03,0x75,0x01,0x95,0x03,0x15,0x00,0x25,0x01,0x81,0x02,
+    0xC0,0xC0 };
+
+static void test_boot(void) {
+    struct hid_ptr p[HID_MAXRPT]; int ids = -1;
+    int n = hid_parse_pointer(boot_mouse, sizeof boot_mouse, p, HID_MAXRPT, &ids);
+    CHECK(n == 1); CHECK(ids == 0);
+    CHECK(p[0].bytes == 4); CHECK(!p[0].absolute);
+    CHECK(p[0].x.off == 8 && p[0].x.bits == 8 && p[0].x.sign);
+    CHECK(p[0].y.off == 16 && p[0].y.bits == 8);
+    CHECK(p[0].wheel.off == 24 && p[0].wheel.bits == 8);
+    CHECK(p[0].btn[0].off == 0 && p[0].btn[1].off == 1 && p[0].btn[2].off == 2 && !p[0].btn[3].bits);
+    uint8_t r[4] = { 0x05, 0xFE, 0x03, 0xFF };
+    int x, y, w, b;
+    CHECK(hid_decode(&p[0], ids, r, 4, &x, &y, &w, &b));
+    CHECK(x == -2 && y == 3 && w == -1 && b == 5);
+    uint8_t r3[3] = { 0x02, 0x7F, 0x80 };                 // a 3 byte boot report: no wheel byte
+    CHECK(hid_decode(&p[0], ids, r3, 3, &x, &y, &w, &b));
+    CHECK(x == 127 && y == -128 && w == 0 && b == 2);
+}
+
+static void test_gaming(void) {
+    struct hid_ptr p[HID_MAXRPT]; int ids = 0;
+    int n = hid_parse_pointer(gaming, sizeof gaming, p, HID_MAXRPT, &ids);
+    CHECK(n == 1); CHECK(ids == 1);
+    CHECK(p[0].id == 1); CHECK(p[0].bytes == 8);
+    CHECK(p[0].btn[4].bits == 1 && p[0].btn[4].off == 4);
+    CHECK(p[0].x.off == 8 && p[0].x.bits == 16 && p[0].x.sign && p[0].x.lmin == -32767);
+    CHECK(p[0].y.off == 24 && p[0].y.bits == 16);
+    CHECK(p[0].wheel.off == 40 && p[0].pan.off == 48);
+    uint8_t r[8] = { 1, 0x03, 0x10, 0x00, 0xF0, 0xFF, 0x02, 0x00 };   // left+right, x=16, y=-16, wheel=2
+    int x, y, w, b;
+    CHECK(hid_decode(&p[0], ids, r, 8, &x, &y, &w, &b));
+    CHECK(b == 3 && x == 16 && y == -16 && w == 2);
+    uint8_t other[8] = { 2, 1, 2, 3, 4, 5, 6, 7 };         // the vendor report must not be taken for a pointer report
+    CHECK(!hid_decode(&p[0], ids, other, 8, &x, &y, &w, &b));
+}
+
+static void test_tablet(void) {
+    struct hid_ptr p[HID_MAXRPT]; int ids = 1;
+    int n = hid_parse_pointer(tablet, sizeof tablet, p, HID_MAXRPT, &ids);
+    CHECK(n == 1); CHECK(ids == 0); CHECK(p[0].absolute);
+    CHECK(p[0].x.off == 8 && p[0].x.bits == 16 && !p[0].x.sign && p[0].x.lmax == 0x7FFF);
+    uint8_t r[6] = { 0x01, 0xFF, 0x7F, 0x00, 0x40, 0x00 };
+    int x, y, w, b;
+    CHECK(hid_decode(&p[0], ids, r, 6, &x, &y, &w, &b));
+    CHECK(x == 65535); CHECK(y == 32768 - 1 || y == 32768 || y == 32769 /* 0x4000/0x7FFF */ ); CHECK(b == 1);
+    CHECK(y > 32760 && y < 32780);
+}
+
+static void test_others(void) {
+    struct hid_ptr p[HID_MAXRPT]; int ids = 5;
+    CHECK(hid_parse_pointer(keyboard, sizeof keyboard, p, HID_MAXRPT, &ids) == 0);
+    int n = hid_parse_pointer(extended, sizeof extended, p, HID_MAXRPT, &ids);
+    CHECK(n == 1); CHECK(ids == 0);
+    CHECK(p[0].x.off == 0 && p[0].y.off == 8 && p[0].btn[0].off == 16 && p[0].btn[2].off == 18 && p[0].bytes == 3);
+    CHECK(hid_parse_pointer(boot_mouse, 0, p, HID_MAXRPT, &ids) == 0);
+    CHECK(hid_parse_pointer(0, 10, p, HID_MAXRPT, &ids) == 0);
+    for (int cut = 0; cut < (int)sizeof boot_mouse; cut++)  // every truncation must be safe
+        (void)hid_parse_pointer(boot_mouse, cut, p, HID_MAXRPT, &ids);
+    CHECK(hid_get((const uint8_t*)"\xAB\xCD", 2, 4, 8, 0) == 0xDA);   // bits 4..11 of 0xCDAB
+    CHECK(hid_get((const uint8_t*)"\xFF", 1, 0, 9, 0) == 0);           // out of range
+    CHECK(hid_get((const uint8_t*)"\xF0", 1, 4, 4, 1) == -1);
+}
+
+static void fuzz(void) {
+    unsigned seed = 12345;
+    #define RND() (seed = seed * 1103515245u + 12345u, (seed >> 8) & 0xFFFF)
+    static const uint8_t* seeds[] = { boot_mouse, gaming, tablet, keyboard, extended };
+    static const int lens[] = { sizeof boot_mouse, sizeof gaming, sizeof tablet, sizeof keyboard, sizeof extended };
+    for (int it = 0; it < 300000; it++) {
+        uint8_t buf[300];
+        int n;
+        if (it & 1) {                                         // pure noise
+            n = (int)(RND() % 300);
+            for (int i = 0; i < n; i++) buf[i] = (uint8_t)RND();
+        } else {                                              // mutated real descriptor
+            int s = (int)(RND() % 5);
+            n = lens[s];
+            memcpy(buf, seeds[s], (size_t)n);
+            int muts = 1 + (int)(RND() % 6);
+            for (int m = 0; m < muts; m++) buf[RND() % n] = (uint8_t)RND();
+        }
+        struct hid_ptr p[HID_MAXRPT]; int ids;
+        int c = hid_parse_pointer(buf, n, p, HID_MAXRPT, &ids);
+        uint8_t rep[80];
+        for (int i = 0; i < 80; i++) rep[i] = (uint8_t)RND();
+        for (int k = 0; k < c; k++) {
+            int x, y, w, b;
+            int rl = (int)(RND() % 81);
+            int ok = hid_decode(&p[k], ids, rep, rl, &x, &y, &w, &b);
+            if (ok && p[k].absolute) { CHECK(x >= 0 && x <= 65535); CHECK(y >= 0 && y <= 65535); }
+        }
+    }
+}
+
+int main(void) {
+    test_boot(); test_gaming(); test_tablet(); test_others(); fuzz();
+    printf(fails ? "HID FAIL (%d)\n" : "HID PASS\n", fails);
+    return fails != 0;
+}

@@ -1154,10 +1154,10 @@ static void shell_execute(int win_id, const char* input) {
         shell_execute_run(win_id, args);
     }
     else if (str_eq(cmd_buf, "usb")) {
-        char ub[96];
-        xhci_status(ub, sizeof ub);
-        window_puts(win_id, ub);
-        window_puts(win_id, "\n");
+        static char ub[2048];
+        if (args[0] && str_eq(args, "rescan")) { xhci_rescan(); window_puts(win_id, "usb: rescanning the ports (run `usb` again in a second)\n"); }
+        else if (args[0] && str_eq(args, "selftest")) { xhci_selftest(ub, sizeof ub); window_puts(win_id, ub); }
+        else { xhci_status(ub, sizeof ub); window_puts(win_id, ub); }
     }
     else if (str_eq(cmd_buf, "shutdown")) {
         window_puts(win_id, "Shutting down...\n");
