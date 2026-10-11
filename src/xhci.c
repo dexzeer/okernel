@@ -135,6 +135,8 @@ struct rport { uint8_t known, tries, slot; uint32_t next; };
 static struct {
     int ready;
     int ss_keep;                 // `usb3` on the command line: leave SuperSpeed links on
+    int ss_force, ss_port;       // `usbss`: force the switch-off (tests); the port being switched off
+    uint32_t ss_t;
     struct pci_loc loc;
     uint16_t did;
     volatile uint8_t* cap;
@@ -994,19 +996,28 @@ static int port_reset(int port) {
 }
 
 // On the Cherry Trail laptop the touchpad (I2C) only ever worked while the boot stick ran at USB 2 speed; with its SuperSpeed link up
-// the touchpad answers garbage (5 of 5 logged boots). Nothing here needs SuperSpeed, so the USB 3 half of a port is switched off and
-// the device falls back to the port's USB 2 half (it shows up on its own root port a moment later). Boot with `usb3` to keep it.
+// the touchpad answers garbage (5 of 5 logged boots). Nothing here needs SuperSpeed, so the USB 3 half of a port is put in the Disabled
+// link state (no power change) and the device is expected to fall back to the port's USB 2 half, where it shows up on its own root port.
+// If no storage device appears within 3 s the link is restored (X.ss_keep) so the stick log keeps working. `usb3` on the command line keeps
+// SuperSpeed on; `usbss` forces the switch-off on any controller (a test hook).
 static int ss_power_off(int p, uint32_t v) {
-    if (X.ss_keep || X.did != 0x22b5) return 0;                                   // only the Cherry Trail controller (8086:22b5)
-    uint32_t off = OP_PORTSC + 0x10u * (uint32_t)(p - 1);
-    if (rd32(X.cap, CAP_HCCPARAMS1) & (1u << 3)) {                                // port power control: remove the power from the USB 3 half
-        wr32(X.op, off, PORT_PRESERVE(v) & ~PORT_PP);
-        xlog("port %d: SuperSpeed link powered off; the device falls back to USB 2", p);
-    } else {                                                                      // otherwise put the link in the Disabled state (no receiver termination)
-        wr32(X.op, off, (PORT_PRESERVE(v) & ~(15u << 5)) | (4u << 5) | (1u << 16));
-        xlog("port %d: SuperSpeed link disabled; the device falls back to USB 2", p);
-    }
+    if (X.ss_keep || X.ss_port || !(X.did == 0x22b5 || X.ss_force)) return 0;
+    wr32(X.op, OP_PORTSC + 0x10u * (uint32_t)(p - 1), (PORT_PRESERVE(v) & ~(15u << 5)) | (4u << 5) | (1u << 16));
+    X.ss_port = p; X.ss_t = tick_count ? tick_count : 1;
+    xlog("port %d: SuperSpeed link disabled; the device should fall back to USB 2", p);
     return 1;
+}
+
+static void ss_check(void) {
+    if (!X.ss_port) return;
+    if (B.used) { xlog("port %d: the device came back at USB 2 speed", X.ss_port); X.ss_port = 0; return; }
+    if ((int)(tick_count - X.ss_t) < 300) return;
+    int p = X.ss_port;
+    uint32_t off = OP_PORTSC + 0x10u * (uint32_t)(p - 1), v = rd32(X.op, off);
+    wr32(X.op, off, (PORT_PRESERVE(v) & ~(15u << 5)) | (5u << 5) | (1u << 16));       // back to Rx.Detect
+    memset(&RP[p], 0, sizeof RP[p]);
+    X.ss_keep = 1; X.ss_port = 0;
+    xlog("port %d: no fallback within 3 s; SuperSpeed restored", p);
 }
 
 static void root_enum(int p) {
@@ -1026,6 +1037,7 @@ static void root_enum(int p) {
 }
 
 static void scan_roots(void) {
+    ss_check();
     for (int p = 1; p <= X.maxports && p < 32; p++) {
         uint32_t off = OP_PORTSC + 0x10u * (uint32_t)(p - 1);
         uint32_t v = rd32(X.op, off);
@@ -1141,6 +1153,8 @@ void xhci_init(uint32_t mboot_phys) {
     if (!found) { xlog("no xHCI controller"); return; }
     X.loc = l;
     X.did = (uint16_t)(pcix_read32(l, 0) >> 16);
+    X.ss_keep = cmdline_has(mboot_phys, "usb3");
+    X.ss_force = cmdline_has(mboot_phys, "usbss");
     // power state D0 if the controller was parked
     uint8_t pm = pcix_find_cap(l, 1, 0);
     if (pm) { uint16_t cs = pcix_read16(l, (uint8_t)(pm + 4)); if (cs & 3) { pcix_write16(l, (uint8_t)(pm + 4), cs & ~3u); delay_us(20000); } }
