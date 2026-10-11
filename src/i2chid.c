@@ -48,6 +48,10 @@ static struct {
     int button;
     int logged;
     int paused;                        // `touchpad off`
+    int order[MAXDEV];                 // devices, touchpads first
+    uint32_t dbar[MAXDEV];             // controller register block of each device, from the AML (0 = unknown)
+    uint32_t dbar1[MAXDEV];            // its PCI-config mirror (power state at +0x84)
+    int aml_stage;                     // 0 not started, 1 done
 } T;
 
 static int cmdline_has(uint32_t mboot, const char* word) {
@@ -156,6 +160,48 @@ static void crumb(const char* fmt, ...) {
     __asm__ volatile("sfence" ::: "memory");
 }
 
+static int aml_rd(uint32_t phys, uint32_t* v) { return acpi_phys_read(phys, v, 4); }
+
+// ---- bring-up on the address the AML gave (state 5) -----------------------------------------------------
+// Step by step, each logged AND written to the stick before the next access: the first real run froze on a blind read.
+#define AML_START_TICK 200
+static void aml_bringup(void) {
+    if (tick_count < AML_START_TICK || T.paused) return;
+    for (int oi = 0; oi < T.ndev; oi++) {
+        int d = T.order[oi];
+        uint32_t bar = T.dbar[d];
+        if (!bar) continue;
+        int dup = 0;
+        for (int k = 0; k < oi; k++) if (T.dbar[T.order[k]] == bar) dup = 1;
+        if (dup) continue;                                              // this controller was tried for an earlier device
+        if (T.dbar1[d]) {                                               // _PS0: clear the D-state bits of the PCI-config mirror (PSAT at +0x84)
+            klog_set_scan_window(T.dbar1[d] & 0xFFC00000u);
+            crumb("touchpad: power state of %x", T.dbar1[d]);
+            klog_flush();
+            volatile uint8_t* m = blk_map(T.dbar1[d]);
+            if (m) {
+                uint32_t ps = mm_rd((void*)m, 0x84);
+                tlog("%s: PSAT %x", T.dev[d].ctrl, ps);
+                klog_flush();
+                if (ps != 0xFFFFFFFFu && (ps & 3)) {
+                    mm_wr((void*)m, 0x84, ps & ~3u);
+                    ms_delay(20);
+                    tlog("  set to D0: PSAT %x", mm_rd((void*)m, 0x84));
+                }
+            }
+        }
+        klog_set_scan_window(bar & 0xFFC00000u);
+        crumb("touchpad: controller at %x", bar);
+        klog_flush();
+        if (try_block(bar)) { T.state = 2; klog_set_scan_window(0); return; }
+        tlog("%s at %x: the touchpad did not answer", T.dev[d].ctrl, bar);
+    }
+    klog_set_scan_window(0);
+    paging_probe_window(0);
+    T.state = 3;
+    tlog("NOT WORKING: no controller answered (`touchpad aml` and the stick log have the details)");
+}
+
 static void scan_restart(void) {
     S.w = 0x40000000u; S.p = 0; S.pages = 0; S.cycles = 0; S.active = 0; S.ticks = 0;
     T.nblk = 0;
@@ -202,7 +248,7 @@ static void scan_step(void) {
                 T.blk[T.nblk++] = phys;
                 tlog("  DesignWare I2C block at %x", phys);
                 crumb("touchpad: trying the I2C block at %x", phys);
-                if (try_block(phys) && bring_up_device()) { T.state = 2; S.cycles += rdtsc() - t0; scan_finish(); return; }   // found: the window stays on this block
+                if (try_block(phys)) { T.state = 2; S.cycles += rdtsc() - t0; scan_finish(); return; }   // found: the window stays on this block
                 v = (volatile uint32_t*)paging_probe_window(S.w);                    // try_block re-pointed it at the same block
             }
             if ((S.pages & 7) == 0 && rdtsc() - t0 > SCAN_BUDGET) { S.p += 0x1000; S.cycles += rdtsc() - t0; paging_probe_window(0); return; }
@@ -244,8 +290,10 @@ static int try_block(uint32_t phys) {
     for (int pass = 0; pass < 2; pass++) {
         if (pass == 1) lpss_kick(regs);
         if (dw_setup(&T.dw, 0) < 0) { tlog("  controller will not switch off (pass %d)", pass); continue; }
-        for (int d = 0; d < T.ndev; d++) {
+        for (int oi = 0; oi < T.ndev; oi++) {
+            int d = T.order[oi];
             const struct i2c_hid_dev* dev = &T.dev[d];
+            if (T.dbar[d] && T.dbar[d] != phys) continue;               // the AML says this device sits on another controller
             static const uint16_t fallback[] = { 0x0020, 0x0001, 0x0000, 0x0002, 0x0010, 0x0030, 0x0100 };
             uint16_t cand[8 + 7];
             int nc = 0;
@@ -264,7 +312,8 @@ static int try_block(uint32_t phys) {
                 if (rc == 0) {
                     tlog("  %s at %x on block %x: HID descriptor at register %x (pass %d)", dev->hid, dev->addr, phys, cand[i], pass);
                     T.cur = d; T.base = phys;
-                    return 1;
+                    if (bring_up_device()) return 1;                  // a touchpad or mouse: running. Anything else (a touchscreen): next device
+                    break;
                 }
             }
             tlog("  addr %x: no HID descriptor (first try rc %d, abort %x, pass %d)", dev->addr, firstrc, T.dw.last_abort, pass);
@@ -275,7 +324,7 @@ static int try_block(uint32_t phys) {
 
 static void try_all_blocks(void) {
     for (int i = 0; i < T.nblk; i++) {
-        if (try_block(T.blk[i]) && bring_up_device()) { T.state = 2; return; }
+        if (try_block(T.blk[i])) { T.state = 2; return; }
     }
     if (T.state != 2) T.state = 3;
 }
@@ -394,10 +443,25 @@ void i2chid_init(uint32_t mboot_phys) {
     uint32_t lens[24];
     int nt = acpi_aml_tables(tabs, lens, 24);
     T.ndev = 0;
-    for (int i = 0; i < nt; i++) {
+    for (int i = 0; i < nt; i++)
         if (T.ndev < MAXDEV) T.ndev += i2caml_find(tabs[i], lens[i], T.dev + T.ndev, MAXDEV - T.ndev);
-        kfree(tabs[i]);
+    // touchpads first (a touchscreen on the same controller must not be tried before it)
+    int no = 0;
+    for (int pass = 0; pass < 2; pass++)
+        for (int i = 0; i < T.ndev; i++) {
+            const char* h = T.dev[i].hid;
+            int pad = !strncmp(h, "SYNA", 4) || !strncmp(h, "ELAN", 4) || !strncmp(h, "ALPS", 4) || !strncmp(h, "CYAP", 4) || !strncmp(h, "FTE", 3) || !strncmp(h, "HPQ", 3);
+            if (pad == (pass == 0)) T.order[no++] = i;
+        }
+    // where the AML says each controller's registers are
+    for (int i = 0; i < T.ndev; i++) {
+        struct i2c_ctrl_bars b;
+        if (i2caml_ctrl_bars((const uint8_t* const*)tabs, lens, nt, T.dev[i].ctrl, aml_rd, &b)) {
+            T.dbar[i] = b.bar0; T.dbar1[i] = b.psat_known ? b.bar1 : 0;
+            tlog("AML: %s registers at %x (len %x), config mirror %x", T.dev[i].ctrl, b.bar0, b.len0, b.bar1);
+        } else tlog("AML: no register address found for %s", T.dev[i].ctrl);
     }
+    for (int i = 0; i < nt; i++) kfree(tabs[i]);
     if (!T.ndev) return;                                                // nothing to look for: stay out of the way
     for (int i = 0; i < T.ndev; i++) {
         const struct i2c_hid_dev* d = &T.dev[i];
@@ -409,8 +473,13 @@ void i2chid_init(uint32_t mboot_phys) {
     }
     crumb("touchpad: memory map and PCI ranges");
     collect_ranges(mboot_phys);
-    dump_ctrl_aml(T.dev[0].ctrl);                 // what the AML says about the controller (also in the on-stick log with the raw tables)
-    if (cmdline_has(mboot_phys, "i2cscan")) {
+    dump_ctrl_aml(T.dev[T.order[0]].ctrl);        // what the AML says about the controller (also in the on-stick log with the raw tables)
+    int have = 0;
+    for (int i = 0; i < T.ndev; i++) if (T.dbar[i]) have = 1;
+    if (have && !cmdline_has(mboot_phys, "i2cscan")) {
+        T.state = 5;                              // the firmware told us where the controller is: bring it up from the main loop (no scan)
+        tlog("controller addresses known from the AML: bring-up starts %u s after boot", AML_START_TICK / 100);
+    } else if (cmdline_has(mboot_phys, "i2cscan")) {
         scan_restart();                           // the hunt itself runs from i2chid_poll, a little per tick
         tlog("controller hunt starts %u s after boot (a little per tick)", SCAN_START_TICK / 100);
     } else {
@@ -466,6 +535,7 @@ void i2chid_rescan(void) {
 
 void i2chid_poll(void) {
     if (T.state == 1) { scan_step(); return; }
+    if (T.state == 5) { aml_bringup(); return; }
     if (T.state != 2 || T.paused) return;
     uint32_t t = tick_count;
     if (t == T.last_tick) return;
@@ -512,7 +582,7 @@ void i2chid_aml(char* buf, int cap) {
 void i2chid_status(char* buf, int cap) {
     buf[0] = 0;
     const char* st = T.state == 2 ? (T.paused ? "paused (touchpad on)" : "running") : T.state == 1 ? "searching" : T.state == 3 ? "NOT WORKING" :
-                     T.state == 4 ? "controller not located (`touchpad scan` hunts for it)" : "no I2C-HID device in ACPI";
+                     T.state == 4 ? "controller not located (`touchpad scan` hunts for it)" : T.state == 5 ? "starting (address from the AML)" : "no I2C-HID device in ACPI";
     int at = sfmt(buf, cap, 0, "touchpad: %s, reports %u, empty polls %u, errors %u, unmatched %u", st, T.reports, T.empty, T.errors, T.unmatched);
     if (T.state == 1)
         at = sfmt(buf, cap, at, "hunt: %s at %x, %u pages read, %d controller block(s) found%s", tick_count < SCAN_START_TICK ? "starts soon" : "now", S.w, S.pages, T.nblk,

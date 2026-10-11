@@ -371,8 +371,50 @@ static void fuzz_ptp(void) {
     }
 }
 
+// the controller base from the firmware's named fields (bytes of the real laptop's I2C5 device, GNVS region/field synthetic)
+static uint32_t fake_mem[1024];                     // pretend GNVS at 0x7b7dba98
+static int fake_rd(uint32_t phys, uint32_t* v) {
+    if (phys < 0x7b7dba98u || phys >= 0x7b7dba98u + 4096) return 0;
+    *v = fake_mem[(phys - 0x7b7dba98u) / 4];
+    return 1;
+}
+static void test_bars(void) {
+    static const uint8_t dev[] = {
+        0x5b,0x82,0x41,0x37,'I','2','C','5',0x08,'_','H','I','D',0x0d,'8','0','8','6','2','2','C','1',0x00,
+        0x08,'_','U','I','D',0x0a,0x05,0x08,'R','B','U','F',0x11,0x26,0x0a,0x23,0x86,0x09,0x00,0x01,0x00,0x00,0x00,
+        0x00,0x00,0x10,0x00,0x00,0x89,0x06,0x00,0x05,0x01,0x24,0x00,0x00,0x00,0x79,0x00,0x14,0x33,'_','C','R','S',0x00,
+        0x8a,'R','B','U','F',0x0a,0x04,'B','0','B','A',0x8a,'R','B','U','F',0x0a,0x08,'B','0','L','N',
+        0x70,'I','5','0','A','B','0','B','A',0x70,'I','5','0','L','B','0','L','N',0xa4,'R','B','U','F',
+        0x14,0x26,'_','P','S','0',0x00,0xa0,0x1f,0x93,'I','5','D','3',0x01,0x7b,'P','S','A','T',0x0c,0xfc,0xff,
+        0xff,0xff,'P','S','A','T',0x7d,'P','S','A','T',0x00,'P','S','A','T',
+        0x5b,0x80,'K','E','Y','S',0x00,'I','5','1','A',0x0b,0x00,0x01,
+        0x5b,0x81,0x0e,'K','E','Y','S',0x43,0x00,0x40,0x42,'P','S','A','T',0x20 };
+    uint8_t t[2048];
+    uint32_t n = 36;
+    memset(t, 0, sizeof t);
+    memcpy(t, "DSDT", 4);
+    static const uint8_t reg[] = { 0x5b,0x80,'G','N','V','S',0x00,0x0c,0x98,0xba,0x7d,0x7b,0x0b,0x4a,0x03 };   // OperationRegion(GNVS, SystemMemory, 0x7b7dba98, 842)
+    memcpy(t + n, reg, sizeof reg); n += sizeof reg;
+    // Field(GNVS) { Offset(456), I50A,32, I50L,32, I51A,32 }: 3648 reserved bits = PkgLength 0x40 0xE4
+    static const uint8_t fld[] = { 0x5b,0x81,0x1a,'G','N','V','S',0x10, 0x00,0x40,0xe4, 'I','5','0','A',0x20, 'I','5','0','L',0x20, 'I','5','1','A',0x20 };
+    memcpy(t + n, fld, sizeof fld); n += sizeof fld;
+    memcpy(t + n, dev, sizeof dev);
+    uint32_t body = (uint32_t)sizeof dev - 2;                                          // PkgLength covers itself and everything after it
+    t[n + 2] = (uint8_t)(0x40 | (body & 0xF)); t[n + 3] = (uint8_t)(body >> 4);
+    n += sizeof dev;
+    t[36 + sizeof reg + 2] = 0x18;                                                     // the Field's PkgLength
+    fake_mem[456 / 4] = 0x81350000u; fake_mem[460 / 4] = 0x1000; fake_mem[464 / 4] = 0x81351000u;
+    const uint8_t* tabs[1] = { t };
+    uint32_t lens[1] = { n };
+    struct i2c_ctrl_bars b;
+    CHECK(i2caml_ctrl_bars(tabs, lens, 1, "\\_SB.PCI0.I2C5", fake_rd, &b));
+    CHECK(b.bar0 == 0x81350000u && b.len0 == 0x1000 && b.psat_known && b.bar1 == 0x81351000u);
+    CHECK(!i2caml_ctrl_bars(tabs, lens, 1, "\\_SB.PCI0.I2C6", fake_rd, &b));         // no such device
+    for (uint32_t cut = 0; cut < n; cut++) { uint32_t l2 = cut; (void)i2caml_ctrl_bars(tabs, &l2, 1, "\\_SB.PCI0.I2C5", fake_rd, &b); }   // truncations stay in bounds
+}
+
 int main(void) {
-    test_ptp_parse(); test_gestures(); test_bus(); test_aml(); fuzz(); fuzz_ptp();
+    test_ptp_parse(); test_gestures(); test_bus(); test_aml(); test_bars(); fuzz(); fuzz_ptp();
     printf(fails ? "TOUCH FAIL (%d)\n" : "TOUCH PASS\n", fails);
     return fails != 0;
 }
