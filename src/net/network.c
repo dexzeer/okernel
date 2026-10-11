@@ -165,8 +165,7 @@ static void build_eth_header(struct eth_header* eth, uint8_t* dst, uint8_t* src,
 }
 
 void arp_send_request(uint8_t* target_ip) {
-    serial_printf("[arp] send request to %d.%d.%d.%d
-", target_ip[0], target_ip[1], target_ip[2], target_ip[3]);
+    serial_printf("[arp] send request to %d.%d.%d.%d\n", target_ip[0], target_ip[1], target_ip[2], target_ip[3]);
 
     uint8_t frame[ETH_FRAME_MAX];
     uint8_t* mac = nic_mac();
