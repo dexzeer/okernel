@@ -110,6 +110,8 @@ struct hidep {
     uint16_t vid, pid;
     uint32_t last_tick, restarts, watchdog, bad, next_try;   // halted-endpoint restarts, restarts found by the state check, failed restarts
     int lastcode;                // completion code of the last transfer event
+    uint32_t burst, idle_restarts, stall_logs;   // reports in the current burst; restarts after a pause; stall dumps written
+    int armed;                   // a report came since the last pause check
     int dead;                    // gave up after repeated failed restarts
 };
 
@@ -236,6 +238,8 @@ static void ep_requeue(struct hidep* e) {
 
 static void ptr_report(struct hidep* e, const uint8_t* b, int n) {
     if (n <= 0) return;
+    if ((int)(tick_count - e->last_tick) > 25) e->burst = 0;
+    e->burst++; e->armed = 1;
     e->reports++; X.reports++; e->last_tick = tick_count;
     if (e->logged < 2) {
         e->logged++;
@@ -1063,6 +1067,30 @@ static void poll_inner(void) {
             if (++e->bad >= 10) { e->dead = 1; xlog("slot %d: giving up on this endpoint (unplug and replug)", e->slot); }
         }
     }
+    for (int i = 0; i < MAXEP; i++) {                           // a pointer that went quiet after moving: dump what the controller thinks, then restart it
+        struct hidep* e = &E[i];
+        if (!e->used || !e->armed || e->fail || e->dead || (int)(tick_count - e->last_tick) < 25) continue;
+        e->armed = 0;
+        if (e->burst < 4 || !X.devctx[e->slot]) continue;
+        if (e->stall_logs < 6) {
+            e->stall_logs++;
+            volatile uint32_t* oc = (volatile uint32_t*)ctx(X.devctx[e->slot], e->dci);
+            uint32_t deq = oc[2] & ~15u;
+            xlog("t=%u quiet after %u reports (#%u): ep %08x %08x %08x %08x", tick_count, e->burst, e->reports, oc[0], oc[1], oc[2], oc[3]);
+            uint32_t ix = (deq - e->ring.phys) / 16;
+            if (ix < (uint32_t)e->ring.n) {
+                volatile struct trb* t = &e->ring.trb[ix];
+                xlog("  hw deq idx %u trb %08x %08x %08x; ours enq %d cyc %d", ix, t->lo, t->status, t->control, e->ring.enq, e->ring.cycle);
+            } else xlog("  hw deq %08x is outside the ring at %08x", deq, e->ring.phys);
+            struct dev* d = &D[e->slot];
+            uint32_t ps = rd32(X.op, OP_PORTSC + 0x10u * (uint32_t)(d->root - 1));
+            xlog("  USBSTS %08x ERDP %08x root port %d PORTSC %08x", rd32(X.op, 4), rd32(X.rt, IR_ERDP), d->root, ps);
+            uint32_t st, ch;
+            if (d->parent && D[d->parent].used && hub_status(d->parent, d->pport, &st, &ch)) xlog("  hub port %d status %04x change %04x", d->pport, st, ch);
+        }
+        e->idle_restarts++;
+        if (!ep_recover(e)) xlog("slot %d: restart after a pause failed", e->slot);
+    }
     if (X.port_pending || (int)(tick_count - X.next_scan) >= 0) {
         X.next_scan = tick_count + 20;
         for (int i = 0; i < MAXEP; i++) {                       // the controller's own idea of each endpoint: running (1), or halted / stopped / error
@@ -1161,7 +1189,7 @@ void xhci_status(char* buf, int cap) {
                 uint32_t st = X.devctx[E[i].slot] ? ((volatile uint32_t*)ctx(X.devctx[E[i].slot], E[i].dci))[0] & 7 : 9;
                 at = sadd(buf, cap, at, "slot %d %x:%x if%d: %u reports, %u errors, %u unmatched", E[i].slot, E[i].vid, E[i].pid, E[i].ifnum,
                           E[i].reports, E[i].errors, E[i].unmatched);
-                at = sadd(buf, cap, at, "  ep state %u, last code %d, restarts %u (watchdog %u), last report %u ms ago%s", st, E[i].lastcode, E[i].restarts, E[i].watchdog, (tick_count - E[i].last_tick) * 10,
+                at = sadd(buf, cap, at, "  ep state %u, last code %d, restarts %u (watchdog %u, after pauses %u), last report %u ms ago%s", st, E[i].lastcode, E[i].restarts, E[i].watchdog, E[i].idle_restarts, (tick_count - E[i].last_tick) * 10,
                           E[i].dead ? ", GAVE UP" : "");
             }
         uint32_t sts = rd32(X.op, 4);

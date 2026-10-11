@@ -49,6 +49,108 @@ static void add_reg(struct i2c_hid_dev* d, uint16_t v) {
     if (d->nreg < 8) d->reg[d->nreg++] = v;
 }
 
+// ---- where the firmware put the controller's registers ----------------------------------------------
+// Intel LPSS devices in ACPI mode have no PCI function; their _CRS fills the Memory32Fixed base from a named field:
+//   CreateDWordField(RBUF, 4, B0BA) ... Store(I50A, B0BA)
+// where I50A is a field of a SystemMemory OperationRegion (the firmware's GNVS block in ACPI NVS memory), and _PS0
+// powers the device by clearing the D-state bits of a PCI-config mirror: OperationRegion(KEYS, SystemMemory, I51A, 0x100)
+// with PSAT at +0x84. We find those names by pattern, resolve each to a physical address, and read it.
+static uint32_t pkg(const uint8_t* t, uint32_t i, uint32_t* hdr) {
+    uint32_t lead = t[i], cnt = (lead >> 6) & 3;
+    uint32_t v = cnt == 0 ? (lead & 0x3F) : (lead & 0x0F);
+    for (uint32_t k = 0; k < cnt; k++) v |= (uint32_t)t[i + 1 + k] << (4 + 8 * k);
+    *hdr = 1 + cnt;
+    return v;
+}
+
+// constant integer at t[i]: ByteConst/WordConst/DWordConst/Zero/One. Returns bytes used or 0.
+static int aml_int(const uint8_t* t, uint32_t i, uint32_t end, uint32_t* v) {
+    if (i >= end) return 0;
+    if (t[i] == 0x00) { *v = 0; return 1; }
+    if (t[i] == 0x01) { *v = 1; return 1; }
+    if (t[i] == 0x0A && i + 2 <= end) { *v = t[i + 1]; return 2; }
+    if (t[i] == 0x0B && i + 3 <= end) { *v = (uint32_t)t[i + 1] | ((uint32_t)t[i + 2] << 8); return 3; }
+    if (t[i] == 0x0C && i + 5 <= end) { *v = (uint32_t)t[i + 1] | ((uint32_t)t[i + 2] << 8) | ((uint32_t)t[i + 3] << 16) | ((uint32_t)t[i + 4] << 24); return 5; }
+    return 0;
+}
+
+// physical address of the SystemMemory field `nm` (a 32 bit field at a byte boundary), searching every table
+static int field_phys(const uint8_t* const* tabs, const uint32_t* lens, int nt, const char* nm, uint32_t* phys) {
+    for (int ti = 0; ti < nt; ti++) {
+        const uint8_t* t = tabs[ti];
+        uint32_t len = lens[ti];
+        for (uint32_t i = 36; i + 8 < len; i++) {
+            if (t[i] != 0x5B || t[i + 1] != 0x81) continue;                          // FieldOp
+            uint32_t hdr, pl = pkg(t, i + 2, &hdr);
+            uint32_t end = i + 2 + pl, j = i + 2 + hdr;
+            if (end > len || j + 5 > end) continue;
+            const uint8_t* rn = t + j;                                               // region name
+            j += 5;                                                                  // + flags
+            uint32_t bit = 0;
+            int hit = 0;
+            uint32_t fbit = 0;
+            while (j < end && !hit) {
+                uint8_t b = t[j];
+                if (b == 0) { uint32_t h2, l = pkg(t, j + 1, &h2); bit += l; j += 1 + h2; }
+                else if (b == 1) j += 3;
+                else if (b == 2) j += 1;
+                else if (b == 3) j += 4;
+                else {
+                    if (j + 5 > end) break;
+                    uint32_t h2, l = pkg(t, j + 4, &h2);
+                    if (t[j] == (uint8_t)nm[0] && t[j + 1] == (uint8_t)nm[1] && t[j + 2] == (uint8_t)nm[2] && t[j + 3] == (uint8_t)nm[3] && l == 32 && !(bit & 7)) { hit = 1; fbit = bit; }
+                    bit += l; j += 4 + h2;
+                }
+            }
+            if (!hit) continue;
+            for (int tj = 0; tj < nt; tj++) {                                        // its OperationRegion(name, SystemMemory, const, len)
+                const uint8_t* u = tabs[tj];
+                uint32_t ul = lens[tj];
+                for (uint32_t k = 36; k + 9 < ul; k++) {
+                    if (u[k] != 0x5B || u[k + 1] != 0x80 || u[k + 2] != rn[0] || u[k + 3] != rn[1] || u[k + 4] != rn[2] || u[k + 5] != rn[3] || u[k + 6] != 0) continue;
+                    uint32_t off;
+                    if (!aml_int(u, k + 7, ul, &off) || !(u[k + 7] == 0x0C || u[k + 7] == 0x0B || u[k + 7] == 0x0A)) continue;
+                    *phys = off + fbit / 8;
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int i2caml_ctrl_bars(const uint8_t* const* tabs, const uint32_t* lens, int nt, const char* ctrl, i2caml_rd rd, struct i2c_ctrl_bars* o) {
+    o->ok = 0; o->bar0 = o->bar1 = o->len0 = 0; o->psat_known = 0;
+    int cl = 0;
+    while (ctrl[cl]) cl++;
+    if (cl < 4) return 0;
+    const char* nm = ctrl + cl - 4;
+    for (int ti = 0; ti < nt; ti++) {
+        const uint8_t* t = tabs[ti];
+        uint32_t len = lens[ti];
+        for (uint32_t i = 36; i + 12 < len; i++) {
+            if (t[i] != 0x5B || t[i + 1] != 0x82) continue;
+            uint32_t hdr, pl = pkg(t, i + 2, &hdr);
+            uint32_t ns = i + 2 + hdr, end = i + 2 + pl;
+            if (end > len || ns + 4 > end || t[ns] != (uint8_t)nm[0] || t[ns + 1] != (uint8_t)nm[1] || t[ns + 2] != (uint8_t)nm[2] || t[ns + 3] != (uint8_t)nm[3]) continue;
+            char n0[4] = { 0 }, n1[4] = { 0 }, nl[4] = { 0 };
+            int h0 = 0, h1 = 0, hl = 0;
+            for (uint32_t j = ns + 4; j + 9 <= end; j++) {
+                if (t[j] == 0x70 && t[j + 5] == 'B' && t[j + 6] == '0' && t[j + 7] == 'B' && t[j + 8] == 'A') { for (int k = 0; k < 4; k++) n0[k] = (char)t[j + 1 + k]; h0 = 1; }   // Store(I50A, B0BA)
+                if (t[j] == 0x70 && t[j + 5] == 'B' && t[j + 6] == '0' && t[j + 7] == 'L' && t[j + 8] == 'N') { for (int k = 0; k < 4; k++) nl[k] = (char)t[j + 1 + k]; hl = 1; }   // Store(I50L, B0LN)
+                if (j + 11 <= end && t[j] == 0x5B && t[j + 1] == 0x80 && t[j + 2] == 'K' && t[j + 3] == 'E' && t[j + 4] == 'Y' && t[j + 5] == 'S' && t[j + 6] == 0x00 &&
+                    ((t[j + 7] >= 'A' && t[j + 7] <= 'Z') || t[j + 7] == '_')) { for (int k = 0; k < 4; k++) n1[k] = (char)t[j + 7 + k]; h1 = 1; }   // OperationRegion(KEYS, SystemMemory, I51A, ..)
+            }
+            uint32_t pa;
+            if (h0 && field_phys(tabs, lens, nt, n0, &pa) && rd(pa, &o->bar0)) { o->ok = 1; }
+            if (hl && field_phys(tabs, lens, nt, nl, &pa)) rd(pa, &o->len0);
+            if (h1 && field_phys(tabs, lens, nt, n1, &pa) && rd(pa, &o->bar1)) o->psat_known = 1;
+            return o->ok;
+        }
+    }
+    return 0;
+}
+
 int i2caml_find(const uint8_t* t, uint32_t len, struct i2c_hid_dev* out, int max) {
     int n = 0;
     static const uint8_t guid[16] = { 0xF7, 0xF6, 0xDF, 0x3C, 0x67, 0x42, 0x55, 0x45, 0xAD, 0x05, 0xB3, 0x0A, 0x3D, 0x89, 0x38, 0xDE };

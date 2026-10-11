@@ -17,4 +17,12 @@ struct i2c_hid_dev {
 
 int i2caml_find(const uint8_t* t, uint32_t len, struct i2c_hid_dev* out, int max);
 
+// Where the firmware put the controller's registers (see i2caml.c): `ctrl` is the controller path from i2caml_find
+// ("\_SB.PCI0.I2C5"). The AML fills its Memory32Fixed base from a named field of a SystemMemory region; `rd` reads a
+// dword of physical memory. bar0 = register block (0 = unassigned), len0 its length, bar1 = the PCI-config mirror whose
+// PSAT register (+0x84, the PMCSR power state, bits 1:0 = 0 for D0) the device's _PS0 clears (psat_known = bar1 valid).
+typedef int (*i2caml_rd)(uint32_t phys, uint32_t* v);
+struct i2c_ctrl_bars { int ok; uint32_t bar0, bar1, len0; int psat_known; };
+int i2caml_ctrl_bars(const uint8_t* const* tabs, const uint32_t* lens, int nt, const char* ctrl, i2caml_rd rd, struct i2c_ctrl_bars* out);
+
 #endif
