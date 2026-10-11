@@ -18,8 +18,9 @@
 #include "pcix.h"
 #include "serial.h"
 #include "string.h"
+#include "rtw/rtw.h"
 
-extern uint32_t tick_count;           // 100 Hz since boot (desktop.c); not running while xhci_init() executes
+extern uint32_t tick_count;          // 100 Hz since boot (desktop.c); not running while xhci_init() executes
 
 // ---- register layout ---------------------------------------------------------------------------
 #define CAP_HCSPARAMS1 0x04
@@ -169,6 +170,24 @@ static struct {
     volatile int done, code;
 } B;
 
+#define WL_NRX 6
+#define WL_RXSZ 32768
+#define WL_MAXOUT 4
+static struct {
+    int used, slot, speed, nout, started, dead;
+    int in_ep, in_dci, out_ep[WL_MAXOUT], out_dci[WL_MAXOUT], out_mps[WL_MAXOUT];
+    struct ring rin, rout[WL_MAXOUT];
+    uint8_t* rx;                 // WL_NRX buffers of WL_RXSZ, aligned to their size (a TRB never crosses a 64 KB boundary)
+    uint8_t* tx;                 // 64 KB, 64 KB aligned
+    int rx_head, rx_len[WL_NRX];
+    volatile int rx_state[WL_NRX];   // 0 queued, 1 completed, 2 failed
+    volatile int out_done, out_code;
+    uint16_t vid, pid;
+    int ctl_fails;
+    uint32_t rx_errors, rx_recoveries;
+} WL;
+
+
 static struct hidep E[MAXEP];
 static struct dev D[MAXSLOTS + 1];
 static struct rport RP[32];
@@ -301,6 +320,16 @@ static void pump(void) {
                 }
             } else if (B.used && slot == B.slot && (ep == B.in_dci || ep == B.out_dci)) {
                 B.code = code; B.done = 1;
+            } else if (WL.used && slot == WL.slot && ep != 1) {
+                if (ep == WL.in_dci) {
+                    uint32_t idx = (lo - WL.rin.phys) / 16;
+                    if (idx < WL_NRX) {
+                        if (code == 1 || code == 13) { WL.rx_len[idx] = WL_RXSZ - (int)(status & 0xFFFFFF); WL.rx_state[idx] = 1; }
+                        else if (code != 26 && code != 27) { WL.rx_len[idx] = 0; WL.rx_state[idx] = 2; }
+                    }
+                } else {
+                    WL.out_code = code; WL.out_done = 1;
+                }
             } else {
                 X.ctl_code = code; X.ctl_len = X.ctl_want - (int)(status & 0xFFFFFF); X.ctl_done = 1;
             }
@@ -427,6 +456,7 @@ static void dev_drop(int slot) {
     if (slot < 1 || slot > MAXSLOTS || !D[slot].used) return;
     for (int i = 0; i < MAXEP; i++) if (E[i].used && E[i].slot == slot) E[i].used = 0;
     if (B.used && B.slot == slot) B.used = 0;
+    if (WL.used && WL.slot == slot) { WL.used = 0; WL.started = 0; }
     for (int s = 1; s <= MAXSLOTS; s++)
         if (D[s].used && D[s].parent == slot) dev_drop(s);
     if (D[slot].parent && D[D[slot].parent].used && D[slot].pport <= MAXHUBPORT) D[D[slot].parent].child[D[slot].pport] = 0;
@@ -454,7 +484,7 @@ static void describe_layout(int slot, const struct hid_ptr* p, int ids) {
          p->x.bits, p->x.off, p->y.bits, p->y.off, p->wheel.bits, p->btn[0].bits ? 1 : 0, p->btn[1].bits ? 1 : 0, p->btn[2].bits ? 1 : 0, p->bytes);
 }
 
-struct ifc { int num, cls, sub, proto, rptlen, ep, epmps, epint, bin, bout, binmps, boutmps; };
+struct ifc { int num, cls, sub, proto, rptlen, ep, epmps, epint, bin, bout, binmps, boutmps, nout, outs[4], outmps[4]; };
 
 // ---- USB mass storage, bulk-only transport (SCSI transparent command set) -----------------------------------
 // Only for the on-stick log (klog.c): synchronous, one command at a time, a failure switches it off for good.
@@ -573,6 +603,139 @@ int xhci_storage_rw(int write, uint32_t lba, void* data, uint32_t n) {
     if (!write) memcpy(data, B.data, n * 512);
     return 1;
 }
+// ---- USB Wi-Fi adapter (vendor class, see src/rtw) ----------------------------------------------------------
+// Register access is a vendor control transfer, firmware and frames go out on bulk OUT endpoints and come in on one bulk
+// IN endpoint that keeps WL_NRX buffers in flight. Everything is polled from the caller; the receive buffers are
+// handed out in ring order.
+static void wl_rx_queue(int i) {
+    WL.rx_state[i] = 0;
+    ring_push(&WL.rin, phys_of(WL.rx + (uint32_t)i * WL_RXSZ), 0, WL_RXSZ, (TRB_NORMAL << 10) | (1u << 5) | (1u << 2));   // IOC | ISP
+    wr32(X.db, (uint32_t)WL.slot * 4, (uint32_t)WL.in_dci);
+}
+
+static int wl_setup(int slot, int speed, const struct ifc* f, int cfgval, uint16_t vid, uint16_t pid) {
+    if (!f->bin || f->nout < 1) { xlog("  wifi: bulk endpoints missing"); return 0; }
+    if (!is_ok(ctl(slot, 0x00, 9, (uint16_t)cfgval, 0, 0, 0))) { xlog("  wifi: set configuration failed"); return 0; }
+    if (!WL.rin.trb && !ring_init(&WL.rin, WL_NRX + 1)) { xlog("  wifi: out of memory"); return 0; }
+    for (int i = 0; i < f->nout; i++)
+        if (!WL.rout[i].trb && !ring_init(&WL.rout[i], 9)) { xlog("  wifi: out of memory"); return 0; }
+    if (!WL.rx) WL.rx = (uint8_t*)dma_alloc(WL_NRX * WL_RXSZ, WL_RXSZ);
+    if (!WL.tx) WL.tx = (uint8_t*)dma_alloc(65536, 65536);
+    if (!WL.rx || !WL.tx) { xlog("  wifi: out of memory"); return 0; }
+    ring_reset(&WL.rin);
+    WL.slot = slot; WL.speed = speed; WL.nout = f->nout; WL.started = 0; WL.dead = 0; WL.ctl_fails = 0;
+    WL.vid = vid; WL.pid = pid;
+    WL.in_ep = f->bin; WL.in_dci = (f->bin & 15) * 2 + 1;
+    int maxdci = WL.in_dci;
+    for (int i = 0; i < f->nout; i++) {
+        ring_reset(&WL.rout[i]);
+        WL.out_ep[i] = f->outs[i]; WL.out_mps[i] = f->outmps[i] ? f->outmps[i] : 512;
+        WL.out_dci[i] = (f->outs[i] & 15) * 2;
+        if (WL.out_dci[i] > maxdci) maxdci = WL.out_dci[i];
+    }
+    memset(X.inctx, 0, 33u * (uint32_t)X.ctxsz);
+    memcpy(ctx(X.inctx, 1), ctx(X.devctx[slot], 0), (uint32_t)X.ctxsz);
+    uint32_t add = 1u | (1u << WL.in_dci);
+    uint32_t* ci = ctx(X.inctx, WL.in_dci + 1);
+    ci[1] = (3u << 1) | (6u << 3) | ((uint32_t)f->binmps << 16);  ci[2] = WL.rin.phys | 1;  ci[4] = 4096;
+    for (int i = 0; i < f->nout; i++) {
+        add |= 1u << WL.out_dci[i];
+        uint32_t* co = ctx(X.inctx, WL.out_dci[i] + 1);
+        co[1] = (3u << 1) | (2u << 3) | ((uint32_t)WL.out_mps[i] << 16); co[2] = WL.rout[i].phys | 1; co[4] = 4096;
+    }
+    ctx(X.inctx, 0)[1] = add;
+    uint32_t* sc2 = ctx(X.inctx, 1);
+    if (((sc2[0] >> 27) & 31) < (uint32_t)maxdci) sc2[0] = (sc2[0] & 0x07FFFFFFu) | ((uint32_t)maxdci << 27);
+    int code = command(phys_of(X.inctx), 0, 0, (TRB_CONFIGURE << 10) | ((uint32_t)slot << 24), 0);
+    if (code != 1) { xlog("  wifi: configure endpoint failed (code %d)", code); return 0; }
+    WL.used = 1;
+    xlog("  wifi adapter %x:%x ready: %d bulk OUT, in ep %x", vid, pid, WL.nout, WL.in_ep);
+    return 1;
+}
+
+int xhci_wl_present(struct xhci_wl_info* info) {
+    if (!WL.used) return 0;
+    if (info) { info->vid = WL.vid; info->pid = WL.pid; info->speed = WL.speed; info->nout = WL.nout; }
+    return 1;
+}
+
+void xhci_wl_pump(void) { if (X.ready) pump(); }
+
+int xhci_wl_ctrl(int in, uint8_t req, uint16_t value, uint16_t index, void* buf, uint16_t len) {
+    if (!WL.used || WL.dead || len > 512) return -1;
+    if (!in && len) memcpy(X.dma, buf, len);
+    int code = ctl(WL.slot, in ? 0xC0 : 0x40, req, value, index, len, in);
+    if (!is_ok(code)) {
+        if (++WL.ctl_fails >= 8) { WL.dead = 1; xlog("wifi: control transfers keep failing (code %d): adapter given up", code); }
+        return -2;
+    }
+    WL.ctl_fails = 0;
+    if (in && len) memcpy(buf, X.dma, len);
+    return len;
+}
+
+int xhci_wl_bulk_out(int ep, const void* data, uint32_t len) {
+    if (!WL.used || WL.dead || ep < 0 || ep >= WL.nout || !len || len > 65536) return -1;
+    memcpy(WL.tx, data, len);
+    struct ring* r = &WL.rout[ep];
+    int zlp = (len % (uint32_t)WL.out_mps[ep]) == 0;
+    WL.out_done = 0;
+    ring_push(r, phys_of(WL.tx), 0, len, (TRB_NORMAL << 10) | (zlp ? (1u << 4) : (1u << 5)));      // CH or IOC
+    if (zlp) ring_push(r, phys_of(WL.tx), 0, 0, (TRB_NORMAL << 10) | (1u << 5));
+    wr32(X.db, (uint32_t)WL.slot * 4, (uint32_t)WL.out_dci[ep]);
+    for (int i = 0; i < 40000; i++) {                                                               // 2 s
+        pump();
+        if (WL.out_done) {
+            if (is_ok(WL.out_code)) return 0;
+            xlog("wifi: bulk OUT %d failed (code %d)", ep, WL.out_code);
+            ep_restart(WL.slot, WL.out_dci[ep], r->phys + (uint32_t)r->enq * 16, r->cycle, 0);
+            ctl(WL.slot, 0x02, 1, 0, (uint16_t)WL.out_ep[ep], 0, 0);
+            return -2;
+        }
+        delay_us(50);
+    }
+    xlog("wifi: bulk OUT %d timed out", ep);
+    ep_restart(WL.slot, WL.out_dci[ep], r->phys + (uint32_t)r->enq * 16, r->cycle, 1);
+    return -3;
+}
+
+void xhci_wl_rx_start(void) {
+    if (!WL.used || WL.started) return;
+    WL.started = 1; WL.rx_head = 0;
+    ring_reset(&WL.rin);
+    for (int i = 0; i < WL_NRX; i++) wl_rx_queue(i);
+}
+
+static void wl_rx_recover(void) {
+    WL.rx_recoveries++;
+    ring_reset(&WL.rin);
+    ep_restart(WL.slot, WL.in_dci, WL.rin.phys, 1, 1);
+    ctl(WL.slot, 0x02, 1, 0, (uint16_t)WL.in_ep, 0, 0);
+    WL.rx_head = 0;
+    for (int i = 0; i < WL_NRX; i++) wl_rx_queue(i);
+}
+
+int xhci_wl_rx_get(const uint8_t** data) {
+    if (!WL.used || !WL.started) return 0;
+    pump();
+    for (int guard = 0; guard < WL_NRX; guard++) {
+        int i = WL.rx_head;
+        if (!WL.rx_state[i]) return 0;
+        if (WL.rx_state[i] == 2) { WL.rx_errors++; wl_rx_recover(); return 0; }
+        if (WL.rx_len[i] > 0) { *data = WL.rx + (uint32_t)i * WL_RXSZ; return WL.rx_len[i]; }
+        xhci_wl_rx_done();                                                                        // an empty transfer: drop it
+    }
+    return 0;
+}
+
+void xhci_wl_rx_done(void) {
+    if (!WL.used || !WL.started) return;
+    int i = WL.rx_head;
+    if (!WL.rx_state[i]) return;
+    WL.rx_head = (i + 1) % WL_NRX;
+    wl_rx_queue(i);
+}
+
 struct eparam { int root, parent, pport, speed, depth; uint32_t route; int tt_slot, tt_port; };
 
 // Address the device, read its descriptors; a hub gets its ports powered, a device with pointer interfaces gets them
@@ -655,6 +818,7 @@ static int enum_device(const struct eparam* a, int* known) {
             int mp = (cfg[p + 4] | (cfg[p + 5] << 8)) & 0x7FF;
             if ((cfg[p + 2] & 0x80) && !cur->bin) { cur->bin = cfg[p + 2]; cur->binmps = mp; }
             else if (!(cfg[p + 2] & 0x80) && !cur->bout) { cur->bout = cfg[p + 2]; cur->boutmps = mp; }
+            if (!(cfg[p + 2] & 0x80) && cur->nout < 4) { cur->outs[cur->nout] = cfg[p + 2]; cur->outmps[cur->nout] = mp; cur->nout++; }
         }
     }
     int is_hub = dd[4] == 9 || (nif >= 1 && ifs[0].cls == 9 && dd[4] == 0);
@@ -700,6 +864,17 @@ static int enum_device(const struct eparam* a, int* known) {
         if (f->cls != 8 || f->sub != 6 || f->proto != 0x50 || !f->bin || !f->bout) continue;
         if (storage_setup(slot, speed, f, cfgval)) { B.slot = slot; *known = 1; return slot; }
         *known = 1; dev_drop(slot); return 0;
+    }
+
+    // ---- a USB Wi-Fi adapter the Wi-Fi driver knows (src/rtw) ----
+    if (rtw_usb_id_match(vid, pid)) {
+        for (int i = 0; i < nif; i++) {
+            if (ifs[i].cls != 0xFF) continue;
+            *known = 1;
+            if (wl_setup(slot, speed, &ifs[i], cfgval, vid, pid)) return slot;
+            dev_drop(slot);
+            return 0;
+        }
     }
 
     // ---- pointer interfaces ----

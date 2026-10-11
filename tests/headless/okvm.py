@@ -66,6 +66,9 @@ class OkVM:
             cmd += ["-msg", "timestamp=on"]
             for pat in os.environ["OKVM_TRACE"].split(","):   # file= on each: a bare -trace resets it
                 cmd += ["-trace", f"enable={pat},file={os.path.join(OUTDIR, tag + '.trace')}"]
+        if os.environ.get("OKVM_EXTRA"):  # any extra QEMU arguments, e.g. a passed-through USB device
+            import shlex
+            cmd += shlex.split(os.environ["OKVM_EXTRA"])
         if os.environ.get("OKVM_ACCEL"):  # e.g. OKVM_ACCEL=kvm (needs /dev/kvm access)
             cmd += ["-accel", os.environ["OKVM_ACCEL"]]
         self.q = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
