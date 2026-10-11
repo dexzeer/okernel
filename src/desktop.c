@@ -37,6 +37,8 @@
 #include "xhci.h"
 #include "i2chid.h"
 #include "klog.h"
+#include "devlog.h"
+#include "rtw/rtw.h"
 #include "smp.h"
 #include "prof.h"
 #include "fpu.h"
@@ -1164,6 +1166,13 @@ static void shell_execute(int win_id, const char* input) {
         else { if (args[0] && str_eq(args, "retry")) i2chid_retry(); i2chid_status(tb, sizeof tb); }
         window_puts(win_id, tb);
     }
+    else if (str_eq(cmd_buf, "wifi")) {
+        static char wb[2048];
+        if (args[0] && str_eq(args, "log")) { wb[0] = 0; devlog_tail('w', wb, sizeof wb, 0, 24); }
+        else rtw_command(args, wb, sizeof wb);
+        window_puts(win_id, wb);
+        serial_puts(wb);              // the headless tests read the serial log
+    }
     else if (str_eq(cmd_buf, "usb")) {
         static char ub[2048];
         if (args[0] && str_eq(args, "rescan")) { xhci_rescan(); window_puts(win_id, "usb: rescanning the ports (run `usb` again in a second)\n"); }
@@ -2122,6 +2131,7 @@ void kernel_main(uint32_t mboot_phys) {
         // Poll network for incoming packets
         e1000_poll();
         xhci_poll();      // USB mouse reports and hot-plug (polled; nothing interrupts for it)
+        rtw_poll();       // Wi-Fi adapter: received frames, scanning
         i2chid_poll();    // I2C-HID touchpad reports (polled, 100 Hz)
         klog_poll();      // the log on the boot stick (only when the flash tool marked it)
         net_poll();
