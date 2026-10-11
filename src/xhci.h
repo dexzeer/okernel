@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-// USB 3 host controller (xHCI) + a HID boot-protocol mouse. Polled: no interrupts. Written from the xHCI 1.2,
+// USB 3 host controller (xHCI) + USB pointing devices (any HID mouse, trackball or tablet, directly or behind USB 2 hubs). Polled: no interrupts. Written from the xHCI 1.2,
 // USB 2.0 and HID 1.11 specifications.
 //
 // xhci_init() runs at boot BEFORE the first process exists (the register window comes from paging_map_mmio);
@@ -12,6 +12,12 @@
 // it moves the pointer (cursor.c: mouse_inject), notices hot-plug and re-enumerates.
 void xhci_init(uint32_t mboot_phys);
 void xhci_poll(void);
+
+// Recovery self test for the `usb selftest` command (stalls endpoint 0, restarts the pointer endpoints).
+void xhci_selftest(char* buf, int cap);
+
+// Forget the ports that failed or hold a non-pointer device and try them again (`usb rescan`).
+void xhci_rescan(void);
 
 // One line of status for the `usb` shell command.
 void xhci_status(char* buf, int cap);
