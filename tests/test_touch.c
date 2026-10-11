@@ -265,6 +265,11 @@ static void test_bus(void) {
 
     // input polling: nothing, then a report (the last thing addressed was the report descriptor: must still read input)
     uint8_t buf[64];
+    h.max_in = 0x10;
+    CHECK(hidi2c_input(&h, buf, sizeof buf) == -5 && h.stale == 1);   // the device still answers from the descriptor register: not a report, and it is pointed back
+    CHECK(hidi2c_input(&h, buf, sizeof buf) == 0 && h.zeros == 1);
+    CHECK(hidi2c_get_desc(&h, 0x0020) == 0);                          // the bring-up ends with a descriptor read: the next input read sees the descriptor
+    CHECK(hidi2c_input(&h, buf, sizeof buf) == -5 && h.stale == 2);
     CHECK(hidi2c_input(&h, buf, sizeof buf) == 0);
     M.input[0] = 5; M.input[1] = 0; M.input[2] = 4; M.input[3] = 0xAA; M.input[4] = 0xBB; M.inlen = 5;
     h.max_in = 0x10;
