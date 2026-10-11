@@ -28,6 +28,8 @@ int hidi2c_get_desc(struct hidi2c* h, uint16_t reg);
 int hidi2c_power(struct hidi2c* h, int on);
 // RESET and wait for the device's zero-length answer. 0 = acknowledged, 1 = no answer (carry on), < 0 = bus error.
 int hidi2c_reset(struct hidi2c* h);
+// Start the device over: SET_POWER sleep, 30 ms, SET_POWER on, RESET (result as hidi2c_reset).
+int hidi2c_restart(struct hidi2c* h);
 // The report descriptor (returns its length, or < 0).
 int hidi2c_report_desc(struct hidi2c* h, uint8_t* buf, int cap);
 // SET_REPORT (feature). `id` = report id (0 = none), `data` = the report without the id byte. Returns 0 or a bus error.

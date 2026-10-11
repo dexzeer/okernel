@@ -55,6 +55,13 @@ static struct {
     volatile uint32_t* attn;           // the touchpad's interrupt pad (control register 0; bit 1 = the pin's level, low = data ready)
     int attn_last;
     uint32_t attn_low, attn_edges, reports_low;
+    uint8_t mode_rep[16];              // the Input Mode feature report (id first when the device uses ids), kept to repeat it on a restart
+    int mode_len, mode_ids;
+    uint32_t garbage_tick;
+    uint32_t garbage_run;              // consecutive input reads that were not a report
+    uint32_t next_recover;             // tick before which no restart is attempted
+    uint32_t recovers;                 // restarts so far
+    int recover_logged;                // the first read after a restart is logged
 } T;
 
 static int cmdline_has(uint32_t mboot, const char* word) {
@@ -171,7 +178,7 @@ static int aml_rd(uint32_t phys, uint32_t* v) { return acpi_phys_read(phys, v, 4
 
 // ---- bring-up on the address the AML gave (state 5) -----------------------------------------------------
 // Step by step, each logged AND written to the stick before the next access: the first real run froze on a blind read.
-#define AML_START_TICK 0                  // first pass of the main loop: the touchpad is alive as soon as the desktop is
+#define AML_START_TICK 150                // 1.5 s after boot: the first attempt, at tick 0, got a device that only answered garbage
 static void aml_bringup(void) {
     if (tick_count < AML_START_TICK || T.paused) return;
     for (int oi = 0; oi < T.ndev; oi++) {
@@ -368,6 +375,8 @@ static int bring_up_device(void) {
         uint8_t mr[16];
         int ml = hid_touch_mode_report(&T.touch, tids, mr, sizeof mr);
         if (ml) {
+            T.mode_len = ml; T.mode_ids = tids;
+            for (int i = 0; i < ml && i < (int)sizeof T.mode_rep; i++) T.mode_rep[i] = mr[i];
             int rc = hidi2c_set_feature(h, tids ? mr[0] : 0, mr + (tids ? 1 : 0), ml - (tids ? 1 : 0));
             tlog("  Input Mode = touchpad: %s (%d)", rc == 0 ? "sent" : "failed", rc);
         }
@@ -383,6 +392,23 @@ static int bring_up_device(void) {
     T.fails = 0;
     tlog("  touchpad running");
     return 1;
+}
+
+// The device keeps answering with something that is not a report (seen on the real laptop when the bring-up ran in the
+// first moments after power-up): start it over. Every third attempt also drops the bus back to standard speed.
+static void recover_device(uint32_t t) {
+    struct hidi2c* h = &T.h;
+    T.recovers++;
+    T.next_recover = t + (T.recovers < 12 ? 100 : 500);
+    int slow = (T.recovers % 3) == 0;
+    if (slow) dw_setup(&T.dw, 0);
+    int r = hidi2c_restart(h);
+    int rc = -9;
+    if (T.mode_len) rc = hidi2c_set_feature(h, T.mode_ids ? T.mode_rep[0] : 0, T.mode_rep + (T.mode_ids ? 1 : 0), T.mode_len - (T.mode_ids ? 1 : 0));
+    hidi2c_power(h, 1);
+    tlog("restart %u (%s speed): reset %d, Input Mode %d", T.recovers, slow ? "standard" : "same", r, rc);
+    T.garbage_run = 0;
+    T.recover_logged = 1;
 }
 
 // ---- what the AML says about the controller (shown by `touchpad aml` when the hunt fails) -------------
@@ -502,7 +528,7 @@ void i2chid_init(uint32_t mboot_phys) {
     for (int i = 0; i < T.ndev; i++) if (T.dbar[i]) have = 1;
     if (have && !cmdline_has(mboot_phys, "i2cscan")) {
         T.state = 5;                              // the firmware told us where the controller is: bring it up from the main loop (no scan)
-        tlog("controller addresses known from the AML: bring-up starts with the desktop");
+        tlog("controller addresses known from the AML: bring-up starts 1.5 s after boot");
     } else if (cmdline_has(mboot_phys, "i2cscan")) {
         scan_restart();                           // the hunt itself runs from i2chid_poll, a little per tick
         tlog("controller hunt starts %u s after boot (a little per tick)", SCAN_START_TICK / 100);
@@ -577,6 +603,14 @@ void i2chid_poll(void) {
     int n = hidi2c_input(&T.h, buf, sizeof buf);
     if (n > 0 && !lvl) T.reports_low++;
     uint32_t now = t * 10;
+    if (n == -5) {                                                 // a burst of non-reports (not stray ones minutes apart) restarts the device
+        if (t - T.garbage_tick > 300) T.garbage_run = 0;
+        T.garbage_tick = t;
+        if (++T.garbage_run >= 30 && t >= T.next_recover) recover_device(t);
+    } else if (n > 0) {
+        T.garbage_run = 0;
+        if (T.recover_logged) { tlog("reports are coming after restart %u", T.recovers); T.recover_logged = 0; }
+    }
     if (n > 0) {
         T.reports++;
         T.fails = 0;
@@ -591,7 +625,7 @@ void i2chid_poll(void) {
         }
     } else {
         T.errors++;
-        if (T.errors <= 3 || (n == -5 && T.errors <= 40 && (T.errors & 7) == 0)) {
+        if (T.errors <= 3 || (n == -5 && ((T.errors <= 40 && (T.errors & 7) == 0) || (T.recovers && T.recovers <= 20 && T.garbage_run == 1)))) {
             tlog("input read error %d (abort %x), max_in %u", n, T.dw.last_abort, T.h.max_in);
             if (n == -5) hexline("  raw:", T.h.bad, 16);
         }

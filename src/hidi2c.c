@@ -34,6 +34,15 @@ int hidi2c_reset(struct hidi2c* h) {
     return 1;
 }
 
+int hidi2c_restart(struct hidi2c* h) {
+    hidi2c_power(h, 0);
+    h->bus.delay_ms(30);
+    int r = hidi2c_power(h, 1);
+    if (r < 0) return r;
+    h->bus.delay_ms(10);
+    return hidi2c_reset(h);
+}
+
 int hidi2c_report_desc(struct hidi2c* h, uint8_t* buf, int cap) {
     if (h->rdesc_len > cap) return -4;
     uint8_t w[2] = { (uint8_t)h->rdesc_reg, (uint8_t)(h->rdesc_reg >> 8) };
