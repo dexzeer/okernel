@@ -152,13 +152,16 @@ static volatile uint8_t* blk_map(uint32_t phys) {
     return v ? v + (phys & 0x003FFFFFu) : 0;
 }
 
-// one line at the top left of the screen, flushed (and the write buffers drained) BEFORE the reads it describes
+// A line at the top left of the screen, flushed (and the write buffers drained) BEFORE the reads it describes. Only while the
+// blind memory hunt is on (menu 2h / `touchpad scan`): the normal start-up has nothing to show. Every line also goes to the log.
+static int crumbs_on;
 static void crumb(const char* fmt, ...) {
     char s[72];
     va_list ap;
     va_start(ap, fmt);
     devlog_fmt(s, sizeof s, fmt, ap);
     va_end(ap);
+    if (!crumbs_on) return;
     draw_string_1x(4, 4, s, 0xFFFFFF, 0x000000);
     graphics_flush();
     __asm__ volatile("sfence" ::: "memory");
@@ -168,7 +171,7 @@ static int aml_rd(uint32_t phys, uint32_t* v) { return acpi_phys_read(phys, v, 4
 
 // ---- bring-up on the address the AML gave (state 5) -----------------------------------------------------
 // Step by step, each logged AND written to the stick before the next access: the first real run froze on a blind read.
-#define AML_START_TICK 200
+#define AML_START_TICK 0                  // first pass of the main loop: the touchpad is alive as soon as the desktop is
 static void aml_bringup(void) {
     if (tick_count < AML_START_TICK || T.paused) return;
     for (int oi = 0; oi < T.ndev; oi++) {
@@ -207,6 +210,7 @@ static void aml_bringup(void) {
 }
 
 static void scan_restart(void) {
+    crumbs_on = 1;
     S.w = 0x40000000u; S.p = 0; S.pages = 0; S.cycles = 0; S.active = 0; S.ticks = 0;
     T.nblk = 0;
     T.state = 1;
@@ -498,7 +502,7 @@ void i2chid_init(uint32_t mboot_phys) {
     for (int i = 0; i < T.ndev; i++) if (T.dbar[i]) have = 1;
     if (have && !cmdline_has(mboot_phys, "i2cscan")) {
         T.state = 5;                              // the firmware told us where the controller is: bring it up from the main loop (no scan)
-        tlog("controller addresses known from the AML: bring-up starts %u s after boot", AML_START_TICK / 100);
+        tlog("controller addresses known from the AML: bring-up starts with the desktop");
     } else if (cmdline_has(mboot_phys, "i2cscan")) {
         scan_restart();                           // the hunt itself runs from i2chid_poll, a little per tick
         tlog("controller hunt starts %u s after boot (a little per tick)", SCAN_START_TICK / 100);
