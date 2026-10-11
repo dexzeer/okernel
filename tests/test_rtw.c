@@ -18,6 +18,9 @@ static int fails = 0;
 // ---- kernel services the driver uses --------------------------------------------------------------------------------
 uint32_t tick_count;
 void pit_delay_us(uint32_t us) { tick_count += us / 10000; (void)us; }
+uint8_t* net_get_ip(void) { static uint8_t ip[4] = { 192, 168, 1, 9 }; return ip; }
+uint8_t* net_get_gateway(void) { static uint8_t ip[4] = { 192, 168, 1, 1 }; return ip; }
+int net_wifi_bound(void) { return 1; }
 int rand_bytes(uint8_t* o, uint32_t n) { (void)o; (void)n; return 0; }          // not seeded: the driver falls back to its own mixing
 void* kmalloc(uint32_t n) { return malloc(n); }
 void kfree(void* p) { free(p); }

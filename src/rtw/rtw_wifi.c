@@ -7,6 +7,8 @@
 #include "../crypto/rand.h"
 #include "../devlog.h"
 #include "../string.h"
+#include "../net/network.h"
+#include "../xhci.h"
 
 extern uint32_t tick_count;
 
@@ -91,6 +93,143 @@ void rtw_poll(void) {
     }
 }
 
+// ---- the Wi-Fi window's view of things --------------------------------------------------------------------------------------------------
+static void start_scan(void) {
+    wsta_reset_scan();
+    S.active = 1; S.idx = 0; S.until = tick_count;
+}
+
+// A simulated adapter for testing the window under QEMU: a fixed set of networks, one scan takes ~1.5 s, a connection ~2 s and
+// succeeds for open networks and for the password "demo1234".
+static struct { int on, scan_done_at, conn_at, conn_state, pass_ok; char ssid[33]; } demo;
+static const struct rtw_ui_bss demo_nets[] = {
+    { "Home-Fiber", 6, 3, -48 }, { "Home-Fiber-5G", 36, 3, -52 }, { "CoffeeShop Guest", 1, 0, -63 }, { "AndroidAP-7F2C", 3, 3, -66 },
+    { "HP-Printer-1A2B", 1, 3, -70 }, { "Neighbour 2.4", 11, 3, -77 }, { "xfinitywifi", 6, 0, -82 }, { "Old-Router-WEP", 9, 1, -85 },
+    { "WPA3-Only-Net", 44, 4, -60 },
+};
+void rtw_ui_demo(int on) { memset(&demo, 0, sizeof demo); demo.on = on; }
+
+int rtw_ui_adapter(void) {
+    if (demo.on || R.state == 2) return 2;
+    return xhci_wl_present(0) ? 1 : 0;
+}
+
+static void copy_str(char* d, int cap, const char* s) { int i = 0; for (; s && s[i] && i < cap - 1; i++) d[i] = s[i]; d[i] = 0; }
+
+void rtw_ui_adapter_name(char* buf, int cap) {
+    if (demo.on) { copy_str(buf, cap, "Simulated adapter (demo)"); return; }
+    if (R.state == 2) {
+        char t[64];
+        static const char hx[] = "0123456789ABCDEF";
+        const char* pre = "Realtek USB adapter ";
+        int n = 0;
+        for (; pre[n]; n++) t[n] = pre[n];
+        for (int i = 0; i < 6; i++) { t[n++] = hx[R.mac[i] >> 4]; t[n++] = hx[R.mac[i] & 15]; if (i < 5) t[n++] = ':'; }
+        t[n] = 0;
+        copy_str(buf, cap, t);
+        return;
+    }
+    copy_str(buf, cap, xhci_wl_present(0) ? "Realtek USB adapter (not started)" : "No Wi-Fi adapter found");
+}
+
+int rtw_ui_start(void) {
+    if (demo.on || R.state == 2) return 0;
+    int r = rtw_start();
+    if (!r && !sta_ready) { wsta_init(R.mac, &OPS); sta_ready = 1; }
+    return r;
+}
+
+void rtw_ui_scan(void) {
+    if (demo.on) { demo.scan_done_at = (int)(tick_count + 150); return; }
+    if (R.state != 2 || S.active) return;
+    if (wsta_state() == WSTA_UP || wsta_state() == WSTA_HANDSHAKE) return;
+    start_scan();
+}
+
+int rtw_ui_scanning(void) {
+    if (demo.on) return demo.scan_done_at && (int)(tick_count - (uint32_t)demo.scan_done_at) < 0;
+    return S.active;
+}
+
+int rtw_ui_list(struct rtw_ui_bss* out, int max) {
+    int n = 0;
+    if (demo.on) {
+        if (!demo.scan_done_at || rtw_ui_scanning()) return 0;
+        for (int i = 0; i < (int)(sizeof demo_nets / sizeof demo_nets[0]) && n < max; i++) out[n++] = demo_nets[i];
+        return n;
+    }
+    for (int i = 0; i < wsta_bss_count() && n < max; i++) {
+        const struct wsta_bss* b = wsta_bss_at(i);
+        if (!b->ssid_len || b->ssid[0] == 0) continue;
+        int dup = -1;
+        for (int k = 0; k < n; k++) if (!strcmp(out[k].ssid, b->ssid)) dup = k;
+        if (dup >= 0) { if (b->rssi > out[dup].rssi) { out[dup].rssi = b->rssi; out[dup].ch = b->ch; out[dup].sec = b->sec; } continue; }
+        memcpy(out[n].ssid, b->ssid, 33); out[n].ch = b->ch; out[n].sec = b->sec; out[n].rssi = b->rssi;
+        n++;
+    }
+    for (int i = 1; i < n; i++) {                                          // strongest first
+        struct rtw_ui_bss x = out[i];
+        int k = i - 1;
+        while (k >= 0 && out[k].rssi < x.rssi) { out[k + 1] = out[k]; k--; }
+        out[k + 1] = x;
+    }
+    return n;
+}
+
+static void put_ip(char* o, const uint8_t* ip) {
+    int n = 0;
+    for (int i = 0; i < 4; i++) {
+        int v = ip[i];
+        if (v >= 100) o[n++] = (char)('0' + v / 100);
+        if (v >= 10) o[n++] = (char)('0' + (v / 10) % 10);
+        o[n++] = (char)('0' + v % 10);
+        if (i < 3) o[n++] = '.';
+    }
+    o[n] = 0;
+}
+
+void rtw_ui_link_info(struct rtw_ui_link* l) {
+    memset(l, 0, sizeof *l);
+    if (demo.on) {
+        copy_str(l->ssid, sizeof l->ssid, demo.ssid);
+        if (demo.conn_state == 1) {
+            if ((int)(tick_count - (uint32_t)demo.conn_at) < 200) { l->state = RTW_LINK_BUSY; copy_str(l->msg, sizeof l->msg, "Connecting..."); }
+            else demo.conn_state = demo.pass_ok ? 2 : 3;
+        }
+        if (demo.conn_state == 2) { l->state = RTW_LINK_UP; copy_str(l->ip, sizeof l->ip, "192.168.50.23"); copy_str(l->gateway, sizeof l->gateway, "192.168.50.1"); }
+        else if (demo.conn_state == 3) { l->state = RTW_LINK_FAILED; copy_str(l->msg, sizeof l->msg, "Wrong password, or the key exchange failed"); }
+        return;
+    }
+    if (R.state != 2) return;
+    int st = wsta_state();
+    copy_str(l->ssid, sizeof l->ssid, wsta_ssid());
+    if (st == WSTA_AUTH) { l->state = RTW_LINK_BUSY; copy_str(l->msg, sizeof l->msg, "Authenticating..."); }
+    else if (st == WSTA_ASSOC) { l->state = RTW_LINK_BUSY; copy_str(l->msg, sizeof l->msg, "Joining the network..."); }
+    else if (st == WSTA_HANDSHAKE) { l->state = RTW_LINK_BUSY; copy_str(l->msg, sizeof l->msg, "Checking the password..."); }
+    else if (st == WSTA_UP) {
+        if (net_wifi_bound()) { l->state = RTW_LINK_UP; put_ip(l->ip, net_get_ip()); put_ip(l->gateway, net_get_gateway()); }
+        else { l->state = RTW_LINK_BUSY; copy_str(l->msg, sizeof l->msg, "Getting an address..."); }
+    } else if (st == WSTA_FAILED) { l->state = RTW_LINK_FAILED; copy_str(l->msg, sizeof l->msg, wsta_last_error() ? wsta_last_error() : "Could not connect"); }
+}
+
+void rtw_ui_connect(const char* ssid, const char* pass) {
+    if (demo.on) {
+        copy_str(demo.ssid, sizeof demo.ssid, ssid);
+        int open = 0;
+        for (int i = 0; i < (int)(sizeof demo_nets / sizeof demo_nets[0]); i++) if (!strcmp(demo_nets[i].ssid, ssid)) open = demo_nets[i].sec == 0;
+        demo.pass_ok = open || !strcmp(pass, "demo1234");
+        demo.conn_state = 1; demo.conn_at = (int)tick_count;
+        return;
+    }
+    if (R.state != 2 || S.active) return;
+    wsta_connect(ssid, pass);
+}
+
+void rtw_ui_disconnect(void) {
+    if (demo.on) { demo.conn_state = 0; return; }
+    if (R.state == 2) wsta_disconnect();
+}
+
 // ---- the shell command --------------------------------------------------------------------------------------------------------------------
 static int ap(char* buf, int cap, int at, const char* fmt, ...) {
     char line[200];
@@ -147,8 +286,7 @@ void rtw_command(const char* args, char* buf, int cap) {
     if (R.state != 2) { ap(buf, cap, 0, "wifi: not started (`wifi start`)"); return; }
     if (!strcmp(args, "scan")) {
         if (wsta_state() == WSTA_UP || wsta_state() == WSTA_HANDSHAKE) { ap(buf, cap, 0, "wifi: disconnect first (`wifi disconnect`)"); return; }
-        wsta_reset_scan();
-        S.active = 1; S.idx = 0; S.until = tick_count;
+        start_scan();
         ap(buf, cap, 0, "wifi: scanning %d channels (about %d s); `wifi list` shows what was heard", scan_total(), scan_total() * 15 / 100 + 1);
         return;
     }

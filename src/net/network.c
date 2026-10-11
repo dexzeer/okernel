@@ -1452,6 +1452,8 @@ static void dhcp_poll(void) {
     }
 }
 
+int net_wifi_bound(void) { return nic_wifi && dh.state == DH_BOUND; }
+
 // the interface settings, for the shell
 static int fmtv(char* b, int cap, const char* f, ...) {
     va_list ap;
