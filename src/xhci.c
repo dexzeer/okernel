@@ -154,6 +154,17 @@ static struct {
     uint8_t* inctx;
 } X;
 
+// the one USB mass storage device (bulk-only transport) the on-stick log uses; see klog.c
+static struct {
+    int used, failed, slot, in_dci, out_dci, in_ep, out_ep;
+    struct ring rin, rout;
+    uint8_t* data;               // 64 KB, 64 KB aligned: one TRB never crosses a 64 KB boundary
+    uint8_t* cb;                 // CBW at 0, CSW at 64
+    uint32_t tag;
+    uint32_t sectors;            // capacity (blocks of 512; larger devices are cut at 2^32 blocks)
+    volatile int done, code;
+} B;
+
 static struct hidep E[MAXEP];
 static struct dev D[MAXSLOTS + 1];
 static struct rport RP[32];
@@ -281,6 +292,8 @@ static void pump(void) {
                     e->errors++;
                     e->fail = code ? code : 99;
                 }
+            } else if (B.used && slot == B.slot && (ep == B.in_dci || ep == B.out_dci)) {
+                B.code = code; B.done = 1;
             } else {
                 X.ctl_code = code; X.ctl_len = X.ctl_want - (int)(status & 0xFFFFFF); X.ctl_done = 1;
             }
@@ -405,6 +418,7 @@ static void free_slot(int slot) {
 static void dev_drop(int slot) {
     if (slot < 1 || slot > MAXSLOTS || !D[slot].used) return;
     for (int i = 0; i < MAXEP; i++) if (E[i].used && E[i].slot == slot) E[i].used = 0;
+    if (B.used && B.slot == slot) B.used = 0;
     for (int s = 1; s <= MAXSLOTS; s++)
         if (D[s].used && D[s].parent == slot) dev_drop(s);
     if (D[slot].parent && D[D[slot].parent].used && D[slot].pport <= MAXHUBPORT) D[D[slot].parent].child[D[slot].pport] = 0;
@@ -432,7 +446,125 @@ static void describe_layout(int slot, const struct hid_ptr* p, int ids) {
          p->x.bits, p->x.off, p->y.bits, p->y.off, p->wheel.bits, p->btn[0].bits ? 1 : 0, p->btn[1].bits ? 1 : 0, p->btn[2].bits ? 1 : 0, p->bytes);
 }
 
-struct ifc { int num, cls, sub, proto, rptlen, ep, epmps, epint; };
+struct ifc { int num, cls, sub, proto, rptlen, ep, epmps, epint, bin, bout, binmps, boutmps; };
+
+// ---- USB mass storage, bulk-only transport (SCSI transparent command set) -----------------------------------
+// Only for the on-stick log (klog.c): synchronous, one command at a time, a failure switches it off for good.
+static int bulk_xfer(int in, uint32_t phys, uint32_t len) {
+    struct ring* r = in ? &B.rin : &B.rout;
+    B.done = 0;
+    ring_push(r, phys, 0, len, (TRB_NORMAL << 10) | (1u << 5) | (in ? (1u << 2) : 0));      // IOC (+ ISP for IN)
+    wr32(X.db, (uint32_t)B.slot * 4, (uint32_t)(in ? B.in_dci : B.out_dci));
+    for (int i = 0; i < 100000; i++) {                                                       // 5 s
+        pump();
+        if (B.done) return B.code;
+        delay_us(50);
+    }
+    return -1;
+}
+
+// clear a halted bulk endpoint: skip what is left on the ring, then CLEAR_FEATURE(ENDPOINT_HALT)
+static void bulk_unhalt(int in) {
+    struct ring* r = in ? &B.rin : &B.rout;
+    ep_restart(B.slot, in ? B.in_dci : B.out_dci, r->phys + (uint32_t)r->enq * 16, r->cycle, 0);
+    ctl(B.slot, 0x02, 1, 0, (uint16_t)(in ? B.in_ep : B.out_ep), 0, 0);
+}
+
+// one SCSI command; data (len bytes) in B.data. Returns 0 on success, 1 = command failed (CSW status), -1 = transport failure
+static int bot_cmd(const uint8_t* cdb, int cdblen, int in, uint32_t len) {
+    if (!B.used || B.failed) return -1;
+    uint8_t* cbw = B.cb;
+    memset(cbw, 0, 64);
+    uint32_t tag = ++B.tag;
+    *(uint32_t*)(cbw + 0) = 0x43425355u;                       // 'USBC'
+    *(uint32_t*)(cbw + 4) = tag;
+    *(uint32_t*)(cbw + 8) = len;
+    cbw[12] = in ? 0x80 : 0;
+    cbw[13] = 0; cbw[14] = (uint8_t)cdblen;
+    memcpy(cbw + 15, cdb, (uint32_t)cdblen);
+    int c = bulk_xfer(0, phys_of(cbw), 31);
+    if (!is_ok(c)) { if (c == 6) bulk_unhalt(0); return -1; }
+    if (len) {
+        c = bulk_xfer(in, phys_of(B.data), len);
+        if (c == 6) bulk_unhalt(in);
+        else if (!is_ok(c)) return -1;
+    }
+    uint8_t* csw = B.cb + 64;
+    for (int tries = 0; tries < 2; tries++) {
+        memset(csw, 0, 16);
+        c = bulk_xfer(1, phys_of(csw), 13);
+        if (c == 6) { bulk_unhalt(1); continue; }
+        if (!is_ok(c)) return -1;
+        if (*(uint32_t*)csw != 0x53425355u || *(uint32_t*)(csw + 4) != tag) return -1;
+        return csw[12] == 0 ? 0 : 1;
+    }
+    return -1;
+}
+
+static int scsi_simple(uint8_t op, uint32_t lba, uint32_t count, int in, uint32_t len) {
+    uint8_t cdb[10] = { op, 0, (uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba, 0, (uint8_t)(count >> 8), (uint8_t)count, 0 };
+    return bot_cmd(cdb, 10, in, len);
+}
+
+// set the interface up as storage. Returns 1 when ready.
+static int storage_setup(int slot, int speed, const struct ifc* f, int cfgval) {
+    if (!is_ok(ctl(slot, 0x00, 9, (uint16_t)cfgval, 0, 0, 0))) { xlog("  storage: set configuration failed"); return 0; }
+    if (!B.rin.trb && (!ring_init(&B.rin, 17) || !ring_init(&B.rout, 17))) { xlog("  storage: out of memory"); return 0; }
+    if (!B.data) { B.data = (uint8_t*)dma_alloc(65536, 65536); B.cb = (uint8_t*)dma_alloc(4096, 64); }
+    if (!B.data || !B.cb) { xlog("  storage: out of memory"); return 0; }
+    ring_reset(&B.rin); ring_reset(&B.rout);
+    B.slot = slot; B.in_ep = f->bin; B.out_ep = f->bout;
+    B.in_dci = (f->bin & 15) * 2 + 1; B.out_dci = (f->bout & 15) * 2;
+    B.failed = 0; B.sectors = 0;
+    memset(X.inctx, 0, 33u * (uint32_t)X.ctxsz);
+    memcpy(ctx(X.inctx, 1), ctx(X.devctx[slot], 0), (uint32_t)X.ctxsz);
+    int maxdci = B.in_dci > B.out_dci ? B.in_dci : B.out_dci;
+    ctx(X.inctx, 0)[1] = 1u | (1u << B.in_dci) | (1u << B.out_dci);
+    uint32_t* ci = ctx(X.inctx, B.in_dci + 1);
+    uint32_t* co = ctx(X.inctx, B.out_dci + 1);
+    ci[1] = (3u << 1) | (6u << 3) | ((uint32_t)f->binmps << 16);  ci[2] = B.rin.phys | 1;  ci[4] = 4096;
+    co[1] = (3u << 1) | (2u << 3) | ((uint32_t)f->boutmps << 16); co[2] = B.rout.phys | 1; co[4] = 4096;
+    uint32_t* sc2 = ctx(X.inctx, 1);
+    if (((sc2[0] >> 27) & 31) < (uint32_t)maxdci) sc2[0] = (sc2[0] & 0x07FFFFFFu) | ((uint32_t)maxdci << 27);
+    int code = command(phys_of(X.inctx), 0, 0, (TRB_CONFIGURE << 10) | ((uint32_t)slot << 24), 0);
+    if (code != 1) { xlog("  storage: configure endpoint failed (code %d)", code); return 0; }
+    B.used = 1;
+    (void)speed;
+    uint8_t sense[6] = { 0x03, 0, 0, 0, 18, 0 };
+    int ready = 0;
+    for (int t = 0; t < 6 && !ready; t++) {                       // TEST UNIT READY, clearing unit-attention states with REQUEST SENSE
+        uint8_t tur[6] = { 0 };
+        int r = bot_cmd(tur, 6, 0, 0);
+        if (r == 0) ready = 1;
+        else if (r < 0) break;
+        else { bot_cmd(sense, 6, 1, 18); delay_ms(50); }
+    }
+    if (!ready) { xlog("  storage: not ready"); B.used = 0; return 0; }
+    if (scsi_simple(0x25, 0, 0, 1, 8) != 0) { xlog("  storage: read capacity failed"); B.used = 0; return 0; }
+    uint32_t last = ((uint32_t)B.data[0] << 24) | ((uint32_t)B.data[1] << 16) | ((uint32_t)B.data[2] << 8) | B.data[3];
+    uint32_t bs = ((uint32_t)B.data[4] << 24) | ((uint32_t)B.data[5] << 16) | ((uint32_t)B.data[6] << 8) | B.data[7];
+    if (bs != 512 || last == 0xFFFFFFFFu) { xlog("  storage: block size %u / %u blocks: not used", bs, last); B.used = 0; return 0; }
+    B.sectors = last + 1;
+    xlog("  storage: %u blocks of 512 (%u MB)", B.sectors, B.sectors >> 11);
+    return 1;
+}
+
+int xhci_storage_ready(uint32_t* sectors) {
+    if (!B.used || B.failed) return 0;
+    *sectors = B.sectors;
+    return 1;
+}
+
+// read or write `n` (<= 128) sectors; the data goes through a DMA buffer. Returns 1 on success; a failure disables the storage.
+int xhci_storage_rw(int write, uint32_t lba, void* data, uint32_t n) {
+    if (!B.used || B.failed || n == 0 || n > 128) return 0;
+    if (n > 128 || lba + n > B.sectors || lba + n < lba) return 0;
+    if (write) memcpy(B.data, data, n * 512);
+    int r = scsi_simple(write ? 0x2A : 0x28, lba, n, !write, n * 512);
+    if (r != 0) { B.failed = 1; xlog("storage %s lba %u failed (%d): log disabled", write ? "write" : "read", lba, r); return 0; }
+    if (!write) memcpy(data, B.data, n * 512);
+    return 1;
+}
 struct eparam { int root, parent, pport, speed, depth; uint32_t route; int tt_slot, tt_port; };
 
 // Address the device, read its descriptors; a hub gets its ports powered, a device with pointer interfaces gets them
@@ -511,6 +643,10 @@ static int enum_device(const struct eparam* a, int* known) {
             cur->rptlen = cfg[p + 7] | (cfg[p + 8] << 8);
         } else if (cfg[p + 1] == 5 && p + 7 <= total && cur && !cur->ep && (cfg[p + 3] & 3) == 3 && (cfg[p + 2] & 0x80)) {
             cur->ep = cfg[p + 2]; cur->epmps = (cfg[p + 4] | (cfg[p + 5] << 8)) & 0x7FF; cur->epint = cfg[p + 6];
+        } else if (cfg[p + 1] == 5 && p + 7 <= total && cur && (cfg[p + 3] & 3) == 2) {          // bulk endpoint
+            int mp = (cfg[p + 4] | (cfg[p + 5] << 8)) & 0x7FF;
+            if ((cfg[p + 2] & 0x80) && !cur->bin) { cur->bin = cfg[p + 2]; cur->binmps = mp; }
+            else if (!(cfg[p + 2] & 0x80) && !cur->bout) { cur->bout = cfg[p + 2]; cur->boutmps = mp; }
         }
     }
     int is_hub = dd[4] == 9 || (nif >= 1 && ifs[0].cls == 9 && dd[4] == 0);
@@ -548,6 +684,14 @@ static int enum_device(const struct eparam* a, int* known) {
         xlog("  hub with %d port(s)%s", np, (speed == 3 && dd[6] == 2) ? ", multi-TT" : "");
         *known = 1;
         return slot;
+    }
+
+    // ---- mass storage: the first one is kept for the on-stick log (klog.c) ----
+    for (int i = 0; i < nif && !B.used; i++) {
+        const struct ifc* f = &ifs[i];
+        if (f->cls != 8 || f->sub != 6 || f->proto != 0x50 || !f->bin || !f->bout) continue;
+        if (storage_setup(slot, speed, f, cfgval)) { B.slot = slot; *known = 1; return slot; }
+        *known = 1; dev_drop(slot); return 0;
     }
 
     // ---- pointer interfaces ----

@@ -9,6 +9,7 @@
 #include "hid.h"
 #include "hidi2c.h"
 #include "i2caml.h"
+#include "klog.h"
 #include "lapic.h"
 #include "memlayout.h"
 #include "memory.h"
@@ -79,6 +80,7 @@ static void collect_ranges(uint32_t mboot) {
             const volatile uint32_t* e = (const volatile uint32_t*)P2V_U32(maddr + o);
             uint32_t esz = e[0], base = e[1], baseh = e[2], rl = e[3], rlh = e[4], type = e[5];
             if (esz < 20) break;
+            devlog('p', "mem %x%08x +%x%08x type %u", baseh, base, rlh, rl, type);
             if ((type == 1 || type == 3 || type == 4) && baseh == 0) {
                 uint32_t hi = (rlh || base + rl < base) ? 0xFFFFFFFFu : base + rl;
                 rng_add(base, hi);
@@ -89,8 +91,9 @@ static void collect_ranges(uint32_t mboot) {
     rng_add(0xE0000000u, 0xF0000000u);                                // the usual PCI config window
     struct pci_loc l;
     if (cmdline_has(mboot, "i2cbars")) return;                        // test option: scan the PCI BARs too (QEMU device models)
-    for (int n = 0; n < 96 && pcix_find_class(0xFF, 0, n, &l); n++) {
+    for (int n = 0; n < 96 && pcix_find_any(n, &l); n++) {
         if (pcix_read32(l, 0) == 0xFFFFFFFFu) continue;
+        devlog('p', "pci %x:%x.%x id %x class %x", l.bus, l.dev, l.fn, pcix_read32(l, 0), pcix_read32(l, 8) >> 8);
         int ht = pcix_read8(l, 0x0E) & 0x7F;
         int nb = ht == 0 ? 6 : ht == 1 ? 2 : 0;
         for (int b = 0; b < nb; b++) {
@@ -100,6 +103,7 @@ static void collect_ranges(uint32_t mboot) {
             int mem, above;
             uint32_t base = pcix_bar(l, b, &mem, &above);
             uint32_t size = base ? pcix_bar_size(l, b) : 0;
+            if (base) devlog('p', "  bar%d %x%s size %x", b, base, above ? " (above 4G)" : "", size);
             if (base && !above && size) rng_add(base, base + size < base ? 0xFFFFFFFFu : base + size);
             if (is64) b++;
         }
@@ -159,6 +163,7 @@ static void scan_restart(void) {
 }
 
 static void scan_finish(void) {
+    klog_set_scan_window(0);
     if (T.state != 2) paging_probe_window(0);                    // a running touchpad keeps the window pointed at its block
     S.active = 0;
     tlog("scan: %u pages read in %u Mcycles, %d DesignWare I2C block(s)", S.pages, (uint32_t)(S.cycles >> 20), T.nblk);
@@ -182,6 +187,7 @@ static void scan_step(void) {
             if (!any) { S.w += 0x400000u; continue; }
         }
         if (!v) {
+            klog_set_scan_window(S.w);                           // on the stick BEFORE the read: a freeze leaves the culprit in the log
             crumb("touchpad scan %x", S.w);
             t0 = rdtsc();                                        // the budget is for reading, not for drawing the breadcrumb
             v = (volatile uint32_t*)paging_probe_window(S.w);
@@ -403,8 +409,14 @@ void i2chid_init(uint32_t mboot_phys) {
     }
     crumb("touchpad: memory map and PCI ranges");
     collect_ranges(mboot_phys);
-    scan_restart();                               // the hunt itself runs from i2chid_poll, a little per tick
-    tlog("controller hunt starts %u s after boot (a little per tick)", SCAN_START_TICK / 100);
+    dump_ctrl_aml(T.dev[0].ctrl);                 // what the AML says about the controller (also in the on-stick log with the raw tables)
+    if (cmdline_has(mboot_phys, "i2cscan")) {
+        scan_restart();                           // the hunt itself runs from i2chid_poll, a little per tick
+        tlog("controller hunt starts %u s after boot (a little per tick)", SCAN_START_TICK / 100);
+    } else {
+        T.state = 4;                              // the first real run froze inside the blind memory hunt: it only runs when asked for
+        tlog("controller not located: the blind hunt is off (`touchpad scan` starts it)");
+    }
 }
 
 void i2chid_retry(void) {
@@ -499,7 +511,8 @@ void i2chid_aml(char* buf, int cap) {
 
 void i2chid_status(char* buf, int cap) {
     buf[0] = 0;
-    const char* st = T.state == 2 ? (T.paused ? "paused (touchpad on)" : "running") : T.state == 1 ? "searching" : T.state == 3 ? "NOT WORKING" : "no I2C-HID device in ACPI";
+    const char* st = T.state == 2 ? (T.paused ? "paused (touchpad on)" : "running") : T.state == 1 ? "searching" : T.state == 3 ? "NOT WORKING" :
+                     T.state == 4 ? "controller not located (`touchpad scan` hunts for it)" : "no I2C-HID device in ACPI";
     int at = sfmt(buf, cap, 0, "touchpad: %s, reports %u, empty polls %u, errors %u, unmatched %u", st, T.reports, T.empty, T.errors, T.unmatched);
     if (T.state == 1)
         at = sfmt(buf, cap, at, "hunt: %s at %x, %u pages read, %d controller block(s) found%s", tick_count < SCAN_START_TICK ? "starts soon" : "now", S.w, S.pages, T.nblk,

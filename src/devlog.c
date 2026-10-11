@@ -1,8 +1,9 @@
 // On-screen driver log (see devlog.h).
 #include "devlog.h"
 #include "serial.h"
+#include "klog.h"
 
-#define LOGN 64
+#define LOGN 256
 #define LOGW 74                  // tag + text + terminator; fits the 85-column terminal
 
 static char LOG[LOGN][LOGW];
@@ -57,6 +58,7 @@ void devlog(char tag, const char* fmt, ...) {
     while (line[i] && i < LOGW - 2) { slot[i + 1] = line[i]; i++; }
     slot[i + 1] = 0;
     log_n++;
+    klog_write(tag, line);
     serial_putchar('['); serial_putchar(tag); serial_puts("] ");
     serial_puts(line);
     serial_puts("\n");

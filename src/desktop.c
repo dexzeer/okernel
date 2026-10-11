@@ -36,6 +36,7 @@
 #include "acpi.h"
 #include "xhci.h"
 #include "i2chid.h"
+#include "klog.h"
 #include "smp.h"
 #include "prof.h"
 #include "fpu.h"
@@ -1159,7 +1160,7 @@ static void shell_execute(int win_id, const char* input) {
         if (args[0] && str_eq(args, "off")) { i2chid_enable(0); i2chid_status(tb, sizeof tb); }
         else if (args[0] && str_eq(args, "on")) { i2chid_enable(1); i2chid_status(tb, sizeof tb); }
         else if (args[0] && str_eq(args, "aml")) i2chid_aml(tb, sizeof tb);
-        else if (args[0] && str_eq(args, "rescan")) { i2chid_rescan(); i2chid_status(tb, sizeof tb); }
+        else if (args[0] && (str_eq(args, "rescan") || str_eq(args, "scan"))) { i2chid_rescan(); i2chid_status(tb, sizeof tb); }
         else { if (args[0] && str_eq(args, "retry")) i2chid_retry(); i2chid_status(tb, sizeof tb); }
         window_puts(win_id, tb);
     }
@@ -2122,6 +2123,7 @@ void kernel_main(uint32_t mboot_phys) {
         e1000_poll();
         xhci_poll();      // USB mouse reports and hot-plug (polled; nothing interrupts for it)
         i2chid_poll();    // I2C-HID touchpad reports (polled, 100 Hz)
+        klog_poll();      // the log on the boot stick (only when the flash tool marked it)
         net_poll();
         fetch_poll();     // drive the HTTP/HTTPS fetch engine (parallel, keep-alive)
         // Persist TOFU pins on change (write-through VFS, same as editor).
