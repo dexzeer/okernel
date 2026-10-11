@@ -34,9 +34,11 @@ On a UEFI machine the menu starts on entry 1b by itself after 30 seconds.
    entries; plug it in before or after boot. In the desktop, the shell command `usb` prints the controller, every
    connected port, what each device is, and the driver's log; `usb rescan` tries the ports again; `usb selftest`
    checks the error recovery.
-   The **touchpad** (I2C): at boot the kernel finds it in the ACPI tables, hunts for the I2C controller (about a second)
-   and starts it when it answers. The shell command `touchpad` shows what happened (`touchpad aml` shows what the firmware
-   tables say about the controller, `touchpad retry` tries again). One finger moves the pointer, two fingers scroll, a
+   The **touchpad** (I2C): the kernel finds it in the ACPI tables and, 3 seconds after boot, hunts for the I2C controller
+   in the background (a few seconds to a few minutes; the block being read is shown at the top left of the screen, so if
+   the machine ever freezes, photograph that number). It starts the touchpad when the controller answers. The shell command
+   `touchpad` shows what happened (`touchpad aml` shows what the firmware tables say about the controller, `touchpad retry`
+   tries again, `touchpad rescan` hunts again from the start, `touchpad off` pauses it). One finger moves the pointer, two fingers scroll, a
    tap clicks, a two-finger tap right-clicks.
 3. **Desktop 1280x800**, 4. **1024x768**, 5. **let the video firmware choose** - fallbacks if 2 shows nothing or a
    scrambled picture. If a mode is not usable the screen shows a one-line message and the machine stops (BIOS) or
@@ -50,8 +52,8 @@ On a UEFI machine the menu starts on entry 1b by itself after 30 seconds.
 Photos of: entry 1b as it appears at boot, `pci`, `acpi`, `memmap`, `pcidump 0:2.0`, and the screen of entry 6; and
 what entries 2-5 do (picture, black screen, message, reboot).
 
-From the desktop (entry 2): the output of `usb` (with a USB mouse plugged in) and of `touchpad`; if `touchpad` says
-"NOT WORKING", also `touchpad aml`.
+From the desktop (entry 2): the output of `usb` (with a USB mouse plugged in; run it again right after the mouse stops
+moving, using the keyboard) and of `touchpad`; if `touchpad` says "NOT WORKING", also `touchpad aml`.
 
 ## Known limits on such a machine
 

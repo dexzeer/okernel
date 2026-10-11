@@ -121,31 +121,93 @@ static int bus_xfer(void* ctx, int addr, const uint8_t* w, int wl, uint8_t* r, i
 // and records every page whose component type register reads "DesignWare I2C".
 static int try_block(uint32_t phys);
 static int bring_up_device(void);
+static void dump_ctrl_aml(const char* path);
 
-static void scan_for_controllers(void) {
-    uint32_t pages = 0;
-    uint32_t t0 = (uint32_t)(rdtsc() >> 20);
+// The hunt runs from the main loop, a few hundred microseconds per tick, starting a few seconds after boot: a bus that
+// stalls on a read can then be seen (the breadcrumb on screen names the 4 MB block being read) and never delays the boot.
+#define SCAN_START_TICK 300
+#define SCAN_BUDGET 1200000u              // cycles of reading per tick
+static struct {
+    uint32_t w, p;                        // next 4 MB window and byte offset inside it
+    uint32_t pages;
+    uint64_t cycles;
+    int active;                           // the window is mapped and p/w are valid
+    uint32_t ticks;
+} S;
+
+static volatile uint8_t* blk_map(uint32_t phys) {
+    volatile uint8_t* v = (volatile uint8_t*)paging_probe_window(phys & 0xFFC00000u);
+    return v ? v + (phys & 0x003FFFFFu) : 0;
+}
+
+// one line at the top left of the screen, flushed (and the write buffers drained) BEFORE the reads it describes
+static void crumb(const char* fmt, ...) {
+    char s[72];
+    va_list ap;
+    va_start(ap, fmt);
+    devlog_fmt(s, sizeof s, fmt, ap);
+    va_end(ap);
+    draw_string_1x(4, 4, s, 0xFFFFFF, 0x000000);
+    graphics_flush();
+    __asm__ volatile("sfence" ::: "memory");
+}
+
+static void scan_restart(void) {
+    S.w = 0x40000000u; S.p = 0; S.pages = 0; S.cycles = 0; S.active = 0; S.ticks = 0;
     T.nblk = 0;
-    for (uint32_t w = 0x40000000u; w < 0xFEC00000u && T.nblk < MAXBLK; w += 0x400000u) {
-        int any = 0;
-        for (uint32_t p = 0; p < 0x400000u && !any; p += 0x1000) if (!rng_has(w + p)) any = 1;
-        if (!any) continue;
-        volatile uint32_t* v = (volatile uint32_t*)paging_probe_window(w);
-        if (!v) { tlog("scan: no probe window available"); return; }
-        for (uint32_t p = 0; p < 0x400000u; p += 0x1000) {
-            if (rng_has(w + p)) continue;
-            pages++;
-            if (v[(p + 0xFC) / 4] == DW_COMP_TYPE && T.nblk < MAXBLK) {
-                uint32_t phys = w + p;
+    T.state = 1;
+}
+
+static void scan_finish(void) {
+    if (T.state != 2) paging_probe_window(0);                    // a running touchpad keeps the window pointed at its block
+    S.active = 0;
+    tlog("scan: %u pages read in %u Mcycles, %d DesignWare I2C block(s)", S.pages, (uint32_t)(S.cycles >> 20), T.nblk);
+    if (T.state != 2) {
+        T.state = 3;
+        tlog("the touchpad did not answer on any controller block (`touchpad aml` shows what the AML says)");
+        if (T.ndev) dump_ctrl_aml(T.dev[0].ctrl);
+    }
+}
+
+static void scan_step(void) {
+    if (T.paused) return;
+    if (tick_count < SCAN_START_TICK) return;
+    uint64_t t0 = rdtsc();
+    volatile uint32_t* v = 0;
+    if (++S.ticks % 500 == 0) tlog("  hunt: %x+%x, %u pages, %u Mcycles", S.w, S.p, S.pages, (uint32_t)(S.cycles >> 20));
+    while (S.w < 0xFEC00000u && T.nblk < MAXBLK) {
+        if (S.p == 0) {                                          // entering a window: skip it when nothing in it may be read
+            int any = 0;
+            for (uint32_t p = 0; p < 0x400000u && !any; p += 0x1000) if (!rng_has(S.w + p)) any = 1;
+            if (!any) { S.w += 0x400000u; continue; }
+        }
+        if (!v) {
+            crumb("touchpad scan %x", S.w);
+            t0 = rdtsc();                                        // the budget is for reading, not for drawing the breadcrumb
+            v = (volatile uint32_t*)paging_probe_window(S.w);
+            if (!v) { tlog("scan: no probe window available"); S.w = 0xFEC00000u; break; }
+        }
+        for (; S.p < 0x400000u; S.p += 0x1000) {
+            if (rng_has(S.w + S.p)) continue;
+            S.pages++;
+            if (v[(S.p + 0xFC) / 4] == DW_COMP_TYPE && T.nblk < MAXBLK) {
+                uint32_t phys = S.w + S.p;
+                S.p += 0x1000;
                 T.blk[T.nblk++] = phys;
                 tlog("  DesignWare I2C block at %x", phys);
-                if (try_block(phys) && bring_up_device()) { T.state = 2; goto done; }      // found the touchpad: stop looking
+                crumb("touchpad: trying the I2C block at %x", phys);
+                if (try_block(phys) && bring_up_device()) { T.state = 2; S.cycles += rdtsc() - t0; scan_finish(); return; }   // found: the window stays on this block
+                v = (volatile uint32_t*)paging_probe_window(S.w);                    // try_block re-pointed it at the same block
             }
+            if ((S.pages & 7) == 0 && rdtsc() - t0 > SCAN_BUDGET) { S.p += 0x1000; S.cycles += rdtsc() - t0; paging_probe_window(0); return; }
         }
+        S.p = 0; S.w += 0x400000u;
+        if (!(S.w & 0x0FFFFFFFu)) tlog("  hunt at %x: %u pages read, %u Mcycles", S.w, S.pages, (uint32_t)(S.cycles >> 20));
+        if (rdtsc() - t0 > SCAN_BUDGET) { S.cycles += rdtsc() - t0; paging_probe_window(0); return; }
+        v = 0;
     }
-done:
-    paging_probe_window(0);
-    tlog("scan: %u pages read in %u Mcycles, %d DesignWare I2C block(s)", pages, (uint32_t)(rdtsc() >> 20) - t0, T.nblk);
+    S.cycles += rdtsc() - t0;
+    scan_finish();
 }
 
 static void hexline(const char* what, const uint8_t* b, int n) {
@@ -166,7 +228,7 @@ static void lpss_kick(volatile uint8_t* regs) {
 
 // Does the touchpad answer on the controller block at `phys`? Two passes: as the firmware left it, then after the LPSS kick.
 static int try_block(uint32_t phys) {
-    volatile uint8_t* regs = (volatile uint8_t*)paging_map_mmio(phys, 0x1000);
+    volatile uint8_t* regs = blk_map(phys);
     if (!regs) { tlog("block %x: cannot map", phys); return 0; }
     T.dw.rd = mm_rd; T.dw.wr = mm_wr; T.dw.delay_us = us_delay; T.dw.ctx = (void*)regs;
     if (!dw_present(&T.dw)) { tlog("block %x: not a DesignWare I2C now (type %x)", phys, mm_rd((void*)regs, 0xFC)); return 0; }
@@ -321,6 +383,7 @@ static void dump_ctrl_aml(const char* path) {
 // ---- entry points -------------------------------------------------------------------------------
 void i2chid_init(uint32_t mboot_phys) {
     if (cmdline_has(mboot_phys, "noi2c")) { tlog("disabled (noi2c)"); return; }
+    crumb("touchpad: reading the ACPI tables");
     uint8_t* tabs[24];
     uint32_t lens[24];
     int nt = acpi_aml_tables(tabs, lens, 24);
@@ -338,21 +401,19 @@ void i2chid_init(uint32_t mboot_phys) {
         rs[k] = 0;
         tlog("  _DSM register candidates: %s", k ? rs : "none");
     }
-    T.state = 1;
+    crumb("touchpad: memory map and PCI ranges");
     collect_ranges(mboot_phys);
-    scan_for_controllers();                       // each block found is tried at once
-    if (T.state != 2) {
-        T.state = 3;
-        tlog("the touchpad did not answer on any controller block (`touchpad aml` shows what the AML says)");
-        dump_ctrl_aml(T.dev[0].ctrl);
-    }
+    scan_restart();                               // the hunt itself runs from i2chid_poll, a little per tick
+    tlog("controller hunt starts %u s after boot (a little per tick)", SCAN_START_TICK / 100);
 }
 
 void i2chid_retry(void) {
     if (!T.ndev) { tlog("no I2C-HID device in ACPI"); return; }
     if (T.state == 2) { tlog("already running"); return; }
+    if (!T.nblk) { scan_restart(); tlog("no controller block known yet: hunting again"); return; }
     T.state = 1;
     try_all_blocks();
+    if (T.state != 2) T.state = 3;
 }
 
 static void process(const uint8_t* b, int n, uint32_t now) {
@@ -384,7 +445,15 @@ static void process(const uint8_t* b, int n, uint32_t now) {
 
 void i2chid_enable(int on) { T.paused = !on; tlog(on ? "polling on" : "polling off"); }
 
+void i2chid_rescan(void) {
+    if (!T.ndev) { tlog("no I2C-HID device in ACPI"); return; }
+    if (T.state == 2) { tlog("already running"); return; }
+    scan_restart();
+    tlog("hunting again from the start");
+}
+
 void i2chid_poll(void) {
+    if (T.state == 1) { scan_step(); return; }
     if (T.state != 2 || T.paused) return;
     uint32_t t = tick_count;
     if (t == T.last_tick) return;
@@ -432,5 +501,8 @@ void i2chid_status(char* buf, int cap) {
     buf[0] = 0;
     const char* st = T.state == 2 ? (T.paused ? "paused (touchpad on)" : "running") : T.state == 1 ? "searching" : T.state == 3 ? "NOT WORKING" : "no I2C-HID device in ACPI";
     int at = sfmt(buf, cap, 0, "touchpad: %s, reports %u, empty polls %u, errors %u, unmatched %u", st, T.reports, T.empty, T.errors, T.unmatched);
+    if (T.state == 1)
+        at = sfmt(buf, cap, at, "hunt: %s at %x, %u pages read, %d controller block(s) found%s", tick_count < SCAN_START_TICK ? "starts soon" : "now", S.w, S.pages, T.nblk,
+                  T.paused ? " (paused)" : "");
     devlog_tail('t', buf, cap, at, 22);
 }
