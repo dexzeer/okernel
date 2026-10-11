@@ -791,6 +791,64 @@ void rtw_rx_poll(void) {
     }
 }
 
+// ---- transmitting 802.11 frames ---------------------------------------------------------------------------------------------------
+// Management frames go out on the management queue at 6 Mbit/s with the hardware numbering them; data frames at a fixed OFDM
+// rate (the firmware's rate adaptation is not driven), numbered by the caller.
+#define RATE_6M  0x04
+#define RATE_24M 0x08
+
+int rtw_tx_frame(const uint8_t* f, int len, int is_data) {
+    if (R.state != 2 || len < 10 || len > 2300) return -1;
+    int bmc = f[4] & 1;
+    int mgmt = !is_data;
+    int qsel = mgmt ? QSEL_MGMT : (bmc ? QSEL_HIGH : 0);
+    uint32_t w[10] = { 0 };
+    w[0] = (uint32_t)len | (48u << 16) | ((uint32_t)bmc << 24) | B(26) | (mgmt ? B(31) : 0);
+    w[1] = (uint32_t)0 | ((uint32_t)qsel << 8) | ((uint32_t)7 << 16) | (qsel == QSEL_HIGH ? B(29) : 0);   // MACID 0, queue, rate id (G), more data for the high queue
+    w[3] = B(8) | B(10);                                                      // use the rate in this descriptor, no fallback
+    w[4] = is_data ? RATE_24M : RATE_6M;
+    if (mgmt) w[8] = B(15);                                                   // sequence numbers from the hardware
+    else w[9] = (uint32_t)((((uint32_t)f[22] | ((uint32_t)f[23] << 8)) >> 4) & 0xfff) << 12;
+    return rtw_tx_raw(qsel, w, f, len);
+}
+
+// ---- station link state ---------------------------------------------------------------------------------------------------------------
+void rtw_set_link(int up, const uint8_t* bssid, int aid) {
+    uint8_t h[8];
+    for (int i = 0; i < 6; i++) rtw_w8(R_BSSID + (uint32_t)i, up ? bssid[i] : 0);
+    rtw_w32_mask(R_CR, 0x30000, up ? 2 : 0);                                  // network type: infrastructure station / no link
+    rtw_w32_mask(0x06a8, 0x7ff, up ? (uint32_t)aid : 0);
+    memset(h, 0, 8);
+    h[0] = 0x01; h[1] = (uint8_t)(up ? 1 : 0); h[2] = 0;                      // media status report for MACID 0
+    rtw_h2c_mbox(h);
+    if (up) {
+        memset(h, 0, 8);
+        h[0] = 0x2c; h[1] = 0; h[2] = 0;                                      // default port 0 <- MACID 0
+        rtw_h2c_mbox(h);
+        memset(h, 0, 8);                                                      // rate adaptation info: legacy rates only
+        uint32_t mask = R.channel <= 14 ? 0xFFF : 0xFF0;
+        h[0] = 0x40; h[1] = 0; h[2] = (uint8_t)(R.channel <= 14 ? 6 : 7); h[3] = (uint8_t)(1 << 6);       // rate id BG / G, disable power tracking
+        h[4] = (uint8_t)mask; h[5] = (uint8_t)(mask >> 8);
+        rtw_h2c_mbox(h);
+    }
+    wlog("wifi: link %s (bssid %02x:%02x:%02x:%02x:%02x:%02x, aid %d)", up ? "up" : "down", bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], aid);
+}
+
+// RF calibration done by the firmware (IQK), needed before transmitting on a new channel.
+void rtw_iqk(void) {
+    uint8_t p[32];
+    memset(p, 0, sizeof p);
+    p[0] = 1; p[1] = 0xFF; p[2] = 0x0E; p[4] = 8 + 1;
+    if (rtw_h2c_pkt(p)) return;
+    int i;
+    for (i = 0; i < 300; i++) {
+        if (rtw_rf_read(0x08, 0xfffff) == 0xabcde) break;
+        rtw_mdelay(20);
+    }
+    rtw_rf_write(0x08, 0xfffff, 0);
+    wlog("wifi: calibration %s after %d ms (result %08x)", i < 300 ? "done" : "TIMED OUT", i * 20, rtw_r32(0x1bf0));
+}
+
 // ---- Bluetooth coexistence in "Wi-Fi only" mode ------------------------------------------------------------------------------------
 // The chip shares its antenna switch and radio front end with Bluetooth. After power-up the switch points at BT; without
 // these steps the radio hears nothing. We never run Bluetooth, so: GNT_BT low, GNT_WL high, the path owned by Wi-Fi, the
@@ -926,6 +984,9 @@ int rtw_start(void) {
     xhci_wl_rx_start();
     rtw_w32(R_RCR, R.rcr);
     R.state = 2;
+    for (int i = 0; i < 6; i++) rtw_w8(R_MACID + (uint32_t)i, R.mac[i]);       // our address (acknowledgements, unicast reception)
+    rtw_w32_mask(R_CR, 0x30000, 0);
+    rtw_w8(R_BCN_CTRL, EN_BCN_FUNCTION);
     rtw_set_channel(1);
     wlog("wifi: on channel 1, tx power index %u", R.tx_idx);
     return 0;

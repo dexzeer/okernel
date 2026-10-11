@@ -274,7 +274,9 @@ void e1000_init(void) {
     }
 
     // Enable RX (accept broadcast + MAC filter)
-    mmio_write(E1000_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC);
+    // (the flags named BAM / SECRC here are really bits 2 and 3 - store-bad-packets and unicast-promiscuous - which the receive path
+    // is built around; broadcast acceptance is bit 15, needed for DHCP replies)
+    mmio_write(E1000_RCTL, RCTL_EN | RCTL_BAM | RCTL_SECRC | 0x8000);
 
     // Enable TX
     mmio_write(E1000_TCTL, TCTL_EN | TCTL_PSP);
@@ -405,5 +407,6 @@ void e1000_poll(void) {
 }
 
 uint8_t* e1000_get_mac(void) { return mac_addr; }
+int e1000_present(void) { return mmio != 0; }
 
 void e1000_set_rx_callback(e1000_rx_callback_t cb) { rx_callback = cb; }

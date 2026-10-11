@@ -53,6 +53,10 @@ void rtw_h2c_mbox(const uint8_t* h2c8);
 int rtw_set_channel(int ch);
 void rtw_rx_poll(void);
 
+int rtw_tx_frame(const uint8_t* f, int len, int is_data);
+void rtw_set_link(int up, const uint8_t* bssid, int aid);
+void rtw_iqk(void);
+
 // implemented in rtw_wifi.c
 void rtw_rx_frame(const uint8_t* f, int len, int rate, int rssi, int icv_err);
 void rtw_c2h(const uint8_t* p, int len);

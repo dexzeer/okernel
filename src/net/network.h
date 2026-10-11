@@ -70,6 +70,10 @@ void icmp_send_ping(uint8_t* target_ip, uint16_t id, uint16_t seq);
 // Send a UDP packet
 void udp_send(uint8_t* dst_ip, uint16_t src_port, uint16_t dst_port, uint8_t* data, uint16_t len);
 
+// Ask the router for an address (DHCP); automatic on the Wi-Fi link. net_status: the interface settings as text.
+void net_dhcp(void);
+int net_status(char* buf, int cap);
+
 // Get our IP address
 uint8_t* net_get_ip(void);
 
