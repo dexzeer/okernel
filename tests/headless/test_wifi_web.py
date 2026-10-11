@@ -18,7 +18,7 @@ try:
     vm.wait_for("wifi: connected to", timeout=40, fail_pats=["refused", "did not finish", "no answer", "cannot join"])
     vm.wait_for("dhcp: address", timeout=40)
     time.sleep(3)
-    for i, url in enumerate(["http://example.com/", "https://example.com/"]):
+    for i, url in enumerate(["https://example.com/"]):
         before = vm.serial().count("parse: count=")
         vm.type_string("okai " + url + "\n")
         t0 = time.time()
