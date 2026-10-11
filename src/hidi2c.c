@@ -50,7 +50,7 @@ int hidi2c_input(struct hidi2c* h, uint8_t* buf, int cap) {
     if (r < 0) return r;
     int len = le16(in);
     if (len == 0 || len == 0xFFFF) return 0;
-    if (len < 3 || len > want) return -5;                     // garbage
+    if (len < 3 || len > want) { for (int i = 0; i < 16 && i < want; i++) h->bad[i] = in[i]; return -5; }   // garbage
     len -= 2;
     if (len > cap) len = cap;
     for (int i = 0; i < len; i++) buf[i] = in[2 + i];

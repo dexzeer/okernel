@@ -557,7 +557,10 @@ void i2chid_poll(void) {
         }
     } else {
         T.errors++;
-        if (T.errors <= 3) tlog("input read error %d (abort %x)", n, T.dw.last_abort);
+        if (T.errors <= 3 || (n == -5 && T.errors <= 40 && (T.errors & 7) == 0)) {
+            tlog("input read error %d (abort %x), max_in %u", n, T.dw.last_abort, T.h.max_in);
+            if (n == -5) hexline("  raw:", T.h.bad, 16);
+        }
         if (n == -1 && ++T.fails >= 20) { tlog("bus stuck: touchpad polling stopped"); T.state = 3; }
     }
 }
