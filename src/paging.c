@@ -179,8 +179,10 @@ static void* map_windows(uint32_t phys_addr, uint32_t len, uint32_t flags) {
 void* paging_map(uint32_t phys_addr) { return map_windows(phys_addr, 1, 0x03); }
 
 // A scratch 4MB window (the last MMIO slot) that can be re-pointed at any 4MB-aligned physical block, to read device
-// registers in address space nobody has mapped (hunting for an ACPI-mode controller). Boot time only: page directories
-// copy the kernel half when a process is created. paging_probe_window(0) unmaps it again.
+// registers in address space nobody has mapped (hunting for an ACPI-mode controller). The entry goes into the kernel
+// page directory and into the page directory that is current now (address spaces made earlier hold a copy of the kernel
+// half from their creation, so only the caller's own space sees a later change: use it from one thread).
+// paging_probe_window(0) unmaps it again.
 void* paging_probe_window(uint32_t phys4mb) {
     uint32_t idx = (MMIO_VBASE >> 22) + MMIO_WINDOWS - 1;
     static int ours;                                       // 1 once we have put our own entry there
@@ -188,7 +190,12 @@ void* paging_probe_window(uint32_t phys4mb) {
         if (page_directory[idx] & 1) return 0;             // something else (an identity-mapped framebuffer) lives there
         ours = 1;
     }
-    page_directory[idx] = phys4mb ? ((phys4mb & 0xFFC00000) | 0x9B) : 0;     // P | RW | PWT | PCD | PS
+    uint32_t ent = phys4mb ? ((phys4mb & 0xFFC00000) | 0x9B) : 0;            // P | RW | PWT | PCD | PS
+    uint32_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    uint32_t* cur = (uint32_t*)P2V_U32(cr3 & 0xFFFFF000u);
+    if (cur != page_directory) cur[idx] = ent;
+    page_directory[idx] = ent;
     __asm__ volatile("invlpg (%0)" :: "r"(idx << 22) : "memory");
     return phys4mb ? (void*)(idx << 22) : 0;
 }

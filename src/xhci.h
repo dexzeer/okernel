@@ -15,6 +15,7 @@ void xhci_poll(void);
 
 // Recovery self test for the `usb selftest` command (stalls endpoint 0, restarts the pointer endpoints).
 void xhci_selftest(char* buf, int cap);
+void xhci_selftest_stop(char* buf, int cap);
 
 // Forget the ports that failed or hold a non-pointer device and try them again (`usb rescan`).
 void xhci_rescan(void);

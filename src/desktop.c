@@ -1159,6 +1159,7 @@ static void shell_execute(int win_id, const char* input) {
         if (args[0] && str_eq(args, "off")) { i2chid_enable(0); i2chid_status(tb, sizeof tb); }
         else if (args[0] && str_eq(args, "on")) { i2chid_enable(1); i2chid_status(tb, sizeof tb); }
         else if (args[0] && str_eq(args, "aml")) i2chid_aml(tb, sizeof tb);
+        else if (args[0] && str_eq(args, "rescan")) { i2chid_rescan(); i2chid_status(tb, sizeof tb); }
         else { if (args[0] && str_eq(args, "retry")) i2chid_retry(); i2chid_status(tb, sizeof tb); }
         window_puts(win_id, tb);
     }
@@ -1166,6 +1167,7 @@ static void shell_execute(int win_id, const char* input) {
         static char ub[2048];
         if (args[0] && str_eq(args, "rescan")) { xhci_rescan(); window_puts(win_id, "usb: rescanning the ports (run `usb` again in a second)\n"); }
         else if (args[0] && str_eq(args, "selftest")) { xhci_selftest(ub, sizeof ub); window_puts(win_id, ub); }
+        else if (args[0] && str_eq(args, "selftest stop")) { xhci_selftest_stop(ub, sizeof ub); window_puts(win_id, ub); }
         else { xhci_status(ub, sizeof ub); window_puts(win_id, ub); }
     }
     else if (str_eq(cmd_buf, "shutdown")) {

@@ -108,6 +108,9 @@ struct hidep {
     uint32_t reports, errors, unmatched;
     int fail, recoveries, logged;
     uint16_t vid, pid;
+    uint32_t last_tick, restarts, watchdog, bad, next_try;   // halted-endpoint restarts, restarts found by the state check, failed restarts
+    int lastcode;                // completion code of the last transfer event
+    int dead;                    // gave up after repeated failed restarts
 };
 
 // a device that owns a slot
@@ -145,6 +148,7 @@ static struct {
     uint32_t next_scan;
     int rescan_req;
     uint32_t reports;
+    uint32_t slow, slowmax;      // polls that took >= 50 ms, and the longest in 10 ms ticks
     struct ring ep0[MAXSLOTS + 1];
     uint8_t* devctx[MAXSLOTS + 1];
     uint8_t* inctx;
@@ -221,7 +225,7 @@ static void ep_requeue(struct hidep* e) {
 
 static void ptr_report(struct hidep* e, const uint8_t* b, int n) {
     if (n <= 0) return;
-    e->reports++; X.reports++;
+    e->reports++; X.reports++; e->last_tick = tick_count;
     if (e->logged < 2) {
         e->logged++;
         char hex[40]; int k = 0;
@@ -265,9 +269,10 @@ static void pump(void) {
             struct hidep* e = ep_find(slot, ep);
             if (e) {
                 uint32_t idx = (lo - e->ring.phys) / 16;
+                e->lastcode = code;
                 if (idx < NBUF && (code == 1 || code == 13)) {
                     int n = e->tlen - (int)(status & 0xFFFFFF);
-                    e->recoveries = 0;
+                    e->recoveries = 0; e->bad = 0;
                     ptr_report(e, e->buf + idx * (uint32_t)e->slotsz, n);
                     ep_requeue(e);
                 } else if (code == 26 || code == 27) {
@@ -663,7 +668,7 @@ static int port_reset(int port) {
 static void root_enum(int p) {
     struct rport* r = &RP[p];
     r->tries++;
-    r->next = tick_count + 30;                                   // 300 ms between attempts
+    r->next = tick_count + (r->tries < 4 ? 30 : 500);   // 300 ms between the first attempts, then 5 s (a flaky port is retried for a while)
     if (!port_reset(p)) { xlog("port %d: no usable device (PORTSC %08x)", p, rd32(X.op, OP_PORTSC + 0x10u * (uint32_t)(p - 1))); return; }
     uint32_t v = rd32(X.op, OP_PORTSC + 0x10u * (uint32_t)(p - 1));
     struct eparam a;
@@ -679,15 +684,19 @@ static void scan_roots(void) {
     for (int p = 1; p <= X.maxports && p < 32; p++) {
         uint32_t off = OP_PORTSC + 0x10u * (uint32_t)(p - 1);
         uint32_t v = rd32(X.op, off);
-        if (v & PORT_CHANGES) wr32(X.op, off, PORT_PRESERVE(v) | (v & PORT_CHANGES));      // acknowledge
         struct rport* r = &RP[p];
+        if (v & PORT_CHANGES) {
+            static int plogged;
+            if ((r->known || r->slot) && plogged < 24) { plogged++; xlog("t=%u port %d: status change, PORTSC %08x", tick_count, p, v); }
+            wr32(X.op, off, PORT_PRESERVE(v) | (v & PORT_CHANGES));                        // acknowledge
+        }
         if (!(v & PORT_CCS) || ((v & PORT_CSC) && (r->known || r->slot))) {                 // gone (or replaced between scans)
-            if (r->slot || r->known) xlog("port %d: device removed", p);
+            if (r->slot || r->known) xlog("t=%u port %d: device removed", tick_count, p);
             if (r->slot) dev_drop(r->slot);
             memset(r, 0, sizeof *r);
             if (!(v & PORT_CCS)) continue;
         }
-        if (!r->known && r->tries < 4 && (int)(tick_count - r->next) >= 0) root_enum(p);
+        if (!r->known && r->tries < 10 && (int)(tick_count - r->next) >= 0) root_enum(p);
     }
 }
 
@@ -883,8 +892,7 @@ void xhci_init(uint32_t mboot_phys) {
 
 void xhci_rescan(void) { X.rescan_req = 1; }
 
-void xhci_poll(void) {
-    if (!X.ready) return;
+static void poll_inner(void) {
     pump();
     if (X.rescan_req) {
         X.rescan_req = 0;
@@ -895,22 +903,43 @@ void xhci_poll(void) {
         X.next_scan = 0;
         xlog("rescan");
     }
-    for (int i = 0; i < MAXEP; i++) {                           // halted pointer endpoints: reset and restart (a few times)
+    for (int i = 0; i < MAXEP; i++) {                           // halted pointer endpoints: reset and restart, as often as needed
         struct hidep* e = &E[i];
-        if (!e->used || !e->fail) continue;
+        if (!e->used || !e->fail || e->dead) continue;
+        if ((int)(tick_count - e->next_try) < 0) continue;      // backing off after the last restart
         int code = e->fail;
         e->fail = 0;
-        if (e->recoveries >= 5) continue;
-        e->recoveries++;
-        xlog("slot %d endpoint error (code %d): restarting (%d)", e->slot, code, e->recoveries);
-        if (!ep_recover(e)) xlog("slot %d: restart failed", e->slot);
+        e->recoveries++; e->restarts++;
+        e->next_try = tick_count + (e->recoveries < 8 ? 3 : 30);
+        if (e->restarts <= 8 || (e->restarts & 63) == 0) xlog("t=%u slot %d endpoint error (code %d): restart #%u", tick_count, e->slot, code, e->restarts);
+        if (!ep_recover(e)) {
+            xlog("slot %d: restart failed", e->slot);
+            e->next_try = tick_count + 100;
+            e->fail = code;
+            if (++e->bad >= 10) { e->dead = 1; xlog("slot %d: giving up on this endpoint (unplug and replug)", e->slot); }
+        }
     }
     if (X.port_pending || (int)(tick_count - X.next_scan) >= 0) {
         X.next_scan = tick_count + 20;
+        for (int i = 0; i < MAXEP; i++) {                       // the controller's own idea of each endpoint: running (1), or halted / stopped / error
+            struct hidep* e = &E[i];
+            if (!e->used || e->fail || e->dead || !X.devctx[e->slot]) continue;
+            uint32_t st = ((volatile uint32_t*)ctx(X.devctx[e->slot], e->dci))[0] & 7;
+            if (st != 1) { e->fail = 100 + (int)st; e->watchdog++; }
+        }
         X.port_pending = 0;
         scan_roots();
         scan_hubs();
     }
+}
+
+// the main loop polls us: a call that takes long (control transfers with timeouts) freezes the whole desktop, so it is counted
+void xhci_poll(void) {
+    if (!X.ready) return;
+    uint32_t t0 = tick_count;
+    poll_inner();
+    uint32_t dt = tick_count - t0;
+    if (dt >= 5) { X.slow++; if (dt > X.slowmax) X.slowmax = dt; }
 }
 
 static int sadd(char* buf, int cap, int at, const char* fmt, ...) {
@@ -951,6 +980,21 @@ void xhci_selftest(char* buf, int cap) {
     if (!at) sadd(buf, cap, at, "usb selftest: no device to test");
 }
 
+// `usb selftest stop`: leaves every pointer endpoint STOPPED; the state check in xhci_poll must find and restart them
+void xhci_selftest_stop(char* buf, int cap) {
+    int at = 0, n = 0;
+    buf[0] = 0;
+    for (int i = 0; i < MAXEP; i++) {
+        struct hidep* e = &E[i];
+        if (!e->used) continue;
+        uint32_t base = ((uint32_t)e->slot << 24) | ((uint32_t)e->dci << 16);
+        int c = command(0, 0, 0, (TRB_STOP_EP << 10) | base, 0);
+        at = sadd(buf, cap, at, "slot %d dci %d: stopped (code %d); the watchdog must bring it back within a second", e->slot, e->dci, c);
+        n++;
+    }
+    if (!n) sadd(buf, cap, at, "usb selftest stop: no pointer endpoint");
+}
+
 // ---- status for the shell ---------------------------------------------------------------------------
 void xhci_status(char* buf, int cap) {
     int at = 0;
@@ -964,13 +1008,20 @@ void xhci_status(char* buf, int cap) {
         for (int p = 1; p <= X.maxports && p < 32; p++) {
             uint32_t v = rd32(X.op, OP_PORTSC + 0x10u * (uint32_t)(p - 1));
             if (!(v & PORT_CCS)) continue;
-            const char* what = RP[p].slot ? (D[RP[p].slot].hub ? "hub" : "pointer") : RP[p].known ? "other device" : RP[p].tries >= 4 ? "FAILED" : "pending";
+            const char* what = RP[p].slot ? (D[RP[p].slot].hub ? "hub" : "pointer") : RP[p].known ? "other device" : RP[p].tries >= 10 ? "FAILED" : "pending";
             at = sadd(buf, cap, at, "port %d: %08x %s, %s", p, v, speed_name((int)PORT_SPEED(v)), what);
         }
         for (int i = 0; i < MAXEP; i++)
             if (E[i].used)
+            if (E[i].used) {
+                uint32_t st = X.devctx[E[i].slot] ? ((volatile uint32_t*)ctx(X.devctx[E[i].slot], E[i].dci))[0] & 7 : 9;
                 at = sadd(buf, cap, at, "slot %d %x:%x if%d: %u reports, %u errors, %u unmatched", E[i].slot, E[i].vid, E[i].pid, E[i].ifnum,
                           E[i].reports, E[i].errors, E[i].unmatched);
+                at = sadd(buf, cap, at, "  ep state %u, last code %d, restarts %u (watchdog %u), last report %u ms ago%s", st, E[i].lastcode, E[i].restarts, E[i].watchdog, (tick_count - E[i].last_tick) * 10,
+                          E[i].dead ? ", GAVE UP" : "");
+            }
+        uint32_t sts = rd32(X.op, 4);
+        at = sadd(buf, cap, at, "USBSTS %08x  event ring at %d  slow polls %u (longest %u ms)", sts, X.ev_deq, X.slow, X.slowmax * 10);
     }
     at = sadd(buf, cap, at, "log:");
     devlog_tail('u', buf, cap, at, 14);
