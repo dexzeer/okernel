@@ -754,6 +754,7 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  terminal  - open new terminal\n");
         window_puts(win_id, "  exit      - close this terminal\n");
         window_puts(win_id, "  okai   - open web okai\n");
+        window_puts(win_id, "  wifigui   - Wi-Fi window (scan, connect)\n");
         window_puts(win_id, "  ls        - list files\n");
         window_puts(win_id, "  save      - force one file to disk\n");
         window_puts(win_id, "  ps        - list processes\n");
@@ -761,6 +762,14 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  reboot    - reboot system\n");
         window_puts(win_id, "  shutdown  - power off\n");
         if (adv) {
+            window_puts(win_id, "  wifi      - Wi-Fi adapter: start | scan | list |\n");
+            window_puts(win_id, "              connect NAME [PASS] | disconnect |\n");
+            window_puts(win_id, "              status | log | ch N\n");
+            window_puts(win_id, "  wifigui demo - Wi-Fi window, simulated adapter\n");
+            window_puts(win_id, "  dhcp      - ask the router for an address\n");
+            window_puts(win_id, "  ipconfig  - address, mask, gateway, DNS\n");
+            window_puts(win_id, "  usb       - USB controller and devices\n");
+            window_puts(win_id, "  touchpad  - I2C touchpad status\n");
             window_puts(win_id, "  ping      - ping gateway\n");
             window_puts(win_id, "  ip        - show IP address\n");
             window_puts(win_id, "  netdrop N - drop 1-in-N TCP pkts (test)\n");
