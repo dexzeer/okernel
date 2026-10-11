@@ -18,6 +18,14 @@ Boot from it: press the boot-menu key at power-on (usually F12, F9, Esc or F10) 
 (**"UEFI: USB DISK"** on a UEFI machine). If the firmware has **Secure Boot** on, turn it off in the setup (F2 / Del):
 GRUB on the stick is not signed for it.
 
+## The automatic log (no more photographs)
+
+If the stick was written with `tools\stick\flash.ps1` (not Rufus), the desktop writes everything it logs, a status
+snapshot every 5 seconds and the raw ACPI tables into a reserved area at the very end of the stick (the last 2 MB, which
+the ISO does not use; the kernel never writes to a stick without the marker the script adds). To read it: put the stick
+back into the PC and run `tools\stick\readlog.ps1 -Disk N -Out folder`. Nothing to photograph, nothing to type; if the
+laptop freezes, power it off and read the stick: the last lines say where it stopped.
+
 ## The menu
 
 On a UEFI machine the menu starts on entry 1b by itself after 30 seconds.

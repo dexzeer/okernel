@@ -19,6 +19,8 @@ void     pcix_write32(struct pci_loc l, uint8_t off, uint32_t v);
 // (class 0xFF = any class; prog_if ignored). Returns 1 and fills *out.
 int pcix_find_id(uint16_t vendor, uint16_t device, int nth, struct pci_loc* out);
 int pcix_find_class(uint8_t cls, uint8_t subclass, int nth, struct pci_loc* out);
+// The nth function of any kind (class 0xFF in pcix_find_class matches only class 0xFF, not "any").
+int pcix_find_any(int nth, struct pci_loc* out);
 
 // Command register: memory space + bus master on, legacy INTx off.
 void pcix_enable(struct pci_loc l, int intx_off);

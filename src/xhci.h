@@ -20,6 +20,12 @@ void xhci_selftest_stop(char* buf, int cap);
 // Forget the ports that failed or hold a non-pointer device and try them again (`usb rescan`).
 void xhci_rescan(void);
 
+// The first USB mass storage device (bulk-only, 512 byte blocks), for the on-stick log (klog.c).
+// xhci_storage_ready: 1 when there is one (and it has not failed), *sectors = its size.
+// xhci_storage_rw: n <= 128 sectors; 1 on success, 0 on failure (which also switches the storage off).
+int xhci_storage_ready(uint32_t* sectors);
+int xhci_storage_rw(int write, uint32_t lba, void* data, uint32_t n);
+
 // One line of status for the `usb` shell command.
 void xhci_status(char* buf, int cap);
 

@@ -56,6 +56,9 @@ int pcix_find_id(uint16_t vendor, uint16_t device, int nth, struct pci_loc* out)
     return enumerate(match_id, &a, nth, out);
 }
 
+static int match_any(struct pci_loc l, const void* a) { (void)l; (void)a; return 1; }
+int pcix_find_any(int nth, struct pci_loc* out) { return enumerate(match_any, 0, nth, out); }
+
 struct cls_arg { uint8_t c, s; };
 static int match_class(struct pci_loc l, const void* a) {
     const struct cls_arg* x = (const struct cls_arg*)a;
