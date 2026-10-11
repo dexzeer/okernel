@@ -130,6 +130,7 @@ static int bus_xfer(void* ctx, int addr, const uint8_t* w, int wl, uint8_t* r, i
 static int try_block(uint32_t phys);
 static int bring_up_device(void);
 static void dump_ctrl_aml(const char* path);
+static void hexlog(const char* what, const uint8_t* b, uint32_t n);
 
 // The hunt runs from the main loop, a few hundred microseconds per tick, starting a few seconds after boot: a bus that
 // stalls on a read can then be seen (the breadcrumb on screen names the 4 MB block being read) and never delays the boot.
@@ -343,6 +344,7 @@ static int bring_up_device(void) {
     int n = hidi2c_report_desc(h, rd, h->rdesc_len);
     if (n < 0) { tlog("  report descriptor read failed (%d)", n); kfree(rd); return 0; }
     hexline("  rd[0..]:", rd, n);
+    hexlog("rd ", rd, (uint32_t)n);                                // the whole report descriptor goes to the log ('a' lines)
     T.nptr = hid_parse_pointer(rd, n, T.lay, HID_MAXRPT, &T.ids);
     int tids = 0;
     T.have_touch = hid_parse_touch(rd, n, &T.touch, &tids);
