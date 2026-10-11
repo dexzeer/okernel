@@ -178,7 +178,7 @@ static int aml_rd(uint32_t phys, uint32_t* v) { return acpi_phys_read(phys, v, 4
 
 // ---- bring-up on the address the AML gave (state 5) -----------------------------------------------------
 // Step by step, each logged AND written to the stick before the next access: the first real run froze on a blind read.
-#define AML_START_TICK 150                // 1.5 s after boot: the first attempt, at tick 0, got a device that only answered garbage
+#define AML_START_TICK 250                // 2.5 s after boot (the stick log of 5 failing boots all had the boot stick on a SuperSpeed link, see xhci.c ss_power_off)
 static void aml_bringup(void) {
     if (tick_count < AML_START_TICK || T.paused) return;
     for (int oi = 0; oi < T.ndev; oi++) {
