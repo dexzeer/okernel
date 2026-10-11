@@ -58,6 +58,7 @@ int hidi2c_input(struct hidi2c* h, uint8_t* buf, int cap) {
     // descriptor read) until a command is written, which points it back at the input register: so anything that is not
     // a report is answered with SET_POWER(on) and counted. (An explicit write of the input register address was tried and
     // the device never produced a report that way.)
+    for (int i = 0; i < want; i++) in[i] = 0xA5;                  // poison: a read that returns without writing shows up as A5 A5 ... in the log
     int r = h->bus.xfer(h->bus.ctx, h->addr, 0, 0, in, want);
     if (r == -2) { h->nack++; return 0; }                     // a device with nothing to say may not answer at all
     if (r < 0) return r;

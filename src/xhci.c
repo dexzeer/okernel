@@ -134,6 +134,7 @@ struct rport { uint8_t known, tries, slot; uint32_t next; };
 
 static struct {
     int ready;
+    int ss_keep;                 // `usb3` on the command line: leave SuperSpeed links on
     struct pci_loc loc;
     uint16_t did;
     volatile uint8_t* cap;
@@ -992,12 +993,29 @@ static int port_reset(int port) {
     return (v & PORT_CCS) && (v & PORT_PED);
 }
 
+// On the Cherry Trail laptop the touchpad (I2C) only ever worked while the boot stick ran at USB 2 speed; with its SuperSpeed link up
+// the touchpad answers garbage (5 of 5 logged boots). Nothing here needs SuperSpeed, so the USB 3 half of a port is switched off and
+// the device falls back to the port's USB 2 half (it shows up on its own root port a moment later). Boot with `usb3` to keep it.
+static int ss_power_off(int p, uint32_t v) {
+    if (X.ss_keep || X.did != 0x22b5) return 0;                                   // only the Cherry Trail controller (8086:22b5)
+    uint32_t off = OP_PORTSC + 0x10u * (uint32_t)(p - 1);
+    if (rd32(X.cap, CAP_HCCPARAMS1) & (1u << 3)) {                                // port power control: remove the power from the USB 3 half
+        wr32(X.op, off, PORT_PRESERVE(v) & ~PORT_PP);
+        xlog("port %d: SuperSpeed link powered off; the device falls back to USB 2", p);
+    } else {                                                                      // otherwise put the link in the Disabled state (no receiver termination)
+        wr32(X.op, off, (PORT_PRESERVE(v) & ~(15u << 5)) | (4u << 5) | (1u << 16));
+        xlog("port %d: SuperSpeed link disabled; the device falls back to USB 2", p);
+    }
+    return 1;
+}
+
 static void root_enum(int p) {
     struct rport* r = &RP[p];
     r->tries++;
     r->next = tick_count + (r->tries < 4 ? 30 : 500);   // 300 ms between the first attempts, then 5 s (a flaky port is retried for a while)
     if (!port_reset(p)) { xlog("port %d: no usable device (PORTSC %08x)", p, rd32(X.op, OP_PORTSC + 0x10u * (uint32_t)(p - 1))); return; }
     uint32_t v = rd32(X.op, OP_PORTSC + 0x10u * (uint32_t)(p - 1));
+    if (PORT_SPEED(v) == 4 && ss_power_off(p, v)) { r->known = 1; r->tries = 0; return; }
     struct eparam a;
     memset(&a, 0, sizeof a);
     a.root = p; a.speed = (int)PORT_SPEED(v);
