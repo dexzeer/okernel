@@ -16,6 +16,7 @@ struct hidi2c {
     int addr;
     uint16_t desc_reg;
     uint16_t bcd, rdesc_len, rdesc_reg, in_reg, max_in, out_reg, max_out, cmd_reg, data_reg, vid, pid, ver;
+    uint8_t bad[16];                // the first bytes of the last input read that was not a report (diagnostics)
 };
 
 #define HIDI2C_MAXREPORT 1024

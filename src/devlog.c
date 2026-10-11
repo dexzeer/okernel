@@ -4,7 +4,7 @@
 #include "klog.h"
 
 #define LOGN 256
-#define LOGW 74                  // tag + text + terminator; fits the 85-column terminal
+#define LOGW 120                 // tag + text + terminator; fits the 85-column terminal
 
 static char LOG[LOGN][LOGW];
 static int log_n;

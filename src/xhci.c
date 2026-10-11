@@ -90,9 +90,9 @@ struct ring {
 };
 
 // ---- state --------------------------------------------------------------------------------------
-#define EVN 64
+#define EVN 256
 #define MAXSLOTS 16
-#define NBUF 16                  // transfers kept in flight per pointer endpoint (ring of NBUF + 1 TRBs)
+#define NBUF 128                 // transfers kept in flight per pointer endpoint (ring of NBUF + 1 TRBs)
 #define MAXEP 6                  // pointer endpoints served at once
 #define MAXHUBPORT 15
 
@@ -112,6 +112,8 @@ struct hidep {
     int lastcode;                // completion code of the last transfer event
     uint32_t burst, idle_restarts, stall_logs;   // reports in the current burst; restarts after a pause; stall dumps written
     int armed;                   // a report came since the last pause check
+    uint32_t since, planned;     // reports since the ring was last (re)started; restarts made just before the ring wraps
+    int replan;                  // restart before the ring's link TRB is reached
     int dead;                    // gave up after repeated failed restarts
 };
 
@@ -290,6 +292,7 @@ static void pump(void) {
                     e->recoveries = 0; e->bad = 0;
                     ptr_report(e, e->buf + idx * (uint32_t)e->slotsz, n);
                     ep_requeue(e);
+                    if (++e->since >= NBUF - 8) e->replan = 1;      // the controller stalled at the ring's link TRB on the real laptop: never get there
                 } else if (code == 26 || code == 27) {
                     // Stopped: the leftovers of a Stop Endpoint we issued ourselves; the restart queues everything again
                 } else {
@@ -386,6 +389,7 @@ static int get_desc(int slot, uint8_t rt, uint16_t value, uint16_t index, uint16
 
 // a halted (or stopped) pointer endpoint: reset it, empty the ring and queue the transfers again
 static int ep_recover(struct hidep* e) {
+    e->since = 0; e->replan = 0;
     ring_reset(&e->ring);
     if (!ep_restart(e->slot, e->dci, e->ring.phys, 1, 1)) return 0;
     for (int k = 0; k < NBUF; k++) ep_requeue(e);
@@ -1067,6 +1071,12 @@ static void poll_inner(void) {
             if (++e->bad >= 10) { e->dead = 1; xlog("slot %d: giving up on this endpoint (unplug and replug)", e->slot); }
         }
     }
+    for (int i = 0; i < MAXEP; i++) {                           // about to reach the ring's link TRB: start the ring over (the controller did not follow it)
+        struct hidep* e = &E[i];
+        if (!e->used || !e->replan || e->fail || e->dead) continue;
+        e->planned++;
+        if (!ep_recover(e)) xlog("slot %d: planned restart failed", e->slot);
+    }
     for (int i = 0; i < MAXEP; i++) {                           // a pointer that went quiet after moving: dump what the controller thinks, then restart it
         struct hidep* e = &E[i];
         if (!e->used || !e->armed || e->fail || e->dead || (int)(tick_count - e->last_tick) < 25) continue;
@@ -1082,6 +1092,18 @@ static void poll_inner(void) {
                 volatile struct trb* t = &e->ring.trb[ix];
                 xlog("  hw deq idx %u trb %08x %08x %08x; ours enq %d cyc %d", ix, t->lo, t->status, t->control, e->ring.enq, e->ring.cycle);
             } else xlog("  hw deq %08x is outside the ring at %08x", deq, e->ring.phys);
+            {   // stop the endpoint: that makes the controller write its real dequeue pointer back to the context
+                uint32_t sb = ((uint32_t)e->slot << 24) | ((uint32_t)e->dci << 16);
+                int sc = command(0, 0, 0, (TRB_STOP_EP << 10) | sb, 0);
+                uint32_t dq = oc[2], di = ((dq & ~15u) - e->ring.phys) / 16;
+                xlog("  after stop (code %d): hw deq %08x dcs %u idx %u since-restart %u", sc, dq & ~15u, dq & 1, di, e->since);
+                if (di < (uint32_t)e->ring.n) {
+                    uint32_t a = di > 2 ? di - 2 : 0;
+                    xlog("  ctl[%u..] %08x %08x %08x %08x %08x %08x", a, e->ring.trb[a].control, e->ring.trb[a + 1].control, e->ring.trb[a + 2].control,
+                         e->ring.trb[a + 3].control, e->ring.trb[a + 4].control, e->ring.trb[a + 5].control);
+                }
+                xlog("  link trb %08x %08x %08x", e->ring.trb[e->ring.n - 1].lo, e->ring.trb[e->ring.n - 1].status, e->ring.trb[e->ring.n - 1].control);
+            }
             struct dev* d = &D[e->slot];
             uint32_t ps = rd32(X.op, OP_PORTSC + 0x10u * (uint32_t)(d->root - 1));
             xlog("  USBSTS %08x ERDP %08x root port %d PORTSC %08x", rd32(X.op, 4), rd32(X.rt, IR_ERDP), d->root, ps);
@@ -1189,7 +1211,7 @@ void xhci_status(char* buf, int cap) {
                 uint32_t st = X.devctx[E[i].slot] ? ((volatile uint32_t*)ctx(X.devctx[E[i].slot], E[i].dci))[0] & 7 : 9;
                 at = sadd(buf, cap, at, "slot %d %x:%x if%d: %u reports, %u errors, %u unmatched", E[i].slot, E[i].vid, E[i].pid, E[i].ifnum,
                           E[i].reports, E[i].errors, E[i].unmatched);
-                at = sadd(buf, cap, at, "  ep state %u, last code %d, restarts %u (watchdog %u, after pauses %u), last report %u ms ago%s", st, E[i].lastcode, E[i].restarts, E[i].watchdog, E[i].idle_restarts, (tick_count - E[i].last_tick) * 10,
+                at = sadd(buf, cap, at, "  ep state %u, last code %d, restarts %u (watchdog %u, after pauses %u, planned %u), last report %u ms ago%s", st, E[i].lastcode, E[i].restarts, E[i].watchdog, E[i].idle_restarts, E[i].planned, (tick_count - E[i].last_tick) * 10,
                           E[i].dead ? ", GAVE UP" : "");
             }
         uint32_t sts = rd32(X.op, 4);
