@@ -277,6 +277,11 @@ static void test_bus(void) {
     CHECK(n == 3 && buf[0] == 4 && buf[1] == 0xAA && buf[2] == 0xBB);
     CHECK(hidi2c_input(&h, buf, sizeof buf) == 0);
 
+    // restart: sleep, wake, reset (power ends on, reset command last)
+    M.power = 0;
+    CHECK(hidi2c_restart(&h) == 0);
+    CHECK(M.power && M.last_cmd[3] == 0x01);
+
     // SET_REPORT
     uint8_t mode = 3;
     CHECK(hidi2c_set_feature(&h, 3, &mode, 1) == 0);
