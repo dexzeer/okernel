@@ -259,11 +259,13 @@ static void touch_leave(void* ctx, int depth) {
 }
 static void touch_field(void* ctx, const struct hid_ev* e) {
     struct touch_ctx* c = (struct touch_ctx*)ctx;
-    if (!c->in_tp) return;
+    // the Input Mode (Device Mode) feature sits in its own "Device Configuration" collection (0x0D:0x0E) in Windows
+    // precision touchpads, next to the Touch Pad collection, so it is taken wherever it appears
     if (e->kind) {
         if (e->page == 0x0D && e->id == 0x52 && !c->mode.bits) { set_fld(&c->mode, e->off, e->g); c->mode_id = e->rid; }
         return;
     }
+    if (!c->in_tp) return;
     struct hid_touch* t = touch_find(c, e->rid);
     if (!t) return;
     if (c->in_finger) {

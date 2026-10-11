@@ -151,7 +151,7 @@ struct model {
     int dev_addr;
     uint8_t desc[30];
     uint8_t rdesc[512]; int rdl;
-    int reset_pending, power;
+    int reset_pending, power, ptr;
     uint8_t input[64]; int inlen;            // a report waiting (with its 2-byte length prefix already in place)
     uint8_t last_cmd[2048]; int last_cmd_n;
     int fifo_max_seen;
@@ -161,16 +161,22 @@ static void dev_write_phase(struct model* m) {
     if (m->did_write_phase) return;
     m->did_write_phase = 1;
     m->rn = m->rh = 0;
-    if (m->wn == 0) {                          // plain read: the input register
+    unsigned reg = m->wn >= 2 ? (unsigned)(m->wbuf[0] | (m->wbuf[1] << 8)) : 0;
+    // like the real SYNA3602: a plain read returns what the LAST ADDRESSED register holds (the descriptor after a descriptor read)
+    int plain = m->wn == 0;
+    if (plain && m->ptr == 0x20) { memcpy(m->rbuf, m->desc, 30); m->rn = 30; return; }
+    if (plain && m->ptr == 0x21) { memcpy(m->rbuf, m->rdesc, (size_t)m->rdl); m->rn = m->rdl; return; }
+    if (plain || (m->wn == 2 && reg == 0x0023)) {   // the input register
+        m->ptr = 0;
         if (m->inlen) { memcpy(m->rbuf, m->input, (size_t)m->inlen); m->rn = m->inlen; m->inlen = 0; }
         else if (m->reset_pending) { m->rbuf[0] = m->rbuf[1] = 0; m->rn = 2; m->reset_pending = 0; }
         else { m->rbuf[0] = m->rbuf[1] = 0; m->rn = 2; }
         return;
     }
-    unsigned reg = m->wbuf[0] | (m->wbuf[1] << 8);
-    if (m->wn == 2 && reg == 0x0020) { memcpy(m->rbuf, m->desc, 30); m->rn = 30; }
-    else if (m->wn == 2 && reg == 0x0021) { memcpy(m->rbuf, m->rdesc, (size_t)m->rdl); m->rn = m->rdl; }
+    if (m->wn == 2 && reg == 0x0020) { memcpy(m->rbuf, m->desc, 30); m->rn = 30; m->ptr = 0x20; }
+    else if (m->wn == 2 && reg == 0x0021) { memcpy(m->rbuf, m->rdesc, (size_t)m->rdl); m->rn = m->rdl; m->ptr = 0x21; }
     else if (reg == 0x0022 && m->wn >= 4) {
+        m->ptr = 0;
         memcpy(m->last_cmd, m->wbuf, (size_t)m->wn); m->last_cmd_n = m->wn;
         if (m->wbuf[3] == 0x01) m->reset_pending = 1;
         if (m->wbuf[3] == 0x08) m->power = m->wbuf[2] == 0;
@@ -257,7 +263,7 @@ static void test_bus(void) {
     CHECK(!memcmp(rd, ptp_desc, h.rdesc_len));
     CHECK(M.fifo_max_seen <= 7);
 
-    // input polling: nothing, then a report
+    // input polling: nothing, then a report (the last thing addressed was the report descriptor: must still read input)
     uint8_t buf[64];
     CHECK(hidi2c_input(&h, buf, sizeof buf) == 0);
     M.input[0] = 5; M.input[1] = 0; M.input[2] = 4; M.input[3] = 0xAA; M.input[4] = 0xBB; M.inlen = 5;
@@ -371,6 +377,24 @@ static void fuzz_ptp(void) {
     }
 }
 
+// Input Mode feature in a separate "Device Configuration" collection (what the real SYNA3602 descriptor has: mode-feature was 0)
+static void test_mode_separate(void) {
+    static const uint8_t d[] = {
+        0x05,0x0D,0x09,0x05,0xA1,0x01,0x85,0x04,                       // Touch Pad, report id 4
+        0x09,0x22,0xA1,0x02,0x09,0x42,0x15,0x00,0x25,0x01,0x75,0x01,0x95,0x01,0x81,0x02,0x75,0x07,0x95,0x01,0x81,0x03,
+        0x05,0x01,0x09,0x30,0x75,0x10,0x95,0x01,0x15,0x00,0x26,0x80,0x0C,0x81,0x02,0x09,0x31,0x26,0x5C,0x06,0x81,0x02,0xC0,
+        0x05,0x0D,0x09,0x54,0x75,0x08,0x95,0x01,0x81,0x02,0xC0,
+        0x05,0x0D,0x09,0x0E,0xA1,0x01,0x85,0x03,                       // Device Configuration, report id 3
+        0x09,0x22,0xA1,0x02,0x09,0x52,0x15,0x00,0x25,0x0A,0x75,0x08,0x95,0x01,0xB1,0x02,0xC0,0xC0 };
+    struct hid_touch t;
+    int ids = 0;
+    CHECK(hid_parse_touch(d, (int)sizeof d, &t, &ids));
+    CHECK(ids == 1 && t.id == 4 && t.nf == 1);
+    CHECK(t.mode.bits == 8 && t.mode_id == 3 && t.mode_bytes == 1);
+    uint8_t mr[8];
+    CHECK(hid_touch_mode_report(&t, ids, mr, sizeof mr) == 2 && mr[0] == 3 && mr[1] == 3);
+}
+
 // the controller base from the firmware's named fields (bytes of the real laptop's I2C5 device, GNVS region/field synthetic)
 static uint32_t fake_mem[1024];                     // pretend GNVS at 0x7b7dba98
 static int fake_rd(uint32_t phys, uint32_t* v) {
@@ -414,7 +438,7 @@ static void test_bars(void) {
 }
 
 int main(void) {
-    test_ptp_parse(); test_gestures(); test_bus(); test_aml(); test_bars(); fuzz(); fuzz_ptp();
+    test_ptp_parse(); test_gestures(); test_bus(); test_aml(); test_bars(); test_mode_separate(); fuzz(); fuzz_ptp();
     printf(fails ? "TOUCH FAIL (%d)\n" : "TOUCH PASS\n", fails);
     return fails != 0;
 }

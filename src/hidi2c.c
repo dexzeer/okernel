@@ -45,7 +45,10 @@ int hidi2c_input(struct hidi2c* h, uint8_t* buf, int cap) {
     uint8_t in[HIDI2C_MAXREPORT + 2];
     int want = h->max_in;
     if (want > (int)sizeof in) want = (int)sizeof in;
-    int r = h->bus.xfer(h->bus.ctx, h->addr, 0, 0, in, want);
+    // Address the input register explicitly. A plain read returns what the device last addressed: the real SYNA3602 kept
+    // answering with its HID descriptor after the descriptor re-read at the end of the bring-up.
+    uint8_t w[2] = { (uint8_t)h->in_reg, (uint8_t)(h->in_reg >> 8) };
+    int r = h->bus.xfer(h->bus.ctx, h->addr, w, 2, in, want);
     if (r == -2) return 0;                                    // a device with nothing to say may not answer at all
     if (r < 0) return r;
     int len = le16(in);
