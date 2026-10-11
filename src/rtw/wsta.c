@@ -302,7 +302,11 @@ static void install_keys_done(void) {
 }
 
 // ---- state machine ------------------------------------------------------------------------------------------------------------------
+static const char* last_err;
+const char* wsta_last_error(void) { return last_err; }
+
 static void fail(const char* why) {
+    last_err = why;
     LOG("wifi: %s", why);
     if (S.state >= WSTA_AUTH && S.state != WSTA_FAILED) O->link(0, S.bssid, 0);
     S.state = WSTA_FAILED;
@@ -322,6 +326,7 @@ int wsta_connect(const char* ssid, const char* pass) {
     if (open && b->sec != 0) { LOG("wifi: %s needs a pass phrase", ssid); return -2; }
     if (!open && b->sec != 3) { LOG("wifi: %s is not WPA2-Personal with AES (security class %d)", ssid, b->sec); return -3; }
     if (S.state != WSTA_IDLE && S.state != WSTA_FAILED) wsta_disconnect();
+    last_err = 0;
     memset(&S, 0, sizeof S);
     memcpy(S.ssid, ssid, sl); S.ssid_len = (uint8_t)sl;
     S.open = open;
@@ -347,13 +352,13 @@ void wsta_poll(void) {
     uint32_t t = now();
     switch (S.state) {
     case WSTA_AUTH:
-        if (t - S.t_last >= 300) { if (++S.tries > 4) { fail("no answer to the authentication request"); break; } send_auth(); S.t_last = t; }
+        if (t - S.t_last >= 300) { if (++S.tries > 4) { fail("The access point did not answer"); break; } send_auth(); S.t_last = t; }
         break;
     case WSTA_ASSOC:
-        if (t - S.t_last >= 300) { if (++S.tries > 4) { fail("no answer to the association request"); break; } send_assoc(); S.t_last = t; }
+        if (t - S.t_last >= 300) { if (++S.tries > 4) { fail("The access point did not answer"); break; } send_assoc(); S.t_last = t; }
         break;
     case WSTA_HANDSHAKE:
-        if (t - S.t_start > 5000) fail("the key handshake did not finish (wrong pass phrase?)");
+        if (t - S.t_start > 5000) fail("Wrong password, or the key exchange failed");
         break;
     case WSTA_UP:
         if (t - S.last_tx_ms > 20000) {                                         // keep-alive: a null data frame
@@ -448,16 +453,17 @@ void wsta_rx(const uint8_t* f, int len, int rssi, int channel) {
         if (S.state < WSTA_AUTH || S.state == WSTA_FAILED || memcmp(f + 16, S.bssid, 6)) return;
         if (sub == 11 && S.state == WSTA_AUTH && len >= 30) {                  // authentication response
             if (rd16(f + 24) != 0 || rd16(f + 26) != 2) return;
-            if (rd16(f + 28) != 0) { LOG("wifi: authentication refused (status %d)", rd16(f + 28)); fail("authentication refused"); return; }
+            if (rd16(f + 28) != 0) { LOG("wifi: authentication refused (status %d)", rd16(f + 28)); fail("The access point refused the connection"); return; }
             S.state = WSTA_ASSOC; S.tries = 1; S.t_start = now();
             send_assoc(); S.t_last = now();
         } else if ((sub == 1 || sub == 3) && S.state == WSTA_ASSOC && len >= 30) {   // association / reassociation response
-            if (rd16(f + 26) != 0) { LOG("wifi: association refused (status %d)", rd16(f + 26)); fail("association refused"); return; }
+            if (rd16(f + 26) != 0) { LOG("wifi: association refused (status %d)", rd16(f + 26)); fail("The access point refused the connection"); return; }
             S.aid = rd16(f + 28) & 0x3fff;
             O->link(1, S.bssid, S.aid);
             if (S.open) { S.state = WSTA_UP; LOG("wifi: connected to %s (open), aid %d", S.ssid, S.aid); return; }
             S.state = WSTA_HANDSHAKE; S.t_start = now();
         } else if (sub == 12 || sub == 10) {                                   // deauthentication / disassociation
+            last_err = "The access point ended the connection";
             LOG("wifi: the access point ended the connection (reason %d)", len >= 26 ? rd16(f + 24) : 0);
             O->link(0, S.bssid, 0);
             S.state = WSTA_FAILED; S.ptk_installed = 0; S.have_ptk = 0; S.have_gtk = 0;

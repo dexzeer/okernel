@@ -43,5 +43,6 @@ const char* wsta_state_name(void);
 const uint8_t* wsta_bssid(void);
 const char* wsta_ssid(void);
 void wsta_stats(uint32_t* tx, uint32_t* rx, uint32_t* bad);
+const char* wsta_last_error(void);            // why the last attempt failed (NULL = no failure)
 
 #endif

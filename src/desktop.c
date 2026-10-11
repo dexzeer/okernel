@@ -39,6 +39,7 @@
 #include "klog.h"
 #include "devlog.h"
 #include "rtw/rtw.h"
+#include "wifigui.h"
 #include "smp.h"
 #include "prof.h"
 #include "fpu.h"
@@ -1179,6 +1180,10 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, nb);
         serial_puts(nb);
     }
+    else if (str_eq(cmd_buf, "wifigui")) {
+        wifigui_open(args[0] && str_eq(args, "demo"));
+        window_puts(win_id, "Wi-Fi window opened.\n");
+    }
     else if (str_eq(cmd_buf, "wifi")) {
         static char wb[2048];
         if (args[0] && str_eq(args, "log")) { wb[0] = 0; devlog_tail('w', wb, sizeof wb, 0, 24); }
@@ -1285,6 +1290,8 @@ static void on_keypress(char c, int alt) {
             } else return;
         } else return;
     }
+
+    if (win_id >= 0 && win_id == wifigui_win()) { wifigui_key(c); return; }
 
     // Check if this is an editor window
     int ed_id = editor_find_by_win(win_id);
@@ -2145,6 +2152,7 @@ void kernel_main(uint32_t mboot_phys) {
         e1000_poll();
         xhci_poll();      // USB mouse reports and hot-plug (polled; nothing interrupts for it)
         rtw_poll();       // Wi-Fi adapter: received frames, scanning
+        wifigui_poll();   // the Wi-Fi window
         i2chid_poll();    // I2C-HID touchpad reports (polled, 100 Hz)
         klog_poll();      // the log on the boot stick (only when the flash tool marked it)
         net_poll();
@@ -2200,6 +2208,7 @@ void kernel_main(uint32_t mboot_phys) {
             if (wid >= 0) {
                 int br_id = okai_find_by_win(wid);
                 if (br_id >= 0) okai_handle_mouse_scroll(br_id, wheel);
+                else if (wid == wifigui_win()) wifigui_wheel(wheel);
                 else if (find_term_idx(wid) >= 0) window_scroll_view(wid, wheel);
             }
         }
@@ -2268,6 +2277,8 @@ void kernel_main(uint32_t mboot_phys) {
                             }
                         } else if (i == info_win) {
                             close_sysinfo();
+                        } else if (i == wifigui_win()) {
+                            wifigui_close();
                         } else {
                             int ed_id = editor_find_by_win(i);
                             if (ed_id >= 0) {
@@ -2401,6 +2412,9 @@ void kernel_main(uint32_t mboot_phys) {
                         }
                         // Okai page area → pixel hit test (links, form
                         // controls) against the engine's layout.
+                        else if (i == wifigui_win()) {
+                            wifigui_click(mx - (w->x + WIN_BORDER), my - grid_top);
+                        }
                         else {
                             int br_id = okai_find_by_win(i);
                             if (br_id >= 0) okai_content_click(br_id, mx, my);
