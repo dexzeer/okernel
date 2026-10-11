@@ -15,7 +15,7 @@ try:
     started = vm.wait_for("wifi: started", timeout=240)
     time.sleep(2)
     if started:
-        vm.type_string("wifi scan\n"); time.sleep(10)
+        vm.type_string("wifi scan\n"); vm.wait_for("scan finished", timeout=120); time.sleep(2)
         vm.type_string("wifi list\n"); time.sleep(3)
         vm.type_string("wifi connect " + ssid + " " + psk + "\n")
         vm.wait_for("wifi: connected to", timeout=40, fail_pats=["refused", "did not finish", "no answer", "cannot join"])
