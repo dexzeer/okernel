@@ -52,6 +52,9 @@ static struct {
     uint32_t dbar[MAXDEV];             // controller register block of each device, from the AML (0 = unknown)
     uint32_t dbar1[MAXDEV];            // its PCI-config mirror (power state at +0x84)
     int aml_stage;                     // 0 not started, 1 done
+    volatile uint32_t* attn;           // the touchpad's interrupt pad (control register 0; bit 1 = the pin's level, low = data ready)
+    int attn_last;
+    uint32_t attn_low, attn_edges, reports_low;
 } T;
 
 static int cmdline_has(uint32_t mboot, const char* word) {
@@ -372,6 +375,7 @@ static int bring_up_device(void) {
         if (hidi2c_get_desc(h, h->desc_reg) != 0) { tlog("  fast mode failed: back to standard"); dw_setup(&T.dw, 0); }
         else tlog("  bus in fast mode");
     }
+    hidi2c_power(h, 1);                                            // a command write points the device back at its input register
     T.fails = 0;
     tlog("  touchpad running");
     return 1;
@@ -463,6 +467,20 @@ void i2chid_init(uint32_t mboot_phys) {
             tlog("AML: %s registers at %x (len %x), config mirror %x", T.dev[i].ctrl, b.bar0, b.len0, b.bar1);
         } else tlog("AML: no register address found for %s", T.dev[i].ctrl);
     }
+    if (T.ndev) {                                                       // the touchpad's interrupt pin (an INT33FF community: pad register = base + 0x4400 + 0x400 * (pin / 15) + 8 * (pin % 15))
+        uint32_t pin, gb;
+        char src[5];
+        int chv;
+        const struct i2c_hid_dev* d0 = &T.dev[T.order[0]];
+        if (i2caml_gpioint((const uint8_t* const*)tabs, lens, nt, d0->name, &pin, src) && i2caml_mem32((const uint8_t* const*)tabs, lens, nt, src, &gb, &chv)) {
+            tlog("%s interrupt: pin %u of %s (registers %x, %s)", d0->hid, pin, src, gb, chv ? "Cherry Trail pin controller" : "unknown controller type");
+            if (chv && gb >= 0xFEC00000u && gb < 0xFF000000u) {
+                T.attn = (volatile uint32_t*)(gb + 0x4400 + 0x400 * (pin / 15) + 8 * (pin % 15));      // inside the identity-mapped uncached 0xFEC00000 window
+                tlog("  pad %x: control0 %x control1 %x", (uint32_t)T.attn, T.attn[0], T.attn[1]);
+                T.attn_last = (T.attn[0] >> 1) & 1;
+            }
+        } else tlog("%s: no interrupt pin found in the AML", d0->hid);
+    }
     for (int i = 0; i < nt; i++) kfree(tabs[i]);
     if (!T.ndev) return;                                                // nothing to look for: stay out of the way
     for (int i = 0; i < T.ndev; i++) {
@@ -543,7 +561,17 @@ void i2chid_poll(void) {
     if (t == T.last_tick) return;
     T.last_tick = t;
     static uint8_t buf[HIDI2C_MAXREPORT];
+    int lvl = 1;
+    if (T.attn) {                                                  // observe the interrupt line (diagnostics: the read below is not gated by it)
+        lvl = (int)((T.attn[0] >> 1) & 1);
+        if (!lvl) T.attn_low++;
+        if (lvl != T.attn_last) {
+            T.attn_last = lvl;
+            if (++T.attn_edges <= 30) tlog("interrupt line %s", lvl ? "high" : "low");
+        }
+    }
     int n = hidi2c_input(&T.h, buf, sizeof buf);
+    if (n > 0 && !lvl) T.reports_low++;
     uint32_t now = t * 10;
     if (n > 0) {
         T.reports++;
@@ -589,6 +617,9 @@ void i2chid_status(char* buf, int cap) {
     const char* st = T.state == 2 ? (T.paused ? "paused (touchpad on)" : "running") : T.state == 1 ? "searching" : T.state == 3 ? "NOT WORKING" :
                      T.state == 4 ? "controller not located (`touchpad scan` hunts for it)" : T.state == 5 ? "starting (address from the AML)" : "no I2C-HID device in ACPI";
     int at = sfmt(buf, cap, 0, "touchpad: %s, reports %u, empty polls %u, errors %u, unmatched %u", st, T.reports, T.empty, T.errors, T.unmatched);
+    if (T.state == 2)
+        at = sfmt(buf, cap, at, "input reads: %u NACK, %u length 0, %u length ffff, %u not a report; interrupt line low %u polls, %u edges, %u reports while low",
+                  T.h.nack, T.h.zeros, T.h.ones, T.h.stale, T.attn_low, T.attn_edges, T.reports_low);
     if (T.state == 1)
         at = sfmt(buf, cap, at, "hunt: %s at %x, %u pages read, %d controller block(s) found%s", tick_count < SCAN_START_TICK ? "starts soon" : "now", S.w, S.pages, T.nblk,
                   T.paused ? " (paused)" : "");

@@ -45,15 +45,22 @@ int hidi2c_input(struct hidi2c* h, uint8_t* buf, int cap) {
     uint8_t in[HIDI2C_MAXREPORT + 2];
     int want = h->max_in;
     if (want > (int)sizeof in) want = (int)sizeof in;
-    // Address the input register explicitly. A plain read returns what the device last addressed: the real SYNA3602 kept
-    // answering with its HID descriptor after the descriptor re-read at the end of the bring-up.
-    uint8_t w[2] = { (uint8_t)h->in_reg, (uint8_t)(h->in_reg >> 8) };
-    int r = h->bus.xfer(h->bus.ctx, h->addr, w, 2, in, want);
-    if (r == -2) return 0;                                    // a device with nothing to say may not answer at all
+    // A plain read returns what the device last addressed (the real SYNA3602 kept answering with its HID descriptor after a
+    // descriptor read) until a command is written, which points it back at the input register: so anything that is not
+    // a report is answered with SET_POWER(on) and counted. (An explicit write of the input register address was tried and
+    // the device never produced a report that way.)
+    int r = h->bus.xfer(h->bus.ctx, h->addr, 0, 0, in, want);
+    if (r == -2) { h->nack++; return 0; }                     // a device with nothing to say may not answer at all
     if (r < 0) return r;
     int len = le16(in);
-    if (len == 0 || len == 0xFFFF) return 0;
-    if (len < 3 || len > want) { for (int i = 0; i < 16 && i < want; i++) h->bad[i] = in[i]; return -5; }   // garbage
+    if (len == 0) { h->zeros++; return 0; }
+    if (len == 0xFFFF) { h->ones++; return 0; }
+    if (len < 3 || len > want || (len == 30 && le16(in + 2) == 0x0100)) {          // garbage, or the descriptor again
+        for (int i = 0; i < 16 && i < want; i++) h->bad[i] = in[i];
+        h->stale++;
+        hidi2c_power(h, 1);
+        return -5;
+    }
     len -= 2;
     if (len > cap) len = cap;
     for (int i = 0; i < len; i++) buf[i] = in[2 + i];

@@ -119,6 +119,58 @@ static int field_phys(const uint8_t* const* tabs, const uint32_t* lens, int nt, 
     return 0;
 }
 
+// the Device() scope called `nm` in any table: its content range [*from, *to) in table *ti
+static int device_range(const uint8_t* const* tabs, const uint32_t* lens, int nt, const char* nm, int* ti, uint32_t* from, uint32_t* to) {
+    for (int k = 0; k < nt; k++) {
+        const uint8_t* t = tabs[k];
+        uint32_t len = lens[k];
+        for (uint32_t i = 36; i + 12 < len; i++) {
+            if (t[i] != 0x5B || t[i + 1] != 0x82) continue;
+            uint32_t hdr, pl = pkg(t, i + 2, &hdr);
+            uint32_t ns = i + 2 + hdr, end = i + 2 + pl;
+            if (end > len || ns + 4 > end || t[ns] != (uint8_t)nm[0] || t[ns + 1] != (uint8_t)nm[1] || t[ns + 2] != (uint8_t)nm[2] || t[ns + 3] != (uint8_t)nm[3]) continue;
+            *ti = k; *from = ns + 4; *to = end;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int i2caml_gpioint(const uint8_t* const* tabs, const uint32_t* lens, int nt, const char* devname, uint32_t* pin, char src[5]) {
+    int ti; uint32_t from, to;
+    if (!device_range(tabs, lens, nt, devname, &ti, &from, &to)) return 0;
+    const uint8_t* t = tabs[ti];
+    for (uint32_t j = from; j + 20 <= to; j++) {
+        if (t[j] != 0x8C || t[j + 3] != 0x01 || t[j + 4] != 0x00) continue;                  // GpioInt: rev 1, type 0 = interrupt
+        uint32_t dl = (uint32_t)t[j + 1] | ((uint32_t)t[j + 2] << 8);
+        uint32_t po = (uint32_t)t[j + 14] | ((uint32_t)t[j + 15] << 8), so = (uint32_t)t[j + 17] | ((uint32_t)t[j + 18] << 8);
+        if (dl < 18 || j + 3 + dl > to || po + 2 > dl + 3 || so >= dl + 3) continue;
+        *pin = (uint32_t)t[j + po] | ((uint32_t)t[j + po + 1] << 8);
+        uint32_t e = j + so;                                                              // the source path, NUL terminated: keep its last 4 characters
+        uint32_t k = 0;
+        while (e + k < j + 3 + dl && t[e + k]) k++;
+        for (int c = 0; c < 4; c++) src[c] = k >= 4 ? (char)t[e + k - 4 + (uint32_t)c] : '?';
+        src[4] = 0;
+        return 1;
+    }
+    return 0;
+}
+
+int i2caml_mem32(const uint8_t* const* tabs, const uint32_t* lens, int nt, const char* devname, uint32_t* base, int* is_chv) {
+    int ti; uint32_t from, to;
+    if (!device_range(tabs, lens, nt, devname, &ti, &from, &to)) return 0;
+    const uint8_t* t = tabs[ti];
+    *is_chv = 0;
+    for (uint32_t j = from; j + 7 <= to; j++)
+        if (t[j] == 'I' && t[j + 1] == 'N' && t[j + 2] == 'T' && t[j + 3] == '3' && t[j + 4] == '3' && t[j + 5] == 'F' && t[j + 6] == 'F') *is_chv = 1;
+    for (uint32_t j = from; j + 12 <= to; j++) {
+        if (t[j] != 0x86 || t[j + 1] != 0x09 || t[j + 2] != 0x00) continue;               // Memory32Fixed
+        *base = (uint32_t)t[j + 4] | ((uint32_t)t[j + 5] << 8) | ((uint32_t)t[j + 6] << 16) | ((uint32_t)t[j + 7] << 24);
+        return 1;
+    }
+    return 0;
+}
+
 int i2caml_ctrl_bars(const uint8_t* const* tabs, const uint32_t* lens, int nt, const char* ctrl, i2caml_rd rd, struct i2c_ctrl_bars* o) {
     o->ok = 0; o->bar0 = o->bar1 = o->len0 = 0; o->psat_known = 0;
     int cl = 0;
@@ -185,6 +237,8 @@ int i2caml_find(const uint8_t* t, uint32_t len, struct i2c_hid_dev* out, int max
         }
         if (!found) continue;
         if (!d.hid[0]) { for (int k = 0; k < 11 && cid[k]; k++) d.hid[k] = cid[k]; }
+        for (int k = 0; k < 4; k++) d.name[k] = (char)t[nstart + (uint32_t)k];
+        d.name[4] = 0;
         int g = find(t, nstart + 4, end, guid, 16);
         if (g >= 0) {
             uint32_t stop = (uint32_t)g + 16 + 500;
