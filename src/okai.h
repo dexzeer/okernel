@@ -78,6 +78,11 @@ struct okai_tab {
     uint32_t js_next_tick;// next realm pump (tick); 0 = poll wjs_next_due
     int js_scroll_evt;    // a scroll happened: dispatch `scroll` on the next pump
     uint32_t links_hash;  // hash of the last logged link/field regions
+    // A form submitted with method=post: the next main-document request is a POST with this body (urlencoded), cleared by the
+    // next navigation and by a 301/302/303 redirect (browsers turn those into GETs)
+    char* post_body;
+    int post_len;
+    char post_ref[OKAI_URL_LEN];  // page the form was on (Referer / Origin of the POST)
 };
 
 struct okai {
