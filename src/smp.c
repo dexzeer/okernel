@@ -243,6 +243,9 @@ int smp_init(void) {
     cpus[0].apic_id = lapic_id();
     serial_printf("[smp] boot cpu apic id %d (%s)\n", cpus[0].apic_id,
                   lapic_is_x2apic() ? "x2APIC" : "xAPIC");
+    idt_set_vector(LAPIC_VEC_WAKE, isr_ipi_wake);        // also the boot CPU's sleep timer (lapic_timer_oneshot_us)
+    idt_set_vector(LAPIC_VEC_SPUR, isr_spurious);
+    if (lapic_timer_calibrate()) serial_puts("[smp] local APIC timer calibrated (idle wake-ups)\n");
     if (!a->madt || a->ncpu < 2) {
         serial_puts("[smp] one CPU\n");
         return 1;

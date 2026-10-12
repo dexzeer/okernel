@@ -19,6 +19,7 @@ param(
     [string]$AudioWav = "", # record what the guest plays (HD Audio) into this WAV
     [string[]]$Extra = @(),  # more QEMU arguments, e.g. -Extra "-icount","shift=0,sleep=off" (a guest of ~1 GIPS: a weak laptop)
     [int]$Slow = 1           # wait-time multiplier for slow guests (-icount)
+    ,[string]$PreCmd = ""      # typed into the terminal before okai starts, e.g. "cpu slow 6"
     ,[switch]$Prof            # turn the kernel profiler on (`prof on`): [prof] zone lines once a second
 )
 $ErrorActionPreference = "Stop"
@@ -70,6 +71,7 @@ try {
     "boot to heap: {0:N1}s" -f ([DateTime]::Now - $t0).TotalSeconds
     Start-Sleep -Seconds 4
     if ($Prof) { Send-Keys "prof on`n"; Start-Sleep -Seconds 1 }
+    if ($PreCmd) { Send-Keys ($PreCmd + "`n"); Start-Sleep -Seconds 1 }
     Send-Keys "okai`n"
     if (-not (Wait-For "home rendered" (60 * $Slow))) { throw "okai did not open" }
     Start-Sleep -Seconds 2

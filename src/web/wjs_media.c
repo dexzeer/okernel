@@ -238,7 +238,16 @@ int wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout) {
         struct wmedia* s = &js->media[i];
         if (!s->m) continue;
         meng_set_governor(wjs_host.budget_scale >= 2);
+        int t_poll = wjs_now();
         meng_poll(s->m);
+        if (wjs_now() - t_poll >= 20) {                          // a slow pass: say what the session was doing
+            static int nslow;
+            if (nslow++ < 200) {
+                char d[200];
+                meng_describe(s->m, d, sizeof d);
+                w_log("[media] slow poll %dms session %d: %s\n", wjs_now() - t_poll, i, d);
+            }
+        }
         if (s->node < 0 || !js->doc) continue;
         const struct meng_frame* f = meng_get_frame(s->m);
         int vw = 0, vh = 0, dx, dy, dw, dh, fixed;
@@ -264,7 +273,15 @@ int wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout) {
             if (wdoc_video_set(js->doc, s->node, 0, vw, vh)) relayout = 1;
         }
     }
-    { int cn = 0; if (wjs_canvas_poll(js, out + n, max - n, &cn)) relayout = 1; n += cn; }
+    {
+        int cn = 0, t_c = wjs_now();
+        if (wjs_canvas_poll(js, out + n, max - n, &cn)) relayout = 1;
+        n += cn;
+        if (wjs_now() - t_c >= 20) {
+            static int ncs;
+            if (ncs++ < 100) w_log("[canvas] slow poll %dms, %d changed\n", wjs_now() - t_c, cn);
+        }
+    }
     if (nout) *nout = n;
     return relayout;
 }

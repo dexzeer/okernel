@@ -80,6 +80,7 @@ int    meng_sb_buffered(const struct meng* m, int sb, int index, double* start, 
 // Counters for the embedder to turn into events.
 uint32_t meng_frames_decoded(const struct meng* m);
 uint32_t meng_frames_shown(const struct meng* m);
+void meng_describe(const struct meng* m, char* out, int cap);   // one line of state, for logs
 uint32_t meng_frames_dropped(const struct meng* m);
 uint32_t meng_audio_frames(const struct meng* m);       // audio frames handed to the sound card so far
 

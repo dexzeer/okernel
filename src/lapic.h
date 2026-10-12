@@ -38,6 +38,11 @@ void lapic_ipi_startup(uint32_t dest, uint8_t page);   // SIPI: start at page*40
 // Busy wait for `us` microseconds (PIT channel 2, independent of the tick).
 void pit_delay_us(uint32_t us);
 
+// Sub-millisecond one-shot wake-up of the boot CPU (for hlt); lapic_timer_calibrate() once after lapic_init, 0 = unavailable.
+int lapic_timer_calibrate(void);
+void lapic_timer_oneshot_us(uint32_t us);
+int lapic_timer_available(void);
+
 // MSR access.
 static inline uint64_t rdmsr(uint32_t msr) {
     uint32_t lo, hi;

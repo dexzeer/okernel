@@ -135,6 +135,7 @@ struct meng {
     uint32_t v_decoded, v_shown, v_dropped;
     uint32_t v_last_show;               // tick of the last presented frame (a backlog never starves the picture)
     uint32_t v_cool_until;              // no video decoding before this tick: a decoder that cannot keep up gets a third of the CPU, not all of it
+    uint8_t first_tries;                // attempts to show the first frame of a video that has not been started (a stream that never yields one must not be decoded forever)
     uint32_t a_frames_out;
 
     int ready_state;
@@ -974,20 +975,30 @@ static void video_pump(struct meng* m, int64_t now) {
     uint32_t t0 = m->env.ticks();
     if (m->seeking) {
         // decode from the keyframe up to the frame at the seek target; only the last of them is shown
-        int first = 1;
+        int first = 1, n = 0;
+        int need_first = m->vcodec == VC_H264 && !m->have_cur_pic && !m->frame_valid;   // nothing shown yet: the decoder holds pictures back (reorder depth), so go on until one comes out
         for (;;) {
             m->vq.next = vq_live(m, m->vq.next);
             if (m->vq.next >= m->vq.n) break;
             const struct mpkt* pk = &m->vq.pk[m->vq.next];
-            if (!first && vkey(m, pk) > m->seek_target_ns) break;
+            if (!first && vkey(m, pk) > m->seek_target_ns && !(need_first && m->nrq == 0 && n < 24)) break;
             first = 0;
+            n++;
             uint32_t nx = vq_live(m, m->vq.next + 1);
             m->skip_present = nx < m->vq.n && vkey(m, &m->vq.pk[nx]) <= m->seek_target_ns;
             video_decode_one(m);
+            if (need_first && m->nrq > 0) break;                  // the first picture is out: show it
             if (m->env.ticks() - t0 >= VIDEO_BUDGET_TICKS) { m->skip_present = 0; return; }
         }
         m->skip_present = 0;
-        if (m->vcodec == VC_H264) h264_present(m, m->seek_target_ns);
+        if (m->vcodec == VC_H264) {
+            int64_t limit = m->seek_target_ns;
+            if (need_first && m->nrq) {                       // show the earliest picture there is
+                limit = m->rq[0].pts;
+                for (int i = 1; i < m->nrq; i++) if (m->rq[i].pts < limit) limit = m->rq[i].pts;
+            }
+            h264_present(m, limit);
+        }
         m->seeking = 0;
         return;
     }
@@ -1141,7 +1152,8 @@ void meng_poll(struct meng* m) {
         }
     } else if (!m->playing && m->seeking && m->v_present && (m->vd || m->hd)) {
         video_pump(m, m->pos_ns);                        // show the frame at a paused position
-    } else if (!m->playing && !m->frame_valid && m->v_present && (m->vd || m->hd) && m->vq.n && !m->seeking) {
+    } else if (!m->playing && !m->frame_valid && m->v_present && (m->vd || m->hd) && m->vq.n && !m->seeking && m->first_tries < 3) {
+        m->first_tries++;
         video_seek(m, m->pos_ns);                        // first frame of a video that has not been started
     }
 }
@@ -1180,3 +1192,17 @@ void meng_set_output_size(struct meng* m, int w, int h) {
 }
 
 const struct meng_frame* meng_get_frame(const struct meng* m) { return m->frame_valid ? &m->frame : 0; }
+
+// One line of state for logs (stalls, profiling).
+void meng_describe(const struct meng* m, char* out, int cap) {
+    int n = 0;
+    #define PUT(s) do { const char* p_ = (s); while (*p_ && n < cap - 1) out[n++] = *p_++; } while (0)
+    #define NUM(v) do { char t_[12]; unsigned x_ = (unsigned)(v); int k_ = 0; if (!x_) t_[k_++] = '0'; while (x_) { t_[k_++] = (char)('0' + x_ % 10); x_ /= 10; } while (k_ && n < cap - 1) out[n++] = t_[--k_]; } while (0)
+    PUT("playing="); NUM(m->playing); PUT(" seeking="); NUM(m->seeking); PUT(" frame_valid="); NUM(m->frame_valid);
+    PUT(" cur_pic="); NUM(m->have_cur_pic); PUT(" nrq="); NUM(m->nrq); PUT(" vq="); NUM(m->vq.next); PUT("/"); NUM(m->vq.n);
+    PUT(" decoded="); NUM(m->v_decoded); PUT(" shown="); NUM(m->v_shown); PUT(" dropped="); NUM(m->v_dropped);
+    PUT(" tries="); NUM(m->first_tries);
+    out[n] = 0;
+    #undef PUT
+    #undef NUM
+}

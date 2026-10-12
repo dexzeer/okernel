@@ -316,6 +316,11 @@ static void test_mp4_video(const char* mp4, const char* yuvname, long chunk, int
     CHECK(meng_has_video(m) && !meng_has_audio(m), "tracks");
     CHECK(meng_get_frame(m) != 0, "no first frame while paused");
     CHECK(frame_matches(meng_get_frame(m), yuv, W, H) == 0, "first frame differs");
+    {   // a paused video must not keep decoding (the first frame was once re-decoded on every poll)
+        uint32_t d0 = meng_frames_decoded(m);
+        for (int i = 0; i < 300; i++) step(m);
+        CHECK(meng_frames_decoded(m) == d0, "paused video decoded %u more frames", meng_frames_decoded(m) - d0);
+    }
     meng_play(m);
     for (int i = 0; i < 60; i++) step(m);                       // 0.6 s
     CHECK(meng_frames_decoded(m) >= 17, "decoded only %u frames in 0.6 s", meng_frames_decoded(m));

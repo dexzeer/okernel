@@ -46,6 +46,7 @@
 #include "prof.h"
 #include "fpu.h"
 #include "cpufreq.h"
+#include "lapic.h"
 #include "cursor.h"
 #include "simd.h"
 #include "i915.h"
@@ -757,6 +758,7 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  terminal  - open new terminal\n");
         window_puts(win_id, "  exit      - close this terminal\n");
         window_puts(win_id, "  okai   - open web okai\n");
+        window_puts(win_id, "  search    - search the web (search WORDS | engine NAME)\n");
         window_puts(win_id, "  wifigui   - Wi-Fi window (scan, connect)\n");
         window_puts(win_id, "  ls        - list files\n");
         window_puts(win_id, "  save      - force one file to disk\n");
@@ -850,6 +852,35 @@ static void shell_execute(int win_id, const char* input) {
             window_puts(win_id, args);
             window_puts(win_id, "...\n");
             dns_resolve(args);
+        }
+    }
+    else if (str_eq(cmd_buf, "search")) {
+        // "search WORDS" opens a search in okai; "search engine [NAME]" shows / picks the engine. The browser's address
+        // bar does the same with any text that is not an address.
+        if (args[0] == 'e' && args[1] == 'n' && args[2] == 'g' && args[3] == 'i' && args[4] == 'n' && args[5] == 'e' && (args[6] == 0 || args[6] == ' ')) {
+            const char* nm = args + 6;
+            while (*nm == ' ') nm++;
+            if (*nm && !okai_search_engine_set(nm)) window_puts(win_id, "unknown engine\n");
+            window_puts(win_id, "engine:");
+            for (int i = 0; okai_search_engine_name(i); i++) {
+                window_puts(win_id, i == okai_search_engine_current() ? " [" : " ");
+                window_puts(win_id, okai_search_engine_name(i));
+                if (i == okai_search_engine_current()) window_put_char(win_id, ']');
+            }
+            window_put_char(win_id, '\n');
+        } else if (!args[0]) {
+            window_puts(win_id, "search WORDS         search the web in okai\n");
+            window_puts(win_id, "search engine [NAME] show / choose the engine\n");
+        } else {
+            static char surl[OKAI_URL_LEN];
+            okai_search_url(args, surl, sizeof surl);
+            if (okai_window_count() > 0) {
+                okai_new_tab(0, surl);
+                window_set_focus(okai_get(0)->win_id);
+            } else okai_open(surl);
+            window_puts(win_id, "Searching with ");
+            window_puts(win_id, okai_search_engine_name(okai_search_engine_current()));
+            window_put_char(win_id, '\n');
         }
     }
     else if (str_eq(cmd_buf, "okai")) {
@@ -1783,6 +1814,7 @@ void kernel_main(uint32_t mboot_phys) {
     sti();
 
     // Main loop
+    static uint32_t why_composed, why_cursor, why_mouse, why_fetch, why_okai, why_mplay;
     static uint32_t main_loops = 0;
     static uint64_t halted_cyc = 0, busy_t0 = 0;
     while (1) {
@@ -2743,7 +2775,9 @@ void kernel_main(uint32_t mboot_phys) {
             uint32_t sp_k = (uint32_t)(span >> 16), ht_k = (uint32_t)(halted_cyc >> 16);
             if (ht_k > sp_k) ht_k = sp_k;
             unsigned busy = sp_k ? 100 - ht_k * 100 / sp_k : 100;
-            serial_printf("[fps] %u loops=%u busy=%u%%\n", fps, main_loops, busy); // 1Hz, headless perf ground truth
+            serial_printf("[fps] %u loops=%u busy=%u%% awake: composed=%u cursor=%u mouse=%u fetch=%u okai=%u mplay=%u\n", fps, main_loops, busy,
+                          why_composed, why_cursor, why_mouse, why_fetch, why_okai, why_mplay); // 1Hz, headless perf ground truth
+            why_composed = why_cursor = why_mouse = why_fetch = why_okai = why_mplay = 0;
             prof_report();
             main_loops = 0; halted_cyc = 0; busy_t0 = now;
         }
@@ -2772,8 +2806,23 @@ void kernel_main(uint32_t mboot_phys) {
         // this costs no pointer latency. Busy-spinning here hammered the
         // e1000's MMIO so hard that QEMU's timer starved and PIT ticks were
         // lost (the kernel clock ran ~30% slow under TCG).
+        int ow_now = okai_wants_cpu();    // 0 idle, 1 CPU work, 2 waiting for the network, 3 waiting for a timed animation/render
+        {   // why the loop did not sleep (counted per pass, printed with the 1 Hz [fps] line)
+            if (composed) why_composed++;
+            if (cursor_moved) why_cursor++;
+            if (mb || wheel || drag_win >= 0 || resize_win >= 0) why_mouse++;
+            if (fetch_free_slots() != FETCH_MAX) why_fetch++;
+            if (ow_now == 1) why_okai++;
+            if (mplay_wants_cpu()) why_mplay++;
+        }
+        // Waiting for the network only (a fetch in flight, nothing else to run): packets are polled, so sleep in
+        // half-millisecond steps (local APIC timer) instead of spinning; with nothing at all to do, sleep to the next tick.
+        int net_wait = fetch_free_slots() != FETCH_MAX || ow_now == 2;
+        int timed_wait = ow_now == 3;
         if (!composed && !cursor_moved && !mb && !wheel && drag_win < 0 && resize_win < 0 &&
-            fetch_free_slots() == FETCH_MAX && !okai_wants_cpu() && !mplay_wants_cpu()) {
+            ow_now != 1 && !mplay_wants_cpu() && ((!net_wait && !timed_wait) || lapic_timer_available())) {
+            if (net_wait) lapic_timer_oneshot_us(500);
+            else if (timed_wait) lapic_timer_oneshot_us(3000);
             uint64_t h0 = rdtsc_now();
             // A key queued after this iteration's dispatch must not sleep
             // until the next timer tick: check with interrupts off, then
