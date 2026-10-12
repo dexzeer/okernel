@@ -13,6 +13,9 @@
 #define OKAI_URL_LEN 2048
 #define MAX_OKAIS 2            // one browser window (+ spare); tabs live inside
 #define OKAI_MAX_TABS 4        // tabs per browser window
+#define OKAI_MAX_FRAMES 12     // iframe documents per browser window (all tabs); their slots follow the tabs in tabs[]
+#define OKAI_SLOTS (OKAI_MAX_TABS + OKAI_MAX_FRAMES)
+#define OKAI_MAX_FRAME_DEPTH 3  // iframes inside iframes
 #define OKAI_MAX_REDIRECTS 8
 #define OKAI_MAX_CSS_FETCH 24  // external stylesheets fetched per page
 #define OKAI_MAX_IMG_FETCH 32  // images fetched per page (rest stay blank)
@@ -83,13 +86,24 @@ struct okai_tab {
     char* post_body;
     int post_len;
     char post_ref[OKAI_URL_LEN];  // page the form was on (Referer / Origin of the POST)
+    // iframe documents live in slots >= OKAI_MAX_TABS (never shifted by tab closes); the page pipeline treats them like tabs
+    int is_frame, frame_used;
+    int top_tab;          // visible tab whose page this frame belongs to
+    int parent_slot;      // slot of the document holding the <iframe>
+    int parent_node;      // the <iframe> element in it
+    int fw, fh;           // content size in px (the viewport of the frame document)
+    uint32_t* fpx;        // the painted frame (ARGB, published into the parent as the iframe element's image)
+    int fpx_cap;
+    int frame_depth;
+    uint32_t frames_sync_tick;  // next time scripts may trigger a frames_sync of this document
+    char frame_name[64];  // name attribute (target= and window.frames[name])
 };
 
 struct okai {
     int win_id;
     int active_tab;       // index into tabs[]
     int tab_count;        // live tabs (tabs[0..tab_count-1])
-    struct okai_tab tabs[OKAI_MAX_TABS];
+    struct okai_tab tabs[OKAI_SLOTS];     // [0, OKAI_MAX_TABS): browser tabs, the rest: iframe documents
     int addr_bar_focused; // 1 = typing in address bar, 0 = scrolling
     char addr_input[OKAI_URL_LEN];
     int addr_input_len;
