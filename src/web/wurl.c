@@ -58,6 +58,47 @@ static void put_path(struct ob* o, const char* p, int n) {
     }
 }
 
+
+// http(s) URLs as written in pages often carry characters that must not appear in a request line (a space in a query, a
+// raw '"' or '<', non-ASCII bytes): percent-encode them the way browsers do (WHATWG path / query encode sets). Fragments,
+// existing %XX and other schemes are left alone. In place; skipped when the result would not fit.
+static int url_unsafe(unsigned char c, int in_path) {
+    if (c <= 0x20 || c >= 0x7F || c == '"' || c == '<' || c == '>') return 1;
+    return in_path && (c == '`' || c == '{' || c == '}');
+}
+static void encode_unsafe(char* out, int* np, int cap) {
+    int n = *np;
+    if (n < 8 || !(memcmp(out, "http://", 7) == 0 || memcmp(out, "https://", 8) == 0)) return;
+    int extra = 0, in_path = 1;
+    for (int i = 0; i < n; i++) {
+        if (out[i] == '#') break;
+        if (out[i] == '?') in_path = 0;
+        if (url_unsafe((unsigned char)out[i], in_path)) extra += 2;
+    }
+    if (!extra || n + extra >= cap) return;
+    int end = n;                                   // expand backwards: index of the last byte moves to n + extra - 1
+    int hash = n;
+    for (int i = 0; i < n; i++) if (out[i] == '#') { hash = i; break; }
+    int w = n + extra;
+    out[w] = 0;
+    // the fragment is copied unchanged
+    for (int i = n - 1; i >= hash; i--) out[--w] = out[i];
+    // find where the query starts (to apply the right set going backwards, classify by position)
+    int q = hash;
+    for (int i = 0; i < hash; i++) if (out[i] == '?') { q = i; break; }
+    for (int i = hash - 1; i >= 0; i--) {
+        unsigned char c = (unsigned char)out[i];
+        if (url_unsafe(c, i < q)) {
+            static const char hex[] = "0123456789ABCDEF";
+            out[--w] = hex[c & 15];
+            out[--w] = hex[c >> 4];
+            out[--w] = '%';
+        } else out[--w] = (char)c;
+    }
+    (void)end;
+    *np = n + extra;
+}
+
 int wurl_resolve(const char* base, const char* rel, int rlen, char* out, int cap) {
     while (rlen > 0 && w_isspace((unsigned char)rel[0])) { rel++; rlen--; }
     while (rlen > 0 && w_isspace((unsigned char)rel[rlen - 1])) rlen--;
@@ -128,6 +169,7 @@ int wurl_resolve(const char* base, const char* rel, int rlen, char* out, int cap
 done:
     if (o.bad || o.n >= cap) { if (cap > 0) out[0] = 0; return -1; }
     out[o.n] = 0;
+    encode_unsafe(out, &o.n, cap);
     return o.n;
 }
 

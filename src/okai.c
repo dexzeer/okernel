@@ -2317,6 +2317,31 @@ static void focus_next(int id, struct okai_tab* T) {
     }
 }
 
+// The control a click on `node` reaches through a <label> ancestor: the element its `for` names, else the first control inside
+// the label; -1 when node is not inside a label (or the label has no control).
+static int label_control(struct wdom* d, int node) {
+    for (int a = node; a >= 0 && a < d->nn; a = d->n[a].parent) {
+        if (d->n[a].type != WN_ELEM) continue;
+        if (is_tag(d, a, T_a) || is_tag(d, a, T_button) || is_tag(d, a, T_input) || is_tag(d, a, T_select) || is_tag(d, a, T_textarea)) return -1;
+        if (!is_tag(d, a, T_label)) continue;
+        int fl;
+        const char* f = wdom_attr(d, a, A_for, &fl);
+        if (f && fl > 0) {
+            char idbuf[128];
+            if (fl >= (int)sizeof idbuf) return -1;
+            memcpy(idbuf, f, (size_t)fl);
+            idbuf[fl] = 0;
+            int c = wdom_find_id(d, idbuf);
+            if (c >= 0 && (is_tag(d, c, T_input) || is_tag(d, c, T_select) || is_tag(d, c, T_textarea) || is_tag(d, c, T_button))) return c;
+            return -1;
+        }
+        for (int c = d->n[a].first; c >= 0; c = wdom_next(d, c, a))
+            if (d->n[c].type == WN_ELEM && (is_tag(d, c, T_input) || is_tag(d, c, T_select) || is_tag(d, c, T_textarea) || is_tag(d, c, T_button))) return c;
+        return -1;
+    }
+    return -1;
+}
+
 int okai_content_click(int id, int mx, int my) {
     if (id < 0 || id >= MAX_OKAIS) return 0;
     struct okai* b = &okais[id];
@@ -2385,6 +2410,30 @@ int okai_content_click(int id, int mx, int my) {
         }
         okai_navigate(id, hit.href);
         return 1;
+    }
+    if (hit.kind == WDOC_HIT_NONE) {
+        // a click on a <label> (its text, or an image inside it) acts on the control it belongs to
+        int el = hit.node;
+        if (el < 0) {
+            memset(&j, 0, sizeof j);
+            j.op = JOB_ELEM_AT;
+            j.doc = T->doc;
+            j.x = x;
+            j.y = y;
+            run_job(&j);
+            el = j.result;
+        }
+        struct wdom* d = wdoc_dom(T->doc);
+        int ctl = el >= 0 && d ? label_control(d, el) : -1;
+        if (ctl >= 0) {
+            serial_printf("[okai] label click -> control node=%d\n", ctl);
+            js_event(id, T, ctl, "click", x, y, 0, 0);
+            if (T->doc && wdoc_dom(T->doc) == d && T->load_state == 1) {
+                if (is_text_input(d, ctl) || is_tag(d, ctl, T_textarea)) set_focus(id, T, ctl);
+                else activate_control(id, T, ctl);
+            }
+            return 1;
+        }
     }
     if (hit.kind == WDOC_HIT_FIELD) {
         struct wdom* d = wdoc_dom(T->doc);
