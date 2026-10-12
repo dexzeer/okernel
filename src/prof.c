@@ -6,7 +6,8 @@ uint64_t prof_cyc[PZ_COUNT];
 uint32_t prof_cnt[PZ_COUNT];
 
 static const char* const names[PZ_COUNT] = {
-    "keys", "okai", "windows", "taskbar", "flush", "halt", "job", "paint", "scroll", "blit"
+    "keys", "okai", "windows", "taskbar", "flush", "halt", "job", "paint", "scroll", "blit",
+    "net", "fetch", "tls", "rtw", "klog", "xhci", "i2c", "j_load", "j_fetch", "j_js", "j_event", "j_media"
 };
 
 void prof_report(void) {

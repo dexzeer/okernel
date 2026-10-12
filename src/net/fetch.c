@@ -26,6 +26,7 @@ extern uint32_t tick_count;   // 100 Hz
 #define RESP_MAX       (8 * 1024 * 1024)
 #define RESP_HEADROOM  (TLS_RECORD_MAX_PAYLOAD + 64)
 #define IDLE_TICKS     3000       // keep-alive: close after 30s unused
+#include "../prof.h"
 #define CONNECT_TICKS  1500       // DNS + TCP connect bound (15s)
 #define STALL_TICKS    2500       // nothing received for 25s -> fail
 #define STEP_TICKS     3          // TLS work per connection per poll (~30ms)
@@ -295,7 +296,9 @@ static void conn_run(struct fconn* c) {
             uint32_t before = c->tls->out_len;
             uint32_t req_before = c->tls->req_off;
             tls_bind_out(c, s);
+            PROF_BEGIN(PZ_TLS);
             int r = tls_state_step(c->tls, &c->io);
+            PROF_END(PZ_TLS);
             if (c->tls->req_off != req_before) c->t_progress = tick_count;      // a big request is going out
             s->resp_len = c->tls->out_len;
             if (r == TLS_STEP_ERR) {

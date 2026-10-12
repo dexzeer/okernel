@@ -21,6 +21,7 @@
 #define PREROLL_PACKETS 6               // decoded and thrown away before a seek target
 #define VIDEO_LEAD_NS 20000000LL        // decode a frame this long before it is due
 #define VIDEO_BUDGET_TICKS 3            // ~30 ms of video work per poll
+#define LATE_JUMP_NS 1000000000LL       // a video this far behind its clock skips ahead to the newest due key frame
 #define GAP_NS 250000000LL              // a hole longer than this ends a buffered range
 #define SHOW_AT_LEAST_TICKS 15            // while decoding falls behind, still present a frame every 150 ms
 #define FIRST_FRAME_SLACK_NS 150000000LL   // a stream whose first picture is this late still shows it at position 0
@@ -133,6 +134,7 @@ struct meng {
     int have_last_img;
     uint32_t v_decoded, v_shown, v_dropped;
     uint32_t v_last_show;               // tick of the last presented frame (a backlog never starves the picture)
+    uint32_t v_cool_until;              // no video decoding before this tick: a decoder that cannot keep up gets a third of the CPU, not all of it
     uint32_t a_frames_out;
 
     int ready_state;
@@ -928,6 +930,9 @@ static void h264_present(struct meng* m, int64_t limit) {
     m->v_last_show = m->env.ticks();
 }
 
+static int governor;                            // see meng_set_governor
+void meng_set_governor(int on) { governor = on; }
+
 static inline int64_t vkey(const struct meng* m, const struct mpkt* p) { return m->vcodec == VC_H264 ? p->dts_ns : p->pts_ns; }
 
 static void on_image(void* u, const struct vp9_image* img) {
@@ -986,6 +991,22 @@ static void video_pump(struct meng* m, int64_t now) {
         m->seeking = 0;
         return;
     }
+    if (governor && (int32_t)(t0 - m->v_cool_until) < 0) {                              // cooling down after a long pass: only show what is decoded
+        if (m->vcodec == VC_H264) h264_present(m, clock_now(m) + VIDEO_LEAD_NS);
+        return;
+    }
+    m->vq.next = vq_live(m, m->vq.next);
+    if (governor && m->vq.next < m->vq.n && vkey(m, &m->vq.pk[m->vq.next]) + LATE_JUMP_NS < now) {
+        // more than a second behind: decoding every frame in between only falls further behind. Continue from the
+        // newest key frame that is already due (the decoder restarts there; the pictures between are dropped)
+        uint32_t k = pq_find_key(&m->vq, now);
+        if (k < m->vq.n && k > m->vq.next) {
+            m->v_dropped += k - m->vq.next;
+            m->vq.next = k;
+            if (m->hd) rq_clear(m);
+        }
+    }
+    int busy = 0;
     while (m->vq.next < m->vq.n) {
         m->vq.next = vq_live(m, m->vq.next);
         if (m->vq.next >= m->vq.n) break;
@@ -995,9 +1016,10 @@ static void video_pump(struct meng* m, int64_t now) {
         m->skip_present = nx < m->vq.n && vkey(m, &m->vq.pk[nx]) <= now + VIDEO_LEAD_NS;
         if (m->skip_present && m->env.ticks() - m->v_last_show >= SHOW_AT_LEAST_TICKS) m->skip_present = 0;
         video_decode_one(m);
-        if (m->env.ticks() - t0 >= VIDEO_BUDGET_TICKS) break;
+        if (m->env.ticks() - t0 >= VIDEO_BUDGET_TICKS) { busy = 1; break; }
         now = clock_now(m);
     }
+    if (busy && governor) m->v_cool_until = m->env.ticks() + 2 * (m->env.ticks() - t0 + 1);   // behind: the rest of the machine gets two thirds
     m->skip_present = 0;
     if (m->vcodec == VC_H264) h264_present(m, clock_now(m) + VIDEO_LEAD_NS);
 }

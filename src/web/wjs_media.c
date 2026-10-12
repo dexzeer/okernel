@@ -237,6 +237,7 @@ int wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout) {
     for (int i = 0; i < WM_MAX; i++) {
         struct wmedia* s = &js->media[i];
         if (!s->m) continue;
+        meng_set_governor(wjs_host.budget_scale >= 2);
         meng_poll(s->m);
         if (s->node < 0 || !js->doc) continue;
         const struct meng_frame* f = meng_get_frame(s->m);

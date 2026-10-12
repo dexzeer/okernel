@@ -9,6 +9,8 @@
 enum {
     PZ_KEYS, PZ_OKAI, PZ_WINDOWS, PZ_TASKBAR, PZ_FLUSH, PZ_HALT,
     PZ_JOB, PZ_PAINT, PZ_SCROLL, PZ_BLIT,
+    PZ_NET, PZ_FETCH, PZ_TLS, PZ_RTW, PZ_KLOG, PZ_XHCI, PZ_I2C,      // device polls; TLS runs inside FETCH
+    PZ_JLOAD, PZ_JFETCH, PZ_JJS, PZ_JEVENT, PZ_JMEDIA,               // engine jobs by kind (inside JOB)
     PZ_COUNT
 };
 

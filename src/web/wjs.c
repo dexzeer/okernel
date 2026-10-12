@@ -28,8 +28,9 @@ extern const char wjs_prelude_src[];
 extern const uint32_t wjs_prelude_len;
 void wjs_selq_forget(struct wdom* d);
 
-#define SCRIPT_BUDGET_MS 4000   // one script evaluation (the whole OS waits: keep it short)
-#define TASK_BUDGET_MS   3000   // one timer / event / callback / promise job (killing a half-run job corrupts a framework's state: only a runaway loop should hit this)
+#define BUDGET_SCALE     (wjs_host.budget_scale > 1 ? wjs_host.budget_scale : 1)
+#define SCRIPT_BUDGET_MS (4000 * BUDGET_SCALE)   // one script evaluation (the whole OS waits: keep it short)
+#define TASK_BUDGET_MS   (3000 * BUDGET_SCALE)   // one timer / event / callback / promise job (killing a half-run job corrupts a framework's state: only a runaway loop should hit this)
 #define REALM_STACK_MAX  (900u << 10)
 #define MAX_SCRIPTS      256
 #define MAX_MODULES      512
@@ -145,7 +146,12 @@ static int interrupt_cb(ojs* J, void* op) {
     if (nobudget < 0) nobudget = getenv("OJS_NOBUDGET") != 0;
     if (nobudget) return 0;
 #endif
-    if (js->deadline && wjs_now() > js->deadline) { js->interrupted = 1; return 1; }
+    int now = wjs_now();
+    if (js->deadline && now > js->deadline) { js->interrupted = 1; return 1; }
+    if (wjs_host.yield) {
+        static int last_yield;
+        if (now - last_yield >= 20 || now < last_yield) { last_yield = now; wjs_host.yield(); }
+    }
     return 0;
 }
 
@@ -153,7 +159,7 @@ static void flush_rejections(struct wjs* js);
 // Every promise job gets its own time budget (a framework's initial render is thousands of chained jobs: one
 // budget for the whole checkpoint killed the page's state half-way). A checkpoint that runs longer than
 // DRAIN_BUDGET_MS yields to the shell with jobs still queued; wjs_next_due() reports "now" until they are done.
-#define DRAIN_BUDGET_MS 3000
+#define DRAIN_BUDGET_MS (3000 * BUDGET_SCALE)
 void wjs_drain_jobs(struct wjs* js) {
     int armed = js->deadline != 0;
     int start = wjs_now();
@@ -289,6 +295,10 @@ NATIVE(n_now) {
     struct wjs* js = JSX(ctx);
     return ojs_int(wjs_now() - js->t0);
 }
+NATIVE(n_slow) {                // how many times slower than a fast desktop the CPU is (1 = fast; media autoplay policy)
+    (void)this_val; (void)argc; (void)argv; (void)ctx;
+    return ojs_int(BUDGET_SCALE);
+}
 NATIVE(n_resolve) {
     (void)this_val;
     struct wjs* js = JSX(ctx);
@@ -423,6 +433,7 @@ NATIVE(n_utf8dec) {
 static const struct ojs_func_entry env_funcs[] = {
     { "log", n_log, 2 },
     { "now", n_now, 0 },
+    { "slow", n_slow, 0 },
     { "resolve", n_resolve, 2 },
     { "docURL", n_doc_url, 0 },
     { "baseURL", n_base_url, 0 },

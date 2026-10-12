@@ -6,6 +6,11 @@
 // Initialize serial port (COM1)
 void serial_init(void);
 
+// Copy of everything written (the last SERIAL_RING bytes; serial_total counts all of it), for the stick log (klog.c).
+#define SERIAL_RING 131072
+extern char serial_ring[SERIAL_RING];
+extern volatile uint32_t serial_total;
+
 // Write a character to serial port
 void serial_putchar(char c);
 

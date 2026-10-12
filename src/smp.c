@@ -1,6 +1,7 @@
 #include "smp.h"
 #include "lapic.h"
 #include "fpu.h"
+#include "cpufreq.h"
 #include "gdt.h"
 #include "idt.h"
 #include "io.h"
@@ -169,6 +170,7 @@ void smp_ap_entry(void) {
     idt_load_ap();
     pat_init();                         // same page attribute table as the boot CPU
     fpu_init_cpu();                     // x87 + SSE as on the boot CPU
+    cpufreq_init_ap();                  // same clock request as the boot CPU
     lapic_init(0);
     int idx = start_idx;
     cpus[idx].apic_id = lapic_id();

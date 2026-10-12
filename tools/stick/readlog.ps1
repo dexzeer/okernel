@@ -40,6 +40,25 @@ $odd = Text-At 257 256
 [IO.File]::WriteAllText((Join-Path $Out 'log_even_boots.txt'), $even)
 [IO.File]::WriteAllText((Join-Path $Out 'log_odd_boots.txt'), $odd)
 [IO.File]::WriteAllText((Join-Path $Out 'status.txt'), (Text-At 513 64))
+# the serial output of the last two boots: a 128 KB ring each (src/klog.h), oldest byte at total % 128 KB
+foreach ($par in 0, 1) {
+    $total = [BitConverter]::ToUInt32($r, 220 + 4 * $par)
+    $bootId = [BitConverter]::ToUInt32($r, 228 + 4 * $par)
+    if ($total -eq 0) { continue }
+    $ring = 131072
+    $base = (3584 + 256 * $par) * 512
+    $take = [Math]::Min($total, $ring)
+    $b = New-Object byte[] $take
+    if ($total -le $ring) { [Array]::Copy($r, $base, $b, 0, $take) }
+    else {
+        $head = $total % $ring
+        [Array]::Copy($r, $base + $head, $b, 0, $ring - $head)
+        [Array]::Copy($r, $base, $b, $ring - $head, $head)
+    }
+    $name = if ($par -eq 0) { 'serial_even_boots.txt' } else { 'serial_odd_boots.txt' }
+    [IO.File]::WriteAllBytes((Join-Path $Out $name), $b)
+    Write-Host "$name : boot $bootId, $total bytes written, last $take kept"
+}
 $tabs = Join-Path $Out 'tables'
 New-Item -ItemType Directory -Force -Path $tabs | Out-Null
 for ($i = 0; $i -lt $ntab -and $i -lt 16; $i++) {
