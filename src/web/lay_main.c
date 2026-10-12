@@ -245,9 +245,9 @@ static void replaced_size(struct wlayout* L, int bi, int32_t cbw, int32_t* cw, i
     int32_t iw = 0, ih = 0;    // intrinsic LU
     int32_t ratio = 0;          // w/h * 1000
     switch (b->rk) {
-    case RK_IMG: case RK_VIDEO: case RK_CANVAS: case RK_OBJECT: case RK_SVG: {
+    case RK_IMG: case RK_VIDEO: case RK_CANVAS: case RK_IFRAME: case RK_OBJECT: case RK_SVG: {
         if (b->iw > 0 && b->ih > 0) { iw = PX(b->iw); ih = PX(b->ih); ratio = w_muldiv(b->iw, 1000, b->ih); }
-        if (b->rk == RK_VIDEO || b->rk == RK_CANVAS || b->rk == RK_OBJECT) {
+        if (b->rk == RK_VIDEO || b->rk == RK_CANVAS || b->rk == RK_IFRAME || b->rk == RK_OBJECT) {
             if (!iw) { iw = PX(300); ih = PX(150); ratio = 2000; }
         }
         if (b->rk == RK_SVG && !iw) {
@@ -277,7 +277,6 @@ static void replaced_size(struct wlayout* L, int bi, int32_t cbw, int32_t* cw, i
         }
         break;
     }
-    case RK_IFRAME: iw = PX(300); ih = PX(150); break;
     case RK_INPUT_TEXT: {
         int sl, size = 20;
         const char* sz = b->node >= 0 ? wdom_attr(L->d, b->node, A_size, &sl) : 0;
@@ -957,13 +956,13 @@ struct wlayout* wlay_run(struct wdom* d, struct wstyleset* ss, int vw, int vh,
     // replaced: intrinsic image sizes
     for (int i = 0; i < L->nb; i++) {
         struct lbox* b = &L->b[i];
-        if (b->kind == LB_REPLACED && (b->rk == RK_IMG || b->rk == RK_VIDEO || b->rk == RK_CANVAS) && imgs && imgs->for_node) {
+        if (b->kind == LB_REPLACED && (b->rk == RK_IMG || b->rk == RK_VIDEO || b->rk == RK_CANVAS || b->rk == RK_IFRAME) && imgs && imgs->for_node) {
             int w = 0, h = 0;
             b->img = imgs->for_node(imgs->ctx, b->node, &w, &h);
             b->iw = w;
             b->ih = h;
         }
-        if (b->kind == LB_REPLACED && b->rk == RK_CANVAS && b->img < 0 && b->node >= 0) {
+        if (b->kind == LB_REPLACED && (b->rk == RK_CANVAS || b->rk == RK_IFRAME) && b->img < 0 && b->node >= 0) {
             // a canvas nobody has drawn on: the width / height attributes (default 300 x 150)
             int vl, w = 300, h = 150;
             const char* v = wdom_attr(L->d, b->node, A_width, &vl);

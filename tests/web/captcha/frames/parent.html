@@ -1,0 +1,12 @@
+<!doctype html>
+<html><head><title>frames parent</title>
+<style>body{font-family:sans-serif;margin:16px;background:#eef}
+iframe{border:1px solid #888;background:#fff}
+#f2{width:60%;height:140px;display:block;margin-top:12px}</style></head>
+<body>
+<h1>Parent page</h1>
+<p>Before the first frame.</p>
+<iframe id="f1" name="one" src="child.html?n=1" width="320" height="160"></iframe>
+<iframe id="f2" src="child.html?n=2"></iframe>
+<p id="after">After the frames.</p>
+</body></html>

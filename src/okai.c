@@ -78,6 +78,9 @@ static void okai_tab_reset(struct okai_tab* T);
 static void load_home(int id, int tab);
 static void show_error(int id, int tab);
 static void request_render(struct okai_tab* T, int delay);
+static void frames_drop_children(int bi, int slot);
+static void frames_sync(int bi, int slot);
+static void frames_check_sizes(int bi, int slot);
 
 // ---- small string helpers -----------------------------------------------------
 
@@ -567,19 +570,19 @@ static void req_cancel_tab(int bi, int tab) {
     for (int i = 0; i < FETCH_MAX; i++)
         if (reqs[i].used && reqs[i].bi == bi && reqs[i].tab == tab) req_free(&reqs[i]);
     struct okai* b = (bi >= 0 && bi < MAX_OKAIS) ? &okais[bi] : 0;
-    if (b && tab >= 0 && tab < OKAI_MAX_TABS) b->tabs[tab].sub_inflight = 0;
+    if (b && tab >= 0 && tab < OKAI_SLOTS) b->tabs[tab].sub_inflight = 0;
 }
 
 // A tab left the array: drop its requests, renumber the tabs after it.
 static void req_tab_removed(int bi, int tab) {
     req_cancel_tab(bi, tab);
     for (int i = 0; i < FETCH_MAX; i++)
-        if (reqs[i].used && reqs[i].bi == bi && reqs[i].tab > tab) reqs[i].tab--;
+        if (reqs[i].used && reqs[i].bi == bi && reqs[i].tab < OKAI_MAX_TABS && reqs[i].tab > tab) reqs[i].tab--;   // frame slots do not shift
 }
 
 // A window left the array (windows compact): same for window ids.
 static void req_window_removed(int bi) {
-    for (int t = 0; t < OKAI_MAX_TABS; t++) req_cancel_tab(bi, t);
+    for (int t = 0; t < OKAI_SLOTS; t++) req_cancel_tab(bi, t);
     for (int i = 0; i < FETCH_MAX; i++)
         if (reqs[i].used && reqs[i].bi > bi) reqs[i].bi--;
 }
@@ -758,8 +761,12 @@ void okai_init(void) {
         okais[i].show_security = 0;
         okais[i].page_px = 0;
         okais[i].page_w = okais[i].page_h = okais[i].page_cap = 0;
-        for (int t = 0; t < OKAI_MAX_TABS; t++) {
+        for (int t = 0; t < OKAI_SLOTS; t++) {
             okais[i].tabs[t].doc = 0;
+            okais[i].tabs[t].fpx = 0;
+            okais[i].tabs[t].fpx_cap = 0;
+            okais[i].tabs[t].frame_used = 0;
+            okais[i].tabs[t].is_frame = t >= OKAI_MAX_TABS;
             okai_tab_reset(&okais[i].tabs[t]);
             okais[i].tabs[t].anim_w = 0;
             okais[i].tabs[t].closing = 0;
@@ -819,6 +826,7 @@ static void okai_tab_reset(struct okai_tab* T) {
 // A tab leaves the array (close animation finished / window closed).
 static void tab_dispose(int id, int tab) {
     struct okai_tab* T = &okais[id].tabs[tab];
+    frames_drop_children(id, tab);
     if (T->doc) { doc_free(T->doc); T->doc = 0; }
     tab_post_clear(T);
     req_tab_removed(id, tab);
@@ -939,6 +947,7 @@ static int html_put(char* out, int at, int cap, const char* s) {
 // scripts: run page JavaScript (internal and error pages never do)
 static void tab_load_html(int id, int tab, const char* html, int len, const char* charset, int scripts) {
     struct okai_tab* T = &okais[id].tabs[tab];
+    frames_drop_children(id, tab);                    // the frames of the document being replaced
     if (!T->doc) T->doc = wdoc_new();
     if (!T->doc) { serial_puts("[okai] out of memory (wdoc_new)\n"); return; }
     wdoc_set_scripting(T->doc, scripts);
@@ -1158,6 +1167,7 @@ void okai_render_content(int id) {
     b->chrome_dirty = 1;
     int first = !T->first_paint;
     T->first_paint = 1;
+    frames_check_sizes(id, b->active_tab);
     if (first) {
         serial_printf("[okai] render tab=%d %dx%d doc_h=%d scroll=%d in %dms (page origin %d,%d) stack=%dKB\n",
                       b->active_tab, pw, ph, T->content_height, T->scroll_y,
@@ -1248,6 +1258,248 @@ static void scroll_to(int id, int ny) {
 // Start the main-document fetch for tab `tab`. Returns 0 if a request is in
 // flight, 1 if the page was produced locally (home/error), -1 if refused,
 // 2 if the fetch engine is full (try again on a later poll).
+static int is_tag(struct wdom* d, int n, int tag);
+// ---- iframes -------------------------------------------------------------------------------------------------------
+// An <iframe> is a document of its own: a slot of tabs[] at index >= OKAI_MAX_TABS (never shifted when tabs close) that goes
+// through the same pipeline as a tab (fetch, sub-resources, scripts, render) but paints into a bitmap of its own, which the
+// parent document shows as the image of the <iframe> element (wdoc_video_set: the element is laid out like a canvas, so CSS
+// sizes it and the parent paints it like any replaced box). The viewport of the frame document is the box the parent
+// laid out for the element. Input is routed by rectangle (frame_at / frame_click).
+
+static int slot_is_frame(int slot) { return slot >= OKAI_MAX_TABS; }
+
+static int slot_valid(struct okai* b, int slot) {
+    return slot < OKAI_MAX_TABS ? slot < b->tab_count : b->tabs[slot].frame_used;
+}
+
+// Is the page this slot belongs to the one on screen?
+static int slot_is_active(struct okai* b, int slot) {
+    return (slot_is_frame(slot) ? b->tabs[slot].top_tab : slot) == b->active_tab;
+}
+
+static int slot_of(struct okai* b, const struct okai_tab* T) { return (int)(T - b->tabs); }
+
+// URL of the top-level page a request of this slot is made on behalf of (cookie SameSite context); NULL for a top-level
+// navigation of a tab.
+static const char* top_url_for(int bi, int slot, int sub) {
+    struct okai_tab* T = &okais[bi].tabs[slot];
+    if (T->is_frame) return okais[bi].tabs[T->top_tab].url;
+    return sub ? T->url : 0;
+}
+
+static void frame_free(int bi, int slot);
+
+// Every frame whose parent document is `slot` goes away (the document is being replaced or closed).
+static void frames_drop_children(int bi, int slot) {
+    struct okai* b = &okais[bi];
+    for (int s = OKAI_MAX_TABS; s < OKAI_SLOTS; s++)
+        if (b->tabs[s].frame_used && b->tabs[s].parent_slot == slot) frame_free(bi, s);
+}
+
+static void frame_free(int bi, int slot) {
+    struct okai* b = &okais[bi];
+    struct okai_tab* F = &b->tabs[slot];
+    if (!F->frame_used) return;
+    frames_drop_children(bi, slot);
+    req_cancel_tab(bi, slot);
+    if (F->doc) { doc_free(F->doc); F->doc = 0; }
+    tab_post_clear(F);
+    if (F->fpx) { kfree(F->fpx); F->fpx = 0; F->fpx_cap = 0; }
+    F->frame_used = 0;
+    F->render_pending = 0;
+    F->load_state = 0;
+}
+
+// An <iframe> node counts when it is attached to the document (JS may keep detached ones around).
+static int node_attached(struct wdom* d, int n) {
+    for (int guard = 0; n >= 0 && n < d->nn && guard < 4096; guard++) {
+        if (n == d->root) return 1;
+        n = d->n[n].parent;
+    }
+    return 0;
+}
+
+static int attr_px(struct wdom* d, int n, int atom, int dflt) {
+    int l;
+    const char* v = wdom_attr(d, n, atom, &l);
+    if (!v || l <= 0) return dflt;
+    int k = 0, val = 0;
+    while (k < l && v[k] >= '0' && v[k] <= '9' && val < 100000) val = val * 10 + (v[k++] - '0');
+    if (!k || (k < l && v[k] == '%')) return dflt;
+    return val;
+}
+
+// The document of `slot` has (new) <iframe> elements, lost some, or changed a src: bring the frame slots in line.
+static void frames_sync(int bi, int slot) {
+    struct okai* b = &okais[bi];
+    struct okai_tab* P = &b->tabs[slot];
+    if (!P->doc || (slot_is_frame(slot) && !P->frame_used)) return;
+    struct wdom* d = wdoc_dom(P->doc);
+    if (!d) return;
+    int depth = slot_is_frame(slot) ? P->frame_depth + 1 : 1;
+    int top = slot_is_frame(slot) ? P->top_tab : slot;
+    int keep[OKAI_SLOTS];
+    memset(keep, 0, sizeof keep);
+    int made = 0;
+    for (int n = 0; n < d->nn; n++) {
+        if (d->n[n].type != WN_ELEM || !is_tag(d, n, T_iframe) || !node_attached(d, n)) continue;
+        static char url[OKAI_URL_LEN];
+        url[0] = 0;
+        int sl;
+        const char* src = wdom_attr(d, n, A_src, &sl);
+        int usable = 0;
+        if (src && sl > 0 && wurl_resolve(P->url, src, sl, url, sizeof url) > 0 && url_is_http(url)) usable = 1;
+        int found = -1;
+        for (int s = OKAI_MAX_TABS; s < OKAI_SLOTS; s++)
+            if (b->tabs[s].frame_used && b->tabs[s].parent_slot == slot && b->tabs[s].parent_node == n) { found = s; break; }
+        if (found >= 0) {
+            keep[found] = 1;
+            struct okai_tab* F = &b->tabs[found];
+            if (usable && strcmp(F->url, url)) {
+                // src changed: load the new document into the same frame (the old picture stays until it arrives)
+                req_cancel_tab(bi, found);
+                frames_drop_children(bi, found);
+                scopy(F->url, url, OKAI_URL_LEN);
+                tab_reset_load(F);
+                serial_printf("[okai] frame %d: src -> %s\n", found, url);
+            }
+            continue;
+        }
+        if (!usable || depth > OKAI_MAX_FRAME_DEPTH) continue;
+        int s = -1;
+        for (int k = OKAI_MAX_TABS; k < OKAI_SLOTS; k++) if (!b->tabs[k].frame_used) { s = k; break; }
+        if (s < 0) { serial_puts("[okai] no free frame slot\n"); break; }
+        struct okai_tab* F = &b->tabs[s];
+        okai_tab_reset(F);
+        F->is_frame = 1;
+        F->frame_used = 1;
+        F->top_tab = top;
+        F->parent_slot = slot;
+        F->parent_node = n;
+        F->frame_depth = depth;
+        F->fw = attr_px(d, n, A_width, 300);
+        F->fh = attr_px(d, n, A_height, 150);
+        if (F->fw < 1) F->fw = 1;
+        if (F->fh < 1) F->fh = 1;
+        F->frame_name[0] = 0;
+        { int nl; const char* nm = wdom_attr(d, n, A_name, &nl); if (nm && nl > 0 && nl < (int)sizeof F->frame_name) { memcpy(F->frame_name, nm, (size_t)nl); F->frame_name[nl] = 0; } }
+        scopy(F->url, url, OKAI_URL_LEN);
+        F->is_https = url_is_https(F->url);
+        keep[s] = 1;
+        made++;
+        serial_printf("[okai] frame %d: %s (in slot %d, node %d, %dx%d)\n", s, F->url, slot, n, F->fw, F->fh);
+    }
+    for (int s = OKAI_MAX_TABS; s < OKAI_SLOTS; s++)
+        if (b->tabs[s].frame_used && b->tabs[s].parent_slot == slot && !keep[s]) {
+            serial_printf("[okai] frame %d removed\n", s);
+            frame_free(bi, s);
+        }
+    (void)made;
+}
+
+// Repaint a rectangle of the page surface (page px, scroll already applied) from the document of tab `ti` of window `bi`.
+static void page_region_repaint(int bi, int ti, int x0, int y0, int x1, int y1) {
+    struct okai* b = &okais[bi];
+    struct okai_tab* T = &b->tabs[ti];
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > b->page_w) x1 = b->page_w;
+    if (y1 > b->page_h) y1 = b->page_h;
+    if (x0 >= x1 || y0 >= y1 || !b->page_px) return;
+    struct wsurf s;
+    surf_of(b, &s);
+    s.cx0 = x0; s.cx1 = x1; s.cy0 = y0; s.cy1 = y1;
+    struct job p;
+    memset(&p, 0, sizeof p);
+    p.op = JOB_PAINT;
+    p.doc = T->doc;
+    p.surf = &s;
+    p.scroll = T->scroll_y;
+    run_job(&p);
+    window_dirty_pixels(b->win_id, x0, y0, x1 - x0, y1 - y0);
+}
+
+// Paint the frame document into its bitmap and show it in the parent.
+static void frame_render(int bi, int slot) {
+    struct okai* b = &okais[bi];
+    struct okai_tab* F = &b->tabs[slot];
+    F->render_pending = 0;
+    if (!F->frame_used || !F->doc || F->load_state != 1) return;
+    struct okai_tab* P = &b->tabs[F->parent_slot];
+    if (!P->doc) return;
+    // size: the box the parent laid out for the element (CSS decides); the attributes are the first guess
+    int w = F->fw, h = F->fh, dx, dy, dw, dh, fixed;
+    if (F->first_paint && wdoc_video_dest(P->doc, F->parent_node, &dx, &dy, &dw, &dh, &fixed) && dw > 0 && dh > 0) { w = dw; h = dh; }
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    if (w > 4096) w = 4096;
+    if (h > 4096) h = 4096;
+    if ((int64_t)w * h > (6 << 20)) h = (6 << 20) / w;
+    if (w * h > F->fpx_cap) {
+        if (F->fpx) kfree(F->fpx);
+        F->fpx = (uint32_t*)kmalloc((uint32_t)w * (uint32_t)h * 4);
+        F->fpx_cap = F->fpx ? w * h : 0;
+        if (!F->fpx) { serial_printf("[okai] frame bitmap alloc failed (%dx%d)\n", w, h); return; }
+    }
+    for (int i = 0; i < w * h; i++) F->fpx[i] = 0xFFFFFFFFu;
+    struct wsurf s;
+    s.px = F->fpx;
+    s.w = w;
+    s.h = h;
+    s.stride = w;
+    ws_reset_clip(&s);
+    struct job j;
+    memset(&j, 0, sizeof j);
+    j.op = JOB_PAINT;
+    j.doc = F->doc;
+    j.surf = &s;
+    j.scroll = F->scroll_y;
+    j.vw = w;
+    j.vh = h;
+    run_job(&j);
+    F->content_height = j.result;
+    F->scroll_y = j.scroll;
+    F->has_fixed = j.h;
+    F->fw = w;
+    F->fh = h;
+    int first = !F->first_paint;
+    F->first_paint = 1;
+    F->last_render_tick = tick_count;
+    // show it: the parent learns the size (layout) or just repaints the box
+    int changed = wdoc_video_set(P->doc, F->parent_node, F->fpx, w, h);
+    if (first) serial_printf("[okai] frame %d rendered %dx%d doc_h=%d\n", slot, w, h, F->content_height);
+    if (changed) { request_render(P, 0); return; }
+    int pslot = F->parent_slot;
+    if (!slot_is_frame(pslot) && pslot == b->active_tab && P->first_paint && !P->render_pending &&
+        wdoc_video_dest(P->doc, F->parent_node, &dx, &dy, &dw, &dh, &fixed) && dw > 0 && dh > 0) {
+        int y0 = dy - (fixed ? 0 : P->scroll_y);
+        page_region_repaint(bi, pslot, dx, y0, dx + dw, y0 + dh);
+    } else request_render(P, 0);
+}
+
+// After the parent was laid out: frames whose box changed size need a repaint at the new size.
+static void frames_check_sizes(int bi, int slot) {
+    struct okai* b = &okais[bi];
+    struct okai_tab* P = &b->tabs[slot];
+    if (!P->doc) return;
+    for (int s = OKAI_MAX_TABS; s < OKAI_SLOTS; s++) {
+        struct okai_tab* F = &b->tabs[s];
+        if (!F->frame_used || F->parent_slot != slot || !F->first_paint) continue;
+        int dx, dy, dw, dh, fixed;
+        if (wdoc_video_dest(P->doc, F->parent_node, &dx, &dy, &dw, &dh, &fixed) && dw > 0 && dh > 0 && (dw != F->fw || dh != F->fh))
+            request_render(F, 0);
+    }
+}
+
+// Frame documents that are due to paint.
+static void frames_render_due(int bi) {
+    struct okai* b = &okais[bi];
+    for (int s = OKAI_MAX_TABS; s < OKAI_SLOTS; s++) {
+        struct okai_tab* F = &b->tabs[s];
+        if (F->frame_used && F->render_pending && (int)(tick_count - (uint32_t)F->render_due) >= 0) frame_render(bi, s);
+    }
+}
+
 static int start_main_fetch(int id, int tab) {
     struct okai* b = &okais[id];
     struct okai_tab* T = &b->tabs[tab];
@@ -1263,7 +1515,7 @@ static int start_main_fetch(int id, int tab) {
     q->post = T->post_body;
     q->post_len = T->post_len;
     q->post_ref = T->post_ref;
-    int r = req_fetch(q, 0);
+    int r = req_fetch(q, top_url_for(id, tab, 0));
     if (r == -2) { q->used = 0; return 2; }
     if (r < 0) {
         // No hostname (e.g. a malformed address-bar entry). Never fire the
@@ -1352,7 +1604,7 @@ static int start_next_sub(int bi, int ti) {
         struct oreq* q = req_new(bi, ti, T->doc, id, url);
         if (q) q->cors = kind == WDOC_RK_REQ;
         serial_printf("[okai] sub-res fetch: %s %s\n", kind_name(kind), url);
-        if (!q || req_fetch(q, T->url) != 0) {
+        if (!q || req_fetch(q, top_url_for(bi, ti, 1)) != 0) {
             if (q) q->used = 0;
             sub_fail(T, id, url);
             continue;
@@ -1436,6 +1688,7 @@ static void main_loaded(int id, int tab, char* resp, int len) {
     }
     if (T->doc && wdoc_pending_css(T->doc) > 0) request_render(T, CSS_WAIT_TICKS);
     else request_render(T, 0);
+    frames_sync(id, tab);                             // <iframe> elements of the new document
 }
 
 // A resource finished (st: 1 done, -1 failed, -2 truncated). Delivers it to
@@ -1528,6 +1781,7 @@ static void sub_landed(struct okai_tab* T, int kind) {
 static void set_focus(int id, struct okai_tab* T, int node);
 static void submit_form_node(int id, struct okai_tab* T, int form, int submitter, int fire_event);
 static void navigate_ex(int id, const char* url, int push);
+static void navigate_slot(int id, int slot, const char* url, int push);
 
 // Apply what a realm entry asked for (WJS_* flags).
 static void js_apply(int id, int tab, int flags) {
@@ -1536,16 +1790,17 @@ static void js_apply(int id, int tab, int flags) {
     if (!T->doc) return;
     struct wjs* js = wdoc_js(T->doc);
     if (!js) return;
-    int active = tab == b->active_tab;
+    int active = slot_is_active(b, tab);
+    int frame = slot_is_frame(tab);
     if (flags & WJS_TITLE) {
         const char* t = wdoc_title(T->doc);
         scopy(T->title, t && t[0] ? t : T->url, sizeof T->title);
-        if (active) window_set_title(b->win_id, T->title);
+        if (active && !frame) window_set_title(b->win_id, T->title);
         b->chrome_dirty = 1;
     }
     if (flags & WJS_URL) {
         scopy(T->url, wdoc_url(T->doc), OKAI_URL_LEN);
-        if (T->history_count > 0) scopy(T->history[T->history_pos], T->url, OKAI_URL_LEN);
+        if (T->history_count > 0 && !frame) scopy(T->history[T->history_pos], T->url, OKAI_URL_LEN);
         b->chrome_dirty = 1;
         serial_printf("[okai] script URL -> %s\n", T->url);
     }
@@ -1556,18 +1811,22 @@ static void js_apply(int id, int tab, int flags) {
     if (flags & WJS_SCROLL) {
         int y;
         if (wjs_take_scroll(js, &y)) {
-            if (active && T->first_paint) scroll_to(id, y);
-            else T->scroll_y = y;
+            if (active && !frame && T->first_paint) scroll_to(id, y);
+            else { T->scroll_y = y; if (frame) request_render(T, 0); }
         }
     }
     if (flags & WJS_DIRTY) {
         if (T->first_paint) request_render(T, 15);
         else if (wdoc_pending_css(T->doc) == 0) request_render(T, 0);
+        if ((int)(tick_count - T->frames_sync_tick) >= 0) {       // scripts add / remove / retarget <iframe> elements
+            T->frames_sync_tick = tick_count + 20;
+            frames_sync(id, tab);
+        }
     }
     if (flags & WJS_NAV) {
         static char u[OKAI_URL_LEN];
         int rep = 0;
-        if (wjs_take_nav(js, u, sizeof u, &rep) && active && T->load_state == 1) {
+        if (wjs_take_nav(js, u, sizeof u, &rep) && (active || frame) && T->load_state == 1) {
             if (!strncmp(u, "#submit:", 8)) {
                 int f = 0, btn = 0, neg = 0, k = 8;
                 while (u[k] >= '0' && u[k] <= '9') f = f * 10 + (u[k++] - '0');
@@ -1576,11 +1835,13 @@ static void js_apply(int id, int tab, int flags) {
                 while (u[k] >= '0' && u[k] <= '9') btn = btn * 10 + (u[k++] - '0');
                 submit_form_node(id, T, f, neg ? -1 : btn, 0);
             } else if (!strncmp(u, "#hist:", 6)) {
-                if (u[6] == '-') okai_nav_back(id);
-                else okai_nav_fwd(id);
+                if (!frame) {
+                    if (u[6] == '-') okai_nav_back(id);
+                    else okai_nav_fwd(id);
+                }
             } else {
-                serial_printf("[okai] script navigation -> %s\n", u);
-                navigate_ex(id, u, !rep);
+                serial_printf("[okai] script navigation%s -> %s\n", frame ? " (frame)" : "", u);
+                navigate_slot(id, tab, u, !rep && !frame);
             }
         }
     }
@@ -1612,12 +1873,13 @@ static void js_pump(void) {
     for (int bi = 0; bi < MAX_OKAIS; bi++) {
         struct okai* b = okai_get(bi);
         if (!b) continue;
-        for (int ti = 0; ti < b->tab_count; ti++) {
+        for (int ti = 0; ti < OKAI_SLOTS; ti++) {
+            if (!slot_valid(b, ti)) continue;
             struct okai_tab* T = &b->tabs[ti];
             if (!T->doc || T->load_state != 1 || T->closing) continue;
             struct wjs* js = wdoc_js(T->doc);
             if (!js) continue;
-            int active = ti == b->active_tab;
+            int active = slot_is_active(b, ti);
             if (T->js_next_tick && (int)(tick_count - T->js_next_tick) < 0) continue;
             if (T->js_scroll_evt && active) {
                 T->js_scroll_evt = 0;
@@ -1727,7 +1989,7 @@ static void sub_complete(struct okai_tab* T, struct oreq* cur, int st, char* res
     fetch_end(cur->h);
     cur->h = -1;
     if (again) {
-        if (req_reissue(cur, T->url)) return;   // still in flight (sub_inflight unchanged)
+        if (req_reissue(cur, top_url_for(cur->bi, cur->tab, 1))) return;   // still in flight (sub_inflight unchanged)
         sub_fail(T, cur->sub_id, cur->url);
     }
     T->sub_inflight--;
@@ -1763,7 +2025,7 @@ static void main_complete(int bi, int tab, struct oreq* cur, int st, char* resp,
             cur->post = T->post_body;                      // still there after a 307/308, gone after 301/302/303
             cur->post_len = T->post_len;
             cur->post_ref = T->post_ref;
-            if (!req_reissue(cur, 0)) show_error(bi, tab);
+            if (!req_reissue(cur, top_url_for(bi, tab, 0))) show_error(bi, tab);
             return;
         }
         main_loaded(bi, tab, resp, len);   // resources start from okai_poll
@@ -1805,7 +2067,7 @@ static void main_complete(int bi, int tab, struct oreq* cur, int st, char* resp,
                 }
                 serial_printf("[okai] resumption retry in flight for %s\n", T->url);
                 scopy(cur->url, T->url, OKAI_URL_LEN);
-                if (req_reissue(cur, 0)) return;
+                if (req_reissue(cur, top_url_for(bi, tab, 0))) return;
             } else {
                 serial_printf("[okai] TLS connection failure (reason=%d), no HTTP fallback for %s\n", fr, T->url);
                 T->conn_failed = 1;
@@ -1821,7 +2083,7 @@ static void main_complete(int bi, int tab, struct oreq* cur, int st, char* resp,
             serial_printf("[okai] https failed, retrying http: %s\n", T->url);
             serial_printf("[okai] http fallback in flight for %s\n", T->url);
             scopy(cur->url, T->url, OKAI_URL_LEN);
-            if (req_reissue(cur, 0)) return;
+            if (req_reissue(cur, top_url_for(bi, tab, 0))) return;
         }
     }
     show_error(bi, tab);
@@ -1835,7 +2097,7 @@ static void req_poll(struct oreq* q) {
     q->used = 0;
     q->h = -1;
     struct okai* b = okai_get(cur.bi);
-    if (!b || cur.tab < 0 || cur.tab >= b->tab_count) { fetch_end(cur.h); return; }
+    if (!b || cur.tab < 0 || cur.tab >= OKAI_SLOTS || !slot_valid(b, cur.tab)) { fetch_end(cur.h); return; }
     struct okai_tab* T = &b->tabs[cur.tab];
     char* resp = 0;
     int len = 0, st = -1;          // 1 done, -1 failed, -2 truncated
@@ -1864,8 +2126,9 @@ void okai_poll(void) {
         for (int bi = 0; bi < MAX_OKAIS; bi++) {
             struct okai* b = okai_get(bi);
             if (!b) continue;
-            for (int ti = 0; ti < b->tab_count; ti++) {
-                if ((pass == 0) != (ti == b->active_tab)) continue;
+            for (int ti = 0; ti < OKAI_SLOTS; ti++) {
+                if (!slot_valid(b, ti)) continue;
+                if ((pass == 0) != slot_is_active(b, ti)) continue;
                 struct okai_tab* T = &b->tabs[ti];
                 if (T->load_state != 0 || T->closing || req_has_main(bi, ti)) continue;
                 start_main_fetch(bi, ti);
@@ -1878,8 +2141,9 @@ void okai_poll(void) {
         for (int bi = 0; bi < MAX_OKAIS; bi++) {
             struct okai* b = okai_get(bi);
             if (!b) continue;
-            for (int ti = 0; ti < b->tab_count; ti++) {
-                if ((pass == 0) != (ti == b->active_tab)) continue;
+            for (int ti = 0; ti < OKAI_SLOTS; ti++) {
+                if (!slot_valid(b, ti)) continue;
+                if ((pass == 0) != slot_is_active(b, ti)) continue;
                 struct okai_tab* T = &b->tabs[ti];
                 if (T->load_state != 1 || !T->doc || T->closing) continue;
                 while (T->sub_inflight < OKAI_SUB_PAR && start_next_sub(bi, ti) == 1) {}
@@ -1893,6 +2157,7 @@ void okai_poll(void) {
         if (!b) continue;
         struct okai_tab* T = okai_tab_of(b);
         if (T->render_pending && (int)tick_count - T->render_due >= 0) okai_render_content(bi);
+        frames_render_due(bi);                      // iframe documents paint into their bitmaps (and the parent shows them)
     }
     // Fetch-pill erase: the progress pill is an overlay; when a window's
     // requests end repaint it once so its pixels go away.
@@ -1948,8 +2213,11 @@ void okai_close(int id) {
     if (id < 0 || id >= okai_count) return;
     struct okai* b = &okais[id];
     req_window_removed(id);
-    for (int t = 0; t < OKAI_MAX_TABS; t++)
+    for (int t = 0; t < OKAI_SLOTS; t++) {
         if (b->tabs[t].doc) { wdoc_free(b->tabs[t].doc); b->tabs[t].doc = 0; }
+        if (b->tabs[t].fpx) { kfree(b->tabs[t].fpx); b->tabs[t].fpx = 0; b->tabs[t].fpx_cap = 0; }
+        b->tabs[t].frame_used = 0;
+    }
     if (b->win_id >= 0) {
         window_destroy(b->win_id);
         b->win_id = -1;
@@ -1964,23 +2232,29 @@ void okai_close(int id) {
     okais[okai_count].win_id = -1;
     okais[okai_count].page_px = 0;
     okais[okai_count].page_cap = 0;
-    for (int t = 0; t < OKAI_MAX_TABS; t++) okais[okai_count].tabs[t].doc = 0;
+    for (int t = 0; t < OKAI_SLOTS; t++) { okais[okai_count].tabs[t].doc = 0; okais[okai_count].tabs[t].fpx = 0; okais[okai_count].tabs[t].fpx_cap = 0; okais[okai_count].tabs[t].frame_used = 0; }
     okais[okai_count].tab_count = 0;
 }
 
 // Load `url` into the active tab. push = add a history entry.
 static void navigate_ex(int id, const char* url, int push) {
+    navigate_slot(id, okais[id].active_tab, url, push);
+}
+
+// Load `url` into a tab slot (a browser tab, or an iframe document: no history, no address bar).
+static void navigate_slot(int id, int slot, const char* url, int push) {
     struct okai* b = &okais[id];
-    struct okai_tab* T = okai_tab_of(b);
+    struct okai_tab* T = &b->tabs[slot];
+    int frame = slot_is_frame(slot);
     if (b->win_id < 0) return;
     // Cancel this tab's requests (old document's resources included) so
     // the new URL loads and nothing lands in the page being replaced.
-    req_cancel_tab(id, b->active_tab);
+    req_cancel_tab(id, slot);
     char norm[OKAI_URL_LEN];
-    if (looks_like_query(url)) okai_search_url(url, norm, OKAI_URL_LEN);   // typed words: search
+    if (!frame && looks_like_query(url)) okai_search_url(url, norm, OKAI_URL_LEN);   // typed words: search
     else okai_normalize_https(url, norm, OKAI_URL_LEN);
     scopy(T->url, norm, OKAI_URL_LEN);
-    if (push) {
+    if (push && !frame) {
         if (T->history_count > 0 && T->history_pos < T->history_count - 1)
             T->history_count = T->history_pos + 1;    // drop forward history
         if (T->history_count == OKAI_MAX_HISTORY) {
@@ -1998,8 +2272,8 @@ static void navigate_ex(int id, const char* url, int push) {
     }
     T->focused_node = -1;
     b->chrome_dirty = 1;
-    serial_printf("[okai] navigate %s\n", T->url);
-    if (okai_is_home(T->url)) load_home(id, b->active_tab);
+    serial_printf("[okai] navigate %s%s\n", frame ? "(frame) " : "", T->url);
+    if (okai_is_home(T->url)) load_home(id, slot);
     // otherwise okai_poll starts the fetch; the old page stays visible
     // until the new one arrives.
 }
@@ -2211,7 +2485,7 @@ static void submit_form_node(int id, struct okai_tab* T, int form, int submitter
         static char referer[OKAI_URL_LEN];
         scopy(referer, T->url, sizeof referer);
         serial_printf("[okai] submit form (POST, %d bytes) -> %s\n", ql, action);
-        okai_navigate(id, action);                       // resets the tab's load state (and any older POST body)
+        navigate_slot(id, slot_of(&okais[id], T), action, 1);                       // resets the tab's load state (and any older POST body)
         T->post_body = (char*)kmalloc((size_t)ql + 1);
         if (T->post_body) {
             memcpy(T->post_body, q, (size_t)ql + 1);
@@ -2227,7 +2501,7 @@ static void submit_form_node(int id, struct okai_tab* T, int form, int submitter
     for (int i = 0; q[i] && ul < OKAI_URL_LEN - 1; i++) url[ul++] = q[i];
     url[ul] = 0;
     serial_printf("[okai] submit form -> %s\n", url);
-    okai_navigate(id, url);
+    navigate_slot(id, slot_of(&okais[id], T), url, 1);
 }
 
 // Click / Enter on a non-text control.
@@ -2618,6 +2892,11 @@ static int okai_anim_step(int id) {
             for (int j = i; j < b->tab_count - 1; j++) b->tabs[j] = b->tabs[j + 1];
             b->tabs[b->tab_count - 1].doc = 0;
             b->tab_count--;
+            for (int s = OKAI_MAX_TABS; s < OKAI_SLOTS; s++) {        // frames name their tab by index
+                if (!b->tabs[s].frame_used) continue;
+                if (b->tabs[s].top_tab > i) b->tabs[s].top_tab--;
+                if (b->tabs[s].parent_slot < OKAI_MAX_TABS && b->tabs[s].parent_slot > i) b->tabs[s].parent_slot--;
+            }
             if (b->active_tab >= b->tab_count) b->active_tab = b->tab_count - 1;
             else if (i < b->active_tab) b->active_tab--;
         } else {
@@ -2638,24 +2917,22 @@ int okai_wants_cpu(void) {
     int io_wait = 0, timed = 0;
     for (int id = 0; id < MAX_OKAIS; id++) {
         if (okais[id].win_id < 0) continue;
+        struct okai* b = &okais[id];
         if (okai_is_animating(id)) timed = 1;                     // spinner / tab animation: a frame every few ms is plenty
-        for (int t = 0; t < okais[id].tab_count; t++) {
-            struct okai_tab* RT = &okais[id].tabs[t];
+        for (int t = 0; t < OKAI_SLOTS; t++) {
+            if (!slot_valid(b, t)) continue;
+            struct okai_tab* RT = &b->tabs[t];
             if (RT->render_pending) {
                 if ((int)(tick_count - (uint32_t)RT->render_due) >= 0) return 1;
                 timed = 1;                                        // coalescing delay: wait for it, do not spin
             }
             if (okai_tab_busy(id, t)) io_wait = 1;                // requests in flight: waiting for the network, not for the CPU
-        }
-        for (int t = 0; t < okais[id].tab_count; t++) {
-            struct okai_tab* MT = &okais[id].tabs[t];
-            if (MT->doc && MT->load_state == 1 && !MT->closing && wjs_media_active(wdoc_js(MT->doc))) return 1;
-        }
-        // page JS with work due right now (js_pump runs it every iteration)
-        struct okai_tab* T = &okais[id].tabs[okais[id].active_tab];
-        if (T->doc && T->load_state == 1 && !T->closing) {
-            struct wjs* js = wdoc_js(T->doc);
-            if (js && wjs_next_due(js) == 0) return 1;
+            if (t < OKAI_MAX_TABS && RT->doc && RT->load_state == 1 && !RT->closing && wjs_media_active(wdoc_js(RT->doc))) return 1;
+            // page JS with work due right now (js_pump runs it every iteration): the active tab and its frames
+            if (slot_is_active(b, t) && RT->doc && RT->load_state == 1 && !RT->closing) {
+                struct wjs* js = wdoc_js(RT->doc);
+                if (js && wjs_next_due(js) == 0) return 1;
+            }
         }
     }
     return io_wait ? 2 : timed ? 3 : 0;

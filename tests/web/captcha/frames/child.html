@@ -1,0 +1,12 @@
+<!doctype html>
+<html><head><title>child</title>
+<style>body{margin:0;font-family:monospace;background:#fde}
+h2{background:#c36;color:#fff;margin:0;padding:6px}
+.box{width:60px;height:40px;background:#3a6;margin:8px;display:inline-block}</style></head>
+<body><h2>CHILD FRAME</h2>
+<p style="margin:8px">query: <span id="q"></span></p>
+<div class="box"></div><div class="box" style="background:#36c"></div>
+<p style="margin:8px"><a href="child.html?n=3">follow link inside the frame</a></p>
+<form action="child.html" method="get" style="margin:8px"><input name="t" size="10"><button>Go</button></form>
+<script>document.getElementById('q').textContent = location.search || '(none)';</script>
+</body></html>
