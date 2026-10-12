@@ -61,6 +61,7 @@ void meng_seek(struct meng* m, double seconds);
 void meng_set_volume(struct meng* m, double volume, int muted);
 void meng_set_rate(struct meng* m, double rate);        // 0.25 .. 4 (audio keeps its pitch only at 1)
 void meng_poll(struct meng* m);                         // call often from the main loop
+void meng_set_governor(int on);                         // slow CPU: video gets a share of the CPU (cool-down after a long pass, skip to the newest due key frame when a second behind)
 
 // ---- state ----
 double meng_current_time(struct meng* m);

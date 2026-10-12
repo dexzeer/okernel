@@ -53,6 +53,8 @@ vm = OkVM(tag)
 try:
     vm.wait_for("[mem] heap", timeout=60)
     time.sleep(10)
+    vm.type_string("cpu slow 1\n", delay=0.05)    # QEMU/TCG benchmarks as a slow CPU, which blocks muted autoplay: this test wants the desktop policy
+    time.sleep(1)
     base = "http://10.0.2.2:8002/web/js/"
     want = "okai " + base + "media_long.html"
     for attempt in range(4):

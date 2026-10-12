@@ -21,7 +21,23 @@ static int serial_transmit_empty(void) {
 // is an emulated I/O exit — this halves the cost of serial logging.
 static int tx_room = 0;
 
+// Everything that goes to the serial port is also kept in a ring: a laptop has no serial port, and klog.c copies the ring to
+// the boot stick (the stick log then shows every [okai]/[net]/[js] line a serial console would).
+char serial_ring[SERIAL_RING];
+volatile uint32_t serial_total;
+static int uart_absent = -1;                 // -1 not probed yet; 1 = no UART answers at COM1: skip the port I/O
+
 void serial_putchar(char c) {
+    uint32_t fl;
+    __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
+    serial_ring[serial_total & (SERIAL_RING - 1)] = c;
+    serial_total++;
+    if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
+    if (uart_absent < 0) {
+        outb(0x3F8 + 7, 0xA5);               // the scratch register keeps what is written to it; a floating bus reads 0xFF
+        uart_absent = inb(0x3F8 + 7) != 0xA5;
+    }
+    if (uart_absent) return;
     if (tx_room == 0) {
         while (!serial_transmit_empty());
         tx_room = 16;

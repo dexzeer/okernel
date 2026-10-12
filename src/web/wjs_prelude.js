@@ -1226,6 +1226,7 @@ accessor(HTMLTitleElement.prototype, 'text', function () { return W.text(this); 
 // engine state changes into events while something is playing or loading.
 const HM = HTMLMediaElement.prototype;
 reflectURL(HM, 'src', 'src');
+let userActivated = false;   // a trusted click / key press / pointer press reached the page (autoplay policy, see HM.play)
 for (const a of ['autoplay', 'loop', 'controls', 'playsInline', 'disableRemotePlayback']) reflectBool(HM, a, a.toLowerCase());
 reflect(HM, 'crossOrigin', 'crossorigin');
 reflect(HM, 'preload', 'preload');
@@ -1260,6 +1261,9 @@ function parseMime(mime) {
     const codecs = (m[3] !== undefined ? m[3] : m[4] !== undefined ? m[4] : m[5] !== undefined ? m[5] : null);
     return { type: m[1].toLowerCase(), sub: m[2].toLowerCase(), codecs: codecs === null ? null : codecs.split(',').map(c => c.trim().toLowerCase()).filter(Boolean) };
 }
+// A slow CPU cannot decode big pictures in real time: codec strings above a level cap are reported as unsupported, which makes a
+// player (YouTube) pick a smaller format on its own. Level = decimal level x 10 (VP9 "vp09.00.31.08" and H.264 "avc1.64001f" are 3.1 = 720p).
+function levelCap() { const s = W.slow(); return s >= 8 ? 21 : s >= 4 ? 30 : s >= 2 ? 31 : 99; }
 function mimeKinds(mime) {      // bit 0 audio, bit 1 video; 0 = unsupported
     const p = parseMime(mime);
     if (!p || (p.type !== 'video' && p.type !== 'audio')) return 0;
@@ -1269,11 +1273,12 @@ function mimeKinds(mime) {      // bit 0 audio, bit 1 video; 0 = unsupported
     let k = 0;
     for (const c of p.codecs) {
         if (c === 'opus') k |= 1;
-        else if (c === 'vp9' || /^vp09(\.|$)/.test(c)) { if (p.type === 'audio') return 0; k |= 2; }
+        else if (c === 'vp9' || /^vp09(\.|$)/.test(c)) { if (p.type === 'audio') return 0; const lv = parseInt(c.split('.')[2], 10); if (lv > levelCap()) return 0; k |= 2; }
         else if (mp4 && /^mp4a\.40\.0?(2|5)$/.test(c)) k |= 1;                           // AAC-LC (HE-AAC plays without SBR)
         else if (mp4 && /^avc[13]\.[0-9a-f]{6}$/.test(c)) {                               // H.264: Baseline, Main, High (8-bit 4:2:0)
             const prof = parseInt(c.substr(5, 2), 16);
             if (prof !== 66 && prof !== 77 && prof !== 100) return 0;
+            if (parseInt(c.substr(9, 2), 16) > levelCap()) return 0;
             if (p.type === 'audio') return 0;
             k |= 2;
         }
@@ -1578,6 +1583,12 @@ methods(HM, {
             if (!s.id && !s.currentSrc) return Promise.reject(new DOMException('The element has no supported sources.', 'NotSupportedError'));
         }
         if (s.error) return Promise.reject(new DOMException('The media resource indicated by the src attribute was not suitable.', 'NotSupportedError'));
+        // A slow CPU cannot afford decorative background video: muted autoplay waits for the first click or key press
+        // (the same "autoplay blocked" path a browser in low-power mode takes).
+        if (!userActivated && W.slow() >= 3 && (this.muted || W.getAttr(this, 'muted') !== null)) {
+            mlog('play() blocked: slow CPU, no user activation');
+            return Promise.reject(new DOMException("play() failed because the user didn't interact with the document first.", 'NotAllowedError'));
+        }
         const wasPaused = s.paused;
         s.paused = false;
         s.started = true;
@@ -1785,7 +1796,7 @@ function mediaDecodingInfo(cfg) {
     const v = cfg && cfg.video, a = cfg && cfg.audio;
     if ((v || a) && (!v || mimeKinds(v.contentType) & 2) && (!a || mimeKinds(a.contentType) & 1)) {
         ok = true;
-        smooth = !v || (v.width * v.height <= 1280 * 720 && (v.framerate || 30) <= 30);
+        smooth = !v || (v.width * v.height <= (levelCap() >= 99 ? 1280 * 720 : levelCap() >= 31 ? 1280 * 720 : levelCap() >= 30 ? 854 * 480 : 480 * 360) && (v.framerate || 30) <= 30);
     }
     return Promise.resolve({ supported: ok, smooth, powerEfficient: false });
 }
@@ -2972,15 +2983,17 @@ function structuredCloneLite(v) {
 // ---------------------------------------------------------------- timers
 let timerSeq = 1;
 const TIMERS = new Map();     // id -> {fn, args, due, interval}
+let timerNest = 0;   // nesting level of the timer callback being run
 function addTimer(fn, ms, args, repeat) {
     if (typeof fn !== 'function') {
         const code = String(fn);
         fn = () => (0, eval)(code);
     }
     ms = +ms || 0;
-    if (ms < 4) ms = repeat ? 10 : 0;
+    const nest = timerNest + 1;
+    if (ms < 4) ms = repeat ? 10 : (nest > 5 ? 4 : 0);      // HTML: timers nested more than 5 deep wait at least 4 ms (a setTimeout(0) chain would spin the CPU)
     const id = timerSeq++;
-    TIMERS.set(id, { fn, args, due: W.now() + ms, interval: repeat ? Math.max(ms, 10) : -1 });
+    TIMERS.set(id, { fn, args, due: W.now() + ms, interval: repeat ? Math.max(ms, 10) : -1, nest });
     return id;
 }
 function setTimeout(fn, ms, ...args) { return addTimer(fn, ms, args, false); }
@@ -3006,7 +3019,10 @@ function runDue(now) {
     for (const [id, t] of TIMERS) if (t.due <= now && (!best || t.due < best.due)) { best = t; bestId = id; }
     if (!best) return false;
     if (best.interval >= 0) best.due = now + best.interval; else TIMERS.delete(bestId);
+    const prevNest = timerNest;
+    timerNest = best.nest || 0;
     try { best.fn.apply(G, best.args); } catch (e) { report(e, 'timer'); }
+    timerNest = prevNest;
     return true;
 }
 let lastFrame = 0;
@@ -4267,6 +4283,7 @@ function uiEvent(target, type, x, y, button, key) {
     else if (type === 'wheel') ev = new WheelEvent('wheel', Object.assign(base, { deltaY: key }));
     else ev = new Event(type, { bubbles: true, cancelable: true });
     hidden(ev, 'isTrusted', true);
+    if (type === 'click' || type === 'mousedown' || type === 'keydown' || type === 'pointerdown') userActivated = true;
     return dispatch(target || G, ev);
 }
 function dispatchClick(el) {

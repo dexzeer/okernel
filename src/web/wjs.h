@@ -24,6 +24,8 @@ struct wjs_host {
     void (*random)(uint8_t* out, int n);    // crypto.getRandomValues (CPRNG)
     int  (*now_ms)(void);                   // monotonic ms
     void (*log)(const char* s);             // console output sink
+    void (*yield)(void);                    // called now and then while a script runs (>= ~20 ms apart): keep the machine alive
+    int  budget_scale;                      // time budgets x this (a slow CPU needs longer; 0 = 1)
 };
 extern struct wjs_host wjs_host;
 

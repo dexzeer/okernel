@@ -16,7 +16,10 @@ param(
     [string]$Iso = "",
     [int]$Mem = 512,
     [string]$Shot = "",    # screendump (PPM) of the last page once it settled
-    [string]$AudioWav = "" # record what the guest plays (HD Audio) into this WAV
+    [string]$AudioWav = "", # record what the guest plays (HD Audio) into this WAV
+    [string[]]$Extra = @(),  # more QEMU arguments, e.g. -Extra "-icount","shift=0,sleep=off" (a guest of ~1 GIPS: a weak laptop)
+    [int]$Slow = 1           # wait-time multiplier for slow guests (-icount)
+    ,[switch]$Prof            # turn the kernel profiler on (`prof on`): [prof] zone lines once a second
 )
 $ErrorActionPreference = "Stop"
 $Urls = @($Urls | ForEach-Object { $_ -split "," } | Where-Object { $_ })
@@ -31,6 +34,7 @@ $qargs = @("-accel", $Accel, "-m", "$Mem", "-cdrom", $iso, "-boot", "d", "-vga",
           "-device", "e1000,netdev=net0", "-netdev", "user,id=net0",
           "-serial", "file:$log", "-display", "none", "-no-reboot",
           "-monitor", "tcp:127.0.0.1:$Port,server,nowait")
+if ($Extra) { $qargs += $Extra }
 if ($AudioWav) { $qargs += @("-audiodev", "wav,id=a0,path=$AudioWav", "-device", "intel-hda", "-device", "hda-output,audiodev=a0") }
 $p = Start-Process -FilePath $Qemu -ArgumentList $qargs -PassThru -WindowStyle Hidden
 
@@ -62,11 +66,12 @@ function Wait-For([string]$pat, [int]$sec) {
 
 try {
     $t0 = [DateTime]::Now
-    if (-not (Wait-For "[mem] heap" 60)) { throw "no boot" }
+    if (-not (Wait-For "[mem] heap" (60 * $Slow))) { throw "no boot" }
     "boot to heap: {0:N1}s" -f ([DateTime]::Now - $t0).TotalSeconds
     Start-Sleep -Seconds 4
+    if ($Prof) { Send-Keys "prof on`n"; Start-Sleep -Seconds 1 }
     Send-Keys "okai`n"
-    if (-not (Wait-For "home rendered" 60)) { throw "okai did not open" }
+    if (-not (Wait-For "home rendered" (60 * $Slow))) { throw "okai did not open" }
     Start-Sleep -Seconds 2
     # "settled" = no network activity (live pages keep re-rendering forever)
     $act = [regex]'\[okai\] (fetch|sub-res)|\[tls-net\]|\[http\]|parse: count='
@@ -77,7 +82,7 @@ try {
         Send-Keys ($u + "`n")
         $nav = $null; $doc = $null; $rend = $null; $last = [DateTime]::Now; $buf = ""; $fetches = 0
         $start = [DateTime]::Now
-        while (([DateTime]::Now - $start).TotalSeconds -lt 240) {
+        while (([DateTime]::Now - $start).TotalSeconds -lt (240 * $Slow)) {
             $s = Read-Log
             if ($s.Length -gt $pos) { $buf += $s.Substring($pos); $pos = $s.Length }
             $now = [DateTime]::Now

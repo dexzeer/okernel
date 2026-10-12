@@ -7,6 +7,8 @@
 #include "xhci.h"
 #include "rtw/rtw.h"
 #include "devlog.h"
+#include "serial.h"
+#include "cpufreq.h"
 
 extern uint32_t tick_count;
 
@@ -54,6 +56,29 @@ void klog_write(char tag, const char* line) {
 
 static int wr(uint32_t sect, const void* data, uint32_t n) { return xhci_storage_rw(1, sect, (void*)data, n); }
 
+static uint32_t ser_flushed;                                 // serial_total up to which the stick has it
+
+// Copy the part of the serial ring the stick has not seen yet (whole sectors, in runs that do not wrap) and tell the header.
+static void ser_flush(void) {
+    uint32_t end = serial_total;
+    if (end == ser_flushed) return;
+    uint32_t from = ser_flushed;
+    if (end - from > SERIAL_RING) from = end - SERIAL_RING;
+    uint32_t s = from / 512, last = (end - 1) / 512;            // absolute sector numbers; the ring slot is s % KLOG_SER_SECTORS
+    uint32_t base = S0 + KLOG_SER_FIRST + (H.boot & 1) * KLOG_SER_SECTORS;
+    while (s <= last) {
+        uint32_t slot = s % KLOG_SER_SECTORS, n = last - s + 1;
+        if (n > 64) n = 64;
+        if (slot + n > KLOG_SER_SECTORS) n = KLOG_SER_SECTORS - slot;
+        if (!wr(base + slot, serial_ring + slot * 512, n)) { state = 2; return; }
+        s += n;
+    }
+    ser_flushed = end;
+    H.ser_total[H.boot & 1] = end;
+    H.ser_boot[H.boot & 1] = H.boot;
+    wr(S0, &H, 1);
+}
+
 void klog_flush(void) {
     if (state != 1 || in_flush) return;
     uint32_t end = len;
@@ -88,7 +113,7 @@ static void dump_tables(void) {
     H.ntab = 0;
     for (int i = 0; i < nt; i++) {
         uint32_t nsect = (lens[i] + 511) / 512;
-        if (H.ntab < 16 && sect + nsect <= KLOG_REGION_SECTORS) {
+        if (H.ntab < 16 && sect + nsect <= KLOG_SER_FIRST) {
             struct klog_tab* t = &H.tab[H.ntab];
             memcpy(t->sig, tabs[i], 4); t->sect = sect; t->len = lens[i];
             int ok = 1;
@@ -142,7 +167,7 @@ void klog_poll(void) {
     }
     uint32_t sectors;
     if (!xhci_storage_ready(&sectors)) { state = 2; return; }
-    if ((int)(tick_count - last_flush) >= 100) { last_flush = tick_count; klog_flush(); }
+    if ((int)(tick_count - last_flush) >= 100) { last_flush = tick_count; klog_flush(); if (state == 1) ser_flush(); }
     if (state == 1 && (int)(tick_count - last_snap) >= 500) {
         last_snap = tick_count;
         memset(snap, 0, sizeof snap);
@@ -153,6 +178,29 @@ void klog_poll(void) {
         n = (int)strlen(snap);
         snap[n++] = 10;
         rtw_command("status", snap + n, 2500);                  // Wi-Fi adapter state
+        n = (int)strlen(snap);
+        snap[n++] = 10;
+        cpufreq_report(snap + n, 1000);                         // clock measurements
+        n = (int)strlen(snap);
+        snap[n++] = 10;
+        {
+            uint32_t tot, used, peak, lf;
+            heap_stats(&tot, &used, &peak, &lf);
+            char t[160];
+            int k = 0;
+            const char* p = "heap KB total/used/peak/largest-free: ";
+            while (*p) t[k++] = *p++;
+            uint32_t v[4] = { tot >> 10, used >> 10, peak >> 10, lf >> 10 };
+            for (int i = 0; i < 4; i++) {
+                char d[12]; int m = 0; uint32_t x = v[i];
+                if (!x) d[m++] = '0';
+                while (x) { d[m++] = (char)('0' + x % 10); x /= 10; }
+                while (m) t[k++] = d[--m];
+                t[k++] = i < 3 ? '/' : '\n';
+            }
+            t[k] = 0;
+            memcpy(snap + n, t, (size_t)k + 1);
+        }
         wr(S0 + 513, snap, KLOG_SNAP_SECTORS / 2);             // 16 KB are plenty
     }
 }

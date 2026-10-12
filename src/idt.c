@@ -319,6 +319,13 @@ void isr_handler(int int_num) {
         return; // Don't halt on syscall
     }
 
+    if (int_num == 13) {
+        // A fault-safe RDMSR/WRMSR (cpufreq.c) names its instruction and the place to resume at; weak: the text build has no cpufreq.c
+        extern volatile uint32_t msr_fix_from, msr_fix_to __attribute__((weak));
+        uint32_t* pe = (uint32_t*)(__builtin_frame_address(0) + 16);
+        if (&msr_fix_from && msr_fix_from && pe[10] == msr_fix_from) { pe[10] = msr_fix_to; return; }
+    }
+
     {
         // An exception on an application processor only parks that CPU
         // (smp.c); weak so the text build, which has no SMP, links.

@@ -8,6 +8,7 @@
 #include "taskbar.h"
 #include "graphics.h"
 #include "web/image.h"
+#include "web/wjs.h"
 #include "window.h"
 #include "paging.h"
 #include "memlayout.h"
@@ -44,6 +45,7 @@
 #include "smp.h"
 #include "prof.h"
 #include "fpu.h"
+#include "cpufreq.h"
 #include "cursor.h"
 #include "simd.h"
 #include "i915.h"
@@ -771,6 +773,8 @@ static void shell_execute(int win_id, const char* input) {
             window_puts(win_id, "  ipconfig  - address, mask, gateway, DNS\n");
             window_puts(win_id, "  usb       - USB controller and devices\n");
             window_puts(win_id, "  touchpad  - I2C touchpad status\n");
+            window_puts(win_id, "  cpu       - core clock, speed factor; cpu slow N|auto\n");
+            window_puts(win_id, "  prof      - on|off: per-second cycle profile\n");
             window_puts(win_id, "  ping      - ping gateway\n");
             window_puts(win_id, "  ip        - show IP address\n");
             window_puts(win_id, "  netdrop N - drop 1-in-N TCP pkts (test)\n");
@@ -1017,6 +1021,31 @@ static void shell_execute(int win_id, const char* input) {
         // "prof on|off": per-second cycle profile of the desktop loop on the serial log
         prof_on = str_eq(args, "on");
         window_puts(win_id, prof_on ? "profiler on (serial [prof] lines)\n" : "profiler off\n");
+    }
+    else if (str_eq(cmd_buf, "cpu")) {
+        // "cpu": clock measurements; "cpu slow N" forces the slow-CPU factor (script time limits, muted-autoplay block,
+        // video size cap: 1 = fast desktop), "cpu slow auto" goes back to the boot-time benchmark.
+        if (args[0] == 's' && args[1] == 'l' && args[2] == 'o' && args[3] == 'w') {
+            const char* a = args + 4;
+            while (*a == ' ') a++;
+            if (str_eq(a, "auto")) wjs_host.budget_scale = cpufreq_slow_factor();
+            else if (*a >= '0' && *a <= '9') {
+                int n = 0;
+                while (*a >= '0' && *a <= '9' && n < 100) n = n * 10 + (*a++ - '0');
+                wjs_host.budget_scale = n < 1 ? 1 : n > 16 ? 16 : n;
+            }
+        }
+        char rep[1200];
+        cpufreq_report(rep, sizeof rep);
+        window_puts(win_id, rep);
+        char t[16];
+        window_puts(win_id, "\nslow factor in use: ");
+        put_uint(t, (uint32_t)(wjs_host.budget_scale > 1 ? wjs_host.budget_scale : 1));
+        window_puts(win_id, t);
+        window_puts(win_id, " (benchmark: ");
+        put_uint(t, (uint32_t)cpufreq_slow_factor());
+        window_puts(win_id, t);
+        window_puts(win_id, ")\n");
     }
     else if (str_eq(cmd_buf, "smp")) {
         // "smp" lists the CPUs; "smp test" runs the job-system self test.
@@ -1463,6 +1492,19 @@ static void desktop_sched_yield(void) {
     sched_yield();
 }
 
+// Device pollers that must keep running while a page script is busy (okai.c engine_pump, on the main stack): pointer
+// reports, network receive/transmit and the TLS handshakes, the log on the boot stick. Nothing here draws or reaches
+// the page. The main loop runs the same calls once per pass.
+void desktop_bg_poll(void) {
+    e1000_poll();
+    xhci_poll();
+    rtw_poll();
+    i2chid_poll();
+    klog_poll();
+    net_poll();
+    fetch_poll();
+}
+
 void kernel_main(uint32_t mboot_phys) {
     // mboot_phys is PHYS (GRUB via trampoline). GRUB structs live low, so
     // read through the boot PD's 0-4M LOW identity window (valid pre- and
@@ -1613,6 +1655,8 @@ void kernel_main(uint32_t mboot_phys) {
 
     // Wake the other CPUs (they only run smp_parallel_for jobs). Interrupts are
     // still off; the PIT is programmed, so the boot CPU's tick is unaffected.
+    cpufreq_init();    // measure the core clock and request the top ratio (Atom); the other CPUs repeat the request as they start
+    wjs_host.budget_scale = cpufreq_slow_factor();   // a slow CPU gets proportionally longer script time budgets
     smp_init();
     audio_init();      // HD Audio output (QEMU: -device intel-hda -device hda-output); failure leaves the system silent
 
@@ -2160,14 +2204,14 @@ void kernel_main(uint32_t mboot_phys) {
             }
         }
         // Poll network for incoming packets
-        e1000_poll();
-        xhci_poll();      // USB mouse reports and hot-plug (polled; nothing interrupts for it)
-        rtw_poll();       // Wi-Fi adapter: received frames, scanning
+        { PROF_BEGIN(PZ_NET); e1000_poll(); PROF_END(PZ_NET); }
+        { PROF_BEGIN(PZ_XHCI); xhci_poll(); PROF_END(PZ_XHCI); }     // USB mouse reports and hot-plug (polled; nothing interrupts for it)
+        { PROF_BEGIN(PZ_RTW); rtw_poll(); PROF_END(PZ_RTW); }        // Wi-Fi adapter: received frames, scanning
         wifigui_poll();   // the Wi-Fi window
-        i2chid_poll();    // I2C-HID touchpad reports (polled, 100 Hz)
-        klog_poll();      // the log on the boot stick (only when the flash tool marked it)
-        net_poll();
-        fetch_poll();     // drive the HTTP/HTTPS fetch engine (parallel, keep-alive)
+        { PROF_BEGIN(PZ_I2C); i2chid_poll(); PROF_END(PZ_I2C); }     // I2C-HID touchpad reports (polled, 100 Hz)
+        { PROF_BEGIN(PZ_KLOG); klog_poll(); PROF_END(PZ_KLOG); }     // the log on the boot stick (only when the flash tool marked it)
+        { PROF_BEGIN(PZ_NET); net_poll(); PROF_END(PZ_NET); }
+        { PROF_BEGIN(PZ_FETCH); fetch_poll(); PROF_END(PZ_FETCH); }  // drive the HTTP/HTTPS fetch engine (parallel, keep-alive)
         // Persist TOFU pins on change (write-through VFS, same as editor).
         {
             extern int tls_pin_dirty(void);

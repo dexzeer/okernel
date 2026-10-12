@@ -237,8 +237,14 @@ static void job_entry(void* p) {
 static void run_job_inner(struct job* j);
 static void run_job(struct job* j) {
     PROF_BEGIN(PZ_JOB);
+    uint64_t t0 = prof_on ? prof_tsc() : 0;
     run_job_inner(j);
     PROF_END(PZ_JOB);
+    if (prof_on) {
+        int z = j->op == JOB_LOAD ? PZ_JLOAD : j->op == JOB_FETCH_DONE ? PZ_JFETCH : j->op == JOB_JS_RUN ? PZ_JJS :
+                j->op == JOB_JS_EVENT ? PZ_JEVENT : j->op == JOB_MEDIA ? PZ_JMEDIA : -1;
+        if (z >= 0) { prof_cyc[z] += prof_tsc() - t0; prof_cnt[z]++; }
+    }
 }
 static void run_job_inner(struct job* j) {
     if (!engine_stack) {
@@ -643,7 +649,23 @@ static void okai_js_random(uint8_t* out, int n) {
 
 static void okai_js_log(const char* s) { serial_puts(s); }
 
+// Script time slices can be long (a big bundle on a slow CPU takes seconds): while one runs, the interpreter calls this
+// every ~20 ms. It hands the CPU to the device pollers on the MAIN stack (below the point where call_on_stack left it):
+// the touchpad/USB pointer keeps moving, the Wi-Fi/Ethernet receive rings are emptied and TLS handshakes advance, so
+// nothing times out just because a script is busy. It never calls into the page or draws.
+extern uint32_t engine_main_sp;
+extern void desktop_bg_poll(void);
+static void engine_pump_body(void* arg) { (void)arg; desktop_bg_poll(); }
+static void engine_pump(void) {
+    static int pumping;
+    if (pumping || !in_engine || !engine_stack || !engine_main_sp) return;
+    pumping = 1;
+    call_on_stack(engine_pump_body, 0, (void*)(engine_main_sp - 64));
+    pumping = 0;
+}
+
 void okai_init(void) {
+    wjs_host.yield = engine_pump;
     wjs_host.now_ms = okai_now_ms;
     wjs_host.random = okai_js_random;
     wjs_host.log = okai_js_log;
