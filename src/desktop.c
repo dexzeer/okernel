@@ -1053,6 +1053,11 @@ static void shell_execute(int win_id, const char* input) {
         prof_on = str_eq(args, "on");
         window_puts(win_id, prof_on ? "profiler on (serial [prof] lines)\n" : "profiler off\n");
     }
+    else if (str_eq(cmd_buf, "cpu") && str_eq(args, "msrtest")) {
+        int msr_ok = cpufreq_msr_selftest();
+        window_puts(win_id, msr_ok ? "msr fault-safety: PASS\n" : "msr fault-safety: FAIL\n");
+        serial_puts(msr_ok ? "[cpu] msrtest PASS\n" : "[cpu] msrtest FAIL\n");
+    }
     else if (str_eq(cmd_buf, "cpu")) {
         // "cpu": clock measurements; "cpu slow N" forces the slow-CPU factor (script time limits, muted-autoplay block,
         // video size cap: 1 = fast desktop), "cpu slow auto" goes back to the boot-time benchmark.
