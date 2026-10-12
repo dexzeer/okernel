@@ -205,3 +205,26 @@ void cpufreq_report(char* buf, int cap) {
 uint32_t cpufreq_mhz(void) { return core_mhz; }
 uint32_t cpufreq_tsc_mhz(void) { return tsc_mhz; }
 int cpufreq_slow_factor(void) { return bench_factor; }
+
+
+// Self test of the fault recovery that rdmsr_safe/wrmsr_safe use. Real emulators and CPUs differ in which MSRs fault, so the
+// test provokes a #GP that is the same on all of them (loading a segment register with a selector far outside the GDT --
+// nothing is changed, the load faults first) and checks that execution resumes at the recovery label.
+int cpufreq_msr_selftest(void) {
+    uint32_t ok;
+    __asm__ volatile(
+        "movl $1f, msr_fix_from\n\t"
+        "movl $2f, msr_fix_to\n\t"
+        "movw $0x7FF8, %%ax\n\t"
+        "1: movw %%ax, %%gs\n\t"
+        "movl $0, %[ok]\n\t"                      // the load worked: not what a bad selector should do
+        "jmp 3f\n"
+        "2: movl $1, %[ok]\n"                     // resumed here after the #GP
+        "3:\n\t"
+        "movl $0, msr_fix_from\n\t"
+        : [ok] "=&r"(ok)
+        :
+        : "eax", "memory", "cc");
+    uint64_t v = 0;
+    return ok && rdmsr_safe(0x1B, &v);            // and a real MSR still reads
+}

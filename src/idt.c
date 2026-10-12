@@ -321,9 +321,14 @@ void isr_handler(int int_num) {
 
     if (int_num == 13) {
         // A fault-safe RDMSR/WRMSR (cpufreq.c) names its instruction and the place to resume at; weak: the text build has no cpufreq.c
-        extern volatile uint32_t msr_fix_from, msr_fix_to __attribute__((weak));
+        extern volatile uint32_t msr_fix_from __attribute__((weak));
+        extern volatile uint32_t msr_fix_to __attribute__((weak));
         uint32_t* pe = (uint32_t*)(__builtin_frame_address(0) + 16);
-        if (&msr_fix_from && msr_fix_from && pe[10] == msr_fix_from) { pe[10] = msr_fix_to; return; }
+        if (&msr_fix_from && msr_fix_from && pe[10] == msr_fix_from) {
+            *(volatile uint32_t*)&pe[10] = msr_fix_to;     // volatile + barrier: the frame is about to be popped, the store must not be dropped
+            __asm__ volatile("" ::: "memory");
+            return;
+        }
     }
 
     {
