@@ -20,6 +20,9 @@
 #define R_LVT_LINT0 0x350
 #define R_LVT_LINT1 0x360
 #define R_LVT_ERR   0x370
+#define R_TIMER_INIT 0x380
+#define R_TIMER_CUR  0x390
+#define R_TIMER_DIV  0x3E0
 
 #define LVT_MASKED 0x00010000u
 
@@ -159,3 +162,32 @@ void pit_delay_us(uint32_t us) {
         us -= chunk;
     }
 }
+
+// ---- one-shot wake-up timer for the boot CPU ------------------------------------------------------------------------
+// The 8259 PIT ticks every 10 ms; a main loop that is only waiting for the network (nothing to run, packets are polled)
+// would spin flat out between ticks. The local APIC timer gives a sub-millisecond wake-up for `hlt`, so the CPU can sleep
+// in between. It reuses the wake IPI's vector (its handler only sends the EOI).
+static uint32_t timer_per_us;           // timer counts per microsecond (divide by 16 configuration)
+
+int lapic_timer_calibrate(void) {
+    if (!ready || timer_per_us) return timer_per_us != 0;
+    wr(R_TIMER_DIV, 3);                                  // divide by 16
+    wr(R_LVT_TIMER, LVT_MASKED | LAPIC_VEC_WAKE);
+    wr(R_TIMER_INIT, 0xFFFFFFFFu);
+    pit_delay_us(10000);
+    uint32_t cur = rd(R_TIMER_CUR);
+    wr(R_TIMER_INIT, 0);
+    uint32_t per_us = (0xFFFFFFFFu - cur) / 10000;
+    if (per_us == 0 || per_us > 100000) return 0;        // not counting (or absurd): leave the timer alone
+    timer_per_us = per_us;
+    return 1;
+}
+
+void lapic_timer_oneshot_us(uint32_t us) {
+    if (!timer_per_us) return;
+    if (us > 0xFFFFFFFFu / timer_per_us) us = 0xFFFFFFFFu / timer_per_us;
+    wr(R_LVT_TIMER, LAPIC_VEC_WAKE);                     // one-shot, unmasked
+    wr(R_TIMER_INIT, us * timer_per_us);
+}
+
+int lapic_timer_available(void) { return timer_per_us != 0; }

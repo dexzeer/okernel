@@ -631,6 +631,64 @@ static void okai_rewrite_scheme_http(char* url) {
 
 int okai_is_home(const char* url) { return strcmp(url, OKAI_HOME_URL) == 0; }
 
+// ---- search from the address bar ---------------------------------------------------------------------------------------
+// Text that is not an address (it has a space, or is a single word without a dot / colon / slash) goes to the search engine
+// instead of being taken for a host name. `search engine NAME` (shell) picks the engine.
+static const struct { const char* name; const char* url; } search_engines[] = {
+    { "ddg",       "https://html.duckduckgo.com/html/?q=" },          // the lightweight page: little script, no captcha from most networks
+    { "bing",      "https://www.bing.com/search?q=" },
+    { "google",    "https://www.google.com/search?q=" },
+    { "brave",     "https://search.brave.com/search?q=" },
+    { "mojeek",    "https://www.mojeek.com/search?q=" },
+    { "startpage", "https://www.startpage.com/do/search?q=" },
+    { "yandex",    "https://yandex.com/search/?text=" },
+    { "wikipedia", "https://en.wikipedia.org/w/index.php?search=" },
+};
+#define N_SEARCH_ENGINES ((int)(sizeof search_engines / sizeof search_engines[0]))
+static int search_engine = 0;
+
+const char* okai_search_engine_name(int i) { return i >= 0 && i < N_SEARCH_ENGINES ? search_engines[i].name : 0; }
+int okai_search_engine_current(void) { return search_engine; }
+int okai_search_engine_set(const char* name) {
+    for (int i = 0; i < N_SEARCH_ENGINES; i++)
+        if (!strcmp(name, search_engines[i].name)) { search_engine = i; return 1; }
+    return 0;
+}
+
+// The URL that searches for `q` with the chosen engine (query text percent-encoded, spaces as '+').
+void okai_search_url(const char* q, char* out, int cap) {
+    static const char hex[] = "0123456789ABCDEF";
+    int j = 0;
+    for (const char* p = search_engines[search_engine].url; *p && j < cap - 1; p++) out[j++] = *p;
+    while (*q == ' ') q++;
+    for (; *q && j < cap - 4; q++) {
+        unsigned char c = (unsigned char)*q;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') out[j++] = (char)c;
+        else if (c == ' ') out[j++] = '+';
+        else { out[j++] = '%'; out[j++] = hex[c >> 4]; out[j++] = hex[c & 15]; }
+    }
+    while (j > 0 && out[j - 1] == '+') j--;
+    out[j] = 0;
+}
+
+static int looks_like_query(const char* in) {
+    while (*in == ' ') in++;
+    if (!*in) return 0;
+    if (iprefix(in, "okai:") || iprefix(in, "about:") || iprefix(in, "data:") || iprefix(in, "javascript:") || iprefix(in, "file:")) return 0;
+    int space = 0, dot = 0, colon = 0, slash = 0, n = 0;
+    for (const char* p = in; *p; p++) {
+        n++;
+        if (*p == ' ' && p[1] && p[1] != ' ') space = 1;
+        else if (*p == '.') dot = 1;
+        else if (*p == ':') colon = 1;
+        else if (*p == '/') slash = 1;
+    }
+    for (const char* p = in; *p; p++) if (p[0] == ':' && p[1] == '/' && p[2] == '/') return 0;   // "https://..." and friends
+    if (space) return 1;
+    if (!dot && !colon && !slash && strcmp(in, "localhost")) return 1;   // one word: not a host name
+    return 0;
+}
+
 // ---- init / tabs -----------------------------------------------------------------
 
 // ---- script realm host services --------------------------------------------------
@@ -1557,6 +1615,7 @@ static void js_pump(void) {
 // video frames are painted straight into the page surface (only the video's rectangle) and
 // pushed to the screen as a dirty rectangle.
 #define MEDIA_RECTS 8
+static uint32_t media_next[MAX_OKAIS][OKAI_MAX_TABS];   // earliest tick of the next look at an idle session
 static void media_pump(void) {
     static struct wjs_rect rects[MEDIA_RECTS];
     for (int bi = 0; bi < MAX_OKAIS; bi++) {
@@ -1566,8 +1625,13 @@ static void media_pump(void) {
             struct okai_tab* T = &b->tabs[ti];
             if (!T->doc || T->load_state != 1 || T->closing) continue;
             struct wjs* js = wdoc_js(T->doc);
-            if (!js || !wjs_media_active(js)) {
+            int active = js && wjs_media_active(js);
+            if (!active) {
                 if (!js || !wjs_media_any(js)) continue;
+                // paused / waiting sessions have nothing to do between page calls: look at them ten times a second
+                // (a pass costs a stack switch plus a poll of every session: once per main-loop pass was 70% of a CPU)
+                if ((int)(tick_count - media_next[bi][ti]) < 0) continue;
+                media_next[bi][ti] = tick_count + 10;
             }
             struct job j;
             memset(&j, 0, sizeof j);
@@ -1872,7 +1936,8 @@ static void navigate_ex(int id, const char* url, int push) {
     // the new URL loads and nothing lands in the page being replaced.
     req_cancel_tab(id, b->active_tab);
     char norm[OKAI_URL_LEN];
-    okai_normalize_https(url, norm, OKAI_URL_LEN);
+    if (looks_like_query(url)) okai_search_url(url, norm, OKAI_URL_LEN);   // typed words: search
+    else okai_normalize_https(url, norm, OKAI_URL_LEN);
     scopy(T->url, norm, OKAI_URL_LEN);
     if (push) {
         if (T->history_count > 0 && T->history_pos < T->history_count - 1)
@@ -2467,11 +2532,18 @@ static int okai_anim_step(int id) {
 // halt until the next interrupt.
 int okai_tab_busy(int id, int tab);
 int okai_wants_cpu(void) {
+    int io_wait = 0, timed = 0;
     for (int id = 0; id < MAX_OKAIS; id++) {
         if (okais[id].win_id < 0) continue;
-        if (okai_is_animating(id)) return 1;
-        for (int t = 0; t < okais[id].tab_count; t++)
-            if (okai_tab_busy(id, t) || okais[id].tabs[t].render_pending) return 1;
+        if (okai_is_animating(id)) timed = 1;                     // spinner / tab animation: a frame every few ms is plenty
+        for (int t = 0; t < okais[id].tab_count; t++) {
+            struct okai_tab* RT = &okais[id].tabs[t];
+            if (RT->render_pending) {
+                if ((int)(tick_count - (uint32_t)RT->render_due) >= 0) return 1;
+                timed = 1;                                        // coalescing delay: wait for it, do not spin
+            }
+            if (okai_tab_busy(id, t)) io_wait = 1;                // requests in flight: waiting for the network, not for the CPU
+        }
         for (int t = 0; t < okais[id].tab_count; t++) {
             struct okai_tab* MT = &okais[id].tabs[t];
             if (MT->doc && MT->load_state == 1 && !MT->closing && wjs_media_active(wdoc_js(MT->doc))) return 1;
@@ -2483,7 +2555,7 @@ int okai_wants_cpu(void) {
             if (js && wjs_next_due(js) == 0) return 1;
         }
     }
-    return 0;
+    return io_wait ? 2 : timed ? 3 : 0;
 }
 
 int okai_tab_busy(int id, int tab) {

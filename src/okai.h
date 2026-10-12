@@ -124,7 +124,7 @@ void okai_blit_content(int id);
 // reads) so the desktop loop can throttle overlay repaints to when the chrome
 // can actually change.
 int okai_is_animating(int id);
-int okai_wants_cpu(void);   // loading / render pending / animating anywhere
+int okai_wants_cpu(void);   // 1 = CPU work (render pending, animation, script or media due), 2 = only waiting for the network, 0 = idle
 // Hover target / loading spinner changed since the chrome was last drawn.
 int okai_ui_needs_paint(int id);
 int okai_find_by_win(int win_id);
@@ -161,6 +161,12 @@ void okai_paint_overlays(int id);
 // Clip the overlay to the given sub-rects (okai window minus higher-z windows)
 // so it never paints over a covering window.
 void okai_paint_overlays_rects(int id, int rects[][4], int nr);
+
+// Search: text typed into the address bar (or `okai WORDS`) that is not an address goes to the chosen search engine.
+const char* okai_search_engine_name(int i);   // engine names, NULL past the last
+int  okai_search_engine_current(void);
+int  okai_search_engine_set(const char* name);
+void okai_search_url(const char* query, char* out, int cap);
 
 // Page scripts on/off for newly loaded pages (the J key toggles + reloads).
 extern int okai_scripts_on;
