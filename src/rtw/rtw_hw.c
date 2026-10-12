@@ -9,6 +9,7 @@
 #include "../memory.h"
 #include "../string.h"
 #include "../xhci.h"
+#include "rtw_pci.h"
 
 extern uint32_t tick_count;
 extern const uint8_t rtw_fw_start[], rtw_fw_end[];
@@ -39,6 +40,7 @@ static void reg_sec(uint32_t addr, uint8_t d) {
 }
 
 static uint32_t rd(uint32_t addr, int len) {
+    if (R.hci) return rtwpci_rd(addr, len);
     uint8_t b[4] = { 0, 0, 0, 0 };
     int r = xhci_wl_ctrl(1, 5, (uint16_t)addr, 0, b, (uint16_t)len);
     if (r < 0) { R.io_err++; return 0xFFFFFFFFu >> (8 * (4 - len)); }
@@ -48,6 +50,7 @@ static uint32_t rd(uint32_t addr, int len) {
 }
 
 static void wr(uint32_t addr, uint32_t v, int len) {
+    if (R.hci) { rtwpci_wr(addr, v, len); return; }
     uint8_t b[4] = { (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24) };
     if (xhci_wl_ctrl(0, 5, (uint16_t)addr, 0, b, (uint16_t)len) < 0) { R.io_err++; return; }
     reg_sec(addr, b[0]);
@@ -141,6 +144,43 @@ static const struct pcmd pwr_off_seq[] = {
     { 0x0090, P_W, B(1), 0 },
 };
 
+// the PCIe flavour of the same flows (the steps the chip's table marks for the PCI interface)
+static const struct pcmd pwr_on_seq_pci[] = {
+    { 0x0005, P_W, B(3) | B(4) | B(7), 0 },
+    { 0x0300, P_W, 0xFF, 0 },
+    { 0x0301, P_W, 0xFF, 0 },
+    { 0x0005, P_W, B(4) | B(3) | B(2), 0 },
+    { 0x0075, P_W, B(0), B(0) },
+    { 0x0006, P_POLL, B(1), B(1) },
+    { 0x0075, P_W, B(0), 0 },
+    { 0x0006, P_W, B(0), B(0) },
+    { 0x0005, P_W, B(7), 0 },
+    { 0x0005, P_W, B(4) | B(3), 0 },
+    { 0x0005, P_W, B(0), B(0) },
+    { 0x0005, P_POLL, B(0), 0 },
+    { 0x0020, P_W, B(3), B(3) },
+    { 0x0074, P_W, B(5), B(5) },
+    { 0x0022, P_W, B(1), 0 },
+    { 0x0062, P_W, B(7) | B(6) | B(5), B(7) | B(6) | B(5) },
+    { 0x0061, P_W, B(7) | B(6) | B(5), 0 },
+    { 0x007C, P_W, B(1), 0 },
+};
+
+static const struct pcmd pwr_off_seq_pci[] = {
+    { 0x0093, P_W, B(3), 0 },
+    { 0x001F, P_W, 0xFF, 0 },
+    { 0x0049, P_W, B(1), 0 },
+    { 0x0006, P_W, B(0), B(0) },
+    { 0x0002, P_W, B(1), 0 },
+    { 0x0005, P_W, B(1), B(1) },
+    { 0x0005, P_POLL, B(1), 0 },
+    { 0x0020, P_W, B(3), 0 },
+    { 0x0067, P_W, B(5), 0 },
+    { 0x0005, P_W, B(2), B(2) },
+    { 0x0081, P_W, B(7) | B(6), 0 },
+    { 0x0090, P_W, B(1), 0 },
+};
+
 static int run_seq(const struct pcmd* s, int n) {
     for (int i = 0; i < n; i++) {
         const struct pcmd* c = &s[i];
@@ -153,6 +193,15 @@ static int run_seq(const struct pcmd* s, int n) {
                 if ((rtw_r8(c->reg) & c->mask) == (c->val & c->mask)) ok = 1;
                 else rtw_udelay(50);
             }
+            if (!ok && R.hci) {                                                                    // on PCIe, toggling WOWL wakes a sleepy block: try once more
+                uint8_t v = rtw_r8(0x0004);
+                rtw_w8(0x0004, (uint8_t)(v | B(3)));
+                rtw_w8(0x0004, (uint8_t)(v & ~B(3)));
+                for (int t = 0; t < 20000 && !ok; t++) {
+                    if ((rtw_r8(c->reg) & c->mask) == (c->val & c->mask)) ok = 1;
+                    else rtw_udelay(50);
+                }
+            }
             if (!ok) { wlog("power sequence: reg %04x never became %02x/%02x", c->reg, c->val, c->mask); return -1; }
         } else rtw_mdelay(c->reg);
     }
@@ -161,6 +210,7 @@ static int run_seq(const struct pcmd* s, int n) {
 
 static void pre_system_cfg(void) {
     rtw_w8(R_RSV_CTRL, 0);
+    if (R.hci) rtw_w32_set(R_HCI_OPT_CTRL, B(8));                                                   // PCIe: USB suspend logic off
     uint32_t v = rtw_r32(R_PAD_CTRL1); v |= B(29) | B(28); rtw_w32(R_PAD_CTRL1, v);                 // pin mux
     v = rtw_r32(R_LED_CFG); v &= ~(B(25) | B(26)); rtw_w32(R_LED_CFG, v);
     v = rtw_r32(R_GPIO_MUXCFG); v |= B(2); rtw_w32(R_GPIO_MUXCFG, v);
@@ -170,15 +220,18 @@ static void pre_system_cfg(void) {
 }
 
 static int power_switch(int on) {
-    uint8_t rpwm = rtw_r8(0xfe58);
-    if (rtw_r16(R_MCUFW_CTRL) == 0xC078) { rpwm = (uint8_t)((rpwm ^ B(7)) & B(7)); rtw_w8(0xfe58, rpwm); }   // firmware still there: toggle RPWM
+    uint32_t rpwm_addr = R.hci ? 0x03d9 : 0xfe58;
+    uint8_t rpwm = rtw_r8(rpwm_addr);
+    if (rtw_r16(R_MCUFW_CTRL) == 0xC078) { rpwm = (uint8_t)((rpwm ^ B(7)) & B(7)); rtw_w8(rpwm_addr, rpwm); }   // firmware still there: toggle RPWM
     int cur;
     if (rtw_r8(R_CR) == 0xea) cur = 0;
-    else if (rtw_r8(R_SYS_STATUS1 + 1) & 1) cur = 0;
+    else if (!R.hci && (rtw_r8(R_SYS_STATUS1 + 1) & 1)) cur = 0;
     else cur = 1;
     if (on == cur) return 1;                                                                       // already in the wanted state
-    int r = on ? run_seq(pwr_on_seq, sizeof pwr_on_seq / sizeof pwr_on_seq[0]) : run_seq(pwr_off_seq, sizeof pwr_off_seq / sizeof pwr_off_seq[0]);
-    if (on) rtw_w8_clr(R_SYS_STATUS1 + 1, B(0));
+    int r;
+    if (R.hci) r = on ? run_seq(pwr_on_seq_pci, sizeof pwr_on_seq_pci / sizeof pwr_on_seq_pci[0]) : run_seq(pwr_off_seq_pci, sizeof pwr_off_seq_pci / sizeof pwr_off_seq_pci[0]);
+    else r = on ? run_seq(pwr_on_seq, sizeof pwr_on_seq / sizeof pwr_on_seq[0]) : run_seq(pwr_off_seq, sizeof pwr_off_seq / sizeof pwr_off_seq[0]);
+    if (on && !R.hci) rtw_w8_clr(R_SYS_STATUS1 + 1, B(0));
     return r;
 }
 
@@ -244,8 +297,9 @@ int rtw_tx_raw(int qsel, const uint32_t w[10], const uint8_t* payload, int len) 
     memset(buf, 0, 48);
     for (int i = 0; i < 10; i++) { buf[4 * i] = (uint8_t)w[i]; buf[4 * i + 1] = (uint8_t)(w[i] >> 8); buf[4 * i + 2] = (uint8_t)(w[i] >> 16); buf[4 * i + 3] = (uint8_t)(w[i] >> 24); }
     memcpy(buf + 48, payload, (uint32_t)len);
-    txdesc_checksum(buf);
+    if (!R.hci) txdesc_checksum(buf);                                   // only the USB path checksums the descriptor
     int total = 48 + len;
+    if (R.hci) return rtwpci_tx(qsel, buf, total);
     return xhci_wl_bulk_out(qsel_ep(qsel), buf, (uint32_t)total);
 }
 
@@ -295,7 +349,7 @@ static int fw_to_mem(const uint8_t* data, uint32_t dst, uint32_t size) {
     while (left) {
         uint32_t n = left > 0x1000 ? 0x1000 : left;
         uint32_t send = n;
-        if (((send + 48) & 511) == 0) send += 1;                         // a packet that fills the last USB packet exactly would need a zero-length one
+        if (!R.hci && ((send + 48) & 511) == 0) send += 1;                         // a packet that fills the last USB packet exactly would need a zero-length one
         memset(chunk, 0, send);
         memcpy(chunk, data + off, n);
         if (write_rsvd_page(0, chunk, send)) { wlog("fw: writing the reserved page failed at offset %u", off); return -1; }
@@ -371,6 +425,7 @@ static int download_firmware(void) {
         if ((rtw_r16(R_MCUFW_CTRL) & FW_READY_MASK) == FW_READY) ready = 1; else rtw_mdelay(5);
     }
     if (!ready) { wlog("fw: not ready (MCUFW_CTRL %08x, DBG7 %08x)", rtw_r32(R_MCUFW_CTRL), rtw_r32(R_FW_DBG7)); return -1; }
+    if (R.hci) rtwpci_hci_setup();                                                // the vendor driver resets descriptors and indexes once the firmware runs
     R.h2c_seq = 0; R.h2c_box = 0;
     wlog("fw: running");
     return 0;
@@ -457,7 +512,7 @@ static int cond_match(uint32_t c) {
     uint32_t rfe = c & 0xff, intf = (c >> 8) & 0xf, pkg = (c >> 12) & 0xf, cut = (c >> 24) & 0xf;
     if (cut && cut != (R.cut ? R.cut : 15u)) return 0;
     if (pkg && pkg != (R.pkg ? R.pkg : 15u)) return 0;
-    if (intf && intf != 2) return 0;                          // USB
+    if (intf && intf != (R.hci ? 1u : 2u)) return 0;          // PCIe is interface 1, USB 2
     return rfe == R.rfe;
 }
 
@@ -504,9 +559,11 @@ static int priority_queue_cfg(void) {
     rtw_w16(R_FIFOPAGE_CTRL_2 + 2, R.rsvd_boundary);
     rtw_w16(R_BCNQ1_BDNY_V1, R.rsvd_boundary);
     rtw_w32(R_RXFF_BNDY, 16384 - 256 - 1);
-    uint8_t v = rtw_r8(R_AUTO_LLT_V1); v = (uint8_t)((v & 0x0f) | (3 << 4)); rtw_w8(R_AUTO_LLT_V1, v);     // USB TX aggregation descriptors
-    rtw_w8(R_AUTO_LLT_V1 + 3, 3);
-    rtw_w8_set(R_TXDMA_OFFSET_CHK + 1, B(1));
+    if (!R.hci) {
+        uint8_t v = rtw_r8(R_AUTO_LLT_V1); v = (uint8_t)((v & 0x0f) | (3 << 4)); rtw_w8(R_AUTO_LLT_V1, v);     // USB TX aggregation descriptors
+        rtw_w8(R_AUTO_LLT_V1 + 3, 3);
+        rtw_w8_set(R_TXDMA_OFFSET_CHK + 1, B(1));
+    }
     rtw_w8_set(R_AUTO_LLT_V1, B(0));
     if (!hw_ready(R_AUTO_LLT_V1, B(0), 0, 1000)) return -3;
     rtw_w8(R_CR + 3, 0);
@@ -520,7 +577,7 @@ static int init_trx_cfg(void) {
     rtw_w8(R_CR, 0);
     rtw_w8(R_CR, (uint8_t)MAC_TRX_ENABLE);
     rtw_w32(R_H2CQ_CSR, B(31));
-    rtw_w8_set(R_TXDMA_PQ_MAP, B(0));
+    if (!R.hci) rtw_w8_set(R_TXDMA_PQ_MAP, B(0));                          // USB: receive DMA arbitration
     int r = priority_queue_cfg();
     if (r) { wlog("mac: queue setup failed (%d)", r); return r; }
     // H2C queue geometry
@@ -762,30 +819,44 @@ static int phy_rssi(const uint8_t* ps) {
     return -120;
 }
 
+// one received packet starting at d (n bytes available); returns the bytes it takes up, or -1 when the descriptor is not sane
+static int rx_packet(const uint8_t* d, int n) {
+    uint32_t w0 = le32p(d), w2 = le32p(d + 8), w3 = le32p(d + 12);
+    int plen = (int)(w0 & 0x3fff), crc = (int)((w0 >> 14) & 1), icv = (int)((w0 >> 15) & 1);
+    int dinfo = (int)((w0 >> 16) & 0xf) * 8, shift = (int)((w0 >> 24) & 3), physt = (int)((w0 >> 26) & 1);
+    int is_c2h = (int)((w2 >> 28) & 1);
+    int rate = (int)(w3 & 0x7f);
+    int total = 24 + dinfo + shift + plen;
+    if (plen == 0 || total > n || (dinfo && dinfo != 32)) { R.rx_bad++; return -1; }
+    const uint8_t* payload = d + 24 + dinfo + shift;
+    if (is_c2h) {
+        rtw_c2h(payload, plen);
+    } else if (!crc && plen > 4) {
+        int rssi = physt && dinfo ? phy_rssi(d + 24 + shift) : -120;
+        R.rx_frames++;
+        rtw_rx_frame(payload, plen - 4, rate, rssi, icv);          // the 4-byte FCS is appended (RCR.APP_FCS)
+    } else R.rx_crc++;
+    return (total + 7) & ~7;
+}
+
 void rtw_rx_poll(void) {
     const uint8_t* buf;
     int got = 0;
+    if (R.hci) {                                                       // PCIe: one packet per receive buffer
+        for (int n; (n = rtwpci_rx_get(&buf)) > 0 && got < 16; got++) {
+            R.rx_bufs++;
+            rx_packet(buf, n);
+            rtwpci_rx_done();
+        }
+        return;
+    }
     for (int n; (n = xhci_wl_rx_get(&buf)) > 0 && got < 8; got++) {
         R.rx_bufs++;
         int off = 0;
         while (off + 24 <= n) {
-            const uint8_t* d = buf + off;
-            uint32_t w0 = le32p(d), w2 = le32p(d + 8), w3 = le32p(d + 12);
-            int plen = (int)(w0 & 0x3fff), crc = (int)((w0 >> 14) & 1), icv = (int)((w0 >> 15) & 1);
-            int dinfo = (int)((w0 >> 16) & 0xf) * 8, shift = (int)((w0 >> 24) & 3), physt = (int)((w0 >> 26) & 1);
-            int is_c2h = (int)((w2 >> 28) & 1);
-            int rate = (int)(w3 & 0x7f);
-            int total = 24 + dinfo + shift + plen;
-            if (plen == 0 || total > n - off || (dinfo && dinfo != 32)) { R.rx_bad++; break; }
-            const uint8_t* payload = d + 24 + dinfo + shift;
-            if (is_c2h) {
-                rtw_c2h(payload, plen);
-            } else if (!crc && plen > 4) {
-                int rssi = physt && dinfo ? phy_rssi(d + 24 + shift) : -120;
-                R.rx_frames++;
-                rtw_rx_frame(payload, plen - 4, rate, rssi, icv);          // the 4-byte FCS is appended (RCR.APP_FCS)
-            } else R.rx_crc++;
-            off += (total + 7) & ~7;
+            int used = rx_packet(buf + off, n - off);
+            if (used < 0) break;
+            off += used;
         }
         xhci_wl_rx_done();
     }
@@ -933,7 +1004,7 @@ static int parse_efuse(const uint8_t* m) {
     for (int g = 0; g < 14; g++) R.pwr_5g[g] = m[0x22 + g];
     R.ofdm_diff_2g = (int8_t)(m[0x1b] << 4) >> 4;                         // signed low nibble
     R.ofdm_diff_5g = (int8_t)(m[0x30] << 4) >> 4;
-    memcpy(R.mac, m + 0x107, 6);                                           // USB adapters keep the MAC at 0x107
+    memcpy(R.mac, m + (R.hci ? 0xd0 : 0x107), 6);                           // USB adapters keep the MAC at 0x107, PCIe ones at 0xd0
     int bad = 1;
     for (int i = 0; i < 6; i++) if (R.mac[i] != 0xff && R.mac[i] != 0) bad = 0;
     if (bad || (R.mac[0] & 1)) return -1;
@@ -943,10 +1014,17 @@ static int parse_efuse(const uint8_t* m) {
 int rtw_start(void) {
     struct xhci_wl_info wi;
     memset(&R, 0, sizeof R);
-    if (!xhci_wl_present(&wi)) { wlog("wifi: no supported USB adapter attached"); return -1; }
-    R.nout = wi.nout; R.speed = wi.speed; R.vid = wi.vid; R.pid = wi.pid;
-    wlog("wifi: adapter %x:%x, %d bulk OUT endpoints, USB speed %d", wi.vid, wi.pid, wi.nout, wi.speed);
+    if (xhci_wl_present(&wi)) {
+        R.nout = wi.nout; R.speed = wi.speed; R.vid = wi.vid; R.pid = wi.pid;
+        wlog("wifi: adapter %x:%x, %d bulk OUT endpoints, USB speed %d", wi.vid, wi.pid, wi.nout, wi.speed);
+    } else if (rtwpci_present()) {
+        R.hci = 1; R.nout = 4; R.vid = 0x10ec; R.pid = rtwpci_device_id();                      // queue tables: the PCIe rows equal the 4-endpoint USB ones
+        if (rtwpci_alloc()) { wlog("wifi: no memory for the PCIe rings"); R.hci = 0; return -1; }
+        wlog("wifi: PCIe adapter %x:%x", R.vid, R.pid);
+        rtwpci_hci_setup();
+    } else { wlog("wifi: no supported adapter (USB stick or PCIe card) found"); return -1; }
     R.chip_ver = rtw_r32(R_SYS_CFG1);
+    if (R.chip_ver == 0xFFFFFFFFu) { wlog("wifi: the adapter does not answer register reads"); return -1; }
     R.cut = (uint8_t)((R.chip_ver >> 12) & 0xf);
     wlog("wifi: SYS_CFG1 %08x (cut %u, %s), io errors so far %u", R.chip_ver, R.cut, (R.chip_ver & B(27)) ? "2T2R" : "1T1R", R.io_err);
     if (R.io_err) return -1;
@@ -968,6 +1046,7 @@ int rtw_start(void) {
     kfree(map);
     if (pr) { mac_power_off(); return -6; }
     mac_power_off();
+    if (R.hci) { rtwpci_phy_cfg(); rtwpci_hci_setup(); }
 
     // real start: power on, firmware, MAC, radio
     if (mac_power_on()) { wlog("wifi: second power-on failed"); return -7; }
@@ -975,13 +1054,13 @@ int rtw_start(void) {
     if (init_trx_cfg()) { mac_power_off(); return -9; }
     chip_mac_init();
     drv_info_cfg();
-    usb_interface_cfg();
+    if (!R.hci) usb_interface_cfg();
     phy_set_param();
     wlog("wifi: MAC and PHY initialised (io errors %u)", R.io_err);
     rtw_send_fw_info();
     coex_wifi_only();
     rtw_w8(R_C2HEVT, 0);
-    xhci_wl_rx_start();
+    if (!R.hci) xhci_wl_rx_start();
     rtw_w32(R_RCR, R.rcr);
     R.state = 2;
     for (int i = 0; i < 6; i++) rtw_w8(R_MACID + (uint32_t)i, R.mac[i]);       // our address (acknowledgements, unicast reception)

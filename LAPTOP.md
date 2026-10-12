@@ -69,7 +69,7 @@ moving, using the keyboard) and of `touchpad`; if `touchpad` says "NOT WORKING",
   (Synaptics SYNA3602) works since 2026-10-11 (moves the pointer; polled at 100 Hz, it starts 1.5 s after boot; starting at tick 0 left it answering only garbage, so the driver also restarts it when that happens),
   and so does a USB mouse (also behind a hub). Scrolling, taps and clicks are implemented but their feel is untuned.
   USB keyboards are not supported.
-* Wi-Fi: the built-in chip (Realtek RTL8821CE, PCIe) has no driver yet, but a Realtek USB Wi-Fi stick (8811CU / 8821CU) works: type `wifigui`
+* Wi-Fi: the built-in chip (Realtek RTL8821CE, PCIe) has a driver since 2026-10-12 that has not run on the real hardware yet: type `wifi start` and then `wifi status` (details: `wifi log`). A Realtek USB Wi-Fi stick (8811CU / 8821CU) works too: type `wifigui`
   (or `wifi` for the text commands), turn it on, pick a network, enter the password; the browser then reaches the internet (WPA2 networks only).
 * No hard disk access and no sound codecs tested.
 * The kernel needs no SSE2 and runs on a Pentium III or later; 256 MB of RAM or more. Under UEFI the memory map

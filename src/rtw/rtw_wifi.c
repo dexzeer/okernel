@@ -9,6 +9,7 @@
 #include "../string.h"
 #include "../net/network.h"
 #include "../xhci.h"
+#include "rtw_pci.h"
 
 extern uint32_t tick_count;
 
@@ -111,7 +112,7 @@ void rtw_ui_demo(int on) { memset(&demo, 0, sizeof demo); demo.on = on; }
 
 int rtw_ui_adapter(void) {
     if (demo.on || R.state == 2) return 2;
-    return xhci_wl_present(0) ? 1 : 0;
+    return (xhci_wl_present(0) || rtwpci_present()) ? 1 : 0;
 }
 
 static void copy_str(char* d, int cap, const char* s) { int i = 0; for (; s && s[i] && i < cap - 1; i++) d[i] = s[i]; d[i] = 0; }
@@ -121,7 +122,7 @@ void rtw_ui_adapter_name(char* buf, int cap) {
     if (R.state == 2) {
         char t[64];
         static const char hx[] = "0123456789ABCDEF";
-        const char* pre = "Realtek USB adapter ";
+        const char* pre = R.hci ? "Realtek PCIe adapter " : "Realtek USB adapter ";
         int n = 0;
         for (; pre[n]; n++) t[n] = pre[n];
         for (int i = 0; i < 6; i++) { t[n++] = hx[R.mac[i] >> 4]; t[n++] = hx[R.mac[i] & 15]; if (i < 5) t[n++] = ':'; }
@@ -129,7 +130,7 @@ void rtw_ui_adapter_name(char* buf, int cap) {
         copy_str(buf, cap, t);
         return;
     }
-    copy_str(buf, cap, xhci_wl_present(0) ? "Realtek USB adapter (not started)" : "No Wi-Fi adapter found");
+    copy_str(buf, cap, xhci_wl_present(0) ? "Realtek USB adapter (not started)" : rtwpci_present() ? "Realtek PCIe adapter (not started)" : "No Wi-Fi adapter found");
 }
 
 int rtw_ui_start(void) {

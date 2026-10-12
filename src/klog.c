@@ -5,6 +5,7 @@
 #include "memory.h"
 #include "string.h"
 #include "xhci.h"
+#include "rtw/rtw.h"
 #include "devlog.h"
 
 extern uint32_t tick_count;
@@ -149,6 +150,9 @@ void klog_poll(void) {
         int n = (int)strlen(snap);
         snap[n++] = '\n';
         i2chid_status(snap + n, 6000);
+        n = (int)strlen(snap);
+        snap[n++] = 10;
+        rtw_command("status", snap + n, 2500);                  // Wi-Fi adapter state
         wr(S0 + 513, snap, KLOG_SNAP_SECTORS / 2);             // 16 KB are plenty
     }
 }
