@@ -94,7 +94,7 @@ MEDIA_OBJ = $(patsubst %,src/media/%.o,$(MEDIA_SRC))
 src/media/%.o: src/media/%.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
 src/userland_seed.o: $(USERLAND_GEN)
-DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) src/hda.o src/pcix.o src/acpi_pm.o src/xhci.o src/wifigui.o src/rtw/rtw_hw.o src/rtw/rtw_wifi.o src/rtw/wsta.o src/rtw/wcrypto.o src/rtw/rtw_tables.o src/rtw/rtwfw.o src/hid.o src/devlog.o src/dwi2c.o src/hidi2c.o src/ptp.o src/i2caml.o src/i2chid.o src/klog.o src/virtio.o src/vgpu.o src/i915.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
+DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) src/hda.o src/pcix.o src/acpi_pm.o src/xhci.o src/wifigui.o src/rtw/rtw_hw.o src/rtw/rtw_pci.o src/rtw/rtw_wifi.o src/rtw/wsta.o src/rtw/wcrypto.o src/rtw/rtw_tables.o src/rtw/rtwfw.o src/hid.o src/devlog.o src/dwi2c.o src/hidi2c.o src/ptp.o src/i2caml.o src/i2chid.o src/klog.o src/virtio.o src/vgpu.o src/i915.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
               src/font_data.o $(WEB_OBJ) $(OJS_OBJ) \
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/aes.o src/crypto/chacha20.o src/crypto/poly1305.o \
@@ -159,7 +159,7 @@ host-tests:
 	gcc -m32 -O1 -fsanitize=address,undefined -Isrc -o build-host/t_acpi tests/test_acpi.c && ./build-host/t_acpi | tail -n 1
 	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc -o build-host/t_hid tests/test_hid.c src/hid.c && ./build-host/t_hid | tail -n 1
 	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc -o build-host/t_touch tests/test_touch.c src/hid.c src/ptp.c src/dwi2c.c src/hidi2c.c src/i2caml.c && ./build-host/t_touch | tail -n 1
-	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc -o build-host/t_rtw tests/test_rtw.c src/rtw/rtw_tables.c src/rtw/wsta.c src/rtw/wcrypto.c src/crypto/sha1.c src/crypto/aes.c && ./build-host/t_rtw | tail -n 1
+	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc -o build-host/t_rtw -DRTWPCI_HOST tests/test_rtw.c src/rtw/rtw_pci.c src/rtw/rtw_tables.c src/rtw/wsta.c src/rtw/wcrypto.c src/crypto/sha1.c src/crypto/aes.c && ./build-host/t_rtw | tail -n 1
 	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_wcrypto tests/test_wcrypto.c src/rtw/wcrypto.c src/crypto/sha1.c src/crypto/aes.c && (python3 tests/wcrypto_vectors.py 1 | ./build-host/t_wcrypto | tail -n 1)
 	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_wsta tests/test_wsta.c src/rtw/wsta.c src/rtw/wcrypto.c src/crypto/sha1.c src/crypto/aes.c && ./build-host/t_wsta | tail -n 1
 	gcc -m32 -O1 -fsanitize=address,undefined -o build-host/t_i915 tests/test_i915.c src/i915.c && ./build-host/t_i915 | tail -n 1

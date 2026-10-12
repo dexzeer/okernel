@@ -8,6 +8,7 @@
 #include <string.h>
 #include <stdint.h>
 #include "../src/xhci.h"
+#include "../src/rtw/rtw_pci.h"
 char* strstr(const char*, const char*);
 
 __asm__(".section .rodata\n.global rtw_fw_start\nrtw_fw_start:\n.incbin \"firmware/rtw8821c_fw.bin\"\n.global rtw_fw_end\nrtw_fw_end:\n.byte 0\n.text\n");
@@ -23,6 +24,8 @@ uint8_t* net_get_gateway(void) { static uint8_t ip[4] = { 192, 168, 1, 1 }; retu
 int net_wifi_bound(void) { return 1; }
 int rand_bytes(uint8_t* o, uint32_t n) { (void)o; (void)n; return 0; }          // not seeded: the driver falls back to its own mixing
 void* kmalloc(uint32_t n) { return malloc(n); }
+void* kcalloc(uint32_t n, uint32_t sz) { return calloc(n, sz); }
+void rtwpci_host_attach(uint16_t did);
 void kfree(void* p) { free(p); }
 int devlog_fmt(char* out, int cap, const char* fmt, va_list ap);
 static int vlog_n;
@@ -100,11 +103,9 @@ int xhci_wl_ctrl(int in, uint8_t req, uint16_t value, uint16_t index, void* buf,
     else { memcpy(regs + value, buf, len); model_write_hook(value, len); }
     return len;
 }
-int xhci_wl_bulk_out(int ep, const void* data, uint32_t len) {
-    (void)ep;
+static int pci_mode;
+static int tx_model(const uint8_t* d, uint32_t len, int ep) {
     bulk_calls++;
-    if (getenv("RTW_LOG") && bulk_calls < 6) printf("bulk ep %d len %u\n", ep, len);
-    const uint8_t* d = data;
     if (len < 48) return -1;
     uint32_t w0 = (uint32_t)d[0] | (d[1] << 8) | (d[2] << 16) | ((uint32_t)d[3] << 24), w1 = (uint32_t)d[4] | (d[5] << 8) | (d[6] << 16) | ((uint32_t)d[7] << 24);
     uint32_t qsel = (w1 >> 8) & 0x1f;
@@ -112,14 +113,86 @@ int xhci_wl_bulk_out(int ep, const void* data, uint32_t len) {
     CHECK((w0 & 0xffff) == len - 48 || qsel == 19);
     uint16_t x = 0;
     for (int i = 0; i < 16; i++) x ^= (uint16_t)(d[2 * i] | (d[2 * i + 1] << 8));
-    CHECK(x == 0);                                                                   // the descriptor checksum folds to zero
+    if (!pci_mode) CHECK(x == 0);                                                    // the descriptor checksum folds to zero (USB only)
     if (qsel == 16) { memcpy(last_page, d, len < sizeof last_page ? len : sizeof last_page); last_page_len = (int)len; wr32m(0x204, rd32m(0x204) | (1u << 15)); }
     return 0;
+}
+int xhci_wl_bulk_out(int ep, const void* data, uint32_t len) {
+    if (getenv("RTW_LOG") && bulk_calls < 6) printf("bulk ep %d len %u\n", ep, len);
+    return tx_model(data, len, ep);
 }
 void xhci_wl_rx_start(void) {}
 int xhci_wl_rx_get(const uint8_t** data) { if (rx_i >= rx_n) return 0; *data = rx_q[rx_i]; return rx_len[rx_i]; }
 void xhci_wl_rx_done(void) { rx_i++; }
 void xhci_wl_pump(void) {}
+
+// ---- PCIe flavour of the model: registers through MMIO hooks, frames through descriptor rings in "DMA" memory ---------------------------
+static const uint16_t m_desa[8] = { 0x330, 0x328, 0x320, 0x318, 0x310, 0x340, 0x1320, 0x308 };
+static const uint16_t m_num[8]  = { 0x38A, 0x388, 0x386, 0x384, 0x380, 0x38C, 0x1328, 0 };
+static const uint16_t m_idx[8]  = { 0x3AC, 0x3A8, 0x3A4, 0x3A0, 0x3B0, 0x3B8, 0x132C, 0 };
+static int pci_tx_pkts, pci_bad_bd;
+static uint8_t* dma_ptr(uint32_t phys) { return (uint8_t*)(uintptr_t)(phys + 0xC0000000u); }
+static uint16_t rd16m(uint32_t a) { return (uint16_t)(regs[a] | (regs[a + 1] << 8)); }
+
+static void pci_one_tx(const uint8_t* bd, int own_expected) {
+    uint16_t size0 = (uint16_t)(bd[0] | (bd[1] << 8)), psb = (uint16_t)(bd[2] | (bd[3] << 8));
+    uint32_t dma0 = (uint32_t)bd[4] | (bd[5] << 8) | (bd[6] << 16) | ((uint32_t)bd[7] << 24);
+    uint16_t size1 = (uint16_t)(bd[8] | (bd[9] << 8));
+    uint32_t dma1 = (uint32_t)bd[12] | (bd[13] << 8) | (bd[14] << 16) | ((uint32_t)bd[15] << 24);
+    if (size0 != 48 || dma1 != dma0 + 48 || ((psb & 0x7fff) != (uint16_t)((size0 + size1 - 1) / 128 + 1)) || (!!(psb & 0x8000)) != own_expected) { pci_bad_bd++; return; }
+    static uint8_t pk[8192];
+    memcpy(pk, dma_ptr(dma0), size0);
+    memcpy(pk + size0, dma_ptr(dma1), size1);
+    pci_tx_pkts++;
+    tx_model(pk, (uint32_t)(size0 + size1), 0);
+}
+
+static void pci_process_queue(int q) {
+    uint32_t base = rd32m(m_desa[q]);
+    int len = rd16m(m_num[q]);
+    uint32_t reg = rd32m(m_idx[q]);
+    int hw = (int)((reg >> 16) & 0xfff), host = (int)(reg & 0xfff);
+    if (!len || host >= len) { pci_bad_bd++; return; }
+    while (hw != host) { pci_one_tx(dma_ptr(base) + hw * 16, 0); hw = (hw + 1) % len; }
+    regs[m_idx[q] + 2] = (uint8_t)hw; regs[m_idx[q] + 3] = (uint8_t)(hw >> 8);
+}
+
+static uint32_t reset_after_clr;
+static void pci_write_hook(uint32_t a, int len) {
+    for (int q = 0; q < 7; q++) if (a == m_idx[q] && len == 2) pci_process_queue(q);
+    if (a == 0x383 && (regs[0x383] & 0x10)) { pci_one_tx(dma_ptr(rd32m(0x308)), 1); regs[0x383] &= (uint8_t)~0x10; }
+    if (a == 0x39C) { for (int q = 0; q < 7; q++) wr32m(m_idx[q], 0); wr32m(0x3B4, 0); reset_after_clr++; }
+    if (a == 0x3F8 || a == 0x3FB) regs[0x3F8] &= (uint8_t)~0x20;                       // MDIO write completes at once
+}
+
+uint32_t host_mmio_rd(uint32_t addr, int len) {
+    model_read_hook(addr, len);
+    uint32_t v = 0;
+    for (int i = 0; i < len; i++) v |= (uint32_t)regs[addr + i] << (8 * i);
+    return v;
+}
+void host_mmio_wr(uint32_t addr, uint32_t v, int len) {
+    for (int i = 0; i < len; i++) regs[addr + i] = (uint8_t)(v >> (8 * i));
+    model_write_hook(addr, len);
+    if (pci_mode) pci_write_hook(addr, len);
+}
+
+// the chip delivers one received packet into the next buffer of the receive ring
+static int pci_rx_push(const uint8_t* pkt, int n) {
+    uint32_t base = rd32m(0x338);
+    int len = rd16m(0x382);
+    int hw = (int)((rd32m(0x3B4) >> 16) & 0xfff), host = (int)(rd32m(0x3B4) & 0xfff);
+    if (!len || (hw + 1) % len == host) return -1;                                      // ring full
+    const uint8_t* bd = dma_ptr(base) + hw * 8;
+    uint16_t bsz = (uint16_t)(bd[0] | (bd[1] << 8));
+    uint32_t dma = (uint32_t)bd[4] | (bd[5] << 8) | (bd[6] << 16) | ((uint32_t)bd[7] << 24);
+    if (bsz != 11478 || n > bsz) { pci_bad_bd++; return -1; }
+    memset(dma_ptr(dma), 0, 64);
+    memcpy(dma_ptr(dma), pkt, (size_t)n);
+    hw = (hw + 1) % len;
+    regs[0x3B6] = (uint8_t)hw; regs[0x3B7] = (uint8_t)(hw >> 8);
+    return 0;
+}
 
 #include "../src/rtw/rtw_hw.c"
 #include "../src/rtw/rtw_wifi.c"
@@ -249,6 +322,72 @@ int main(void) {
         CHECK(((w9 >> 12) & 0xfff) == 0x075);
     }
     CHECK(rtw_tx_frame(df, 5, 1) < 0 && rtw_tx_frame(df, 5000, 1) < 0);
+
+    // ---- the same chip behind PCIe: rings instead of endpoints, registers by MMIO -------------------------------------
+    {
+        wl_present = 0; pci_mode = 1;
+        rtwpci_host_attach(0xc821);
+        memset(regs, 0, sizeof regs); memset(dmem_img, 0, sizeof dmem_img); memset(imem_img, 0, sizeof imem_img); memset(emem_img, 0, sizeof emem_img);
+        uint8_t lp[512];
+        memset(lp, 0xff, sizeof lp);
+        memcpy(lp, lg, 0xd0);
+        memcpy(lp + 0xd0, mac, 6);                                                   // PCIe adapters keep the MAC at 0xd0
+        build_efuse(lp);
+        regs[0x100] = 0xEA;
+        wr32m(0xF0, (0x2u << 12) | (1u << 23));
+        bulk_calls = 0; ef_pending = 0; last_page_len = 0;
+        int rp = rtw_start();
+        CHECK(rp == 0);
+        CHECK(R.hci == 1 && R.state == 2 && R.vid == 0x10ec);
+        CHECK(!memcmp(R.mac, mac, 6));
+        CHECK(pci_bad_bd == 0);
+        CHECK(!memcmp(dmem_img, fw + 64, dsz));                                      // the firmware went through the beacon ring
+        CHECK(!memcmp(imem_img, fw + 64 + dsz, isz));
+        CHECK(!memcmp(emem_img, fw + 64 + dsz + isz, esz));
+        CHECK(R.channel == 1 && R.io_err == 0);
+        CHECK(reset_after_clr >= 3);                                                 // ring pointers were reset before each power-on and after each firmware start
+        CHECK(rd32m(0x300) & (1u << 20));                                            // DMA reset + RX tags
+        CHECK(rd32m(0x338) != 0 && rd16m(0x382) == 128);                             // receive ring programmed
+        CHECK(rd32m(0x310) != 0 && rd16m(0x380) == 16);                              // management ring
+        CHECK(rd32m(0x608) == (0xE400220Eu | (1u << 28)));
+        CHECK(pci_tx_pkts > 10);                                                     // firmware pages and H2C commands
+        // received beacons: one per ring buffer
+        int sc0 = (int)R.rx_frames;
+        static uint8_t pb[600];
+        int m1 = put_beacon(pb, "pcie-net", 6, b1, 1);
+        CHECK(pci_rx_push(pb, m1) == 0);
+        static uint8_t pb2[600];
+        int m2 = put_beacon(pb2, "pcie-open", 11, b2, 0);
+        CHECK(pci_rx_push(pb2, m2) == 0);
+        rtw_command("scan", out, sizeof out);
+        for (int i = 0; i < 400; i++) { tick_count += 20; rtw_poll(); }
+        rtw_command("list", out, sizeof out);
+        CHECK((int)R.rx_frames - sc0 == 2);
+        CHECK(strstr(out, "pcie-net") && strstr(out, "WPA2") && strstr(out, "pcie-open"));
+        CHECK((rd32m(0x3B4) & 0xfff) == 2);                                          // the host index moved past both buffers
+        // the ring survives wrapping: 300 more packets through 128 buffers
+        int pushed = 0;
+        for (int i = 0; i < 300; i++) {
+            while (pci_rx_push(pb2, m2) < 0) { rtw_rx_poll(); }
+            pushed++;
+            if ((i & 7) == 7) rtw_rx_poll();
+        }
+        rtw_rx_poll();
+        CHECK(pushed == 300 && R.rx_bad == 0);
+        // transmit: management and data frames go to their rings with the right descriptors
+        int before = pci_tx_pkts;
+        CHECK(rtw_tx_frame(mf, 30, 0) == 0);
+        CHECK(pci_tx_pkts == before + 1 && last_tx_len == 48 + 30 && !memcmp(last_tx + 48, mf, 30));
+        CHECK(((last_tx[5]) & 0x1f) == 18);
+        CHECK(rtw_tx_frame(df, 60, 1) == 0);
+        CHECK(pci_tx_pkts == before + 2 && !memcmp(last_tx + 48, df, 60) && (last_tx[5] & 0x1f) == 0);
+        for (int i = 0; i < 100; i++) CHECK(rtw_tx_frame(df, 60, 1) == 0);           // more than the ring holds: slots are reused
+        CHECK(pci_tx_pkts == before + 102 && pci_bad_bd == 0);
+        // a second start (power cycle) works too
+        CHECK(rtw_start() == 0 && R.state == 2 && pci_bad_bd == 0);
+        pci_mode = 0;
+        rtwpci_host_attach(0);
+    }
 
     // no adapter: a clean failure
     wl_present = 0;

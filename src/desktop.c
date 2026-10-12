@@ -39,6 +39,7 @@
 #include "klog.h"
 #include "devlog.h"
 #include "rtw/rtw.h"
+#include "rtw/rtw_pci.h"
 #include "wifigui.h"
 #include "smp.h"
 #include "prof.h"
@@ -1721,6 +1722,7 @@ void kernel_main(uint32_t mboot_phys) {
     // Init input
     mouse_init_fb();
     xhci_init(mboot_phys);      // USB controller + a USB mouse (laptops without a PS/2 pointer); fail-safe
+    rtwpci_init();              // the built-in Realtek Wi-Fi card, if any (registers mapped now; started by `wifi start` / wifigui)
     i2chid_init(mboot_phys);    // I2C-HID touchpad (only when the AML describes one); fail-safe
     keyboard_init();
     keyboard_set_callback(on_key_irq);

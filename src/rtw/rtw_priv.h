@@ -9,6 +9,7 @@
 // the adapter's state
 struct rtw {
     int state;                              // 0 off, 2 running
+    int hci;                                // 0 USB, 1 PCIe
     uint16_t vid, pid;
     int nout, speed;
     uint32_t chip_ver;
