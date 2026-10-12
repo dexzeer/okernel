@@ -182,6 +182,20 @@ static void unit_tests(void) {
         CHECK(!strcmp(out, "https://a.com/foo/baz"), "url dots (%s)", out);
         wurl_resolve("http://a.com:8080/a/b", "/c", 2, out, sizeof out);
         CHECK(!strcmp(out, "http://a.com:8080/c"), "url port (%s)", out);
+        // characters that cannot appear in a request line are percent-encoded (spaces in a query, quotes, braces in a path, non-ASCII)
+        { const char* r = "//d.com/p q/{x}?q=linux kernel&a=\"b\"<c>#frag ment";
+          wurl_resolve("https://a.com/", r, (int)strlen(r), out, sizeof out);
+          CHECK(!strcmp(out, "https://d.com/p%20q/%7Bx%7D?q=linux%20kernel&a=%22b%22%3Cc%3E#frag ment"), "url encoding (%s)", out); }
+        { const char* r = "/s?q=caf\xc3\xa9&z=%41";
+          wurl_resolve("https://a.com/", r, (int)strlen(r), out, sizeof out);
+          CHECK(!strcmp(out, "https://a.com/s?q=caf%C3%A9&z=%41"), "url utf-8 + existing escapes (%s)", out); }
+        { const char* r = "data:text/html,<p>a b</p>";
+          wurl_resolve("https://a.com/", r, (int)strlen(r), out, sizeof out);
+          CHECK(!strcmp(out, "data:text/html,<p>a b</p>"), "data: urls are untouched (%s)", out); }
+        { const char* r = "/x y";
+          char tiny[12];
+          wurl_resolve("https://a.com/", r, (int)strlen(r), tiny, sizeof tiny);
+          CHECK(tiny[0] == 0 || !strcmp(tiny, "https://a.c") || strlen(tiny) < sizeof tiny, "url encoding never overruns"); }
     }
 }
 
