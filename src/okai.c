@@ -399,6 +399,9 @@ struct oreq {
     int redirects, retried;
     int cors;                  // script request (fetch/XHR): send Origin cross-origin
     int as_get;                // a redirect turned the request into a bodyless GET
+    const char* post;          // main document only: body of a form POST (owned by the tab), NULL = GET
+    int post_len;
+    const char* post_ref;      // the page the form was on
     int h;                     // fetch handle, -1 = none
     char url[OKAI_URL_LEN];
 };
@@ -428,6 +431,9 @@ static struct oreq* req_new(int bi, int tab, struct wdoc* doc, int sub_id, const
         q->redirects = q->retried = 0;
         q->cors = 0;
         q->as_get = 0;
+        q->post = 0;
+        q->post_len = 0;
+        q->post_ref = 0;
         q->h = -1;
         scopy(q->url, url, OKAI_URL_LEN);
         return q;
@@ -522,6 +528,23 @@ static int req_fetch(struct oreq* q, const char* top) {
                 hs = e;
                 while (*hs == '\r' || *hs == '\n') hs++;
             }
+        }
+    }
+    if (!q->doc && q->sub_id < 0 && q->post && q->post_len > 0 && !q->as_get) {
+        // a form POST navigation: the body, its type, and the Origin / Referer servers check on POSTs
+        o.method = "POST";
+        o.body = (const uint8_t*)q->post;
+        o.body_len = (uint32_t)q->post_len;
+        static const char ct[] = "Content-Type: application/x-www-form-urlencoded\r\n";
+        if (n + (int)sizeof ct < (int)sizeof cookie_hdr - 600) { memcpy(cookie_hdr + n, ct, sizeof ct - 1); n += (int)sizeof ct - 1; }
+        if (q->post_ref && q->post_ref[0]) {
+            char og[256];
+            url_origin(q->post_ref, og, sizeof og);
+            const char* parts[4] = { "Origin: ", og, "\r\nReferer: ", q->post_ref };
+            for (int pi = 0; pi < 4; pi++)
+                for (const char* s = parts[pi]; *s && n < (int)sizeof cookie_hdr - 8; s++) cookie_hdr[n++] = *s;
+            cookie_hdr[n++] = '\r';
+            cookie_hdr[n++] = '\n';
         }
     }
     cookie_hdr[n] = 0;
@@ -751,7 +774,14 @@ struct okai_tab* okai_tab_of(struct okai* b) { return &b->tabs[b->active_tab]; }
 int okai_window_count(void) { return okai_count; }
 
 // Per-load state (navigation keeps url/history/doc).
+static void tab_post_clear(struct okai_tab* T) {
+    if (T->post_body) kfree(T->post_body);
+    T->post_body = 0;
+    T->post_len = 0;
+}
+
 static void tab_reset_load(struct okai_tab* T) {
+    tab_post_clear(T);
     T->load_state = 0;
     T->redirect_count = 0;
     T->https_fell_back = 0;
@@ -790,6 +820,7 @@ static void okai_tab_reset(struct okai_tab* T) {
 static void tab_dispose(int id, int tab) {
     struct okai_tab* T = &okais[id].tabs[tab];
     if (T->doc) { doc_free(T->doc); T->doc = 0; }
+    tab_post_clear(T);
     req_tab_removed(id, tab);
 }
 
@@ -1229,6 +1260,9 @@ static int start_main_fetch(int id, int tab) {
     T->is_https = url_is_https(T->url);
     struct oreq* q = req_new(id, tab, 0, -1, T->url);
     if (!q) return 2;
+    q->post = T->post_body;
+    q->post_len = T->post_len;
+    q->post_ref = T->post_ref;
     int r = req_fetch(q, 0);
     if (r == -2) { q->used = 0; return 2; }
     if (r < 0) {
@@ -1337,6 +1371,7 @@ static int follow_redirect(int id, struct okai_tab* T, const struct resp_info* r
     if (wurl_resolve(T->url, ri->location, (int)strlen(ri->location), abs, sizeof abs) <= 0) return 0;
     if (!url_is_http(abs)) return 0;
     T->redirect_count++;
+    if (ri->status != 307 && ri->status != 308) tab_post_clear(T);   // 301/302/303: the POST becomes a GET
     scopy(T->url, abs, OKAI_URL_LEN);
     // a redirect replaces the history entry (it is not a new page)
     if (T->history_count > 0) scopy(T->history[T->history_pos], T->url, OKAI_URL_LEN);
@@ -1675,6 +1710,9 @@ static int req_reissue(const struct oreq* cur, const char* top) {
     q->retried = cur->retried;
     q->cors = cur->cors;
     q->as_get = cur->as_get;
+    q->post = cur->post;
+    q->post_len = cur->post_len;
+    q->post_ref = cur->post_ref;
     if (req_fetch(q, top) != 0) { q->used = 0; return 0; }
     return 1;
 }
@@ -1722,6 +1760,9 @@ static void main_complete(int bi, int tab, struct oreq* cur, int st, char* resp,
         if (follow_redirect(bi, T, &ri)) {
             fetch_end(cur->h);
             scopy(cur->url, T->url, OKAI_URL_LEN);
+            cur->post = T->post_body;                      // still there after a 307/308, gone after 301/302/303
+            cur->post_len = T->post_len;
+            cur->post_ref = T->post_ref;
             if (!req_reissue(cur, 0)) show_error(bi, tab);
             return;
         }
@@ -2160,12 +2201,25 @@ static void submit_form_node(int id, struct okai_tab* T, int form, int submitter
         }
     }
     q[ql] = 0;
-    if (attr_ieq(d, form, A_method, "post")) serial_puts("[okai] POST form submitted as GET\n");
     static char action[OKAI_URL_LEN];
     char url[OKAI_URL_LEN];
     int al;
     const char* a = wdom_attr(d, form, A_action, &al);
     if (!a || !al || wurl_resolve(T->url, a, al, action, sizeof action) <= 0) scopy(action, T->url, sizeof action);
+    if (attr_ieq(d, form, A_method, "post")) {
+        // method=post: the fields travel in the request body (urlencoded; multipart uploads are not supported)
+        static char referer[OKAI_URL_LEN];
+        scopy(referer, T->url, sizeof referer);
+        serial_printf("[okai] submit form (POST, %d bytes) -> %s\n", ql, action);
+        okai_navigate(id, action);                       // resets the tab's load state (and any older POST body)
+        T->post_body = (char*)kmalloc((size_t)ql + 1);
+        if (T->post_body) {
+            memcpy(T->post_body, q, (size_t)ql + 1);
+            T->post_len = ql;
+            scopy(T->post_ref, referer, sizeof T->post_ref);
+        }
+        return;
+    }
     // the query replaces the action's query + fragment
     int ul = 0;
     while (action[ul] && action[ul] != '?' && action[ul] != '#' && ul < OKAI_URL_LEN - 2) { url[ul] = action[ul]; ul++; }
