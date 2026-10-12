@@ -45,6 +45,7 @@ static struct {
     int have_touch;
     struct ptp ptp;
     uint32_t reports, errors, empty, unmatched, last_tick, fails;
+    uint32_t moves, move_abs, taps, dbg_n, dec_fail;       // gesture output: injected moves, sum of |dx|+|dy|, button events; decoded-frame log budget
     int button;
     int logged;
     int paused;                        // `touchpad off`
@@ -555,9 +556,15 @@ static void process(const uint8_t* b, int n, uint32_t now) {
             struct ptp_out o;
             T.button = button;
             ptp_report(&T.ptp, now, c, nc, count, button, &o);
+            if (T.dbg_n < 80 && nc > 0 && c[0].tip) {                 // the first 80 frames with a finger down: what the gesture code made of them
+                T.dbg_n++;
+                tlog("ct n=%d count=%d tip=%d id=%d x=%d y=%d btn=%d -> dx=%d dy=%d wheel=%d", nc, count, c[0].tip, c[0].id, c[0].x, c[0].y, button, o.dx, o.dy, o.wheel);
+            }
+            if (o.dx || o.dy) { T.moves++; T.move_abs += (uint32_t)((o.dx < 0 ? -o.dx : o.dx) + (o.dy < 0 ? -o.dy : o.dy)); }
             if (o.changed) mouse_inject(o.dx, o.dy, o.wheel, o.buttons);
             return;
         }
+        T.dec_fail++;
     }
     for (int i = 0; i < T.nptr; i++) {
         int rx, ry, w, bt;
@@ -656,8 +663,13 @@ void i2chid_status(char* buf, int cap) {
                      T.state == 4 ? "controller not located (`touchpad scan` hunts for it)" : T.state == 5 ? "starting (address from the AML)" : "no I2C-HID device in ACPI";
     int at = sfmt(buf, cap, 0, "touchpad: %s, reports %u, empty polls %u, errors %u, unmatched %u", st, T.reports, T.empty, T.errors, T.unmatched);
     if (T.state == 2)
-        at = sfmt(buf, cap, at, "input reads: %u NACK, %u length 0, %u length ffff, %u not a report; interrupt line low %u polls, %u edges, %u reports while low",
+        at = sfmt(buf, cap, at, "input: %u NACK, %u len 0, %u len ffff, %u bad; line low %u polls, %u edges, %u rep while low",
                   T.h.nack, T.h.zeros, T.h.ones, T.h.stale, T.attn_low, T.attn_edges, T.reports_low);
+    if (T.state == 2) {
+        int cx, cy;
+        mouse_get_position(&cx, &cy);
+        at = sfmt(buf, cap, at, "gestures: %u moves, %u px total, %u frames not decoded; cursor at %d,%d", T.moves, T.move_abs, T.dec_fail, cx, cy);
+    }
     if (T.state == 1)
         at = sfmt(buf, cap, at, "hunt: %s at %x, %u pages read, %d controller block(s) found%s", tick_count < SCAN_START_TICK ? "starts soon" : "now", S.w, S.pages, T.nblk,
                   T.paused ? " (paused)" : "");
