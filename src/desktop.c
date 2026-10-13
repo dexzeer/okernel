@@ -758,7 +758,6 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  terminal  - open new terminal\n");
         window_puts(win_id, "  exit      - close this terminal\n");
         window_puts(win_id, "  okai   - open web okai\n");
-        window_puts(win_id, "  search    - search the web (search WORDS | engine NAME)\n");
         window_puts(win_id, "  wifigui   - Wi-Fi window (scan, connect)\n");
         window_puts(win_id, "  ls        - list files\n");
         window_puts(win_id, "  save      - force one file to disk\n");
@@ -852,35 +851,6 @@ static void shell_execute(int win_id, const char* input) {
             window_puts(win_id, args);
             window_puts(win_id, "...\n");
             dns_resolve(args);
-        }
-    }
-    else if (str_eq(cmd_buf, "search")) {
-        // "search WORDS" opens a search in okai; "search engine [NAME]" shows / picks the engine. The browser's address
-        // bar does the same with any text that is not an address.
-        if (args[0] == 'e' && args[1] == 'n' && args[2] == 'g' && args[3] == 'i' && args[4] == 'n' && args[5] == 'e' && (args[6] == 0 || args[6] == ' ')) {
-            const char* nm = args + 6;
-            while (*nm == ' ') nm++;
-            if (*nm && !okai_search_engine_set(nm)) window_puts(win_id, "unknown engine\n");
-            window_puts(win_id, "engine:");
-            for (int i = 0; okai_search_engine_name(i); i++) {
-                window_puts(win_id, i == okai_search_engine_current() ? " [" : " ");
-                window_puts(win_id, okai_search_engine_name(i));
-                if (i == okai_search_engine_current()) window_put_char(win_id, ']');
-            }
-            window_put_char(win_id, '\n');
-        } else if (!args[0]) {
-            window_puts(win_id, "search WORDS         search the web in okai\n");
-            window_puts(win_id, "search engine [NAME] show / choose the engine\n");
-        } else {
-            static char surl[OKAI_URL_LEN];
-            okai_search_url(args, surl, sizeof surl);
-            if (okai_window_count() > 0) {
-                okai_new_tab(0, surl);
-                window_set_focus(okai_get(0)->win_id);
-            } else okai_open(surl);
-            window_puts(win_id, "Searching with ");
-            window_puts(win_id, okai_search_engine_name(okai_search_engine_current()));
-            window_put_char(win_id, '\n');
         }
     }
     else if (str_eq(cmd_buf, "okai")) {
