@@ -759,6 +759,7 @@ void okai_init(void) {
         okais[i].active_tab = 0;
         okais[i].tab_count = 0;
         okais[i].show_security = 0;
+        okais[i].focus_slot = -1;
         okais[i].page_px = 0;
         okais[i].page_w = okais[i].page_h = okais[i].page_cap = 0;
         for (int t = 0; t < OKAI_SLOTS; t++) {
@@ -838,6 +839,7 @@ int okai_switch_tab(int id, int tab) {
     struct okai* b = &okais[id];
     if (tab < 0 || tab >= b->tab_count || tab == b->active_tab) return -1;
     b->active_tab = tab;
+    b->focus_slot = -1;
     b->chrome_dirty = 1;
     okai_render_content(id);
     serial_printf("[okai] switch tab -> %d (%s)\n", tab, b->tabs[tab].url);
@@ -1302,6 +1304,7 @@ static void frame_free(int bi, int slot) {
     if (!F->frame_used) return;
     frames_drop_children(bi, slot);
     req_cancel_tab(bi, slot);
+    if (b->focus_slot == slot) b->focus_slot = -1;
     if (F->doc) { doc_free(F->doc); F->doc = 0; }
     tab_post_clear(F);
     if (F->fpx) { kfree(F->fpx); F->fpx = 0; F->fpx_cap = 0; }
@@ -1489,6 +1492,17 @@ static void frames_check_sizes(int bi, int slot) {
         if (wdoc_video_dest(P->doc, F->parent_node, &dx, &dy, &dw, &dh, &fixed) && dw > 0 && dh > 0 && (dw != F->fw || dh != F->fh))
             request_render(F, 0);
     }
+}
+
+// Scroll the document of a slot: the tab's page (scroll_to) or an iframe's own content.
+static void scroll_slot(int id, int slot, int ny) {
+    if (!slot_is_frame(slot)) { scroll_to(id, ny); return; }
+    struct okai_tab* F = &okais[id].tabs[slot];
+    int maxs = F->content_height - F->fh;
+    if (maxs < 0) maxs = 0;
+    if (ny > maxs) ny = maxs;
+    if (ny < 0) ny = 0;
+    if (ny != F->scroll_y) { F->scroll_y = ny; F->js_scroll_evt = 1; request_render(F, 0); }
 }
 
 // Frame documents that are due to paint.
@@ -2187,6 +2201,7 @@ int okai_open(const char* url) {
     b->addr_input_len = 0;
     b->addr_input[0] = 0;
     b->show_security = 0;
+    b->focus_slot = -1;
     b->chrome_dirty = 1;
     okai_tab_reset(&b->tabs[0]);
     b->tabs[0].anim_w = 0;
@@ -2616,15 +2631,26 @@ static int label_control(struct wdom* d, int node) {
     return -1;
 }
 
-int okai_content_click(int id, int mx, int my) {
-    if (id < 0 || id >= MAX_OKAIS) return 0;
+static void scroll_slot(int id, int slot, int ny);
+
+// A click at (x, y) in the viewport of `slot` (a tab's page area or an iframe's bitmap). (mx, my): screen position, for the log.
+static int tab_click(int id, int slot, int x, int y, int mx, int my) {
     struct okai* b = &okais[id];
-    if (b->win_id < 0) return 0;
-    struct okai_tab* T = okai_tab_of(b);
-    int sx, sy, pw, ph;
-    if (!page_geom(b, &sx, &sy, &pw, &ph)) return 0;
-    int x = mx - sx, y = my - sy;
-    if (x < 0 || y < 0 || x >= pw || y >= ph || !T->doc) return 0;
+    struct okai_tab* T = &b->tabs[slot];
+    if (!T->doc) return 0;
+    // an iframe under the pointer takes the click (and the keyboard focus)
+    for (int s = OKAI_MAX_TABS; s < OKAI_SLOTS; s++) {
+        struct okai_tab* F = &b->tabs[s];
+        if (!F->frame_used || F->parent_slot != slot || !F->first_paint) continue;
+        int dx, dy, dw, dh, fixed;
+        if (!wdoc_video_dest(T->doc, F->parent_node, &dx, &dy, &dw, &dh, &fixed)) continue;
+        int ry = dy - (fixed ? 0 : T->scroll_y);
+        if (x >= dx && x < dx + dw && y >= ry && y < ry + dh) {
+            b->focus_slot = s;
+            serial_printf("[okai] click in frame %d at %d,%d\n", s, x - dx, y - ry);
+            return tab_click(id, s, x - dx, y - ry, mx, my);
+        }
+    }
     static struct wdoc_hit hit;
     struct job j;
     memset(&j, 0, sizeof j);
@@ -2678,11 +2704,11 @@ int okai_content_click(int id, int mx, int my) {
                 j.doc = T->doc;
                 j.frag = hs + 1;
                 run_job(&j);
-                if (j.result >= 0) scroll_to(id, j.result);
+                if (j.result >= 0) scroll_slot(id, slot, j.result);
                 return 1;
             }
         }
-        okai_navigate(id, hit.href);
+        navigate_slot(id, slot, hit.href, !slot_is_frame(slot));
         return 1;
     }
     if (hit.kind == WDOC_HIT_NONE) {
@@ -2722,6 +2748,27 @@ int okai_content_click(int id, int mx, int my) {
     }
     if (T->focused_node >= 0) set_focus(id, T, -1);
     return 0;
+}
+
+// Click in the page area at screen (mx, my).
+int okai_content_click(int id, int mx, int my) {
+    if (id < 0 || id >= MAX_OKAIS) return 0;
+    struct okai* b = &okais[id];
+    if (b->win_id < 0) return 0;
+    struct okai_tab* T = okai_tab_of(b);
+    int sx, sy, pw, ph;
+    if (!page_geom(b, &sx, &sy, &pw, &ph)) return 0;
+    int x = mx - sx, y = my - sy;
+    if (x < 0 || y < 0 || x >= pw || y >= ph || !T->doc) return 0;
+    // a click that does not land in a frame gives the keyboard back to the tab (frames set focus_slot themselves)
+    if (b->focus_slot >= 0 && b->focus_slot < OKAI_SLOTS && b->tabs[b->focus_slot].frame_used) {
+        struct okai_tab* old = &b->tabs[b->focus_slot];
+        if (old->doc && old->focused_node >= 0 && wdoc_dom(old->doc) && old->focused_node < wdoc_dom(old->doc)->nn)
+            wdoc_dom(old->doc)->n[old->focused_node].flags &= ~(WNF_FOCUSED);
+        old->focused_node = -1;
+    }
+    b->focus_slot = -1;
+    return tab_click(id, b->active_tab, x, y, mx, my);
 }
 
 static void edit_field(struct okai_tab* T, char c) {
@@ -2768,6 +2815,13 @@ void okai_handle_key(int id, char c) {
         return;
     }
 
+    // a click inside an iframe gave it the keyboard
+    int kslot = b->active_tab;
+    if (b->focus_slot >= OKAI_MAX_TABS && b->focus_slot < OKAI_SLOTS && b->tabs[b->focus_slot].frame_used &&
+        b->tabs[b->focus_slot].doc && slot_is_active(b, b->focus_slot)) {
+        kslot = b->focus_slot;
+        T = &b->tabs[kslot];
+    }
     struct wdom* d = T->doc ? wdoc_dom(T->doc) : 0;
     int fn = T->focused_node;
     if (d && fn >= 0 && fn < d->nn) {
@@ -2807,13 +2861,13 @@ void okai_handle_key(int id, char c) {
     } else if (c == '\t') {
         focus_next(id, T);
     } else if (c == 'j' || c == '\n' || c == '\x10') {
-        scroll_to(id, T->scroll_y + SCROLL_STEP);
+        scroll_slot(id, kslot, T->scroll_y + SCROLL_STEP);
     } else if (c == 'k' || c == '\x11') {
-        scroll_to(id, T->scroll_y - SCROLL_STEP);
+        scroll_slot(id, kslot, T->scroll_y - SCROLL_STEP);
     } else if (c == ' ' || c == '\x04') { // space / Page Down
-        scroll_to(id, T->scroll_y + (b->page_h > 120 ? b->page_h - 80 : 40));
+        scroll_slot(id, kslot, T->scroll_y + ((slot_is_frame(kslot) ? T->fh : b->page_h) > 120 ? (slot_is_frame(kslot) ? T->fh : b->page_h) - 80 : 40));
     } else if (c == '\x12') {             // Page Up
-        scroll_to(id, T->scroll_y - (b->page_h > 120 ? b->page_h - 80 : 40));
+        scroll_slot(id, kslot, T->scroll_y - ((slot_is_frame(kslot) ? T->fh : b->page_h) > 120 ? (slot_is_frame(kslot) ? T->fh : b->page_h) - 80 : 40));
     } else if (c == 'r') {
         okai_nav_reload(id);
     } else if (c == 'b') {
@@ -2829,6 +2883,46 @@ void okai_handle_mouse_scroll(int id, int dy) {
     struct okai_tab* T = okai_tab_of(b);
     serial_printf("[okai] wheel dy=%d old_scroll=%d\n", dy, T->scroll_y);
     scroll_to(id, T->scroll_y + dy * WHEEL_STEP);
+}
+
+// The iframe of document `slot` under viewport point (x, y): its slot (the point becomes frame coordinates), or -1.
+static int frame_child_at(struct okai* b, int slot, int* x, int* y) {
+    struct okai_tab* T = &b->tabs[slot];
+    if (!T->doc) return -1;
+    for (int s = OKAI_MAX_TABS; s < OKAI_SLOTS; s++) {
+        struct okai_tab* F = &b->tabs[s];
+        if (!F->frame_used || F->parent_slot != slot || !F->first_paint) continue;
+        int dx, dy, dw, dh, fixed;
+        if (!wdoc_video_dest(T->doc, F->parent_node, &dx, &dy, &dw, &dh, &fixed)) continue;
+        int ry = dy - (fixed ? 0 : T->scroll_y);
+        if (*x >= dx && *x < dx + dw && *y >= ry && *y < ry + dh) { *x -= dx; *y -= ry; return s; }
+    }
+    return -1;
+}
+
+// Wheel at screen (mx, my): the innermost iframe under the pointer that can scroll that way takes it, else the page.
+void okai_handle_wheel_at(int id, int dy, int mx, int my) {
+    struct okai* b = &okais[id];
+    if (b->win_id < 0) return;
+    int sx, sy, pw, ph;
+    if (page_geom(b, &sx, &sy, &pw, &ph)) {
+        int x = mx - sx, y = my - sy;
+        if (x >= 0 && y >= 0 && x < pw && y < ph) {
+            int chain[OKAI_MAX_FRAME_DEPTH + 2], n = 0, slot = b->active_tab;
+            chain[n++] = slot;
+            for (int s; n < OKAI_MAX_FRAME_DEPTH + 2 && (s = frame_child_at(b, slot, &x, &y)) >= 0; slot = s) chain[n++] = s;
+            for (int k = n - 1; k >= 1; k--) {
+                struct okai_tab* F = &b->tabs[chain[k]];
+                int maxs = F->content_height - F->fh;
+                if (maxs > 0 && ((dy > 0 && F->scroll_y < maxs) || (dy < 0 && F->scroll_y > 0))) {
+                    serial_printf("[okai] wheel in frame %d dy=%d old_scroll=%d\n", chain[k], dy, F->scroll_y);
+                    scroll_slot(id, chain[k], F->scroll_y + dy * WHEEL_STEP);
+                    return;
+                }
+            }
+        }
+    }
+    okai_handle_mouse_scroll(id, dy);
 }
 
 

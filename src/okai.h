@@ -104,6 +104,7 @@ struct okai {
     int active_tab;       // index into tabs[]
     int tab_count;        // live tabs (tabs[0..tab_count-1])
     struct okai_tab tabs[OKAI_SLOTS];     // [0, OKAI_MAX_TABS): browser tabs, the rest: iframe documents
+    int focus_slot;       // iframe slot holding the keyboard focus (set by a click inside it), -1 = the active tab
     int addr_bar_focused; // 1 = typing in address bar, 0 = scrolling
     char addr_input[OKAI_URL_LEN];
     int addr_input_len;
@@ -135,6 +136,7 @@ int  okai_tab_hit(int id, int mx, int my, int* on_close);
 void okai_navigate(int id, const char* url);
 void okai_handle_key(int id, char c);
 void okai_handle_mouse_scroll(int id, int dy);
+void okai_handle_wheel_at(int id, int dy, int mx, int my);   // wheel over the page: an iframe under the pointer scrolls first
 // Full render: relayout (if the document changed) + repaint the page surface.
 void okai_render_content(int id);
 // Repaint the window from the existing page surface (no engine work).
