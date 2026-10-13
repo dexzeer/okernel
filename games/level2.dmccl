@@ -29,8 +29,8 @@ endifchain
 when run do
     game:message("LEVEL 2: WRECKING YARD", 3)
     world:block(24, 6, 60, 1)                       # road, x from -6 to 54
-    world:block(98, 6, 60, 1)                       # road after the pit, x from 68 to 128
-    world:block(75, 10, 22, 1)                      # pit floor
+    world:block(96.5, 6, 63, 1)                     # road after the pit, x from 65 to 128
+    world:block(62.5, 10, 8, 1)                     # pit floor
     guy = world:spawn("wheelchair", 3, 4.6)
 
     world:wrecker(22, -0.6, 7, 0.8)                 # swinging ball: pick your moment
@@ -39,10 +39,9 @@ when run do
     world:make("barrel", 44, 5.0)
     world:make("mama", 50, 4.5)
 
-    world:slope(56, 5.5, 61, 4.5, 1)                # take-off ramp
-    world:block(64, 5.9, 3.5, 0.2)                  # a flimsy stepping plate over the pit...
-    world:spikes(75, 9.5, 12)                       # ...spikes below
-    world:seesaw(90, 5.5, 8)
+    world:slope(54, 5.5, 60, 4.2, 1)                # take-off ramp, then a 5 m pit full of spikes
+    world:spikes(62.5, 9.5, 12)
+    world:seesaw(80, 5.5, 8)
     world:goal(112, 5.5)
 endifchain
 
