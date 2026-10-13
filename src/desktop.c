@@ -2299,7 +2299,7 @@ void kernel_main(uint32_t mboot_phys) {
             int wid = window_from_point(mx, my);
             if (wid >= 0) {
                 int br_id = okai_find_by_win(wid);
-                if (br_id >= 0) okai_handle_mouse_scroll(br_id, wheel);
+                if (br_id >= 0) okai_handle_wheel_at(br_id, wheel, mx, my);
                 else if (wid == wifigui_win()) wifigui_wheel(wheel);
                 else if (find_term_idx(wid) >= 0) window_scroll_view(wid, wheel);
             }
