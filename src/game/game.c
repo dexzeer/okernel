@@ -122,7 +122,7 @@ void g_boom(struct game* g, double x, double y, double power) {
         v2 imp = { nx * power * k * b->m * 0.9, ny * power * k * b->m * 0.9 - power * k * b->m * 0.25 };
         ph_apply_impulse(b, imp, b->p);
         int e = g_ent_of_body(g, i);
-        if (e >= 0 && g->ent[e].kind == K_PLAYER && !g->ent[e].dead && k > 0.55) g_player_die(g, e, "BOOM");
+        if (e >= 0 && g->ent[e].kind == K_PLAYER && !g->ent[e].dead && power >= 60 && k > 0.5) g_player_die(g, e, "KABOOM");     // small blasts throw you; big ones end you
     }
     for (int i = 0; i < 70; i++) {
         double a = g_rand(g) * 6.2831853, sp = 2 + g_rand(g) * (4 + power * 0.25);
@@ -343,12 +343,26 @@ static int f_slope(dm_vm* vm, int argc, const dm_val* a, dm_val* ret, void* ctx)
     return 0;
 }
 
+// bouncy(x, y, width [, height]): a trampoline pad. Anything dropped on it comes back up (higher than it should, even).
+static int f_bouncy(dm_vm* vm, int argc, const dm_val* a, dm_val* ret, void* ctx) {
+    struct game* g = G(ctx);
+    if (need(vm, argc, a, 3, "world:bouncy(x, y, width [, height])")) return -1;
+    if (make_block(g, vm, K_BLOCK, a[0].u.n, a[1].u.n, a[2].u.n, opt(argc, a, 3, 0.4), 0, ret)) return -1;
+    struct g_ent* E = &g->ent[ret->u.ent];
+    g->world.body[E->body[0]].rest = 1.15;
+    g->world.body[E->body[0]].fric = 0.3;
+    E->fill = 0xff5fb0;
+    E->line = 0x7a1f55;
+    set_text(E->tag, sizeof E->tag, "bouncy");
+    return 0;
+}
+
 static int f_crate(dm_vm* vm, int argc, const dm_val* a, dm_val* ret, void* ctx) {
     struct game* g = G(ctx);
     if (need(vm, argc, a, 2, "world:crate(x, y [, size])")) return -1;
     double s = opt(argc, a, 2, 0.8);
     int e = g_ent_new(g, K_CRATE, 0);
-    if (e < 0 || body_box(g, e, a[0].u.n, a[1].u.n, s, s, 0.5, 1, 0) < 0) return dm_fail(vm, "the level is full (too many bodies)");
+    if (e < 0 || body_box(g, e, a[0].u.n, a[1].u.n, s, s, 0.25, 1, 0) < 0) return dm_fail(vm, "the level is full (too many bodies)");
     adopt(g, vm, e);
     *ret = dm_ent(e);
     return 0;
@@ -689,6 +703,7 @@ static void register_natives(struct game* g, dm_vm* vm) {
     dm_register(vm, "world", "block", f_block, g);
     dm_register(vm, "world", "ramp", f_ramp, g);
     dm_register(vm, "world", "slope", f_slope, g);
+    dm_register(vm, "world", "bouncy", f_bouncy, g);
     dm_register(vm, "world", "crate", f_crate, g);
     dm_register(vm, "world", "plank", f_plank, g);
     dm_register(vm, "world", "ball", f_ball, g);

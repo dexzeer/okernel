@@ -1,0 +1,47 @@
+# LEVEL 4 - CHAIN REACTION
+# The barrels do not like each other, or you. Every barrel that touches another one goes off a moment later.
+from dexlib import world
+from dexlib import game
+from dexlib import fx
+
+thing barrel is "barrel" do
+    when me touches "guy" do
+        fx:boom(me, 50)
+        fx:text(me.x, me.y - 1, "KABOOM")
+        suicide
+    endifchain
+    when me touches "barrel" do
+        waitfor:0.25s
+        fx:boom(me, 50)
+        suicide
+    endifchain
+endifchain
+
+thing popper is "crate" do                          # a crate that cannot sit still
+    when every 1.5s do
+        me.push(0, -7)
+    endifchain
+endifchain
+
+when run do
+    game:message("LEVEL 4: CHAIN REACTION", 3)
+    world:block(40, 6, 110, 1)                      # a long road, x from -15 to 95
+    guy = world:spawn("wheelchair", 3, 4.6)
+
+    repeat 4 as i do
+        world:make("popper", 14 + 3 * i, 4.5)       # jumping crates to dodge
+    endifchain
+    repeat 5 as i do
+        world:make("barrel", 40 + 1.0 * i, 5.0)     # a packed row: touch one and they all go
+    endifchain
+    world:slope(55, 5.5, 60, 4.4, 1)
+    world:slope(60, 4.4, 64, 5.5, 1)
+    repeat 3 as i do
+        world:make("barrel", 70 + 4 * i, 5.0)
+    endifchain
+    world:goal(88, 5.5)
+endifchain
+
+when "barrel" dies do
+    fx:shake(0.15)
+endifchain

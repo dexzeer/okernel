@@ -42,6 +42,7 @@
 #include "rtw/rtw.h"
 #include "rtw/rtw_pci.h"
 #include "wifigui.h"
+#include "gamewin.h"
 #include "smp.h"
 #include "prof.h"
 #include "fpu.h"
@@ -759,6 +760,7 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  exit      - close this terminal\n");
         window_puts(win_id, "  okai   - open web okai\n");
         window_puts(win_id, "  wifigui   - Wi-Fi window (scan, connect)\n");
+        window_puts(win_id, "  game      - KAnarchy Wheels, a ragdoll obstacle course (game | game 1 | game FILE)\n");
         window_puts(win_id, "  ls        - list files\n");
         window_puts(win_id, "  save      - force one file to disk\n");
         window_puts(win_id, "  ps        - list processes\n");
@@ -1225,6 +1227,10 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, nb);
         serial_puts(nb);
     }
+    else if (str_eq(cmd_buf, "game")) {
+        const char* gm = gamewin_open(args);       // a level number or a script in the file system; no argument lists the levels
+        window_puts(win_id, gm ? gm : "Game started.\n");
+    }
     else if (str_eq(cmd_buf, "wifigui")) {
         wifigui_open(args[0] && str_eq(args, "demo"));
         window_puts(win_id, "Wi-Fi window opened.\n");
@@ -1337,6 +1343,7 @@ static void on_keypress(char c, int alt) {
     }
 
     if (win_id >= 0 && win_id == wifigui_win()) { wifigui_key(c); return; }
+    if (win_id >= 0 && win_id == gamewin_win()) { gamewin_key(c); return; }
 
     // Check if this is an editor window
     int ed_id = editor_find_by_win(win_id);
@@ -2215,6 +2222,7 @@ void kernel_main(uint32_t mboot_phys) {
         { PROF_BEGIN(PZ_XHCI); xhci_poll(); PROF_END(PZ_XHCI); }     // USB mouse reports and hot-plug (polled; nothing interrupts for it)
         { PROF_BEGIN(PZ_RTW); rtw_poll(); PROF_END(PZ_RTW); }        // Wi-Fi adapter: received frames, scanning
         wifigui_poll();   // the Wi-Fi window
+        gamewin_poll();   // the game window (held keys, physics, picture)
         { PROF_BEGIN(PZ_I2C); i2chid_poll(); PROF_END(PZ_I2C); }     // I2C-HID touchpad reports (polled, 100 Hz)
         { PROF_BEGIN(PZ_KLOG); klog_poll(); PROF_END(PZ_KLOG); }     // the log on the boot stick (only when the flash tool marked it)
         { PROF_BEGIN(PZ_NET); net_poll(); PROF_END(PZ_NET); }
@@ -2341,6 +2349,8 @@ void kernel_main(uint32_t mboot_phys) {
                             close_sysinfo();
                         } else if (i == wifigui_win()) {
                             wifigui_close();
+                        } else if (i == gamewin_win()) {
+                            gamewin_close();
                         } else {
                             int ed_id = editor_find_by_win(i);
                             if (ed_id >= 0) {

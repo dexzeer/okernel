@@ -1,0 +1,51 @@
+# LEVEL 2 - WRECKING YARD
+# A wrecking ball, explosive barrels, a mother ball with a dark secret, a seesaw and a jump over a spike pit.
+from dexlib import world
+from dexlib import game
+from dexlib import fx
+
+# A barrel that goes off when the guy touches it. It is a `thing`: its handlers run once for every barrel.
+thing barrel is "barrel" do
+    when me touches "guy" do
+        fx:boom(me, 45)
+        fx:text(me.x, me.y - 1, "KABOOM")
+        suicide
+    endifchain
+endifchain
+
+# Mama ball makes three babies, waits, and then... well.
+thing mama is "ball" do
+    when run do
+        repeat 3 as i do
+            world:ball(me.x + 0.8 * i, me.y - 1, 0.25)
+            waitfor:0.3s
+        endifchain
+        waitfor:4s
+        fx:text(me.x, me.y - 1.5, "BYE KIDS")
+        child.abort then suicide
+    endifchain
+endifchain
+
+when run do
+    game:message("LEVEL 2: WRECKING YARD", 3)
+    world:block(24, 6, 60, 1)                       # road, x from -6 to 54
+    world:block(98, 6, 60, 1)                       # road after the pit, x from 68 to 128
+    world:block(75, 10, 22, 1)                      # pit floor
+    guy = world:spawn("wheelchair", 3, 4.6)
+
+    world:wrecker(22, -0.6, 7, 0.8)                 # swinging ball: pick your moment
+    world:make("barrel", 36, 5.0)
+    world:make("barrel", 40, 5.0)
+    world:make("barrel", 44, 5.0)
+    world:make("mama", 50, 4.5)
+
+    world:slope(56, 5.5, 61, 4.5, 1)                # take-off ramp
+    world:block(64, 5.9, 3.5, 0.2)                  # a flimsy stepping plate over the pit...
+    world:spikes(75, 9.5, 12)                       # ...spikes below
+    world:seesaw(90, 5.5, 8)
+    world:goal(112, 5.5)
+endifchain
+
+when guy touches "spikes" do
+    fx:text(guy.x, guy.y - 1, "OUCH")
+endifchain

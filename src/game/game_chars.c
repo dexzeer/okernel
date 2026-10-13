@@ -111,7 +111,7 @@ int g_spawn_player(struct game* g, const char* kind, double x, double y) {
     int j_wheel = hinge(g, E, chair, wheel, x - 0.45, y + 0.30, 0, 0, 0);
     ph_joint_motor(&g->world, j_wheel, 0, 0);
     hinge(g, E, chair, caster, x + 0.55, y + 0.60, 0, 0, 0);
-    hinge(g, E, chair, torso, x - 0.12, y - 0.09, -0.35, 0.35, 0);             // the seat belt: leaving it is what space does
+    hinge(g, E, chair, torso, x - 0.12, y - 0.09, -0.06, 0.7, 0);              // seat belt + backrest (can lean forward, hardly back): leaving it is what space does
     hinge(g, E, torso, head, x - 0.12, y - 0.52, -0.7, 0.7, 6000);
     hinge(g, E, torso, ua_l, x - 0.12, y - 0.44, -2.4, 1.0, 3200);
     hinge(g, E, ua_l, fa_l, x - 0.12, y - 0.24, -0.2, 2.4, 2200);
@@ -147,6 +147,13 @@ void g_player_controls(struct game* g, double dt) {
     else if (E->drive > want) E->drive = E->drive - step * 2 < want ? want : E->drive - step * 2;
     if (!up && !down) { E->drive = w->joint[wheel_j].used ? 0 : 0; ph_joint_motor(w, wheel_j, 0, 0); }
     else ph_joint_motor(w, wheel_j, E->drive, torque);
+    // the rider's back muscles: a gentle motor on the hip holds the torso upright, but a hard knock overpowers it
+    if (E->njoint > 2 && joint_alive(g, E->joint[2]) && E->body[PART_TORSO] >= 0) {
+        double th = w->body[E->body[PART_TORSO]].a - w->body[chair].a;
+        double speed = -9.0 * th;
+        speed = speed > 3 ? 3 : speed < -3 ? -3 : speed;
+        ph_joint_motor(w, E->joint[2], speed, 30);
+    }
     // the rider instinctively leans forward when the chair stands up too far (holding LEFT overrides that on purpose)
     {
         double tilt = w->body[chair].a;
