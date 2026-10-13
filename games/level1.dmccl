@@ -1,0 +1,38 @@
+# LEVEL 1 - ROLLING START
+# Hold UP and the chair rolls to the flag. Along the way: bonky crates, a ramp, a rickety bridge.
+# (Coordinates are in meters: x grows to the right, y grows DOWNWARD. The road's top is at y = 5.5.)
+from dexlib import world
+from dexlib import game
+from dexlib import fx
+
+when run do
+    game:message("LEVEL 1: ROLLING START", 3)
+    world:block(15.25, 6, 81, 1)                       # the long road: center x, y, width, height (it stops at x = 55.75)
+    world:block(86, 6, 40, 1)                          # ...and starts again on the far side of the pit (x = 66)
+    world:block(61, 10, 14, 1)                         # the bottom of the pit
+    guy = world:spawn("wheelchair", 3, 4.6)
+
+    world:crate(16, 5.0, 0.9)                          # a little stack to smash through
+    world:crate(16, 4.1, 0.9)
+    world:crate(17.2, 5.0, 0.9)
+
+    world:slope(26, 5.5, 31, 5.0, 1)                   # a gentle ramp up...
+    world:slope(40, 5.5, 42.5, 5.2, 1)                 # a speed bump
+    world:slope(42.5, 5.2, 45, 5.5, 1)
+
+    world:bridge(55.75, 5.5, 66, 5.5, 10)             # a rope bridge over the pit
+    world:spikes(61, 9.5, 8)                           # the pit is full of spikes, obviously
+    world:goal(78, 5.5)
+endifchain
+
+bonked = -1
+when guy touches "crate" do
+    if time - bonked > 0.6 do                          # one BONK per bump, not one per crate
+        fx:text(guy.x, guy.y - 1.2, "BONK")
+        bonked = time
+    endifchain
+endifchain
+
+when guy touches "bridge" do
+    game:message("WOBBLY!", 1)
+endifchain

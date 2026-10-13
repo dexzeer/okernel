@@ -449,7 +449,7 @@ static int run_thread(dm_vm* vm, int ti) {
         }
         case OP_CALLM: {
             int argc = I->n;
-            dm_val args[8];
+            dm_val args[12];
             for (int i = argc - 1; i >= 0; i--) args[i] = POP();
             dm_val obj = POP();
             dm_val ret = dm_nil();
@@ -470,7 +470,7 @@ static int run_thread(dm_vm* vm, int ti) {
         }
         case OP_CALL: {
             int argc = I->n;
-            dm_val args[8];
+            dm_val args[12];
             for (int i = argc - 1; i >= 0; i--) args[i] = POP();
             dm_val ret = dm_nil();
             vm->err[0] = 0;
@@ -676,6 +676,8 @@ void dm_step(dm_vm* vm, int dt_ms) {
 }
 
 int dm_running(const dm_vm* vm) { return !vm->halted; }
+
+void* dm_host_user(const dm_vm* vm) { return vm->host.user; }
 
 int dm_me(const dm_vm* vm) { return vm->cur >= 0 ? vm->th[vm->cur].me : -1; }
 

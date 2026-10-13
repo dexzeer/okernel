@@ -1,0 +1,10 @@
+from dexlib import world
+
+when run do
+    world:block(60, 6, 200, 1)
+    guy = world:spawn("wheelchair", 3, 4.6)
+endifchain
+
+when every 1s do
+    log:print("t", math("0"), "x", guy.x, "y", guy.y, "speed", guy.speed, "angle", guy.angle)
+endifchain

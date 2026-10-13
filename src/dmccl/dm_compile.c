@@ -6,7 +6,7 @@
 #include "dm_internal.h"
 
 #define MAX_RANGES 256
-#define MAX_ARGS 8
+#define MAX_ARGS 12
 
 struct range { int start, end; };
 
@@ -179,7 +179,7 @@ static int parse_args(struct parser* p) {      // after '(' ... consumes ')'; re
     if (kind(p) != T_RPAREN) {
         do {
             parse_expr(p);
-            if (++n > MAX_ARGS) { err_at(p, line_of(p), "too many arguments (the limit is 8)", 0); return n; }
+            if (++n > MAX_ARGS) { err_at(p, line_of(p), "too many arguments (the limit is 12)", 0); return n; }
         } while (!p->failed && accept(p, T_COMMA));
     }
     expect(p, T_RPAREN, "`)`");
