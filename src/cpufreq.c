@@ -35,7 +35,7 @@ static int rdmsr_safe(uint32_t msr, uint64_t* v) {
     return (int)ok;
 }
 
-static int wrmsr_safe(uint32_t msr, uint64_t v) {
+__attribute__((unused)) static int wrmsr_safe(uint32_t msr, uint64_t v) {   // kept (and self-tested); nothing writes an MSR at the moment, see request_ratio
     uint32_t ok;
     __asm__ volatile(
         "movl $1f, msr_fix_from\n\t"
@@ -135,12 +135,12 @@ static int model_ok(void) {
     return family == 6 && (model == 0x37 || model == 0x4C || model == 0x5A || model == 0x5D);
 }
 
+// NO MSR is written any more. The first version requested the top ratio with `ratio << 8` in IA32_PERF_CTL, as intel_pstate
+// does -- but on Atom cores intel_pstate ALSO puts a voltage id (VID, from the table in MSR 0x66B) into the low byte. A high
+// ratio with VID 0 is a request for the top clock at no voltage: the laptop (Braswell, family 6 model 0x4C) did not even
+// finish booting with it. The ratio the firmware chose stays; the report below still shows what the CPU runs at, and
+// target_ratio is only logged. A VID-aware version needs the 0x66B table and a way to test it that cannot freeze the machine.
 static void request_ratio(void) {
-    if (!target_ratio) return;
-    uint64_t v;
-    if (rdmsr_safe(MSR_MISC_ENABLE, &v) && !(v & (1ull << 16)))
-        wrmsr_safe(MSR_MISC_ENABLE, v | (1ull << 16));          // enhanced SpeedStep on (the request below is ignored without it)
-    wrmsr_safe(MSR_PERF_CTL, (uint64_t)target_ratio << 8);
 }
 
 void cpufreq_init(void) {
@@ -175,8 +175,8 @@ void cpufreq_init(void) {
         uint32_t want = turbor > maxr ? turbor : maxr;
         if (!(have_m && (misc & (1ull << 38))) && want >= 4 && want <= 60) target_ratio = want;   // turbo allowed (bit 38 = disabled)
         else if (maxr >= 4 && maxr <= 60) target_ratio = maxr;
-        if (rdmsr_safe(MSR_ENERGY_BIAS, &epb)) { put_s(" epb "); put_x(epb); wrmsr_safe(MSR_ENERGY_BIAS, 0); }
-        put_s("; request ratio "); put_u(target_ratio);
+        if (rdmsr_safe(MSR_ENERGY_BIAS, &epb)) { put_s(" epb "); put_x(epb); }
+        put_s("; top ratio "); put_u(target_ratio); put_s(" (not requested)");
         request_ratio();
         pit_delay_us(5000);
         core_mhz = measure_core_mhz();
