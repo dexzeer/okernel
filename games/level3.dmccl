@@ -1,5 +1,5 @@
 # LEVEL 3 - MOON WALK
-# Gravity is a suggestion up here. Roll off the edge, bounce on the pink pads, land on the next island.
+# Gravity is a suggestion up here. Roll off the ramps, float across the gaps, bounce on the pink pad.
 from dexlib import world
 from dexlib import game
 from dexlib import fx
@@ -8,19 +8,19 @@ when run do
     game:message("LEVEL 3: MOON WALK", 3)
     game:gravity(4)                                 # the moon (14 is home)
     game:zoom(0.8)
-    world:block(10, 6, 36, 1)                       # launch island, x from -8 to 28
-    world:slope(28, 5.5, 33, 4.3, 1)                # a ramp off the edge
+    world:block(14, 6, 44, 1)                       # island one, x from -8 to 36
+    world:slope(30, 5.5, 36, 4.3, 1)                # a ramp off the edge
     guy = world:spawn("wheelchair", 3, 4.6)
 
-    world:block(52, 6, 14, 1)                       # island two (x 45..59)
-    world:bouncy(66, 6.2, 4)                        # a trampoline in the void
-    world:block(86, 3.5, 12, 1)                     # a high island
-    world:bouncy(96, 3.7, 3)
-    world:block(116, 6, 20, 1)                      # the landing
-    world:spikes(104, 9.5, 20)                      # the void is full of spikes
-    world:crate(55, 4.8, 1.2)
-    world:ball(52, 3, 0.7)                          # a beach ball. why not.
-    world:goal(122, 5.5)
+    world:block(54, 6, 24, 1)                       # island two, x from 42 to 66
+    world:slope(60, 5.5, 66, 4.3, 1)
+    world:block(84, 6, 26, 1)                       # island three, x from 71 to 97
+    world:bouncy(80, 5.7, 3.5)                      # a trampoline: a chair on a trampoline is a funny thing
+    world:crate(88, 4.8, 1.2)
+    world:ball(75, 4.5, 0.7)                        # a beach ball. why not.
+    world:spikes(39, 9.5, 14)                       # the gaps are full of spikes
+    world:spikes(68.5, 9.5, 12)
+    world:goal(93, 5.5)
 endifchain
 
 when guy touches "bouncy" do

@@ -31,6 +31,8 @@ static struct {
     uint32_t last_tick, last_render;
     int render_gap;                      // ticks between pictures: grows when drawing is slow so the physics keeps real time
     int esc_was_down;
+    uint64_t upd_cycles, rnd_cycles;     // since the last report line
+    uint32_t upd_n, rnd_n, report_tick;
     char msg[640];
 } W = { .win = -1, .level = -1 };
 
@@ -191,7 +193,12 @@ void gamewin_poll(void) {
     game_key(W.g, GK_SHIFT, focused && (keyboard_scancode_held(0x2A, 0) || keyboard_scancode_held(0x36, 0)));
     game_key(W.g, GK_CTRL, focused && keyboard_scancode_held(0x1D, 0));
 
-    if (win->visible) game_update(W.g, ticks * 0.01);      // a minimised game waits
+    if (win->visible) {                                    // a minimised game waits
+        uint64_t u0 = rdtsc64();
+        game_update(W.g, ticks * 0.01);
+        W.upd_cycles += rdtsc64() - u0;
+        W.upd_n++;
+    }
 
     if (!win->visible || now - W.last_render < (uint32_t)W.render_gap) return;
     sync_surface(win);
@@ -200,11 +207,20 @@ void gamewin_poll(void) {
     game_render(W.g, W.px, W.sw, W.sh, W.sw);
     window_set_pixels(W.win, W.px, 0, 0, W.sw, W.sh, W.sw);
     uint64_t cycles = rdtsc64() - t0;
+    W.rnd_cycles += cycles;
+    W.rnd_n++;
     W.last_render = now;
     uint32_t mhz = cpufreq_tsc_mhz();
     if (mhz) {                                            // draw no more often than it can be afforded: ~1/3 of the time at most
         uint32_t ms = (uint32_t)(cycles / ((uint64_t)mhz * 1000));
         int gap = (int)(ms * 3 / 10) + 2;
         W.render_gap = gap < 2 ? 2 : gap > 10 ? 10 : gap;
+    }
+    if (now - W.report_tick >= 500 && mhz && W.upd_n && W.rnd_n) {      // every 5 s: what the game costs on THIS machine (it goes to the stick log too)
+        serial_printf("[game] %u updates at %u us, %u pictures at %u us, picture every %d ticks\n", W.upd_n, (uint32_t)(W.upd_cycles / W.upd_n / mhz),
+                      W.rnd_n, (uint32_t)(W.rnd_cycles / W.rnd_n / mhz), W.render_gap);
+        W.upd_cycles = W.rnd_cycles = 0;
+        W.upd_n = W.rnd_n = 0;
+        W.report_tick = now;
     }
 }
