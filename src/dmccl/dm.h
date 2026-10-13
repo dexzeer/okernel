@@ -85,6 +85,7 @@ int    dm_spawn_thing(dm_vm* vm, const char* thing, int ent);   // attach a `thi
 void   dm_step(dm_vm* vm, int dt_ms);                   // time passes (dt_ms of game time), scripts run
 void   dm_ent_gone(dm_vm* vm, int ent);                 // the entity is dead: its threads, handlers and fields go away
 int    dm_idle(const dm_vm* vm);                        // nothing running, nothing that can start by itself
+void*  dm_host_user(const dm_vm* vm);                   // the `user` pointer the host gave dm_vm_new
 int    dm_me(const dm_vm* vm);                          // from a native: the entity whose script is running (-1: the level)
 int    dm_running(const dm_vm* vm);                     // 0 once the level halted itself (`suicide` at level scope)
 
