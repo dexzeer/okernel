@@ -444,6 +444,10 @@ static void solve_joints(struct ph_world* w, double h, int first_iteration) {
         struct ph_body *A = &w->body[J->a], *B = &w->body[J->b];
         if (!A->used || !B->used) { J->used = 0; continue; }
         if (first_iteration) {
+            // impulses of a motor that is off, or of a limit that is no longer touched, must not carry over
+            if (!J->motor) J->acc_motor = 0;
+            double th0 = B->a - A->a - J->ref;
+            if (!J->limit || (th0 > J->lo && th0 < J->hi)) J->acc_lim = 0;
             // warm start with last substep's impulses
             v2 ra = vrot(A->c, A->s, J->la), rb = vrot(B->c, B->s, J->lb);
             apply(A, B, ra, rb, V(J->acc_x, J->acc_y));

@@ -1,0 +1,28 @@
+# LEVEL 3 - MOON WALK
+# Gravity is a suggestion up here. Roll off the edge, bounce on the pink pads, land on the next island.
+from dexlib import world
+from dexlib import game
+from dexlib import fx
+
+when run do
+    game:message("LEVEL 3: MOON WALK", 3)
+    game:gravity(4)                                 # the moon (14 is home)
+    game:zoom(0.8)
+    world:block(10, 6, 36, 1)                       # launch island, x from -8 to 28
+    world:slope(28, 5.5, 33, 4.3, 1)                # a ramp off the edge
+    guy = world:spawn("wheelchair", 3, 4.6)
+
+    world:block(52, 6, 14, 1)                       # island two (x 45..59)
+    world:bouncy(66, 6.2, 4)                        # a trampoline in the void
+    world:block(86, 3.5, 12, 1)                     # a high island
+    world:bouncy(96, 3.7, 3)
+    world:block(116, 6, 20, 1)                      # the landing
+    world:spikes(104, 9.5, 20)                      # the void is full of spikes
+    world:crate(55, 4.8, 1.2)
+    world:ball(52, 3, 0.7)                          # a beach ball. why not.
+    world:goal(122, 5.5)
+endifchain
+
+when guy touches "bouncy" do
+    fx:text(guy.x, guy.y - 1.3, "BOING")
+endifchain

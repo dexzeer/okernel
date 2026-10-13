@@ -49,6 +49,12 @@ static int shift_pressed = 0;
 static int ctrl_pressed = 0; // 1 = Ctrl held (0x1D)
 static int alt_pressed = 0;  // 1 = Alt held (0x38, or 0xE0 0x38 right Alt)
 static int extended = 0; // 1 = received 0xE0 prefix
+// Which keys are physically down right now (set on press, cleared on release). Index = set-1 scancode; extended keys
+// (arrows...) live at 0x80 + scancode. Games read this; the ASCII callback below only ever sees presses.
+static volatile uint8_t held_keys[256];
+int keyboard_scancode_held(int scancode, int extended_key) {
+    return held_keys[(extended_key ? 0x80 : 0) + (scancode & 0x7F)];
+}
 
 static void keyboard_irq(void) {
     // Only take a byte that is there and is the keyboard's (status bit 5 =
@@ -82,6 +88,7 @@ static void keyboard_irq(void) {
     // Extended key (arrow keys, etc.)
     if (extended) {
         extended = 0;
+        held_keys[0x80 + (scancode & 0x7F)] = !(scancode & 0x80);
         if (scancode == 0x38) { alt_pressed = 1; return; }  // right Alt press
         if (scancode == 0xB8) { alt_pressed = 0; return; }  // right Alt release
         if (scancode & 0x80) return; // key release, ignore
@@ -96,6 +103,8 @@ static void keyboard_irq(void) {
         }
         return;
     }
+
+    held_keys[scancode & 0x7F] = !(scancode & 0x80);
 
     // Key release
     if (scancode & 0x80) {
