@@ -117,6 +117,7 @@ struct ruleref {
     uint32_t order;      // global cascade order (sheet position, rule order)
     uint8_t origin;
     uint8_t nanc;        // required-ancestor hashes (ancestor Bloom filter)
+    uint8_t multi;       // indexed under several keys (:is()/:where() alternatives): an element can reach it twice
     uint32_t anc[4];
 };
 
@@ -281,7 +282,7 @@ int css_set_sheet_count(const struct wstyleset* ss) { return ss->nsheets; }
 
 void css_set_free(struct wstyleset* ss) {
     if (!ss) return;
-    for (int i = 0; i < ss->nsheets; i++) { csheet_free(ss->sheets[i]); w_free(ss->sheets[i]); }
+    for (int i = 0; i < ss->nsheets; i++) css_sheet_unref(ss->sheets[i]);
     csheet_free(&ss->inl);
     csheet_free(&ss->hints);
     csheet_free(&ss->var_sh);
@@ -296,6 +297,26 @@ void css_set_free(struct wstyleset* ss) {
     w_free(ss);
 }
 
+void css_sheet_ref(struct wsheet* sh) { if (sh) sh->refs++; }
+void css_sheet_unref(struct wsheet* sh) {
+    if (!sh || --sh->refs > 0) return;
+    csheet_free(sh);
+    w_free(sh);
+}
+
+struct wsheet* css_set_sheet_at(struct wstyleset* ss, int at) { return at >= 0 && at < ss->nsheets ? ss->sheets[at] : 0; }
+
+int css_set_add_shared(struct wstyleset* ss, struct wsheet* sh, int before_idx) {
+    if (ss->nsheets >= MAX_SHEETS || !sh) return -1;
+    int at = (before_idx < 0 || before_idx > ss->nsheets) ? ss->nsheets : before_idx;
+    for (int i = ss->nsheets; i > at; i--) ss->sheets[i] = ss->sheets[i - 1];
+    ss->sheets[at] = sh;
+    sh->refs++;
+    ss->nsheets++;
+    ss->index_dirty = 1;
+    return at;
+}
+
 int css_set_add_sheet(struct wstyleset* ss, const char* text, int len, const char* base_url,
                       int before_idx) {
     return css_set_add_sheet_ex(ss, text, len, base_url, before_idx, 0, 0);
@@ -308,6 +329,7 @@ int css_set_add_sheet_ex(struct wstyleset* ss, const char* text, int len, const 
     if (!sh) return -1;
     sh->origin = CSS_ORIGIN_AUTHOR;
     sh->outer_mq = -1;
+    sh->refs = 1;
     if (media && media_len > 0) csheet_set_media(sh, media, media_len);
     const char* b = base_url && base_url[0] ? base_url : ss->doc_base;
     int n = 0;
@@ -398,6 +420,42 @@ static uint32_t rule_key(const struct wsheet* sh, int sel) {
     return 0;
 }
 
+#define RULE_MAX_KEYS 8
+// Every bucket key a rule has to be filed under. Normally the one key of its rightmost compound; a compound with nothing
+// to key on but `:root` (only the html element) or `:is()` / `:where()` lists (a framework stylesheet has hundreds of
+// them) is filed under the keys of each alternative; anything else (`*`, `:not()`, `:hover` alone...) is universal.
+// Returns the number of keys, 0 for universal.
+static int rule_keys(const struct wsheet* sh, int sel, uint32_t* out, int max, int depth) {
+    uint32_t k = rule_key(sh, sel);
+    if (k) { out[0] = k; return 1; }
+    if (depth > 3) return 0;
+    int last = sh->sels[sel].first;
+    for (int z = last; sh->parts[z].kind != SK_END; z++)
+        if (sh->parts[z].kind == SK_COMB) last = z + 1;
+    for (int z = last; sh->parts[z].kind != SK_END && sh->parts[z].kind != SK_COMB; z++) {
+        const struct cpart* p = &sh->parts[z];
+        if (p->kind != SK_PSEUDO) continue;
+        if (p->op == PC_ROOT) { out[0] = (3u << 16) | T_html; return 1; }
+        if ((p->op == PC_IS || p->op == PC_WHERE) && p->sub >= 0 && p->nsub > 0) {
+            int n = 0;
+            for (int a = 0; a < p->nsub; a++) {
+                uint32_t ak[RULE_MAX_KEYS];
+                int c = rule_keys(sh, p->sub + a, ak, RULE_MAX_KEYS, depth + 1);
+                if (c == 0) { n = 0; break; }                    // one alternative that can match anything: universal
+                for (int q = 0; q < c; q++) {
+                    int dup = 0;
+                    for (int w = 0; w < n; w++) if (out[w] == ak[q]) dup = 1;
+                    if (dup) continue;
+                    if (n >= max) { n = 0; a = p->nsub; break; }
+                    out[n++] = ak[q];
+                }
+            }
+            if (n > 0) return n;
+        }
+    }
+    return 0;
+}
+
 // Hashes of ids/classes/tags that must appear on some ancestor: compounds
 // whose right-hand combinator is descendant or child.
 static int rule_ancestors(const struct wsheet* sh, int sel, uint32_t* out) {
@@ -457,7 +515,16 @@ static void sort_refs(struct ruleref* r, int n) {
 static void build_index(struct wstyleset* ss) {
     int total = 0;
     int nsrc = ss->nsheets + 2;
-    for (int i = 0; i < nsrc; i++) { int m; total += sheet_at(ss, i, &m)->nrule; }
+    for (int i = 0; i < nsrc; i++) {
+        if (i == 1 && !ss->d->quirks) continue;
+        int m;
+        const struct wsheet* sh = sheet_at(ss, i, &m);
+        for (int r = 0; r < sh->nrule; r++) {
+            uint32_t ks[RULE_MAX_KEYS];
+            int c = rule_keys(sh, sh->rules[r].sel, ks, RULE_MAX_KEYS, 0);
+            total += c > 1 ? c : 1;
+        }
+    }
     if (total > ss->caprefs) {
         w_free(ss->refs);
         ss->refs = (struct ruleref*)w_malloc((total + 1) * sizeof(struct ruleref));
@@ -470,14 +537,20 @@ static void build_index(struct wstyleset* ss) {
         int m;
         const struct wsheet* sh = sheet_at(ss, i, &m);
         for (int r = 0; r < sh->nrule; r++) {
-            struct ruleref* rr = &ss->refs[n++];
-            rr->sh = sh;
-            rr->rule = r;
-            rr->key = rule_key(sh, sh->rules[r].sel);
-            rr->order = ((uint32_t)i << 22) | (sh->rules[r].order & 0x3FFFFF);
-            rr->origin = (uint8_t)sh->origin;
-            rr->nanc = (uint8_t)(sh->sels[sh->rules[r].sel].has_rel ? 0 :
-                                 rule_ancestors(sh, sh->rules[r].sel, rr->anc));
+            uint32_t ks[RULE_MAX_KEYS];
+            int nk = rule_keys(sh, sh->rules[r].sel, ks, RULE_MAX_KEYS, 0);
+            if (nk == 0) { ks[0] = 0; nk = 1; }
+            for (int q = 0; q < nk; q++) {
+                struct ruleref* rr = &ss->refs[n++];
+                rr->sh = sh;
+                rr->rule = r;
+                rr->key = ks[q];
+                rr->multi = nk > 1;
+                rr->order = ((uint32_t)i << 22) | (sh->rules[r].order & 0x3FFFFF);
+                rr->origin = (uint8_t)sh->origin;
+                rr->nanc = (uint8_t)(sh->sels[sh->rules[r].sel].has_rel ? 0 :
+                                     rule_ancestors(sh, sh->rules[r].sel, rr->anc));
+            }
         }
     }
     ss->nrefs = n;
@@ -1553,6 +1626,9 @@ static int match_cmp(const struct ruleref* a, const struct ruleref* b) {
 }
 
 static void push_match(struct wstyleset* ss, struct ruleref* r) {
+    if (r->multi)                               // filed under several keys: the same rule must not apply twice
+        for (int i = 0; i < ss->nmatch; i++)
+            if (ss->match[i]->sh == r->sh && ss->match[i]->rule == r->rule) return;
     if (ss->nmatch >= ss->capmatch) {
         int nc = ss->capmatch ? ss->capmatch * 2 : 256;
         struct ruleref** nm = (struct ruleref**)w_realloc(ss->match, nc * sizeof(*nm));

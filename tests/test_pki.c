@@ -72,6 +72,23 @@ int main(void) {
         CHECK(verify_with(int1.sig_alg, &int1, &int2) == 0, "int1 <- int2 (ECDSA P-384/SHA384)");
         CHECK(verify_with(int2.sig_alg, &int2, &rootx) == 0, "int2 <- root (ECDSA P-384/SHA384)");
 
+        printf("== verified-signature memo ==\n");
+        {
+            // a repeat of a verified signature is answered from the memo; a changed signature byte, a changed
+            // signed byte and a different issuer key must all still be verified from scratch and fail
+            CHECK(verify_with(leaf.sig_alg, &leaf, &int1) == 0, "leaf <- int1 again (memo hit)");
+            uint8_t lc[16384];
+            memcpy(lc, buf, (size_t)nl);
+            x509_cert lt;
+            CHECK(x509_parse(lc, (uint32_t)nl, &lt) == 0, "reparse leaf copy");
+            lc[nl - 5] ^= 0x01;                                   // inside the signature value
+            CHECK(x509_parse(lc, (uint32_t)nl, &lt) != 0 || verify_with(lt.sig_alg, &lt, &int1) != 0,
+                  "flipped signature byte is not served from the memo");
+            memcpy(lc, buf, (size_t)nl);
+            CHECK(x509_parse(lc, (uint32_t)nl, &lt) == 0, "reparse leaf copy again");
+            CHECK(verify_with(leaf.sig_alg, &leaf, &int2) != 0, "same signature under another issuer key fails");
+        }
+
         printf("== tamper detection ==\n");
         {
             uint8_t b2c[16384];

@@ -68,6 +68,7 @@ struct okai_tab {
     int sub_landed;       // resources applied since the last render
     uint32_t load_tick;   // tick of the main document parse
     uint32_t last_render_tick;
+    int render_cost;      // ticks the last full render took (background renders wait a multiple of it)
     int render_pending;   // relayout+repaint requested (coalesced in okai_poll)
     char pending_frag[128]; // #fragment to scroll to after the load
     int render_due;       // tick at which a pending render fires

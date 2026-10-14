@@ -38,6 +38,8 @@ int  wdoc_next_fetch(struct wdoc* d, char* url, int cap);
 // Deliver a fetched resource (len < 0 = failed).
 void wdoc_fetch_done(struct wdoc* d, int id, const char* bytes, int len, const char* ctype);
 int  wdoc_pending(struct wdoc* d);       // resources not yet delivered
+// Document y range [y0, y1] that lazy <img loading=lazy> images are loaded for; returns how many became fetchable.
+int  wdoc_set_view(struct wdoc* d, int y0, int y1);
 int  wdoc_is_css(struct wdoc* d, int id);
 void wdoc_set_viewport(struct wdoc* d, int w, int h);
 // Recompute styles/layout if needed; returns 1 if layout changed.

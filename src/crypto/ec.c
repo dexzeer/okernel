@@ -267,7 +267,8 @@ static void pt_dbl(ec_pt* R, const ec_pt* P, const montd* fd) {
 
     fe_mul(y2, P->y, P->y, fd);            // Y^2
     fe_mul(s, P->x, y2, fd);               // X*Y^2
-    fe_mul(s, s, fd->four, fd);            // S = 4*X*Y^2
+    add_fe_mod(s, s, s, fd);
+    add_fe_mod(s, s, s, fd);               // S = 4*X*Y^2
     fe_mul(zz, P->z, P->z, fd);            // Z^2
     sub_fe_mod(t1, P->x, zz, fd);          // X - Z^2
     add_fe_mod(t2, P->x, zz, fd);          // X + Z^2
@@ -285,7 +286,9 @@ static void pt_dbl(ec_pt* R, const ec_pt* P, const montd* fd) {
     sub_fe_mod(t1, s, R->x, fd);
     fe_mul(t1, m, t1, fd);
     fe_mul(t2, y2, y2, fd);                // Y^4
-    fe_mul(t2, t2, fd->eight, fd);         // 8*Y^4
+    add_fe_mod(t2, t2, t2, fd);
+    add_fe_mod(t2, t2, t2, fd);
+    add_fe_mod(t2, t2, t2, fd);            // 8*Y^4
     sub_fe_mod(R->y, t1, t2, fd);
 
     // Z3 = 2*Y*Z
@@ -345,19 +348,60 @@ static void pt_add(ec_pt* R, const ec_pt* P, const ec_pt* Q, const montd* fd) {
     fe_mul(R->z, R->z, Q->z, fd);
 }
 
-// R = k*P (affine P given as mont x,y), uniform double-and-add.
-// MSB-first: R = 2R + bit_k[i] per step. (Scanning LSB-first while doubling
-// R computes the bit-reversed scalar — the classic ladder bug.)
-static void pt_mul(ec_pt* R, const uint32_t* k, int kbits,
-                   const uint32_t* qx, const uint32_t* qy, const montd* fd) {
-    ec_pt Q, T, D;
-    for (int i = 0; i < fd->nl; i++) { Q.x[i] = qx[i]; Q.y[i] = qy[i]; Q.z[i] = fd->one[i]; }
+// R = P + (qx, qy) with the second point affine (Z = 1): 11 field multiplications instead of 16.
+static void pt_add_aff(ec_pt* R, const ec_pt* P, const uint32_t* qx, const uint32_t* qy, const montd* fd) {
+    int nl = fd->nl;
+    if (pt_is_inf(P, fd)) {
+        for (int i = 0; i < nl; i++) { R->x[i] = qx[i]; R->y[i] = qy[i]; R->z[i] = fd->one[i]; }
+        return;
+    }
+    uint32_t z1z1[EC_MAX_LIMBS], u2[EC_MAX_LIMBS], s2[EC_MAX_LIMBS], h[EC_MAX_LIMBS], r[EC_MAX_LIMBS], t[EC_MAX_LIMBS];
+    fe_mul(z1z1, P->z, P->z, fd);
+    fe_mul(u2, qx, z1z1, fd);              // X2*Z1^2
+    fe_mul(t, P->z, z1z1, fd);
+    fe_mul(s2, qy, t, fd);                 // Y2*Z1^3
+    sub_fe_mod(h, u2, P->x, fd);
+    sub_fe_mod(r, s2, P->y, fd);
+    uint32_t hz = 0, rz = 0;
+    for (int i = 0; i < nl; i++) { hz |= h[i]; rz |= r[i]; }
+    if (hz == 0) {
+        if (rz == 0) { pt_dbl(R, P, fd); return; }
+        pt_inf(R, fd);                     // P == -Q
+        return;
+    }
+    uint32_t hh[EC_MAX_LIMBS], hhh[EC_MAX_LIMBS], v[EC_MAX_LIMBS];
+    fe_mul(hh, h, h, fd);
+    fe_mul(hhh, hh, h, fd);
+    fe_mul(v, P->x, hh, fd);               // X1*H^2
+    fe_mul(R->x, r, r, fd);
+    sub_fe_mod(R->x, R->x, hhh, fd);
+    add_fe_mod(t, v, v, fd);
+    sub_fe_mod(R->x, R->x, t, fd);         // X3 = R^2 - H^3 - 2*V
+    sub_fe_mod(t, v, R->x, fd);
+    fe_mul(t, r, t, fd);
+    fe_mul(hhh, P->y, hhh, fd);
+    sub_fe_mod(R->y, t, hhh, fd);          // Y3 = R*(V - X3) - Y1*H^3
+    fe_mul(R->z, P->z, h, fd);             // Z3 = Z1*H
+}
+
+// R = k1*G + k2*Q for PUBLIC scalars (signature verification: nothing here is secret, so no constant-time
+// discipline). Shamir's trick: one shared chain of doublings, adding G, Q or G+Q by the pair of bits.
+static void pt_mul2(ec_pt* R, const uint32_t* k1, const uint32_t* gx, const uint32_t* gy,
+                    const uint32_t* k2, const uint32_t* qx, const uint32_t* qy, int kbits, const montd* fd) {
+    ec_pt GQ, G, Q, t;
+    for (int i = 0; i < fd->nl; i++) {
+        G.x[i] = gx[i]; G.y[i] = gy[i]; G.z[i] = fd->one[i];
+        Q.x[i] = qx[i]; Q.y[i] = qy[i]; Q.z[i] = fd->one[i];
+    }
+    pt_add(&GQ, &G, &Q, fd);
     pt_inf(R, fd);
     for (int i = kbits - 1; i >= 0; i--) {
-        pt_dbl(&D, R, fd);
-        pt_add(&T, &D, &Q, fd);            // add-always; select below
-        uint32_t bit = (k[i / 32] >> (i % 32)) & 1;
-        if (bit) *R = T; else *R = D;
+        pt_dbl(&t, R, fd);
+        *R = t;
+        int sel = (int)((k1[i / 32] >> (i % 32)) & 1) | (int)(((k2[i / 32] >> (i % 32)) & 1) << 1);
+        if (sel == 1) { pt_add_aff(&t, R, gx, gy, fd); *R = t; }
+        else if (sel == 2) { pt_add_aff(&t, R, qx, qy, fd); *R = t; }
+        else if (sel == 3) { pt_add(&t, R, &GQ, fd); *R = t; }
     }
 }
 
@@ -555,8 +599,7 @@ int ec_verify(int alg,
     fe_mul(u2, r, sinv_mont, &c->nd);
 
     // R = u1*G + u2*Q
-    ec_pt R1, R2, R;
-    pt_mul(&R1, u1, c->nbits, c->gx, c->gy, &c->fd);
+    ec_pt R;
     // Q affine (mont): decode point
     uint32_t qx[EC_MAX_LIMBS], qy[EC_MAX_LIMBS];
     be_to_limbs(point + 1, (uint32_t)c->nl * 4, qx, c->nl);
@@ -572,9 +615,8 @@ int ec_verify(int alg,
         fe_set_mont(xm, qx, &c->fd);
         fe_set_mont(ym, qy, &c->fd);
         if (on_curve(c, xm, ym) != 0) return -1;
-        pt_mul(&R2, u2, c->nbits, xm, ym, &c->fd);
+        pt_mul2(&R, u1, c->gx, c->gy, u2, xm, ym, c->nbits, &c->fd);
     }
-    pt_add(&R, &R1, &R2, &c->fd);
     if (pt_is_inf(&R, &c->fd)) return -1;
 
     // x_aff = X / Z^2 ; check x_aff mod n == r
