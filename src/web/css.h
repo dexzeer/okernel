@@ -187,6 +187,12 @@ void css_set_free(struct wstyleset* ss);
 int  css_set_add_sheet(struct wstyleset* ss, const char* text, int len, const char* base_url,
                        int before_idx);
 // Same, gated by a media query list (the media="" attribute); NULL = all.
+// A parsed sheet can be shared between style sets (a rebuild after scripts touch <style>/<link> elements would otherwise
+// parse every stylesheet again): the sheet counts its owners and is freed with the last one.
+int  css_set_add_shared(struct wstyleset* ss, struct wsheet* sh, int before_idx);   // returns its position
+struct wsheet* css_set_sheet_at(struct wstyleset* ss, int at);
+void css_sheet_ref(struct wsheet* sh);
+void css_sheet_unref(struct wsheet* sh);
 int  css_set_add_sheet_ex(struct wstyleset* ss, const char* text, int len, const char* base_url,
                           int before_idx, const char* media, int media_len);
 // @import URLs discovered so far that have not been supplied yet; returns

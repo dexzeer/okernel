@@ -1353,8 +1353,16 @@ function mediaFail(el, s, code, msg) {
     s.netState = 3;
     fire(el, 'error');
 }
+// Decorative media on a slow CPU: a muted or autoplay element is not fetched (a whole mp4 is downloaded by fetch()) until the
+// user clicks or presses a key, the same moment play() stops being refused. Controls-driven players are not affected.
+function mediaDecorative(el) {
+    if (/^blob:/i.test(W.getAttr(el, 'src') || '')) return false;     // MediaSource players need their events either way
+    return !userActivated && W.slow() >= 3 && (W.getAttr(el, 'autoplay') !== null || W.getAttr(el, 'muted') !== null || el.muted);
+}
 function mediaLoad(el) {
     const s = mst(el);
+    if (mediaDecorative(el)) { s.deferred = true; mlog('load deferred until user activation: ' + (W.getAttr(el, 'src') || '(sources)')); return; }
+    s.deferred = false;
     mlog('load ' + (W.getAttr(el, 'src') || '(sources)'));
     const hadSession = s.id !== 0 || s.currentSrc !== '';
     mediaTeardown(el, s);
@@ -1577,6 +1585,10 @@ methods(HM, {
     play() {
         const s = mst(this);
         mlog('play()');
+        if (!userActivated && W.slow() >= 3 && (this.muted || W.getAttr(this, 'muted') !== null)) {
+            mlog('play() blocked: slow CPU, no user activation');
+            return Promise.reject(new DOMException("play() failed because the user didn't interact with the document first.", 'NotAllowedError'));
+        }
         if (!s.id && !s.currentSrc) {
             const hasSrc = W.getAttr(this, 'src') !== null || W.query(this, 'source', true).length;
             if (hasSrc) mediaLoad(this);
@@ -4283,7 +4295,12 @@ function uiEvent(target, type, x, y, button, key) {
     else if (type === 'wheel') ev = new WheelEvent('wheel', Object.assign(base, { deltaY: key }));
     else ev = new Event(type, { bubbles: true, cancelable: true });
     hidden(ev, 'isTrusted', true);
-    if (type === 'click' || type === 'mousedown' || type === 'keydown' || type === 'pointerdown') userActivated = true;
+    if (type === 'click' || type === 'mousedown' || type === 'keydown' || type === 'pointerdown') {
+        if (!userActivated) {
+            userActivated = true;
+            for (const m of W.query(document, 'video,audio', true)) if (mst(m).deferred) mediaLoad(m);
+        }
+    }
     return dispatch(target || G, ev);
 }
 function dispatchClick(el) {

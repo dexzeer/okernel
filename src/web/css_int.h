@@ -142,6 +142,7 @@ struct wsheet {
     uint32_t src_off;
     int src_len;
     int outer_mq;        // <link media>/<style media> condition (-1 none)
+    int refs;            // owners: style sets (and the document's parsed-sheet cache) sharing this immutable sheet
 };
 
 // Parse into an existing sheet (atoms interned into `atoms`; NULL atoms

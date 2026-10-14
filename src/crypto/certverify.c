@@ -198,9 +198,55 @@ void cert_verify_trust_extra_distrust(const x509_time* after) {
 // the OCSP module): verify `sig` over `tbs` with `issuer`'s key under the
 // given signature algorithm (chain signatures AND OCSP response
 // signatures both use PKCS#1 v1.5 for RSA — never PSS outside CV).
+// Signatures that already verified are remembered (SHA-256 of algorithm, issuer SPKI, signed bytes and signature): a page
+// opens a handful of connections to the same few hosts, and every handshake would otherwise redo the same leaf and
+// intermediate signature checks (an ECDSA P-384 verify is ~26M cycles; the whole handshake ~350M on a 1 GHz-class core).
+// Only SUCCESS is cached and only a full digest match hits, so a changed byte anywhere is verified from scratch. The
+// per-handshake proofs (CertificateVerify over the transcript, OCSP) never repeat their input, so they are not helped
+// and not weakened. The cache is plain memory the kernel owns; nothing outside the process can fill it.
+#define SIG_MEMO_N 48
+static uint8_t sig_memo[SIG_MEMO_N][32];
+static int sig_memo_used, sig_memo_next;
+
+static void sig_memo_digest(uint8_t out[32], int sig_alg, const x509_cert* issuer,
+                            const uint8_t* tbs, uint32_t tbs_len, const uint8_t* sig, uint32_t sig_len) {
+    sha256_ctx c;
+    uint8_t head[9] = { (uint8_t)sig_alg, (uint8_t)(issuer->spki.len >> 8), (uint8_t)issuer->spki.len,
+                        (uint8_t)(tbs_len >> 16), (uint8_t)(tbs_len >> 8), (uint8_t)tbs_len,
+                        (uint8_t)(sig_len >> 16), (uint8_t)(sig_len >> 8), (uint8_t)sig_len };
+    sha256_init(&c);
+    sha256_update(&c, head, sizeof head);
+    sha256_update(&c, issuer->spki.p, issuer->spki.len);
+    sha256_update(&c, tbs, tbs_len);
+    sha256_update(&c, sig, sig_len);
+    sha256_final(&c, out);
+}
+
+static int cert_sig_verify_raw(int sig_alg, const x509_cert* issuer,
+                               const uint8_t* tbs, uint32_t tbs_len,
+                               const uint8_t* sig, uint32_t sig_len);
+
 int cert_sig_verify(int sig_alg, const x509_cert* issuer,
                     const uint8_t* tbs, uint32_t tbs_len,
                     const uint8_t* sig, uint32_t sig_len) {
+    uint8_t d[32];
+    if (!issuer->spki.p || issuer->spki.len == 0 || issuer->spki.len > 0xFFFF)
+        return cert_sig_verify_raw(sig_alg, issuer, tbs, tbs_len, sig, sig_len);
+    sig_memo_digest(d, sig_alg, issuer, tbs, tbs_len, sig, sig_len);
+    for (int i = 0; i < sig_memo_used; i++)
+        if (memcmp(sig_memo[i], d, 32) == 0) return 0;
+    int r = cert_sig_verify_raw(sig_alg, issuer, tbs, tbs_len, sig, sig_len);
+    if (r == 0) {
+        memcpy(sig_memo[sig_memo_next], d, 32);
+        sig_memo_next = (sig_memo_next + 1) % SIG_MEMO_N;
+        if (sig_memo_used < SIG_MEMO_N) sig_memo_used++;
+    }
+    return r;
+}
+
+static int cert_sig_verify_raw(int sig_alg, const x509_cert* issuer,
+                               const uint8_t* tbs, uint32_t tbs_len,
+                               const uint8_t* sig, uint32_t sig_len) {
     if (sig_alg == X509_SIG_RSA_SHA256 || sig_alg == X509_SIG_RSA_SHA384 ||
         sig_alg == X509_SIG_RSA_SHA512) {
         rsa_pub k;

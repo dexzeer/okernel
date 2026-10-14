@@ -59,6 +59,7 @@ static uint32_t okai_last_tick = 0;
 #define WHEEL_STEP  80       // per wheel notch
 #define CSS_WAIT_TICKS 300   // first paint waits at most 3s for stylesheets
 #define IMG_RENDER_TICKS 150 // image arrivals repaint at most every 1.5s
+#define RENDER_BG_MAX_TICKS 500 // ...and a background render never waits more than 5s
 #define MAX_BODY (16u << 20) // decompressed document cap
 
 static struct okai okais[MAX_OKAIS];
@@ -78,6 +79,7 @@ static void okai_tab_reset(struct okai_tab* T);
 static void load_home(int id, int tab);
 static void show_error(int id, int tab);
 static void request_render(struct okai_tab* T, int delay);
+static void request_render_bg(struct okai_tab* T, int delay);
 static void frames_drop_children(int bi, int slot);
 static void frames_sync(int bi, int slot);
 static void frames_check_sizes(int bi, int slot);
@@ -762,6 +764,7 @@ static void okai_tab_reset(struct okai_tab* T) {
     T->history_pos = 0;
     T->has_fixed = 0;
     T->last_render_tick = 0;
+    T->render_cost = 0;
     T->load_tick = 0;
     tab_reset_load(T);
 }
@@ -1021,6 +1024,22 @@ static void request_render(struct okai_tab* T, int delay) {
     T->render_pending = 1;
 }
 
+// A render nobody is waiting for (an image arrived, a script touched the DOM): wait at least three times as long as the
+// last render took, so a page that keeps changing cannot eat more than a quarter of the CPU. On a fast machine the cost
+// is a few ticks and this changes nothing; on a slow one a 1.4 s relayout is not repeated every 150 ms.
+// Lazy images (<img loading=lazy>) are fetched once their box is within a few screens of the viewport.
+static void lazy_view(struct okai_tab* T, int ph) {
+    if (T->doc) wdoc_set_view(T->doc, T->scroll_y - ph, T->scroll_y + ph * 5 / 2);
+}
+
+static void request_render_bg(struct okai_tab* T, int delay) {
+    if (T->render_pending) return;                                  // one is already scheduled
+    int floor = T->render_cost * 3;
+    if (floor > RENDER_BG_MAX_TICKS) floor = RENDER_BG_MAX_TICKS;
+    int wait = (int)(T->last_render_tick + (uint32_t)floor - tick_count);   // time left until the last render is 3 costs old
+    request_render(T, delay > wait ? delay : wait);
+}
+
 // Page viewport of window id: surface size and its screen origin.
 static int page_geom(struct okai* b, int* sx, int* sy, int* pw, int* ph) {
     struct window* w = window_get(b->win_id);
@@ -1106,6 +1125,8 @@ void okai_render_content(int id) {
     T->scroll_y = j.scroll;
     T->has_fixed = j.h;
     T->last_render_tick = tick_count;
+    T->render_cost = (int)(tick_count - t0);
+    lazy_view(T, ph);
     window_set_content_bg_rgb(b->win_id, 0xFFFFFF);
     window_set_dirty(b->win_id);
     b->chrome_dirty = 1;
@@ -1193,6 +1214,7 @@ static void scroll_to(int id, int ny) {
     j.scroll = ny;
     run_job(&j);
     window_set_dirty(b->win_id);
+    lazy_view(T, ph);
     PROF_END(PZ_SCROLL);
     serial_printf("[okai] scroll dy=%d in %dkcyc\n", dy, (int)((rdtsc64() - c0) >> 10));
 }
@@ -1485,6 +1507,19 @@ static int start_main_fetch(int id, int tab) {
     return 0;
 }
 
+// Does the path of url (before ? or #) end in ext1 or ext2 (case-insensitive)?
+static int url_has_ext(const char* url, const char* ext1, const char* ext2) {
+    int n = 0;
+    while (url[n] && url[n] != '?' && url[n] != '#') n++;
+    for (int k = 0; k < 2; k++) {
+        const char* e = k ? ext2 : ext1;
+        int el = (int)strlen(e), ok = n >= el;
+        for (int i = 0; ok && i < el; i++) ok = lower((unsigned char)url[n - el + i]) == e[i];
+        if (ok) return 1;
+    }
+    return 0;
+}
+
 static const char* kind_name(int kind) {
     return kind == WDOC_RK_CSS ? "CSS" : kind == WDOC_RK_IMG ? "IMG" : kind == WDOC_RK_SCRIPT ? "JS" : "XHR";
 }
@@ -1528,6 +1563,12 @@ static int start_next_sub(int bi, int ti) {
                      (kind == WDOC_RK_REQ && T->sub_req >= OKAI_MAX_REQ_FETCH);
         // every method goes out except the ones browsers forbid
         int unsupported = kind == WDOC_RK_REQ && (!strcmp(method, "CONNECT") || !strcmp(method, "TRACE") || !strcmp(method, "TRACK"));
+        // glTF models are only ever fetched for WebGL, which okai does not have: skip the download
+        if (kind == WDOC_RK_REQ && url_has_ext(url, ".glb", ".gltf")) {
+            serial_printf("[okai] skipping 3D model (no WebGL): %s\n", url);
+            sub_fail(T, id, url);
+            continue;
+        }
         if (capped || unsupported) {
             if (unsupported) serial_printf("[okai] %s request not supported: %s\n", method, url);
             sub_fail(T, id, url);
@@ -1726,7 +1767,7 @@ static void sub_landed(struct okai_tab* T, int kind) {
     if (kind == WDOC_RK_CSS) {
         if (wdoc_pending_css(T->doc) == 0) request_render(T, 0);
     } else if (kind == WDOC_RK_IMG) {
-        if (T->first_paint || wdoc_pending_css(T->doc) == 0) request_render(T, IMG_RENDER_TICKS);
+        if (T->first_paint || wdoc_pending_css(T->doc) == 0) request_render_bg(T, IMG_RENDER_TICKS);
     } else {
         T->js_next_tick = 0;   // a script/response arrived: pump the realm now
     }
@@ -1772,7 +1813,7 @@ static void js_apply(int id, int tab, int flags) {
         }
     }
     if (flags & WJS_DIRTY) {
-        if (T->first_paint) request_render(T, 15);
+        if (T->first_paint) request_render_bg(T, 15);
         else if (wdoc_pending_css(T->doc) == 0) request_render(T, 0);
         if ((int)(tick_count - T->frames_sync_tick) >= 0) {       // scripts add / remove / retarget <iframe> elements
             T->frames_sync_tick = tick_count + 20;

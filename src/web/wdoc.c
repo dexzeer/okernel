@@ -13,6 +13,7 @@
 
 enum { RES_CSS = WDOC_RK_CSS, RES_IMG = WDOC_RK_IMG, RES_SCRIPT = WDOC_RK_SCRIPT, RES_REQ = WDOC_RK_REQ };
 enum { RS_PENDING, RS_INFLIGHT, RS_DONE, RS_FAILED };
+#define SHEET_CACHE_MAX 96
 
 #define MAX_IMAGES 160
 #define MAX_IMG_DIM 2048
@@ -29,6 +30,7 @@ struct wres {
     char* headers;          // RES_REQ: "Name: value\r\n..." request headers
     char* body;             // RES_REQ: request body (or NULL)
     int blen;
+    uint8_t lazy, near_;    // RES_IMG: only <img loading=lazy> uses it; set once its box came within reach of the viewport
 };
 
 struct wdimg {
@@ -37,6 +39,7 @@ struct wdimg {
     uint32_t* px;
     int ext;                // px belongs to someone else (a <video> frame): never freed
     int state;              // 0 pending, 1 ok, 2 failed
+    uint8_t use;            // collect_images: 1 = used by lazy <img>, 2 = by anything else
     int res;
     char url[512];
 };
@@ -69,6 +72,10 @@ struct wdoc {
     int images_dirty;       // image sources changed: rescan
     int last_forced_ms;     // layout forced by a script (throttle)
     int last_layout_ms;     // cost of the last layout pass
+    // parsed stylesheets by content: the set is rebuilt whenever a script touches a <style>/<link> element, and parsing
+    // tens of thousands of rules again each time was most of that cost
+    struct { uint32_t h1, h2; int len; struct wsheet* sh; } sc[SHEET_CACHE_MAX];
+    int nsc, sc_next;
 };
 
 // ---- data: URLs --------------------------------------------------------------------
@@ -410,6 +417,8 @@ static void doc_clear(struct wdoc* d) {
     d->js = 0;
     if (d->L) wlay_free(d->L);
     if (d->ss) css_set_free(d->ss);
+    for (int i = 0; i < d->nsc; i++) css_sheet_unref(d->sc[i].sh);
+    d->nsc = d->sc_next = 0;
     if (d->d) wdom_free(d->d);
     for (int i = 0; i < d->nimg; i++) if (!d->img[i].ext) w_free(d->img[i].px);
     w_free(d->img);
@@ -466,7 +475,26 @@ static void add_sheet_ordered(struct wdoc* d, const char* text, int len, const c
         d->sheet_order = n;
         d->capsheet = nc;
     }
-    int at = css_set_add_sheet_ex(d->ss, text, len, base, pos, media, mlen);
+    // an identical sheet parsed before (same text, base and media) is shared instead of parsed again
+    uint32_t h1 = 2166136261u, h2 = 0x9E3779B9u;
+    for (int i = 0; i < len; i++) { h1 = (h1 ^ (unsigned char)text[i]) * 16777619u; h2 = (h2 + (unsigned char)text[i]) * 0x01000193u ^ (h2 >> 15); }
+    for (const char* q = base ? base : ""; *q; q++) { h1 = (h1 ^ (unsigned char)*q) * 16777619u; h2 = (h2 + (unsigned char)*q + 1) * 0x01000193u ^ (h2 >> 15); }
+    h1 = (h1 ^ 0xFF) * 16777619u;
+    for (int i = 0; media && i < mlen; i++) { h1 = (h1 ^ (unsigned char)media[i]) * 16777619u; h2 = (h2 + (unsigned char)media[i] + 2) * 0x01000193u ^ (h2 >> 15); }
+    int at = -1;
+    for (int i = 0; i < d->nsc; i++)
+        if (d->sc[i].h1 == h1 && d->sc[i].h2 == h2 && d->sc[i].len == len) { at = css_set_add_shared(d->ss, d->sc[i].sh, pos); break; }
+    if (at < 0) {
+        at = css_set_add_sheet_ex(d->ss, text, len, base, pos, media, mlen);
+        if (at >= 0) {
+            int slot;
+            if (d->nsc < SHEET_CACHE_MAX) slot = d->nsc++;
+            else { slot = d->sc_next++ % SHEET_CACHE_MAX; css_sheet_unref(d->sc[slot].sh); }      // evict the oldest
+            struct wsheet* sh = css_set_sheet_at(d->ss, at);
+            css_sheet_ref(sh);
+            d->sc[slot].h1 = h1; d->sc[slot].h2 = h2; d->sc[slot].len = len; d->sc[slot].sh = sh;
+        }
+    }
     if (at < 0) return;
     for (int i = d->nsheet; i > at; i--) d->sheet_order[i] = d->sheet_order[i - 1];
     d->sheet_order[at] = order;
@@ -547,6 +575,7 @@ static void collect_images(struct wdoc* d) {
     struct wdom* dom = d->d;
     if (!node_img_grow(d)) return;
     char abs[1024];
+    for (int i = 0; i < d->nimg; i++) d->img[i].use = 0;
     for (int el = dom->n[0].first; el >= 0; el = wdom_next(dom, el, 0)) {
         if (dom->n[el].type != WN_ELEM || dom->n[el].ns != NS_HTML) continue;
         int tag = dom->n[el].tag;
@@ -554,12 +583,21 @@ static void collect_images(struct wdoc* d) {
         if (tag == T_img || (tag == T_input && wdom_attr(dom, el, A_type, &(int){0}) &&
                              w_ieq(wdom_attr(dom, el, A_type, &(int){0}), 5, "image"))) {
             slot = pick_img_url(d, el, abs, sizeof abs) > 0 ? img_slot(d, abs) : -1;
+            if (slot >= 0) {
+                int ll;
+                const char* lz = wdom_attr_s(dom, el, "loading", &ll);
+                d->img[slot].use |= (tag == T_img && lz && ll == 4 && w_ieq(lz, 4, "lazy")) ? 1 : 2;
+            }
         } else if (tag == T_video) {
             int pl;
             const char* poster = wdom_attr_s(dom, el, "poster", &pl);
             slot = (poster && wurl_resolve(d->base, poster, pl, abs, sizeof abs) > 0) ? img_slot(d, abs) : -1;
         }
         if (slot != -2 && !(d->node_img[el] >= 0 && d->img[d->node_img[el]].ext)) d->node_img[el] = slot;
+    }
+    for (int i = 0; i < d->nimg; i++) {
+        int r = d->img[i].res;
+        if (r >= 0 && r < d->nres) d->res[r].lazy = d->img[i].use == 1;
     }
 }
 
@@ -622,6 +660,12 @@ int wdoc_load(struct wdoc* d, const char* url, const char* html, int len, const 
     return 0;
 }
 
+// A lazy image whose box has not come near the viewport yet: not fetched, and not counted as pending either (the page
+// is done loading without it).
+static int res_deferred(const struct wres* r) {
+    return r->kind == RES_IMG && r->lazy && !r->near_ && r->state == RS_PENDING;
+}
+
 int wdoc_next_fetch(struct wdoc* d, char* url, int cap) {
     // stylesheets first (they gate the first meaningful paint), then
     // scripts and script requests (in request order), then images
@@ -629,7 +673,7 @@ int wdoc_next_fetch(struct wdoc* d, char* url, int cap) {
         for (int i = 0; i < d->nres; i++) {
             struct wres* r = &d->res[i];
             int p = r->kind == RES_CSS ? 0 : r->kind == RES_IMG ? 2 : 1;
-            if (r->state != RS_PENDING || p != pass) continue;
+            if (r->state != RS_PENDING || p != pass || res_deferred(r)) continue;
             r->state = RS_INFLIGHT;
             int n = (int)strlen(r->url);
             if (n > cap - 1) n = cap - 1;
@@ -655,7 +699,7 @@ int wdoc_fetch_info(struct wdoc* d, int id, const char** method, const char** he
 
 int wdoc_pending(struct wdoc* d) {
     int n = 0;
-    for (int i = 0; i < d->nres; i++) if (d->res[i].state <= RS_INFLIGHT) n++;
+    for (int i = 0; i < d->nres; i++) if (d->res[i].state <= RS_INFLIGHT && !res_deferred(&d->res[i])) n++;
     return n;
 }
 
@@ -752,13 +796,20 @@ void wdoc_invalidate(struct wdoc* d) { d->style_dirty = 1; d->layout_dirty = 1; 
 
 int wdoc_update(struct wdoc* d) {
     if (!d->d) return 0;
+    int t0 = wjs_now(), rebuilt = d->styles_dirty;
     if (d->styles_dirty) { d->styles_dirty = 0; rebuild_styles(d); }
     if (d->images_dirty) { d->images_dirty = 0; collect_images(d); }
     if (!d->ss) return 0;
     if (!d->style_dirty && !d->layout_dirty && d->L) return 0;
+    int t1 = wjs_now(), restyled = d->style_dirty;
     if (d->style_dirty) css_compute_all(d->ss, d->vw, d->vh);
+    int t2 = wjs_now();
     if (d->L) wlay_free(d->L);
     d->L = wlay_run(d->d, d->ss, d->vw, d->vh, &d->li);
+    int t3 = wjs_now();
+    if (t3 - t0 >= 100)
+        w_log("[wdoc] update %dms: sheets%s %dms, style%s %dms, layout %dms (%d nodes)\n", t3 - t0, rebuilt ? " REBUILT" : "", t1 - t0,
+              restyled ? " recomputed" : "", t2 - t1, t3 - t2, d->d->nn);
     d->style_dirty = 0;
     d->layout_dirty = 0;
     return 1;
@@ -1095,6 +1146,29 @@ int wdoc_hit_element(struct wdoc* d, int x, int y) {
 int wdoc_pending_load(struct wdoc* d) {
     int n = 0;
     for (int i = 0; i < d->nres; i++)
-        if ((d->res[i].kind == RES_CSS || d->res[i].kind == RES_IMG) && d->res[i].state <= RS_INFLIGHT) n++;
+        if ((d->res[i].kind == RES_CSS || d->res[i].kind == RES_IMG) && d->res[i].state <= RS_INFLIGHT && !res_deferred(&d->res[i])) n++;
     return n;
+}
+
+// Tell the document which stretch of it (document px) is worth loading lazy images for: every lazy image whose box
+// overlaps [y0, y1] becomes fetchable (and stays so). Reads the layout that exists; never forces one. Returns how many
+// images became fetchable.
+int wdoc_set_view(struct wdoc* d, int y0, int y1) {
+    if (!d->L || !d->nres) return 0;
+    int any = 0;
+    for (int i = 0; i < d->nres; i++) if (res_deferred(&d->res[i])) { any = 1; break; }
+    if (!any) return 0;
+    int woke = 0;
+    // an image that has not loaded has no display item (nothing to draw yet), so look at the box of its element
+    for (int node = 0; node < d->node_img_cap && node < d->d->nn; node++) {
+        int slot = d->node_img ? d->node_img[node] : -1;
+        if (slot < 0 || slot >= d->nimg) continue;
+        int r = d->img[slot].res;
+        if (r < 0 || r >= d->nres || !res_deferred(&d->res[r])) continue;
+        int32_t X, Y, W, H;
+        if (!wlay_node_rect(d->L, node, &X, &Y, &W, &H)) continue;
+        int top = LU_FLOOR(Y), bot = LU_ROUND(Y + H);
+        if (bot >= y0 && top <= y1) { d->res[r].near_ = 1; woke++; }
+    }
+    return woke;
 }

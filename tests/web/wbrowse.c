@@ -303,6 +303,12 @@ again:
     double t2 = now_ms();
     if (js && getenv("WB_EVAL")) { int el; char* es = slurp(getenv("WB_EVAL"), &el); if (es) { es = realloc(es, (size_t)el + 1); es[el] = 0; wjs_debug_eval(js, es); free(es); } }   // WB_EVAL=file.js: run in the page after the load
     wdoc_update(d);
+    if (getenv("WB_RESTYLE")) {                // WB_RESTYLE=N: restyle + relayout the loaded page N times (profiling the cascade)
+        int n = atoi(getenv("WB_RESTYLE"));
+        double r0 = now_ms();
+        for (int i = 0; i < n; i++) { wdoc_invalidate(d); wdoc_update(d); }
+        printf("WB restyle x%d: %.1f ms each\n", n,(now_ms() - r0) / (n ? n : 1));
+    }
     int dh = wdoc_height(d);
     int hh = vh;
     struct wsurf s;
