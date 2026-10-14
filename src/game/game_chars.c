@@ -134,6 +134,9 @@ void g_player_controls(struct game* g, double dt) {
     if (chair < 0 || !joint_alive(g, wheel_j)) return;
     struct ph_world* w = &g->world;
     int up = g->held[GK_UP], down = g->held[GK_DOWN], left = g->held[GK_LEFT], right = g->held[GK_RIGHT];
+    // grip and weight scale with gravity, so the motor does too: full torque on the moon would stand the chair on its tail
+    double grav = w->gravity.y / 14.0;
+    grav = grav < 0.25 ? 0.25 : grav > 1 ? 1 : grav;
     double want = 0, torque = 0;
     if (up && !down) { want = SPEED_FWD; torque = TORQUE_DRIVE; }
     else if (down && !up) {
@@ -142,11 +145,11 @@ void g_player_controls(struct game* g, double dt) {
         else { want = -SPEED_REV; torque = TORQUE_DRIVE * 0.8; }
     }
     // ease the requested wheel speed toward the wanted one: a full-power start would stand the chair up on its back wheel
-    double step = ACCEL * dt;
+    double step = ACCEL * grav * dt;
     if (E->drive < want) E->drive = E->drive + step > want ? want : E->drive + step;
     else if (E->drive > want) E->drive = E->drive - step * 2 < want ? want : E->drive - step * 2;
     if (!up && !down) { E->drive = w->joint[wheel_j].used ? 0 : 0; ph_joint_motor(w, wheel_j, 0, 0); }
-    else ph_joint_motor(w, wheel_j, E->drive, torque);
+    else ph_joint_motor(w, wheel_j, E->drive, torque * grav);
     // the rider's back muscles: a gentle motor on the hip holds the torso upright, but a hard knock overpowers it
     if (E->njoint > 2 && joint_alive(g, E->joint[2]) && E->body[PART_TORSO] >= 0) {
         double th = w->body[E->body[PART_TORSO]].a - w->body[chair].a;
