@@ -440,16 +440,6 @@ static int slot_assign(int si) {
             idle_other = i;
     }
     if (per_host >= CONN_PER_HOST) return 0;
-    // A full TLS handshake costs ~350M instructions (signature checks, key exchange); a resumed one a tenth of that. The first
-    // connection to an origin gets the session ticket, so while it is still handshaking the others wait for it instead of
-    // all starting a full handshake of their own at once (six at a time on a page with many resources from one host).
-    if (s->https && per_host > 0 && !tls_ticket_have(s->host, (uint64_t)tick_count * 10)) {
-        for (int i = 0; i < CONN_MAX; i++) {
-            struct fconn* c = &conns[i];
-            if (c->st == CN_FREE || c->st == CN_IDLE || !conn_matches(c, s)) continue;
-            if (c->st == CN_DNS || c->st == CN_TCP || (c->tls && c->tls->phase < TLS_PH_RECV_BODY)) return 0;
-        }
-    }
     if (free_i < 0 && idle_other >= 0) {   // evict the longest-idle other origin
         conn_close(&conns[idle_other], 0);
         free_i = idle_other;
