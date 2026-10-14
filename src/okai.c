@@ -554,6 +554,7 @@ static int req_fetch(struct oreq* q, const char* top) {
     }
     cookie_hdr[n] = 0;
     if (n > 0) o.extra = cookie_hdr;
+    o.cache = q->doc != 0 && q->sub_id >= 0 && !o.method && !o.body;       // sub-resources, not documents
     q->https = url_is_https(q->url);
     int h = fetch_begin(host, path, (uint16_t)port, q->https, &o);
     if (h < 0) return -2;
@@ -2309,6 +2310,7 @@ void okai_nav_reload(int id) {
     if (b->win_id < 0) return;
     char u[OKAI_URL_LEN];
     scopy(u, okai_tab_of(b)->url, sizeof u);
+    fetch_cache_clear();                       // a reload asks for everything again
     navigate_ex(id, u, 0);
 }
 
