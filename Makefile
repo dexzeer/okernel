@@ -114,7 +114,7 @@ DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/pcix.o src/acpi
              src/crypto/sha512.o src/crypto/der.o src/crypto/x509.o \
              src/crypto/rsa.o src/crypto/ec.o src/crypto/roots.o \
              src/crypto/certverify.o src/rtc.o \
-             src/net/fcache.o src/net/fetch.o
+             src/net/fcache.o src/net/hpack.o src/net/hpack_tables.o src/net/fetch.o
 
 .PHONY: laptop all text desktop clean run debug host-tests host-tests-asan media-tests diff-oracle diff-test tls-interop web-tests
 
@@ -138,6 +138,7 @@ web-tests:
 	$(WEB_HOST_CC) -o build-host/t_webcss tests/web/test_css.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_webcss | tail -n 2
 	$(WEB_HOST_CC) -o build-host/t_font tests/web/test_font.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_font | tail -n 2
 	$(WEB_HOST_CC) -o build-host/t_lazy tests/web/test_lazy.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_lazy | tail -n 2
+	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_hpack tests/test_hpack.c && ASAN_OPTIONS=detect_leaks=1 ./build-host/t_hpack | tail -n 1
 	$(WEB_HOST_CC) -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_pscan tests/web/test_pscan.c src/web/pscan.c src/web/wurl.c && ./build-host/t_pscan | tail -n 1
 	./build-host/wbrowse tests/web/js/basic.html 800 600 build-host/js-basic.ppm 3 | grep RESULT
 	./build-host/wbrowse tests/web/js/fragparse.html 640 400 build-host/js-frag.ppm 3 | grep 'RESULT ALLPASS'
