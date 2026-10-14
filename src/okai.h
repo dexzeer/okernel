@@ -76,6 +76,7 @@ struct okai_tab {
     int first_paint;      // 1 once the loaded document has been painted
     // Animation: current rendered tab width (px) and close-in-progress flag.
     int anim_w;           // eased toward the target width for open/close animation
+    int previewing;       // the page on screen is a preview built from the first part of a document still downloading
     int closing;          // 1 while the tab is shrinking before removal
     // Page scripts
     int sub_js, sub_req;  // script / request fetches issued this page (caps above)
