@@ -110,6 +110,10 @@ int tls_parse_ee_alpn(const uint8_t* ee_body, uint32_t ee_len,
 // extensions, ALPN-if-present must be exactly "http/1.1". Returns 0 if
 // acceptable, -1 otherwise.
 int tls_parse_ee_validate(const uint8_t* ee_body, uint32_t ee_len);
+// Same, but with allow_h2 an ALPN answer of "h2" is accepted too (*is_h2 tells which one the server chose).
+int tls_parse_ee_validate_alpn(const uint8_t* ee_body, uint32_t ee_len, int allow_h2, int* is_h2);
+// Offer "h2" before "http/1.1" in the ClientHellos built from now on (until switched off again).
+void tls_set_offer_h2(int on);
 
 // Confirm a Certificate handshake body parses (basic structural validation:
 // at least one cert entry, each entry's length matches its header). We do

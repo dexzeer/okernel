@@ -612,6 +612,7 @@ void h2_out_done(struct h2* h, uint32_t n) {
 
 int h2_dead(const struct h2* h) { return h->dead; }
 int h2_active(const struct h2* h) { return h->nactive; }
+int h2_draining(const struct h2* h) { return h->goaway; }
 int h2_peer_settings_seen(const struct h2* h) { return h->settings_seen; }
 
 struct h2* h2_new(const struct h2_cb* cb) {

@@ -180,7 +180,24 @@ int tls_ext_append_sni(uint8_t* buf, uint32_t cap, uint32_t* pos,
     return 0;
 }
 
+// Whether the ClientHello being built offers "h2" ahead of "http/1.1" (HTTP/2 over TLS, RFC 9113 3.2). Set by the caller
+// right before building; the connection's own flag (tls_state.offer_h2) decides what its EncryptedExtensions may answer.
+static int g_offer_h2;
+void tls_set_offer_h2(int on) { g_offer_h2 = on != 0; }
+
 int tls_ext_append_alpn_http11(uint8_t* buf, uint32_t cap, uint32_t* pos) {
+    if (g_offer_h2) {
+        // list: 02 'h2' 08 'http/1.1'
+        static const uint8_t lst[] = { 2, 'h', '2', 8, 'h', 't', 't', 'p', '/', '1', '.', '1' };
+        uint32_t start = *pos, list_len = sizeof lst, body_len = 2 + list_len;
+        if (!buf_has(cap, start, 4 + body_len)) return -1;
+        put_u16(buf + start, TLS_EXT_APPLICATION_LAYER_PROTOCOL);
+        if (put_u16_ck(buf + start + 2, body_len) < 0) return -1;
+        if (put_u16_ck(buf + start + 4, list_len) < 0) return -1;
+        memcpy(buf + start + 6, lst, list_len);
+        *pos = start + 4 + body_len;
+        return 0;
+    }
     // ALPN: list_len(2) | list_bytes where list_bytes = { proto_len(1) | proto }
     // list_len describes the bytes that follow the list_len field.
     const char* proto = "http/1.1";
@@ -770,7 +787,10 @@ int tls_cert_has_staple(const uint8_t* cert, uint32_t cert_len,
 // above would mis-speak the connection (we have no h2 stack). Returns 0 if
 // the EE is acceptable, -1 otherwise. Unknown non-ALPN extensions are
 // tolerated (forward compat) but must be well-formed and unique.
-int tls_parse_ee_validate(const uint8_t* ee, uint32_t ee_len) {
+int tls_parse_ee_validate(const uint8_t* ee, uint32_t ee_len) { return tls_parse_ee_validate_alpn(ee, ee_len, 0, 0); }
+
+int tls_parse_ee_validate_alpn(const uint8_t* ee, uint32_t ee_len, int allow_h2, int* is_h2) {
+    if (is_h2) *is_h2 = 0;
     if (ee_len < 2) return -1;
     uint32_t ext_len = get_u16(ee);
     if (ee_len != 2 + ext_len) return -1; // exact: no trailing bytes
@@ -789,12 +809,16 @@ int tls_parse_ee_validate(const uint8_t* ee, uint32_t ee_len) {
             // ALPN body: list_len(2) || proto_len(1) || proto. Exactly one
             // protocol, exactly "http/1.1" (8 bytes) — the only thing we
             // offered and the only thing the HTTP layer speaks.
-            if (elen != 2 + 1 + 8) return -1;
-            if (get_u16(ee + p) != 1 + 8) return -1;
-            if (ee[p + 2] != 8) return -1;
-            static const char want[] = "http/1.1";
-            for (uint32_t i = 0; i < 8; i++)
-                if (ee[p + 3 + i] != (uint8_t)want[i]) return -1;
+            if (allow_h2 && elen == 2 + 1 + 2 && get_u16(ee + p) == 1 + 2 && ee[p + 2] == 2 && ee[p + 3] == 'h' && ee[p + 4] == '2') {
+                if (is_h2) *is_h2 = 1;                   // the server picked HTTP/2
+            } else {
+                if (elen != 2 + 1 + 8) return -1;
+                if (get_u16(ee + p) != 1 + 8) return -1;
+                if (ee[p + 2] != 8) return -1;
+                static const char want[] = "http/1.1";
+                for (uint32_t i = 0; i < 8; i++)
+                    if (ee[p + 3 + i] != (uint8_t)want[i]) return -1;
+            }
         }
         p += elen;
     }

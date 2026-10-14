@@ -174,6 +174,10 @@ struct tls_state {
     // — see tls_response_complete). Preserved by tls_state_wipe (like
     // out/fail codes, unlike key material).
     int saw_close;
+    // HTTP/2 (set by the caller before the first step): offer "h2" in ALPN. alpn_h2 is set when the server chose it; the
+    // connection then carries no HTTP/1.1 request - the caller feeds frames through tls_state_queue and reads them from out.
+    int offer_h2;
+    int alpn_h2;
 };
 
 void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
@@ -202,6 +206,10 @@ int tls_state_reuse(struct tls_state* st, const struct tls_client_io* io,
 // connection-independent and intentionally survive (documented lifetimes,
 // not per-connection state).
 void tls_state_wipe(struct tls_state* st);
+// Raw application-data mode (HTTP/2): queue bytes to send once the previous ones are out (0 = queued, -1 = still sending).
+// The bytes must stay valid until tls_state_sent_all() says they went out.
+int tls_state_queue(struct tls_state* st, const uint8_t* data, uint32_t len);
+int tls_state_sent_all(const struct tls_state* st);
 
 int tls_last_fail_reason(void); // TLS_FAIL_* of the most recent tls_client_run
 

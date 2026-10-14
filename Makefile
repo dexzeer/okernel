@@ -181,6 +181,7 @@ host-tests:
 	$(MAKE) web-tests
 	gcc -m32 -O2 -Isrc/crypto -o build-host/t_aes tests/test_aes.c src/crypto/aes.c && (python3 tests/aes_vectors.py 300 2>/dev/null | ./build-host/t_aes - || ./build-host/t_aes) | tail -n 2
 	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_pki tests/test_pki.c $(HOST_CRYPTO_SRC) && ./build-host/t_pki | tail -n 2
+	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_alpn tests/test_alpn.c $(HOST_CRYPTO_SRC) && ./build-host/t_alpn | tail -n 1
 	printf '#include <string.h>\n#include <stdint.h>\n#include "tls_client.h"\n' > build-host/dechunk_fn.c
 	awk '/^int http_dechunk\(char\* buf, int len\) \{/{p=1} p{print} p&&/^}/{exit}' src/net/network.c >> build-host/dechunk_fn.c
 	gcc -m32 -O1 -fsanitize=address,undefined -Isrc/crypto -Isrc -o build-host/t_dechunk tests/test_dechunk.c build-host/dechunk_fn.c $(HOST_CRYPTO_SRC) && ./build-host/t_dechunk | tail -n 1

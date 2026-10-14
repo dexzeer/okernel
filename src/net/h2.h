@@ -49,6 +49,7 @@ int  h2_open(struct h2* h, const uint8_t* req, uint32_t len, void* user);
 void h2_cancel(struct h2* h, int stream_id);
 
 int  h2_active(const struct h2* h);        // streams still open
+int  h2_draining(const struct h2* h);      // a GOAWAY arrived: no new streams, close when the open ones are done
 int  h2_peer_settings_seen(const struct h2* h);
 
 #endif

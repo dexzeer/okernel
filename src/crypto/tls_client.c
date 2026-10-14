@@ -966,6 +966,16 @@ int tls_state_reuse(struct tls_state* st, const struct tls_client_io* io,
     return 0;
 }
 
+int tls_state_queue(struct tls_state* st, const uint8_t* data, uint32_t len) {
+    if (!st || st->phase != TLS_PH_RECV_BODY || st->req_off < st->request_len) return -1;
+    st->request = data;
+    st->request_len = len;
+    st->req_off = 0;
+    return 0;
+}
+
+int tls_state_sent_all(const struct tls_state* st) { return st->req_off >= st->request_len; }
+
 void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
                     const uint8_t* request, uint32_t request_len,
                     uint8_t* out, uint32_t out_cap) {
@@ -1034,6 +1044,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             st->fail_reason = TLS_FAIL_RNG;
             return TLS_STEP_ERR;
         }
+        tls_set_offer_h2(st->offer_h2);
         st->ch_len = tls_build_client_hello(st->ch, sizeof(st->ch),
                                             st->random, st->session_id,
                                             st->pub, st->host);
@@ -1437,10 +1448,12 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                 // framing, no duplicates, ALPN-if-present == "http/1.1".
                 // An h2-selecting server would otherwise break the HTTP
                 // layer above silently.
-                if (tls_parse_ee_validate(st->ee_body, st->ee_bl) != 0) {
+                int ee_h2 = 0;
+                if (tls_parse_ee_validate_alpn(st->ee_body, st->ee_bl, st->offer_h2, &ee_h2) != 0) {
                     tls_dbg("[tls] EncryptedExtensions rejected\n");
                     st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR;
                 }
+                st->alpn_h2 = ee_h2;
                 st->hs_next = 1;
             } else if (t == TLS_HS_CERTIFICATE) {
                 if (bl > sizeof(st->cert_body)) { st->fail_reason = TLS_FAIL_PROTO; return TLS_STEP_ERR; }
@@ -1804,6 +1817,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
 
         st->c_ap_seq = 0; st->s_ap_seq = 0;
         st->req_off = 0;
+        if (st->alpn_h2) st->request_len = 0;            // HTTP/2: the caller sends frames, not the HTTP/1.1 request
         st->phase = TLS_PH_RECV_BODY;
         return TLS_STEP_AGAIN;
     }
