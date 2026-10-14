@@ -54,7 +54,7 @@ WEB_OBJ = src/web/wdom.o src/web/html5.o src/web/charset.o src/web/wurl.o \
           src/web/lay_tree.o src/web/lay_main.o src/web/lay_inline.o src/web/lay_flex.o \
           src/web/lay_grid.o src/web/lay_table.o src/web/lay_dl.o \
           src/web/paint.o src/web/raster.o src/web/font.o src/web/svg.o src/web/image.o \
-          src/web/wdoc.o src/web/fontdata.o src/web/callstack.o \
+          src/web/wdoc.o src/web/pscan.o src/web/fontdata.o src/web/callstack.o \
           src/web/wjs.o src/web/wjs_dom.o src/web/wjs_media.o src/web/wjs_canvas.o src/web/wcanvas.o src/web/wjs_sys.o src/web/wjs_prelude.o src/web/wcookie.o
 WEB_HEADERS := $(wildcard src/web/*.h) $(wildcard src/ojs/*.h)
 src/wallpaper.o: src/wallpaper.asm tools/wallpaper/wallpaper.jpg
@@ -138,6 +138,7 @@ web-tests:
 	$(WEB_HOST_CC) -o build-host/t_webcss tests/web/test_css.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_webcss | tail -n 2
 	$(WEB_HOST_CC) -o build-host/t_font tests/web/test_font.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_font | tail -n 2
 	$(WEB_HOST_CC) -o build-host/t_lazy tests/web/test_lazy.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_lazy | tail -n 2
+	$(WEB_HOST_CC) -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_pscan tests/web/test_pscan.c src/web/pscan.c src/web/wurl.c && ./build-host/t_pscan | tail -n 1
 	./build-host/wbrowse tests/web/js/basic.html 800 600 build-host/js-basic.ppm 3 | grep RESULT
 	./build-host/wbrowse tests/web/js/fragparse.html 640 400 build-host/js-frag.ppm 3 | grep 'RESULT ALLPASS'
 	./build-host/wbrowse tests/web/js/tostr.html 640 400 build-host/js-tostr.ppm 3 | grep 'RESULT ALLPASS'

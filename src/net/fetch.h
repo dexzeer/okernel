@@ -36,6 +36,9 @@ int   fetch_status(int h);                   // FETCH_RUNNING / DONE / FAILED
 // fetch_end. The caller may modify it in place (dechunk/inflate).
 char* fetch_response(int h, int* len);
 int   fetch_progress(int h);                 // bytes received so far
+// The response so far (status line + headers + body as received, NOT NUL-terminated, may be raw chunked) of a request still
+// running; NULL otherwise. Valid until the next fetch_poll.
+const char* fetch_peek(int h, int* len);
 // Failure classification: TLS_FAIL_* for secure-channel/certificate
 // failures, 0 for transport failures (DNS, connect, reset, timeout).
 int   fetch_fail_reason(int h);
