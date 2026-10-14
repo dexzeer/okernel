@@ -17,6 +17,7 @@
 #include "../string.h"
 #include "../serial.h"
 #include "../crypto/tls_client.h"
+#include "fcache.h"
 
 extern uint32_t tick_count;   // 100 Hz
 
@@ -65,6 +66,9 @@ struct fslot {
     int reused, stale_retried;
     uint32_t t_start;
     uint32_t req_off;       // plain HTTP: request bytes handed to TCP so far
+    struct fcache_key key;  // cache key (valid when cacheable)
+    int cacheable;          // a response to this request may be stored
+    int prefetch;           // speculative: frees itself when done
 };
 
 static struct fconn conns[CONN_MAX];
@@ -199,6 +203,10 @@ static void slot_finish(struct fslot* s, struct fconn* c, int keep) {
     else
         serial_printf("[http] received %u bytes (%s, %ums)%s\n", s->resp_len, s->what,
                       (tick_count - s->t_start) * 10, s->reused ? " [reused]" : "");
+    if (s->cacheable && s->resp) {
+        int ka2 = 0;
+        if (message_state(s->resp, s->resp_len, &ka2) == 1) fcache_store(&s->key, s->resp, s->resp_len, tick_count, s->prefetch);
+    }
     if (keep && c->st == CN_RUN && !tcp_failed(c->sock) && tcp_state(c->sock) == TCP_STATE_ESTABLISHED) {
         c->st = CN_IDLE;
         c->slot = -1;
@@ -483,6 +491,9 @@ void fetch_poll(void) {
     }
     for (int i = 0; i < CONN_MAX; i++)
         if (conns[i].st != CN_FREE) conn_step(&conns[i]);
+    // speculative loads free themselves (a finished one is already in the cache)
+    for (int i = 0; i < FETCH_MAX; i++)
+        if (slots[i].prefetch && (slots[i].st == SL_DONE || slots[i].st == SL_FAIL)) fetch_end(i);
 }
 
 // ---- public API ----------------------------------------------------------------------
@@ -491,14 +502,83 @@ static void put(uint8_t* b, uint32_t* n, uint32_t cap, const char* s) {
     while (*s && *n < cap) b[(*n)++] = (uint8_t)*s++;
 }
 
-int fetch_begin(const char* host, const char* path, uint16_t port, int https,
-                const struct fetch_opts* o) {
+// Cache key of a request: everything that makes two requests the same thing for a cache.
+static void request_key(struct fcache_key* k, const char* host, const char* path, uint16_t port, int https,
+                        const struct fetch_opts* o) {
+    fcache_key_init(k);
+    char pb[8];
+    pb[0] = https ? 's' : 'p';
+    pb[1] = (char)(port & 0xFF);
+    pb[2] = (char)(port >> 8);
+    pb[3] = o && o->gzip ? 'z' : 'r';
+    pb[4] = o && o->accept_html ? 'h' : 'a';
+    fcache_key_add(k, pb, 5);
+    fcache_key_add(k, host, (uint32_t)strlen(host));
+    fcache_key_add(k, path, (uint32_t)strlen(path));
+    if (o && o->extra) {                 // Origin selects the CORS variant of a response
+        for (const char* p = o->extra; *p; ) {
+            const char* e = p;
+            while (*e && *e != '\r' && *e != '\n') e++;
+            if (e - p > 8 && (p[0] | 32) == 'o' && (p[1] | 32) == 'r' && (p[2] | 32) == 'i' && (p[3] | 32) == 'g' &&
+                (p[4] | 32) == 'i' && (p[5] | 32) == 'n' && p[6] == ':')
+                fcache_key_add(k, p, (uint32_t)(e - p));
+            p = e;
+            while (*p == '\r' || *p == '\n') p++;
+        }
+    }
+}
+
+static int begin_request(const char* host, const char* path, uint16_t port, int https,
+                         const struct fetch_opts* o, int prefetch) {
     if (!host || !host[0]) return -1;
+    if (!path || !path[0]) path = "/";
+    uint16_t eport = port ? port : (uint16_t)(https ? 443 : 80);
+    const char* meth = o && o->method && o->method[0] ? o->method : "GET";
+    int cacheable = o && o->cache && !strcmp(meth, "GET") && !(o->body && o->body_len);
+    struct fcache_key key;
+    if (cacheable) {
+        request_key(&key, host, path, eport, https, o);
+        if (!prefetch) {
+            for (int i = 0; i < FETCH_MAX; i++)   // a speculative load of exactly this: take it over
+                if (slots[i].st != SL_FREE && slots[i].prefetch && slots[i].key.h1 == key.h1 && slots[i].key.h2 == key.h2) {
+                    slots[i].prefetch = 0;
+                    serial_printf("[cache] adopted prefetch %s\n", slots[i].what);
+                    return i;
+                }
+        }
+    }
     int h = -1;
     for (int i = 0; i < FETCH_MAX; i++) if (slots[i].st == SL_FREE) { h = i; break; }
     if (h < 0) return -1;
     struct fslot* s = &slots[h];
     memset(s, 0, sizeof *s);
+    s->prefetch = prefetch;
+    if (cacheable) {
+        s->key = key;
+        s->cacheable = 1;
+        const char* data;
+        uint32_t dl;
+        if (!prefetch && fcache_lookup(&key, tick_count, &data, &dl)) {
+            s->resp = (char*)kmalloc(dl + 1);
+            if (s->resp) {
+                memcpy(s->resp, data, dl);
+                s->resp[dl] = 0;
+                s->resp_len = dl;
+                s->resp_cap = dl + 1;
+                s->https = https ? 1 : 0;
+                int k = 0;
+                for (const char* p = host; *p && k < 60; p++) s->what[k++] = *p;
+                for (const char* p = path; *p && k < (int)sizeof s->what - 1; p++) s->what[k++] = *p;
+                s->what[k] = 0;
+                s->conn = -1;
+                s->reused = 1;
+                s->st = SL_DONE;
+                s->cacheable = 0;
+                serial_printf("[cache] hit %s (%u bytes)\n", s->what, dl);
+                return h;
+            }
+        }
+    }
     s->https = https ? 1 : 0;
     s->port = port ? port : (uint16_t)(https ? 443 : 80);
     scopy(s->host, host, sizeof s->host);
@@ -566,6 +646,34 @@ int fetch_begin(const char* host, const char* path, uint16_t port, int https,
     slot_assign(h);
     return h;
 }
+
+int fetch_begin(const char* host, const char* path, uint16_t port, int https, const struct fetch_opts* o) {
+    return begin_request(host, path, port, https, o, 0);
+}
+
+#define PREFETCH_MAX 3        // speculative loads in flight at once
+#define PREFETCH_SPARE 3      // ...and always this many free slots left for real requests
+
+int fetch_prefetch(const char* host, const char* path, uint16_t port, int https, const struct fetch_opts* o) {
+    if (!o || !o->cache || !host || !host[0]) return 0;
+    if (!path || !path[0]) path = "/";
+    uint16_t eport = port ? port : (uint16_t)(https ? 443 : 80);
+    struct fcache_key key;
+    request_key(&key, host, path, eport, https, o);
+    const char* data;
+    uint32_t dl;
+    if (fcache_lookup(&key, tick_count, &data, &dl)) return 0;
+    int running = 0;
+    for (int i = 0; i < FETCH_MAX; i++) {
+        if (slots[i].st == SL_FREE) continue;
+        if (slots[i].cacheable && slots[i].key.h1 == key.h1 && slots[i].key.h2 == key.h2) return 0;
+        if (slots[i].prefetch) running++;
+    }
+    if (running >= PREFETCH_MAX || fetch_free_slots() <= PREFETCH_SPARE) return -1;
+    return begin_request(host, path, port, https, o, 1) >= 0 ? 1 : -1;
+}
+
+void fetch_cache_clear(void) { fcache_clear(); }
 
 static struct fslot* slot_get(int h) {
     if (h < 0 || h >= FETCH_MAX || slots[h].st == SL_FREE) return 0;

@@ -24,6 +24,7 @@ struct fetch_opts {
     const uint8_t* body; // request body (copied), with body_len bytes; Content-Length is added
     uint32_t body_len;
     int own_accept;      // `extra` carries its own Accept header: do not send the default one
+    int cache;           // a bodyless GET that may be answered from / stored in the response cache (sub-resources, not documents)
 };
 
 // Start a request (GET unless o->method says otherwise). port 0 = scheme default. Returns a handle, or -1 when every
@@ -48,5 +49,10 @@ int   fetch_free_slots(void);
 void  fetch_poll(void);
 // Close every idle pooled connection (fresh handshakes from here on).
 void  fetch_close_idle(void);
+// Fire-and-forget load of something the page is about to ask for: the response lands in the cache (kept at least 30 s) and
+// the slot frees itself. A later fetch_begin for the same request adopts a prefetch still in flight. Returns 1 if started,
+// 0 if there is nothing to do (cached / already in flight), -1 if there is no spare capacity right now (try again later).
+int   fetch_prefetch(const char* host, const char* path, uint16_t port, int https, const struct fetch_opts* o);
+void  fetch_cache_clear(void);
 
 #endif

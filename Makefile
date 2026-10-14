@@ -114,7 +114,7 @@ DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/pcix.o src/acpi
              src/crypto/sha512.o src/crypto/der.o src/crypto/x509.o \
              src/crypto/rsa.o src/crypto/ec.o src/crypto/roots.o \
              src/crypto/certverify.o src/rtc.o \
-             src/net/fetch.o
+             src/net/fcache.o src/net/fetch.o
 
 .PHONY: laptop all text desktop clean run debug host-tests host-tests-asan media-tests diff-oracle diff-test tls-interop web-tests
 
