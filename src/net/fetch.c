@@ -18,6 +18,7 @@
 #include "../serial.h"
 #include "../crypto/tls_client.h"
 #include "fcache.h"
+#include "h2.h"
 
 extern uint32_t tick_count;   // 100 Hz
 
@@ -32,7 +33,7 @@ extern uint32_t tick_count;   // 100 Hz
 #define STALL_TICKS    2500       // nothing received for 25s -> fail
 #define STEP_TICKS     3          // TLS work per connection per poll (~30ms)
 
-enum { CN_FREE = 0, CN_DNS, CN_TCP, CN_RUN, CN_IDLE };
+enum { CN_FREE = 0, CN_DNS, CN_TCP, CN_RUN, CN_IDLE, CN_H2 };
 enum { SL_FREE = 0, SL_WAIT, SL_RUN, SL_DONE, SL_FAIL };
 
 struct fconn {
@@ -48,6 +49,9 @@ struct fconn {
     uint32_t t0;                  // tick the current state began
     uint32_t t_progress;          // last tick bytes arrived / phase moved
     int served;                   // responses completed on this connection
+    struct h2* h2;                // CN_H2: the HTTP/2 session (many requests at once)
+    uint8_t* h2_in;               // ...bytes decrypted from the peer, handed to h2_input after every TLS record
+    uint8_t* h2_send;             // ...the chunk of h2 output the TLS layer is sending
 };
 
 struct fslot {
@@ -69,6 +73,8 @@ struct fslot {
     struct fcache_key key;  // cache key (valid when cacheable)
     int cacheable;          // a response to this request may be stored
     int prefetch;           // speculative: frees itself when done
+    int h2sid;              // HTTP/2: the stream this request travels on
+    int h2_over;            // HTTP/2: the response did not fit the buffer
 };
 
 static struct fconn conns[CONN_MAX];
@@ -182,13 +188,225 @@ static void conn_close(struct fconn* c, int abort_it) {
     }
     c->sock = -1;
     if (c->tls) tls_state_wipe(c->tls);
+    if (c->h2) { h2_free(c->h2); c->h2 = 0; }
+    if (c->h2_in) { kfree(c->h2_in); c->h2_in = 0; }
+    if (c->h2_send) { kfree(c->h2_send); c->h2_send = 0; }
     c->st = CN_FREE;
     c->slot = -1;
 }
 
 void fetch_close_idle(void) {
     for (int i = 0; i < CONN_MAX; i++)
-        if (conns[i].st == CN_IDLE) conn_close(&conns[i], 0);
+        if (conns[i].st == CN_IDLE || (conns[i].st == CN_H2 && h2_active(conns[i].h2) == 0)) conn_close(&conns[i], 0);
+}
+
+// ---- HTTP/2 ------------------------------------------------------------------------------------------------------
+// One TLS connection per origin carries every request to it as a stream (net/h2.c does the framing). The first connection
+// to an origin offers "h2" in ALPN; what the server answers is remembered, so later requests either join the session or go
+// the HTTP/1.1 way. Requests are built as HTTP/1.1 messages like always; h2_open turns them into header blocks, and the
+// responses come back as an HTTP/1.1 head plus body, so everything above this file sees the same bytes either way.
+
+#define H2_IN_CAP (80 * 1024)        // decrypted bytes from one or two TLS records, handed to the session right away
+#define H2_SEND_CHUNK (16 * 1024)
+
+#define ORIGINS_MAX 32
+static struct { char host[128]; uint16_t port; uint8_t state; } origins[ORIGINS_MAX];   // state: 0 unknown, 1 h2, 2 http/1.1 only
+static int origin_cursor;
+
+static int origin_find(const char* host, uint16_t port) {
+    for (int i = 0; i < ORIGINS_MAX; i++)
+        if (origins[i].host[0] && origins[i].port == port && host_eq(origins[i].host, host)) return i;
+    return -1;
+}
+
+static int origin_state(const char* host, uint16_t port) {
+    int i = origin_find(host, port);
+    return i < 0 ? 0 : origins[i].state;
+}
+
+static void origin_set(const char* host, uint16_t port, int state) {
+    int i = origin_find(host, port);
+    if (i < 0) {
+        i = origin_cursor++ % ORIGINS_MAX;
+        scopy(origins[i].host, host, sizeof origins[i].host);
+        origins[i].port = port;
+    }
+    origins[i].state = (uint8_t)state;
+}
+
+static void slot_fail(struct fslot* s, struct fconn* c, int reason, const char* why);
+static int conn_matches(const struct fconn* c, const struct fslot* s);
+
+static struct fslot* slot_of_user(void* u) { return &slots[(int)(intptr_t)u]; }
+
+static void h2_on_head(void* u, const char* head, uint32_t len) {
+    struct fslot* s = slot_of_user(u);
+    if (resp_reserve(s, len) != 0) { s->h2_over = 1; return; }
+    memcpy(s->resp + s->resp_len, head, len);
+    s->resp_len += len;
+}
+
+static void h2_on_data(void* u, const uint8_t* d, uint32_t len) {
+    struct fslot* s = slot_of_user(u);
+    if (s->h2_over) return;
+    if (resp_reserve(s, len) != 0) { s->h2_over = 1; return; }
+    memcpy(s->resp + s->resp_len, d, len);
+    s->resp_len += len;
+}
+
+// Send a request that had no answer yet through the queue again (a new session, or HTTP/1.1).
+static void slot_requeue(struct fslot* s) {
+    s->stale_retried = 1;
+    s->h2sid = 0;
+    s->h2_over = 0;
+    s->resp_len = 0;
+    s->conn = -1;
+    s->reused = 0;
+    s->st = SL_WAIT;
+}
+
+// The session carrying slot s is gone (or broke): try once more, otherwise fail it.
+static void slot_h2_lost(struct fslot* s) {
+    struct fconn* c = s->conn >= 0 ? &conns[s->conn] : 0;
+    if (!s->stale_retried && s->resp_len == 0) {
+        if (c && c->served == 0) origin_set(s->host, s->port, 2);          // it never worked even once: stop trying HTTP/2 here
+        serial_printf("[fetch] HTTP/2 connection lost before an answer, retrying (%s)\n", s->what);
+        slot_requeue(s);
+        return;
+    }
+    slot_fail(s, 0, 0, "http/2 connection lost");
+}
+
+static void h2_on_end(void* u, int how, uint32_t code) {
+    struct fslot* s = slot_of_user(u);
+    struct fconn* c = s->conn >= 0 ? &conns[s->conn] : 0;
+    (void)code;
+    if (how == H2_END_OK) {
+        if (s->h2_over) { slot_fail(s, 0, TLS_FAIL_OVERFLOW, "response too large"); return; }
+        if (resp_reserve(s, 1) != 0) { slot_fail(s, 0, TLS_FAIL_OVERFLOW, "response too large"); return; }
+        s->resp[s->resp_len] = 0;
+        s->st = SL_DONE;
+        s->saw_close = 0;
+        s->conn = -1;
+        if (c) { c->served++; c->t0 = tick_count; }
+        serial_printf("[tls-net] received %u bytes (%s, %ums) [h2]%s\n", s->resp_len, s->what, (tick_count - s->t_start) * 10,
+                      c && c->served > 1 ? " [reused]" : "");
+        if (s->cacheable) fcache_store(&s->key, s->resp, s->resp_len, tick_count, s->prefetch);
+        return;
+    }
+    if (how == H2_END_RETRY && !s->stale_retried) {
+        serial_printf("[fetch] HTTP/2 stream not processed by the server, retrying (%s)\n", s->what);
+        slot_requeue(s);
+        return;
+    }
+    if (how == H2_END_BROKEN) { slot_h2_lost(s); return; }
+    slot_fail(s, 0, 0, "http/2 stream reset");
+}
+
+static const struct h2_cb h2_callbacks = { h2_on_head, h2_on_data, h2_on_end };
+
+// Is a connection to this slot's origin still working its way through DNS / TCP / the TLS handshake?
+static int handshaking(const struct fslot* s) {
+    for (int i = 0; i < CONN_MAX; i++) {
+        const struct fconn* c = &conns[i];
+        if (c->st == CN_FREE || c->st == CN_IDLE || c->st == CN_H2 || !conn_matches(c, s)) continue;
+        if (c->st == CN_DNS || c->st == CN_TCP) return 1;
+        if (c->st == CN_RUN && c->tls && c->tls->offer_h2 && c->tls->phase < TLS_PH_RECV_BODY) return 1;
+    }
+    return 0;
+}
+
+// Put slot si on an HTTP/2 session to its origin. 1 = started, -1 = wait (the session is full), 0 = not applicable.
+static int h2_assign(int si) {
+    struct fslot* s = &slots[si];
+    if (origin_state(s->host, s->port) == 2) return 0;
+    int full = 0;
+    for (int i = 0; i < CONN_MAX; i++) {
+        struct fconn* c = &conns[i];
+        if (c->st != CN_H2 || !conn_matches(c, s) || !c->h2) continue;
+        if (h2_can_open(c->h2)) {
+            int id = h2_open(c->h2, s->req, s->req_len, (void*)(intptr_t)si);
+            if (id < 0) continue;
+            s->h2sid = id;
+            s->conn = i;
+            s->st = SL_RUN;
+            s->reused = c->served > 0;
+            s->resp_len = 0;
+            c->t0 = tick_count;
+            return 1;
+        }
+        if (!h2_draining(c->h2)) full = 1;
+    }
+    return full ? -1 : 0;
+}
+
+// The TLS handshake of c (carrying slot s's request) ended with ALPN h2: switch the connection to a session.
+static void h2_attach(struct fconn* c, struct fslot* s) {
+    origin_set(c->host, c->port, 1);
+    c->h2 = h2_new(&h2_callbacks);
+    c->h2_in = (uint8_t*)kmalloc(H2_IN_CAP);
+    c->h2_send = (uint8_t*)kmalloc(H2_SEND_CHUNK);
+    if (!c->h2 || !c->h2_in || !c->h2_send) { slot_fail(s, c, 0, "out of memory"); return; }
+    c->tls->out = c->h2_in;
+    c->tls->out_cap = H2_IN_CAP;
+    c->tls->out_len = 0;
+    c->st = CN_H2;
+    c->slot = -1;
+    serial_printf("[tls-net] HTTP/2 with %s\n", c->host);
+    s->resp_len = 0;
+    int id = h2_open(c->h2, s->req, s->req_len, (void*)(intptr_t)(s - slots));
+    if (id < 0) { slot_fail(s, c, 0, "http/2 request refused"); return; }
+    s->h2sid = id;
+    c->t0 = c->t_progress = tick_count;
+}
+
+// The connection died under its streams.
+static void h2_conn_lost(struct fconn* c) {
+    int ci = (int)(c - conns);
+    for (int i = 0; i < FETCH_MAX; i++)
+        if (slots[i].st == SL_RUN && slots[i].conn == ci && slots[i].h2sid) slot_h2_lost(&slots[i]);
+    conn_close(c, 1);
+}
+
+static void h2_run(struct fconn* c) {
+    uint32_t t0 = tick_count;
+    for (int iter = 0; iter < 256; iter++) {
+        if (tls_state_sent_all(c->tls)) {
+            uint32_t n;
+            const uint8_t* p = h2_out(c->h2, &n);
+            if (n) {
+                if (n > H2_SEND_CHUNK) n = H2_SEND_CHUNK;
+                memcpy(c->h2_send, p, n);
+                h2_out_done(c->h2, n);
+                tls_state_queue(c->tls, c->h2_send, n);
+                c->t_progress = tick_count;
+            }
+        }
+        int avail = tcp_rx_avail(c->sock);
+        c->tls->out = c->h2_in;
+        c->tls->out_cap = H2_IN_CAP;
+        PROF_BEGIN(PZ_TLS);
+        int r = tls_state_step(c->tls, &c->io);
+        PROF_END(PZ_TLS);
+        if (r == TLS_STEP_ERR) { h2_conn_lost(c); return; }
+        if (c->tls->out_len) {
+            c->t_progress = tick_count;
+            int hr = h2_input(c->h2, c->h2_in, c->tls->out_len);
+            c->tls->out_len = 0;
+            if (hr < 0 || h2_dead(c->h2)) { h2_conn_lost(c); return; }
+        }
+        if (r == TLS_STEP_DONE) { h2_conn_lost(c); return; }                   // the peer closed
+        uint32_t pending;
+        h2_out(c->h2, &pending);
+        if (avail == 0 && !pending && tls_state_sent_all(c->tls)) break;
+        if ((uint32_t)(tick_count - t0) >= STEP_TICKS) break;
+    }
+    if (h2_active(c->h2) == 0) {
+        if (h2_draining(c->h2) || (uint32_t)(tick_count - c->t0) > IDLE_TICKS) conn_close(c, 0);
+        return;
+    }
+    c->t0 = tick_count;
+    if ((uint32_t)(tick_count - c->t_progress) > STALL_TICKS) h2_conn_lost(c);
 }
 
 static void slot_finish(struct fslot* s, struct fconn* c, int keep) {
@@ -205,7 +423,7 @@ static void slot_finish(struct fslot* s, struct fconn* c, int keep) {
                       (tick_count - s->t_start) * 10, s->reused ? " [reused]" : "");
     if (s->cacheable && s->resp) {
         int ka2 = 0;
-        if (message_state(s->resp, s->resp_len, &ka2) == 1) fcache_store(&s->key, s->resp, s->resp_len, tick_count, s->prefetch);
+        if (s->h2sid || message_state(s->resp, s->resp_len, &ka2) == 1) fcache_store(&s->key, s->resp, s->resp_len, tick_count, s->prefetch);
     }
     if (keep && c->st == CN_RUN && !tcp_failed(c->sock) && tcp_state(c->sock) == TCP_STATE_ESTABLISHED) {
         c->st = CN_IDLE;
@@ -283,6 +501,7 @@ static void conn_start_request(struct fconn* c, struct fslot* s) {
         tls_state_init(c->tls, c->host, c->port, s->req, s->req_len,
                        (uint8_t*)s->resp, s->resp_cap - 1);
         tls_state_set_now_ms(c->tls, (uint64_t)tick_count * 10);
+        c->tls->offer_h2 = origin_state(c->host, c->port) != 2;      // HTTP/2 unless this origin is known not to speak it
         serial_printf("[tls-net] TCP established, handshake... (%s)\n", s->what);
     } else {
         s->req_off = 0;
@@ -307,6 +526,11 @@ static void conn_run(struct fconn* c) {
             PROF_BEGIN(PZ_TLS);
             int r = tls_state_step(c->tls, &c->io);
             PROF_END(PZ_TLS);
+            if (c->tls->phase == TLS_PH_RECV_BODY && c->tls->offer_h2 && r != TLS_STEP_ERR) {
+                if (c->tls->alpn_h2) { h2_attach(c, s); return; }
+                origin_set(c->host, c->port, 2);                                // the server answered http/1.1
+                c->tls->offer_h2 = 0;
+            }
             if (c->tls->req_off != req_before) c->t_progress = tick_count;      // a big request is going out
             s->resp_len = c->tls->out_len;
             if (r == TLS_STEP_ERR) {
@@ -401,6 +625,9 @@ static void conn_step(struct fconn* c) {
     case CN_RUN:
         conn_run(c);
         return;
+    case CN_H2:
+        h2_run(c);
+        return;
     case CN_IDLE:
         conn_idle(c);
         return;
@@ -416,6 +643,10 @@ static int conn_matches(const struct fconn* c, const struct fslot* s) {
 // Give waiting slot s a connection. Returns 1 if it started.
 static int slot_assign(int si) {
     struct fslot* s = &slots[si];
+    if (s->https) {
+        int r = h2_assign(si);
+        if (r) return r > 0;
+    }
     // 1. an idle keep-alive connection to the same origin
     for (int i = 0; i < CONN_MAX; i++) {
         struct fconn* c = &conns[i];
@@ -448,6 +679,7 @@ static int slot_assign(int si) {
             idle_other = i;
     }
     if (per_host >= CONN_PER_HOST) return 0;
+    if (s->https && origin_state(s->host, s->port) != 2 && handshaking(s)) return 0;     // the first connection decides h2 or not
     if (free_i < 0 && idle_other >= 0) {   // evict the longest-idle other origin
         conn_close(&conns[idle_other], 0);
         free_i = idle_other;
@@ -708,7 +940,11 @@ int fetch_saw_close(int h) { struct fslot* s = slot_get(h); return s ? s->saw_cl
 void fetch_end(int h) {
     struct fslot* s = slot_get(h);
     if (!s) return;
-    if (s->st == SL_RUN && s->conn >= 0) conn_close(&conns[s->conn], 1);
+    if (s->st == SL_RUN && s->conn >= 0) {
+        struct fconn* hc = &conns[s->conn];
+        if (hc->st == CN_H2 && hc->h2) h2_cancel(hc->h2, s->h2sid);
+        else conn_close(hc, 1);
+    }
     if (s->req) kfree(s->req);
     if (s->resp) kfree(s->resp);
     memset(s, 0, sizeof *s);
