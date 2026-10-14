@@ -651,7 +651,7 @@ int fetch_begin(const char* host, const char* path, uint16_t port, int https, co
     return begin_request(host, path, port, https, o, 0);
 }
 
-#define PREFETCH_MAX 3        // speculative loads in flight at once
+#define PREFETCH_MAX 4        // speculative loads in flight at once
 #define PREFETCH_SPARE 3      // ...and always this many free slots left for real requests
 
 int fetch_prefetch(const char* host, const char* path, uint16_t port, int https, const struct fetch_opts* o) {
@@ -694,6 +694,12 @@ char* fetch_response(int h, int* len) {
 }
 
 int fetch_progress(int h) { struct fslot* s = slot_get(h); return s ? (int)s->resp_len : 0; }
+const char* fetch_peek(int h, int* len) {
+    struct fslot* s = slot_get(h);
+    if (!s || s->st != SL_RUN || !s->resp) { if (len) *len = 0; return 0; }
+    if (len) *len = (int)s->resp_len;
+    return s->resp;
+}
 int fetch_fail_reason(int h) { struct fslot* s = slot_get(h); return s ? s->fail_reason : 0; }
 int fetch_fail_detail(int h) { struct fslot* s = slot_get(h); return s ? s->fail_detail : 0; }
 int fetch_offer_unaccepted(int h) { struct fslot* s = slot_get(h); return s ? s->offer_unaccepted : 0; }

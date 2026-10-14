@@ -35,6 +35,7 @@
 #include "crypto/tls_client.h" // TLS_FAIL_*, tls_ticket_drop(), tls_response_complete()
 #include "crypto/rand.h"
 #include "web/wdoc.h"
+#include "web/pscan.h"
 #include "web/wdoc_int.h"
 #include "web/wjs.h"
 #include "web/wcookie.h"
@@ -408,6 +409,12 @@ struct oreq {
     int post_len;
     const char* post_ref;      // the page the form was on
     int h;                     // fetch handle, -1 = none
+    int speculative;           // preload scanner: only warm the cache, no handle kept (see preload_emit)
+    int scan_next;             // main document: scan again once this many bytes have arrived
+    int scan_pos;              // ...from this offset of the (decoded) body
+    int scan_dead;             // ...never (not HTML, <base> seen, no use)
+    uint32_t scan_tick;        // ...and not before this tick (the fetch engine had no room)
+    int scan_res;              // resources handed to the cache so far
     char url[OKAI_URL_LEN];
 };
 static struct oreq reqs[FETCH_MAX];
@@ -440,6 +447,12 @@ static struct oreq* req_new(int bi, int tab, struct wdoc* doc, int sub_id, const
         q->post_len = 0;
         q->post_ref = 0;
         q->h = -1;
+        q->speculative = 0;
+        q->scan_next = 0;
+        q->scan_pos = 0;
+        q->scan_dead = 0;
+        q->scan_tick = 0;
+        q->scan_res = 0;
         scopy(q->url, url, OKAI_URL_LEN);
         return q;
     }
@@ -554,12 +567,135 @@ static int req_fetch(struct oreq* q, const char* top) {
     }
     cookie_hdr[n] = 0;
     if (n > 0) o.extra = cookie_hdr;
-    o.cache = q->doc != 0 && q->sub_id >= 0 && !o.method && !o.body;       // sub-resources, not documents
+    o.cache = (q->speculative || (q->doc != 0 && q->sub_id >= 0)) && !o.method && !o.body;       // sub-resources, not documents
     q->https = url_is_https(q->url);
+    if (q->speculative) {
+        int pr = fetch_prefetch(host, path, (uint16_t)port, q->https, &o);
+        return pr < 0 ? -2 : 0;
+    }
     int h = fetch_begin(host, path, (uint16_t)port, q->https, &o);
     if (h < 0) return -2;
     q->h = h;
     return 0;
+}
+
+// ---- preload scanner ------------------------------------------------------------------
+// While the main document is still downloading, its first kilobytes are scanned for stylesheets, scripts and images
+// (web/pscan.c) and those are fetched right away into the response cache; the real requests, made after the document is
+// parsed, are then answered from the cache or take over the load that is already running. The page's resources start
+// loading one document-download earlier than they otherwise would.
+
+#define PRELOAD_FIRST 4096         // wait for this much body before the first scan
+#define PRELOAD_MAX_RES 40         // speculative loads per document
+#define PRELOAD_MAX_IMG 8
+
+struct preload_ctx { struct oreq* q; const char* top; int blocked; int imgs; };
+
+static int preload_emit(void* c, const char* url, int kind) {
+    struct preload_ctx* P = (struct preload_ctx*)c;
+    if (P->q->scan_res >= PRELOAD_MAX_RES || !url_is_http(url)) return 0;
+    if (kind == PSCAN_IMG && P->imgs >= PRELOAD_MAX_IMG) return 0;
+    static struct oreq tmp;
+    memset(&tmp, 0, sizeof tmp);
+    tmp.used = 1;
+    tmp.h = -1;
+    tmp.sub_id = -1;
+    tmp.speculative = 1;
+    scopy(tmp.url, url, OKAI_URL_LEN);
+    int r = req_fetch(&tmp, P->top);
+    if (r == -2) { P->blocked = 1; return 1; }          // no room in the fetch engine right now: offer it again later
+    if (r == 0) {
+        P->q->scan_res++;
+        if (kind == PSCAN_IMG) P->imgs++;
+        serial_printf("[okai] preload %s\n", url);
+    }
+    return 0;
+}
+
+// Body bytes of a partial chunked message (complete chunks plus the part of the last one that arrived).
+static int dechunk_partial(const char* s, int n, char* out) {
+    int o = 0, i = 0;
+    for (;;) {
+        int sz = 0, any = 0;
+        while (i < n) {
+            int c = s[i], d;
+            if (c >= '0' && c <= '9') d = c - '0';
+            else if (c >= 'a' && c <= 'f') d = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') d = c - 'A' + 10;
+            else break;
+            sz = sz * 16 + d;
+            i++;
+            any = 1;
+            if (sz > (1 << 28)) return o;
+        }
+        if (!any) return o;
+        while (i < n && s[i] != 10) i++;
+        if (i >= n) return o;
+        i++;
+        if (sz == 0) return o;
+        int take = n - i < sz ? n - i : sz;
+        memcpy(out + o, s + i, (size_t)take);
+        o += take;
+        i += take;
+        if (take < sz) return o;
+        if (i < n && s[i] == 13) i++;
+        if (i < n && s[i] == 10) i++;
+        else if (i >= n) return o;
+    }
+}
+
+static void main_preload(struct oreq* q) {
+    if (q->scan_dead || q->h < 0 || fetch_status(q->h) != FETCH_RUNNING) return;
+    int got = fetch_progress(q->h);
+    if (got <= q->scan_next || (int)(tick_count - q->scan_tick) < 0) return;      // nothing new, or too soon
+    int len;
+    const char* r = fetch_peek(q->h, &len);
+    if (!r) return;
+    int he = header_end(r, len);
+    if (he < 0) { q->scan_next = got; return; }
+    struct resp_info ri;
+    parse_resp(r, he, &ri);
+    if (ri.status != 200 || (ri.ctype[0] && !iprefix(ri.ctype, "text/html") && !iprefix(ri.ctype, "application/xhtml"))) {
+        q->scan_dead = 1;
+        return;
+    }
+    // okai's header_end() is the index of the blank line: the body starts after it
+    int bo = he + (he + 3 < len && r[he] == 13 ? 4 : 2);
+    if (bo > len) { q->scan_next = got; return; }
+    int bl = len - bo;
+    if (bl < (ri.gzip ? PRELOAD_FIRST / 4 : PRELOAD_FIRST)) { q->scan_next = got; return; }     // compressed bytes are worth 3-4x
+    const char* v;
+    int chunked = header_get(r, he, "transfer-encoding", &v) > 0 && iprefix(v, "chunked");
+    char* tmp = (char*)kmalloc((uint32_t)bl + 1);
+    if (!tmp) { q->scan_next = got; q->scan_tick = tick_count + 50; return; }
+    int n = chunked ? dechunk_partial(r + bo, bl, tmp) : bl;
+    if (!chunked) memcpy(tmp, r + bo, (size_t)bl);
+    char* html = tmp;
+    int hn = n, heap = 0;
+    if (ri.gzip && n >= 18 && (uint8_t)tmp[0] == 0x1F && (uint8_t)tmp[1] == 0x8B) {
+        struct job j;
+        memset(&j, 0, sizeof j);
+        j.op = JOB_INFLATE;
+        j.bytes = tmp;
+        j.len = n;
+        run_job(&j);                                      // a truncated stream gives what it decoded so far
+        if (!j.out) { kfree(tmp); q->scan_next = got; q->scan_tick = tick_count + 50; return; }
+        html = (char*)j.out;
+        hn = j.out_len;
+        heap = 1;
+    }
+    struct okai_tab* T = &okais[q->bi].tabs[q->tab];
+    struct preload_ctx P = { q, T->url, 0, 0 };
+    int next = q->scan_pos;
+    int found = pscan_html(html, hn, q->scan_pos, T->url, preload_emit, &P, &next);
+    if (found < 0) q->scan_dead = 1;                      // a <base> element: the URLs would need it
+    q->scan_pos = next;
+    // look again as soon as more of the document is in (a gzip body is inflated from the start each time: not too often)
+    int gap = ri.gzip ? (got < 131072 ? 25 : 100) : 5;
+    if (P.blocked) { q->scan_tick = tick_count + 10; q->scan_next = -1; }          // no room in the fetch engine: retry soon
+    else { q->scan_tick = tick_count + gap; q->scan_next = got; }
+    if (heap) kfree(html);
+    kfree(tmp);
 }
 
 static int req_has_main(int bi, int tab) {
@@ -2119,6 +2255,8 @@ static void req_poll(struct oreq* q) {
 void okai_poll(void) {
     for (int i = 0; i < FETCH_MAX; i++)
         if (reqs[i].used && reqs[i].h >= 0) req_poll(&reqs[i]);
+    for (int i = 0; i < FETCH_MAX; i++)
+        if (reqs[i].used && reqs[i].h >= 0 && reqs[i].sub_id < 0) main_preload(&reqs[i]);
     // Main documents first (active tabs first).
     for (int pass = 0; pass < 2; pass++)
         for (int bi = 0; bi < MAX_OKAIS; bi++) {
