@@ -80,6 +80,9 @@ static void okai_tab_reset(struct okai_tab* T);
 static void load_home(int id, int tab);
 static void show_error(int id, int tab);
 static void request_render(struct okai_tab* T, int delay);
+static void tab_load_html(int id, int tab, const char* html, int len, const char* charset, int scripts);
+static int slot_is_frame(int slot);
+static int slot_is_active(struct okai* b, int slot);
 static void request_render_bg(struct okai_tab* T, int delay);
 static void frames_drop_children(int bi, int slot);
 static void frames_sync(int bi, int slot);
@@ -415,6 +418,8 @@ struct oreq {
     int scan_dead;             // ...never (not HTML, <base> seen, no use)
     uint32_t scan_tick;        // ...and not before this tick (the fetch engine had no room)
     int scan_res;              // resources handed to the cache so far
+    uint32_t t_start;          // tick the request was made
+    int previewed;             // main document: a preview of the partial download was built
     char url[OKAI_URL_LEN];
 };
 static struct oreq reqs[FETCH_MAX];
@@ -453,6 +458,8 @@ static struct oreq* req_new(int bi, int tab, struct wdoc* doc, int sub_id, const
         q->scan_dead = 0;
         q->scan_tick = 0;
         q->scan_res = 0;
+        q->t_start = tick_count;
+        q->previewed = 0;
         scopy(q->url, url, OKAI_URL_LEN);
         return q;
     }
@@ -644,6 +651,36 @@ static int dechunk_partial(const char* s, int n, char* out) {
     }
 }
 
+// A big document on a slow link: show what has arrived so far (scripts off) instead of an empty window. The real load replaces
+// it when the download ends (main_loaded), keeping the scroll position. Only worth the double parse when the download is
+// clearly going to take a while, so the page must have been loading for 0.6 s with at least 20 KB of markup in hand.
+#define PREVIEW_AFTER_TICKS 60
+#define PREVIEW_MIN_BYTES 20000
+
+static void main_preview(struct oreq* q, const char* html, int hn, const struct resp_info* ri) {
+    struct okai* b = &okais[q->bi];
+    struct okai_tab* T = &b->tabs[q->tab];
+    if (q->previewed || T->previewing || T->load_state != 0 || slot_is_frame(q->tab) || !slot_is_active(b, q->tab)) return;
+    if (hn < PREVIEW_MIN_BYTES) return;
+    if ((int)(tick_count - q->t_start) < PREVIEW_AFTER_TICKS) {                   // enough markup but too early: look again when it is time
+        q->scan_next = -1;
+        q->scan_tick = q->t_start + PREVIEW_AFTER_TICKS;
+        return;
+    }
+    int cut = hn;
+    while (cut > 0 && html[cut - 1] != '>') cut--;                     // never end inside a tag
+    if (cut < PREVIEW_MIN_BYTES / 2) return;
+    q->previewed = 1;
+    tab_load_html(q->bi, q->tab, html, cut, ri->charset[0] ? ri->charset : 0, 0);
+    T->previewing = 1;
+    T->load_state = 1;
+    T->load_tick = tick_count;
+    T->sub_landed = 0;
+    if (T->doc && wdoc_pending_css(T->doc) > 0) request_render(T, CSS_WAIT_TICKS);
+    else request_render(T, 0);
+    serial_printf("[okai] preview of %d bytes while the document downloads\n", cut);
+}
+
 static void main_preload(struct oreq* q) {
     if (q->scan_dead || q->h < 0 || fetch_status(q->h) != FETCH_RUNNING) return;
     int got = fetch_progress(q->h);
@@ -694,6 +731,7 @@ static void main_preload(struct oreq* q) {
     int gap = ri.gzip ? (got < 131072 ? 25 : 100) : 5;
     if (P.blocked) { q->scan_tick = tick_count + 10; q->scan_next = -1; }          // no room in the fetch engine: retry soon
     else { q->scan_tick = tick_count + gap; q->scan_next = got; }
+    main_preview(q, html, hn, &ri);
     if (heap) kfree(html);
     kfree(tmp);
 }
@@ -887,6 +925,7 @@ static void tab_reset_load(struct okai_tab* T) {
     T->render_due = 0;
     T->pending_frag[0] = 0;
     T->first_paint = 0;
+    T->previewing = 0;
 }
 
 static void okai_tab_reset(struct okai_tab* T) {
@@ -1803,7 +1842,10 @@ static void main_loaded(int id, int tab, char* resp, int len) {
             page_heap = 1;
         }
     }
+    int was_preview = T->previewing, saved_scroll = T->scroll_y;
+    if (was_preview) req_cancel_tab(id, tab);                          // what the preview was loading belongs to the old DOM
     tab_load_html(id, tab, page, plen, ri.charset[0] ? ri.charset : 0, okai_scripts_on);
+    if (was_preview) T->scroll_y = saved_scroll;                       // the reader keeps their place
     struct wdom* dom = T->doc ? wdoc_dom(T->doc) : 0;
     serial_printf("[br] %sparse: count=%d len=%d dom_nodes=%d status=%d%s ctype=%s%s\n",
                   T->is_https ? "https " : "", dom ? dom->nn : 0, blen, dom ? dom->nn : 0,
