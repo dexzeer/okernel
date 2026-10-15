@@ -116,7 +116,7 @@ extern void call_on_stack(void (*fn)(void*), void* arg, void* stack_top);
 static uint8_t* engine_stack;
 static int in_engine;
 
-enum { JOB_LOAD, JOB_FETCH_DONE, JOB_PAINT, JOB_HIT, JOB_RECT, JOB_ANCHOR, JOB_INFLATE, JOB_LINKS,
+enum { JOB_LOAD, JOB_FETCH_DONE, JOB_PAINT, JOB_PAINT_STALE, JOB_HIT, JOB_RECT, JOB_ANCHOR, JOB_INFLATE, JOB_LINKS,
        JOB_JS_RUN, JOB_JS_EVENT, JOB_ELEM_AT, JOB_FREE, JOB_MEDIA };
 
 struct job {
@@ -177,6 +177,9 @@ static void job_entry(void* p) {
     }
     case JOB_FREE:
         wdoc_free(j->doc);
+        break;
+    case JOB_PAINT_STALE:
+        wdoc_paint_stale(j->doc, j->surf, j->scroll);
         break;
     case JOB_PAINT:
         // vw/vh > 0: full paint (viewport may have changed); else a band
@@ -2116,7 +2119,8 @@ static void media_pump(void) {
             j.len = MEDIA_RECTS;
             run_job(&j);
             if (j.result) request_render(T, 0);
-            if (ti != b->active_tab || !b->page_px || !T->first_paint || T->render_pending) continue;
+            // (a pending render does not stop the video: its rectangle is painted from the layout on screen)
+            if (ti != b->active_tab || !b->page_px || !T->first_paint) continue;
             for (int k = 0; k < j.nrects; k++) {
                 int x0 = rects[k].x, x1 = rects[k].x + rects[k].w;
                 int y0 = rects[k].y - (rects[k].fixed ? 0 : T->scroll_y), y1 = y0 + rects[k].h;
@@ -2130,7 +2134,7 @@ static void media_pump(void) {
                 s.cx0 = x0; s.cx1 = x1; s.cy0 = y0; s.cy1 = y1;
                 struct job p;
                 memset(&p, 0, sizeof p);
-                p.op = JOB_PAINT;
+                p.op = JOB_PAINT_STALE;
                 p.doc = T->doc;
                 p.surf = &s;
                 p.scroll = T->scroll_y;
