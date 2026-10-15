@@ -99,6 +99,7 @@ struct okai_tab {
     int frame_depth;
     uint32_t frames_sync_tick;  // next time scripts may trigger a frames_sync of this document
     char frame_name[64];  // name attribute (target= and window.frames[name])
+    char frame_src[OKAI_URL_LEN];  // the <iframe src> this frame was loaded for (url moves on with redirects and link clicks)
 };
 
 struct okai {

@@ -1498,11 +1498,12 @@ static void frames_sync(int bi, int slot) {
         if (found >= 0) {
             keep[found] = 1;
             struct okai_tab* F = &b->tabs[found];
-            if (usable && strcmp(F->url, url)) {
+            if (usable && strcmp(F->frame_src, url)) {
                 // src changed: load the new document into the same frame (the old picture stays until it arrives)
                 req_cancel_tab(bi, found);
                 frames_drop_children(bi, found);
                 scopy(F->url, url, OKAI_URL_LEN);
+                scopy(F->frame_src, url, OKAI_URL_LEN);
                 tab_reset_load(F);
                 serial_printf("[okai] frame %d: src -> %s\n", found, url);
             }
@@ -1527,6 +1528,7 @@ static void frames_sync(int bi, int slot) {
         F->frame_name[0] = 0;
         { int nl; const char* nm = wdom_attr(d, n, A_name, &nl); if (nm && nl > 0 && nl < (int)sizeof F->frame_name) { memcpy(F->frame_name, nm, (size_t)nl); F->frame_name[nl] = 0; } }
         scopy(F->url, url, OKAI_URL_LEN);
+        scopy(F->frame_src, url, OKAI_URL_LEN);
         F->is_https = url_is_https(F->url);
         keep[s] = 1;
         made++;

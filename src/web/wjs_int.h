@@ -61,7 +61,9 @@ struct wjs {
     // values below are GC roots (registered in wjs_new)
     ojsv hooks;              // object returned by the prelude
     ojsv h_dispatch, h_ui, h_fetch, h_nextdue, h_rundue, h_frame, h_dcl, h_load,
-         h_script, h_image, h_proto, h_report, h_mo, h_click, h_ready;
+         h_script, h_image, h_proto, h_report, h_mo, h_click, h_ready, h_obs;
+    int obs_active;          // the page has Resize/IntersectionObserver targets (the prelude says so: W.obsActive)
+    uint32_t obs_sig;        // layout epoch / scroll / viewport the observers last measured
     ojsv rej[2 * WJS_REJ_MAX]; // rejected promises with no handler yet: {promise, reason} pairs (a root range)
     int nrej;
     int ndbg;                // trace lines written so far (WJS_DBG_MAX)

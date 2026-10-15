@@ -559,18 +559,24 @@ static void lay_one_abs(struct wlayout* L, int ai, int cbi) {
 }
 
 static void lay_abs_children(struct wlayout* L, int cbi) {
-    int list = L->b[cbi].abs_head;
-    L->b[cbi].abs_head = -1;
-    // registration order is reversed: lay out in tree order
-    int order[512], n = 0;
-    for (int a = list; a >= 0 && n < 512; a = L->b[a].abs_next) order[n++] = a;
-    for (int k = n - 1; k >= 0; k--) {
-        int saved_base = L->fl_base, saved_n = L->nfl;
-        L->fl_base = L->nfl;
-        lay_one_abs(L, order[k], cbi);
-        L->nfl = saved_n;
-        L->fl_base = saved_base;
+    // Laying out an absolute box can register more boxes with the same containing block: a fixed (or root-anchored) box
+    // nested inside an absolutely positioned one reaches the ICB only now, long after the first list was taken. A
+    // few rounds pick those up (YouTube's <ytd-app> is position:absolute and its masthead is fixed inside it).
+    for (int round = 0; round < 8 && L->b[cbi].abs_head >= 0; round++) {
+        int list = L->b[cbi].abs_head;
+        L->b[cbi].abs_head = -1;
+        // registration order is reversed: lay out in tree order
+        int order[512], n = 0;
+        for (int a = list; a >= 0 && n < 512; a = L->b[a].abs_next) order[n++] = a;
+        for (int k = n - 1; k >= 0; k--) {
+            int saved_base = L->fl_base, saved_n = L->nfl;
+            L->fl_base = L->nfl;
+            lay_one_abs(L, order[k], cbi);
+            L->nfl = saved_n;
+            L->fl_base = saved_base;
+        }
     }
+    L->b[cbi].abs_head = -1;
 }
 
 // ---- block flow --------------------------------------------------------------------
@@ -1048,6 +1054,8 @@ int wlay_node_rect(const struct wlayout* L, int node, int32_t* x, int32_t* y, in
     *x = L->b[b].ax; *y = L->b[b].ay; *w = L->b[b].w; *h = L->b[b].h;
     return 1;
 }
+
+int wlay_knows_node(const struct wlayout* L, int node) { return node >= 0 && node < L->node_box_n - 1; }   // node_box has one spare slot (nn + 1)
 
 void wlay_stats(const struct wlayout* L, int* boxes, int* items, int* lines) {
     *boxes = L->nb;

@@ -144,6 +144,7 @@ web-tests:
 	./build-host/wbrowse tests/web/js/basic.html 800 600 build-host/js-basic.ppm 3 | grep RESULT
 	./build-host/wbrowse tests/web/js/fragparse.html 640 400 build-host/js-frag.ppm 3 | grep 'RESULT ALLPASS'
 	./build-host/wbrowse tests/web/js/tostr.html 640 400 build-host/js-tostr.ppm 3 | grep 'RESULT ALLPASS'
+	./build-host/wbrowse tests/web/js/observers.html 800 600 build-host/js-obs.ppm 4 | grep 'RESULT ALLPASS'
 	sh tests/web/test_media.sh
 	sh tests/web/test_canvas.sh
 	gcc -m32 -O2 -Isrc -Itests/web -o build-host/t_idct tests/web/test_idct.c -lm && ./build-host/t_idct | tail -n 1

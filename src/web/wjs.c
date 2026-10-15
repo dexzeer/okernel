@@ -218,6 +218,7 @@ void wjs_report_exception(struct wjs* js, const char* where) {
 }
 
 static void report_rejection(struct wjs* js, ojs* ctx, ojsv reason);
+static uint32_t obs_signature(struct wjs* js);
 
 // A rejected promise is reported only if it still has no handler once the microtask queue has drained (the
 // HTML "unhandled rejection" rule): `p.then(ok, err)` right after Promise.reject(e) is handled.
@@ -1344,7 +1345,7 @@ struct wjs* wjs_new(struct wdoc* doc) {
     for (int i = 0; i < 2 * WJS_REJ_MAX; i++) js->rej[i] = OJS_UNDEFINED;
     ojsv* hv[] = { &js->hooks, &js->h_dispatch, &js->h_ui, &js->h_fetch, &js->h_nextdue, &js->h_rundue, &js->h_frame,
                    &js->h_dcl, &js->h_load, &js->h_script, &js->h_image, &js->h_proto, &js->h_report,
-                   &js->h_mo, &js->h_click, &js->h_ready, &js->proto_svg, &js->proto_svgroot,
+                   &js->h_mo, &js->h_click, &js->h_ready, &js->h_obs, &js->proto_svg, &js->proto_svgroot,
                    &js->proto_math, &js->proto_text, &js->proto_comment, &js->proto_doc, &js->proto_frag };
     for (unsigned i = 0; i < sizeof hv / sizeof hv[0]; i++) *hv[i] = OJS_UNDEFINED;
     if (!wjs_grow_nodes(js)) { w_free(js); return 0; }
@@ -1407,7 +1408,8 @@ struct wjs* wjs_new(struct wdoc* doc) {
         { &js->h_nextdue, "nextDue" }, { &js->h_rundue, "runDue" }, { &js->h_frame, "runFrame" },
         { &js->h_dcl, "fireDCL" }, { &js->h_load, "fireLoad" }, { &js->h_script, "scriptEvent" },
         { &js->h_image, "imageEvent" }, { &js->h_proto, "protoFor" }, { &js->h_report, "report" },
-        { &js->h_mo, "moChildList" }, { &js->h_click, "dispatchClick" }, { &js->h_ready, "setReady" } };
+        { &js->h_mo, "moChildList" }, { &js->h_click, "dispatchClick" }, { &js->h_ready, "setReady" },
+        { &js->h_obs, "observersCheck" } };
     for (unsigned i = 0; i < sizeof hk / sizeof hk[0]; i++) {
         ojsv v = ojs_get(ctx, hooks, hk[i].name);
         if (ojs_is_exception(v)) { ojs_take_exception(ctx); v = OJS_UNDEFINED; }
@@ -1598,6 +1600,15 @@ int wjs_run(struct wjs* js, int budget_ms) {
             ojsv r = call_hook(js, js->h_frame, 1, a, TASK_BUDGET_MS);
             if (ojs_to_bool(js->J, r)) js->flags |= WJS_DIRTY;
         }
+        if (!over && js->obs_active && !ojs_is_undefined(js->h_obs)) {      // ResizeObserver / IntersectionObserver
+            uint32_t sig = obs_signature(js);
+            if (sig != js->obs_sig) {
+                js->obs_sig = sig;                      // taken first: a layout the callbacks cause is measured on the next pass
+                ojsv r = call_hook(js, js->h_obs, 0, 0, TASK_BUDGET_MS);
+                if (ojs_to_bool(js->J, r)) js->flags |= WJS_DIRTY;        // true: a callback ran
+                if (wjs_now() - start > budget_ms) over = 1;
+            }
+        }
     }
     // 5. load
     if (js->dcl_fired && !js->load_fired && !over && !any_script_pending(js) && !wdoc_pending_load(js->doc)) {
@@ -1630,9 +1641,17 @@ int wjs_run(struct wjs* js, int budget_ms) {
     return f;
 }
 
+// What the Resize/IntersectionObservers measure against: moves when a layout finished, the page scrolled or the viewport changed.
+static uint32_t obs_signature(struct wjs* js) {
+    int vw, vh, sy, dw, dh;
+    wdoc_viewport_get(js->doc, &vw, &vh, &sy, &dw, &dh);
+    return wdoc_layout_epoch(js->doc) * 2654435761u ^ (uint32_t)sy * 40503u ^ (uint32_t)vw * 131u ^ (uint32_t)vh;
+}
+
 int wjs_next_due(struct wjs* js) {
     if (!js || js->dead) return -1;
     if (js->J && ojs_jobs_pending(js->J)) return 0;
+    if (js->obs_active && obs_signature(js) != js->obs_sig) return 0;    // observers have something to re-measure
     // fetched modules wait to be compiled (dependency discovery) in wjs_run
     for (int i = 0; i < js->nmod; i++) if (js->mods[i].state == SS_READY && !js->mods[i].scanned) return 0;
     // a script became ready (fetched) since the last run?
