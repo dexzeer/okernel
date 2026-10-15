@@ -218,6 +218,11 @@ again:
         if (!http_get(start, "GET", 0, 0, 0, &page) || !page.body) { fprintf(stderr, "fetch failed: %s\n", start); return 1; }
         html = page.body;
         len = page.len;
+        if (getenv("WB_BODY")) {                       // WB_BODY=file.html: use this as the document served at the URL (a page captured from another network/region)
+            int bl;
+            char* bb = slurp(getenv("WB_BODY"), &bl);
+            if (bb) { html = bb; len = bl; }
+        }
         snprintf(url, sizeof url, "%s", page.final_url);
     } else {
         html = slurp(argv[1], &len);

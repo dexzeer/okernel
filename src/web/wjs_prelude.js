@@ -558,7 +558,7 @@ accessor(Node.prototype, 'nodeName', function () {
     return t === 3 ? '#text' : t === 8 ? '#comment' : t === 9 ? '#document' : '#document-fragment';
 });
 accessor(Node.prototype, 'nodeValue', function () { const t = W.ntype(this); return t === 3 || t === 8 ? W.data(this) : null; },
-    function (v) { const t = W.ntype(this); if (t === 3 || t === 8) W.setData(this, v === null ? '' : String(v)); });
+    function (v) { const t = W.ntype(this); if (t === 3 || t === 8) setCD(this, v === null ? '' : String(v)); });
 accessor(Node.prototype, 'textContent', function () {
     const t = W.ntype(this);
     if (t === 9) return null;
@@ -566,7 +566,7 @@ accessor(Node.prototype, 'textContent', function () {
 }, function (v) {
     const t = W.ntype(this);
     v = v === null || v === undefined ? '' : String(v);
-    if (t === 3 || t === 8) W.setData(this, v);
+    if (t === 3 || t === 8) setCD(this, v);
     else if (t === 1 || t === 11) W.setText(this, v);
 });
 accessor(Node.prototype, 'parentNode', function () { return W.parent(this); });
@@ -628,13 +628,13 @@ for (const P of [Element.prototype, CharacterData.prototype]) {
 }
 
 // CharacterData / Text
-accessor(CharacterData.prototype, 'data', function () { return W.data(this); }, function (v) { W.setData(this, String(v)); });
+accessor(CharacterData.prototype, 'data', function () { return W.data(this); }, function (v) { setCD(this, String(v)); });
 accessor(CharacterData.prototype, 'length', function () { return W.data(this).length; });
 methods(CharacterData.prototype, {
-    appendData(s) { W.setData(this, W.data(this) + s); },
-    insertData(o, s) { const d = W.data(this); W.setData(this, d.slice(0, o) + s + d.slice(o)); },
-    deleteData(o, n) { const d = W.data(this); W.setData(this, d.slice(0, o) + d.slice(o + n)); },
-    replaceData(o, n, s) { const d = W.data(this); W.setData(this, d.slice(0, o) + s + d.slice(o + n)); },
+    appendData(s) { setCD(this, W.data(this) + s); },
+    insertData(o, s) { const d = W.data(this); setCD(this, d.slice(0, o) + s + d.slice(o)); },
+    deleteData(o, n) { const d = W.data(this); setCD(this, d.slice(0, o) + d.slice(o + n)); },
+    replaceData(o, n, s) { const d = W.data(this); setCD(this, d.slice(0, o) + s + d.slice(o + n)); },
     substringData(o, n) { return W.data(this).substr(o, n); }
 });
 accessor(Text.prototype, 'wholeText', function () { return W.data(this); });
@@ -739,6 +739,13 @@ function insertAdjacent(el, pos, node) {
     else if (pos === 'afterend') { if (!p) return false; preInsert(p, node, W.next(el)); }
     else throw new DOMException('bad position', 'SyntaxError');
     return true;
+}
+// Text/comment data changes are 'characterData' mutations (Polymer's microtask scheduler flips a text node watched by a
+// MutationObserver to run its queue: without delivery every debounced render, YouTube's ps-dom-if, waits forever).
+function setCD(node, v) {
+    const old = moActive ? W.data(node) : null;
+    W.setData(node, v);
+    if (moActive) moRecord('characterData', node, null, old);
 }
 function setAttr(el, name, value) {
     const old = W.getAttr(el, name);
@@ -2679,6 +2686,15 @@ reflect(HTMLDataElement.prototype, 'value', 'value');
 
 // ---------------------------------------------------------------- custom elements
 let ceActive = false;
+// document.importNode(template.content, true): the copy belongs to the document, so the custom elements in it are upgraded
+// before importNode returns (cloneNode of a fragment stays in the inert template document and does not). Polymer stamps every
+// template this way and then assigns properties: on an element that is not upgraded yet they became plain own properties that
+// the element's accessors never saw (yt-formatted-string kept is-empty and its text never showed).
+function importNodeImpl(n, deep) {
+    const c = n.cloneNode(!!deep);
+    if (ceActive && c && W.ntype(c) === 11) for (let k = W.first(c); k; k = W.next(k)) ceUpgradeTree(k);
+    return c;
+}
 function ceConnect(n) {
     if (W.ntype(n) !== 1) return;
     const walk = el => {
@@ -3646,7 +3662,7 @@ methods(D, {
     createRange() { return new Range(); },
     createTreeWalker(root, what, filter) { return new TreeWalker(root, what === undefined ? 0xFFFFFFFF : what, filter); },
     createNodeIterator(root, what, filter) { return new TreeWalker(root, what === undefined ? 0xFFFFFFFF : what, filter); },
-    importNode(n, deep) { return n.cloneNode(!!deep); },
+    importNode(n, deep) { return importNodeImpl(n, deep); },
     adoptNode(n) { if (W.parent(n)) W.parent(n).removeChild(n); return n; },
     write(...s) { W.write(s.join('')); },
     writeln(...s) { W.write(s.join('') + '\n'); },
@@ -3796,7 +3812,7 @@ class DOMParser {
             createTextNode: { value: t => document.createTextNode(t) },
             createComment: { value: t => document.createComment(t) },
             createDocumentFragment: { value: () => document.createDocumentFragment() },
-            importNode: { value: (n, d) => n.cloneNode(!!d) },
+            importNode: { value: (n, d) => importNodeImpl(n, d) },
             adoptNode: { value: n => n },
             implementation: { value: IMPL },
             defaultView: { value: null }

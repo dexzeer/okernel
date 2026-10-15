@@ -1987,7 +1987,7 @@ static void js_apply(int id, int tab, int flags) {
     }
     if (flags & WJS_FOCUS) {
         int node;
-        if (wjs_take_focus(js, &node) && active) set_focus(id, T, node);
+        if (wjs_take_focus(js, &node) && active) { serial_printf("[okai] page script asked for focus: node %d\n", node); set_focus(id, T, node); }
     }
     if (flags & WJS_SCROLL) {
         int y;
@@ -2547,6 +2547,19 @@ static void set_focus(int id, struct okai_tab* T, int node) {
     if (T->focused_node == node) return;
     if (node >= d->nn) node = -1;
     int old = T->focused_node;
+    if (node >= 0) {
+        char tb[48], ib[48];
+        int tl, il = 0;
+        const char* tn = watom_name(&d->atoms, d->n[node].tag, &tl);
+        const char* idv = wdom_attr(d, node, A_id, &il);
+        if (tl > 46) tl = 46;
+        if (!idv || il < 0) il = 0;
+        if (il > 46) il = 46;
+        memcpy(tb, tn, (size_t)tl); tb[tl] = 0;
+        if (il) memcpy(ib, idv, (size_t)il);
+        ib[il] = 0;
+        serial_printf("[okai] focus %d -> %d <%s id=%s>\n", old, node, tb, ib);
+    }
     if (old >= 0 && old < d->nn) {
         d->n[old].flags &= ~WNF_FOCUSED;
         for (int p = old; p >= 0; p = d->n[p].parent) d->n[p].flags &= ~WNF_FOCUS_WITHIN;
@@ -2962,6 +2975,7 @@ void okai_handle_key(int id, char c) {
     struct okai* b = &okais[id];
     if (b->win_id < 0) return;
     struct okai_tab* T = okai_tab_of(b);
+    serial_printf("[okai] key %d focus=%d addr=%d\n", (unsigned char)c, T->focused_node, b->addr_bar_focused);
     b->show_security = 0; // any keypress dismisses the security popup
     b->chrome_dirty = 1;  // addr text / focus / popup may have changed
 

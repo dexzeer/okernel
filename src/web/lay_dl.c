@@ -390,6 +390,14 @@ static int is_layer(struct wlayout* L, int bi) {
     return b->st && (b->kind == LB_BLOCK || b->kind == LB_REPLACED) && b->st->position != POS_STATIC;
 }
 
+// Does this positioned box start a stacking context? (z-index other than auto, opacity < 1, fixed/sticky.) One that does not
+// paints at the z=0 step of its parent context, and its own positioned descendants belong to THAT context, not to it: a
+// dialog with z-index 2202 inside an absolutely positioned (z-index: auto) app root still beats a backdrop at 2201 outside.
+static int creates_ctx(struct wlayout* L, int bi) {
+    const struct wstyle* s = L->b[bi].st;
+    return !s->z_auto || s->opacity < 255 || s->position == POS_FIXED || s->position == POS_STICKY;
+}
+
 struct layers { int* v; int n, cap; };
 static void layers_push(struct layers* ls, int bi) {
     if (ls->n >= ls->cap) {
@@ -407,7 +415,11 @@ static void collect_layers(struct wlayout* L, int bi, struct layers* ls, int dep
     for (int c = L->b[bi].first; c >= 0; c = L->b[c].next) {
         if (!(L->b[c].flags & BF_LAID) && L->b[c].kind != LB_TEXT && L->b[c].kind != LB_INLINE &&
             L->b[c].kind != LB_BR && L->b[c].kind != LB_WBR && L->b[c].kind != LB_MARKER) continue;
-        if (is_layer(L, c)) { layers_push(ls, c); continue; }
+        if (is_layer(L, c)) {
+            layers_push(ls, c);
+            if (!creates_ctx(L, c)) collect_layers(L, c, ls, depth + 1);     // its layers join this context, in tree order
+            continue;
+        }
         collect_layers(L, c, ls, depth + 1);
     }
 }
@@ -551,7 +563,7 @@ static void sort_layers(struct wlayout* L, int* v, int n) {
 static void emit_layer(struct wlayout* L, int bi, int depth) {
     if (depth > 64) return;
     struct layers ls = { 0, 0, 0 };
-    collect_layers(L, bi, &ls, 0);
+    if (bi == L->root || creates_ctx(L, bi)) collect_layers(L, bi, &ls, 0);       // (a box that starts no context: its layers were hoisted)
     sort_layers(L, ls.v, ls.n);
     uint8_t saved_alpha = L->alpha;
     int saved_fixed = L->fixed_ctx;

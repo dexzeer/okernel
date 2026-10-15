@@ -73,6 +73,8 @@ struct wdoc {
     int images_dirty;       // image sources changed: rescan
     int last_forced_ms;     // layout forced by a script (throttle)
     int last_layout_ms;     // cost of the last layout pass
+    int forced_budget;      // ms of script-forced layout still allowed (refills with time, see script_layout_ex)
+    int forced_budget_t;    // when it was last refilled
     // parsed stylesheets by content: the set is rebuilt whenever a script touches a <style>/<link> element, and parsing
     // tens of thousands of rules again each time was most of that cost
     struct { uint32_t h1, h2; int len; struct wsheet* sh; } sc[SHEET_CACHE_MAX];
@@ -1031,12 +1033,19 @@ int wdoc_res_request(struct wdoc* d, const char* url, const char* method, const 
 static int script_layout_ex(struct wdoc* d, int force) {
     if (!d->styles_dirty && !d->images_dirty && !d->style_dirty && !d->layout_dirty && d->L) return d->L != 0;
     int now = wjs_now();
-    int gap = d->last_layout_ms * 4;
-    if (gap < 100) gap = 100;
-    if (!force && d->L && now - d->last_forced_ms < gap) return 1;
+    // A script that measures after changing the DOM must see the new layout (IronFit centres a dialog from its height: a stale
+    // answer put it off screen). Forced layouts are therefore fresh as long as they stay within a budget that refills at one
+    // ms per ms (at most half the time, in bursts of up to 600 ms): a script that mutates and measures in a loop is answered
+    // from the layout that exists once the budget is gone.
+    if (!d->forced_budget_t) { d->forced_budget = 600; d->forced_budget_t = now; }
+    d->forced_budget += now - d->forced_budget_t;
+    d->forced_budget_t = now;
+    if (d->forced_budget > 600) d->forced_budget = 600;
+    if (!force && d->L && d->forced_budget < d->last_layout_ms) return 1;
     wdoc_update(d);
     d->last_forced_ms = wjs_now();
     d->last_layout_ms = d->last_forced_ms - now;
+    d->forced_budget -= d->last_layout_ms;
     return d->L != 0;
 }
 

@@ -1684,6 +1684,10 @@ static void gather(struct wstyleset* ss, int el) {
     }
 }
 
+// Custom properties one element can declare at once (YouTube's <html> declares ~1200 across its sheets; the old limit of 512
+// silently dropped the rest, among them the colour tokens of dialogs: transparent dialogs).
+#define CUSTOM_MAX 4096
+
 // Apply declarations of matched rules for pseudo `pe` into slots, in
 // cascade order: UA normal, hints, author normal, inline normal, author
 // important, inline important, UA important.
@@ -1694,7 +1698,7 @@ static void cascade(struct wstyleset* ss, int pe, struct slot* slots,
     *ncustom = 0;
     #define APPLY(dd, shp) do { \
         const struct cdecl* d_ = (dd); \
-        if (d_->prop == P_CUSTOM) { if (*ncustom < 512) { customs[*ncustom] = d_; custom_sh[*ncustom] = (shp); (*ncustom)++; } } \
+        if (d_->prop == P_CUSTOM) { if (*ncustom < CUSTOM_MAX) { customs[*ncustom] = d_; custom_sh[*ncustom] = (shp); (*ncustom)++; } } \
         else if (d_->prop < P_COUNT) { slots[d_->prop].d = d_; slots[d_->prop].sh = (shp); } \
     } while (0)
     for (int pass = 0; pass < 2; pass++) {
@@ -2386,8 +2390,8 @@ static int32_t compute_one(struct wstyleset* ss, int el, int pe, const struct ws
                            const struct wstyle* root, int hint_first, int hint_count,
                            int inl_first, int inl_count) {
     static struct slot slots[P_COUNT];
-    static const struct cdecl* customs[512];
-    static const struct wsheet* custom_sh[512];
+    static const struct cdecl* customs[CUSTOM_MAX];
+    static const struct wsheet* custom_sh[CUSTOM_MAX];
     int ncustom;
     cascade(ss, pe, slots, customs, custom_sh, &ncustom, hint_first, hint_count, inl_first, inl_count);
     if (pe != PE_NONE) {
@@ -2406,35 +2410,44 @@ static int32_t compute_one(struct wstyleset* ss, int el, int pe, const struct ws
     if (ncustom) {
         struct wcvars* vb = vars_block(ss, parent->vars, ncustom);
         if (vb) {
+            // Every custom property of this element goes in first (as written); the ones that mention var() are substituted
+            // afterwards against the complete block, so `--a: var(--b); --b: red` works whatever the order (the last
+            // declaration of a name wins, as var_find searches backwards).
+            static uint8_t pend[CUSTOM_MAX];
             for (int i = 0; i < ncustom; i++) {
                 const struct cdecl* d = customs[i];
                 const struct wsheet* sh = custom_sh[i];
                 const char* nm = sh->pool.p + d->name;
                 const char* vv = sh->pool.p + d->raw;
                 int vl = (int)d->rawlen;
-                // custom values may reference other vars: substitute now
-                struct wbuf sb = { 0, 0, 0 };
-                int ok = 1;
-                for (int k = 0; k + 4 <= vl; k++) if (w_ieq_prefix(vv + k, vl - k, "var(")) { ok = 0; break; }
-                uint32_t voff, vlen;
-                if (ok) {
-                    int32_t r = str_intern(ss, vv, vl);
-                    voff = (uint32_t)(r - 1); vlen = (uint32_t)vl;
-                } else {
-                    if (var_subst(ss, vb, vv, vl, &sb, 0)) {
-                        int32_t r = str_intern(ss, sb.p ? sb.p : "", sb.len);
-                        voff = (uint32_t)(r - 1); vlen = (uint32_t)sb.len;
-                    } else { voff = 0; vlen = 0; }
-                    wbuf_free(&sb);
-                }
-                // intern name too
+                pend[i] = 0;
+                for (int k = 0; k + 4 <= vl; k++) if (w_ieq_prefix(vv + k, vl - k, "var(")) { pend[i] = 1; break; }
+                int32_t r = str_intern(ss, vv, vl);
                 int32_t nr = str_intern(ss, nm, (int)d->namelen);
                 struct wcvar* cv = &vb->v[vb->n++];
                 cv->hash = sh_hash(nm, (int)d->namelen);
                 cv->name = (uint32_t)(nr - 1);
                 cv->nlen = d->namelen;
-                cv->val = voff;
-                cv->vlen = vlen;
+                cv->val = (uint32_t)(r - 1);
+                cv->vlen = (uint32_t)vl;
+            }
+            for (int i = 0; i < ncustom; i++) {
+                if (!pend[i]) continue;
+                struct wcvar* cv = &vb->v[i];
+                struct wbuf sb = { 0, 0, 0 };
+                // the raw text of this entry, copied: the string pool may move while substituting
+                int vl = (int)cv->vlen;
+                char* raw = (char*)w_malloc((size_t)vl + 1);
+                if (!raw) { cv->vlen = 0; continue; }
+                memcpy(raw, ss->strpool.p + cv->val, (size_t)vl);
+                cv->vlen = 0;                       // a reference to itself is a cycle: invalid
+                if (var_subst(ss, vb, raw, vl, &sb, 0)) {
+                    int32_t r = str_intern(ss, sb.p ? sb.p : "", sb.len);
+                    cv->val = (uint32_t)(r - 1);
+                    cv->vlen = (uint32_t)sb.len;
+                }
+                wbuf_free(&sb);
+                w_free(raw);
             }
             s.vars = vb;
         }
