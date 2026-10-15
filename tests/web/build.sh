@@ -13,7 +13,7 @@ W="src/web/wdom.c src/web/html5.c src/web/charset.c src/web/css_values.c src/web
    src/web/lay_table.c src/web/lay_dl.c src/web/paint.c src/web/svg.c src/web/wdoc.c src/cjk.c \
    src/web/wjs.c src/web/wjs_dom.c src/web/wjs_media.c src/web/wjs_canvas.c src/web/wcanvas.c src/web/wjs_sys.c src/web/wcookie.c \
    src/media/meng.c src/media/webm.c src/media/opus_dec.c src/media/opus_packet.c src/media/celt.c src/media/celt_tables.c \
-   src/media/ec.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/mp4.c src/media/aac.c src/media/aac_tables.c src/media/resample.c src/media/h264.c src/media/h264_slice.c src/media/h264_recon.c src/media/h264_cabac.c src/media/h264_inter.c src/media/h264_lf.c src/media/h264_tables.c"
+   src/media/ec.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_simd.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/mp4.c src/media/aac.c src/media/aac_tables.c src/media/resample.c src/media/h264.c src/media/h264_slice.c src/media/h264_recon.c src/media/h264_cabac.c src/media/h264_inter.c src/media/h264_lf.c src/media/h264_tables.c"
 [ -f src/web/image.c ] && W="$W src/web/image.c"
 nasm -f elf32 src/web/fontdata.asm -o build-host/fontdata.o
 nasm -f elf32 src/web/wjs_prelude.asm -o build-host/wjs_prelude.o
@@ -34,7 +34,7 @@ if [ ! -f $QD/kmath.o ] || [ src/kmath.c -nt $QD/kmath.o ]; then
 fi
 QOBJ="$QOBJ $QD/kmath.o"
 # non-PIE like the kernel (PIE costs a register on i386)
-CF="-m32 -fno-pie -fno-pic -no-pie $OPT -g $SAN -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -Isrc -Itests/web"
+CF="-m32 -msse2 -fno-pie -fno-pic -no-pie $OPT -g $SAN -Wall -Wextra -Wno-unused-parameter -Wno-format-truncation -Isrc -Itests/web"
 gcc $CF -o build-host/wrender tests/web/render.c $W build-host/fontdata.o build-host/wjs_prelude.o $QOBJ -lm
 echo built build-host/wrender
 gcc $CF -o build-host/wbrowse tests/web/wbrowse.c $W build-host/fontdata.o build-host/wjs_prelude.o $QOBJ -lm

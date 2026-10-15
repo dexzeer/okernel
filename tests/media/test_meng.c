@@ -187,6 +187,39 @@ static void test_pause_resume(void) {
     free(file);
 }
 
+// The main loop stalls for seconds (page script, layout): the card plays everything it was given and then silence, and its
+// position counter runs on. The media clock must not follow it: it stops where the data stopped, and the audio resumes there.
+static void test_underrun(void) {
+    printf("underrun: the clock stops where the data stopped, the audio resumes there\n");
+    long n;
+    uint8_t* file = slurp("webm_remux_celt_fb_st.webm", &n);
+    load_ref("opus_celt_fb_st.ref", 2);
+    reset_card();
+    struct meng* m = meng_new(&env);
+    int sb = meng_sb_add(m, 3);
+    feed_all(m, sb, file, n, 8000, 0);
+    meng_end_of_stream(m);
+    meng_play(m);
+    while (meng_current_time(m) < 1.0) step(m);
+    uint64_t written = wr_pos;                       // everything the card will play before it runs dry
+    long data_end = (long)(written - first_wr);      // frames of reference audio (pre-skip not counted) that were given to it
+    dev_pos += 48000 * 2;                            // two seconds with no poll: the card runs dry and plays silence
+    tick += 200;
+    step(m);                                         // the first poll after the stall
+    double t = meng_current_time(m);
+    CHECK(meng_underruns(m) == 1, "underrun not noticed (%u)", meng_underruns(m));
+    CHECK(t < 1.0 + 1.0, "the clock raced %.3f s ahead through the stall", t);
+    uint64_t rs = dev_pos;
+    for (int i = 0; i < 400 && !meng_ended(m); i++) step(m);
+    CHECK(meng_ended(m), "did not end");
+    while (rs < wr_pos && timeline[rs * 2] == 0 && timeline[rs * 2 + 1] == 0) rs++;
+    long md = max_diff(timeline + rs * 2, ref_audio + ((long)pre_skip + data_end) * 2, 4000);
+    CHECK(md <= 1, "the resumed audio is not the continuation of what stopped: max diff %ld", md);
+    printf("  clock after the stall %.3f s, resumed audio max diff %ld\n", t, md);
+    meng_free(m);
+    free(file);
+}
+
 static void test_seek_audio(void) {
     printf("seek: the audio resumes at the target\n");
     long n;
@@ -472,6 +505,7 @@ int main(int argc, char** argv) {
     snprintf(dir, sizeof dir, "%s", argc > 1 ? argv[1] : "tests/media/vec");
     test_progressive_audio();
     test_pause_resume();
+    test_underrun();
     test_seek_audio();
     test_video();
     test_buffered_and_remove();

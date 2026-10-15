@@ -82,6 +82,9 @@ uint32_t meng_frames_decoded(const struct meng* m);
 uint32_t meng_frames_shown(const struct meng* m);
 void meng_describe(const struct meng* m, char* out, int cap);   // one line of state, for logs
 uint32_t meng_frames_dropped(const struct meng* m);
+uint32_t meng_underruns(const struct meng* m);   // times the sound card ran dry while playing (the clock was re-based)
+double meng_take_decode_ms(struct meng* m);   // average ms per decoded video frame since the last call
+uint32_t meng_take_maxgap(struct meng* m);     // longest gap (ticks) between two presented frames since the last call
 uint32_t meng_audio_frames(const struct meng* m);       // audio frames handed to the sound card so far
 
 // ---- video output ----

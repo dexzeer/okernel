@@ -254,7 +254,8 @@ int wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout) {
             uint32_t nowms = (uint32_t)wjs_now();
             if (nowms - last_ms >= 1000) {
                 uint32_t sh = meng_frames_shown(s->m), dr = meng_frames_dropped(s->m);
-                if (last_ms && (sh != last_shown || dr != last_dropped)) w_log("[media] rate: %u shown/s, %u dropped/s (session %d)\n", sh - last_shown, dr - last_dropped, i);
+                int dm = (int)(meng_take_decode_ms(s->m) * 10);
+                if (last_ms && (sh != last_shown || dr != last_dropped)) w_log("[media] rate: %u shown/s, %u dropped/s, longest gap %u ms, clock %d ms, underruns %u, decode %d.%d ms/frame (session %d)\n", sh - last_shown, dr - last_dropped, meng_take_maxgap(s->m) * 10, (int)(meng_current_time(s->m) * 1000), meng_underruns(s->m), dm / 10, dm % 10, i);
                 last_ms = nowms; last_shown = sh; last_dropped = dr;
             }
         }
