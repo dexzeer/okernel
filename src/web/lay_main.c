@@ -24,6 +24,7 @@ int lb_new(struct wlayout* L, int node, const struct wstyle* st, int kind) {
     b->imin = b->imax = -1;
     b->abs_head = b->abs_next = -1;
     b->cbh = -1;
+    b->mo_ok = 0;
     return i;
 }
 
@@ -712,7 +713,38 @@ static void lay_flow(struct wlayout* L, int bi, int32_t content_w, int32_t* cont
 
 // ---- generic box layout ------------------------------------------------------------
 
+static void lay_box_impl(struct wlayout* L, int bi, int32_t avail, int32_t forced_w, int32_t forced_h);
+
+// Laying a flex/grid item out takes several passes (measure, place, stretch), each of which lays out its own items the same
+// way: nested containers multiplied the work per level (a YouTube page: 3,600 layouts of every box, 130-600 ms per relayout).
+// A block that starts its own formatting context depends only on the inputs below, so a second layout with identical
+// inputs is the first one over again: restore what the box itself ended up with (its subtree is already in that state).
+#define MEMO_KEEP (BF_EMPTY | BF_HEIGHT_DEF | BF_LAID)
+int lay_memo_enabled = 1;      // host A/B testing (tests/web/wbrowse.c: WB_NOMEMO=1)
 void lay_box(struct wlayout* L, int bi, int32_t avail, int32_t forced_w, int32_t forced_h) {
+    struct lbox* b = &L->b[bi];
+    int memo = lay_memo_enabled && b->kind == LB_BLOCK && !(b->flags & (BF_ABS | BF_FLOAT | BF_INLINE_LEVEL)) && lay_is_bfc(L, bi);
+    if (memo && b->mo_ok && b->mo_av == avail && b->mo_fw == forced_w && b->mo_fh == forced_h && b->mo_cbh == b->cbh &&
+        b->mo_pax == b->pax && b->mo_pay == b->pay) {
+        b->w = b->mo_w; b->h = b->mo_h;
+        for (int i = 0; i < 4; i++) { b->m[i] = b->mo_m[i]; b->cm[i] = b->mo_cm[i]; }
+        b->baseline = b->mo_base; b->last_baseline = b->mo_lbase;
+        b->flags = (uint16_t)((b->flags & ~MEMO_KEEP) | b->mo_flags);
+        return;
+    }
+    lay_box_impl(L, bi, avail, forced_w, forced_h);
+    if (memo) {
+        b = &L->b[bi];
+        b->mo_av = avail; b->mo_fw = forced_w; b->mo_fh = forced_h; b->mo_cbh = b->cbh; b->mo_pax = b->pax; b->mo_pay = b->pay;
+        b->mo_w = b->w; b->mo_h = b->h;
+        for (int i = 0; i < 4; i++) { b->mo_m[i] = b->m[i]; b->mo_cm[i] = b->cm[i]; }
+        b->mo_base = b->baseline; b->mo_lbase = b->last_baseline;
+        b->mo_flags = (uint16_t)(b->flags & MEMO_KEEP);
+        b->mo_ok = 1;
+    }
+}
+
+static void lay_box_impl(struct wlayout* L, int bi, int32_t avail, int32_t forced_w, int32_t forced_h) {
     struct lbox* b = &L->b[bi];
     const struct wstyle* s = b->st;
     if (++L->depth > 300) { L->depth--; b->w = forced_w > 0 ? forced_w : 0; b->h = 0; return; }

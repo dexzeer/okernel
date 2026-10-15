@@ -197,6 +197,7 @@ int main(int argc, char** argv) {
     const char* out = argc > 4 ? argv[4] : "tests/web/out/wbrowse.ppm";
     double seconds = argc > 5 ? atof(argv[5]) : 8;
     quiet = getenv("WB_QUIET") != 0;
+    { extern int lay_memo_enabled; if (getenv("WB_NOMEMO")) lay_memo_enabled = 0; }
     t_base_ms = (int)now_ms();
     wjs_host.now_ms = host_now;
     wjs_host.log = log_sink;

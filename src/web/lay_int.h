@@ -64,6 +64,11 @@ struct lbox {
     int32_t list_ord;             // list item ordinal
     int32_t cm[4];                // collapsed margins: top pos/neg, bottom pos/neg
     int32_t cbh;                  // containing block content height for % heights (-1 indefinite)
+    // lay_box memo: the inputs and results of the last layout of this box (see lay_box)
+    int32_t mo_av, mo_fw, mo_fh, mo_cbh, mo_pax, mo_pay;
+    int32_t mo_w, mo_h, mo_m[4], mo_cm[4], mo_base, mo_lbase;
+    uint16_t mo_flags;
+    uint8_t mo_ok;
 };
 
 // IFC fragment

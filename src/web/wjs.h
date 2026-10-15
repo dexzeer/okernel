@@ -64,6 +64,7 @@ int  wjs_take_history(struct wjs* js, int* delta);
 // px (unscrolled; fixed = pinned to the viewport), at most `max`, count in *nout.
 struct wjs_rect { int x, y, w, h, fixed; };
 int  wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout);
+void wjs_media_tick(struct wjs* js);         // advance the sessions (decode, audio feed) from inside a running script
 int  wjs_media_active(struct wjs* js);       // something is playing: keep the main loop running
 int  wjs_media_any(struct wjs* js);          // sessions exist (loading, paused...): poll them now and then
 
