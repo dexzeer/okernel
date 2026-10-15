@@ -2,6 +2,7 @@
 // coefficient -> residual via the inverse transforms (8.6.2, 8.7) and reference border
 // extension. Written from the specification text.
 
+#include "vp9_simd.h"
 #include "vp9_int.h"
 #include "vp9_tables.h"
 
@@ -180,48 +181,73 @@ static void block_inter(const struct vp9_dec* d, const struct vp9_buf* ref, int 
             for (int r = 0; r < h; r++) memcpy(dst + (size_t)r * dst_stride, src + (ptrdiff_t)r * ss, (size_t)w * sizeof(pel));
             return;
         }
+        // The 8-tap filters, taps in locals and unrolled (the generic loops over t cost ~80% of a P-frame's decode time).
+        const int simd = (w & 3) == 0 && vp9_simd_ok();         // SSE2 kernels (vp9_simd.c): same arithmetic, ~4x fewer operations
         if (!fy) {                                             // horizontal only
             const int16_t* k = kern[fx];
+            if (simd) { vp9_simd_filter_h(src - 3, ss, dst, dst_stride, w, h, k, maxv); return; }
+            const int k0 = k[0], k1 = k[1], k2 = k[2], k3 = k[3], k4 = k[4], k5 = k[5], k6 = k[6], k7 = k[7];
             for (int r = 0; r < h; r++) {
-                const pel* s = src + (ptrdiff_t)r * ss - 3;
+                const pel* p = src + (ptrdiff_t)r * ss - 3;
                 pel* o = dst + (size_t)r * dst_stride;
-                for (int c = 0; c < w; c++) {
-                    int sum = 0;
-                    for (int t = 0; t < 8; t++) sum += k[t] * s[c + t];
-                    o[c] = (pel)vp9_clip3(0, maxv, (sum + 64) >> 7);
+                for (int c = 0; c < w; c++, p++) {
+                    int sum = k0 * p[0] + k1 * p[1] + k2 * p[2] + k3 * p[3] + k4 * p[4] + k5 * p[5] + k6 * p[6] + k7 * p[7];
+                    sum = (sum + 64) >> 7;
+                    o[c] = (pel)((unsigned)sum > (unsigned)maxv ? (sum < 0 ? 0 : maxv) : sum);
                 }
             }
             return;
         }
         if (!fx) {                                             // vertical only
             const int16_t* k = kern[fy];
+            if (simd) { vp9_simd_filter_v(src - 3 * ss, ss, dst, dst_stride, w, h, k, maxv); return; }
+            const int k0 = k[0], k1 = k[1], k2 = k[2], k3 = k[3], k4 = k[4], k5 = k[5], k6 = k[6], k7 = k[7];
             for (int r = 0; r < h; r++) {
+                const pel* p0 = src + (ptrdiff_t)(r - 3) * ss;
+                const pel* p1 = p0 + ss; const pel* p2 = p1 + ss; const pel* p3 = p2 + ss;
+                const pel* p4 = p3 + ss; const pel* p5 = p4 + ss; const pel* p6 = p5 + ss; const pel* p7 = p6 + ss;
                 pel* o = dst + (size_t)r * dst_stride;
                 for (int c = 0; c < w; c++) {
-                    int sum = 0;
-                    for (int t = 0; t < 8; t++) sum += k[t] * src[(ptrdiff_t)(r + t - 3) * ss + c];
-                    o[c] = (pel)vp9_clip3(0, maxv, (sum + 64) >> 7);
+                    int sum = k0 * p0[c] + k1 * p1[c] + k2 * p2[c] + k3 * p3[c] + k4 * p4[c] + k5 * p5[c] + k6 * p6[c] + k7 * p7[c];
+                    sum = (sum + 64) >> 7;
+                    o[c] = (pel)((unsigned)sum > (unsigned)maxv ? (sum < 0 ? 0 : maxv) : sum);
                 }
             }
             return;
         }
+        if (simd) {
+            uint16_t smid[(64 + 8) * 64];
+            vp9_simd_filter_h(src - 3 * ss - 3, ss, smid, 64, w, h + 7, kern[fx], maxv);
+            vp9_simd_filter_v(smid, 64, dst, dst_stride, w, h, kern[fy], maxv);
+            return;
+        }
         int16_t mid[(64 + 8) * 64];
-        const int16_t* kx = kern[fx];
-        for (int r = 0; r < h + 7; r++) {
-            const pel* s = src + (ptrdiff_t)(r - 3) * ss - 3;
-            for (int c = 0; c < w; c++) {
-                int sum = 0;
-                for (int t = 0; t < 8; t++) sum += kx[t] * s[c + t];
-                mid[r * 64 + c] = (int16_t)vp9_clip3(0, maxv, (sum + 64) >> 7);
+        {
+            const int16_t* kx = kern[fx];
+            const int k0 = kx[0], k1 = kx[1], k2 = kx[2], k3 = kx[3], k4 = kx[4], k5 = kx[5], k6 = kx[6], k7 = kx[7];
+            for (int r = 0; r < h + 7; r++) {
+                const pel* p = src + (ptrdiff_t)(r - 3) * ss - 3;
+                int16_t* m = mid + r * 64;
+                for (int c = 0; c < w; c++, p++) {
+                    int sum = k0 * p[0] + k1 * p[1] + k2 * p[2] + k3 * p[3] + k4 * p[4] + k5 * p[5] + k6 * p[6] + k7 * p[7];
+                    sum = (sum + 64) >> 7;
+                    m[c] = (int16_t)((unsigned)sum > (unsigned)maxv ? (sum < 0 ? 0 : maxv) : sum);
+                }
             }
         }
-        const int16_t* ky = kern[fy];
-        for (int r = 0; r < h; r++) {
-            pel* o = dst + (size_t)r * dst_stride;
-            for (int c = 0; c < w; c++) {
-                int sum = 0;
-                for (int t = 0; t < 8; t++) sum += ky[t] * mid[(r + t) * 64 + c];
-                o[c] = (pel)vp9_clip3(0, maxv, (sum + 64) >> 7);
+        {
+            const int16_t* ky = kern[fy];
+            const int k0 = ky[0], k1 = ky[1], k2 = ky[2], k3 = ky[3], k4 = ky[4], k5 = ky[5], k6 = ky[6], k7 = ky[7];
+            for (int r = 0; r < h; r++) {
+                const int16_t* m0 = mid + r * 64;
+                const int16_t* m1 = m0 + 64; const int16_t* m2 = m1 + 64; const int16_t* m3 = m2 + 64;
+                const int16_t* m4 = m3 + 64; const int16_t* m5 = m4 + 64; const int16_t* m6 = m5 + 64; const int16_t* m7 = m6 + 64;
+                pel* o = dst + (size_t)r * dst_stride;
+                for (int c = 0; c < w; c++) {
+                    int sum = k0 * m0[c] + k1 * m1[c] + k2 * m2[c] + k3 * m3[c] + k4 * m4[c] + k5 * m5[c] + k6 * m6[c] + k7 * m7[c];
+                    sum = (sum + 64) >> 7;
+                    o[c] = (pel)((unsigned)sum > (unsigned)maxv ? (sum < 0 ? 0 : maxv) : sum);
+                }
             }
         }
         return;

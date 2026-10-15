@@ -15,9 +15,9 @@
 
 #define MAX_SB 4
 #define MAX_FRAME 6400                  // 120 ms of audio at 48 kHz, and an AAC frame of an 8 kHz stream resampled
-#define AUDIO_TARGET 9600               // frames (200 ms) kept queued in the sound card
-#define AUDIO_PER_POLL 4                // packets decoded per poll
-#define HIST_FRAMES 16384               // audio kept to replay after a pause (power of two)
+#define AUDIO_TARGET 24000              // frames (500 ms) kept queued in the sound card: a late main loop (page script, layout) must not run it dry
+#define AUDIO_PER_POLL 8                // packets decoded per poll
+#define HIST_FRAMES 32768               // audio kept to replay after a pause (power of two)
 #define PREROLL_PACKETS 6               // decoded and thrown away before a seek target
 #define VIDEO_LEAD_NS 20000000LL        // decode a frame this long before it is due
 #define VIDEO_BUDGET_TICKS 3            // ~30 ms of video work per poll
@@ -127,6 +127,8 @@ struct meng {
     int out_w, out_h;
     uint32_t* fb;
     int fb_cap;
+    uint32_t* cvt;                      // source-size ARGB scratch for upscaled output
+    int cvt_cap;
     struct meng_frame frame;
     int frame_valid;
     int skip_present;
@@ -134,9 +136,13 @@ struct meng {
     int have_last_img;
     uint32_t v_decoded, v_shown, v_dropped;
     uint32_t v_last_show;               // tick of the last presented frame (a backlog never starves the picture)
+    uint32_t v_dec_ticks, v_dec_n;      // time spent in video_decode_one (10 ms ticks, quantised but unbiased on average) and calls
+    uint32_t v_maxgap;                  // longest gap between two presented frames since meng_take_maxgap (ticks), for the rate line
     uint32_t v_cool_until;              // no video decoding before this tick: a decoder that cannot keep up gets a third of the CPU, not all of it
     uint8_t first_tries;                // attempts to show the first frame of a video that has not been started (a stream that never yields one must not be decoded forever)
     uint32_t a_frames_out;
+    uint32_t a_out_start;               // a_frames_out when the audio clock was (re)started
+    uint32_t underruns;                 // times the card ran dry while playing
 
     int ready_state;
     int error;
@@ -402,6 +408,7 @@ void meng_free(struct meng* m) {
     if (m->vd) vp9_dec_free(m->vd);
     if (m->hd) h264_free(m->hd);
     if (m->fb) MEDIA_FREE(m->fb);
+    if (m->cvt) MEDIA_FREE(m->cvt);
     MEDIA_FREE(m);
 }
 
@@ -629,6 +636,7 @@ static void audio_write_out(struct meng* m) {
             m->a_pos0 = m->env.audio_clock() + m->env.audio_queued();
             m->a_pts0 = first_unwritten_pts(m);
             m->audio_started = 1;
+            m->a_out_start = m->a_frames_out;
         }
         if (m->replay_pos < m->replay_len) {
             uint32_t n = card_write(m, m->replay + (size_t)m->replay_pos * 2, m->replay_len - m->replay_pos);
@@ -780,6 +788,33 @@ static void audio_seek(struct meng* m, int64_t t) {
 
 static inline uint8_t clamp8(int v) { return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
 
+// Upscaled output (the usual case: a 640x360 video painted at 1341x754): the colour conversion runs on the SOURCE pixels (a
+// quarter of the work or less) and the picture is then stretched by nearest-neighbour copying, which gives the same pixels as
+// converting every output pixel from its source pixel. Returns the scratch buffer (w x h ARGB), or 0 if there is no memory.
+static uint32_t* cvt_scratch(struct meng* m, int w, int h) {
+    if (w * h > m->cvt_cap) {
+        if (m->cvt) MEDIA_FREE(m->cvt);
+        m->cvt = (uint32_t*)MEDIA_ALLOC((size_t)w * h * 4);
+        m->cvt_cap = m->cvt ? w * h : 0;
+    }
+    return m->cvt;
+}
+
+static void stretch_rows(uint32_t* out, int ow, int oh, const uint32_t* src, int w, int h) {
+    static int xmap[4096];
+    int fw = ow > 4096 ? 4096 : ow;
+    for (int x = 0; x < fw; x++) xmap[x] = (int)(((int64_t)x * w) / ow);
+    int prev = -1;
+    for (int y = 0; y < oh; y++) {
+        int syy = (int)(((int64_t)y * h) / oh);
+        uint32_t* o = out + (size_t)y * ow;
+        if (syy == prev) { memcpy(o, o - ow, (size_t)fw * 4); continue; }      // the same source row again: copy the row just made
+        const uint32_t* r = src + (size_t)syy * w;
+        for (int x = 0; x < fw; x++) o[x] = r[xmap[x]];
+        prev = syy;
+    }
+}
+
 static void convert_frame(struct meng* m, const struct vp9_image* img) {
     int ow = m->out_w ? m->out_w : img->width, oh = m->out_h ? m->out_h : img->height;
     if (ow < 2) ow = 2;
@@ -804,6 +839,25 @@ static void convert_frame(struct meng* m, const struct vp9_image* img) {
     int sh = img->bit_depth - 8;
     int sx = img->subsampling_x, sy = img->subsampling_y;
     int w = img->width, h = img->height;
+    if (ow * oh > 2 * w * h && ow <= 4096) {
+        uint32_t* tmp = cvt_scratch(m, w, h);
+        if (tmp) {
+            for (int y = 0; y < h; y++) {
+                const uint16_t* yr = img->plane[0] + (size_t)y * img->stride[0];
+                const uint16_t* ur = img->plane[1] + (size_t)(y >> sy) * img->stride[1];
+                const uint16_t* vr = img->plane[2] + (size_t)(y >> sy) * img->stride[2];
+                uint32_t* o = tmp + (size_t)y * w;
+                for (int x = 0; x < w; x++) {
+                    int yy = (yr[x] >> sh) - yoff, uu = (ur[x >> sx] >> sh) - 128, vv = (vr[x >> sx] >> sh) - 128;
+                    int base = ky * yy + 128;
+                    int r = (base + rv * vv) >> 8, g = (base - gu * uu - gv * vv) >> 8, b = (base + bu * uu) >> 8;
+                    o[x] = 0xFF000000u | (uint32_t)clamp8(r) << 16 | (uint32_t)clamp8(g) << 8 | clamp8(b);
+                }
+            }
+            stretch_rows(m->fb, ow, oh, tmp, w, h);
+            goto done;
+        }
+    }
     static int xmap[4096];
     int fw = ow > 4096 ? 4096 : ow;
     for (int x = 0; x < fw; x++) xmap[x] = (int)(((int64_t)x * w) / ow);
@@ -825,6 +879,7 @@ static void convert_frame(struct meng* m, const struct vp9_image* img) {
             o[x] = 0xFF000000u | (uint32_t)clamp8(r) << 16 | (uint32_t)clamp8(g) << 8 | clamp8(b);
         }
     }
+done:
     m->frame.px = m->fb;
     m->frame.w = ow;
     m->frame.h = oh;
@@ -857,6 +912,25 @@ static void convert_frame8(struct meng* m, const struct h264_pic* pic) {
         else { ky = 298; rv = 409; gu = 100; gv = 208; bu = 516; yoff = 16; }
     }
     int w = pic->width, h = pic->height;
+    if (ow * oh > 2 * w * h && ow <= 4096) {
+        uint32_t* tmp = cvt_scratch(m, w, h);
+        if (tmp) {
+            for (int y = 0; y < h; y++) {
+                const uint8_t* yr = pic->plane[0] + (size_t)y * pic->stride[0];
+                const uint8_t* ur = pic->plane[1] + (size_t)(y >> 1) * pic->stride[1];
+                const uint8_t* vr = pic->plane[2] + (size_t)(y >> 1) * pic->stride[2];
+                uint32_t* o = tmp + (size_t)y * w;
+                for (int x = 0; x < w; x++) {
+                    int yy = yr[x] - yoff, uu = ur[x >> 1] - 128, vv = vr[x >> 1] - 128;
+                    int base = ky * yy + 128;
+                    int r = (base + rv * vv) >> 8, g = (base - gu * uu - gv * vv) >> 8, b = (base + bu * uu) >> 8;
+                    o[x] = 0xFF000000u | (uint32_t)clamp8(r) << 16 | (uint32_t)clamp8(g) << 8 | clamp8(b);
+                }
+            }
+            stretch_rows(m->fb, ow, oh, tmp, w, h);
+            goto done;
+        }
+    }
     static int xmap[4096];
     int fw = ow > 4096 ? 4096 : ow;
     for (int x = 0; x < fw; x++) xmap[x] = (int)(((int64_t)x * w) / ow);
@@ -878,6 +952,7 @@ static void convert_frame8(struct meng* m, const struct h264_pic* pic) {
             o[x] = 0xFF000000u | (uint32_t)clamp8(r) << 16 | (uint32_t)clamp8(g) << 8 | clamp8(b);
         }
     }
+done:
     m->frame.px = m->fb;
     m->frame.w = ow;
     m->frame.h = oh;
@@ -928,7 +1003,7 @@ static void h264_present(struct meng* m, int64_t limit) {
     m->cur_pic = pic;
     m->have_cur_pic = 1;
     m->v_shown++;
-    m->v_last_show = m->env.ticks();
+    { uint32_t t = m->env.ticks(); if (m->v_last_show && t - m->v_last_show > m->v_maxgap && t - m->v_last_show < 100000) m->v_maxgap = t - m->v_last_show; m->v_last_show = t; }
 }
 
 static int governor;                            // see meng_set_governor
@@ -944,7 +1019,7 @@ static void on_image(void* u, const struct vp9_image* img) {
     m->last_img = *img;
     m->have_last_img = 1;
     m->v_shown++;
-    m->v_last_show = m->env.ticks();
+    { uint32_t t = m->env.ticks(); if (m->v_last_show && t - m->v_last_show > m->v_maxgap && t - m->v_last_show < 100000) m->v_maxgap = t - m->v_last_show; m->v_last_show = t; }
 }
 
 static uint32_t vq_live(const struct meng* m, uint32_t i) {
@@ -953,7 +1028,14 @@ static uint32_t vq_live(const struct meng* m, uint32_t i) {
 }
 
 // Decode the packet at vq.next; returns 0 when there is none.
+static int video_decode_one_raw(struct meng* m);
 static int video_decode_one(struct meng* m) {
+    uint32_t t0 = m->env.ticks();
+    int r = video_decode_one_raw(m);
+    if (r) { m->v_dec_ticks += m->env.ticks() - t0; m->v_dec_n++; }
+    return r;
+}
+static int video_decode_one_raw(struct meng* m) {
     m->vq.next = vq_live(m, m->vq.next);
     if (m->vq.next >= m->vq.n) return 0;
     const struct mpkt* pk = &m->vq.pk[m->vq.next++];
@@ -1129,6 +1211,15 @@ void meng_poll(struct meng* m) {
         }
     }
 
+    if (m->playing && m->clock_running && m->audio_started && m->a_frames_out > m->a_out_start && m->env.audio_queued &&
+        m->env.audio_queued() == 0 && !(m->eos && m->aq.next >= m->aq.n && !m->pend_len && !m->replay_len)) {
+        // The sound card played everything it was given and went on with silence (the main loop was busy for longer than the
+        // queue lasts). Its position counter ran on, so the clock would be ahead of the data by the whole stall and the picture
+        // would have to race to catch up. The media time stopped where the data stopped: restart the clock there, and the audio
+        // and the picture resume together from the same instant.
+        m->underruns++;
+        clock_start(m, first_unwritten_pts(m));
+    }
     if (m->playing && m->clock_running) {
         if (m->a_present && (m->od || m->ad) && m->env.audio_ready && m->env.audio_ready()) audio_pump(m);
         if (m->v_present && (m->vd || m->hd)) video_pump(m, clock_now(m));
@@ -1172,6 +1263,13 @@ int meng_has_video(const struct meng* m) { return m->v_present; }
 uint32_t meng_frames_decoded(const struct meng* m) { return m->v_decoded; }
 uint32_t meng_frames_shown(const struct meng* m) { return m->v_shown; }
 uint32_t meng_frames_dropped(const struct meng* m) { return m->v_dropped; }
+uint32_t meng_underruns(const struct meng* m) { return m->underruns; }
+double meng_take_decode_ms(struct meng* m) {            // average ms per decoded frame since the last call (0 if none)
+    double r = m->v_dec_n ? (double)m->v_dec_ticks * 10.0 / m->v_dec_n : 0;
+    m->v_dec_ticks = m->v_dec_n = 0;
+    return r;
+}
+uint32_t meng_take_maxgap(struct meng* m) { uint32_t g = m->v_maxgap; m->v_maxgap = 0; return g; }
 uint32_t meng_audio_frames(const struct meng* m) { return m->a_frames_out; }
 
 int meng_video_size(const struct meng* m, int* w, int* h) {
