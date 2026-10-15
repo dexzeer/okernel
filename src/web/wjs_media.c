@@ -225,6 +225,15 @@ const uint32_t* wjs_media_frame(struct wjs* js, int sess, int* w, int* h) {
     return f->px;
 }
 
+// Called every ~20 ms from the engine's interrupt hook while a script runs: a page script can run for seconds (YouTube's start-up
+// does), and the sound card's ring and the decoder must not wait for it. Only the engine state moves here (meng_poll: decode,
+// audio, clock); frames are published and painted by wjs_media_poll when the script returns.
+void wjs_media_tick(struct wjs* js) {
+    if (!js || js->dead || !js->media) return;
+    for (int i = 0; i < WM_MAX; i++)
+        if (js->media[i].m) { meng_set_governor(wjs_host.budget_scale >= 2); meng_poll(js->media[i].m); }
+}
+
 int wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout) {
     int relayout = 0, n = 0;
     if (nout) *nout = 0;

@@ -150,7 +150,7 @@ static int interrupt_cb(ojs* J, void* op) {
     if (js->deadline && now > js->deadline) { js->interrupted = 1; return 1; }
     if (wjs_host.yield) {
         static int last_yield;
-        if (now - last_yield >= 20 || now < last_yield) { last_yield = now; wjs_host.yield(); }
+        if (now - last_yield >= 20 || now < last_yield) { last_yield = now; wjs_media_tick(js); wjs_host.yield(); }
     }
     return 0;
 }
