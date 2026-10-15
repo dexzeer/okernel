@@ -31,6 +31,7 @@ const er = e.getBoundingClientRect();
 need(er.width === 40 && er.height === 30, 'fresh element measured: ' + er.width + 'x' + er.height);
 e.remove();
 
+need(!document.all && document.all !== undefined && document.all !== null, 'document.all must be falsy but not undefined (YouTube sanitizer: value || value === document.all)');
 need(typeof IntersectionObserverEntry === 'function' && 'intersectionRatio' in IntersectionObserverEntry.prototype, 'IntersectionObserverEntry');
 
 const events = [];
