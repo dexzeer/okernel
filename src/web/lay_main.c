@@ -1029,7 +1029,7 @@ void wlay_free(struct wlayout* L) {
     if (!L) return;
     w_free(L->b); w_free(L->fr); wbuf_free(&L->text); w_free(L->di); w_free(L->bord);
     w_free(L->dtx); w_free(L->dsh); w_free(L->dbg); w_free(L->rad); w_free(L->hits);
-    w_free(L->node_box); w_free(L->fl);
+    w_free(L->node_box); w_free(L->fl); w_free(L->rank);
     for (int i = 0; i < L->nanon_chunk; i++) w_free(L->anon_chunk[i]);
     w_free(L);
 }
@@ -1053,6 +1053,19 @@ int wlay_node_rect(const struct wlayout* L, int node, int32_t* x, int32_t* y, in
     if (b < 0) return 0;
     *x = L->b[b].ax; *y = L->b[b].ay; *w = L->b[b].w; *h = L->b[b].h;
     return 1;
+}
+
+// Where a node stands in paint order: the rank of its own box, or of the nearest ancestor box that was painted (inline
+// elements are painted by their block's line boxes). *fixed = it sits inside a position:fixed box (viewport coordinates).
+int wlay_paint_rank(const struct wlayout* L, int node, int* fixed) {
+    *fixed = 0;
+    if (!wlay_knows_node(L, node) || !L->rank) return 0;
+    int b = L->node_box[node], rank = 0;
+    for (int hops = 0; b >= 0 && hops < 4096; b = L->b[b].parent, hops++) {
+        if (L->b[b].flags & BF_FIXED) *fixed = 1;
+        if (!rank && b < L->nrank) rank = L->rank[b];
+    }
+    return rank;
 }
 
 int wlay_knows_node(const struct wlayout* L, int node) { return node >= 0 && node < L->node_box_n - 1; }   // node_box has one spare slot (nn + 1)

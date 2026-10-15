@@ -234,6 +234,7 @@ again:
     double t1 = now_ms();
     int fetched = 0, failed = 0, js_runs = 0;
     double deadline = now_ms() + seconds * 1000;
+    double mid_at = getenv("WB_MID_EVAL") ? now_ms() + (getenv("WB_MID_AFTER") ? atof(getenv("WB_MID_AFTER")) : 6000) : 0;   // WB_MID_EVAL=file.js: run it once, WB_MID_AFTER ms after the start, WHILE the load loop (timers, fetches) keeps running
     char rurl[4096];
     struct wjs* js = wdoc_js(d);
     g_top_url = url;
@@ -273,6 +274,11 @@ again:
             }
             free(r.body);
             free(r.headers);
+        }
+        if (js && mid_at && now_ms() >= mid_at) {
+            int el; char* es = slurp(getenv("WB_MID_EVAL"), &el);
+            mid_at = 0;
+            if (es) { es = realloc(es, (size_t)el + 1); es[el] = 0; wjs_debug_eval(js, es); free(es); deadline = now_ms() + (getenv("WB_MID_FOR") ? atof(getenv("WB_MID_FOR")) : 8000); }
         }
         if (js) {
             double tr = now_ms();

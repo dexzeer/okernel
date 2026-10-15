@@ -106,6 +106,8 @@ struct wlayout {
     int nhits, caphits;
     int32_t* node_box;            // DOM node -> first box (-1)
     int node_box_n;               // entries in node_box (DOM size at layout time)
+    int32_t* rank;                // box -> paint order (1 = first painted), 0 = never painted: what hit testing stacks by
+    int nrank, rank_n;
     int root;                     // root box index
     int32_t doc_h, doc_w;         // LU
     uint32_t canvas_bg;

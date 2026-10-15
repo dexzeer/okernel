@@ -1141,16 +1141,24 @@ int wdoc_img_info(struct wdoc* d, int node, int* w, int* h, int* state) {
     return 1;
 }
 
+// The topmost element at a viewport point: of everything whose box contains it, the one painted last (the layout records the
+// paint order, so z-index, positioned layers and floats count; DOM order only breaks ties). Boxes inside a fixed subtree are
+// in viewport coordinates. pointer-events:none and visibility:hidden elements are transparent to the pointer.
 int wdoc_hit_element(struct wdoc* d, int x, int y) {
     if (!script_layout(d)) return -1;
     struct wdom* dom = d->d;
-    int32_t X = PX(x), Y = PX(y + d->scroll_y);
-    int best = -1;
+    int best = -1, best_rank = -1;
     for (int el = dom->n[0].first; el >= 0; el = wdom_next(dom, el, 0)) {
         if (dom->n[el].type != WN_ELEM) continue;
         int32_t rx, ry, rw, rh;
-        if (wlay_node_rect(d->L, el, &rx, &ry, &rw, &rh) && X >= rx && X < rx + rw && Y >= ry && Y < ry + rh)
-            best = el;
+        if (!wlay_node_rect(d->L, el, &rx, &ry, &rw, &rh)) continue;
+        int fixed = 0;
+        int rank = wlay_paint_rank(d->L, el, &fixed);
+        int32_t X = PX(x), Y = PX(fixed ? y : y + d->scroll_y);
+        if (X < rx || X >= rx + rw || Y < ry || Y >= ry + rh) continue;
+        const struct wstyle* st = d->ss ? css_style_of(d->ss, el) : 0;
+        if (st && (st->pointer_events_none || st->visibility != 0)) continue;
+        if (rank >= best_rank) { best = el; best_rank = rank; }
     }
     return best;
 }
