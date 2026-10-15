@@ -356,7 +356,7 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
         }
         int jc = s->justify_content;
         int cnt = z - a;
-        if (free > 0) {
+        if (free > 0 && cnt > 0) {                  // an empty line has nothing to distribute the space over
             if (jc == AL_END || jc == AL_RIGHT) start = free;
             else if (jc == AL_CENTER) start = free / 2;
             else if (jc == AL_SPACE_BETWEEN && cnt > 1) between = free / (cnt - 1);

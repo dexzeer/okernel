@@ -2785,41 +2785,116 @@ function moChildList(parent, added, removed) {
     if (moActive) moRecord('childList', parent, { added, removed }, null);
 }
 
-// IntersectionObserver / ResizeObserver: report everything as visible once
-class IntersectionObserver {
-    constructor(cb, opts) { hidden(this, '_cb', cb); this.root = (opts && opts.root) || null; this.rootMargin = (opts && opts.rootMargin) || '0px'; this.thresholds = [0]; hidden(this, '_els', []); }
-    observe(el) {
-        if (this._els.includes(el)) return;
-        this._els.push(el);
-        setTimeout(() => {
-            if (!this._els.includes(el)) return;
-            const r = rectOf(el);
-            const v = W.view();
-            const inter = r.width > 0 || r.height > 0;
-            try {
-                this._cb([{ target: el, isIntersecting: inter, intersectionRatio: inter ? 1 : 0, boundingClientRect: r,
-                    intersectionRect: r, rootBounds: new DOMRect(0, 0, v[0], v[1]), time: W.now() }], this);
-            } catch (e) { report(e, 'IntersectionObserver callback'); }
-        }, 0);
-    }
-    unobserve(el) { const i = this._els.indexOf(el); if (i >= 0) this._els.splice(i, 1); }
-    disconnect() { this._els.length = 0; }
-    takeRecords() { return []; }
+// IntersectionObserverEntry: a real class, as in browsers (pages feature-detect it: YouTube's polyfill replaces the
+// observer unless 'intersectionRatio' is on IntersectionObserverEntry.prototype)
+class IntersectionObserverEntry {
+    constructor(init) { hidden(this, '_e', init || {}); }
 }
+for (const k of ['time', 'rootBounds', 'boundingClientRect', 'intersectionRect', 'isIntersecting', 'intersectionRatio', 'target'])
+    accessor(IntersectionObserverEntry.prototype, k, function () { return this._e[k]; });
+
+// ResizeObserver / IntersectionObserver. The shell wakes observersCheck() whenever a layout finished, the page scrolled or the
+// viewport changed (W.obsActive tells it there is something to measure), so targets are re-measured like a browser's
+// "update the rendering" step: resize observations first, then intersections.
+const RO_LIST = [];
+const IO_LIST = [];
+function obsSync() { W.obsActive(RO_LIST.length + IO_LIST.length > 0); }
+function observersCheck() {
+    let ran = false;
+    for (const o of RO_LIST.slice()) if (o._check()) ran = true;
+    for (const o of IO_LIST.slice()) if (o._check()) ran = true;
+    return ran;
+}
+const pxOf = v => { const f = parseFloat(v); return f === f ? f : 0; };
+
 class ResizeObserver {
-    constructor(cb) { hidden(this, '_cb', cb); hidden(this, '_els', []); }
-    observe(el) {
-        this._els.push(el);
-        setTimeout(() => {
-            if (!this._els.includes(el)) return;
-            const r = rectOf(el);
-            const box = [{ inlineSize: r.width, blockSize: r.height }];
-            try { this._cb([{ target: el, contentRect: r, borderBoxSize: box, contentBoxSize: box, devicePixelContentBoxSize: box }], this); }
-            catch (e) { report(e, 'ResizeObserver callback'); }
-        }, 0);
+    constructor(cb) {
+        if (typeof cb !== 'function') throw new TypeError("Failed to construct 'ResizeObserver': The callback provided as parameter 1 is not a function.");
+        hidden(this, '_cb', cb); hidden(this, '_t', []);
     }
-    unobserve(el) { const i = this._els.indexOf(el); if (i >= 0) this._els.splice(i, 1); }
-    disconnect() { this._els.length = 0; }
+    observe(el) {
+        if (this._t.some(t => t.el === el)) return;
+        this._t.push({ el, w: 0, h: 0 });                 // the size last reported starts at 0x0: an element that has a size is reported once
+        if (RO_LIST.indexOf(this) < 0) { RO_LIST.push(this); obsSync(); }
+    }
+    unobserve(el) {
+        const i = this._t.findIndex(t => t.el === el);
+        if (i >= 0) this._t.splice(i, 1);
+        if (!this._t.length) this.disconnect();
+    }
+    disconnect() { this._t.length = 0; const i = RO_LIST.indexOf(this); if (i >= 0) { RO_LIST.splice(i, 1); obsSync(); } }
+    _check() {
+        const entries = [];
+        for (const t of this._t) {
+            const r = rectOf(t.el);
+            let cw = r.width, ch = r.height, pl = 0, pt = 0;
+            if (r.width > 0 || r.height > 0) {                  // the content box: the border box minus padding and border
+                const cs = getComputedStyle(t.el);
+                pl = pxOf(cs.paddingLeft) + pxOf(cs.borderLeftWidth); pt = pxOf(cs.paddingTop) + pxOf(cs.borderTopWidth);
+                cw = Math.max(0, r.width - pl - pxOf(cs.paddingRight) - pxOf(cs.borderRightWidth));
+                ch = Math.max(0, r.height - pt - pxOf(cs.paddingBottom) - pxOf(cs.borderBottomWidth));
+            }
+            if (cw === t.w && ch === t.h) continue;
+            t.w = cw; t.h = ch;
+            const cbox = [{ inlineSize: cw, blockSize: ch }], bbox = [{ inlineSize: r.width, blockSize: r.height }];
+            entries.push({ target: t.el, contentRect: new DOMRect(pl, pt, cw, ch), borderBoxSize: bbox, contentBoxSize: cbox, devicePixelContentBoxSize: cbox });
+        }
+        if (!entries.length) return false;
+        try { this._cb(entries, this); } catch (e) { report(e, 'ResizeObserver callback'); }
+        return true;
+    }
+}
+
+class IntersectionObserver {
+    constructor(cb, opts) {
+        if (typeof cb !== 'function') throw new TypeError("Failed to construct 'IntersectionObserver': The callback provided as parameter 1 is not a function.");
+        opts = opts || {};
+        hidden(this, '_cb', cb); hidden(this, '_t', []); hidden(this, '_q', []);
+        this.root = opts.root || null;
+        this.rootMargin = opts.rootMargin === undefined ? '0px 0px 0px 0px' : String(opts.rootMargin);
+        const th = opts.threshold === undefined ? [0] : Array.isArray(opts.threshold) ? opts.threshold.map(Number) : [Number(opts.threshold)];
+        this.thresholds = th.length ? th.sort((a, b) => a - b) : [0];
+        const m = this.rootMargin.trim().split(/\s+/).map(pxOf);       // top right bottom left (px only; % is treated as 0)
+        hidden(this, '_m', m.length === 1 ? [m[0], m[0], m[0], m[0]] : m.length === 2 ? [m[0], m[1], m[0], m[1]] : m.length === 3 ? [m[0], m[1], m[2], m[1]] : m.slice(0, 4));
+    }
+    observe(el) {
+        if (this._t.some(t => t.el === el)) return;
+        this._t.push({ el, idx: -2, inter: false });      // -2: nothing reported yet (the first observation is always delivered)
+        if (IO_LIST.indexOf(this) < 0) { IO_LIST.push(this); obsSync(); }
+    }
+    unobserve(el) {
+        const i = this._t.findIndex(t => t.el === el);
+        if (i >= 0) this._t.splice(i, 1);
+        if (!this._t.length) this.disconnect();
+    }
+    disconnect() { this._t.length = 0; const i = IO_LIST.indexOf(this); if (i >= 0) { IO_LIST.splice(i, 1); obsSync(); } }
+    takeRecords() { return this._q.splice(0); }
+    _check() {
+        const v = W.view();
+        let rx = 0, ry = 0, rw = v[0], rh = v[1];
+        if (this.root && this.root.getBoundingClientRect) { const rr = rectOf(this.root); rx = rr.x; ry = rr.y; rw = rr.width; rh = rr.height; }
+        const m = this._m;
+        const bx = rx - m[3], by = ry - m[0], bw = rw + m[1] + m[3], bh = rh + m[0] + m[2];       // the root rectangle grown by rootMargin
+        const entries = [];
+        for (const t of this._t) {
+            const has = W.rect(t.el) !== null;               // no box (display:none, detached) = never intersecting
+            const r = has ? rectOf(t.el) : new DOMRect(0, 0, 0, 0);
+            const x0 = Math.max(r.x, bx), y0 = Math.max(r.y, by), x1 = Math.min(r.x + r.width, bx + bw), y1 = Math.min(r.y + r.height, by + bh);
+            const inter = has && x0 <= x1 && y0 <= y1;       // touching edges counts, as in the spec
+            const area = r.width * r.height;
+            const ratio = !inter ? 0 : area > 0 ? Math.min(1, ((x1 - x0) * (y1 - y0)) / area) : 1;
+            let idx = -1;
+            if (inter) { idx = 0; for (let i = 0; i < this.thresholds.length; i++) if (ratio >= this.thresholds[i]) idx = i + 1; }
+            if (idx === t.idx && inter === t.inter) continue;
+            t.idx = idx; t.inter = inter;
+            entries.push(new IntersectionObserverEntry({ target: t.el, isIntersecting: inter, intersectionRatio: ratio, boundingClientRect: r,
+                intersectionRect: inter ? new DOMRect(x0, y0, Math.max(0, x1 - x0), Math.max(0, y1 - y0)) : new DOMRect(0, 0, 0, 0),
+                rootBounds: new DOMRect(rx, ry, rw, rh), time: W.now() }));
+        }
+        if (!entries.length) return false;
+        try { this._cb(entries, this); } catch (e) { report(e, 'IntersectionObserver callback'); }
+        return true;
+    }
 }
 
 // ---------------------------------------------------------------- URL
@@ -3969,7 +4044,7 @@ const win = {
     CanvasRenderingContext2D, CanvasGradient, CanvasPattern, ImageData, Path2D, OffscreenCanvas, ImageBitmap, createImageBitmap, DOMMatrix, DOMMatrixReadOnly,
     DOMPoint, DOMPointReadOnly, TextMetrics,
     MediaSource, SourceBuffer, SourceBufferList, TimeRanges, MediaError, ReadableStream, ReadableStreamDefaultReader,
-    XMLHttpRequest, TextEncoder, TextDecoder, Storage, MutationObserver, MutationRecord, IntersectionObserver, ResizeObserver,
+    XMLHttpRequest, TextEncoder, TextDecoder, Storage, MutationObserver, MutationRecord, IntersectionObserver, IntersectionObserverEntry, ResizeObserver,
     CustomElementRegistry, MediaQueryList, PerformanceObserver, Range, TreeWalker, NodeIterator: TreeWalker, NodeFilter,
     DOMParser, XMLSerializer, FontFace, BroadcastChannel, MessageChannel, WebSocket,
     CSSStyleSheet, StyleSheet, CSSRule, Window, Navigator: function Navigator() { illegal(); },
@@ -4332,5 +4407,5 @@ function activate(el) {
 
 // hide the natives; freeze what pages must not break
 return { dispatch, uiEvent, onFetch, nextDue, runDue, runFrame, fireDCL, fireLoad, setReady, scriptEvent, imageEvent,
-         protoFor, report, moChildList, ceConnect, ceUpgradeTree, dispatchClick };
+         protoFor, report, moChildList, ceConnect, ceUpgradeTree, dispatchClick, observersCheck };
 })

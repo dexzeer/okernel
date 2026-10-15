@@ -659,6 +659,11 @@ NATIVE(n_rect) {
     ojs_set_index(ctx, a, 3, ojs_int(h));
     return a;
 }
+NATIVE(n_obs_active) {          // W.obsActive(bool): the page has observer targets, so layout/scroll changes wake the script side
+    struct wjs* js = JSX(ctx); UNUSED_THIS;
+    js->obs_active = argc > 0 && ojs_to_bool(ctx, argv[0]);
+    return OJS_UNDEFINED;
+}
 NATIVE(n_view) {
     struct wjs* js = JSX(ctx); UNUSED_THIS; (void)argc; (void)argv;
     int vw, vh, sy, dw, dh;
@@ -966,6 +971,7 @@ static const struct ojs_func_entry dom_funcs[] = {
     { "byTag", n_by_tag, 2 },
     { "rect", n_rect, 1 },
     { "view", n_view, 0 },
+    { "obsActive", n_obs_active, 1 },
     { "scroll", n_scroll, 1 },
     { "hit", n_hit, 2 },
     { "cstyle", n_cstyle, 1 },

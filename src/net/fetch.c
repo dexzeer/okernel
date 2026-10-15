@@ -675,7 +675,8 @@ static int slot_assign(int si) {
         struct fconn* c = &conns[i];
         if (c->st == CN_FREE) { if (free_i < 0) free_i = i; continue; }
         if (conn_matches(c, s)) per_host++;
-        else if (c->st == CN_IDLE && (idle_other < 0 || (int32_t)(c->t0 - conns[idle_other].t0) < 0))
+        else if ((c->st == CN_IDLE || (c->st == CN_H2 && c->h2 && h2_active(c->h2) == 0)) &&      // an HTTP/2 session with no stream open is idle too
+                 (idle_other < 0 || (int32_t)(c->t0 - conns[idle_other].t0) < 0))
             idle_other = i;
     }
     if (per_host >= CONN_PER_HOST) return 0;

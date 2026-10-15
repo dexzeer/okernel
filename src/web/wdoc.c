@@ -53,6 +53,7 @@ struct wdoc {
     struct wlayout* L;
     int vw, vh;
     int style_dirty, layout_dirty;
+    uint32_t layout_epoch;  // counts finished layouts (script observers re-measure when it moves)
     struct wres* res;
     int nres, capres;
     struct wdimg* img;
@@ -806,6 +807,7 @@ int wdoc_update(struct wdoc* d) {
     int t2 = wjs_now();
     if (d->L) wlay_free(d->L);
     d->L = wlay_run(d->d, d->ss, d->vw, d->vh, &d->li);
+    d->layout_epoch++;
     int t3 = wjs_now();
     if (t3 - t0 >= 100)
         w_log("[wdoc] update %dms: sheets%s %dms, style%s %dms, layout %dms (%d nodes)\n", t3 - t0, rebuilt ? " REBUILT" : "", t1 - t0,
@@ -1011,22 +1013,30 @@ int wdoc_res_request(struct wdoc* d, const char* url, const char* method, const 
 // Layout for a script's query: relayout when stale, but not more often than
 // ~4x the cost of a layout pass (scripts that interleave writes and reads
 // would otherwise spend all their time in layout).
-static int script_layout(struct wdoc* d) {
+// A layout for a script that asks (getBoundingClientRect, clientWidth...). `force` skips the rate limit: a script that measures
+// an element the old layout never saw (created since) must get a real answer, not 0 - YouTube's grid reads clientWidth right
+// after it stamps its elements and gives up on an empty answer.
+static int script_layout_ex(struct wdoc* d, int force) {
     if (!d->styles_dirty && !d->images_dirty && !d->style_dirty && !d->layout_dirty && d->L) return d->L != 0;
     int now = wjs_now();
     int gap = d->last_layout_ms * 4;
     if (gap < 100) gap = 100;
-    if (d->L && now - d->last_forced_ms < gap) return 1;
+    if (!force && d->L && now - d->last_forced_ms < gap) return 1;
     wdoc_update(d);
     d->last_forced_ms = wjs_now();
     d->last_layout_ms = d->last_forced_ms - now;
     return d->L != 0;
 }
 
+static int script_layout(struct wdoc* d) { return script_layout_ex(d, 0); }
+
 int wdoc_layout_rect(struct wdoc* d, int node, int* x, int* y, int* w, int* h) {
     if (!script_layout(d)) return 0;
     int32_t X, Y, W, H;
-    if (!wlay_node_rect(d->L, node, &X, &Y, &W, &H)) return 0;
+    if (!wlay_node_rect(d->L, node, &X, &Y, &W, &H)) {
+        // a node made after the layout we were allowed to reuse has no box yet: measure for real
+        if (wlay_knows_node(d->L, node) || !script_layout_ex(d, 1) || !wlay_node_rect(d->L, node, &X, &Y, &W, &H)) return 0;
+    }
     *x = LU_FLOOR(X); *y = LU_FLOOR(Y); *w = LU_ROUND(W); *h = LU_ROUND(H);
     return 1;
 }
@@ -1035,6 +1045,8 @@ const struct wstyle* wdoc_style_of(struct wdoc* d, int node) {
     script_layout(d);
     return d->ss ? css_style_of(d->ss, node) : 0;
 }
+
+uint32_t wdoc_layout_epoch(struct wdoc* d) { return d->layout_epoch; }
 
 void wdoc_viewport_get(struct wdoc* d, int* vw, int* vh, int* scroll, int* docw, int* doch) {
     *vw = d->vw;

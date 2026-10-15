@@ -26,6 +26,7 @@ int  wdoc_layout_rect(struct wdoc* d, int node, int* x, int* y, int* w, int* h);
 const struct wstyle* wdoc_style_of(struct wdoc* d, int node);
 struct wstyleset* wdoc_styleset(struct wdoc* d);
 void wdoc_viewport_get(struct wdoc* d, int* vw, int* vh, int* scroll, int* docw, int* doch);
+uint32_t wdoc_layout_epoch(struct wdoc* d);   // moves with every finished layout
 // <img> natural size + state (0 loading, 1 ok, 2 failed); 0 if no image
 int  wdoc_img_info(struct wdoc* d, int node, int* w, int* h, int* state);
 int  wdoc_img_node_slot(struct wdoc* d, int node);

@@ -100,6 +100,7 @@ const char* wlay_text(const struct wlayout* L);
 int  wlay_hits(const struct wlayout* L, const struct dhit** hits);
 // Box of a DOM element (absolute border box, LU); 0 if not rendered.
 int  wlay_node_rect(const struct wlayout* L, int node, int32_t* x, int32_t* y, int32_t* w, int32_t* h);
+int  wlay_knows_node(const struct wlayout* L, int node);     // 1 if the node existed when this layout was made
 // Stats for diagnostics.
 void wlay_stats(const struct wlayout* L, int* boxes, int* items, int* lines);
 

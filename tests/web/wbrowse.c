@@ -277,7 +277,7 @@ again:
         if (js) {
             double tr = now_ms();
             int f = wjs_run(js, 500);
-            (void)f;
+            if (f & WJS_DIRTY) wdoc_update(d);        // the shell re-renders after script changes (observers measure the new layout)
             js_runs++;
             if (getenv("WB_TRACE") && now_ms() - tr > 50) printf("[trace] wjs_run %.0fms flags=%x\n", now_ms() - tr, f);
             char nav[2048];
@@ -302,6 +302,10 @@ again:
     }
     double t2 = now_ms();
     if (js && getenv("WB_EVAL")) { int el; char* es = slurp(getenv("WB_EVAL"), &el); if (es) { es = realloc(es, (size_t)el + 1); es[el] = 0; wjs_debug_eval(js, es); free(es); } }   // WB_EVAL=file.js: run in the page after the load
+    if (js && getenv("WB_EVAL") && getenv("WB_EVAL_WAIT")) {      // WB_EVAL_WAIT=ms: keep the timers running afterwards (what the snippet scheduled)
+        double until = now_ms() + atof(getenv("WB_EVAL_WAIT"));
+        while (now_ms() < until) { wjs_run(js, 500); usleep(5000); }
+    }
     wdoc_update(d);
     if (getenv("WB_RESTYLE")) {                // WB_RESTYLE=N: restyle + relayout the loaded page N times (profiling the cascade)
         int n = atoi(getenv("WB_RESTYLE"));
