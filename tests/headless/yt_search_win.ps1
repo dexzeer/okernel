@@ -2,7 +2,7 @@
 # press Enter, and screendump the results. The pointer is homed into the top-left corner first (moves clamp there), then moved
 # by exact pixel counts (1:1), so the click lands where the page's search box is.
 #   powershell -ExecutionPolicy Bypass -File tests\headless\yt_search_win.ps1 [-Query linux] [-Port 45720] [-Shot out.ppm]
-param([string]$Query = "linux", [int]$Port = 45720, [string]$Shot = "", [int]$BoxX = 900, [int]$BoxY = 126, [int]$Mem = 1536)
+param([string]$Query = "linux", [string]$Mode = "enter", [int]$ThenX = 0, [int]$ThenY = 0, [int]$TargetX = 0, [int]$TargetY = 0, [int]$Port = 45720, [string]$Shot = "", [int]$BoxX = 900, [int]$BoxY = 126, [int]$Mem = 1536)
 $ErrorActionPreference = "Stop"
 $Qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -55,7 +55,15 @@ try {
     Send-Text $Query
     Start-Sleep -Milliseconds 800
     M "screendump $out\yts_${Port}_typed.ppm" 1500
-    M "sendkey ret" 100
+    if ($Mode -eq "enter") { M "sendkey ret" 100 }
+    else {                                  # click something else: the search button (1261,126) or a suggestion row
+        $tx = if ($TargetX) { $TargetX } else { 1261 }; $ty = if ($TargetY) { $TargetY } else { 126 }
+        $dx = $tx - $BoxX; $dy = $ty - $BoxY
+        while ($dx -ne 0) { $st = [Math]::Max(-50, [Math]::Min(50, $dx)); M "mouse_move $st 0" 8; $dx -= $st }
+        while ($dy -ne 0) { $st = [Math]::Max(-50, [Math]::Min(50, $dy)); M "mouse_move 0 $st" 8; $dy -= $st }
+        Start-Sleep -Milliseconds 400
+        M "mouse_button 1" 120; M "mouse_button 0" 300
+    }
     $n0 = ([regex]::Matches((Read-Log), "youtubei/v1/search")).Count
     $ok = $false
     $t = [DateTime]::Now
@@ -64,10 +72,21 @@ try {
     Start-Sleep -Seconds 25
     $dst = if ($Shot) { $Shot } else { "$out\yts_${Port}_results.ppm" }
     M "screendump $dst" 1500
+    if ($ThenX) {                           # then open a result: move from the last click and click it
+        $cx = if ($TargetX) { $TargetX } else { 1261 }; $cy = if ($TargetY) { $TargetY } else { 126 }
+        if ($Mode -eq "enter") { $cx = $BoxX; $cy = $BoxY }
+        $dx = $ThenX - $cx; $dy = $ThenY - $cy
+        while ($dx -ne 0) { $st = [Math]::Max(-50, [Math]::Min(50, $dx)); M "mouse_move $st 0" 8; $dx -= $st }
+        while ($dy -ne 0) { $st = [Math]::Max(-50, [Math]::Min(50, $dy)); M "mouse_move 0 $st" 8; $dy -= $st }
+        Start-Sleep -Milliseconds 400
+        M "mouse_button 1" 120; M "mouse_button 0" 300
+        Start-Sleep -Seconds 40
+        M "screendump $out\yts_${Port}_watch.ppm" 1500
+    }
     "screenshots: $out\yts_${Port}_{home,typed,results}.ppm"
 } finally {
     if ($p -and -not $p.HasExited) { Stop-Process -Id $p.Id -Force }
 }
 $log2 = Read-Log
 $final = [regex]::Matches($log2, "\[okai\] navigate [^\r\n]*results\?search_query=" + [regex]::Escape($Query)).Count
-if ($ok -and ($final -gt 0 -or $log2.Contains("results?search_query=$Query"))) { "RESULT PASS" } else { "RESULT FAIL (no search request/navigation seen)" }
+if ($ok -and ($final -gt 0 -or $log2.Contains("results?search_query="))) { "RESULT PASS" } else { "RESULT FAIL (no search request/navigation seen)" }

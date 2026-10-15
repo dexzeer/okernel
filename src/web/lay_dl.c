@@ -479,6 +479,7 @@ static void emit_atomic_or_block(struct wlayout* L, int bi) {
     if (b->flags & BF_FIXED) L->fixed_ctx = 1;
     if (s && s->opacity < 255) L->alpha = (uint8_t)((L->alpha * s->opacity + 127) / 255);
     if (L->alpha == 0) { L->alpha = saved_alpha; L->fixed_ctx = saved_fixed; return; }
+    if (L->rank && bi < L->nrank) L->rank[bi] = ++L->rank_n;       // paint order, for hit testing
     emit_bg_border(L, bi);
     b = &L->b[bi];
     if (b->flags & BF_MARKER) emit_marker(L, bi);
@@ -576,6 +577,11 @@ static void emit_layer(struct wlayout* L, int bi, int depth) {
 }
 
 void lay_emit(struct wlayout* L) {
+    w_free(L->rank);
+    L->nrank = L->nb;
+    L->rank_n = 0;
+    L->rank = (int32_t*)w_malloc((size_t)(L->nb + 1) * sizeof(int32_t));
+    if (L->rank) memset(L->rank, 0, (size_t)(L->nb + 1) * sizeof(int32_t));
     L->ndi = 0;
     L->alpha = 255;
     L->fixed_ctx = 0;
