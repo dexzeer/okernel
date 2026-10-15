@@ -11,5 +11,10 @@ html{--paper-dialog-background-color:var(--t1)} html{--t1:rgb(0, 128, 0)}
 const want = { x1: 'rgb(255, 0, 0)', x2: 'rgb(0, 0, 255)', x3: 'rgb(255, 0, 0)', x4: 'rgb(255, 0, 0)', x5: 'rgb(255, 0, 0)', x6: 'rgb(255, 0, 0)', x7: 'rgb(0, 128, 0)', x9: 'rgb(1, 2, 3)' };
 const bad = [];
 for (const k in want) { const got = getComputedStyle(document.getElementById(k)).backgroundColor; if (got !== want[k]) bad.push(k + ': ' + got); }
+// scripts read custom properties through getComputedStyle (YouTube sizes its player from them)
+{ const cs = getComputedStyle(document.documentElement), x = getComputedStyle(document.getElementById('x1'));
+  if (cs.getPropertyValue('--b') !== 'rgb(255, 0, 0)') bad.push('getPropertyValue(--b): [' + cs.getPropertyValue('--b') + ']');
+  if (x.getPropertyValue('--a') !== 'rgb(255, 0, 0)') bad.push('inherited --a: [' + x.getPropertyValue('--a') + ']');
+  if (x.getPropertyValue('--nothing') !== '') bad.push('unset must be empty'); }
 console.log('RESULT ' + (bad.length ? 'FAIL ' + bad.join(' | ') : 'ALLPASS'));
 </script></body></html>
