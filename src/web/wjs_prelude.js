@@ -1359,6 +1359,42 @@ function mediaDecorative(el) {
     if (/^blob:/i.test(W.getAttr(el, 'src') || '')) return false;     // MediaSource players need their events either way
     return !userActivated && W.slow() >= 3 && (W.getAttr(el, 'autoplay') !== null || W.getAttr(el, 'muted') !== null || el.muted);
 }
+// A plain <video src> / <audio src> is read in ranges instead of one fetch(): a long video is far bigger than the 8 MB response
+// limit, and playback must not wait for the last byte. Chunks (Range requests) are appended as they arrive and the next one is
+// only asked for while less than MEDIA_AHEAD_S seconds are buffered ahead of the playhead. A server that ignores Range sends
+// the whole file in the first answer, which is then the one and only chunk.
+const MEDIA_CHUNK = 2 * 1024 * 1024, MEDIA_AHEAD_S = 45;
+function mediaStream(el, s, gen, src, sb) {
+    const chunk = typeof G.__mediaChunk === 'number' && G.__mediaChunk > 0 ? G.__mediaChunk : MEDIA_CHUNK;   // (tests make it small)
+    let pos = 0, total = -1;
+    const finish = () => { W.mediaEos(s.id); s.netState = 1; fire(el, 'progress'); fire(el, 'suspend'); mediaApplyState(el, s); };
+    const fail = e => { if (s.gen === gen) mediaFail(el, s, 2, 'network error: ' + (e && e.message)); };
+    const step = () => {
+        if (s.gen !== gen) return;
+        if (pos > 0) {                                  // do not run far ahead of what is being played
+            const b = W.mediaBuffered(s.id, sb), t = W.mediaState(s.id)[0];
+            if ((b.length ? b[b.length - 1] : 0) - t > MEDIA_AHEAD_S) { s.netState = 1; setTimeout(step, 500); return; }
+        }
+        s.netState = 2;
+        fetch(src, { headers: { Range: 'bytes=' + pos + '-' + (pos + chunk - 1) } }).then(r => {
+            if (r.status === 416 && pos > 0) return { end: true };
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            const cr = /\/(\d+)\s*$/.exec(r.headers.get('content-range') || '');
+            if (cr) total = +cr[1];
+            return r.arrayBuffer().then(buf => ({ buf, partial: r.status === 206 }));
+        }).then(o => {
+            if (s.gen !== gen) return;
+            if (o.end) { finish(); return; }
+            if (W.mediaAppend(s.id, sb, o.buf) < 0) { mediaFail(el, s, 4, 'DEMUXER_ERROR_COULD_NOT_OPEN: not a playable WebM/MP4 file (Opus, AAC, VP9, H.264)'); return; }
+            pos += o.buf.byteLength;
+            fire(el, 'progress');
+            mediaApplyState(el, s);
+            if (!o.partial || o.buf.byteLength === 0 || (total >= 0 && pos >= total)) { finish(); return; }
+            setTimeout(step, 0);
+        }).catch(fail);
+    };
+    step();
+}
 function mediaLoad(el) {
     const s = mst(el);
     if (mediaDecorative(el)) { s.deferred = true; mlog('load deferred until user activation: ' + (W.getAttr(el, 'src') || '(sources)')); return; }
@@ -1397,21 +1433,7 @@ function mediaLoad(el) {
     }
     if (!mediaSession(el, s)) { mediaFail(el, s, 4, 'no media session available'); return; }
     const sb = W.mediaAddSb(s.id, 3);
-    fetch(src).then(r => {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        return r.arrayBuffer();
-    }).then(buf => {
-        if (s.gen !== gen) return;
-        if (W.mediaAppend(s.id, sb, buf) < 0) { mediaFail(el, s, 4, 'DEMUXER_ERROR_COULD_NOT_OPEN: not a playable WebM/MP4 file (Opus, AAC, VP9, H.264)'); return; }
-        W.mediaEos(s.id);
-        s.netState = 1;
-        fire(el, 'progress');
-        fire(el, 'suspend');
-        mediaApplyState(el, s);
-    }, e => {
-        if (s.gen !== gen) return;
-        mediaFail(el, s, 2, 'network error: ' + (e && e.message));
-    });
+    mediaStream(el, s, gen, src, sb);
     if (W.getAttr(el, 'autoplay') !== null) setTimeout(() => { if (s.gen === gen && s.paused) el.play().catch(() => {}); }, 0);
 }
 // engine state -> events
