@@ -1,0 +1,26 @@
+<!doctype html><html><body><script>
+// Polymer's microtask scheduler flips a detached text node watched by a MutationObserver (characterData); without delivery every
+// debounced render (YouTube's ps-dom-if) waits forever.
+const out = [];
+const n = document.createTextNode('');
+let fired = 0;
+new MutationObserver(() => { fired++; }).observe(n, { characterData: true });
+n.textContent = '1';
+Promise.resolve().then(() => {
+    out.push('after 1st change: ' + fired);
+    n.data = '2';
+    n.nodeValue = '3';
+    setTimeout(() => {
+        out.push('after more changes: ' + fired);
+        const t2 = document.createTextNode('x'); document.body.appendChild(t2);
+        let rec = null;
+        new MutationObserver((r) => { rec = r[0]; }).observe(document.body, { characterData: true, subtree: true });
+        t2.data = 'y';
+        Promise.resolve().then(() => {
+            out.push('subtree rec: ' + (rec ? rec.type + ' target-ok=' + (rec.target === t2) : 'none'));
+            const ok = fired >= 1 && rec && rec.type === 'characterData';
+            console.log('RESULT ' + (ok ? 'ALLPASS' : 'FAIL ' + out.join(' | ')));
+        });
+    }, 30);
+});
+</script></body></html>

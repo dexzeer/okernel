@@ -2,7 +2,7 @@
 # press Enter, and screendump the results. The pointer is homed into the top-left corner first (moves clamp there), then moved
 # by exact pixel counts (1:1), so the click lands where the page's search box is.
 #   powershell -ExecutionPolicy Bypass -File tests\headless\yt_search_win.ps1 [-Query linux] [-Port 45720] [-Shot out.ppm]
-param([string]$Query = "linux", [string]$Mode = "enter", [int]$ThenX = 0, [int]$ThenY = 0, [int]$TargetX = 0, [int]$TargetY = 0, [int]$Port = 45720, [string]$Shot = "", [int]$BoxX = 900, [int]$BoxY = 126, [int]$Mem = 1536)
+param([string]$Query = "linux", [string]$Mode = "enter", [int]$PreX = 0, [int]$PreY = 0, [int]$ThenX = 0, [int]$ThenY = 0, [int]$TargetX = 0, [int]$TargetY = 0, [int]$Port = 45720, [string]$Shot = "", [int]$BoxX = 900, [int]$BoxY = 126, [int]$Mem = 1536)
 $ErrorActionPreference = "Stop"
 $Qemu = "C:\Program Files\qemu\qemu-system-x86_64.exe"
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
@@ -46,6 +46,15 @@ try {
     while (([DateTime]::Now - $t).TotalSeconds -lt 60) { if ((Read-Log) -match "received \d+ bytes \(fonts\.gstatic\.com/s/i/") { break }; Start-Sleep -Milliseconds 500 }
     Start-Sleep -Seconds 8
     M "screendump $out\yts_${Port}_home.ppm" 1500
+    if ($PreX) {                            # first dismiss something (a cookie-consent dialog): click at screen ($PreX,$PreY)
+        for ($i = 0; $i -lt 30; $i++) { M "mouse_move -100 -100" 8 }
+        for ($x = 0; $x -lt $PreX; $x += 50) { M ("mouse_move " + [Math]::Min(50, $PreX - $x) + " 0") 8 }
+        for ($y = 0; $y -lt $PreY; $y += 50) { M ("mouse_move 0 " + [Math]::Min(50, $PreY - $y)) 8 }
+        Start-Sleep -Milliseconds 500
+        M "mouse_button 1" 120; M "mouse_button 0" 300
+        Start-Sleep -Seconds 20
+        M "screendump $out\yts_${Port}_pre.ppm" 1500
+    }
     # home the pointer, then go to the search box
     for ($i = 0; $i -lt 30; $i++) { M "mouse_move -100 -100" 8 }
     for ($x = 0; $x -lt $BoxX; $x += 50) { M "mouse_move 50 0" 8 }

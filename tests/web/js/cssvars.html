@@ -1,0 +1,15 @@
+<!doctype html><html><head><style>
+html{--a:var(--b);--b:rgb(255, 0, 0);--c:var(--d,rgb(0, 0, 255));--e:var(--a)}
+html:not(.zz){--f:var(--b)}
+.x1{background:var(--a)} .x2{background:var(--c)} .x3{background:var(--e)} .x4{background:var(--f)}
+.x5{background:var(--nope,var(--b))} .x6{--g:var(--b); background:var(--g)} .x7{background:var(--paper-dialog-background-color,var(--primary-background-color))}
+html{--paper-dialog-background-color:var(--t1)} html{--t1:rgb(0, 128, 0)}
+:root{--t9:initial;--t8:initial} :root{--t9:rgb(1, 2, 3)} html:not(.zz){--bg9:var(--t9)} :root[dark]{--t9:rgb(9, 9, 9)} .x9{background:var(--bg9)}
+</style></head><body>
+<div class="x1" id="x1">1</div><div class="x2" id="x2">2</div><div class="x3" id="x3">3</div><div class="x4" id="x4">4</div><div class="x5" id="x5">5</div><div class="x6" id="x6">6</div><div class="x7" id="x7">7</div><div class="x9" id="x9">9</div>
+<script>
+const want = { x1: 'rgb(255, 0, 0)', x2: 'rgb(0, 0, 255)', x3: 'rgb(255, 0, 0)', x4: 'rgb(255, 0, 0)', x5: 'rgb(255, 0, 0)', x6: 'rgb(255, 0, 0)', x7: 'rgb(0, 128, 0)', x9: 'rgb(1, 2, 3)' };
+const bad = [];
+for (const k in want) { const got = getComputedStyle(document.getElementById(k)).backgroundColor; if (got !== want[k]) bad.push(k + ': ' + got); }
+console.log('RESULT ' + (bad.length ? 'FAIL ' + bad.join(' | ') : 'ALLPASS'));
+</script></body></html>

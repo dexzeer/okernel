@@ -1,0 +1,35 @@
+<!doctype html><html><body>
+<template id="t"><x-card id="c"></x-card></template>
+<script>
+// document.importNode(template.content, true) upgrades the custom elements in the copy before it returns (Polymer stamps
+// templates this way and then assigns properties: they must reach the element's accessors, not become own properties).
+const bad = [];
+class XCard extends HTMLElement {
+    get label() { return this._l; }
+    set label(v) { this._l = 'seen:' + v; }
+}
+customElements.define('x-card', XCard);
+const f = document.importNode(document.getElementById('t').content, true);
+const c = f.firstElementChild;
+if (!(c instanceof XCard)) bad.push('not upgraded after importNode');
+c.label = 'a';
+if (c.hasOwnProperty('label') || c.label !== 'seen:a') bad.push('property went around the accessor: ' + c.label + ' own=' + c.hasOwnProperty('label'));
+// template content cloned inside the inert document is NOT upgraded
+const inert = document.getElementById('t').content.cloneNode(true).firstElementChild;
+if (inert instanceof XCard) bad.push('cloneNode of template content must stay inert');
+// z-index: a positioned z:auto parent does not trap its z-indexed child; text/comment mutation records are delivered
+const wrap = document.createElement('div');
+wrap.innerHTML = '<div style="position:absolute;left:0;top:300px;width:50px;height:50px;z-index:2;background:#00f" id="low"></div>' +
+    '<div style="position:absolute;left:0;top:0;width:10px;height:10px"><div style="position:absolute;left:0;top:300px;width:50px;height:50px;z-index:5;background:#0f0" id="high"></div></div>';
+document.body.appendChild(wrap);
+const at = document.elementFromPoint(20, 320);
+if (!at || at.id !== 'high') bad.push('z-index nesting: got ' + (at ? at.id : 'null'));
+let recs = 0;
+const txt = document.createTextNode('a');
+new MutationObserver(() => { recs++; }).observe(txt, { characterData: true });
+txt.data = 'b';
+setTimeout(() => {
+    if (recs < 1) bad.push('no characterData record');
+    console.log('RESULT ' + (bad.length ? 'FAIL ' + bad.join(' | ') : 'ALLPASS'));
+}, 20);
+</script></body></html>
