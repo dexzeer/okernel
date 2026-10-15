@@ -3662,6 +3662,11 @@ accessor(D, 'compatMode', function () { return W.quirks() ? 'BackCompat' : 'CSS1
 accessor(D, 'doctype', function () { return null; });
 accessor(D, 'visibilityState', function () { return 'visible'; });
 accessor(D, 'hidden', function () { return false; });
+// document.all is the legacy "falsy object": `if (document.all)` is false and `undefined === document.all` is false. Pages
+// (YouTube's polymer-resin sanitizer: `value || value === document.all`) compare values with it, so it must not be undefined:
+// that turned every `undefined` binding into the string "zClosurez" (hidden="zClosurez": the search results stayed hidden).
+// NaN is falsy and equals nothing, which is all those checks need.
+accessor(D, 'all', function () { return NaN; });
 accessor(D, 'currentScript', function () { return W.currentScript(); });
 accessor(D, 'scripts', function () { return htmlCollection(W.query(document, 'script', true)); });
 accessor(D, 'images', function () { return htmlCollection(W.query(document, 'img', true)); });
