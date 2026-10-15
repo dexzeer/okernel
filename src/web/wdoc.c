@@ -824,6 +824,18 @@ const char* wdoc_title(struct wdoc* d) { return d->d ? d->d->title : ""; }
 const char* wdoc_url(struct wdoc* d) { return d->url; }
 struct wdom* wdoc_dom(struct wdoc* d) { return d->d; }
 
+// Paint into the clip of s from the layout that is there, WITHOUT bringing it up to date: a video frame is drawn into the
+// picture the last render made (its layout still matches what is on screen); the next render repaints everything.
+void wdoc_paint_stale(struct wdoc* d, struct wsurf* s, int scroll_y) {
+    if (!d->L) return;
+    d->scroll_y = scroll_y;
+    d->env.ss = d->ss;
+    d->env.d = d->d;
+    d->env.image = paint_img;
+    d->env.ctx = d;
+    wpaint(d->L, s, scroll_y, &d->env);
+}
+
 void wdoc_paint(struct wdoc* d, struct wsurf* s, int scroll_y) {
     d->scroll_y = scroll_y;
     wdoc_update(d);
@@ -1109,8 +1121,7 @@ int wdoc_video_dest(struct wdoc* d, int node, int* x, int* y, int* w, int* h, in
     if (!d->d || node < 0 || node >= d->node_img_cap || !d->node_img) return 0;
     int slot = d->node_img[node];
     if (slot < 0 || !d->img[slot].ext) return 0;
-    wdoc_update(d);
-    if (!d->L) return 0;
+    if (!d->L) return 0;           // the layout that exists: a stale position is fine (the next render fixes it), a forced relayout per video frame is not
     const struct ditem* it;
     int n = wlay_items(d->L, &it);
     for (int i = 0; i < n; i++) {

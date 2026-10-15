@@ -240,6 +240,15 @@ int wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout) {
         meng_set_governor(wjs_host.budget_scale >= 2);
         int t_poll = wjs_now();
         meng_poll(s->m);
+        {                                                        // once a second: the frame rate actually reaching the screen
+            static uint32_t last_ms, last_shown, last_dropped;
+            uint32_t nowms = (uint32_t)wjs_now();
+            if (nowms - last_ms >= 1000) {
+                uint32_t sh = meng_frames_shown(s->m), dr = meng_frames_dropped(s->m);
+                if (last_ms && (sh != last_shown || dr != last_dropped)) w_log("[media] rate: %u shown/s, %u dropped/s (session %d)\n", sh - last_shown, dr - last_dropped, i);
+                last_ms = nowms; last_shown = sh; last_dropped = dr;
+            }
+        }
         if (wjs_now() - t_poll >= 20) {                          // a slow pass: say what the session was doing
             static int nslow;
             if (nslow++ < 200) {

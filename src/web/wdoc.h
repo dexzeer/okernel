@@ -47,6 +47,7 @@ int  wdoc_update(struct wdoc* d);
 int  wdoc_height(struct wdoc* d);        // document height px
 int  wdoc_width(struct wdoc* d);
 void wdoc_paint(struct wdoc* d, struct wsurf* s, int scroll_y);
+void wdoc_paint_stale(struct wdoc* d, struct wsurf* s, int scroll_y);   // from the existing layout, never relayouts (video frames)
 // Hit test at viewport (x, y) with the given scroll. Returns kind.
 int  wdoc_hit(struct wdoc* d, int x, int y, int scroll_y, struct wdoc_hit* out);
 const char* wdoc_title(struct wdoc* d);
