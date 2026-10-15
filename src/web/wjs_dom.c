@@ -825,7 +825,17 @@ NATIVE(n_cstyle) {
     return o;
 }
 
-NATIVE(n_css_var) { (void)ctx; UNUSED_THIS; (void)argc; (void)argv; return ojs_string(ctx, ""); }
+NATIVE(n_css_var) {             // W.cssVar(el, '--name'): the computed value of a custom property ('' if unset)
+    struct wjs* js = JSX(ctx); UNUSED_THIS; ARG_NODE(0, n);
+    if (js->d->n[n].type != WN_ELEM || !wdom_is_connected(js->d, n)) return ojs_string(ctx, "");
+    size_t nl;
+    const char* name = ojs_to_cstring(ctx, argc > 1 ? argv[1] : OJS_UNDEFINED, &nl);
+    if (!name) return OJS_EXCEPTION;
+    static char buf[2048];
+    int l = wdoc_custom_value(js->doc, n, name, (int)nl, buf, sizeof buf);
+    ojs_free_cstring(ctx, (char*)name);
+    return ojs_string_len(ctx, l > 0 ? buf : "", l > 0 ? l : 0);
+}
 
 NATIVE(n_img_size) {
     struct wjs* js = JSX(ctx); UNUSED_THIS; ARG_NODE(0, n);

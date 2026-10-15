@@ -1062,6 +1062,12 @@ int wdoc_layout_rect(struct wdoc* d, int node, int* x, int* y, int* w, int* h) {
     return 1;
 }
 
+int wdoc_custom_value(struct wdoc* d, int node, const char* name, int nl, char* out, int cap) {
+    script_layout(d);
+    if (!d->ss) return -1;
+    return css_custom_value(d->ss, css_style_of(d->ss, node), name, nl, out, cap);
+}
+
 const struct wstyle* wdoc_style_of(struct wdoc* d, int node) {
     script_layout(d);
     return d->ss ? css_style_of(d->ss, node) : 0;

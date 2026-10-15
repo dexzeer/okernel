@@ -1,0 +1,21 @@
+<!doctype html><html><head><style>
+html{--w:1280px;--r:1.5;--mh:56px}
+body{margin:0}
+.a{width:min(var(--w), 400px);height:10px}
+.b{width:min(var(--w), calc((100vh - var(--mh)) * 2));height:10px}
+.c{width:max(10px, calc(var(--r) * 100px));height:10px}
+.d{width:clamp(50px, 20vw, 90px);height:10px}
+.e{width:calc(var(--r) * 100px + 2 * 5px);height:10px}
+.f{width:calc(100vh - var(--mh));height:10px}
+.g{width:calc(var(--w) / 2 * 1);height:10px}
+.h{--m:min(var(--w), 300px); width:var(--m);height:10px}
+.i{--p:calc(100vh - var(--mh)); --q:min(500px, calc(var(--p) * 2)); width:var(--q);height:10px}
+</style></head><body>
+<div class="a" id="a"></div><div class="b" id="b"></div><div class="c" id="c"></div><div class="d" id="d"></div><div class="e" id="e"></div><div class="f" id="f"></div><div class="g" id="g"></div><div class="h" id="h"></div><div class="i" id="i"></div>
+<script>
+// vw=800, vh=600 in the test run
+const want = { a: 400, b: 1088, c: 150, d: 90, e: 160, f: 544, g: 640, h: 300, i: 500 };
+const bad = [];
+for (const k in want) { const w = Math.round(document.getElementById(k).getBoundingClientRect().width); if (w !== want[k]) bad.push(k + ': ' + w + ' (want ' + want[k] + ')'); }
+console.log('RESULT ' + (bad.length ? 'FAIL ' + bad.join(' | ') : 'ALLPASS'));
+</script></body></html>

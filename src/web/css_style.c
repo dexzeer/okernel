@@ -2710,6 +2710,19 @@ void css_compute_all(struct wstyleset* ss, int vw, int vh) {
     for (int i = 0; i < d->nn; i++) d->n[i].aux = ss->node_style[i];
 }
 
+int css_custom_value(const struct wstyleset* ss, const struct wstyle* s, const char* name, int nl, char* out, int cap) {
+    const struct wcvar* v = s ? var_find(s->vars, name, nl) : 0;
+    if (!v || v->vlen == 0) return -1;
+    const char* p = ss->strpool.p + v->val;
+    int n = (int)v->vlen;
+    while (n > 0 && (unsigned char)*p <= ' ') { p++; n--; }
+    while (n > 0 && (unsigned char)p[n - 1] <= ' ') n--;
+    if (n >= cap) n = cap - 1;
+    memcpy(out, p, (size_t)n);
+    out[n] = 0;
+    return n;
+}
+
 const struct wstyle* css_style_of(const struct wstyleset* ss, int node) {
     if (node < 0 || node >= ss->node_cap || node >= ss->d->nn) return 0;
     int32_t i = ss->node_style[node];

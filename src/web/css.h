@@ -207,6 +207,8 @@ int  css_collect_inline(struct wdom* d, char* out, int cap);
 // given viewport (px). Results are attached via wnode.aux (style index).
 void css_compute_all(struct wstyleset* ss, int viewport_w, int viewport_h);
 const struct wstyle* css_style_of(const struct wstyleset* ss, int node);
+// Computed value of the custom property `name` ("--x") on a computed style: copies it (trimmed) into out, returns its length or -1.
+int css_custom_value(const struct wstyleset* ss, const struct wstyle* s, const char* name, int nl, char* out, int cap);
 // Pseudo-element styles: 1 = ::before, 2 = ::after, 3 = ::marker. NULL if none.
 const struct wstyle* css_pseudo_of(const struct wstyleset* ss, int node, int which);
 // String pool access (content, grid templates, urls).
