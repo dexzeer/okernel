@@ -1,502 +1,105 @@
-# KAnarchy OS — Handoff Document (okernel kernel)
+# KAnarchy OS — Handoff
 
-## What is this?
+**KAnarchy OS** is a from-scratch OS in C and x86 assembly (no libc, no Linux, no third-party code except fonts). The kernel is **okernel** (also the repo folder), the desktop is **Scrawl**, the browser is **okai**. It runs in QEMU (WHPX/KVM), with an optional real-laptop build. Refreshed 2026-10-16.
 
-KAnarchy OS is a from-scratch operating system built in C and x86 assembly, powered by the okernel kernel. It has two modes:
+Read order: this file (orientation), `AGENTS.md` (the living rulebook: one bullet per finding, the traps are there), `LAPTOP.md` (real-laptop image), `tests/headless/TESTING.md` (test harness).
 
-- **Text mode** (`make text`) — VGA text terminal with commands, scrolling, terminal multiplexing
-- **Desktop mode** (`make desktop`) — 1920x1080x32bpp graphical desktop with windows, mouse, okai (browser), editor, shell, networking, and a TLS 1.3 client
+## Working agreements (the owner's, keep them)
 
-Current version: **v0.8** (desktop edition). Highlights since v0.7:
-- Real document rendering: a **DOM tree + from-scratch CSS cascade + display-list layout engine** (replaces the old flat token renderer for pages)
-- **External stylesheets are fetched and applied**; external `<script>` is fetched but **not executed** (see below)
-- High-half kernel, preemptive scheduler, ring-3 processes, VFS, PFS (persistent FS on ATA), full TLS 1.3 + PKI with adversarial hardening
+- **From scratch only.** No third-party code of any license. User-approved exceptions: fonts, Realtek's `rtw8821c_fw.bin` (runs on the chip), the AAC Huffman tables read out of FAAD2, CELT written from the RFC 6716 reference source.
+- **Do what was asked.** An unrequested `search` command made the owner angry. No extra features.
+- **QEMU first.** The real-laptop port is optional and later. Never suggest flashing the stick. Never write power/clock MSRs without the full voltage-id path (a bare PERF_CTL write froze the laptop).
+- **Test at normal speed** (WHPX/KVM), not throttled to the laptop.
+- **Honest identity.** No Chrome/Firefox claim, no client hints, no faked attestation. Consent dialogs are the user's to click.
+- **Done means** built, tested, working in QEMU, and not blowing kernel memory.
 
----
+## What exists
 
-## Project Structure
+| Area | State |
+|---|---|
+| Kernel | High-half at 0xC0100000, paging, preemptive kernel threads, ring-3 processes (fork/exec/ELF/pipes, syscalls 0-17), VFS + persistent FS on ATA (PFS), spinlocks, segregated-fit heap. |
+| SMP | ACPI/MADT, LAPIC/x2APIC, APs run only `smp_parallel_for` jobs (nothing else is reentrant). LAPIC one-shot timer lets the idle loop sleep during fetches. |
+| Display | Backbuffer with per-row damage spans, framebuffer cursor in the mouse IRQ, write-combining mapping, backends: GRUB framebuffer, virtio-gpu (hardware cursor). Runtime resolution from the bootloader. Intel i915: read-only `gpu` report only. SSE2 only in `simd.c`/`vp9_simd.c`. |
+| **Scrawl** (desktop) | Window manager (`window.c`: cell-grid or pixel-surface windows), cached AA taskbar (window buttons, FPS chip, clock), GNOME-style title bars, wallpaper JPEG, topmost-by-z click routing. No launcher: everything starts from the terminal (`Ctrl+Alt+T` opens another). |
+| Input | PS/2 keyboard (queued, dispatched from the main loop), PS/2 mouse with wheel, xHCI USB pointers (HID report parsing, USB2 hubs, hot-plug), I2C-HID touchpad (laptop), USB mass-storage stick log. |
+| Network | e1000 (polled), TCP socket table, DNS cache, DHCP, Wi-Fi RTL8821C (USB stick and the laptop's PCIe card; WPA2, `wifigui` window), TLS 1.3 + Mozilla root store + OCSP, HTTP/2, fetch engine (16 slots, keep-alive, cache, preload scanner, streaming `fetch()` bodies, dead-host fast-fail). |
+| Audio | Intel HD Audio output, polled, 48 kHz stereo; `audio_clock()` is the A/V master clock. |
+| **okai** (browser) | Firefox-style chrome (`okai_ui.c`), tabs, forms incl. POST, cookies, iframes (+ cross-frame `postMessage`), 8 KB URLs and big cookie jars. Engine in `src/web`: WHATWG parser, CSS cascade, block/inline/flex/grid/table layout, AA painter, TrueType, images, SVG, Canvas 2D, WebAssembly (V8-verified), Workers, IndexedDB, SubtleCrypto, streams, MSE. |
+| JS | **ojs**, our engine (`src/ojs`): ES2025, test262 ~98.9%, mark-sweep GC with conservative stack scan, x87 doubles. One realm per document. |
+| Media | Own decoders: VP9, H.264, Opus (CELT), AAC-LC; WebM/MP4 demux; `meng` playback engine under `<video>`/MSE and the `play` command. YouTube plays 25-50 s, then the attestation wall (below). |
+| Game | `dmccl` (the owner's language, rewritten in C) + 2D physics + "KAnarchy Wheels" (`game`). |
+| Text mode | Separate small VGA-text build (`make text`); also a framebuffer-text report kernel for UEFI laptops. |
+
+## Layout
+
+`boot/` asm entry, ISR, SMP trampoline · `src/` kernel (flat) · `src/net` NIC/TCP/fetch/h2 · `src/crypto` TLS+PKI · `src/web` web engine + prelude (`wjs_prelude.js`) · `src/ojs` JS engine · `src/media` codecs · `src/rtw` Wi-Fi · `src/dmccl`, `src/game` · `fonts/` · `firmware/` · `games/` levels · `userland/` ring-3 programs · `tools/` generators and laptop-stick scripts · `tests/` (host C tests, `tests/web`, `tests/media`, `tests/headless` QEMU suites). Per-file ownership table: AGENTS.md.
+
+## Build, run, test
 
 ```
-okernel/
-├── boot/
-│   ├── start.asm          # Low trampoline _start (paging off) + private boot GDT; jumps to _start_high
-│   ├── isr.asm            # ISR/IRQ stubs, GDT flush, INT 0x80 gate, enter_user_mode, context_switch
-│   └── user_test.asm      # Ring 3 test program (legacy; spawn_user path retired 2026-09-10)
-├── src/
-│   ├── kernel.c           # Text-mode entry (terminal-only build)
-│   ├── desktop.c          # Desktop entry + main loop + shell commands + fetch driver
-│   │
-│   ├── graphics.c/.h      # Framebuffer, font, primitives, dirty-row flush, clip rect
-│   ├── window.c/.h        # Window manager, PS/2 mouse driver, stateless cursor sprite
-│   ├── paging.c/.h        # High-half page tables, paging_map_user, user-range validation
-│   ├── memlayout.h        # KERNEL_VBASE/V2P/P2V_U32/IS_HIGH
-│   │
-│   ├── okai.c/.h          # Browser shell: tabs, URL bar state, fetch driver (okai_poll),
-│   │                      #   page surface, input routing, forms, error/home pages
-│   ├── okai_ui.c          # Browser chrome (Firefox-style): layout, AA icons/text, hit tests
-│   ├── web/               # Web engine (desktop-only; see "Browser (okai)" below)
-│   │   ├── wdoc.c/.h      # Document controller: load, sub-resource queue, update, paint, hit
-│   │   ├── wdom.c/.h      # Heap DOM (int32 links, attrs, text arena, atoms)
-│   │   ├── html5.c, charset.c, entities.h   # WHATWG tokenizer + tree builder, decoders
-│   │   ├── css_*.c, css.h, css_int.h        # CSS parse/select/cascade/computed values
-│   │   ├── lay_*.c, layout.h, lay_int.h     # Box tree, block/inline/float/abs, flex, grid, table, display list
-│   │   ├── paint.c, raster.c, surface.h     # Painter + AA rasterizer into a 32bpp surface
-│   │   ├── font.c, fontdata.asm             # TrueType engine + embedded Noto subsets (fonts/)
-│   │   ├── image.c, svg.c                   # PNG/JPEG/GIF/BMP + inflate/gzip, SVG renderer
-│   │   ├── wurl.c                           # RFC 3986 URL resolution
-│   │   └── callstack.asm                    # call_on_stack: engine runs on its own 1MB stack
-│   ├── textslot.c/.h      # Codepoint -> bitmap-font slot (editor/terminal; split from old html.c)
-│   ├── editor.c/.h        # Text editor (open/edit/save)
-│   ├── filesystem.c/.h    # In-memory VFS (write-through hooks to PFS)
-│   ├── pfs.c/.h           # OKPFS1 persistent FS on ATA (mount-or-format + hydrate)
-│   │
-│   ├── gdt.c/.h           # GDT + TSS (user segments, ring 3)
-│   ├── idt.c/.h           # IDT, PIC remap, IRQ dispatch, INT 0x80 gate, GP error decode
-│   ├── keyboard.c/.h      # PS/2 keyboard (scancode set 1)
-│   ├── mouse.c/.h         # PS/2 mouse (IntelliMouse 4-byte wheel negotiation)
-│   ├── process.c/.h       # Process table (16 slots), private PDs, esp0/ticks, handoff switch
-│   ├── sched.c/.h         # Slice accounting, sched_yield, sched_spawn_user, prepare/reap
-│   ├── syscall.c/.h       # INT 0x80 ABI 0-17 (print/exit/write/read/open/close/fork/exec/sbrk/
-│   │                      #   pipe/dup/wait/kill/mmap/munmap)
-│   ├── sys_proc.c/.h      # fd table over VFS + pipe rings, fork/exec, wait/kill/signals
-│   ├── elf.c/.h           # ET_EXEC/i386 ELF loader
-│   ├── spinlock.c/.h      # xchg spinlock + IRQ-safe variants + mutex (locktest selftest)
-│   ├── ata.c/.h           # Polling-PIO LBA28 primary-master disk
-│   │
-│   ├── memory.c/.h        # Physical page allocator (bitmap) + segregated-fit heap (kfree works)
-│   ├── serial.c/.h        # COM1 + serial_printf
-│   ├── string.c/.h        # Freestanding mem*/str* (used by crypto + JS)
-│   ├── rtc.c/.h           # CMOS real-time clock
-│   ├── userland_seed.c    # Embedded seed files (e.g. /bin/hello) for the VFS
-│   ├── io.h               # inb/outb/inw/outw
-│   │
-│   ├── vga.c/.h, terminal.c/.h, shell.c/.h   # Text-mode build only
-│   │
-│   ├── net/
-│   │   ├── pci.c/.h       # PCI enumeration
-│   │   ├── e1000.c/.h     # e1000 NIC (TX + RX)
-│   │   ├── rtl8139.c/.h   # RTL8139 (TX only; RX broken — unused)
-│   │   ├── network.c/.h   # ARP, IP, ICMP, UDP, TCP, DNS, HTTP (dechunk), TLS RX hook
-│   │   └── tls_net.c/.h   # Async HTTPS fetch wrapper (DNS+TCP+TLS), kernel_tcp_recv
-│   │
-│   ├── js/                # "tinyjs ok edition(tm)" — C port of tiny-js (MIT), rewritten
-│   │   ├── js_os.h/.c     # Host/kernel shim (kmalloc, printf, strtod/dtoa; -DJS_KERNEL)
-│   │   ├── js.h, js_var.c, js_lex.c, js_parse.c, js_funcs.c, js_math.c
-│   │   ├── js_dom.c/.h    # js_init/js_run + DOM bridge (getElementById, querySelector,
-│   │   │                  #   setText, setStyle, setAttribute, appendChild, body)
-│   │   └── tests/*.js     # Upstream tiny-js test scripts
-│   │
-│   └── crypto/            # TLS 1.3 + PKI (host-tested; integrated in kernel)
-│       ├── sha256.c, sha1.c, sha512.c         # hashes
-│       ├── chacha20.c, poly1305.c, aead.c     # AEAD (Poly1305 streaming API)
-│       ├── hmac.c, hkdf.c                     # MAC + key schedule
-│       ├── x25519.c                           # RFC 7748 (constant-time, fail-closed API)
-│       ├── der.c                              # DER parser
-│       ├── rsa.c, ec.c                        # RSA-PSS/PKCS1 + ECDSA (P-256/P-384)
-│       ├── x509.c, certverify.c, roots.c      # X.509 parse, chain verify, embedded roots
-│       ├── ocsp.c                             # Stapled-OCSP validation
-│       ├── tls_record.c, tls_handshake.c, tls_keysched.c, tls_client.c
-│       ├── rand.c/.h                          # ChaCha20 CPRNG (tiered, fail-closed)
-│       └── memwipe.h, tls_dbg.h, roots.h
-│       
+make desktop            # kanarchy-desktop.iso (primary)     make text   # text-mode ISO
+make laptop             # BIOS+UEFI laptop ISO               make clean  # when unsure (headers are tracked, -MMD -MP)
+make host-tests         # crypto, TLS, PKI, adversarial 209, h2/hpack, acpi, hid, touch, rtw...
+make web-tests          # CSS/font/lazy tests, JS regression pages (basic.html must say ALLPASS 37), canvas, wasm vs node, media
+make media-tests        # decoders vs ffmpeg/RFC oracles + ASan/UBSan fuzz
 ```
 
-Shared between builds: `gdt.c`, `idt.c`, `memory.c`, `serial.c`, `keyboard.c`, `mouse.c`, `string.c`, `syscall.c`, `paging.c`.
-Desktop-only: everything else above. **Networking, TLS, the web engine (src/web), JS engine, okai are desktop-only.**
-If you touch shared code, build **both** targets.
-
----
-
-## Architecture
-
-### Boot Sequence
-1. GRUB loads the kernel; desktop links high at `0xC0100000` (`linker-high.ld`; text keeps `linker.ld`).
-2. LOW `_start` (phys `0x100030`, paging off) builds a private boot GDT + boot PD (4MB PSE pages: phys 0-64M identity at PD 0-15 AND high at PD 768-783 — the image + .bss outgrew a single 4K-page table once fonts/engine landed; the boot stack lives in .bss), then `_start_high` sets the high stack and calls `kernel_main()`.
-3. Order in `kernel_main()`: memory → mboot copy (fb@88/pitch@96) → `paging_init` → process table → graphics → windows → mouse → keyboard → networking → CPRNG seed → `sti` → main loop.
-4. Desktop asks GRUB for `gfxpayload=1920x1080x32`.
-
-### Memory Layout
-- Kernel physical base 0x100000, virtual base 0xC0000000 (`KERNEL_VBASE`). `V2P`/`P2V_U32` in `src/memlayout.h`.
-- `paging_init` builds full low identity (0-128M, supervisor) + high alias (PD 768-799) + FB/MMIO supervisor mappings. The framebuffer is above 4MB (typically `0xFD000000`) and is **identity-mapped**, never via `paging_map` (a window map faults).
-- Page tables: user-low is per-process (private PD, copy via high alias); kernel-high (PD 768-1023) is shared.
-- Image: ~2.8MB text (1.5MB embedded fonts) + ~7.9MB BSS; `_kernel_end` ≈ 11.3MB physical. The old per-tab okai arrays (~37MB) are gone — page data lives on the heap (DOM/styles/layout per `struct wdoc`, page surface per window). Keep big tables on the heap, not in BSS.
-- Heap: segregated-fit, coalescing `kfree`, RAM-sized (414MB at `-m 512`, ~54MB at 128MB); `heap_stats()` / shell `mem`.
-- NIC RX/TX buffers live in low memory (`0x80000-0x9FFFF`) for DMA.
-
-### Display Pipeline
-1. All drawing goes to a `kmalloc`'d backbuffer (8MB).
-2. Dirty-row tracking: `graphics_mark_dirty(y)`; `graphics_flush()` copies only changed rows.
-3. Clip rectangle (`graphics_set_clip`/`graphics_clip_reset`) restricts repair drawing so small repairs dirty few rows.
-4. Window drag = backbuffer blit (`graphics_blit_rect`) + exposed-strip repair; resize = band repair; content buffers are slack-allocated with fixed stride (`CONTENT_COLS_MAX`).
-5. Result: hundreds of FPS idle/dragging/resizing at 1920×1080.
-
-### Cursor Compositor — DO NOT reintroduce saved-pixel cursors (v0.3.1 artifact fix)
-> **This is the single most important invariant in the window/mouse code. Agents
-> have repeatedly "optimized" it back to a saved-background cursor and
-> reintroduced the artifacts. Read this before touching cursor drawing.**
-
-The cursor is a **stateless sprite** — there is NO saved background patch and no
-save/restore pair. This is deliberate. The previous save/restore design caused
-**persistent artifacts** (arrow ghosts left behind on screen, wallpaper-colored
-holes punched into windows) because:
-1. the saved patch went **stale against scene changes** made underneath it between
-   save and restore, and
-2. **IRQ12 could tear it mid-read** (the mouse ISR mutates position while the main
-   loop was copying the patch).
-
-Rules that keep it correct:
-- Main loop order (in `desktop.c`): `desktop_paint_rect(old cursor rect)` → scene
-  draws → `mouse_paint_cursor()` → `graphics_flush()`. **Nothing draws after the
-  sprite.**
-- **`desktop_paint_rect(x, y, w, h)`** — the single authoritative repair path:
-  wallpaper → icons → windows back-to-front → taskbar. Recomposites any region
-  from the scene model. Also used to erase the cursor.
-- **`window_paint_region(id, rect)`** — repaints a window from its content model
-  clipped to a rect (frame/title are redrawn whole — over-repair is harmless;
-  content cells are clipped).
-- **`mouse_get_position()`** — atomic position snapshot (`cli`/`sti` around the
-  two-word read; the ISR mutates it on IRQ12).
-- Blinking text-cursor state is a **pure function of `tick_count`** (per-window
-  `last_cursor_visible` caches the phase; no global statics).
-- **Invariant:** backbuffer = render(model) + one cursor sprite drawn LAST. If you
-  reintroduce saved-pixel cursors (`cursor_bg`) or draw anything after
-  `mouse_paint_cursor()`, artifacts WILL return.
-
-### Window content cells
-A window can instead show a **client pixel surface** (`window_set_pixels`, `window_dirty_pixels`): the content area blits those pixels (occlusion-clipped like cells) and fills the rest with `content_bg_rgb`. okai uses this for the page; the cell grid is unused there.
-
-The window interior is otherwise a **fixed character-cell grid** (`CONTENT_GW=12`, `CONTENT_GH=24`, `CONTENT_COLS_MAX` stride). Each cell carries VGA nibbles + per-cell RGB planes (`cell_fg`/`cell_bg`/`cell_attr`). `window_write_cell_rgb` writes RGB; `cell_attr` (BOLD/UL) routes to `draw_char_cell` which draws a styled glyph.
-**Gotcha:** `draw_char_cell`/`draw_char_sized` now paint the cell **background even when the glyph is NULL** (control char / uninitialized) — skipping it left stale backbuffer pixels.
-
-### Input Pipeline
-- PS/2 keyboard → IRQ1 → scancode → ASCII → focused surface.
-- PS/2 mouse → IRQ12 → 3- or 4-byte packets → 4-sample smoothing → cursor.
-- IntelliMouse 4-byte wheel mode IS negotiated in `mouse_init_fb`. The 200/100/80 magic + `0xF2` handshake must wait for the ACK **and** the ID byte in order — draining then reading desyncs the PS/2 stream (movement dies mid-session). See Critical Bugs #25.
-- Mouse smoothing means scripted moves need ~4× dilation; use `vm.burst()` in headless tests.
-
-### Scheduler & Processes
-- Preemptive via `process_switch_to` from the timer IRQ (`sched_tick`), through the `context_switch` stub in `isr.asm`.
-- Guards: never switch from ring-3 trap stacks (defers), never into un-entered/BLOCKED/ZOMBIE slots, `switch_busy` closes the drain window, per-slot `generation` aborts reuse-under-cli.
-- `sched_yield()` runs on the INT 0x80 trap stack and **never** switches CR3/ESP0 there (slice reset only).
-- `process_switch` (lightweight CR3+ESP0) is handoff-point-only (entry/exit drains).
-- **PCB offsets: use `offsetof` only; new fields go at the TAIL.** `idt.c`'s exec-redirect reads `user_eip/esp` via `offsetof`; a past hardcoded index crossed EIP/ESP when a field was inserted mid-struct.
-
-### Syscall ABI (INT 0x80)
-0=print, 1=exit, 2=write, 3=getpid, 4=yield, 5=mmap_user, … through 17 (see `syscall.h`).
-- All user pointers go through `paging_user_range_valid()` (present+U/S at both levels) before dereference — a bad ring-3 pointer prints an error, never faults the kernel.
-- `enter_user_mode` uses register convention (eip→EAX, esp→EDX, no stack args). `sys_exit` resumes via `user_exit_trampoline`.
-- Return values are written through the saved-EAX slot. Desktop-only services are reached via hooks (text build fails safe).
-
-### Networking Stack
-1. **PCI** enumeration finds e1000 (8086:100E).
-2. **e1000**: MMIO TX+RX, **polled** from the main loop (interrupts masked — the loop never halts, per-packet IRQs only cost exits). 256 RX / 64 TX descriptors with buffers on the heap (`V2P` of a heap block is its contiguous physical address). TX checks the descriptor's DD before reusing it. Per-packet logging only with `net_trace` (shell `nettrace`).
-3. **ARP** (4-entry cache) → **IP** → **ICMP** → **UDP** → **DNS** → **TCP**.
-4. **DNS**: 32-entry cache (`dns_lookup`: 1 resolved / 0 in flight / -1 failed), concurrent queries matched by transaction id (the id is kept across resends: SLIRP's host resolver can take >8s for NXDOMAIN and a late answer must still count), TTL clamped 30-600s, failures negative-cached 10s. Shell `resolve` posts the answer as a net event.
-5. **TCP**: socket table (`TCP_MAX_SOCKS` 16): `tcp_open/state/send/recv/rx_avail/failed/close/abort`. Per socket: retransmit flight (16KB, RTT-estimated RTO, floor 200ms), reorder buffer (8×1500B), 256KB receive ring. **The advertised window is the ring's free space** (the old fixed 32KB window let the peer outrun a busy main loop — ACKed bytes were dropped). ACKs are batched: data arrival sets `ack_pending`, `net_poll` (right after `e1000_poll`) sends one ACK per socket. Fast retransmit counts **only pure-ACK repeats** (plen==0). SYN carries MSS 1460; ISN from RDTSC; ephemeral ports unique among live sockets.
-6. **Fetch engine** (`src/net/fetch.c`): see *Browser — navigation & fetching*. HTTP framing via the shared parser below.
-7. **e1000 RX release**: `RDT = index of LAST processed descriptor` — never index+1 (RDT==RDH reads as "ring full" and hardware drops everything), never write RDH. Written once per batch.
-
-### HTTP framing (shared parser)
-`http_parse_framing()` (RFC 9112 line grammar, exact-name match) feeds **both** `tls_response_complete()` and `http_dechunk()` — one parser, no differentials. Verdicts: COMPLETE (C-L satisfied / chunked terminated), SHORT (headers cut / short body / unterminated chunks), UNKNOWN (close-delimited; curl-parity accept). SHORT renders a TRUNCATED warning in the UI and never falls back to HTTP.
-
-### Browser (okai) — rendering pipeline
-okai is a shell around the web engine in `src/web/` (all integer/fixed-point: LU = 1/64 px; no FPU, no libgcc — use `w_div64`/`w_muldiv` for 64-bit division).
-
-1. **Parse** — `whtml_parse` (WHATWG tokenizer + tree builder, scripting-off so `<noscript>` renders; charset from HTTP/meta/BOM with a 1252 fallback) → `struct wdom`.
-2. **Style** — `css_set_*`: UA + quirks sheets, author sheets in document order (`<style>`, `<link>`, `@import`, `media=`), selectors L3/L4 (`:has`, `:is`, `:nth-*(of S)`), cascade origins/importance, `var()`, `calc()`, `@media`/`@supports`/nesting, presentational hints; interned computed styles.
-3. **Layout** — `wlay_run`: box tree with anonymous fixups, block flow + margin collapsing, floats, abs/fixed, inline formatting (line breaking, `text-align`, `vertical-align`, inline boxes), flexbox, grid, tables, list markers, replaced elements → a **display list** + hit regions.
-4. **Paint** — `wpaint` into a `struct wsurf` (AA rasterizer, TrueType glyph cache 6MB, gradients, shadows, borders/radii, images, SVG).
-
-`struct wdoc` ties it together (`wdoc_load` → `wdoc_next_fetch`/`wdoc_fetch_done` → `wdoc_update` → `wdoc_paint` / `wdoc_hit`). Each okai window owns a page surface (viewport-sized, kmalloc'd); `okai_render_content` paints the active tab into it and the window system blits it. Scrolling shifts the surface and repaints only the exposed band (full repaint when the layout has `position:fixed` content). The chrome, scrollbar, status panel and site-identity panel are an overlay painted after the window (`okai_paint_overlays*`). **Chrome = `src/okai_ui.c`** (Firefox Proton look, palette `FX_*` in `theme.h`): drawn with the web engine's AA rasterizer (stroked icons from `seg`/`arc`/`polyline`, rounded boxes via `wr_rrect`) and Noto Sans text (`wfont_draw`) into a per-window cache that re-renders only when a state signature changes (tabs, titles, URL, focus, hover target, spinner phase); each overlay paint blits the cache (~4.5ms per re-render under TCG). `ui_layout()` is the single source of geometry for drawing AND hit tests (tabs, close boxes, '+', nav buttons, address field, identity box) and is logged as `[okai] ui ...`. Caption buttons (minimize / maximize-restore / close, `WIN_CTRL_W` 46px x tab-strip height) belong to the window system: `window_ctrl_rect`, `window_check_*_click`, `window_toggle_maximize` (repairs the old footprint via `desktop_paint_rect_pub`). Hover and the tab spinner drive repaints through `okai_ui_needs_paint` in the desktop overlay throttle. The FPS counter is a chip in the taskbar's right corner (`taskbar_paints` tells it when the taskbar repainted under it).
-
-**Engine stack:** every engine call goes through `run_job()` → `call_on_stack()` onto a private 1MB heap stack (boot stack is 256KB; Wikipedia peaks ~20KB — the render log prints the high-water mark as `stack=NKB`).
-
-**Logs (headless tests key on these):** `[br] [https ]parse: count=N ...` per document, `[okai] render tab=.. (page origin X,Y)` + `[okai] link[i] x= y= w= h= href=` / `[okai] field[i] ... btn=` for each page's first render (page px, viewport-relative), `[okai] click x= y= (mx= my=) hit= node=`, `[okai] LINK HIT -> url`, `[okai] focus input node=`, `[okai] toggle node= checked=`, `[okai] submit form -> url`, `[okai] error page: <title> for <url>`, `[okai] sub-res fetch: CSS|IMG url` / `sub-res done`.
-
-### Browser — navigation & fetching
-- URL bar (g to focus, Esc to exit); toolbar; j/k/arrows (48px), space/PgDn/PgUp (page), wheel (80px/notch); b/f back/forward, r reload; tabs; internal `okai:home` (an HTML page rendered by the engine). History: 8 entries/tab, redirects replace the current entry.
-- **`okai_normalize_https`**: bare host defaults to `https://`, except IP literals and explicit non-443 ports (`10.0.2.2:8000/x`) which default to `http://` (local/dev servers — TLS against them fails closed with no fallback). An explicit `http://` is respected.
-- **No-downgrade gate** (unchanged): cert/hostname failures → security warning page; secure-channel failures (PROTO/MAC/ALERT/RNG/OVERFLOW) → connection error page (after up to 2 same-origin resumption retries); **only transport failures** get the one-shot plain-HTTP retry. Error pages are generated HTML documents (`show_error`).
-- **Fetch engine** (`src/net/fetch.c`, driven by `fetch_poll()` from the main loop right after `net_poll`): up to `FETCH_MAX` (8) GETs at once. A connection walks DNS → TCP → TLS handshake (the request rides the handshake) → response; a response **complete by HTTP framing** (Content-Length / terminal chunk / 204/304) on an HTTP/1.1 connection without `Connection: close` leaves the connection IDLE in the pool (`CONN_MAX` 8, 6 per host, 30s idle timeout; `tls_state_reuse` sends the next request on the same session). A reused connection that dies before the first response byte (server closed it while idle) re-runs the request on a fresh one. Each poll drains every available TLS record per connection (the old driver did one record per main-loop pass). Responses grow from 64KB to 8MB. Failures: TLS fail reason for secure-channel/cert failures, 0 for transport (DNS, connect, reset, 25s without progress). Reading past the end of the message is never done — www.google.com's trailing record fails AEAD on this network path (OpenSSL agrees).
-- **Fetch driver** = `okai_poll()`: a request table (`struct oreq`: window, tab, document, wdoc resource id or -1 for the main document, redirect/retry state, fetch handle). Main documents start first; then each loaded tab runs up to `OKAI_SUB_PAR` (6) resources in parallel (active tab first), always leaving one engine slot for navigations. **A finished request is detached from the table before its response is processed** (delivery can run scripts that navigate; navigation cancels the tab's requests and would free the response mid-use); redirects/retries/fallbacks re-issue a new record after `fetch_end`. Navigation/tab close/window close cancel the tab's requests; results for a replaced document are dropped. Responses: status/headers parsed, `http_dechunk`, gzip inflated. Non-HTML documents are wrapped (`text/plain` → `<pre>`, `image/*` → `<img>`).
-- **Sub-resources**: stylesheets, then scripts/requests, then images (`wdoc_next_fetch` order), each with its own scheme, 3xx following and one transport retry; caps `OKAI_MAX_CSS_FETCH` 24 / `OKAI_MAX_IMG_FETCH` 32 / JS 160 / requests 64. Cross-origin `fetch()`/XHR send `Origin` (CORS). Rendering is coalesced: first paint waits for stylesheets (≤3s), image arrivals repaint at most every 1.5s, plus a final paint on drain.
-- **Forms**: click focuses text fields (caret drawn), typing edits the `value` attribute, Enter submits (GET; POST forms are sent as GET), Tab cycles controls, checkboxes/radios toggle, `<select>` cycles options.
-- **Requests**: top-level navigations send a browser's HTML-first `Accept` (`net_accept_html`; crates.io 404s `*/*`), sub-resources and script fetches `*/*`; cookies from the shared jar (`wcookie`, SameSite against the top-level page); `Accept-Encoding: gzip`.
-
-### Browser — page scripts (ojs)
-- **Engine**: ojs, our own JavaScript engine in `src/ojs/` (see `src/ojs/README`): parser, compiler, direct-threaded bytecode interpreter with inline caches, non-moving mark-sweep GC (conservative scan of the C stack and the VM stack), all built-ins (ES2025 + iterator helpers, Math.sumPrecise, RegExp v-mode, BigInt, Proxy, typed arrays, modules with top-level await). Replaced QuickJS on 2026-10-09 (the kernel now contains no third-party code except the fonts: our libm `src/kmath.c`, our 64-bit division `src/divdi3.c`, no libgcc). x87 doubles at 53-bit precision: `wjs` sets the control word on every entry, the kernel FNSAVE/FRSTORs per thread.
-- **Realm per document** (`src/web/wjs.c`, created lazily by `wdoc`): heap cap = half the kernel heap, 96-512MB (`wjs_sys_realm_limit`; memory taken from the system + ArrayBuffer storage; at the cap an allocation collects first) plus a kernel-reserve guard (`wjs_sys_mem_ok`: never below 1/8 of the heap free), 900KB stack cap, 4s per script / 1s per task (interrupt handler). Web API = `wjs_prelude.js` (events, DOM classes, forms, custom elements, MutationObserver, CSSOM + constructable sheets, URL, storage, Intl en-US, ...) over C natives in `wjs_dom.c` (selectors through the CSS engine, layout queries, HTML serialization); `wjs_sys.c` gives the engine the kernel heap and clock.
-- **Scheduling** follows the HTML spec's shape: parser-blocking classic scripts in order (external fetched first), then defer + module scripts, DOMContentLoaded, async/dynamic as they arrive, load once scripts/sheets/images settle. Module graphs are fetched ahead (compiled without resolving to discover imports; dynamic `import()` parks until fetched). Timers/rAF/microtasks run from `okai_poll` under a budget; script DOM mutations trigger stylesheet rebuilds/image rescans and a coalesced re-render.
-- **okai integration**: DOM events dispatch before default actions (click/keys/input/change/submit/focus/scroll; `preventDefault` honoured); script navigation/scroll/focus/title/pushState flow back through `wdoc_js_take_*`; fetch()/XHR go over the single connection (CORS-checked) like any sub-resource. `J` (Shift+J) toggles page scripts globally and reloads (`[okai] page scripts on|off`).
-- **Host harness**: `build-host/wbrowse <url|file> w h out.ppm [secs]` runs the same engine + scripts on the host (live sites cached under `~/.cache/wbrowse`); `tests/web/js/basic.html` is the DOM/API regression page (`[js] RESULT ALLPASS 37`). Headless: `test_okai_js.py`.
-
----
-
-## Build & Run
-
-```bash
-make desktop       # Desktop ISO (kanarchy-desktop.iso) — primary target
-make text          # Text-mode ISO (kanarchy-text.iso)
-make run           # Build + run text mode in QEMU
-make run-desktop   # Build + run desktop mode in QEMU
-make clean         # Remove all artifacts
-make host-tests    # Host unit/suite tests (crypto, TLS, PKI, CSS, DOM, layout, HTML, RNG)
-make host-tests-asan # Same, under ASan/UBSan
-make diff-oracle   # Build the differential oracle (crypto)
-make diff-test     # Run differential vs python-cryptography
-make tls-interop   # TLS-Attacker / pyserver interop battery
-```
-
-**Run accelerated.** Windows: `run-windows.bat` (`qemu-system-x86_64 -accel whpx -accel tcg` — the Windows i386 build has no WHPX; the 32-bit kernel boots fine in x86_64 QEMU, boot to heap 2s). Linux: add `-accel kvm` (`make run-desktop` does, falling back to TCG). Plain TCG is ~10x slower on every CPU-bound step.
-
-Desktop QEMU (must use `-vga std`; `-device e1000` for networking):
-```bash
-qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std \
-  -device e1000,netdev=net0 -netdev user,id=net0
-```
-Serial ground truth (network/TLS bring-up):
-```bash
-qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std \
-  -device e1000,netdev=net0 -netdev user,id=net0 \
-  -nographic -serial stdio
-```
-Packet capture: add `-object filter-dump,id=dump0,netdev=net0,file=/tmp/net.pcap`.
-
-**Compiler flags that matter:** `-m32 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector -nostartfiles -nodefaultlibs -fno-pic -fno-pie -mno-red-zone -O2 -fno-strict-aliasing -DKERNEL -Isrc`. Without `-fno-pic/-fno-pie/-mno-red-zone`, GCC emits `__x86.get_pc_thunk` calls that crash a freestanding kernel.
-
----
-
-## Shell Commands
-
-**Desktop:** `about clear disk echo edit exit help ip locktest ls mem netdrop okai open ping ps reboot resolve run [path] save shutdown sysinfo` (alias `neofetch`) `terminal uptime usermode` (retired — prints a hint; use `run /bin/hello`).
-**Text:** `help clear echo mem terminal exit list switch N about reboot shutdown`. (The text build is a separate, smaller terminal-only shell — it does **not** share the desktop command set.)
-
----
-
-## User Mode (Ring 3)
-
-Working end-to-end: GDT user segments + TSS, INT 0x80 gate (DPL=3), `paging_map_user` (U/S on BOTH PT and PD entries), `enter_user_mode` via IRET. The `usermode`/`spawn_user` single-slot path was **retired 2026-09-10**; ring-3 now runs through the scheduler (`sched_spawn_user`, fork/exec, wait/kill).
-
----
-
-## Known Limitations
-
-- **Single CPU** — no SMP.
-- **In-memory VFS** — only files explicitly synced to PFS survive reboot.
-- **TCP** — no congestion control or window scaling (64KB max window; SLIRP is local, so it does not matter in QEMU); reorder buffer 8×1500B per socket; no TIME_WAIT.
-- **TLS 1.3 only** — suites ChaCha20-Poly1305-SHA256 + AES-128-GCM-SHA256 (no AES-256-GCM-SHA384, no TLS 1.2: whatwg.org, baidu.com, arstechnica.com fail the handshake). Bot protection (Akamai/Cloudflare/Fastly) answers many big sites with 403 pages — TLS works, the page is a challenge.
-- **JavaScript** — no WebAssembly or workers; WebSocket (never opens), canvas (`getContext()` → null) and media elements are inert stubs; layout queries are answered from the last layout; `Intl` is en-US only.
-- **Web engine** — no `position: sticky`, transforms are translate-only, no animations/transitions, `mask-image` boxes skip their background; JPEG chroma is nearest-neighbour; CJK beyond the 16px bitmap fallback table renders as tofu.
-- **Fetching** — GET only (POST forms go as GET, script POST requests fail); HTTP/1.1 only (no HTTP/2 multiplexing — parallelism is 6 connections per host); capped at 24 stylesheets / 32 images per page.
-- **Emulation speed** — under plain TCG every CPU-bound step is ~10x slower than under KVM/WHPX (layout of a big page ~300ms vs ~30ms, a TLS handshake's crypto ~200ms). Run accelerated (`run-windows.bat`, `make run-desktop`).
-
----
-
-## Critical Bugs Found (and Fixed)
-
-Kernel / build:
-1. `section .note.GNU-stack` must be **LAST** in `.asm` files (otherwise code is swallowed into a non-executable section).
-2. `-fno-pic -fno-pie -mno-red-zone` are required (freestanding).
-3. Framebuffer is above 4MB — requires identity-mapped page tables before access.
-4. **Cursor save/restore causes persistent artifacts (v0.3.1)** — the saved background patch goes stale against scene changes and IRQ12 can tear it mid-read → arrow ghosts + wallpaper holes in windows. Fixed by the **stateless sprite** + `desktop_paint_rect` scene repair (see *Cursor Compositor* above — it has the full invariant). **Do NOT reintroduce `cursor_bg` or draw after `mouse_paint_cursor()`.**
-5. Unclipped repair painting kills FPS — every repair path must set/reset the clip rect.
-6. `_kernel_end` must stay under available RAM; large static arrays can blow the identity map.
-7. **16-bit offset overflow (2026, this session)** — `struct dom_attr.val_off`/`name_off` and `struct dom_node.tag_off` were `uint16_t` while `DOM_MAX_TEXT`/`DOM_MAX_NAMES` are 512KB/128KB. On a big page all attribute values wrapped and read from the wrong arena offset, corrupting `href`/`id`/`class`/`alt` (garbled leaked text, wrong links). Fix: widen to `uint32_t` (`dom.h`) and `layout_run.text_off` too (`layout.h`); drop the truncating casts.
-8. **UA stylesheet was inert** — `css_apply` initialized `win[idx] = -1`, but UA rules carry specificity base `-10000`, so `spec < win[idx]` rejected every UA rule. Fix: init `win[]` to `-0x7FFFFFFF`. Verified: `body` now gets UA `background:#FFFFFF;color:#000000`.
-9. **`draw_char_cell` skipped bg on NULL glyph** — control/uninitialized cells left stale backbuffer pixels (noisy dither). Fix: paint the cell background in the early-return paths.
-
-Network / TLS:
-10. e1000 register offsets: RDH/RDT/TDH/TDT at `0x02810/0x02818/0x03810/0x03818`.
-11. e1000 RX buffers must be in low memory for DMA; 16-bit MMIO writes for RDH/RDT.
-12. **TCP payload length from padded frame, not IP `total_length`** — Ethernet pads short frames, so zero pad bytes were fed to TLS. Fix: derive length from `ip_hdr.total_length` at the IHL offset.
-13. **TLS buffers too small** — 16KB ring/response dropped bytes on multi-record pages. Fix: 64KB both.
-14. **Stale-tail host buffers** — string copies didn't NUL at actual length, so a previous host leaked into the next. Fix: `net_copy_str()`.
-15. **DNS definitive failure wedged the fetch owner** — NXDOMAIN left a retry flag set forever. Fix: abort the parked request; refuse empty-host URLs; always release the owner.
-16. **`uint16` memcpy is little-endian on the wire** — always use `put_u16()` for TLS integer fields.
-17. TLS extension `list_length` is a single 2-byte prefix — don't double-count.
-18. **HKDF-Expand-Label** needs the `"tls13 "` prefix and a 1-byte label length.
-19. **Transcript hash body-length** — `tls_build_client_hello` returns header+body; pass body-only to `tls_transcript_update_msg`.
-20. **TLS Certificate parser** must skip `cert_request_context<0..2^8-1>` before the list length.
-21. **`send_aead`** must append the 16-byte tag (not send stack garbage).
-22. **Finished key** derives from the handshake traffic secret, not the application secret.
-23. **Separate app-traffic sequence counters** for send and receive.
-24. **TLS 1.3 transcript hash** is over `type(1)||len(3)||body`, not the record framing.
-
-okai / browser:
-25. **IntelliMouse ID read drained the byte it waited for** — wait for ACK, then for ID (bounded spins). Detection logs `[mse] wheel detect id=0x03 4-byte mode ON`.
-26. **Forced full-window repaint under a covering window** tanked FPS (60→13). Fix: clip okai's overlay to the uncovered region (`okai_paint_overlays_rects`).
-27. **Sub-resource JS execution wedged the kernel** — real minified bundles hang tinyjs. Fix: do not execute external scripts (see above).
-28. **External CSS wasn't fetched on main-page load** — `okai_queue_sub_resources()` existed but was never called, and the fetch owner was cleared immediately (so the sub-res branch, which requires an active owner, never ran). Fix: call it after parsing and keep ownership while resources are queued.
-29. **kbd offer-wake stole input for wait-parked init (2026-09-30)** — the OFFER-WAKE scan took the oldest BLOCKED slot with any staged resume, so wait-parked init (slot 1, ret=-2) always beat read-parked sh (slot 2): deterministic starvation, sh never received typed lines. Fix: skip staged ret `-2` (wait-park; re-stage untouched) so offers reach readers. Plus: `kbd_wake_armed` was set even when the offer was dropped (stale-backlog guard) — `sys_proc_kbd_offer` now returns queued/dropped and the IRQ arms only on queued.
-30. **Text build triple-faulted at boot (2026-10-01)** — the LOW trampoline builds its boot page tables with `label - 0xC0000000` expressions that only resolve against HIGH-VMA links; low-linked they wrap to garbage phys (bisected: #DF at `_start+0x5D`, IDT=0). The text kernel never enables paging, so `linker.ld` now enters at `_start_high` directly (with a `mov edi, ebx` there — the trampoline used to set up the mboot pointer). Follow-ups in the same session: text GRUB entry needs `gfxpayload=text` AND its own multiboot header without the video request (`-DTEXTMODE` start object — the shared header asks GRUB for 1920x1080x32, leaving the text kernel writing an invisible 0xB8000).
-31. **TCP send > MSS crashed the kernel (2026-10-07)** — a 1594-byte TLS record (long module-batch URL) went through `tcp_send_raw`'s 1514-byte stack frame; the overflow smashed the return address (EIP garbage). TCP sends are now split at the MSS.
-32. **Stale objects after a header change (2026-10-07)** — the Makefile didn't list `src/crypto/*.h` as dependencies; `struct tls_state` grew (`suite`, 8KB staple) but `tls_net.o` kept the old size, so `tls_state_init`'s memset ran past `tls_s` and zeroed `tls_start_tick`: every HTTPS fetch "timed out" on its first step and downgraded to plain HTTP (14-byte pages). Fix: `-MMD -MP` dependency files + `src/crypto/*.h` in `HEADERS`.
-33. **DNS race on navigation (2026-10-07)** — the resolver has one slot; a sub-resource lookup still pending when the user navigated made the new fetch skip its own query, then read the stale answer for another host as "no A record" → abort → HTTP fallback. Fix: `dns_is_pending_for(host)` (only a query for the same host is waited on; a new query's tx id drops the stale answer) and a superseded TLS lookup re-queries.
-34. **Fetch timeout / ticket clock units (2026-10-07)** — `TLS_FETCH_TIMEOUT_TICKS 1200` was "66s at 18 Hz" but the PIT runs at 100 Hz (12s; now 3000 = 30s), and the ticket-age clock was fed raw ticks as ms (tickets lived 10× their lifetime; now `tick_count * 10`).
-35. **One request at a time, one TLS record per main-loop pass (2026-10-07, "loading is EXTREMELY SLOW")** — every resource paid DNS + TCP + full TLS handshake + request (≥3 round trips, ~1s each on this network) strictly in sequence. Replaced by the TCP socket table + fetch engine + okai request table (parallel, keep-alive). Measured (TCG): python.org settled 32.6s → 9.6s, apple.com 17.6s (13 of 33 resources) → 5.9s (all 33), Wikipedia 10 resources/23.5s → 43 resources/22.3s.
-36. **Fixed 32KB TCP window over a ring the main loop drains** — a long render let the peer fill it; bytes were ACKed then dropped. The window is now the ring's free space.
-37. **Per-packet serial logs** — hex frame/descriptor dumps, a register dump every 500 polls and a line per TCP segment wrote hundreds of KB to COM1 per page (each byte = 2 port I/O exits). Gated behind `net_trace`; serial writes now poll the status register once per 16 bytes (FIFO).
-38. **No `Origin` on cross-origin XHR** — servers omit Access-Control-Allow-Origin without it; BBC's sign-in check failed and its script redirected bbc.com ↔ bbc.co.uk forever (679 fetches in 2 minutes).
-39. **8-second script budget froze the OS** — apple.com's gallery script loops on a layout value that never changes until interrupted; the budget (the whole UI waits) is now 4s per script evaluation, 1s per task.
-40. **`udp_send` placed the UDP header over the IP header** (missing Ethernet offset) — latent until DNS started using it.
-41. **FPS HUD over the browser's close button (2026-10-07)** — the black FPS box was drawn at the screen's top-right every frame, on top of the maximized browser's caption controls; the title-bar-less browser had no minimize at all. FPS moved into the taskbar; title-bar-less windows get real min/max/close (`window_ctrl_rect`).
-42. **Chrome geometry duplicated in 5 places** (draw + 4 hit tests + tests, "MUST mirror" comments) — replaced by `ui_layout()` + the `[okai] ui` geometry log.
-43. **Maximize/restore left the old frame on screen** — `needs_redraw` only composites dirty windows; the vacated area needs a region repair (`desktop_paint_rect_pub` of the old rect).
-44. **Half-drawn hover highlights on taskbar/caption buttons (2026-10-08, WHPX)** — the cursor-erase repair (`desktop_paint_rect`, clip = old cursor rect) re-rendered the cached taskbar strip / okai chrome band when the mouse had moved since the main-loop update that frame, so the new hover state reached the screen only inside that small rect; the signature then matched and the full blit never came (half-red close button, grey patch on maximize). Only reproduces with real-mouse timing (WHPX; `tests/headless/hover_win.ps1`). Fix: clipped repairs only blit the taskbar cache (`taskbar_update` alone re-renders), and an okai chrome render under a partial clip sets `partial` so `okai_ui_needs_paint` forces the main-loop full paint.
-46. **Keystrokes reversed / dropped (2026-10-08)** — `rand_stir_src` (keyboard IRQ entropy) bracketed its pool update with a bare `cli`/`sti`; the `sti` re-enabled interrupts inside the keyboard handler (EOI already sent), so queued scancodes nested and were delivered LIFO ("okai" → "okia", "abcdef" → "fedcba"). Latent since the entropy hook; surfaced when the cursor rework made the main loop's interrupt-free flush chunks queue key bytes. Fix: save/restore IF (`rng_cli`/`rng_sti`); `test_typing.py`.
-47. **Kernel clock ran slow under a busy loop (2026-10-08)** — once the cursor stopped costing anything, the main loop spun ~190k times/s polling e1000 MMIO; QEMU's timer starved and PIT ticks were lost (the 1 Hz `[fps]` line came every ~1.5 s). Fix: halt when idle (see AGENTS "main loop halts when idle").
-49. **Backward memmove + interrupt = memory corruption (2026-10-08; latent since 90cf6c9)** — memmove's overlapping path runs `rep movs` with DF=1 for ~7MB on an okai scroll-up; an IRQ landing there ran C with DF=1, so the timer's per-tick `rand_stir` memcpy (and every other string op) copied backwards, scribbling below its buffers. Mostly harmless by luck until the wheel-scroll benchmark hung the kernel (EFLAGS 0x200c96: DF=1, IF=0). Fix: `cld` in `isr_common_stub`/`irq_common_stub` (iret restores the interrupted DF) + a DF canary in `irq_handler`; `test_scroll_irq.py` (fails on a build without the cld).
-48. **Mouse lag** — every main-loop iteration erased the cursor by recompositing wallpaper + windows (+ AA title bar, okai chrome, taskbar) under it and repainted it, then a 4-packet moving average made the pointer trail the hand and swallowed moves < 4 units. Replaced by the framebuffer cursor in `cursor.c` (IRQ-moved, never in the backbuffer).
-50. **Keyboard garbled after boot (2026-10-08, latent since the first mouse driver)** — `mouse_init_fb` sent the controller "read config" command and read port 0x60 without waiting for the reply; a pending byte (a key held or released during boot — the GRUB Enter — or a late mouse ACK) was read instead and written back as the config byte. Translation (bit 6) cleared → the keyboard sent raw set-2 scancodes: 'a' (0x1C) typed Enter, 's' (0x1B) typed ']', and every release (F0 xx) retyped the key; other stale bytes turned IRQ1 off entirely. The mouse reset's ACK/BAT/ID bytes were likewise drained instead of read in order. Fix: both ports disabled during init, flush, every reply read with a wait, translate/IRQ bits forced, `[ps2] config was=.. now=..` logged; the keyboard IRQ ignores bytes flagged as mouse data. `test_boot_keys.py` (spams keys + mouse from power-on: old build 0/3 lines typed, new 3/3; WHPX repro 5/5).
-52. **Keys handled inside IRQ1 (2026-10-08)** — `on_keypress` (shell commands, okai navigation, page keydown/input JS, page scrolls) ran in the keyboard interrupt, on top of whatever the main loop was doing — often `okai_poll` on the same document. Navigation freed the document mid-poll; QuickJS was re-entered. Fix: single-producer/single-consumer key queue (IRQ pushes, main loop dispatches), Alt sampled at press time and carried with the key; idle halt checks the queue with IF=0 before `sti; hlt`. `test_typing.py` (now also Ctrl+Alt+T + typing into the new terminal).
-51. **Crypto audit (2026-10-08)** — (a) root store generated from the Debian bundle trusted 4 roots Mozilla had removed or limited (Entrust, Chunghwa ePKI, SecureSign RootCA12, Atos TrustedRoot 2011) and ignored distrust-after (Izenpe): now generated from certdata.txt with distrust-after enforced; (b) NameConstraints ".example.com" (leading dot) never matched — an EXCLUDED subtree in that form was not enforced; (c) duplicate X.509 extensions accepted, later copies overriding (EKU/BasicConstraints) or appending; trailing junk inside extension values accepted; (d) `*.com` wildcards accepted; (e) Must-Staple bypass: the OCSP "issuer" was the flight's 2nd cert even when the leaf anchored directly on a store root (or was a pinned leaf) — an appended same-name CA could sign a "good" staple for a revoked leaf; (f) OCSP returned "revoked" before checking the response signature; (g) a protected change_cipher_spec (and one after the handshake) was skipped instead of aborting (RFC 8446 §5); (h) AES-GCM decrypt staged plaintext in one static 16KB buffer (now tag-then-decrypt, no scratch); (i) chunk-size u32 wrap in the HTTP completeness walk / int overflow in `http_dechunk`; (j) CPRNG fed its own (public) output back as "forward secrecy" key material — now fast-key-erasure. Each of (b)-(g) has a check in `test_adversarial.c` that fails on the pre-audit code (10 fail old / 209 pass new, ASan+UBSan); real-site census unchanged (86/91, 33 good staples).
-45. **Typing went to the browser instead of the terminal (2026-10-08)** — window clicks were routed by slot index (high→low), not z-order: with okai in slot 1 under the terminal (slot 0), a click on the terminal's overlapping area focused okai. Now topmost-by-z first (`test_desktop_ui.py`).
-
----
-
-## TLS traps (next agent: read these)
-
-**Crypto/TLS math**
-- Limb packing: never route >64 bits through a `uint64_t`; shifts ≥64 are UB.
-- Reduction folds: the ×5/×38 factor applies to BOTH low and high parts of every folded digit, cascades included.
-- `|` vs `+`: OR drops carries when limbs have slack — carry first, then pack additively.
-- Wraparound test for 2^255: check the top BIT, not carry-out.
-- Array initializers: a short literal silently zero-pads the top byte.
-- AEAD nonce = static_iv XOR sequence counter (big-endian, left-padded to 12 bytes; high byte at nonce[4]).
-- TLS record plaintext ends with the real content-type byte then zero padding; when scanning back, skip zeros only (strip-first is provably correct; type-first breaks close_notify).
-- HKDF-Expand-Label info = `out_len(2)||label_len(1)||"tls13 "+label||context_len(1)||context`.
-
-**Record/handshake framing**
-- `tls_record_parse_header` checks only 5 header bytes; accept 0x0303 and 0x0304.
-- Session ID may be empty or 32 zero bytes.
-- Put ChangeCipherSpec AFTER the ClientHello record (Python ssl strict mode rejects it between CH and SH).
-- Match OpenSSL's exact signature_algorithms set; offer enough for EC + RSA-PKCS1 + RSA-PSS.
-- Start offering ONLY x25519 in key_share (some libs reject secp256r1 alongside).
-- `legacy_compression_methods` must be exactly `{0x00}`.
-- Supported_groups body is `{uint16 length; group[]}` (not an early-draft outer prefix).
-- X25519 is constant-time and **fail-closed**: `x25519_shared_secret` returns 1/0; reject u=0/u=1.
-- Hostname canonicalization is centralized in `tls_canon_host()` (applied at SNI/cert/pin/ticket boundaries).
-
-**Trust / PKI (2026-10-07)**
-- Root store = Mozilla's (`tools/gen_roots.py` → `roots.c`, 120 roots; e-Szigno's P-521 root is skipped — no P-521 support). Each entry embeds the whole root cert: SPKI, subject DN, SKI.
-- Two anchors: `root_issued()` (cert's issuer DN == a root subject byte-exactly, AKI == root SKI when both present, signature verifies under the root key — servers don't send roots, so this is the normal path) and the older in-flight SPKI match. Several roots may share a name (re-keyed): every candidate is tried.
-- Validity: leaf up front, each issuer as the walk reaches it. Certs past the anchor are never examined — an expired cross-sign appended by the server must not fail the path (the mutation fuzz proves the trailing example.com cross-sign is unused).
-- OCSP: delegated responders (cert in the response, issued by the CA, `id-kp-OCSPSigning`, RSA ≥ 2048) and byKey responder IDs. Policy: only a verified REVOKED status or a Must-Staple leaf hard-fails; a stale/unverifiable staple is treated like an absent one (it is strippable anyway). Staples up to 8KB.
-- AES-128-GCM (`aes.c`): bitsliced Boyar-Peralta S-box and masked GHASH — no table lookups on secret data. The record key length is part of the HKDF label (`tls_record_key_len`: 16 for AES, 32 for ChaCha20).
-- Adversarial suite clocks come from the test PKI's file mtimes; build it with 64-bit `stat` (`_FILE_OFFSET_BITS 64`) — on WSL's `/mnt` drives 32-bit `stat()` fails with EOVERFLOW and the suite silently used a fallback date (42 bogus failures).
-
-**Kernel**
-- Heap is a segregated-fit allocator (`kmalloc`/`kfree`); big tables go on the heap, not BSS; check `_kernel_end`.
-- e1000 RX release: `RDT = last processed index`.
-- `tcp_handle_packet` runs in IRQ context — IRQ appends to a buffer; the main loop reads after close.
-- `http_get` resets done/length at entry — a stale done-flag races the parse block.
-- Makefile `%.o` depends on headers (`HEADERS` + `-MMD -MP` dep files) — never remove (bug #32).
-- Mouse is relative + smoothed; converge iteratively in scripted tests.
-
-**Process**
-- Serial log (`-serial file:`) is ground truth for network/TLS bugs — grep before theorizing.
-- Screenshot verification: crop + zoom; count specific pixel colors; route PNGs to a vision model rather than eyeballing.
-
----
-
-## Testing
-
-Host suites (`make host-tests`): crypto (sha256/sha1/sha512/chacha/poly/aead), AES-128/GCM (FIPS-197, GCM spec cases, 300 random vectors vs OpenSSL via `tests/aes_vectors.py`), TLS record/handshake/keysched/client, PKI, adversarial (189 checks; `make host-tests-asan` for the ASan/UBSan run), RNG, editor text, live example.com handshake + wrong-hostname rejection, and `make web-tests` (web CSS unit tests 54/54, font tests, JS regression page `[js] RESULT ALLPASS 37`, ojs smoke test, 64-bit division helpers vs the compiler's; builds `build-host/wrender` + `build-host/wbrowse`). ojs: `tests/ojs/build.sh` + `run262.py` (test262) + `corpus/run_corpus.py` (real libraries diffed against node), see `src/ojs/README`.
-Real-site TLS census on the host: `build-host/tls_scan -f tests/tls_hosts.txt` (the kernel's TLS client over host sockets; prints the failure reason per site).
-Web engine (needs the corpus: `python3 tools/fetch_corpus.py`, gitignored): `tests/web/html5_diff.py` (85/85 trees == html5lib), `tests/web/image_diff.py` (59/59 == PIL), every corpus page through `wrender` under ASan/UBSan (`SAN="-fsanitize=address,undefined" OPT=-O1 sh tests/web/build.sh`), `tests/web/compare.py <name> [w] [h] [--fresh]` (side-by-side vs headless Edge; `WR_DUMP_TAG=figure ./build-host/wrender <name> ...` prints a tag's boxes + ancestors). okai's built-in pages export to the corpus with `python3 tools/okai_pages.py`.
-Differential tooling: `make diff-oracle` / `make diff-test` (X25519, SHA-256, HMAC, HKDF, AEAD vs python-cryptography).
-Interop: pyserver + TLS-Attacker (`tests/tlsattacker-*.xml`) — full HS P-256/RSA-P384 PASS, mutilation rejection, fragmentation.
-Persistent FS tests: `OkVM(tag, disk=path)` appends `-hda` for PFS tests; a stale `-hda` QEMU holds the image write-lock (kill it first).
-
-### Headless testing (okvm)
-`tests/headless/okvm.py` drives QEMU headlessly; output in `~/okvm/`; full docs in `tests/headless/TESTING.md`.
-```python
-import sys, time; sys.path.insert(0, 'tests/headless')
-from okvm import OkVM
-vm = OkVM("tag"); time.sleep(14)
-vm.type_string("okai https://example.com/\n")
-ok = vm.wait_for("parse: count=", timeout=140)
-vm.kill()
-```
-- Serial log (`~/okvm/<tag>_serial.log`) is ground truth — never guess from pixels.
-- `vm.wait_for(pattern)` polls serial — never raw `sleep()`.
-- `vm.burst()` for mouse movement (4-sample smoothing ≈ 4× dilation).
-- Closed-loop clicks: `vm.click_link(href_part)` / `vm.click_at(page_x, page_y)` (read `[okai] click x= y=` → correct → repeat) and `vm.click_screen(x, y, regex)` for chrome (reads `[mse] btn=1`). `vm.link_regions()` parses the last render's link log; `vm.premove()` dead-reckons first so the probe click never lands on a link under the cursor.
-- Chrome geometry is logged by the kernel, not hard-coded: every time the chrome layout settles okai prints `[okai] ui back=x,y,w,h fwd=.. reload=.. home=.. url=.. ident=.. newtab=.. min=.. max=.. close=..` and `[okai] ui tabs n=N tab<i>=.. tabx<i>=..` (tab i and its close box). Aim with `vm.click_ui(name, regex)` / `vm.ui_center(name)` / `vm.ui_rect(name)`; for targets next to the close button pass `anchor=(x, y)` (a harmless probe click nearby — long dead-reckoned moves drift ~50px). The chrome band is 96px (44 tab strip + 52 nav bar); the page starts right below it.
-- `python3 tests/headless/run_suite.py -j3 test_a.py ...` runs tests in parallel (outputs in `~/okvm/<test>.out`).
-- Scripts (all green 2026-10-07): `test_okai_js.py` (page scripts: offline fixture + Wikipedia), `test_sites.py [tag] [url ...]` (real-site sweep, needs internet: OK only when the document arrived over TLS — a plain-HTTP fallback or error page fails; 15/15 on 2026-10-07), `test_okai_interact.py` (offline: CSS+image load, checkbox, link click, back, Tab+typing+Enter submit, wheel), `test_okai_page.py <url> [tag] [--scroll N]` (load + screenshot any page), `test_links.py`, `test_nav.py`, `test_tab_x.py`, `test_addrbar.py`, `test_lock.py`, `test_errors.py`, `test_https_default.py`, `test_certfail.py` (starts its own self-signed `openssl s_server`), `test_resume.py`, `test_pki_qemu.py`, `test_google.py`, `test_google_search.py`, `test_firstrender.py`, `test_stale_doc.py`, `test_fixed_header.py` (self-contained fixtures), `test_boot_mem.py`, `test_font_render.py`, `test_css_box.py`, `test_sh_hello.py`.
-
-### Host preview (no QEMU)
-`build-host/wrender <corpus-name> <w> <h> out.ppm [page_h]` runs the exact engine sources (`src/web`) on the host — the same code okai links. `tests/web/compare.py` pairs it with an Edge screenshot.
-
----
-
-## Session Log (condensed)
-
-Older, fully-resolved narratives were collapsed. Newest first.
-
-**2026-10-08 (later) — mouse/cursor rework ("it feels laggier; rewrite the mouse, better cursor, more fps, no artifacts").** New `src/cursor.c`: PS/2 driver (1:1 packets with 9-bit sign + overflow, 200 Hz) and a framebuffer-composited cursor — a macOS-style AA arrow (black body, white outline, soft shadow) built at boot with the `ui_draw` rasterizer, alpha-blended over backbuffer pixels straight into video memory and moved inside the mouse IRQ; `graphics_flush` re-blends it after each interrupt-free chunk. The scene is never recomposited for mouse motion. Measured (TCG, `bench_mouse.py`, main-loop iterations/s before the idle halt): idle 7.6k → 187k, mouse over the terminal title bar 3.0k → 334k, over okai 2.6k → 116k; with the idle halt the CPU is ~1% busy while the pointer moves at the input-bound ~123 fps. Found and fixed bug #46 (LIFO keystrokes), #47 (clock starvation) and #49 (DF=1 inside interrupt handlers — a real memory-corruption bug shipped with the rep-movs memmove) on the way. New tests: `test_typing.py`, `test_scroll_irq.py`, `bench_mouse.py`.
-
-**2026-10-09 — SMP, step 1 of "more cores, SSE, GPU drivers" (bare metal later).** The kernel now runs on all cores: ACPI MADT parse, LAPIC (xAPIC and x2APIC), INIT/SIPI AP bring-up and a data-parallel job system. Design choice: APs never run kernel threads - they execute `smp_parallel_for` jobs only, so the scheduler, process table, okai/JS realm and windows stay single-CPU and nothing there had to become reentrant. The heap and PMM got spinlocks (IRQs off while held). Measured in QEMU/TCG: 2.1x / 4.0x / 6.7x on 2 / 4 / 8 CPUs for a CPU-bound loop; WHPX (real virtualization, incl. x2APIC): 4.03x on 4. Nothing uses it yet - next uses: parallel raster tiles, image decode, backbuffer flush. UEFI note: GRUB's multiboot1 does not pass the RSDP, so it is searched in the ACPI-reclaim/NVS regions of the memory map (untested without OVMF). Untested on real hardware.
-
-**2026-10-10 — media: decoders done, `play` works (QEMU).** CELT (own implementation, bit-exact to the RFC decoder), WebM demuxer, VP9 decoder (bit-exact vs ffmpeg), `play <url>` with audio+video sync (`tests/headless/test_play_video.py`: 300 frames in 10 s real time at 320x180 under TCG, screenshot matches the reference frame to 0.19 mean abs diff). Next: HTMLMediaElement backed by an incremental media engine (append bytes, trim consumed packets, seek to keyframes), MediaSource/SourceBuffer, painting video into the page surface, then SILK/hybrid, multi-core (`smp_parallel_for`) for loop filter / tiles, 8-bit sample storage to halve memory. See AGENTS.md (Media bullet) for the pitfalls.
-
-**2026-10-10 — media, step 1: sound output; Opus groundwork.** `src/hda.c` plays through Intel HD Audio (verified by recording QEMU's output: 440/1000 Hz tones exact, no dropouts). Found and fixed two bugs on the way: `pit_delay_us` (see AGENTS) and the played-data wipe erasing queued audio after one ring lap. Media decoding plan (YouTube = WebM, VP9 video + Opus audio, MediaSource): `src/media/ec.c` (Opus range decoder, from RFC 6716 4.1) and `opus_packet.c` (framing) exist; test vectors come from a host ffmpeg (test tooling only: `tests/media/gen_opus_vectors.py`) and the RFC's reference decoder serves as a host-side ORACLE for comparing output (extracted from the RFC text into the scratch dir, never in the repo). YouTube's Opus is CELT-only, so SILK is optional; the CELT half of the RFC is a prose description and the reference code is normative, so with the user's OK (2026-10-10) CELT is written from that source, our own structure, nothing copied.
-
-**2026-10-09 — runtime screen size + Intel groundwork (step 4).** For bare metal: the kernel no longer assumes 1920x1080; it takes whatever mode GRUB set (see AGENTS), tested at 1024x768, 1280x800, 1920x1080, 2560x1440 with the framebuffer and with virtio-gpu. The Intel part is deliberately conservative because QEMU has no Intel GPU and nothing can be verified here: boot-time probing reads PCI config only; the `gpu` shell command prints a read-only register report (pipes, planes, cursor, GTT entry of the scanout surface). The decode helpers are unit-tested (`tests/test_i915.c` caught a Sandy/Ivy Bridge id-range bug) and the whole probe/report path runs in a test kernel against QEMU's VGA (`test_i915_probe.py`). What is NOT done: any write to the display hardware (hardware cursor, direct scanout of the backbuffer through GTT entries, blitter) - each needs the generation-specific facts that the `gpu` report from the real machine provides.
-
-**2026-10-09 — virtio-gpu display backend (step 3).** `-vga virtio` (QEMU virtio-vga) now gives a GPU scanout: the kernel creates a 1920x1080 B8G8R8X8 resource backed directly by the backbuffer, `SET_SCANOUT`s it and presents damage rectangles with TRANSFER_TO_HOST_2D + RESOURCE_FLUSH; the mouse pointer is the device cursor. The same display-backend interface (`src/display.h`) is what the Intel driver plugs into next. Verified: every `test_gfx_verify.py` stage (typing, windows, okai, wheel, drag, wiggle) matches QEMU's screendump band for band, the usual headless suite passes under `OKVM_VGA=virtio` (+`OKVM_SMP=4`), WHPX profile identical to the framebuffer path on a static page. Notes: the main loop still spins at 100% on a LIVE page (Wikipedia: `okai_wants_cpu` stays true, probably page JS timers) with either backend - separate issue; the terminal's text-cursor blink presents a 12x24 rect each toggle, cheap with the framebuffer, a round trip with the GPU.
-
-**2026-10-09 — SSE2, write-combining framebuffer, damage tracking (step 2).** New cycle profiler (`prof on`, `[prof]` lines, `tests/headless/prof_win.ps1`): under WHPX it showed `graphics_flush` eating ~2/3 of all cycles while pages loaded (the main loop spins ~1.2M times/s while fetches are in flight, and each spin scanned 1080 dirty-row flags). Fixed with span-based damage tracking (O(1) idle flush, only dirty columns copied; `gfxcheck` + `test_gfx_verify.py` prove nothing is lost). Page scroll steps are ~1 ms of CPU under WHPX, so rendering itself is not the bottleneck there. For bare metal: the framebuffer is now mapped write-combining through the PAT (the old write-back mapping of a PCI-hole aperture would be seconds per frame). SSE2: enabled on every CPU, context switches use FXSAVE, `simd_copy*` used by the flush and blits (1.7x faster than rep movs here). Remaining spin: the loop cannot `hlt` during fetches because the e1000 is polled (IRQs masked) - an e1000 interrupt handler would let it sleep.
-
-**2026-10-09 — YouTube loads ("increase our size buffer, i want to watch youtube").** The page realm cap is now RAM-scaled (half the kernel heap, 207MB at `-m 512`; YouTube's watch page peaks at ~211MB heap / 106MB live) with a guard that keeps 1/8 of the kernel heap free whatever the tabs do. ArrayBuffer storage was not counted at all (`new ArrayBuffer(300e6)` took 300MB straight from kmalloc): it now goes through `gc_ext_alloc` and counts against the cap (`tests/ojs/memlimit.js`). Three engine bugs found on YouTube's 10.8MB app script: (1) the parser appended each function to its parent's child list by walking the list - quadratic for a bundle wrapper with 34k functions (11s parse); (2) `add_const` deduplicated by linear search - quadratic again (now a hash index past 16 constants); together kevlar_base went 12s -> 1.5s, babel's corpus run 5.5s -> 1.9s; (3) constant indices were 16-bit in CONST/CLOSURE/CLASS/REGEXP/THROW_ERR/CHECK_GLOBAL_DECLS/EVAL and the TDZ-check ops, and that wrapper has >65536 constants: indices wrapped and loaded another constant - a function template leaked into JS (`typeof` "number", `String()` ""), which broke YouTube's custom element registration. Now CONST_W / u32 operands (`tests/ojs/manyconsts.js`); captured variables are capped with an error like locals. Prelude: `ProcessingInstruction`, `Audio()`, a `BatteryManager` (on mains power) instead of a rejecting `getBattery`. `tests/headless/perf_win.ps1` typed every `e` as Esc under Windows PowerShell 5.1 ("`e" is a PS7-only escape). Still no media playback: `<video>`/`<audio>` refuse `play()`, there is no MediaSource, no video/audio decoder and no sound driver.
-
-**2026-10-09 — everything from scratch: ojs replaces QuickJS ("remake everything borrowed except fonts").** The kernel now contains no third-party code apart from the fonts. `src/ojs` is our JavaScript engine (parser, compiler, direct-threaded interpreter with inline caches, mark-sweep GC with conservative stack scanning, all built-ins, RegExp, BigInt, Proxy, typed arrays, modules); `src/kmath.c` replaced musl libm (commit 16a578a), `src/divdi3.c` replaces libgcc's 64-bit division (the kernel links no libgcc any more), `src/kclock.c` + `src/web/wjs_sys.c` replace the QuickJS libc shim. `src/qjs` and `tests/qjs` are deleted. Unicode tables (`src/ojs/unicode_data.c`) are generated from the UCD by our `tools/gen_unicode.py` (data). Found and fixed on the way, by running real code: `break` out of nested `for...of` skipped the inner iterator, `var x` redeclaring a parameter shadowed it, `null == undefined` was false, arrows in strict functions lost `this`, `let` in a `finally` reached by return/break, module function hoisting, enum-style `obj[1 << 29]` allocating a 1GB element array, O(N^2) shape property arrays, x87 rounding-mode switches on every double->int conversion (fldcw), interrupt/OOM accounting at the realm limit, UTF-16 script sources kept at twice their size (now UTF-8 after compile). Verified: test262 98.92% language / 98.61% built-ins+annexB (0 crashes, GC-stress clean); `tests/ojs/corpus` (babel, typescript incl. a typecheck, prettier, terser, acorn, esprima, lodash, ramda, immutable, rxjs, d3, react SSR, moment, marked, handlebars, js-yaml, decimal.js, pako, crypto-js) byte-identical to node, also under `OJS_GCSTRESS`; QuickJS's own test files pass except checks of QuickJS-only behaviour (refcount timing, its JSON error format); host `make web-tests` / `make host-tests`; full headless suite on the final ISO. Speed vs QuickJS 2026-06-04 (microbench, same 32-bit host): 1.2x total (calls 1.4x, regexp 1.3-1.5x, number formatting 2x; arithmetic, property access, typed arrays faster). Sites on the host vs the old build: Wikipedia, GitHub, MDN, NYT, StackOverflow 0 JS errors; python.org/apple.com fewer errors than QuickJS; BBC finishes but 5 jobs exceed the 1s task budget (GC-heavy React hydration; no budget = 0 errors); CNN is heavy (55-75MB live, close to the 96MB realm cap). Image: `_kernel_end` 11.3MB -> 7.5MB.
-
-**2026-10-08 — terminal-first fixes.** Removed the taskbar's KAnarchy launcher (the OS is driven from the terminal; `terminal` / Ctrl+Alt+T open more), fixed stale hover highlights (bug #44) and click focus by z-order (bug #45). New `test_desktop_ui.py` (passes on this build; on 90cf6c9 the launcher + focus checks fail — its hover checks don't trip under TCG, `hover_win.ps1` is the WHPX repro).
-
-**2026-10-07 (late night) — desktop restyle + speed pass ("taskbar, plain terminal, 3D wallpaper, optimize it to hell").** New `src/taskbar.c`: cached AA strip (frosted wallpaper tint, red KAnarchy mark that opens a terminal, per-window buttons with app icons + Noto titles + red focus pill, FPS chip, RTC clock), geometry logged as `[taskbar] btn` (okvm `taskbar_rect`). Title-bar windows (terminal, editor, sysinfo) now have a GNOME-style dark header bar with round close/minimize buttons, drawn with the shared `ui_draw.h` primitives; the red terminal chrome and the KAnarchy banner/welcome text are gone — the terminal opens as a plain 72x24 shell with just `kanarchy>`, left of the wallpaper emblem. Wallpaper: a raymarched chrome K in a red ring over a reflective grid floor (`tools/wallpaper/`, WebGL → JPEG, embedded and decoded at boot; replaces the 256-colour `wallpaper.h`, -1.2MB of source). Speed: `memcpy/memset/memmove` are `rep movs/stos` (were byte loops), dirty-row flush copies coalesced runs in one memcpy, wallpaper blits/rect fills/hlines/window-drag row moves use the same primitives. Measured (TCG, `bench_ui.py`, same wheel-scroll input): page scroll step 79.8M → 26.1M cycles; FPS under synthetic mouse motion is input-bound (~28 both). `bench_ui.py` scrolls with the wheel now (j/k silently no-op'd when the address bar had focus: 0 scrolls).
-
-**2026-10-07 (night) — okai chrome revamp ("make it look like modern Firefox").** New `src/okai_ui.c`: Proton-style light tab strip with a floating selected tab, Noto Sans titles with fade-out, globe/search favicons and a loading spinner, AA stroked nav icons (back/forward with disabled state, reload, home), rounded address field (host emphasized, `https://` trimmed, blue focus ring + caret, placeholder), site-identity button + panel (secure / not secure / built-in page), Firefox-style status panel, Windows-11 caption buttons with hover (red close). Window system: caption buttons for title-bar-less windows, maximize/restore. FPS counter moved to the taskbar. Tests aim from the `[okai] ui` geometry log; new `test_okai_chrome.py` (hover, focus ring, navigate, identity panel, tab open/close, restore/maximize, minimize + taskbar restore).
-
-**2026-10-07 (evening) — "loading is EXTREMELY SLOW": parallel networking.** Profiled first (`perf_load.py`: host-stamped serial timeline; pcap via `OKVM_PCAP` + `pcap_tcp.py`): every resource paid a fresh DNS+TCP+TLS handshake (~1s round trips on this network) strictly one at a time, the TLS driver decrypted one record per main-loop pass, and per-packet serial dumps cost port-I/O exits. Rewrote the client side of `network.c` (TCP socket table with ring-sized windows, batched ACKs, multi-entry DNS cache), added `src/net/fetch.c` (8 parallel GETs, keep-alive pool, `tls_state_reuse`), replaced okai's single owner with a request table (6 resources per tab in parallel), moved the e1000 to a 256-entry heap ring with masked IRQs, gated packet logging. Found on the way: no `Origin` on cross-origin XHR (BBC redirect loop), an 8s script budget freezing the OS (now 4s/1s), `udp_send` header offset. Acceleration: the kernel runs under WHPX (`run-windows.bat`) and KVM — rendering/JS/crypto ~10x faster than TCG. Results (TCG, same network): python.org 32.6s → 9.6s, apple.com 17.6s/13 resources → 5.9s/33, Wikipedia 23.5s for 10 resources → 22.3s for 43; under WHPX Wikipedia settles in ~12-14s with first render at ~4s. Full headless suite green.
-
-**2026-10-07 (late) — "half the sites give a connection or security error" fixed.** Census with `tls_scan` (kernel TLS client on the host, `tests/tls_hosts.txt`) went 31/91 → 86/91 (left: 3 TLS-1.2-only servers, netflix truncating mid-body, washingtonpost timing out). Causes and fixes: no name-bound anchoring + a tiny root store ("untrusted root" for most sites) → full Mozilla store with subject/SKI and `root_issued()`; 11 roots the strict parser rejected → `x509_parse_spki` (only the key is needed); OCSP staples from delegated/byKey responders rejected → supported, plus soft-fail for unverifiable staples; Akamai sites (eBay, Microsoft, Apple…) offer no ChaCha20 → constant-time AES-128-GCM. In the kernel, every HTTPS fetch had silently been timing out and downgrading to HTTP since the header change (bug #32), plus the DNS navigation race (#33), the stale previous-connection bytes parsed as the next ServerHello (reason=6 phase=1 on back-to-back sub-resources), timeout/ticket clock units (#34) and the `Accept: */*` 404 on crates.io. `test_sites.py` 15/15 over HTTPS (bot-protection 403s count — the TLS side works); adversarial 189/189 (+ASan), live MITM check PASS. Still failing: TLS-1.2-only servers (whatwg.org, baidu.com, arstechnica.com), netflix (server truncates), washingtonpost (times out).
-
-**2026-10-07 — Phase 6: real JavaScript (QuickJS), commit 67fc1c7.** See *Browser — page scripts*. QuickJS hosted-style on a freestanding libc shim + musl libm, x87 per-thread state, realm-per-document with budgets and abort containment; spec-shaped script scheduling incl. module graphs and deferred `import()`; Web API prelude + C DOM natives; events before default actions; fetch/XHR; cookie jar shared with HTTP. TCP sends split at the MSS (bug #31). tinyjs retired. Verified: Wikipedia (ResourceLoader, 10 scripts, 0 errors) in QEMU, `test_okai_js.py` + full headless suite, GitHub/MDN modules clean on the host under ASan.
-
-**2026-10-07 — new web engine integrated into the kernel (phases 0-5 done).** `src/web` linked into the desktop build (+`fontdata.asm`, `callstack.asm`); okai rewritten around `struct wdoc` (per-tab heap documents, per-window page surface via the new window pixel-surface mode, pixel hit-testing, coalesced renders, HTML error/home pages, forms incl. checkbox/radio/select, gzip, sub-resource images). Old renderer retired (`dom.c`, `css.c`, `layout.c`, `html.c` + their host tests/preview; the editor's slot map moved to `textslot.c`). Kernel fixes found on the way: boot PD widened to 0-64M PSE (bigger image put the boot stack past 4M → silent triple fault), HTTPS fetches no longer reuse the previous connection (every other sub-resource failed), TLS fetch ends at HTTP message completion (Google's trailing record fails AEAD on this path — OpenSSL too), 1024-byte request paths (Wikipedia's load.php URLs were truncated), host:port/IP default to http. Engine fixes: root/body gradient & image paint the canvas, inline-box fragments double-counted padding+border, percentage max-width on replaced elements zeroed their max-content (Wikipedia thumbnails at 100px). Verified in QEMU: home, example.com, Wikipedia (675KB gzip HTML, 2 CSS + 24 images, first render ~250-400ms), HN, Google search submit, error pages; full headless suite green; host CSS 54/54, corpus clean under ASan/UBSan.
-
-**2026-10-01 — KAnarchy rebrand + i18n push (overnight session).** Dual identity: KAnarchy OS product, okernel kernel. Boot/desktop/shell rebranded (red block-logo banner from `kanarchy.txt`, red prompt/chrome, `kanarchy-*.iso`, GRUB entries); code identifiers, User-Agent, and history prose intentionally untouched. things.txt done: flat-red terminal chrome (per-window `red_chrome` flag, square black buttons), closeable main terminal, global Ctrl+Alt+T (new Alt tracking in the keyboard driver), wallpaper replaced with a circled-K on black. Text boot resurrected (bug #30). Wikipedia zero-???: census found 459 fallback codepoints across ~25 scripts; transliteration tables for all of them (~4300 cases, generated from Unicode names with per-script review), 4-byte UTF-8 decoder + Gothic + math folds + astral drop, and a real-glyph CJK path (Unifont-extracted 16x16 bitmaps for 228 Han/Hangul/kana, raw-UTF-8 runs flagged `LAYOUT_FLAG_CJK`, codepoints bit-packed into unused model bytes so repair repaints stay exact — zero struct changes). Verified: portal 0 fallback '?', main-page only legit punctuation, torture page clean, host suite + sh_hello green, both ISOs screenshot-verified. Known gaps: Kanji beyond the 228-glyph table still '?', JA/ZH Wikipedias need table growth (mechanism supports it).
-
-**2026-09-30 — ring-0/ring-3 sorting, first slice (this session).** Centralized the ring-3 trap site: new `userland/usys.h`/`usys.c` carry the whole INT 0x80 ABI (0–17, raw-phys `SYS_MMAP_USER` deliberately excluded as ring-0-only); all 9 userland programs link it, 17 scattered `int $0x80` blocks deleted, `gen_*.h` reseeded. Validation caught a pre-existing kernel bug (not from this change — no `src/` file touched by it): the kbd offer-wake scan always picked wait-parked init over read-parked sh (bug #29 above), starving the shell; fixed plus the stale-arm on dropped offers. `test_sh_hello.py` fully green twice (`shell alive: PASS (sh)`).
-
-**2026-09-29 — wikipedia-with-languages follow-up (this session).** Cursor-compositor gating fully reverted per owner (main loop back to erase → scene → sprite → flush every spin; `graphics_flush` back to `void`). Real fixes underneath the reported symptoms: (1) sub-resource pipeline was dead — driver never kicked the first fetch AND stale main-page done/len fired a bogus `sub_res_done` eating queue entry 0 (external CSS parsed 0 rules; verified by hexdump of the response buffer). Both HTTP+HTTPS paths now kick `okai_start_sub_res_fetch`; external `<script src>` queueing restored to documented fetch-but-never-execute. (2) `<nav>` blanket-drop hid the portal's whole language grid (0 link runs) — landmarks now drop only on chrome class/id signals (bare landmarks still drop). (3) Latin-Extended + Cyrillic-Extended transliteration table (~60 cases: ČčĚěŘřŮůĂăȚțʻʼƏəЇїЄєҐґЎў…; narrow-nbsp → space) so language names read instead of `?`. (4) drain re-render skipped unless a stylesheet landed (`sub_res_css_changed`); error pages clear stale `g_lay` headings; occlusion-aware `window_paint_uncovered` stops background-terminal bleed-through. Verified headless repeatedly: portal with blue top-10 links, readable language list, search, sister projects; scrolling clean. **Open/accepted:** unfounded scripts (CJK/Arabic/Hebrew/Greek/Thai/Vietnamese-combining — no font), TLS fetch flakes (resumption reason=6, ciphertext/partial races pre-date this work), an intermittent blank render seen mid-session that resisted root-causing (identical-input layout divergence; checksum/purity probes added then removed — layout proven pure back-to-back; prime suspect is fetch-byte nondeterminism, not render).
-
-**2026-09-28 — render-performance pass + sub-resource repair (this session).** Wallpaper re-injected (`wallpaper.png` → `src/wallpaper.h` regen; the header was never regenerated after the swap, still all-zeros); icons shrunk 48→32px (cell 176→128). Typing/scroll costs cut: partial-dirty window repaint (keystroke = 1-3 cells, not full window), `draw_char_sized` fast paths (1:1 blit + hoisted coverage tables + blend early-out), `window_write_cell_rgb` skips `rgb_to_vga`, okai layout/blit split (j/k/wheel re-blit without `layout_run`; item-driven blit; quiet scroll logs), taskbar/FPS/overlay throttled (state-gated + chrome-dirty + anim check). Cursor-compositor gating was built then FULLY REVERTED per owner request — main loop is back to erase → scene → sprite → flush every spin. Sub-resource repair (real bugs, pre-existing): the fetch driver never kicked the first sub-res fetch AND the stale main-page done/len fired a bogus `sub_res_done` that ate queue entry 0 (external CSS parsed 0 rules — pages rendered unstyled); both HTTP+HTTPS paths now kick `okai_start_sub_res_fetch`. External `<script src>` queueing restored to HANDOFF parity (fetched, never executed — `n_js = 0` had dropped it); error pages clear stale `g_lay` headings. Verified headless: styled page (ext CSS 2 rules applied, JS fetched+skipped), scroll/link-click/nav all PASS at adapted fullscreen geometry (test_nav/test_links hardcode the old 1010,60 window — stale, fail on geometry, not on render). **Open:** h1 cascade color on external sheets, SYN-loss stall on refused ports (no RST handling), test_nav/test_links geometry refresh for the maximized browser.
-
-**2026-09-26 — browser rendering overhaul (this session).** Replaced the flat-token renderer with DOM+CSS+layout (see `dom.c`/`css.c`/`layout.c`). Fixed the 16-bit arena-offset corruption (#7) and the inert UA stylesheet (#8); wired external CSS fetching (#28) and disabled external JS execution (#27). Added `draw_char_cell` bg fill (#9), HTML-decoded `<link>`/`<script>` URLs, explicit-`http://` respect, and `#define lay`/`g_lay` cleanups. Host suites green; text build green. **Open:** the `draw_char_cell` full-content-area noise (deterministic) and the stalled sub-resource fetch / `[poll]` spam.
-
-**2026-09-12 — crypto hardening rounds 1-4 (commits 3035064, 7cfd158, 6ae95cc, 1ea10d8).** Four external reviews, all findings fixed and re-attacked: RNG tiering + fail-closed labels; certificate NC/SAN fail-closed + truncation; stapled-OCSP validation + Must-Staple; preloaded first-visit pins; deterministic-VM randomness (boot jitter + PFS seed); X25519 branchless field arithmetic + fail-closed API; hostname canonicalization; reused line-oriented HTTP framing; Poly1305 streaming API; SH reassembly; truncation integrity (mid-record EOF fatal, close_notify snapshot). Adversarial 183/183 + ASan/UBSan; differential tooling committed. **Open (accepted/documented):** OpenSSL-PSK-decline quirk, CT verification deferred, HTTP/2 future, TLS-Attacker resumption-continuity limitation.
-
-**2026-09-11 — TLS interop + OCSP/pins.** `ocsp.c` (issuer-signed, freshness, certID SHA-1/256); pin persistence (export/import + VFS hooks + reboot-survival); independent-stack interop loop; PSK offer bugs (binder prefix, kex mode, CH1 truncation). One undiagnosed silent-TLS-stall flake recorded honestly.
-
-**2026-09-10 — reviews, resumption, exec root-cause.** `make host-tests`; P-384 CV proof; scheduler generation guard; **exec resumed at EIP=user_esp / ESP=entered_ring3 root-caused** (PCB indexing — hence the `offsetof`-only rule); external review round 2 (78/78 + ASan); session resumption, OCSP offer, TOFU pinning; `test_links` 5/5; `resolve_href` port-drop fix; **usermode retired** (Phase 6 exit).
-
-**2026-09-09 — PKI + adversarial.** Full TLS 1.3 server authentication (chain, hostname, CV); adversarial suite (cert-verify mutation fuzz + 19-mode mock server); [ring-3 shell cutover debugging].
-
-**2026-09-08/07 — userland & kernel foundations.** High-half kernel (`linker-high.ld`, LOW trampoline, boot GDT, identity FB); preemptive scheduler via `process_switch_to`; syscall ABI 0-17; PFS + ATA first slice; better TCP; ring-3 entry (4 stacked GDT/IRET/paging/ESP0 bugs fixed).
-
-**2026-08 — okai browser polish.** Firefox-blue pixel chrome + theming; clickable toolbar nav + nav test; heading hierarchy (H1=3×/H2=2×); tabs/home/z-order fixes; terminal wheel scrollback; Cyrillic/tables; host preview; FPS regression fixes; okvm headless harness.
-
----
-
-## Next Steps
-
-1. **TLS coverage**: TLS 1.2 (ECDHE + AES-GCM/ChaCha20, needed for whatwg.org, baidu.com, arstechnica.com) and the SHA-384 schedule for TLS_AES_256_GCM_SHA384. The intermittent resumption failure noted 2026-09-29 should be re-checked now that stale previous-connection bytes are dropped.
-2. **JavaScript**: canvas 2D, WebSocket over TLS, layout-dependent APIs that need a fresh layout mid-script, performance on heavy SPAs (budget slices). ojs: lazy function compilation (big bundles compile every function up front: memory on CNN-class pages), a generational/incremental GC (BBC spends ~1s in GC; a few React jobs pass the 1s task budget), explicit resource management (`using`, DisposableStack), Intl beyond the prelude's en-US subset, the remaining test262 failures (Annex B eval/function edge cases, `with` + compound assignment, Unicode property tests from a different UCD version).
-3. **Engine fidelity**: GitHub's right "About" sidebar and button wrapping, `position: sticky`, transforms beyond translate, smoother JPEG chroma upsampling, CJK TrueType fallback, `<select>` popup menu.
-4. **Networking**: HTTP/2 (multiplexing would replace the 6-connections-per-host fan-out), POST bodies, a congestion window for real (non-SLIRP) networks, incremental layout for script layout queries (scripts that poll `offsetWidth` in a loop hit the 4s budget).
-5. **Deferred (unchanged):** CT/SCT verification, HTTP/2, OpenSSL-PSK inquiry.
-
----
+Build and test run in WSL (`MSYS_NO_PATHCONV=1 wsl -e bash -lc 'cd /mnt/d/projects/okernel && ...'`); Windows has node and Edge (used as references). **Run accelerated**: Windows `run-windows.bat` (WHPX, 1536 MB, HD Audio; add `-serial file:serial.log` for the log), Linux `-accel kvm`. TCG is ~10x slower. QEMU needs `-vga std -device e1000`.
+
+- **Headless**: `tests/headless/okvm.py` drives QEMU; the serial log is ground truth. `python3 tests/headless/run_suite.py -j3 test_*.py`. Core browser set: `test_okai_{js,interact,frames,media,cache,preload,preview,stream,webapi,postmessage,wasm,longurl,reqheaders}.py`, `test_captcha_ddg`, `test_nav`, `test_errors`, `test_tab_x`, `test_sites.py` (15 real HTTPS sites). Fixed-port suites clash in parallel: rerun a failing one alone.
+- **Windows/WHPX**: `tests/headless/perf_win.ps1 -Accel whpx -Mem 1536 -Urls <url> -Settle N -Shot out.ppm` (YouTube: `https://www.youtube.com/watch?v=aqz-KE-bpKQ`), `-PreCmd "fetchhdr"` logs request heads. Slow-CPU model: `-icount shift=0` (see AGENTS).
+- **Host browser**: `sh tests/web/build.sh`, then `build-host/wbrowse URL|file W H out.ppm secs` (same engine on the host; env `OJS_NOBUDGET`, `OJS_TRACE_THROW`, `OJS_TRACE_MISS`, `WB_EVAL`, `WB_PRE`/`WB_DUMP`). Edge reference tools: `tests/web/trace_edge.mjs`, `headers_edge.mjs`, `surface_make_cmp.py`.
+- Shell commands (Scrawl terminal): `about audio beep clear cpu dhcp disk echo edit exit fetchhdr game gfxcheck gpu help ip ipconfig locktest ls mem neofetch netdrop nettrace okai open ping play prof ps reboot resolve run save shutdown simd smp stopplay sysinfo terminal touchpad uptime usb wifi wifigui`.
+
+## Rules that bite (details and the story behind each: AGENTS.md)
+
+1. Paging before the framebuffer (identity-mapped, above 4 MB); the boot PD maps phys 0-64M with 4 MB pages and the image must fit.
+2. **The cursor lives on the framebuffer**, moved in the mouse IRQ. Never draw it into the backbuffer or recomposite for mouse motion. Direct backbuffer writes must call `graphics_mark_dirty`/`graphics_mark_rect`.
+3. Never a bare `sti` in code reachable from an IRQ (keystrokes came out reversed). Keys are queued by IRQ1 and dispatched from the main loop; shell, navigation and page JS never run in an interrupt.
+4. The main loop halts when idle; packets are polled. Anything per-iteration that touches MMIO starves the PIT.
+5. XMM only in `simd.c`/`vp9_simd.c`; handlers never touch it. ISR stubs `cld` first. `memcpy` is `rep movs`.
+6. New `struct process` fields go at the tail; use `offsetof`. `sched_yield` on the trap stack never switches CR3/ESP0. Syscall pointers go through `paging_user_range_valid`.
+7. `-fno-pic -fno-pie -mno-red-zone`; `section .note.GNU-stack` last in `.asm`. Big tables on the heap, not BSS.
+8. Web engine: integer/fixed-point (LU = 1/64 px), no libgcc (`w_div64`/`w_muldiv`), every engine call through `run_job()` (own 1 MB stack). ojs: doubles at 53-bit x87 precision, never cast double to int in hot paths (`d2i64`/`dtoi32`), values held in C memory must be GC roots.
+9. TCP: the advertised window is the ring's free space; fast retransmit counts only pure-ACK repeats. e1000 RX: `RDT` = last processed index.
+10. TLS: HKDF labels need `"tls13 "`; transcript hash is over handshake messages, not records; nonce = IV xor sequence; plaintext ends with the content type then zeros; offer only x25519 in `key_share`.
+11. Hardware that QEMU cannot show (laptop touchpad, USB quirks, power MSRs) gets a log path (`devlog`, stick log), not blind writes.
+12. Tooling: Python patch scripts mangle `\n` inside C string literals (use Edit); if WSL shows files as mode 000, `find . -path ./.git -prune -o -type f -perm 000 -print0 | xargs -0 chmod 755`.
+
+## YouTube and the attestation wall
+
+Watch pages load, search works, video plays smoothly (28-31 fps, A/V in sync, streaming fetch, MSE ad hand-over fixed, Range-streamed long videos). After ~25-50 s the video servers answer 107/123-byte refusals and `youtubei/v1/player` returns a 549-byte error: BotGuard's token is not accepted. Signing in does not change it (sign-in itself works since URLs are 8 KB and cookies uncapped).
+
+Measured, not solved (AGENTS "Why is YouTube's BotGuard token rejected"): BotGuard runs to completion here and produces a snapshot the same size as Edge's, but it computes its signals inside its own VM, so API traces cannot show what it dislikes. Fixed on the way: wire User-Agent now equals `navigator.userAgent`, `Accept-Language`, `Referer`, Fetch Metadata, Origin on unsafe methods, WebIDL shapes. Remaining differences from Edge: no Trusted Types, no `Intl`, no WebGL/Web Audio, a stub `about:blank` iframe window, the JS engine itself (not V8). Policy: no spoofing, no Chrome identity.
+
+## Real laptop (optional, later)
+
+Cherry Trail Atom laptop (1.6 GHz, I2C touchpad, RTL8821CE Wi-Fi). Boots via `make laptop` (BIOS and UEFI); touchpad, USB mouse and logging to the boot stick work; the first real runs found most of the hard bugs (I2C base from firmware AML, xHCI ring-end stall, MSR freeze). Wi-Fi PCIe, audio and Intel graphics are untested on hardware. Details in LAPTOP.md and AGENTS.md (touchpad, xHCI, stick-log bullets).
+
+## Known limits
+
+TLS 1.3 only (no TLS 1.2, no SHA-384 suites). HTTP/2 without push; no congestion control. No WebGL, Web Audio, WebRTC, EME, ServiceWorker, XPath, multipart uploads, `position: sticky`; transforms are translate-only; CJK beyond the bitmap table is tofu. Wasm: no SIMD/threads/exceptions. SILK/hybrid Opus and AAC SBR missing. Page JS is slow under TCG (use WHPX/KVM). Single scheduler CPU. In-memory VFS: only PFS-synced files survive reboot.
+
+## Bug classes worth remembering
+
+Stale objects after a header change (keep `-MMD -MP`); 16-bit offsets in big arenas; stale buffers leaking into the next request; DNS/fetch owner races (now a request table); polled hardware starved by a spinning loop; interrupts re-enabled inside handlers; DF set when an interrupt lands in a backward `memmove`; PS/2 init reading config bytes without waiting; clicks routed by slot instead of z-order; cached chrome re-rendered under a small clip; quadratic parser/const-table code on huge bundles; 16-bit const indices; URL/cookie buffers that silently truncate.
+
+## Next steps
+
+1. **BotGuard, if wanted**: Trusted Types (small), `Intl.DateTimeFormat`/`NumberFormat` (large), real `about:blank` iframe realms (large); re-measure each with the trace tools. Odds are low; the server never says why.
+2. **Web**: `window` attributes as accessors, hide internal `_names`, `position: sticky`, richer transforms, WebGL/Web Audio only if a real use appears.
+3. **Net/TLS**: TLS 1.2 + SHA-384 (whatwg.org, baidu.com), real congestion window for non-SLIRP networks.
+4. **JS engine**: lazy function compilation, generational GC, `using`/DisposableStack, remaining test262 edge cases.
+5. **Laptop** (only when the owner asks): verify PCIe Wi-Fi, audio, Intel scanout from our own buffer.
+6. Name `Scrawl` is docs-only so far; wiring it into `about`/`sysinfo`/the terminal prompt is a small change if the owner wants it.
+
+## History (one line each)
+
+- 2026-09: high-half kernel, preemptive scheduler, ring-3 userland, PFS; TLS 1.3 + PKI hardened through four external reviews.
+- 2026-09-26/10-07: new web engine (DOM, CSS, layout, painter) replaces the flat renderer; page scripting (QuickJS at first); parallel networking; Mozilla roots; AES-GCM; Firefox-style chrome; taskbar and wallpaper.
+- 2026-10-08: cursor moved to the framebuffer, idle halt, key queue; mouse/keyboard/clock/memmove bugs fixed.
+- 2026-10-09: SMP, SSE2, damage tracking, virtio-gpu, runtime resolution, i915 groundwork; **ojs replaces QuickJS** (all from scratch except fonts).
+- 2026-10-10/11: UEFI laptop image, ACPI power, HD Audio, Opus/VP9/H.264/AAC + media engine, Canvas 2D; xHCI pointer driver, I2C touchpad, stick log.
+- 2026-10-12/13: Wi-Fi (USB then PCIe), slow-CPU model, idle LAPIC sleep, iframes, forms/POST, dmccl + game.
+- 2026-10-14/15: page-load speed (cache, preload scanner, HTTP/2, preview), YouTube home/search/consent fixes, layout memo, A/V sync.
+- 2026-10-16: MSE ad hand-over, stale-wake-up and fetch-starvation fixes, big Web API wave (Workers, IndexedDB, SubtleCrypto, WebAssembly, streams), streaming `fetch()`, 8 KB URLs, WebIDL shapes, BotGuard investigation, honest HTTP request metadata; desktop named **Scrawl**.
