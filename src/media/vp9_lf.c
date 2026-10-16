@@ -174,9 +174,41 @@ static void superblock_filter(struct vp9_dec* d, int plane, int pass, int row, i
     }
 }
 
+// The filter order is raster over superblocks (all vertical edges of a superblock, then its horizontal edges, per plane). A superblock
+// only touches pixels of its own area, 8 columns of the superblock to its left (vertical edges) and 8 rows of the one above (horizontal
+// edges), which that one's right neighbour has changed as well: so superblock (r, c) may run as soon as (r-1, c+1) is done. Rows therefore
+// run as a wavefront on several CPUs, each a column pair behind the row above, with the same result as the raster order.
+#define LF_MAX_ROWS 128
+struct lf_wave {
+    struct vp9_dec* d;
+    int simd, cols;
+    volatile int progress[LF_MAX_ROWS];                           // superblocks done in each row
+};
+
+static void lf_row_task(void* ctx, int r) {
+    struct lf_wave* w = (struct lf_wave*)ctx;
+    struct vp9_dec* d = w->d;
+    for (int c = 0; c < w->cols; c++) {
+        if (r > 0) {
+            int need = c + 2 < w->cols ? c + 2 : w->cols;
+            while (__atomic_load_n(&w->progress[r - 1], __ATOMIC_ACQUIRE) < need) __asm__ volatile("pause" ::: "memory");
+        }
+        for (int plane = 0; plane < 3; plane++)
+            for (int pass = 0; pass < 2; pass++) superblock_filter(d, plane, pass, r * 8, c * 8, w->simd);
+        __atomic_store_n(&w->progress[r], c + 1, __ATOMIC_RELEASE);
+    }
+}
+
 void vp9_loop_filter_frame(struct vp9_dec* d) {
     loop_filter_frame_init(d);
     int simd = vp9_simd_ok();
+    if (d->par_run && d->sb64_rows > 1 && d->sb64_rows <= LF_MAX_ROWS) {
+        struct lf_wave w;
+        w.d = d; w.simd = simd; w.cols = d->sb64_cols;
+        for (int i = 0; i < d->sb64_rows; i++) w.progress[i] = 0;
+        d->par_run(d->par_user, lf_row_task, &w, d->sb64_rows);
+        return;
+    }
     for (int row = 0; row < d->mi_rows; row += 8)
         for (int col = 0; col < d->mi_cols; col += 8)
             for (int plane = 0; plane < 3; plane++)

@@ -26,6 +26,9 @@ struct opus_packet {
 // Parse the TOC and frame layout (section 3). Returns 0 or -1 for a malformed packet.
 int opus_parse_packet(const uint8_t* data, int len, struct opus_packet* out);
 
+// Same, for the self-delimited framing the packets of all but the last stream of a multistream packet use (Appendix B); *used = bytes taken.
+int opus_parse_packet_sd(const uint8_t* data, int len, struct opus_packet* out, int* used);
+
 enum {
     OPUS_ERR_BAD_ARG = -1,
     OPUS_ERR_INVALID_PACKET = -4,
@@ -35,6 +38,11 @@ enum {
 
 struct opus_dec;
 struct opus_dec* opus_dec_new(int channels);          // channels: 1 or 2 (output)
+// Multistream (OpusHead mapping family 1: 5.1, 7.1...): `streams` Opus streams (the first `coupled` are stereo, the rest mono) whose
+// channels `map[0..channels-1]` pick (255 = silence). opus_decode() then returns STEREO (the Vorbis channel order is mixed down the
+// way Web Audio does); opus_decode_raw() returns all `channels` channels. channels <= 2 with one stream is the plain decoder.
+struct opus_dec* opus_dec_new_ms(int channels, int streams, int coupled, const uint8_t* map);
+int opus_decode_raw(struct opus_dec* d, const uint8_t* data, int len, int16_t* pcm, int max_frames, int* channels);
 void opus_dec_free(struct opus_dec* d);
 void opus_dec_reset(struct opus_dec* d);              // after a seek
 // Decode one packet. pcm gets nframes * channels int16 samples; max_frames is its capacity

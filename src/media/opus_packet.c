@@ -96,3 +96,86 @@ int opus_parse_packet(const uint8_t* data, int len, struct opus_packet* o) {
     for (int i = 0; i < m; i++) { o->frame[i] = p; o->size[i] = sizes[i]; p += sizes[i]; }
     return 0;
 }
+
+// Self-delimited framing (RFC 6716, Appendix B): the packets of every stream of a multistream packet except the last one carry
+// the length of their final frame explicitly, so the next stream's packet can be found behind it. `*used` = bytes this packet occupies.
+int opus_parse_packet_sd(const uint8_t* data, int len, struct opus_packet* o, int* used) {
+    if (len < 1) return -1;
+    int toc = data[0];
+    o->config = toc >> 3;
+    o->stereo = (toc >> 2) & 1;
+    o->mode = o->config < 12 ? OPUS_MODE_SILK : o->config < 16 ? OPUS_MODE_HYBRID : OPUS_MODE_CELT;
+    if (o->config < 12) o->bandwidth = o->config < 4 ? OPUS_BW_NB : o->config < 8 ? OPUS_BW_MB : OPUS_BW_WB;
+    else if (o->config < 16) o->bandwidth = o->config < 14 ? OPUS_BW_SWB : OPUS_BW_FB;
+    else {
+        int g = (o->config - 16) >> 2;
+        o->bandwidth = g == 0 ? OPUS_BW_NB : g == 1 ? OPUS_BW_WB : g == 2 ? OPUS_BW_SWB : OPUS_BW_FB;
+    }
+    o->frame_ms10 = frame_ms10_tab[o->config];
+    const uint8_t* p = data + 1;
+    int avail = len - 1;
+    for (int i = 0; i < OPUS_MAX_FRAMES; i++) { o->frame[i] = 0; o->size[i] = 0; }
+    int u, n1, n2;
+    switch (toc & 3) {
+    case 0:
+        u = read_len(p, avail, &n1);
+        if (u < 0 || n1 > 1275 || n1 > avail - u) return -1;
+        o->nframes = 1; o->frame[0] = p + u; o->size[0] = n1;
+        *used = 1 + u + n1;
+        return 0;
+    case 1:
+        u = read_len(p, avail, &n1);
+        if (u < 0 || n1 > 1275 || 2 * n1 > avail - u) return -1;
+        o->nframes = 2;
+        o->frame[0] = p + u; o->size[0] = n1;
+        o->frame[1] = p + u + n1; o->size[1] = n1;
+        *used = 1 + u + 2 * n1;
+        return 0;
+    case 2: {
+        u = read_len(p, avail, &n1);
+        if (u < 0) return -1;
+        int u2 = read_len(p + u, avail - u, &n2);
+        if (u2 < 0 || n1 > 1275 || n2 > 1275 || n1 + n2 > avail - u - u2) return -1;
+        o->nframes = 2;
+        o->frame[0] = p + u + u2; o->size[0] = n1;
+        o->frame[1] = p + u + u2 + n1; o->size[1] = n2;
+        *used = 1 + u + u2 + n1 + n2;
+        return 0;
+    }
+    default: break;
+    }
+    if (avail < 1) return -1;
+    int fc = p[0];
+    int m = fc & 0x3F, vbr = (fc >> 7) & 1, pad = (fc >> 6) & 1;
+    p++; avail--;
+    if (m == 0 || m > OPUS_MAX_FRAMES || (long)m * o->frame_ms10 > 1200) return -1;
+    int padding = 0;
+    if (pad) {
+        for (;;) {
+            if (avail < 1) return -1;
+            int b = *p++; avail--;
+            if (b == 255) padding += 254;
+            else { padding += b; break; }
+        }
+    }
+    int sizes[OPUS_MAX_FRAMES], total = 0;
+    if (!vbr) {
+        u = read_len(p, avail, &n1);
+        if (u < 0 || n1 > 1275) return -1;
+        p += u; avail -= u;
+        for (int i = 0; i < m; i++) { sizes[i] = n1; total += n1; }
+    } else {
+        for (int i = 0; i < m; i++) {
+            u = read_len(p, avail, &n1);
+            if (u < 0 || n1 > 1275) return -1;
+            p += u; avail -= u;
+            sizes[i] = n1; total += n1;
+        }
+    }
+    if (total + padding > avail) return -1;
+    o->nframes = m;
+    const uint8_t* q = p;
+    for (int i = 0; i < m; i++) { o->frame[i] = q; o->size[i] = sizes[i]; q += sizes[i]; }
+    *used = (int)(q - data) + padding;
+    return 0;
+}

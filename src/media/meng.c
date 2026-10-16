@@ -60,8 +60,9 @@ static int vw_pending(const struct meng* m);
 // clock going. The boot CPU copies a few packets into a job, hands it over (one asynchronous SMP job) and presents finished pictures
 // when their time comes. While a job runs the boot CPU touches none of what the job uses: the packets are copies, the pictures go
 // into private ring slots, the decoder belongs to the job. Seeks and teardown wait for it (vw_sync).
-#define VW_RING 4                       // converted pictures waiting for their presentation time
-#define VW_BATCH 4                      // packets per job
+#define VW_RING 6                       // pictures in flight: being decoded, waiting for a converter, converted and waiting for their time
+#define VW_CONV 2                       // colour-conversion jobs at once (each on its own CPU when there are enough)
+#define VW_BATCH 3                      // packets per decode job
 #define VW_AHEAD_NS 40000000LL          // decode this far beyond the presentation lead
 #define VW_MIN_SHOW_NS 25000000LL       // behind: convert (and show) a picture at least this often
 
@@ -70,10 +71,16 @@ struct vslot {
     size_t cap;                         // pixels
     int w, h, src_w, src_h;
     int64_t pts;
-    volatile int state;                 // 0 free, 1 claimed by the running job, 2 ready (written by the job, released by the engine)
+    volatile int state;                 // 0 free, 1 claimed by the decode job, 3 decoded (planes in `yuv`), 4 being converted, 2 ready (px)
+    uint16_t* yuv;                      // a private copy of the decoded planes: the decoder reuses its own buffers, and the conversion runs on
+    size_t yuv_cap;                     // another CPU while the decoder already works on the next picture (samples)
+    struct vp9_image img;               // describes that copy
+    int ow, oh;                         // the size to convert to
 };
 
+struct vtp;
 struct vjob {
+    struct vtp* tp;                     // tile-parallel executor of this worker (kernel with >= 3 CPUs), or 0
     struct vp9_dec* vd;
     uint32_t (*ticks)(void);
     uint8_t* data;                      // copies of the packets, one after the other
@@ -87,19 +94,25 @@ struct vjob {
     int error;
 };
 
+static int g_vp9_par = 1;
+void meng_set_parallel(int on) { g_vp9_par = on; }
+int meng_get_parallel(void) { return g_vp9_par; }
+
 static void vw_run(void* ctx, uint32_t item, uint32_t cpu);
+static void vc_run(void* ctx, uint32_t item, uint32_t cpu);
+typedef void (*vjob_fn)(void* ctx, uint32_t item, uint32_t cpu);
 
 #ifdef KERNEL
 struct vhandle { struct smp_async a; };
 static int vh_can(void) { return smp_ncpu() > 1 && !smp_on_ap(); }
-static int vh_start(struct vhandle* h, void* ctx) { return smp_async_start(vw_run, ctx, &h->a); }
+static int vh_start(struct vhandle* h, vjob_fn fn, void* ctx) { return smp_async_start(fn, ctx, &h->a); }
 static int vh_done(struct vhandle* h) { return smp_async_done(&h->a); }
 #elif defined(MENG_PTHREAD)
-struct vhandle { pthread_t t; volatile int done; int live; void* ctx; };
+struct vhandle { pthread_t t; volatile int done; int live; void* ctx; vjob_fn fn; };
 static int vh_can(void) { return 1; }
-static void* vh_thread(void* p) { struct vhandle* h = (struct vhandle*)p; vw_run(h->ctx, 0, 1); __sync_synchronize(); h->done = 1; return 0; }
-static int vh_start(struct vhandle* h, void* ctx) {
-    h->done = 0; h->ctx = ctx; h->live = 1;
+static void* vh_thread(void* p) { struct vhandle* h = (struct vhandle*)p; h->fn(h->ctx, 0, 1); __sync_synchronize(); h->done = 1; return 0; }
+static int vh_start(struct vhandle* h, vjob_fn fn, void* ctx) {
+    h->done = 0; h->ctx = ctx; h->fn = fn; h->live = 1;
     if (pthread_create(&h->t, 0, vh_thread, h)) { h->live = 0; return -1; }
     return 0;
 }
@@ -111,14 +124,85 @@ static int vh_done(struct vhandle* h) {
 #else
 struct vhandle { int unused; };
 static int vh_can(void) { return 1; }
-static int vh_start(struct vhandle* h, void* ctx) { (void)h; vw_run(ctx, 0, 0); return 0; }      // the host has no second CPU in the tests: the job runs at once
+static int vh_start(struct vhandle* h, vjob_fn fn, void* ctx) { (void)h; fn(ctx, 0, 0); return 0; }      // the host has no second CPU in the tests: the job runs at once
 static int vh_done(struct vhandle* h) { (void)h; return 1; }
 #endif
 
+// Tile-parallel VP9 decoding in the kernel: the decode job (on one AP) hands the tile columns of a frame to idle CPUs through the SMP mailbox
+// and works on them itself. Helpers claim tasks with a compare-and-swap on one word (generation << 32 | next index); the word is "closed"
+// (next = all ones) as soon as a frame's tasks are all claimed, so a helper that only starts running later - after the frame is over and
+// the fields below have been rewritten - finds nothing to do, and a claimed task can never belong to another frame (the owner does not
+// return before every claimed task is done).
+#ifdef KERNEL
+#define VTP_HELPERS 3
+struct vth { struct vtp* p; volatile uint32_t gen; struct smp_async h; };
+struct vtp {
+    vp9_par_task task;
+    void* ctx;
+    volatile uint32_t n, done, gen;
+    volatile uint64_t word;
+    volatile uint32_t by_owner, by_helper;       // tile tasks run by the decode job itself / by helper CPUs (statistics)
+    struct vth th[VTP_HELPERS];
+};
+
+static void vtp_claim_loop(struct vtp* p, volatile uint32_t* mygen, int owner) {
+    for (;;) {
+        uint64_t w = p->word;
+        uint32_t g = (uint32_t)(w >> 32), i = (uint32_t)w;
+        if (g != *mygen || i >= p->n) return;
+        if (__sync_bool_compare_and_swap(&p->word, w, w + 1)) {
+            p->task(p->ctx, (int)i);
+            __sync_fetch_and_add(owner ? &p->by_owner : &p->by_helper, 1);
+            __sync_fetch_and_add(&p->done, 1);
+        }
+    }
+}
+
+static void vtp_help(void* ctx, uint32_t item, uint32_t cpu) {
+    (void)item; (void)cpu;
+    struct vth* t = (struct vth*)ctx;
+    vtp_claim_loop(t->p, &t->gen, 0);
+}
+
+static void vw_par_run(void* user, vp9_par_task task, void* ctx, int n) {
+    struct vtp* p = (struct vtp*)user;
+    int helpers = smp_ncpu() - 2;                       // one AP is this very job
+    if (helpers > VTP_HELPERS) helpers = VTP_HELPERS;
+    if (helpers > n - 1) helpers = n - 1;
+    if (helpers < 1) { for (int i = 0; i < n; i++) task(ctx, i); return; }
+    uint32_t gen = ++p->gen;
+    p->task = task; p->ctx = ctx; p->n = (uint32_t)n; p->done = 0;
+    for (int i = 0; i < helpers; i++) p->th[i].gen = gen;
+    __sync_synchronize();
+    p->word = (uint64_t)gen << 32;                      // open
+    __sync_synchronize();
+    for (int i = 0; i < helpers; i++) { p->th[i].p = p; smp_async_start(vtp_help, &p->th[i], &p->th[i].h); }
+    vtp_claim_loop(p, &gen, 1);
+    while (p->done < (uint32_t)n) __asm__ volatile("pause" ::: "memory");
+    p->word = ((uint64_t)gen << 32) | 0xFFFFFFFFu;      // closed: nothing more to claim until the next frame
+    __sync_synchronize();
+}
+#endif
+
+// one colour-conversion job: slot -> ARGB at the output size
+struct vconv {
+    struct vhandle h;
+    int busy;
+    struct vslot* s;
+    struct vscratch vs;
+    uint32_t (*ticks)(void);
+    uint32_t used;                      // ticks the job took
+    int ok;
+};
+
 struct vwork {
+#ifdef KERNEL
+    struct vtp tp;
+#endif
     struct vjob job;
     struct vslot slot[VW_RING];
     struct vhandle h;
+    struct vconv conv[VW_CONV];
     int busy;
     int64_t last_conv_pts;              // presentation time of the last picture handed to the converter
     int dead;                           // a job never finished: its memory is abandoned, the worker is off for good
@@ -172,6 +256,8 @@ struct meng {
     int acodec, vcodec;                 // AC_* / VC_*
     int a_owner, v_owner;               // source buffer carrying each track (-1 none)
     int pre_skip, gain_q8;
+    int op_channels, op_streams, op_coupled;   // Opus channel mapping (OpusHead family 1: 5.1 and so on); 0 channels = plain mono/stereo
+    uint8_t op_map[8];
     int64_t delay_ns;                   // Opus encoder delay: presentation time = webm time - delay
     int v_w, v_h;
     int tracks_known;
@@ -238,6 +324,7 @@ struct meng {
     int have_last_img;
     uint32_t v_decoded, v_shown, v_dropped;
     uint32_t v_last_show;               // tick of the last presented frame (a backlog never starves the picture)
+    uint32_t v_cvt_ticks, v_cvt_n;      // colour conversion (10 ms ticks) and pictures converted
     uint32_t v_dec_ticks, v_dec_n;      // time spent in video_decode_one (10 ms ticks, quantised but unbiased on average) and calls
     uint32_t v_maxgap;                  // longest gap between two presented frames since meng_take_maxgap (ticks), for the rate line
     uint32_t v_cool_until;              // no video decoding before this tick: a decoder that cannot keep up gets a third of the CPU, not all of it
@@ -360,8 +447,21 @@ static uint32_t pq_find_key(const struct pq* q, int64_t t) {
 // ---------------------------------------------------------------------------
 // source buffers
 
+// The channel layout of an Opus track (OpusHead bytes 9 and 18.. / dOps bytes 1 and 10..): `rest` = stream count, coupled count, mapping.
+// Mono and stereo use the plain decoder; family 1 with more channels is a multistream (a 5.1 mix is 4 streams) that is mixed down to stereo.
+static void opus_layout(struct meng* m, int channels, int family, const uint8_t* rest, int rest_len) {
+    m->op_channels = 0;
+    if (m->od) { opus_dec_free(m->od); m->od = 0; }
+    if (channels <= 2 || family != 1 || !rest || rest_len < 2 + channels || channels > 8) return;
+    m->op_channels = channels;
+    m->op_streams = rest[0];
+    m->op_coupled = rest[1];
+    for (int i = 0; i < channels; i++) m->op_map[i] = rest[2 + i];
+}
+
 static void want_decoders(struct meng* m) {
-    if (m->acodec == AC_OPUS && !m->od) m->od = opus_dec_new(2);
+    if (m->acodec == AC_OPUS && !m->od)
+        m->od = m->op_channels > 2 ? opus_dec_new_ms(m->op_channels, m->op_streams, m->op_coupled, m->op_map) : opus_dec_new(2);
     if (m->vcodec == VC_VP9 && !m->vd) m->vd = vp9_dec_new();
 }
 
@@ -394,6 +494,7 @@ static void on_tracks(void* u, const struct webm_info* info) {
             if (t->priv_len >= 19 && memcmp(t->priv, "OpusHead", 8) == 0) {
                 m->pre_skip = t->priv[10] | t->priv[11] << 8;
                 m->gain_q8 = (int16_t)(t->priv[16] | t->priv[17] << 8);
+                opus_layout(m, t->priv[9], t->priv[18], t->priv_len >= 21 ? t->priv + 19 : 0, t->priv_len - 19);
             }
             m->delay_ns = frames_to_ns(m->pre_skip);
         } else if (t->type == WEBM_TRACK_VIDEO && (s->kinds & 2) && strcmp(t->codec, "V_VP9") == 0 &&
@@ -462,6 +563,7 @@ static void on_tracks_mp4(void* u, const struct mp4_info* info) {
                 m->acodec = AC_OPUS;
                 m->pre_skip = t->config[2] << 8 | t->config[3];
                 m->gain_q8 = (int16_t)(t->config[8] << 8 | t->config[9]);
+                opus_layout(m, t->config[1], t->config[10], t->config_len >= 13 ? t->config + 11 : 0, t->config_len - 11);
                 m->delay_ns = frames_to_ns(m->pre_skip);
             } else continue;
             m->a_present = 1;
@@ -1158,45 +1260,78 @@ static int video_decode_one_raw(struct meng* m) {
 
 // ---- video decode worker ----
 
+// copy the decoded planes into the slot (tight strides): the decoder keeps working while another CPU converts this picture
+static int slot_copy(struct vslot* s, const struct vp9_image* img) {
+    size_t cw = (size_t)img->chroma_width, ch = (size_t)img->chroma_height, w = (size_t)img->width, h = (size_t)img->height;
+    size_t need = w * h + 2 * cw * ch;
+    if (need > s->yuv_cap) {
+        uint16_t* p = (uint16_t*)MEDIA_ALLOC(need * 2 + 64);
+        if (!p) return -1;
+        if (s->yuv) MEDIA_FREE(s->yuv);
+        s->yuv = p;
+        s->yuv_cap = need;
+    }
+    uint16_t* d = s->yuv;
+    s->img = *img;
+    for (int pl = 0; pl < 3; pl++) {
+        size_t pw = pl ? cw : w, ph = pl ? ch : h;
+        for (size_t y = 0; y < ph; y++) memcpy(d + y * pw, img->plane[pl] + y * (size_t)img->stride[pl], pw * 2);
+        s->img.plane[pl] = d;
+        s->img.stride[pl] = (int)pw;
+        d += pw * ph;
+    }
+    return 0;
+}
+
 static void vw_on_image(void* u, const struct vp9_image* img) {
     struct vjob* j = (struct vjob*)u;
     j->n_decoded++;
     if (!j->pk[j->cur].convert) { j->n_dropped++; return; }
     struct vslot* s = &j->slots[j->pk[j->cur].slot];
     if (s->state != 1) { j->n_dropped++; return; }                    // a second picture from the same packet: the first stays
+    if (slot_copy(s, img)) { j->n_dropped++; return; }
     int ow = j->ow ? j->ow : img->width, oh = j->oh ? j->oh : img->height;
-    if (ow < 2) ow = 2;
-    if (oh < 2) oh = 2;
-    size_t need = (size_t)ow * (size_t)oh;
-    if (need > s->cap) {
-        uint32_t* p = (uint32_t*)MEDIA_ALLOC(need * 4);
-        if (!p) { j->n_dropped++; return; }
-        if (s->px) MEDIA_FREE(s->px);
-        s->px = p;
-        s->cap = need;
-    }
-    if (image_to_argb(img, s->px, ow, oh, &j->vs)) { j->n_dropped++; return; }
-    s->w = ow; s->h = oh; s->src_w = img->width; s->src_h = img->height;
+    s->ow = ow < 2 ? 2 : ow;
+    s->oh = oh < 2 ? 2 : oh;
     s->pts = j->pk[j->cur].pts;
     __sync_synchronize();
-    s->state = 2;
+    s->state = 3;                                                     // the engine hands it to a converter
+}
+
+// the conversion job (on another CPU): the slot's planes -> ARGB at the output size
+static void vc_run(void* ctx, uint32_t item, uint32_t cpu) {
+    (void)item; (void)cpu;
+    struct vconv* c = (struct vconv*)ctx;
+    struct vslot* s = c->s;
+    uint32_t t0 = c->ticks();
+    c->ok = image_to_argb(&s->img, s->px, s->ow, s->oh, &c->vs) == 0;
+    c->used = c->ticks() - t0;
+    if (c->ok) { s->w = s->ow; s->h = s->oh; s->src_w = s->img.width; s->src_h = s->img.height; }
+    __sync_synchronize();
+    s->state = c->ok ? 2 : 0;
 }
 
 // the job: decode the packets in order (on an AP, interrupts off: no logging, no engine calls)
 static void vw_run(void* ctx, uint32_t item, uint32_t cpu) {
     (void)item; (void)cpu;
     struct vjob* j = (struct vjob*)ctx;
+#ifdef KERNEL
+    if (j->tp && g_vp9_par && smp_ncpu() >= 3) vp9_dec_set_parallel(j->vd, vw_par_run, j->tp);
+#endif
     for (j->cur = 0; j->cur < j->n; j->cur++) {
         uint32_t t0 = j->ticks();
         int rc = vp9_decode(j->vd, j->data + j->pk[j->cur].off, j->pk[j->cur].len, vw_on_image, j);
         j->dec_ticks += j->ticks() - t0;
         if (rc < 0) j->error = 1;
     }
+#ifdef KERNEL
+    if (j->tp) vp9_dec_set_parallel(j->vd, 0, 0);       // (the engine decodes inline after a seek)
+#endif
 }
 
 static int vw_pending(const struct meng* m) {
     if (m->vw.busy) return 1;
-    for (int i = 0; i < VW_RING; i++) if (m->vw.slot[i].state == 2) return 1;
+    for (int i = 0; i < VW_RING; i++) if (m->vw.slot[i].state != 0) return 1;
     return 0;
 }
 
@@ -1213,23 +1348,29 @@ static void vw_adopt(struct meng* m) {
     w->busy = 0;
 }
 
-// wait for the running job (seek, teardown, an inline decode)
+// wait for the running jobs (seek, teardown, an inline decode): the decode job and every conversion
 static void vw_sync(struct meng* m) {
     struct vwork* w = &m->vw;
-    if (!w->busy) return;
     uint32_t t0 = m->env.ticks();
-    while (!vh_done(&w->h)) {
-        __asm__ volatile("pause" ::: "memory");
-        if ((uint32_t)(m->env.ticks() - t0) > 500u) {                 // 5 s: the CPU running it is gone. Abandon its memory, never touch the decoder again
-            w->dead = 1;
-            w->busy = 0;
-            m->vw_on = 0;
-            m->vd = 0;
-            m->error = MENG_ERR_DECODE;
-            return;
+    for (int i = -1; i < VW_CONV; i++) {
+        struct vhandle* h = i < 0 ? &w->h : &w->conv[i].h;
+        int* busy = i < 0 ? &w->busy : &w->conv[i].busy;
+        if (!*busy) continue;
+        while (!vh_done(h)) {
+            __asm__ volatile("pause" ::: "memory");
+            if ((uint32_t)(m->env.ticks() - t0) > 500u) {             // 5 s: the CPU running it is gone. Abandon its memory, never touch the decoder again
+                w->dead = 1;
+                w->busy = 0;
+                for (int k = 0; k < VW_CONV; k++) w->conv[k].busy = 0;
+                m->vw_on = 0;
+                m->vd = 0;
+                m->error = MENG_ERR_DECODE;
+                return;
+            }
         }
+        if (i < 0) vw_adopt(m);
+        else { m->v_cvt_ticks += w->conv[i].used; m->v_cvt_n++; w->conv[i].busy = 0; }
     }
-    vw_adopt(m);
 }
 
 static void vw_reset(struct meng* m) {                               // seek: forget every picture in flight
@@ -1241,9 +1382,10 @@ static void vw_free(struct meng* m) {
     vw_sync(m);
     struct vwork* w = &m->vw;
     if (w->dead) return;
-    for (int i = 0; i < VW_RING; i++) if (w->slot[i].px) MEDIA_FREE(w->slot[i].px);
+    for (int i = 0; i < VW_RING; i++) { if (w->slot[i].px) MEDIA_FREE(w->slot[i].px); if (w->slot[i].yuv) MEDIA_FREE(w->slot[i].yuv); }
     if (w->job.data) MEDIA_FREE(w->job.data);
     vs_free(&w->job.vs);
+    for (int i = 0; i < VW_CONV; i++) vs_free(&w->conv[i].vs);
     memset(w, 0, sizeof *w);
 }
 
@@ -1314,6 +1456,11 @@ static void vw_submit(struct meng* m, int64_t now) {
         off += pk->len;
     }
     j->vd = m->vd;
+#ifdef KERNEL
+    j->tp = &w->tp;
+#else
+    j->tp = 0;
+#endif
     j->ticks = m->env.ticks;
     j->n = nsel;
     j->cur = 0;
@@ -1325,15 +1472,65 @@ static void vw_submit(struct meng* m, int64_t now) {
     m->vq.next = k;
     m->have_last_img = 0;                                            // the decoder's picture is about to change under it
     w->busy = 1;
-    if (vh_start(&w->h, j) != 0) {                                   // could not hand it over: do it here
+    if (vh_start(&w->h, vw_run, j) != 0) {                           // could not hand it over: do it here
         vw_run(j, 0, 0);
         vw_adopt(m);
+    }
+}
+
+// colour conversion: reap finished jobs, throw away decoded pictures that a newer due one makes pointless, start conversions on free CPUs
+static void vw_convert(struct meng* m, int64_t now) {
+    struct vwork* w = &m->vw;
+    for (int i = 0; i < VW_CONV; i++) {
+        struct vconv* c = &w->conv[i];
+        if (c->busy && vh_done(&c->h)) {
+            c->busy = 0;
+            m->v_cvt_ticks += c->used;
+            m->v_cvt_n++;
+            if (!c->ok) m->v_dropped++;
+        }
+    }
+    int64_t limit = now + VIDEO_LEAD_NS;
+    int newest = -1;
+    for (int i = 0; i < VW_RING; i++)
+        if (w->slot[i].state == 3 && w->slot[i].pts <= limit && (newest < 0 || w->slot[i].pts > w->slot[newest].pts)) newest = i;
+    if (newest >= 0)
+        for (int i = 0; i < VW_RING; i++)
+            if (w->slot[i].state == 3 && w->slot[i].pts < w->slot[newest].pts && w->slot[i].pts <= limit) { w->slot[i].state = 0; m->v_dropped++; }
+    for (;;) {
+        int fc = -1, best = -1;
+        for (int i = 0; i < VW_CONV; i++) if (!w->conv[i].busy) { fc = i; break; }
+        if (fc < 0) return;
+        for (int i = 0; i < VW_RING; i++)
+            if (w->slot[i].state == 3 && (best < 0 || w->slot[i].pts < w->slot[best].pts)) best = i;
+        if (best < 0) return;
+        struct vslot* s = &w->slot[best];
+        size_t need = (size_t)s->ow * (size_t)s->oh;
+        if (need > s->cap) {
+            uint32_t* p = (uint32_t*)MEDIA_ALLOC(need * 4);
+            if (!p) { s->state = 0; m->v_dropped++; continue; }
+            if (s->px) MEDIA_FREE(s->px);
+            s->px = p;
+            s->cap = need;
+        }
+        struct vconv* c = &w->conv[fc];
+        c->s = s;
+        c->ticks = m->env.ticks;
+        s->state = 4;
+        c->busy = 1;
+        if (vh_start(&c->h, vc_run, c) != 0) {                      // no free CPU: convert here
+            vc_run(c, 0, 0);
+            c->busy = 0;
+            m->v_cvt_ticks += c->used;
+            m->v_cvt_n++;
+        }
     }
 }
 
 static void vw_pump(struct meng* m, int64_t now) {
     struct vwork* w = &m->vw;
     if (w->busy && vh_done(&w->h)) vw_adopt(m);
+    vw_convert(m, now);
     vw_present(m, now + VIDEO_LEAD_NS);
     if (w->busy) return;
     m->vq.next = vq_live(m, m->vq.next);
@@ -1560,6 +1757,37 @@ uint32_t meng_frames_decoded(const struct meng* m) { return m->v_decoded; }
 uint32_t meng_frames_shown(const struct meng* m) { return m->v_shown; }
 uint32_t meng_frames_dropped(const struct meng* m) { return m->v_dropped; }
 uint32_t meng_underruns(const struct meng* m) { return m->underruns; }
+void meng_take_vp9_profile(struct meng* m, uint32_t* tiles, uint32_t* lf, uint32_t* ext, uint32_t* tsum, uint32_t* tmax) {   // kilocycles per decoded frame since the last call
+    uint32_t kf, kt, kl, ke, n, ts, tm;
+    *tiles = *lf = *ext = *tsum = *tmax = 0;
+    if (!m->vd) return;
+    vp9_dec_take_profile(m->vd, &kf, &kt, &kl, &ke, &n, &ts, &tm);
+    if (!n) return;
+    *tiles = kt / n; *lf = kl / n; *ext = ke / n; *tsum = ts / n; *tmax = tm / n;
+}
+
+double meng_buffered_ahead(const struct meng* m) {
+    if (!m->tracks_known) return 0;
+    int64_t t = m->clock_running ? clock_now((struct meng*)m) : m->pos_ns;
+    double a = ahead_of((struct meng*)m, t);
+    return a < 0 ? 0 : a;
+}
+
+void meng_take_tile_stats(struct meng* m, uint32_t* by_owner, uint32_t* by_helper) {   // tile tasks since the last call
+#ifdef KERNEL
+    *by_owner = m->vw.tp.by_owner; *by_helper = m->vw.tp.by_helper;
+    m->vw.tp.by_owner = m->vw.tp.by_helper = 0;
+#else
+    *by_owner = *by_helper = 0; (void)m;
+#endif
+}
+
+double meng_take_convert_ms(struct meng* m) {          // average ms per converted picture since the last call (0 if none)
+    double r = m->v_cvt_n ? (double)m->v_cvt_ticks * 10.0 / m->v_cvt_n : 0;
+    m->v_cvt_ticks = m->v_cvt_n = 0;
+    return r;
+}
+
 double meng_take_decode_ms(struct meng* m) {            // average ms per decoded frame since the last call (0 if none)
     double r = m->v_dec_n ? (double)m->v_dec_ticks * 10.0 / m->v_dec_n : 0;
     m->v_dec_ticks = m->v_dec_n = 0;

@@ -34,7 +34,7 @@ void smp_parallel_for(smp_fn fn, void* ctx, uint32_t n, uint32_t grain);
 // Run fn(ctx, 0, cpu) ONCE on some idle AP and return at once (the caller does not take part and does not wait). Poll
 // smp_async_done() for completion; `ctx` and everything fn touches must stay valid and unshared until then. The same rules as for
 // parallel jobs apply to fn (no serial/graphics/windows, no blocking; kmalloc and SSE are fine). Returns -1 (nothing started) when
-// there is no AP, the caller is one, or all 8 mailbox entries are busy: run the work inline instead. Several jobs may be outstanding at once;
+// there is no AP or all 8 mailbox entries are busy: run the work inline instead. Callable from an AP as well. Several jobs may be outstanding at once;
 // each runs exactly once (they do not travel through the broadcast slots of smp_parallel_for).
 struct smp_async { uint32_t g; };
 int smp_async_start(smp_fn fn, void* ctx, struct smp_async* h);

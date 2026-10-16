@@ -150,6 +150,9 @@ void okai_blit_content(int id);
 // reads) so the desktop loop can throttle overlay repaints to when the chrome
 // can actually change.
 int okai_is_animating(int id);
+void okai_note_flush(void);              // the desktop loop flushed the framebuffer: a video frame painted since the last flush reached the screen
+void okai_vidfps_set(int on);             // the frame-rate counter on video corners (shell `vidfps`)
+int okai_vidfps_get(void);
 int okai_wants_cpu(void);   // 1 = CPU work (render pending, animation, script or media due), 2 = only waiting for the network, 0 = idle
 // Hover target / loading spinner changed since the chrome was last drawn.
 int okai_ui_needs_paint(int id);

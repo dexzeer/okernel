@@ -156,7 +156,7 @@ static struct aent aents[NASYNC];
 static uint32_t async_seq;
 
 int smp_async_start(smp_fn fn, void* ctx, struct smp_async* h) {
-    if (!fn || !h || ncpu_total < 2 || smp_on_ap()) return -1;
+    if (!fn || !h || ncpu_total < 2) return -1;        // (an AP may post too: a decode job asks idle CPUs to help with its tiles)
     spin_lock(&pub_lock);
     struct aent* e = 0;
     uint32_t idx = 0;

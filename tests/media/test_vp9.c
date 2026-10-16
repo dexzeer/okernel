@@ -75,6 +75,25 @@ static void on_frame(void* u, const struct webm_frame* f) {
     }
 }
 
+
+#ifdef VP9_TEST_THREADS
+#include <pthread.h>
+// VP9_PAR=1: the tile columns of every frame run on their own threads (the same contract as the kernel's executor)
+struct par_ctx { vp9_par_task task; void* ctx; int idx; };
+static void* par_thread(void* p) { struct par_ctx* c = (struct par_ctx*)p; c->task(c->ctx, c->idx); return 0; }
+static void par_run(void* user, vp9_par_task task, void* ctx, int n) {
+    (void)user;
+    pthread_t t[64];
+    struct par_ctx c[64];
+    for (int i = 1; i < n; i++) { c[i].task = task; c[i].ctx = ctx; c[i].idx = i; pthread_create(&t[i], 0, par_thread, &c[i]); }
+    task(ctx, 0);
+    for (int i = 1; i < n; i++) pthread_join(t[i], 0);
+}
+#define SETUP_PAR(d) do { if (getenv("VP9_PAR")) vp9_dec_set_parallel((d), par_run, 0); } while (0)
+#else
+#define SETUP_PAR(d) do { } while (0)
+#endif
+
 int main(int argc, char** argv) {
     if (argc < 3) { fprintf(stderr, "usage: test_vp9 in.webm ref.yuv\n"); return 2; }
     verbose = getenv("VP9_VERBOSE") != 0;
@@ -82,6 +101,7 @@ int main(int argc, char** argv) {
     uint8_t* data = slurp(argv[1], &n);
     ref = slurp(argv[2], &ref_len);
     dec = vp9_dec_new();
+    SETUP_PAR(dec);
     struct webm_cb cb = {on_tracks, on_frame, 0};
     struct webm_demux* dm = webm_new(&cb);
     if (webm_feed(dm, data, (size_t)n) < 0) { printf("%s: demux failed\n", argv[1]); return 1; }
