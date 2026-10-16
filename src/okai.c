@@ -379,7 +379,7 @@ static void parse_resp(const char* r, int len, struct resp_info* ri) {
     if (vl >= 4) for (int k = 0; k + 4 <= vl; k++) if (iprefix(v + k, "gzip")) { ri->gzip = 1; break; }
     vl = header_get(r, he, "location", &v);
     if (vl > 0) {
-        if (vl > OKAI_URL_LEN - 1) vl = OKAI_URL_LEN - 1;
+        if (vl > OKAI_URL_LEN - 1) { serial_printf("[okai] Location of %d bytes cut to %d\n", vl, OKAI_URL_LEN - 1); vl = OKAI_URL_LEN - 1; }
         memcpy(ri->location, v, vl);
         ri->location[vl] = 0;
     }
@@ -534,7 +534,7 @@ static int req_fetch(struct oreq* q, const char* top) {
     o.extra = 0;
     int n = 0;
     memcpy(cookie_hdr, "Cookie: ", 8);
-    int cl = wcookie_header(q->url, top, cookie_hdr + 8, NET_EXTRA_MAX - 512);
+    int cl = wcookie_header(q->url, top, cookie_hdr + 8, (int)sizeof cookie_hdr - 2400);
     if (cl > 0) {
         n = 8 + cl;
         cookie_hdr[n++] = '\r';
@@ -1971,6 +1971,8 @@ static void main_loaded(int id, int tab, char* resp, int len) {
     struct okai_tab* T = &okais[id].tabs[tab];
     struct resp_info ri;
     parse_resp(resp, len, &ri);
+    if (ri.status == 400 || ri.status == 431 || ri.status == 414)
+        serial_printf("[okai] HTTP %d for a document: url len %d cookies %d: %s\n", ri.status, (int)strlen(T->url), wcookie_count(), T->url);
     int blen, heap;
     char* body = resp_body(resp, len, &ri, &blen, &heap);
     char* page = body;

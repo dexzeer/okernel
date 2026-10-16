@@ -10,7 +10,7 @@
 // per-window pixel surface that the window system blits (window_set_pixels).
 
 #define OKAI_MAX_HISTORY 8
-#define OKAI_URL_LEN 2048
+#define OKAI_URL_LEN 8192
 #define MAX_OKAIS 2            // one browser window (+ spare); tabs live inside
 #define OKAI_MAX_TABS 4        // tabs per browser window
 #define OKAI_MAX_FRAMES 12     // iframe documents per browser window (all tabs); their slots follow the tabs in tabs[]
