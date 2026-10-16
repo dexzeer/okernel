@@ -5744,6 +5744,76 @@ for (const C of [IDBKeyRange, IDBRequest, IDBOpenDBRequest, IDBTransaction, IDBO
 Object.defineProperty(G, 'indexedDB', { value: indexedDBInstance, writable: true, configurable: true, enumerable: true });
 Object.defineProperty(G, 'IDBCursorWithValue', { value: IDBCursor, writable: true, configurable: true, enumerable: false });
 
+// ---------------------------------------------------------------- Cache API (in memory) and WakeLock
+const CACHES = new Map();      // cache name -> Cache
+const cacheKey = (req, ignoreSearch) => {
+    const u = new URL(req instanceof Request ? req.url : String(req), location.href);
+    if (ignoreSearch) u.search = '';
+    u.hash = '';
+    return u.href;
+};
+class Cache {
+    constructor() { illegal(); }
+    _find(req, opts) {
+        const method = req instanceof Request ? req.method : 'GET';
+        if (method !== 'GET' && !(opts && opts.ignoreMethod)) return [];
+        const k = cacheKey(req, opts && opts.ignoreSearch);
+        return this._e.filter(e => (opts && opts.ignoreSearch ? cacheKey(e.url, true) : e.url) === k);
+    }
+    match(req, opts) { const m = this._find(req, opts)[0]; return Promise.resolve(m ? m.res.clone() : undefined); }
+    matchAll(req, opts) { return Promise.resolve(req === undefined ? this._e.map(e => e.res.clone()) : this._find(req, opts).map(e => e.res.clone())); }
+    add(req) { return this.addAll([req]); }
+    addAll(reqs) {
+        return Promise.all(Array.from(reqs, r => fetch(r).then(res => { if (!res.ok) throw new TypeError('Request failed'); return this.put(r, res); }))).then(() => undefined);
+    }
+    put(req, res) {
+        if (!(res instanceof Response)) return Promise.reject(new TypeError("Failed to execute 'put' on 'Cache': parameter 2 is not of type 'Response'."));
+        const method = req instanceof Request ? req.method : 'GET';
+        if (method !== 'GET') return Promise.reject(new TypeError("Failed to execute 'put' on 'Cache': Request method '" + method + "' is unsupported"));
+        const url = cacheKey(req, false);
+        this._e = this._e.filter(e => e.url !== url);
+        this._e.push({ url, req: req instanceof Request ? req : new Request(url), res: res.clone() });
+        return Promise.resolve();
+    }
+    delete(req, opts) { const hit = this._find(req, opts); this._e = this._e.filter(e => !hit.includes(e)); return Promise.resolve(hit.length > 0); }
+    keys(req, opts) { return Promise.resolve(req === undefined ? this._e.map(e => e.req) : this._find(req, opts).map(e => e.req)); }
+}
+class CacheStorage {
+    constructor() { illegal(); }
+    open(name) {
+        name = String(name);
+        let c = CACHES.get(name);
+        if (!c) { c = Object.create(Cache.prototype); hidden(c, '_e', []); CACHES.set(name, c); }
+        return Promise.resolve(c);
+    }
+    has(name) { return Promise.resolve(CACHES.has(String(name))); }
+    delete(name) { return Promise.resolve(CACHES.delete(String(name))); }
+    keys() { return Promise.resolve(Array.from(CACHES.keys())); }
+    match(req, opts) {
+        for (const c of CACHES.values()) { const m = c._find(req, opts)[0]; if (m) return Promise.resolve(m.res.clone()); }
+        return Promise.resolve(undefined);
+    }
+}
+class WakeLockSentinel extends EventTarget {
+    constructor() { illegal(); }
+    get released() { return this._rel; }
+    get type() { return this._type; }
+    release() { if (!this._rel) { this._rel = true; dispatch(this, new Event('release')); } return Promise.resolve(); }
+}
+{
+    const wl = {
+        request(type) {
+            if (type !== undefined && type !== 'screen') return Promise.reject(new TypeError("The provided value '" + type + "' is not a valid enum value of type WakeLockType."));
+            const s = Object.create(WakeLockSentinel.prototype);
+            hidden(s, '_rel', false); hidden(s, '_type', 'screen');
+            return Promise.resolve(s);
+        },
+    };
+    Object.defineProperty(navigator, 'wakeLock', { value: wl, enumerable: true, configurable: true });
+}
+for (const C of [Cache, CacheStorage, WakeLockSentinel]) Object.defineProperty(G, C.name, { value: C, writable: true, configurable: true, enumerable: false });
+Object.defineProperty(G, 'caches', { value: Object.create(CacheStorage.prototype), writable: true, configurable: true, enumerable: true });
+
 // window properties
 function Window() { illegal(); }
 Window.prototype = Object.create(EventTarget.prototype, { constructor: { value: Window, writable: true, configurable: true } });
