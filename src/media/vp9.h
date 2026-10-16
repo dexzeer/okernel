@@ -22,6 +22,16 @@ struct vp9_image {
 
 struct vp9_dec;
 
+// Optional parallel execution of the tile columns of a frame (they are independent: contexts, motion vector candidates and intra edges
+// stop at their borders). `run(user, task, ctx, n)` must call task(ctx, i) once for every i in 0..n-1, in any order on any threads, and
+// return when all are done; tasks must be STARTED in increasing index order (the loop filter's rows wait for the row above). Without it
+// (the default) the tiles are decoded one after the other.
+typedef void (*vp9_par_task)(void* ctx, int index);
+typedef void (*vp9_par_fn)(void* user, vp9_par_task task, void* ctx, int n);
+void vp9_dec_set_parallel(struct vp9_dec* d, vp9_par_fn run, void* user);
+// Cycles spent (since the last call) in: the whole frame, the tile columns, the loop filter, the border extension; and frames counted.
+void vp9_dec_take_profile(struct vp9_dec* d, uint32_t* kcyc_frame, uint32_t* kcyc_tiles, uint32_t* kcyc_lf, uint32_t* kcyc_ext, uint32_t* frames, uint32_t* kcyc_tile_sum, uint32_t* kcyc_tile_max);
+
 struct vp9_dec* vp9_dec_new(void);
 void vp9_dec_free(struct vp9_dec* d);
 // Largest frame accepted, in luma samples (default 36 million, about 8K UHD).

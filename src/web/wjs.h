@@ -72,6 +72,12 @@ struct wjs_rect { int x, y, w, h, fixed; };
 int  wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout);
 void wjs_media_tick(struct wjs* js);         // advance the sessions (decode, audio feed) from inside a running script
 int  wjs_media_worker(void);                  // video is decoded on another CPU
+// A video frame that came out of the decoder while a page script was running: the shell blits it at once, without waiting for the script
+// (a script can run for seconds, and the picture used to freeze meanwhile). px is the engine's stable frame buffer, w x h = the painted size.
+struct wjs_present { const uint32_t* px; int w, h, x, y, fixed; struct wdoc* doc; };
+int  wjs_media_take_present(struct wjs_present* out);
+struct wjs_vidstat { uint32_t shown, dropped, gap_ms, dec_x10, cvt_x10, underruns, tiles_own, tiles_help, kc_tiles, kc_lf, kc_ext, kc_tsum, kc_tmax, ahead_ms; int clock_ms, valid; };
+int  wjs_media_vidstat(struct wjs_vidstat* out);   // the last whole second of the first playing video (updated by wjs_media_poll); 1 = fresh
 int  wjs_media_relaxed(struct wjs* js);      // ...but a poll every few ms is enough (decode on another CPU / audio only)
 int  wjs_media_active(struct wjs* js);       // something is playing: keep the main loop running
 int  wjs_media_any(struct wjs* js);          // sessions exist (loading, paused...): poll them now and then

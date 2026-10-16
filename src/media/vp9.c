@@ -1695,6 +1695,67 @@ static int get_tile_offset(int tile_num, int mis, int tile_sz_log2) {
     return vp9_imin(offset, mis);
 }
 
+// One tile column of one tile row on a private copy of the decoder state (everything the block decoder writes lives in the copy or in
+// distinct columns of the shared frame arrays). The caller merges the symbol counts and the error flags afterwards.
+static inline uint64_t prof_now(void) {
+#if defined(__i386__) || defined(__x86_64__)
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+#else
+    return 0;
+#endif
+}
+
+struct tile_task {
+    struct vp9_dec* master;
+    struct vp9_dec* work;
+    const uint8_t* data;
+    size_t size;
+    int row_start, row_end, col_start, col_end;
+    int rc;
+    uint64_t cycles;
+};
+
+static void decode_one_tile(struct vp9_dec* d, const uint8_t* data, size_t size, int row_start, int row_end, int col_start, int col_end, int* rc) {
+    d->mi_row_start = row_start;
+    d->mi_row_end = row_end;
+    d->mi_col_start = col_start;
+    d->mi_col_end = col_end;
+    if (bd_init(&d->bd, data, size) < 0) { *rc = VP9_ERR_INVALID; return; }
+    for (int r = d->mi_row_start; r < d->mi_row_end; r += 8) {
+        memset(d->left_nonzero, 0, sizeof d->left_nonzero);
+        memset(d->left_partition, 0, sizeof d->left_partition);
+        memset(d->left_seg_pred, 0, sizeof d->left_seg_pred);
+        for (int c = d->mi_col_start; c < d->mi_col_end; c += 8) decode_partition(d, r, c, BLOCK_64X64);
+    }
+    *rc = 0;
+}
+
+static void tile_task_run(void* ctx, int i) {
+    struct tile_task* tk = (struct tile_task*)ctx + i;
+    struct vp9_dec* t = tk->work;
+    uint64_t c0 = prof_now();
+    memcpy(t, tk->master, sizeof *t);
+    memset(&t->counts, 0, sizeof t->counts);
+    decode_one_tile(t, tk->data, tk->size, tk->row_start, tk->row_end, tk->col_start, tk->col_end, &tk->rc);
+    tk->cycles = prof_now() - c0;
+}
+
+void vp9_dec_take_profile(struct vp9_dec* d, uint32_t* kf, uint32_t* kt, uint32_t* kl, uint32_t* ke, uint32_t* n, uint32_t* ts, uint32_t* tm) {
+    *kf = (uint32_t)(d->prof_frame >> 10); *kt = (uint32_t)(d->prof_tiles >> 10); *kl = (uint32_t)(d->prof_lf >> 10); *ke = (uint32_t)(d->prof_ext >> 10);
+    *n = d->prof_n;
+    *ts = (uint32_t)(d->prof_tsum >> 10); *tm = (uint32_t)(d->prof_tmax >> 10);
+    d->prof_tsum = d->prof_tmax = 0;
+    d->prof_frame = d->prof_tiles = d->prof_lf = d->prof_ext = 0;
+    d->prof_n = 0;
+}
+
+void vp9_dec_set_parallel(struct vp9_dec* d, vp9_par_fn run, void* user) {
+    d->par_run = run;
+    d->par_user = user;
+}
+
 static int decode_tiles(struct vp9_dec* d, const uint8_t* data, size_t sz) {
     int tile_cols = 1 << d->tile_cols_log2, tile_rows = 1 << d->tile_rows_log2;
     size_t aw = (size_t)d->sb64_cols * 16 + 16;
@@ -1703,6 +1764,13 @@ static int decode_tiles(struct vp9_dec* d, const uint8_t* data, size_t sz) {
     memset(d->above_nonzero[2], 0, aw);
     memset(d->above_partition, 0, (size_t)d->sb64_cols * 8 + 8);
     memset(d->above_seg_pred, 0, (size_t)d->sb64_cols * 8 + 8);
+    struct tile_task tasks[64];
+    int par = d->par_run && tile_cols > 1 && tile_cols <= 64;
+    if (par)
+        for (int c = 0; c < tile_cols && par; c++) {
+            if (!d->tile_dec[c]) d->tile_dec[c] = (struct vp9_dec*)MEDIA_ALLOC(sizeof(struct vp9_dec));
+            if (!d->tile_dec[c]) par = 0;                       // no memory for the copies: decode in sequence
+        }
     for (int tile_row = 0; tile_row < tile_rows; tile_row++) {
         for (int tile_col = 0; tile_col < tile_cols; tile_col++) {
             int last = tile_row == tile_rows - 1 && tile_col == tile_cols - 1;
@@ -1716,16 +1784,32 @@ static int decode_tiles(struct vp9_dec* d, const uint8_t* data, size_t sz) {
                 sz -= 4;
                 if (tile_size > sz) return VP9_ERR_INVALID;
             }
-            d->mi_row_start = get_tile_offset(tile_row, d->mi_rows, d->tile_rows_log2);
-            d->mi_row_end = get_tile_offset(tile_row + 1, d->mi_rows, d->tile_rows_log2);
-            d->mi_col_start = get_tile_offset(tile_col, d->mi_cols, d->tile_cols_log2);
-            d->mi_col_end = get_tile_offset(tile_col + 1, d->mi_cols, d->tile_cols_log2);
-            if (bd_init(&d->bd, data, tile_size) < 0) return VP9_ERR_INVALID;
-            for (int r = d->mi_row_start; r < d->mi_row_end; r += 8) {
-                memset(d->left_nonzero, 0, sizeof d->left_nonzero);
-                memset(d->left_partition, 0, sizeof d->left_partition);
-                memset(d->left_seg_pred, 0, sizeof d->left_seg_pred);
-                for (int c = d->mi_col_start; c < d->mi_col_end; c += 8) decode_partition(d, r, c, BLOCK_64X64);
+            int rs = get_tile_offset(tile_row, d->mi_rows, d->tile_rows_log2);
+            int re = get_tile_offset(tile_row + 1, d->mi_rows, d->tile_rows_log2);
+            int cs = get_tile_offset(tile_col, d->mi_cols, d->tile_cols_log2);
+            int ce = get_tile_offset(tile_col + 1, d->mi_cols, d->tile_cols_log2);
+            if (par) {                                          // collect the row's tiles, decode them together when the last one is known
+                tasks[tile_col] = (struct tile_task){ d, d->tile_dec[tile_col], data, tile_size, rs, re, cs, ce, 0, 0 };
+                if (tile_col == tile_cols - 1) {
+                    d->par_run(d->par_user, tile_task_run, tasks, tile_cols);
+                    uint64_t tmax = 0;
+                    for (int c = 0; c < tile_cols; c++) {
+                        struct vp9_dec* t = d->tile_dec[c];
+                        d->prof_tsum += tasks[c].cycles;
+                        if (tasks[c].cycles > tmax) tmax = tasks[c].cycles;
+                        if (tasks[c].rc < 0) return tasks[c].rc;
+                        uint32_t* a = (uint32_t*)&d->counts;
+                        const uint32_t* b = (const uint32_t*)&t->counts;
+                        for (size_t k = 0; k < sizeof d->counts / 4; k++) a[k] += b[k];
+                        if (t->corrupt) d->corrupt = 1;
+                        if (t->bad_ref) d->bad_ref = 1;
+                    }
+                    d->prof_tmax += tmax;
+                }
+            } else {
+                int rc;
+                decode_one_tile(d, data, tile_size, rs, re, cs, ce, &rc);
+                if (rc < 0) return rc;
             }
             data += tile_size;
             sz -= tile_size;
@@ -1794,6 +1878,7 @@ void vp9_dec_free(struct vp9_dec* d) {
     for (int p = 0; p < 3; p++) MEDIA_FREE(d->above_nonzero[p]);
     MEDIA_FREE(d->above_partition);
     MEDIA_FREE(d->above_seg_pred);
+    for (int i = 0; i < 64; i++) if (d->tile_dec[i]) MEDIA_FREE(d->tile_dec[i]);
     MEDIA_FREE(d);
 }
 
@@ -1869,7 +1954,9 @@ static int decode_frame(struct vp9_dec* d, const uint8_t* data, size_t sz, vp9_o
     memset(d->mi, 0, (size_t)d->mi_cols * d->mi_rows * sizeof(struct mi));
     d->bad_ref = 0;
     d->corrupt = 0;
+    uint64_t tp0 = prof_now();
     rc = decode_tiles(d, data + hdr_bytes + d->header_size_in_bytes, sz - hdr_bytes - d->header_size_in_bytes);
+    d->prof_tiles += prof_now() - tp0;
     if (rc < 0) return rc;
     if (d->bad_ref || d->corrupt) return VP9_ERR_INVALID;
 
@@ -1884,8 +1971,13 @@ static int decode_frame(struct vp9_dec* d, const uint8_t* data, size_t sz, vp9_o
     }
     if (d->refresh_frame_context) save_probs(d, d->frame_context_idx);
 
+    uint64_t tp1 = prof_now();
     if (d->loop_filter_level) vp9_loop_filter_frame(d);
+    uint64_t tp2 = prof_now();
     vp9_extend_borders(d->cur);
+    d->prof_lf += tp2 - tp1;
+    d->prof_ext += prof_now() - tp2;
+    d->prof_n++;
 
     if (d->seg_enabled && d->seg_update_map) {
         size_t n = (size_t)d->mi_cols * d->mi_rows;

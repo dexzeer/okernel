@@ -19,6 +19,25 @@ static void on_tracks(void* u, const struct webm_info* info) {
 }
 static void on_frame(void* u, const struct webm_frame* f) { (void)u; if (f->track == video_track) vp9_decode(dec, f->data, f->len, on_image, 0); }
 
+
+#ifdef VP9_TEST_THREADS
+#include <pthread.h>
+// VP9_PAR=1: the tile columns of every frame run on their own threads (the same contract as the kernel's executor)
+struct par_ctx { vp9_par_task task; void* ctx; int idx; };
+static void* par_thread(void* p) { struct par_ctx* c = (struct par_ctx*)p; c->task(c->ctx, c->idx); return 0; }
+static void par_run(void* user, vp9_par_task task, void* ctx, int n) {
+    (void)user;
+    pthread_t t[64];
+    struct par_ctx c[64];
+    for (int i = 1; i < n; i++) { c[i].task = task; c[i].ctx = ctx; c[i].idx = i; pthread_create(&t[i], 0, par_thread, &c[i]); }
+    task(ctx, 0);
+    for (int i = 1; i < n; i++) pthread_join(t[i], 0);
+}
+#define SETUP_PAR(d) do { if (getenv("VP9_PAR")) vp9_dec_set_parallel((d), par_run, 0); } while (0)
+#else
+#define SETUP_PAR(d) do { } while (0)
+#endif
+
 int main(int argc, char** argv) {
     FILE* fp = fopen(argv[1], "rb");
     if (!fp) { perror(argv[1]); return 2; }
@@ -31,6 +50,7 @@ int main(int argc, char** argv) {
     for (int p = 0; p < passes; p++) {
         video_track = 0;
         dec = vp9_dec_new();
+        SETUP_PAR(dec);
         struct webm_cb cb = {on_tracks, on_frame, 0};
         struct webm_demux* dm = webm_new(&cb);
         webm_feed(dm, d, (size_t)n);

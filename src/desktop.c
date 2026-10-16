@@ -22,6 +22,7 @@
 #include "filesystem.h"
 #include "editor.h"
 #include "okai.h"
+#include "media/meng.h"
 
 #include "theme.h"
 #include "crypto/rand.h"
@@ -843,6 +844,7 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  terminal  - open new terminal\n");
         window_puts(win_id, "  exit      - close this terminal\n");
         window_puts(win_id, "  okai   - open web okai\n");
+        window_puts(win_id, "  vidfps - toggle the video frame-rate counter\n");
         window_puts(win_id, "  wifigui   - Wi-Fi window (scan, connect)\n");
         window_puts(win_id, "  game      - KAnarchy Wheels, a ragdoll obstacle course (game | game 1 | game FILE)\n");
         window_puts(win_id, "  ls        - list files\n");
@@ -911,6 +913,17 @@ static void shell_execute(int win_id, const char* input) {
         // Log the head of every request that leaves (serial: [fetch-head]); cookies reduced to their size
         fetch_log_heads = !fetch_log_heads;
         window_puts(win_id, fetch_log_heads ? "Request-head logging on (serial).\n" : "Request-head logging off.\n");
+    }
+    else if (str_eq(cmd_buf, "vp9par")) {
+        // VP9 tile columns and loop filter on several CPUs (needs -smp 3 or more); `vp9par off` / `vp9par on`
+        if (str_eq(args, "off")) meng_set_parallel(0);
+        else if (str_eq(args, "on")) meng_set_parallel(1);
+        window_puts(win_id, meng_get_parallel() ? "VP9 multi-CPU decode: on\n" : "VP9 multi-CPU decode: off\n");
+    }
+    else if (str_eq(cmd_buf, "vidfps")) {
+        // Frame-rate counter on video corners (dec = frames the decoder handed over, scr = frames that reached the screen); also logged as [vidfps]
+        okai_vidfps_set(!okai_vidfps_get());
+        window_puts(win_id, okai_vidfps_get() ? "Video fps counter on.\n" : "Video fps counter off.\n");
     }
     else if (str_eq(cmd_buf, "nettrace")) {
         // Per-packet serial tracing (frames, TCP segments) on/off
@@ -1588,6 +1601,11 @@ static void desktop_sched_yield(void) {
 // Device pollers that must keep running while a page script is busy (okai.c engine_pump, on the main stack): pointer
 // reports, network receive/transmit and the TLS handshakes, the log on the boot stick. Nothing here draws or reaches
 // the page. The main loop runs the same calls once per pass.
+// Put one window's pending pixel damage on the screen right now (okai.c: a video frame that arrived while a page script is running).
+void desktop_present_window(int win_id) {
+    if (window_draw(win_id)) { graphics_flush(); okai_note_flush(); }
+}
+
 void desktop_bg_poll(void) {
     e1000_poll();
     xhci_poll();
@@ -2861,6 +2879,7 @@ void kernel_main(uint32_t mboot_phys) {
         if (composed || cursor_moved) frame_count++;
 
         { PROF_BEGIN(PZ_FLUSH); graphics_flush(); PROF_END(PZ_FLUSH); }
+        okai_note_flush();
         if (gfxsum_pending) { gfxsum_pending = 0; gfxsum_report(); }
         static int cursor_live = 0;
         if (!cursor_live) { cursor_enable(); cursor_live = 1; }

@@ -67,6 +67,8 @@ void meng_seek(struct meng* m, double seconds);
 void meng_set_volume(struct meng* m, double volume, int muted);
 void meng_set_rate(struct meng* m, double rate);        // 0.25 .. 4 (audio keeps its pitch only at 1)
 void meng_poll(struct meng* m);                         // call often from the main loop
+void meng_set_parallel(int on);                      // VP9 tiles / loop filter on several CPUs inside the decode worker (default on)
+int meng_get_parallel(void);
 void meng_set_async(int mode);                         // VP9 decode worker: -1 automatic (a second CPU), 0 off, 1 on (tests); applies to engines created afterwards
 int  meng_have_worker(void);                           // VP9 is decoded on another CPU (a second CPU is running)
 int  meng_relaxed(const struct meng* m);               // polling every few ms is enough (the decode runs on another CPU, or there is no video): the main loop may sleep between polls
@@ -92,6 +94,10 @@ uint32_t meng_frames_shown(const struct meng* m);
 void meng_describe(const struct meng* m, char* out, int cap);   // one line of state, for logs
 uint32_t meng_frames_dropped(const struct meng* m);
 uint32_t meng_underruns(const struct meng* m);   // times the sound card ran dry while playing (the clock was re-based)
+void meng_take_vp9_profile(struct meng* m, uint32_t* tiles, uint32_t* lf, uint32_t* ext, uint32_t* tsum, uint32_t* tmax);   // VP9 kilocycles per frame spent in the tile columns, loop filter, border extension
+double meng_buffered_ahead(const struct meng* m);   // seconds of media (audio and video) buffered beyond the playhead: ~0 = the network is the limit, more = the decoder is
+void meng_take_tile_stats(struct meng* m, uint32_t* by_owner, uint32_t* by_helper);   // VP9 tile tasks run by the decode job / by helper CPUs since the last call
+double meng_take_convert_ms(struct meng* m);  // average ms per converted video picture since the last call
 double meng_take_decode_ms(struct meng* m);   // average ms per decoded video frame since the last call
 uint32_t meng_take_maxgap(struct meng* m);     // longest gap (ticks) between two presented frames since the last call
 uint32_t meng_audio_frames(const struct meng* m);       // audio frames handed to the sound card so far

@@ -14,6 +14,7 @@ struct wmedia {
     struct meng* m;
     int node;                 // bound <video> element, -1
     uint32_t serial;          // last frame published
+    uint32_t pres_serial;     // last frame handed to the shell while a script was running (wjs_media_tick)
     int out_w, out_h;         // output size requested from the engine
     int audio;                // this session owns the sound card
 };
@@ -236,13 +237,38 @@ const uint32_t* wjs_media_frame(struct wjs* js, int sess, int* w, int* h) {
     return f->px;
 }
 
+static struct wjs_vidstat vid_last;                 // written once a second by wjs_media_poll, taken by okai's overlay
+static int vid_fresh;
+
 // Called every ~20 ms from the engine's interrupt hook while a script runs: a page script can run for seconds (YouTube's start-up
 // does), and the sound card's ring and the decoder must not wait for it. Only the engine state moves here (meng_poll: decode,
 // audio, clock); frames are published and painted by wjs_media_poll when the script returns.
+static struct wjs_present pend;
+static int pend_valid;
+int wjs_media_take_present(struct wjs_present* out) {
+    if (!pend_valid) return 0;
+    pend_valid = 0;
+    *out = pend;
+    return 1;
+}
+
 void wjs_media_tick(struct wjs* js) {
     if (!js || js->dead || !js->media) return;
-    for (int i = 0; i < WM_MAX; i++)
-        if (js->media[i].m) { meng_set_governor(wjs_host.budget_scale >= 2); meng_poll(js->media[i].m); }
+    for (int i = 0; i < WM_MAX; i++) {
+        struct wmedia* s = &js->media[i];
+        if (!s->m) continue;
+        meng_set_governor(wjs_host.budget_scale >= 2);
+        meng_poll(s->m);
+        // a new picture at the size the element is painted at goes to the shell right away (the normal poll republishes it properly later)
+        if (s->node < 0 || !js->doc || pend_valid) continue;
+        const struct meng_frame* f = meng_get_frame(s->m);
+        if (!f || !f->px || f->serial == s->pres_serial || f->serial == s->serial) continue;
+        int dx, dy, dw, dh, fixed;
+        if (!wdoc_video_dest(js->doc, s->node, &dx, &dy, &dw, &dh, &fixed) || dw != f->w || dh != f->h) continue;
+        pend.px = f->px; pend.w = f->w; pend.h = f->h; pend.x = dx; pend.y = dy; pend.fixed = fixed; pend.doc = js->doc;
+        pend_valid = 1;
+        s->pres_serial = f->serial;
+    }
 }
 
 int wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout) {
@@ -265,8 +291,12 @@ int wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout) {
             uint32_t nowms = (uint32_t)wjs_now();
             if (nowms - last_ms >= 1000) {
                 uint32_t sh = meng_frames_shown(s->m), dr = meng_frames_dropped(s->m);
-                int dm = (int)(meng_take_decode_ms(s->m) * 10);
-                if (last_ms && (sh != last_shown || dr != last_dropped)) w_log("[media] rate: %u shown/s, %u dropped/s, longest gap %u ms, clock %d ms, underruns %u, decode %d.%d ms/frame (session %d)\n", sh - last_shown, dr - last_dropped, meng_take_maxgap(s->m) * 10, (int)(meng_current_time(s->m) * 1000), meng_underruns(s->m), dm / 10, dm % 10, i);
+                int dm = (int)(meng_take_decode_ms(s->m) * 10), cm = (int)(meng_take_convert_ms(s->m) * 10);
+                if (last_ms && (sh != last_shown || dr != last_dropped)) {
+                    vid_last.shown = sh - last_shown; vid_last.dropped = dr - last_dropped; vid_last.gap_ms = meng_take_maxgap(s->m) * 10;
+                    vid_last.dec_x10 = (uint32_t)dm; vid_last.cvt_x10 = (uint32_t)cm; vid_last.ahead_ms = (uint32_t)(meng_buffered_ahead(s->m) * 1000); meng_take_tile_stats(s->m, &vid_last.tiles_own, &vid_last.tiles_help); meng_take_vp9_profile(s->m, &vid_last.kc_tiles, &vid_last.kc_lf, &vid_last.kc_ext, &vid_last.kc_tsum, &vid_last.kc_tmax); vid_last.underruns = meng_underruns(s->m); vid_last.clock_ms = (int)(meng_current_time(s->m) * 1000); vid_last.valid = 1; vid_fresh = 1;
+                }
+                if (last_ms && (sh != last_shown || dr != last_dropped)) w_log("[media] rate: %u shown/s, %u dropped/s, longest gap %u ms, clock %d ms, underruns %u, decode %d.%d + convert %d.%d ms/frame (session %d)\n", sh - last_shown, dr - last_dropped, vid_last.gap_ms, (int)(meng_current_time(s->m) * 1000), meng_underruns(s->m), dm / 10, dm % 10, cm / 10, cm % 10, i);
                 last_ms = nowms; last_shown = sh; last_dropped = dr;
             }
         }
@@ -324,6 +354,13 @@ int wjs_media_any(struct wjs* js) {
 }
 
 int wjs_media_worker(void) { return meng_have_worker(); }
+
+int wjs_media_vidstat(struct wjs_vidstat* out) {
+    if (!vid_fresh) return 0;
+    vid_fresh = 0;
+    *out = vid_last;
+    return 1;
+}
 
 // Every session that is playing could do with a poll every few milliseconds instead of every main-loop pass (VP9 decoded on another CPU,
 // audio only): the loop may sleep in short timed waits.

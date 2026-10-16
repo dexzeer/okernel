@@ -262,6 +262,14 @@ struct vp9_dec {
     // scratch for inter prediction
     uint16_t pred_tmp[2][64 * 64];
     int32_t inter_tmp[(64 * 5 + 16) * 64];
+
+    // tile-parallel decoding (kept last: a tile's working copy of this struct is made with memcpy)
+    vp9_par_fn par_run;
+    void* par_user;
+    uint64_t prof_frame, prof_tiles, prof_lf, prof_ext;   // rdtsc cycles
+    uint32_t prof_n;
+    uint64_t prof_tsum, prof_tmax;   // per frame: the sum of the tile tasks' cycles, and the longest one (summed over frames)
+    struct vp9_dec* tile_dec[64];   // one working copy per tile column, allocated on first use
 };
 
 // ---- vp9_recon.c ----

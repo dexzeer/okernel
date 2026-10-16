@@ -201,6 +201,8 @@ media-tests:
 	mkdir -p build-host
 	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -o build-host/t_celt tests/media/test_celt.c src/media/celt.c src/media/celt_tables.c src/media/ec.c src/media/opus_packet.c -lm
 	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_celt_fuzz tests/media/fuzz_celt.c src/media/celt.c src/media/celt_tables.c src/media/ec.c -lm
+	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_opus_ms tests/media/test_opus_ms.c src/media/opus_dec.c src/media/opus_packet.c src/media/celt.c src/media/celt_tables.c src/media/ec.c -lm
+	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_opus_ms tests/media/vec | tail -n 1
 	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -o build-host/t_opus tests/media/test_opus.c src/media/opus_dec.c src/media/opus_packet.c src/media/celt.c src/media/celt_tables.c src/media/ec.c -lm
 	@test -d tests/media/vec || { echo "no test vectors: run tests/media/gen_opus_vectors.py (needs ffmpeg + the RFC reference decoder)"; exit 1; }
 	@set -e; for f in tests/media/vec/opus_*.bit; do n=$${f%.bit}; ASAN_OPTIONS=detect_leaks=0 ./build-host/t_opus $$n.bit $$n.ref | tail -n 1 | sed "s|^|$$n: |"; done
@@ -215,6 +217,8 @@ media-tests:
 	./build-host/t_vp9_lf | tail -n 1
 	gcc -m32 -O1 -msse2 -fsanitize=address,undefined -o build-host/t_vp9 tests/media/test_vp9.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_simd.c src/media/vcvt.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/webm.c -lm
 	@set -e; for f in tests/media/vec/vp9_*.webm; do n=$${f%.webm}; ASAN_OPTIONS=detect_leaks=0 ./build-host/t_vp9 $$n.webm $$n.yuv | tail -n 1 | sed "s|^|$$n: |"; done
+	gcc -m32 -O1 -msse2 -pthread -DVP9_TEST_THREADS -fsanitize=address,undefined -o build-host/t_vp9_par tests/media/test_vp9.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_simd.c src/media/vcvt.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/webm.c -lm
+	@set -e; for f in tests/media/vec/vp9_*.webm; do n=$${f%.webm}; VP9_PAR=1 ASAN_OPTIONS=detect_leaks=0 ./build-host/t_vp9_par $$n.webm $$n.yuv | tail -n 1 | sed "s|^|$$n (tiles + loop filter on threads): |"; done
 	gcc -m32 -O1 -msse2 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_vp9_fuzz tests/media/fuzz_vp9.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_simd.c src/media/vcvt.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/webm.c -lm
 	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_vp9_fuzz 400 1 tests/media/vec/vp9_inter.webm tests/media/vec/vp9_intra.webm tests/media/vec/vp9_tiles.webm tests/media/vec/vp9_aq3.webm tests/media/vec/vp9_yuv422.webm tests/media/vec/vp9_yuv440.webm tests/media/vec/vp9_p10.webm tests/media/vec/vp9_odd.webm | tail -n 1
 	sh tests/media/build_meng.sh | tail -n 1

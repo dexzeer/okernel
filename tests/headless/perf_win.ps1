@@ -23,6 +23,8 @@ param(
     ,[string]$PreCmd = ""      # typed into the terminal before okai starts, e.g. "cpu slow 6"
     ,[string]$ShotAt = ""    # extra screendumps this many seconds after the navigation, e.g. "8 14 22" (needs -Shot: files <Shot>.<N>s.ppm)
     ,[string]$ClickAt = ""   # a mouse click on screen: "X,Y@SEC" = click (X,Y) SEC seconds after the navigation (the pointer is first pushed into the top-left corner)
+    ,[string]$Display = "none"   # "sdl"/"gtk": a real QEMU window like run-windows.bat (its display refresh and audio mixing share QEMU's main thread: the stutter the headless runs do not show)
+    ,[switch]$AudioSdl         # sound through QEMU's SDL backend (as run-windows.bat), not a WAV file
     ,[switch]$Prof            # turn the kernel profiler on (`prof on`): [prof] zone lines once a second
 )
 $ErrorActionPreference = "Stop"
@@ -39,12 +41,13 @@ Remove-Item $log -ErrorAction SilentlyContinue
 
 $qargs = @("-accel", $Accel, "-m", "$Mem", "-cdrom", $iso, "-boot", "d", "-vga", "std",
           "-device", "e1000,netdev=net0", "-netdev", "user,id=net0",
-          "-serial", "file:$log", "-display", "none", "-no-reboot",
+          "-serial", "file:$log", "-display", $Display, "-no-reboot",
           "-monitor", "tcp:127.0.0.1:$Port,server,nowait")
 if ($Smp -gt 1) { $qargs += @("-smp", "$Smp") }
 if ($Extra) { $qargs += $Extra }
+if ($AudioSdl) { $qargs += @("-audiodev", "sdl,id=a0", "-device", "intel-hda", "-device", "hda-output,audiodev=a0") }
 if ($AudioWav) { $qargs += @("-audiodev", "wav,id=a0,path=$AudioWav", "-device", "intel-hda", "-device", "hda-output,audiodev=a0") }
-$p = Start-Process -FilePath $Qemu -ArgumentList $qargs -PassThru -WindowStyle Hidden
+$p = Start-Process -FilePath $Qemu -ArgumentList $qargs -PassThru -WindowStyle $(if ($Display -eq 'none') { 'Hidden' } else { 'Normal' })
 
 function Send-Keys([string]$s) {
     $map = @{ ' '='spc'; '/'='slash'; '.'='dot'; ':'='shift-semicolon'; '-'='minus'; "`n"='ret';

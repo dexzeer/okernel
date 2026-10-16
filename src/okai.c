@@ -44,6 +44,7 @@
 #include "web/wurl.h"
 #include "web/image.h"
 #include "web/surface.h"
+#include "ui_draw.h"
 #include <stdint.h>
 
 // Wall-clock baseline for the tab open/close animation. okai_anim_step eases
@@ -1134,7 +1135,9 @@ static void okai_js_log(const char* s) { serial_puts(s); }
 // nothing times out just because a script is busy. It never calls into the page or draws.
 extern uint32_t engine_main_sp;
 extern void desktop_bg_poll(void);
-static void engine_pump_body(void* arg) { (void)arg; desktop_bg_poll(); }
+extern void desktop_present_window(int win_id);
+static void present_pending_video(void);
+static void engine_pump_body(void* arg) { (void)arg; desktop_bg_poll(); present_pending_video(); }
 static void engine_pump(void) {
     static int pumping;
     if (pumping || !in_engine || !engine_stack || !engine_main_sp) return;
@@ -2434,8 +2437,74 @@ static void js_pump(void) {
 // pushed to the screen as a dirty rectangle.
 #define MEDIA_RECTS 8
 static uint32_t media_next[MAX_OKAIS][OKAI_MAX_TABS];   // earliest tick of the next look at an idle session
+
+// Video frame-rate counter (shell `vidfps`): once a second the decoder's numbers (frames handed to the page, dropped, longest gap) are
+// joined with what happened on this side - frames painted into the page picture and frames that actually reached the framebuffer flush
+// (okai_note_flush from the desktop loop) - printed on the video's corner and to the serial log as `[vidfps]`.
+static int vid_overlay_on = 1;
+static uint32_t vid_paints, vid_scr, vid_paints_last, vid_scr_last, vid_next_tick;
+static int vid_flush_pending;
+static char vid_text[80];
+void okai_vidfps_set(int on) { vid_overlay_on = on; }
+int okai_vidfps_get(void) { return vid_overlay_on; }
+void okai_note_flush(void) { if (vid_flush_pending) { vid_flush_pending = 0; vid_scr++; } }
+static void vid_put(char* d, int* n, const char* s) { while (*s && *n < 78) d[(*n)++] = *s++; d[*n] = 0; }
+static void vid_putu(char* d, int* n, uint32_t v) {
+    char t[12]; int k = 0;
+    do { t[k++] = (char)('0' + v % 10); v /= 10; } while (v && k < 11);
+    while (k && *n < 78) d[(*n)++] = t[--k];
+    d[*n] = 0;
+}
+static void vid_second(void) {
+    if ((int)(tick_count - vid_next_tick) < 0) return;
+    vid_next_tick = tick_count + 100;
+    struct wjs_vidstat st;
+    if (!wjs_media_vidstat(&st)) { vid_paints_last = vid_paints; vid_scr_last = vid_scr; return; }
+    uint32_t paint = vid_paints - vid_paints_last, scr = vid_scr - vid_scr_last;
+    vid_paints_last = vid_paints; vid_scr_last = vid_scr;
+    int n = 0;
+    vid_text[0] = 0;
+    vid_put(vid_text, &n, "dec "); vid_putu(vid_text, &n, st.shown);
+    vid_put(vid_text, &n, "  scr "); vid_putu(vid_text, &n, scr);
+    vid_put(vid_text, &n, "  drop "); vid_putu(vid_text, &n, st.dropped);
+    vid_put(vid_text, &n, "  gap "); vid_putu(vid_text, &n, st.gap_ms); vid_put(vid_text, &n, "ms");
+    vid_put(vid_text, &n, "  buf "); vid_putu(vid_text, &n, st.ahead_ms / 1000); vid_put(vid_text, &n, "."); vid_putu(vid_text, &n, st.ahead_ms / 100 % 10); vid_put(vid_text, &n, "s");
+    serial_printf("[vidfps] dec %u paint %u scr %u drop %u gap %ums decode %u.%u + convert %u.%u ms tiles own %u helped %u kcyc/frame tiles %u (sum %u max %u) lf %u ext %u clock %dms underruns %u buffered %ums\n", st.shown, paint, scr, st.dropped,
+                  st.gap_ms, st.dec_x10 / 10, st.dec_x10 % 10, st.cvt_x10 / 10, st.cvt_x10 % 10, st.tiles_own, st.tiles_help, st.kc_tiles, st.kc_tsum, st.kc_tmax, st.kc_lf, st.kc_ext, st.clock_ms, st.underruns, st.ahead_ms);
+}
+// A frame that was decoded while a page script runs (wjs_media_tick): copy it into the page picture and put it on the screen now.
+// Only its rectangle is touched and nothing of the page is called; the normal media_pump repaints it with the page's overlays later.
+static void present_pending_video(void) {
+    struct wjs_present p;
+    if (!wjs_media_take_present(&p)) return;
+    for (int bi = 0; bi < MAX_OKAIS; bi++) {
+        struct okai* b = okai_get(bi);
+        if (!b || !b->page_px) continue;
+        for (int ti = 0; ti < b->tab_count; ti++) {
+            struct okai_tab* T = &b->tabs[ti];
+            if (T->doc != p.doc || ti != b->active_tab || !T->first_paint || T->closing) continue;
+            struct wsurf s;
+            surf_of(b, &s);
+            int y0 = p.y - (p.fixed ? 0 : T->scroll_y);
+            int x0 = p.x, x1 = p.x + p.w, y1 = y0 + p.h;
+            int cx0 = x0 < 0 ? 0 : x0, cy0 = y0 < 0 ? 0 : y0;
+            if (x1 > s.w) x1 = s.w;
+            if (y1 > s.h) y1 = s.h;
+            if (cx0 >= x1 || cy0 >= y1) return;
+            for (int y = cy0; y < y1; y++)
+                memcpy(s.px + (size_t)y * (size_t)s.stride + cx0, p.px + (size_t)(y - y0) * (size_t)p.w + (size_t)(cx0 - x0), (size_t)(x1 - cx0) * 4);
+            vid_paints++;
+            vid_flush_pending = 1;
+            window_dirty_pixels(b->win_id, cx0, cy0, x1 - cx0, y1 - cy0);
+            desktop_present_window(b->win_id);
+            return;
+        }
+    }
+}
+
 static void media_pump(void) {
     static struct wjs_rect rects[MEDIA_RECTS];
+    vid_second();
     for (int bi = 0; bi < MAX_OKAIS; bi++) {
         struct okai* b = okai_get(bi);
         if (!b) continue;
@@ -2479,6 +2548,16 @@ static void media_pump(void) {
                 p.surf = &s;
                 p.scroll = T->scroll_y;
                 run_job(&p);
+                vid_paints++;
+                vid_flush_pending = 1;
+                if (vid_overlay_on && vid_text[0]) {              // counter on the video's corner (inside the clip: only this rect is touched)
+                    int tw = ui_text_w(14, 1, vid_text, (int)strlen(vid_text));
+                    int ox = x0 + 8, oy = y0 + 8;
+                    if (ox + tw + 16 <= x1 && oy + 26 <= y1) {
+                        ui_rrect(&s, ox, oy, tw + 16, 24, 6, 0xB0000000u);
+                        ui_text_draw(&s, ox + 8, oy + 12, 14, 1, 0xFFFFFFFFu, vid_text, (int)strlen(vid_text), tw + 4, 0x00000000u);
+                    }
+                }
                 window_dirty_pixels(b->win_id, x0, y0, x1 - x0, y1 - y0);
             }
         }
