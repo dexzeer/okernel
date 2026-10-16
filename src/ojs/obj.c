@@ -669,6 +669,7 @@ static int array_set_length(ojs* J, struct obj* a, const struct pdesc* d) {
 // ---------------------------------------------------------------- get / has / set / delete
 
 int ord_has(ojs* J, struct obj* o, pkey k) {
+    struct obj* start = o;
     for (;;) {
         int r;
         if ((o->flags & OF_EXOTIC) && class_ops[obj_class(o)].has) return class_ops[obj_class(o)].has(J, o, k);
@@ -683,7 +684,7 @@ int ord_has(ojs* J, struct obj* o, pkey k) {
         int err = 0;
         struct obj* p = obj_get_proto(J, o, &err);
         if (err) return -1;
-        if (!p) return 0;
+        if (!p) { OJS_MISS(J, start, k, "has"); return 0; }
         o = p;
     }
 }
@@ -696,6 +697,7 @@ static jv call_getter(ojs* J, jv getter, jv receiver) {
 }
 
 jv ord_get(ojs* J, struct obj* o, pkey k, jv receiver) {
+    struct obj* start = o;
     for (;;) {
         if (o->flags & OF_EXOTIC) {
             const struct class_ops* ops = &class_ops[obj_class(o)];
@@ -715,7 +717,7 @@ jv ord_get(ojs* J, struct obj* o, pkey k, jv receiver) {
         int err = 0;
         struct obj* p = obj_get_proto(J, o, &err);
         if (err) return JV_EXC;
-        if (!p) return JV_UNDEFINED;
+        if (!p) { OJS_MISS(J, start, k, "get"); return JV_UNDEFINED; }
         o = p;
     }
 }

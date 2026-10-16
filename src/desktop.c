@@ -823,6 +823,11 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, ip_buf);
         window_puts(win_id, "\n");
     }
+    else if (str_eq(cmd_buf, "fetchhdr")) {
+        // Log the head of every request that leaves (serial: [fetch-head]); cookies reduced to their size
+        fetch_log_heads = !fetch_log_heads;
+        window_puts(win_id, fetch_log_heads ? "Request-head logging on (serial).\n" : "Request-head logging off.\n");
+    }
     else if (str_eq(cmd_buf, "nettrace")) {
         // Per-packet serial tracing (frames, TCP segments) on/off
         net_trace = !net_trace;

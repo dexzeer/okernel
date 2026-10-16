@@ -232,6 +232,30 @@ again:
         if (!getcwd(cwd, sizeof cwd)) cwd[0] = 0;
         snprintf(url, sizeof url, "file://%s/%s", cwd, argv[1]);
     }
+    if (getenv("WB_PRE")) {                        // WB_PRE=file.js: a script run before the page's own (inserted after <head>)
+        int pl;
+        char* ps = slurp(getenv("WB_PRE"), &pl);
+        if (ps) {
+            char* nb = (char*)malloc((size_t)len + (size_t)pl + 64);
+            int at = 0;
+            for (int i = 0; i + 5 < len; i++)
+                if (html[i] == '<' && (html[i + 1] | 32) == 'h' && (html[i + 2] | 32) == 'e' && (html[i + 3] | 32) == 'a' && (html[i + 4] | 32) == 'd' && (html[i + 5] == '>' || html[i + 5] == ' ')) {
+                    at = i;
+                    while (at < len && html[at] != '>') at++;
+                    at++;
+                    break;
+                }
+            memcpy(nb, html, (size_t)at);
+            int o2 = at;
+            memcpy(nb + o2, "<script>", 8); o2 += 8;
+            memcpy(nb + o2, ps, (size_t)pl); o2 += pl;
+            memcpy(nb + o2, "</script>", 9); o2 += 9;
+            memcpy(nb + o2, html + at, (size_t)(len - at));
+            html = nb;
+            len = o2 + (len - at);
+            free(ps);
+        }
+    }
     double t0 = now_ms();
     struct wdoc* d = wdoc_new();
     wdoc_set_viewport(d, vw, vh);
@@ -304,7 +328,7 @@ again:
             int nn;
             wjs_media_poll(js, rr, 8, &nn);
         }
-        if (id >= 0) continue;
+        if (id >= 0) { if (now_ms() > deadline) break; continue; }
         int due = js ? wjs_next_due(js) : -1;
         if (js && wjs_media_active(js)) due = 5;
         if (now_ms() > deadline) break;
@@ -317,6 +341,12 @@ again:
     if (js && getenv("WB_EVAL") && getenv("WB_EVAL_WAIT")) {      // WB_EVAL_WAIT=ms: keep the timers running afterwards (what the snippet scheduled)
         double until = now_ms() + atof(getenv("WB_EVAL_WAIT"));
         while (now_ms() < until) { wjs_run(js, 500); usleep(5000); }
+    }
+    if (js && getenv("WB_DUMP") && getenv("WB_DUMP_FILE")) {      // WB_DUMP=name WB_DUMP_FILE=path: write String(globalThis[name]()) or the value to a file
+        char expr[256];
+        snprintf(expr, sizeof expr, "(function(){var v=globalThis['%s'];return typeof v==='function'?v():v;})()", getenv("WB_DUMP"));
+        char* ds = wjs_debug_eval_str(js, expr);
+        if (ds) { FILE* df = fopen(getenv("WB_DUMP_FILE"), "wb"); if (df) { fwrite(ds, 1, strlen(ds), df); fclose(df); } free(ds); }
     }
     wdoc_update(d);
     if (getenv("WB_RESTYLE")) {                // WB_RESTYLE=N: restyle + relayout the loaded page N times (profiling the cascade)
