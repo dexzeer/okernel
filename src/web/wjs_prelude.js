@@ -116,7 +116,7 @@ class FocusEvent extends UIEvent { constructor(t, i) { super(t, i); this.related
 class InputEvent extends UIEvent { constructor(t, i) { super(t, i); i = i || {}; this.data = i.data === undefined ? null : i.data; this.inputType = i.inputType || ''; this.isComposing = false; } }
 class ErrorEvent extends Event { constructor(t, i) { super(t, i); i = i || {}; this.message = i.message || ''; this.filename = i.filename || ''; this.lineno = i.lineno | 0; this.colno = i.colno | 0; this.error = i.error; } }
 class ProgressEvent extends Event { constructor(t, i) { super(t, i); i = i || {}; this.lengthComputable = !!i.lengthComputable; this.loaded = i.loaded || 0; this.total = i.total || 0; } }
-class MessageEvent extends Event { constructor(t, i) { super(t, i); i = i || {}; this.data = i.data; this.origin = i.origin || ''; this.lastEventId = ''; this.source = i.source || null; this.ports = []; } }
+class MessageEvent extends Event { constructor(t, i) { super(t, i); i = i || {}; this.data = i.data; this.origin = i.origin || ''; this.lastEventId = ''; this.source = i.source || null; this.ports = i.ports ? Array.from(i.ports) : []; } }
 class PopStateEvent extends Event { constructor(t, i) { super(t, i); this.state = i && i.state !== undefined ? i.state : null; } }
 class HashChangeEvent extends Event { constructor(t, i) { super(t, i); i = i || {}; this.oldURL = i.oldURL || ''; this.newURL = i.newURL || ''; } }
 class PageTransitionEvent extends Event { constructor(t, i) { super(t, i); this.persisted = !!(i && i.persisted); } }
@@ -261,7 +261,7 @@ const EVENT_NAMES = ['abort', 'animationend', 'animationiteration', 'animationst
     'beforeunload', 'blur', 'cancel', 'change', 'click', 'close', 'contextmenu', 'copy', 'cut', 'dblclick', 'drag',
     'dragend', 'dragenter', 'dragleave', 'dragover', 'dragstart', 'drop', 'error', 'focus', 'focusin', 'focusout',
     'hashchange', 'input', 'invalid', 'keydown', 'keypress', 'keyup', 'load', 'loadeddata', 'loadedmetadata',
-    'loadend', 'loadstart', 'message', 'mousedown', 'mouseenter', 'mouseleave', 'mousemove', 'mouseout',
+    'loadend', 'loadstart', 'message', 'messageerror', 'open', 'mousedown', 'mouseenter', 'mouseleave', 'mousemove', 'mouseout',
     'mouseover', 'mouseup', 'offline', 'online', 'pagehide', 'pageshow', 'paste', 'pause', 'play', 'playing',
     'pointercancel', 'pointerdown', 'pointerenter', 'pointerleave', 'pointermove', 'pointerout', 'pointerover',
     'pointerup', 'popstate', 'progress', 'readystatechange', 'reset', 'resize', 'scroll', 'scrollend', 'select',
@@ -1699,7 +1699,12 @@ class SourceBuffer extends EventTarget {
     _check() {
         if (this._removed) throw new DOMException('This SourceBuffer has been removed from the parent media source.', 'InvalidStateError');
         if (this.updating) throw new DOMException('The SourceBuffer is still processing an \'appendBuffer\' or \'remove\' operation.', 'InvalidStateError');
-        if (this._ms.readyState === 'ended') { this._ms.readyState = 'open'; fire(this._ms, 'sourceopen'); }
+        if (this._ms.readyState === 'ended') {
+            this._ms.readyState = 'open';
+            const el = this._ms._el, s = el && MS.get(el);
+            if (s && s.id) { W.mediaEos(s.id, 0); s.eosSent = false; }
+            fire(this._ms, 'sourceopen');
+        }
     }
     _op(fn) {
         this.updating = true;
@@ -1721,6 +1726,7 @@ class SourceBuffer extends EventTarget {
         this._op(() => {
             const el = ms._el, s = el && MS.get(el);
             if (!s || !s.id) return false;
+            W.mediaSbOpts(s.id, this._idx, +this.timestampOffset || 0, +this.appendWindowStart || 0, this.appendWindowEnd);
             const rc = W.mediaAppend(s.id, this._idx, data);
             if (rc < 0) { mediaFail(el, s, 3, 'CHUNK_DEMUXER_ERROR_APPEND_FAILED'); return false; }
             mediaApplyState(el, s);
@@ -1735,7 +1741,7 @@ class SourceBuffer extends EventTarget {
         const ms = this._ms;
         this._op(() => {
             const el = ms._el, s = el && MS.get(el);
-            if (s && s.id) W.mediaRemove(s.id, start, end);
+            if (s && s.id) W.mediaRemove(s.id, start, end, this._idx);
             return true;
         });
     }
@@ -1745,7 +1751,14 @@ class SourceBuffer extends EventTarget {
         if (s && s.id) W.mediaAbort(s.id, this._idx);
         if (this.updating) { this.updating = false; fire(this, 'abort'); fire(this, 'updateend'); }
     }
-    changeType(mime) { if (!mimeKinds(mime)) throw new DOMException('Unsupported type', 'NotSupportedError'); this.type = mime; }
+    changeType(mime) {
+        if (this._removed) throw new DOMException('This SourceBuffer has been removed from the parent media source.', 'InvalidStateError');
+        if (this.updating) throw new DOMException("The SourceBuffer is still processing an 'appendBuffer' or 'remove' operation.", 'InvalidStateError');
+        if (!mimeKinds(mime)) throw new DOMException('Unsupported type', 'NotSupportedError');
+        this.type = String(mime);
+        const el = this._ms._el, s = el && MS.get(el);
+        if (s && s.id) W.mediaSbType(s.id, this._idx);     // the next bytes may be another container/codec
+    }
 }
 class MediaSource extends EventTarget {
     constructor() {
@@ -2602,7 +2615,9 @@ function createImageBitmap(src, a, b, c, d) {
 
 function dataUrlToBlob(url, type) {
     const bin = atob(url.slice(url.indexOf(',') + 1));
-    return new Blob([bin], { type: type || 'image/png' });
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new Blob([bytes], { type: type || 'image/png' });
 }
 
 // ---- the canvas element
@@ -3170,7 +3185,7 @@ function startRequest(method, url, headers, body, handler) {
         else if (body instanceof URLSearchParams) { bodyStr = body.toString(); ctype = 'application/x-www-form-urlencoded;charset=UTF-8'; }
         else if (body instanceof FormData) { bodyStr = body._urlencoded(); ctype = 'application/x-www-form-urlencoded;charset=UTF-8'; }
         else if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) bodyStr = body;
-        else if (body instanceof Blob) { bodyStr = body._text(); if (body.type) ctype = body.type; }
+        else if (body instanceof Blob) { bodyStr = body._b; if (body.type) ctype = body.type; }
         else { bodyStr = String(body); ctype = 'text/plain;charset=UTF-8'; }
     }
     const hs = [];
@@ -3219,26 +3234,56 @@ class Headers {
     entries() { return Array.from(this._m.entries()).sort((a, b) => a[0] < b[0] ? -1 : 1)[Symbol.iterator](); }
     [Symbol.iterator]() { return this.entries(); }
 }
+const blobBytes = p => p instanceof Blob ? p._b
+    : p instanceof ArrayBuffer ? new Uint8Array(p)
+    : ArrayBuffer.isView(p) ? new Uint8Array(p.buffer, p.byteOffset, p.byteLength)
+    : new TextEncoder().encode(String(p));
 class Blob {
     constructor(parts, opts) {
-        let s = '';
-        for (const p of parts || []) {
-            if (typeof p === 'string') s += p;
-            else if (p instanceof Blob) s += p._s;
-            else if (p instanceof ArrayBuffer || ArrayBuffer.isView(p)) s += new TextDecoder().decode(p);
-            else s += String(p);
-        }
-        hidden(this, '_s', s);
-        this.type = (opts && opts.type) || '';
+        if (parts !== undefined && (parts === null || typeof parts !== 'object' || typeof parts[Symbol.iterator] !== 'function'))
+            throw new TypeError("Failed to construct 'Blob': The provided value cannot be converted to a sequence.");
+        const chunks = [];
+        let n = 0;
+        for (const p of parts || []) { const c = blobBytes(p); chunks.push(c); n += c.length; }
+        const all = new Uint8Array(n);
+        let o = 0;
+        for (const c of chunks) { all.set(c, o); o += c.length; }
+        hidden(this, '_b', all);
+        const t = opts && opts.type !== undefined ? String(opts.type) : '';
+        this.type = /^[ -~]*$/.test(t) ? t.toLowerCase() : '';
     }
-    get size() { return new TextEncoder().encode(this._s).length; }
-    _text() { return this._s; }
-    text() { return Promise.resolve(this._s); }
-    arrayBuffer() { return Promise.resolve(new TextEncoder().encode(this._s).buffer); }
-    slice(a, b, t) { return new Blob([this._s.slice(a, b)], { type: t }); }
-    stream() { throw new DOMException('streams are not supported', 'NotSupportedError'); }
+    get size() { return this._b.length; }
+    get _s() { return this._text(); }
+    _text() { return new TextDecoder().decode(this._b); }
+    text() { return Promise.resolve(this._text()); }
+    arrayBuffer() { return Promise.resolve(this._b.slice().buffer); }
+    bytes() { return Promise.resolve(this._b.slice()); }
+    slice(a, b, t) {
+        const n = this._b.length;
+        a = a === undefined ? 0 : Math.trunc(+a) || 0; b = b === undefined ? n : Math.trunc(+b) || 0;
+        a = a < 0 ? Math.max(n + a, 0) : Math.min(a, n); b = b < 0 ? Math.max(n + b, 0) : Math.min(b, n);
+        return new Blob([this._b.subarray(a, Math.max(a, b))], { type: t === undefined ? '' : t });
+    }
+    stream() {
+        const bytes = this._b;
+        let pos = 0;
+        return new ReadableStream({ pull(c) {
+            if (pos >= bytes.length) { c.close(); return; }
+            const n = Math.min(65536, bytes.length - pos);
+            c.enqueue(bytes.slice(pos, pos + n));
+            pos += n;
+            if (pos >= bytes.length) c.close();
+        } });
+    }
 }
-class File extends Blob { constructor(parts, name, opts) { super(parts, opts); this.name = String(name); this.lastModified = Date.now(); } }
+class File extends Blob {
+    constructor(parts, name, opts) {
+        super(parts, opts);
+        this.name = String(name);
+        this.lastModified = opts && opts.lastModified !== undefined ? +opts.lastModified : Date.now();
+    }
+    get webkitRelativePath() { return ''; }
+}
 class FormData {
     constructor(form) {
         hidden(this, '_l', []);
@@ -3416,7 +3461,7 @@ class Response {
             const self = this;
             const b = this._body;
             const bytes = typeof b === 'string' ? new TextEncoder().encode(b)
-                : b instanceof Blob ? new TextEncoder().encode(b._s)
+                : b instanceof Blob ? b._b
                 : b instanceof ArrayBuffer ? new Uint8Array(b)
                 : ArrayBuffer.isView(b) ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength)
                 : new TextEncoder().encode(String(b));
@@ -3439,10 +3484,10 @@ class Response {
         this.bodyUsed = true;
         return Promise.resolve(this._body);
     }
-    text() { return this._consume().then(b => b === null ? '' : typeof b === 'string' ? b : b instanceof Blob ? b._s : new TextDecoder().decode(b)); }
+    text() { return this._consume().then(b => b === null ? '' : typeof b === 'string' ? b : b instanceof Blob ? b._text() : new TextDecoder().decode(b)); }
     json() { return this.text().then(t => JSON.parse(t)); }
-    arrayBuffer() { return this._consume().then(b => b === null ? new ArrayBuffer(0) : typeof b === 'string' ? new TextEncoder().encode(b).buffer : b instanceof ArrayBuffer ? b : new TextEncoder().encode(String(b)).buffer); }
-    blob() { return this.text().then(t => new Blob([t], { type: this.headers.get('content-type') || '' })); }
+    arrayBuffer() { return this._consume().then(b => b === null ? new ArrayBuffer(0) : typeof b === 'string' ? new TextEncoder().encode(b).buffer : b instanceof ArrayBuffer ? b : b instanceof Blob ? b._b.slice().buffer : ArrayBuffer.isView(b) ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength).slice().buffer : new TextEncoder().encode(String(b)).buffer); }
+    blob() { return this._consume().then(b => new Blob(b === null ? [] : [b], { type: this.headers.get('content-type') || '' })); }
     formData() { return this.text().then(t => { const f = new FormData(); for (const [k, v] of new URLSearchParams(t)) f.append(k, v); return f; }); }
     clone() { return new Response(this._body, { status: this.status, statusText: this.statusText, headers: new Headers(this.headers), url: this.url }); }
     static json(data, init) { const r = new Response(JSON.stringify(data), init); r.headers.set('content-type', 'application/json'); return r; }
@@ -3501,7 +3546,7 @@ class XMLHttpRequest extends EventTarget {
         for (const n of ['onreadystatechange', 'onload', 'onerror', 'onabort', 'onloadend', 'onloadstart', 'onprogress', 'ontimeout']) this[n] = null;
     }
     _fire(type) {
-        const ev = type === 'readystatechange' ? new Event(type) : new ProgressEvent(type, { loaded: this.responseText.length, total: this.responseText.length });
+        const ev = type === 'readystatechange' ? new Event(type) : new ProgressEvent(type, { loaded: this._loaded || this.responseText.length, total: this._loaded || this.responseText.length });
         const h = this['on' + type];
         if (typeof h === 'function') try { h.call(this, ev); } catch (e) { report(e, 'XHR on' + type); }
         dispatch(this, ev);
@@ -3534,12 +3579,13 @@ class XMLHttpRequest extends EventTarget {
             this._rh = parseHeaders(raw);
             this._state(2);
             this._state(3);
-            const text = buf === null ? '' : new TextDecoder().decode(buf);
-            this.responseText = text;
             const rt = this.responseType;
+            const text = buf === null || rt === 'arraybuffer' || rt === 'blob' ? '' : new TextDecoder().decode(buf);
+            this._loaded = buf === null ? 0 : buf.byteLength;
+            if (rt === '' || rt === 'text') this.responseText = text;
             if (rt === 'json') { try { this.response = JSON.parse(text); } catch (e) { this.response = null; } }
             else if (rt === 'arraybuffer') this.response = buf || new ArrayBuffer(0);
-            else if (rt === 'blob') this.response = new Blob([text], { type: this._rh.get('content-type') || '' });
+            else if (rt === 'blob') this.response = new Blob(buf === null ? [] : [buf], { type: this._rh.get('content-type') || '' });
             else if (rt === 'document') this.response = null;
             else this.response = text;
             this._state(4);
@@ -3556,18 +3602,54 @@ class TextEncoder {
     encode(s) { return W.utf8enc(s === undefined ? '' : String(s)); }
     encodeInto(s, dest) { const b = this.encode(s); const n = Math.min(b.length, dest.length); dest.set(b.subarray(0, n)); return { read: s.length, written: n }; }
 }
+const TD_LABELS = { 'utf-8': 'utf-8', 'utf8': 'utf-8', 'unicode-1-1-utf-8': 'utf-8', 'utf-16le': 'utf-16le', 'utf-16': 'utf-16le', 'ucs-2': 'utf-16le', 'utf-16be': 'utf-16be',
+    'iso-8859-1': 'windows-1252', 'latin1': 'windows-1252', 'windows-1252': 'windows-1252', 'ascii': 'windows-1252', 'us-ascii': 'windows-1252', 'l1': 'windows-1252' };
 class TextDecoder {
-    constructor(label, opts) { this.encoding = String(label || 'utf-8').toLowerCase(); this.fatal = !!(opts && opts.fatal); this.ignoreBOM = !!(opts && opts.ignoreBOM); }
-    decode(buf) {
-        if (buf === undefined || buf === null) return '';
+    constructor(label, opts) {
+        const l = TD_LABELS[String(label === undefined ? 'utf-8' : label).trim().toLowerCase()];
+        if (!l) throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
+        Object.defineProperty(this, 'encoding', { value: l, enumerable: true });
+        Object.defineProperty(this, 'fatal', { value: !!(opts && opts.fatal), enumerable: true });
+        Object.defineProperty(this, 'ignoreBOM', { value: !!(opts && opts.ignoreBOM), enumerable: true });
+        hidden(this, '_pend', new Uint8Array(0)); hidden(this, '_bom', true);
+    }
+    decode(buf, opts) {
         let u8;
-        if (buf instanceof ArrayBuffer) u8 = new Uint8Array(buf);
+        if (buf === undefined || buf === null) u8 = new Uint8Array(0);
+        else if (buf instanceof ArrayBuffer) u8 = new Uint8Array(buf);
         else if (ArrayBuffer.isView(buf)) u8 = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-        else throw new TypeError('TextDecoder.decode: not a buffer');
-        if (/^(iso-8859-1|latin1|windows-1252|ascii|us-ascii)$/.test(this.encoding)) { let s = ''; for (let i = 0; i < u8.length; i++) s += String.fromCharCode(u8[i]); return s; }
-        return W.utf8dec(u8);
+        else throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The provided value is not of type '(ArrayBuffer or ArrayBufferView)'.");
+        const stream = !!(opts && opts.stream);
+        if (this._pend.length) { const j = new Uint8Array(this._pend.length + u8.length); j.set(this._pend); j.set(u8, this._pend.length); u8 = j; this._pend = new Uint8Array(0); }
+        let out;
+        if (this.encoding === 'windows-1252') { out = ''; for (let i = 0; i < u8.length; i += 8192) out += String.fromCharCode.apply(null, u8.subarray(i, i + 8192)); }
+        else if (this.encoding === 'utf-8') {
+            let n = u8.length;
+            if (stream) {                       // keep an incomplete sequence at the end for the next call
+                let i = n - 1, back = 0;
+                while (i >= 0 && back < 3 && (u8[i] & 0xC0) === 0x80) { i--; back++; }
+                if (i >= 0) {
+                    const c = u8[i], need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+                    if (need > 1 && n - i < need) n = i;
+                }
+            }
+            this._pend = u8.slice(n);
+            out = W.utf8dec(n === u8.length ? u8 : u8.subarray(0, n));
+            if (this.fatal && out.indexOf('�') >= 0 && !bytesHaveFFFD(u8.subarray(0, n))) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid for encoding utf-8");
+        } else {
+            const be = this.encoding === 'utf-16be';
+            let n = u8.length & ~1;
+            this._pend = u8.slice(n);
+            out = '';
+            for (let i = 0; i < n; i += 2) out += String.fromCharCode(be ? u8[i] << 8 | u8[i + 1] : u8[i + 1] << 8 | u8[i]);
+        }
+        if (this._bom && out.length && !this.ignoreBOM && out.charCodeAt(0) === 0xFEFF) out = out.slice(1);
+        if (out.length || !stream) this._bom = stream ? this._bom && !out.length : true;
+        if (!stream) { this._bom = true; this._pend = new Uint8Array(0); }
+        return out;
     }
 }
+function bytesHaveFFFD(u8) { for (let i = 0; i + 2 < u8.length; i++) if (u8[i] === 0xEF && u8[i + 1] === 0xBF && u8[i + 2] === 0xBD) return true; return false; }
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 function btoa(s) {
     s = String(s);
@@ -3970,8 +4052,547 @@ const performance = Object.assign(new EventTarget(), {
     toJSON() { return {}; },
     memory: { jsHeapSizeLimit: 67108864, totalJSHeapSize: 0, usedJSHeapSize: 0 }
 });
-class PerformanceObserver { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } }
-PerformanceObserver.supportedEntryTypes = [];
+// ---------------------------------------------------------------- messaging: MessageChannel / MessagePort / BroadcastChannel
+const PORT_TOKEN = {};
+class MessagePort extends EventTarget {
+    constructor(tok) {
+        if (tok !== PORT_TOKEN) illegal();
+        super();
+        hidden(this, '_peer', null); hidden(this, '_q', []); hidden(this, '_on', false); hidden(this, '_closed', false); hidden(this, '_sched', false);
+    }
+    postMessage(data, transfer) {
+        if (arguments.length === 0) throw new TypeError("Failed to execute 'postMessage' on 'MessagePort': 1 argument required, but only 0 present.");
+        const d = structuredClone(data);
+        const o = this._peer;
+        if (this._closed || !o || o._closed) return;
+        o._q.push(d);
+        o._kick();
+    }
+    _kick() {
+        if (!this._on || this._sched || !this._q.length) return;
+        this._sched = true;
+        setTimeout(() => {
+            this._sched = false;
+            while (this._on && !this._closed && this._q.length) dispatch(this, new MessageEvent('message', { data: this._q.shift(), ports: [] }));
+        }, 0);
+    }
+    start() { this._on = true; this._kick(); }
+    close() { this._closed = true; this._q.length = 0; }
+}
+defineHandlers(MessagePort.prototype);
+{
+    const d = Object.getOwnPropertyDescriptor(MessagePort.prototype, 'onmessage');
+    Object.defineProperty(MessagePort.prototype, 'onmessage', { configurable: true, enumerable: true, get: d.get, set(f) { d.set.call(this, f); if (typeof f === 'function') this.start(); } });
+}
+class MessageChannel {
+    constructor() {
+        const a = new MessagePort(PORT_TOKEN), b = new MessagePort(PORT_TOKEN);
+        a._peer = b; b._peer = a;
+        this.port1 = a; this.port2 = b;
+    }
+}
+const BC_ALL = new Map();      // channel name -> Set of open BroadcastChannels of this realm
+class BroadcastChannel extends EventTarget {
+    constructor(name) {
+        if (arguments.length === 0) throw new TypeError("Failed to construct 'BroadcastChannel': 1 argument required, but only 0 present.");
+        super();
+        Object.defineProperty(this, 'name', { value: String(name), enumerable: true });
+        hidden(this, '_closed', false);
+        let s = BC_ALL.get(this.name);
+        if (!s) BC_ALL.set(this.name, s = new Set());
+        s.add(this);
+    }
+    postMessage(data) {
+        if (this._closed) throw new DOMException('BroadcastChannel is closed.', 'InvalidStateError');
+        const d = structuredClone(data);
+        for (const o of BC_ALL.get(this.name) || []) {
+            if (o === this) continue;
+            setTimeout(() => { if (!o._closed) dispatch(o, new MessageEvent('message', { data: structuredClone(d), origin: location.origin })); }, 0);
+        }
+    }
+    close() { this._closed = true; const s = BC_ALL.get(this.name); if (s) s.delete(this); }
+}
+defineHandlers(BroadcastChannel.prototype);
+
+// ---------------------------------------------------------------- FileReader / FileList
+function bytesToBinary(u8) {
+    let s = '';
+    for (let i = 0; i < u8.length; i += 8192) s += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
+    return s;
+}
+class FileReader extends EventTarget {
+    constructor() { super(); this.readyState = 0; this.result = null; this.error = null; hidden(this, '_gen', 0); }
+    _emit(type, total) { dispatch(this, new ProgressEvent(type, { lengthComputable: true, loaded: total || 0, total: total || 0 })); }
+    _read(blob, kind, enc) {
+        if (!(blob instanceof Blob)) throw new TypeError("Failed to execute 'read' on 'FileReader': parameter 1 is not of type 'Blob'.");
+        if (this.readyState === 1) throw new DOMException("Failed to execute 'read' on 'FileReader': The object is in an invalid state.", 'InvalidStateError');
+        this.readyState = 1; this.result = null; this.error = null;
+        const gen = ++this._gen, n = blob.size;
+        setTimeout(() => {
+            if (gen !== this._gen) return;
+            this._emit('loadstart', 0);
+            let r;
+            try {
+                const b = blob._b;
+                if (kind === 'text') r = new TextDecoder(enc || 'utf-8').decode(b);
+                else if (kind === 'url') r = 'data:' + (blob.type || 'application/octet-stream') + ';base64,' + btoa(bytesToBinary(b));
+                else if (kind === 'binary') r = bytesToBinary(b);
+                else r = b.slice().buffer;
+            } catch (e) {
+                this.readyState = 2; this.error = e instanceof DOMException ? e : new DOMException(String(e && e.message || e), 'NotReadableError');
+                this._emit('error', 0); this._emit('loadend', 0);
+                return;
+            }
+            this.readyState = 2; this.result = r;
+            this._emit('progress', n); this._emit('load', n); this._emit('loadend', n);
+        }, 0);
+    }
+    readAsText(b, enc) { this._read(b, 'text', enc); }
+    readAsDataURL(b) { this._read(b, 'url'); }
+    readAsArrayBuffer(b) { this._read(b, 'buffer'); }
+    readAsBinaryString(b) { this._read(b, 'binary'); }
+    abort() {
+        if (this.readyState !== 1) return;
+        this._gen++; this.readyState = 2; this.result = null;
+        this._emit('abort', 0); this._emit('loadend', 0);
+    }
+}
+FileReader.EMPTY = 0; FileReader.LOADING = 1; FileReader.DONE = 2;
+defineHandlers(FileReader.prototype);
+class FileList {
+    constructor() { illegal(); }
+    get length() { return this._a.length; }
+    item(i) { return this._a[i] || null; }
+    [Symbol.iterator]() { return this._a[Symbol.iterator](); }
+}
+
+// ---------------------------------------------------------------- EventSource (server-sent events)
+class EventSource extends EventTarget {
+    constructor(url, init) {
+        super();
+        if (arguments.length === 0) throw new TypeError("Failed to construct 'EventSource': 1 argument required, but only 0 present.");
+        const u = parseURL(url);
+        if (!u) throw new DOMException("Failed to construct 'EventSource': Cannot parse url '" + url + "'", 'SyntaxError');
+        Object.defineProperty(this, 'url', { value: W.resolve(String(url)), enumerable: true });
+        this.withCredentials = !!(init && init.withCredentials);
+        this.readyState = 0;
+        hidden(this, '_retry', 3000); hidden(this, '_last', ''); hidden(this, '_gen', 0);
+        setTimeout(() => this._connect(), 0);
+    }
+    _connect() {
+        if (this.readyState === 2) return;
+        const gen = ++this._gen;
+        this.readyState = 0;
+        const headers = { Accept: 'text/event-stream', 'Cache-Control': 'no-cache' };
+        if (this._last) headers['Last-Event-ID'] = this._last;
+        fetch(this.url, { headers }).then(resp => {
+            if (gen !== this._gen || this.readyState === 2) return;
+            const ct = resp.headers.get('content-type') || '';
+            if (resp.status !== 200 || !/^text\/event-stream/i.test(ct)) { this._fail(true); return; }
+            this.readyState = 1;
+            dispatch(this, new Event('open'));
+            const rd = resp.body.getReader(), dec = new TextDecoder();
+            let buf = '', data = [], type = '';
+            const line = l => {
+                if (l === '') {
+                    if (data.length) { const ev = new MessageEvent(type || 'message', { data: data.join('\n'), origin: new URL(this.url).origin }); ev.lastEventId = this._last; dispatch(this, ev); }
+                    data = []; type = ''; return;
+                }
+                if (l[0] === ':') return;
+                const i = l.indexOf(':');
+                const f = i < 0 ? l : l.slice(0, i);
+                let v = i < 0 ? '' : l.slice(i + 1);
+                if (v[0] === ' ') v = v.slice(1);
+                if (f === 'data') data.push(v); else if (f === 'event') type = v; else if (f === 'id') { if (v.indexOf('\0') < 0) this._last = v; }
+                else if (f === 'retry' && /^\d+$/.test(v)) this._retry = +v;
+            };
+            const pump = () => rd.read().then(({ done, value }) => {
+                if (gen !== this._gen || this.readyState === 2) return;
+                if (done) { buf += dec.decode(); if (buf) { for (const l of buf.split(/\r\n|\n|\r/)) line(l); } this._fail(false); return; }
+                buf += dec.decode(value, { stream: true });
+                const parts = buf.split(/\r\n|\n|\r/);
+                buf = parts.pop();
+                for (const l of parts) line(l);
+                pump();
+            }, () => { if (gen === this._gen) this._fail(false); });
+            pump();
+        }, () => { if (gen === this._gen) this._fail(false); });
+    }
+    _fail(fatal) {
+        if (this.readyState === 2) return;
+        if (fatal) { this.readyState = 2; dispatch(this, new Event('error')); return; }
+        this.readyState = 0;
+        dispatch(this, new Event('error'));
+        const gen = this._gen;
+        setTimeout(() => { if (gen === this._gen) this._connect(); }, this._retry);
+    }
+    close() { this.readyState = 2; this._gen++; }
+}
+EventSource.CONNECTING = 0; EventSource.OPEN = 1; EventSource.CLOSED = 2;
+defineHandlers(EventSource.prototype);
+// ---------------------------------------------------------------- streams: WritableStream, TransformStream, pipes, text + compression streams
+class WritableStreamDefaultWriter {
+    constructor(st) {
+        if (st._writer) throw new TypeError('This stream has already been locked for exclusive writing by another writer');
+        hidden(this, '_st', st);
+        st._writer = this;
+        hidden(this, 'closed', new Promise((res, rej) => { this._cres = res; this._crej = rej; }));
+        this.closed.catch(() => {});
+        if (st._state === 'closed') this._cres(); else if (st._state === 'errored') this._crej(st._err);
+    }
+    get ready() { return this._st && this._st._state === 'errored' ? Promise.reject(this._st._err) : Promise.resolve(); }
+    get desiredSize() { const s = this._st; return !s ? null : s._state === 'errored' ? null : s._state === 'closed' ? 0 : s._hwm - s._pending; }
+    write(chunk) { return this._st ? this._st._write(chunk) : Promise.reject(new TypeError('This writable stream writer has been released and cannot be used to write to its underlying stream')); }
+    close() { return this._st ? this._st._close() : Promise.reject(new TypeError('released')); }
+    abort(reason) { return this._st ? this._st._abort(reason) : Promise.reject(new TypeError('released')); }
+    releaseLock() { if (this._st) { this._st._writer = null; this._st = null; } }
+}
+class WritableStream {
+    constructor(sink, strategy) {
+        sink = sink || {};
+        hidden(this, '_sink', sink); hidden(this, '_state', 'writable'); hidden(this, '_err', undefined); hidden(this, '_writer', null);
+        hidden(this, '_pending', 0); hidden(this, '_chain', Promise.resolve());
+        hidden(this, '_hwm', strategy && strategy.highWaterMark !== undefined ? +strategy.highWaterMark : 1);
+        const ac = new AbortController();
+        const st = this;
+        hidden(this, '_ctl', { signal: ac.signal, error(e) { st._fail(e); } });
+        hidden(this, '_ac', ac);
+        let started;
+        try { started = sink.start ? sink.start(this._ctl) : undefined; } catch (e) { this._fail(e); return; }
+        this._chain = Promise.resolve(started).then(() => {}, e => { this._fail(e); });
+    }
+    get locked() { return !!this._writer; }
+    _fail(e) {
+        if (this._state !== 'writable') return;
+        this._state = 'errored'; this._err = e;
+        try { this._ac.abort(e); } catch (_) {}
+        if (this._writer) this._writer._crej(e);
+    }
+    _write(chunk) {
+        if (this._state === 'errored') return Promise.reject(this._err);
+        if (this._state !== 'writable') return Promise.reject(new TypeError('The stream is closing or closed'));
+        this._pending++;
+        const p = this._chain.then(() => {
+            if (this._state === 'errored') throw this._err;
+            return this._sink.write ? this._sink.write(chunk, this._ctl) : undefined;
+        });
+        this._chain = p.then(() => { this._pending--; }, e => { this._pending--; this._fail(e); });
+        return p.then(() => undefined, e => { this._fail(e); throw e; });
+    }
+    _close() {
+        if (this._state === 'errored') return Promise.reject(this._err);
+        if (this._state !== 'writable') return Promise.reject(new TypeError('The stream is closing or closed'));
+        this._state = 'closing';
+        const p = this._chain.then(() => { if (this._state === 'errored') throw this._err; return this._sink.close ? this._sink.close() : undefined; });
+        this._chain = p.then(() => { this._state = 'closed'; if (this._writer) this._writer._cres(); }, e => { this._state = 'writable'; this._fail(e); });
+        return p.then(() => undefined, e => { throw e; });
+    }
+    _abort(reason) {
+        if (this._state === 'closed' || this._state === 'errored') return Promise.resolve();
+        this._fail(reason);
+        try { return Promise.resolve(this._sink.abort ? this._sink.abort(reason) : undefined).then(() => undefined); } catch (e) { return Promise.reject(e); }
+    }
+    getWriter() { return new WritableStreamDefaultWriter(this); }
+    abort(reason) { if (this._writer) return Promise.reject(new TypeError('Cannot abort a stream that already has a writer')); return this._abort(reason); }
+    close() { if (this._writer) return Promise.reject(new TypeError('Cannot close a stream that already has a writer')); return this._close(); }
+}
+class TransformStream {
+    constructor(tr, wstrat, rstrat) {
+        tr = tr || {};
+        let rc;
+        const self = this;
+        const ctl = {
+            enqueue(c) { rc.enqueue(c); },
+            error(e) { rc.error(e); self.writable._fail(e); },
+            terminate() { try { rc.close(); } catch (_) {} self.writable._fail(new TypeError('The TransformStream has been terminated')); },
+            get desiredSize() { return rc.desiredSize; },
+        };
+        const readable = new ReadableStream({
+            start(c) { rc = c; },
+            cancel(r) { self.writable._fail(r); },
+        }, rstrat || { highWaterMark: 0 });
+        const writable = new WritableStream({
+            start() { return tr.start ? tr.start(ctl) : undefined; },
+            write(chunk) {
+                try { return Promise.resolve(tr.transform ? tr.transform(chunk, ctl) : ctl.enqueue(chunk)).catch(e => { rc.error(e); throw e; }); }
+                catch (e) { rc.error(e); throw e; }
+            },
+            close() {
+                try { return Promise.resolve(tr.flush ? tr.flush(ctl) : undefined).then(() => { try { rc.close(); } catch (_) {} }, e => { rc.error(e); throw e; }); }
+                catch (e) { rc.error(e); throw e; }
+            },
+            abort(r) { rc.error(r); },
+        }, wstrat);
+        Object.defineProperty(this, 'readable', { value: readable, enumerable: true });
+        Object.defineProperty(this, 'writable', { value: writable, enumerable: true });
+    }
+}
+ReadableStream.prototype.pipeTo = function (dest, opts) {
+    opts = opts || {};
+    if (this.locked) return Promise.reject(new TypeError('Cannot pipe a locked stream'));
+    if (dest.locked) return Promise.reject(new TypeError('Cannot pipe to a locked stream'));
+    const r = this.getReader(), w = dest.getWriter();
+    let aborted = false;
+    const onAbort = () => { aborted = true; const e = opts.signal.reason; if (!opts.preventAbort) w.abort(e).catch(() => {}); if (!opts.preventCancel) r.cancel(e).catch(() => {}); };
+    if (opts.signal) { if (opts.signal.aborted) onAbort(); else opts.signal.addEventListener('abort', onAbort, { once: true }); }
+    return (async () => {
+        try {
+            for (;;) {
+                if (aborted) throw opts.signal.reason;
+                const { done, value } = await r.read();
+                if (done) break;
+                await w.write(value);
+            }
+            if (!opts.preventClose) await w.close();
+        } catch (e) {
+            if (!opts.preventAbort) await w.abort(e).catch(() => {});
+            if (!opts.preventCancel) await r.cancel(e).catch(() => {});
+            throw e;
+        } finally {
+            r.releaseLock(); w.releaseLock();
+        }
+    })();
+};
+ReadableStream.prototype.pipeThrough = function (pair, opts) {
+    this.pipeTo(pair.writable, opts).catch(() => {});
+    return pair.readable;
+};
+class TextEncoderStream extends TransformStream {
+    constructor() {
+        let lead = '';
+        super({
+            transform(chunk, c) {
+                let s = lead + String(chunk);
+                lead = '';
+                const last = s.charCodeAt(s.length - 1);
+                if (last >= 0xD800 && last <= 0xDBFF) { lead = s[s.length - 1]; s = s.slice(0, -1); }
+                if (s) c.enqueue(new TextEncoder().encode(s));
+            },
+            flush(c) { if (lead) c.enqueue(new TextEncoder().encode('�')); },
+        });
+    }
+    get encoding() { return 'utf-8'; }
+}
+class TextDecoderStream extends TransformStream {
+    constructor(label, opts) {
+        const d = new TextDecoder(label, opts);
+        super({
+            transform(chunk, c) { const s = d.decode(chunk, { stream: true }); if (s) c.enqueue(s); },
+            flush(c) { const s = d.decode(); if (s) c.enqueue(s); },
+        });
+        Object.defineProperty(this, 'encoding', { value: d.encoding, enumerable: true });
+        Object.defineProperty(this, 'fatal', { value: d.fatal, enumerable: true });
+    }
+}
+function zipFormat(f) {
+    f = String(f);
+    const i = ['deflate', 'deflate-raw', 'gzip'].indexOf(f);
+    if (i < 0) throw new TypeError("Unsupported compression format: '" + f + "'");
+    return i;
+}
+function zipStream(mode, fmt) {
+    const chunks = [];
+    let n = 0;
+    return new TransformStream({
+        transform(chunk) {
+            if (!(chunk instanceof ArrayBuffer || ArrayBuffer.isView(chunk))) throw new TypeError('Failed to execute \'write\' on \'WritableStreamDefaultWriter\': chunk is not a BufferSource');
+            const u = chunk instanceof ArrayBuffer ? new Uint8Array(chunk) : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+            chunks.push(u.slice()); n += u.length;
+        },
+        flush(c) {
+            const all = new Uint8Array(n);
+            let o = 0;
+            for (const x of chunks) { all.set(x, o); o += x.length; }
+            const r = W.zip(mode, fmt, all);
+            if (r === null) throw new TypeError(mode ? 'The compressed data is not valid' : 'Compression failed');
+            if (r.byteLength) c.enqueue(new Uint8Array(r));
+        },
+    });
+}
+class CompressionStream {
+    constructor(format) { const t = zipStream(0, zipFormat(format)); Object.defineProperty(this, 'readable', { value: t.readable, enumerable: true }); Object.defineProperty(this, 'writable', { value: t.writable, enumerable: true }); }
+}
+class DecompressionStream {
+    constructor(format) { const t = zipStream(1, zipFormat(format)); Object.defineProperty(this, 'readable', { value: t.readable, enumerable: true }); Object.defineProperty(this, 'writable', { value: t.writable, enumerable: true }); }
+}
+
+// ---------------------------------------------------------------- small interfaces pages feature-test or construct
+class MediaQueryListEvent extends Event {
+    constructor(t, i) { super(t, i); i = i || {}; this.media = i.media === undefined ? '' : String(i.media); this.matches = !!i.matches; }
+}
+class DragEvent extends MouseEvent {
+    constructor(t, i) { super(t, i); this.dataTransfer = (i && i.dataTransfer) || null; }
+}
+class Touch {
+    constructor(init) {
+        init = init || {};
+        this.identifier = init.identifier || 0; this.target = init.target || null;
+        for (const k of ['clientX', 'clientY', 'screenX', 'screenY', 'pageX', 'pageY', 'radiusX', 'radiusY', 'rotationAngle', 'force']) this[k] = +init[k] || 0;
+    }
+}
+class TouchList {
+    constructor() { illegal(); }
+}
+class PerformanceEntry {
+    constructor() { illegal(); }
+    toJSON() { return { name: this.name, entryType: this.entryType, startTime: this.startTime, duration: this.duration }; }
+}
+const PERF_ENTRIES = [];
+function perfEntry(proto, o) { const e = Object.create(proto); for (const k of Object.keys(o)) Object.defineProperty(e, k, { value: o[k], enumerable: true }); return e; }
+class PerfMark extends PerformanceEntry { }
+class PerfMeasure extends PerformanceEntry { }
+class PerformanceNavigationTiming extends PerformanceEntry { }
+class PerformanceResourceTiming extends PerformanceEntry { }
+class PerformancePaintTiming extends PerformanceEntry { }
+Object.defineProperty(PerfMark, 'name', { value: 'PerformanceMark' });
+Object.defineProperty(PerfMeasure, 'name', { value: 'PerformanceMeasure' });
+const PERF_OBS = new Set();
+function perfAdd(e) {
+    PERF_ENTRIES.push(e);
+    for (const o of PERF_OBS) if (o._types.has(e.entryType)) { o._buf.push(e); o._sched(); }
+}
+function perfMark(name, opts) {
+    const t = opts && opts.startTime !== undefined ? +opts.startTime : W.now();
+    const e = perfEntry(PerfMark.prototype, { name: String(name), entryType: 'mark', startTime: t, duration: 0, detail: opts && opts.detail !== undefined ? opts.detail : null });
+    perfAdd(e);
+    return e;
+}
+function perfMeasure(name, a, b) {
+    let start = 0, end = W.now(), detail = null;
+    const at = x => { if (typeof x === 'number') return x; const m = PERF_ENTRIES.slice().reverse().find(e => e.entryType === 'mark' && e.name === String(x)); if (!m) throw new DOMException("Failed to execute 'measure' on 'Performance': The mark '" + x + "' does not exist.", 'SyntaxError'); return m.startTime; };
+    if (a && typeof a === 'object') { if (a.start !== undefined) start = at(a.start); if (a.end !== undefined) end = at(a.end); else if (a.duration !== undefined) end = start + a.duration; detail = a.detail !== undefined ? a.detail : null; }
+    else { if (a !== undefined) start = at(a); if (b !== undefined) end = at(b); }
+    const e = perfEntry(PerfMeasure.prototype, { name: String(name), entryType: 'measure', startTime: start, duration: end - start, detail });
+    perfAdd(e);
+    return e;
+}
+const navEntry = () => perfEntry(PerformanceNavigationTiming.prototype, { name: W.docURL(), entryType: 'navigation', startTime: 0, duration: W.now(), type: 'navigate', redirectCount: 0, initiatorType: 'navigation', nextHopProtocol: 'h2' });
+Object.assign(performance, {
+    mark: perfMark, measure: perfMeasure,
+    clearMarks(n) { for (let i = PERF_ENTRIES.length - 1; i >= 0; i--) if (PERF_ENTRIES[i].entryType === 'mark' && (n === undefined || PERF_ENTRIES[i].name === String(n))) PERF_ENTRIES.splice(i, 1); },
+    clearMeasures(n) { for (let i = PERF_ENTRIES.length - 1; i >= 0; i--) if (PERF_ENTRIES[i].entryType === 'measure' && (n === undefined || PERF_ENTRIES[i].name === String(n))) PERF_ENTRIES.splice(i, 1); },
+    getEntries() { return [navEntry()].concat(PERF_ENTRIES); },
+    getEntriesByType(t) { t = String(t); return t === 'navigation' ? [navEntry()] : PERF_ENTRIES.filter(e => e.entryType === t); },
+    getEntriesByName(n, t) { n = String(n); return PERF_ENTRIES.filter(e => e.name === n && (t === undefined || e.entryType === t)); },
+});
+class PerformanceObserver {
+    constructor(cb) {
+        if (typeof cb !== 'function') throw new TypeError("Failed to construct 'PerformanceObserver': The callback provided as parameter 1 is not a function.");
+        hidden(this, '_cb', cb); hidden(this, '_types', new Set()); hidden(this, '_buf', []); hidden(this, '_timer', 0);
+    }
+    _sched() {
+        if (this._timer) return;
+        this._timer = setTimeout(() => {
+            this._timer = 0;
+            const list = this._buf.splice(0);
+            if (!list.length) return;
+            const pl = { getEntries: () => list.slice(), getEntriesByType: t => list.filter(e => e.entryType === t), getEntriesByName: n => list.filter(e => e.name === n) };
+            try { this._cb(pl, this); } catch (e) { report(e, 'PerformanceObserver'); }
+        }, 0);
+    }
+    observe(o) {
+        o = o || {};
+        const ts = o.entryTypes || (o.type ? [o.type] : []);
+        for (const t of ts) if (PerformanceObserver.supportedEntryTypes.includes(t)) this._types.add(t);
+        if (!this._types.size) return;
+        PERF_OBS.add(this);
+        if (o.buffered) for (const e of PERF_ENTRIES) if (this._types.has(e.entryType)) this._buf.push(e);
+        if (this._buf.length) this._sched();
+    }
+    disconnect() { PERF_OBS.delete(this); this._types.clear(); this._buf.length = 0; }
+    takeRecords() { return this._buf.splice(0); }
+}
+PerformanceObserver.supportedEntryTypes = ['mark', 'measure'];
+function reportError(e) {
+    report(e, 'reportError');
+}
+{
+    const tasks = (fn, ms) => new Promise((res, rej) => setTimeout(() => { try { res(fn()); } catch (e) { rej(e); } }, ms));
+    const sched = {
+        postTask(fn, opts) {
+            opts = opts || {};
+            if (typeof fn !== 'function') return Promise.reject(new TypeError('callback is not a function'));
+            const p = tasks(fn, Math.max(0, +opts.delay || 0));
+            if (opts.signal) return new Promise((res, rej) => { if (opts.signal.aborted) return rej(opts.signal.reason); opts.signal.addEventListener('abort', () => rej(opts.signal.reason), { once: true }); p.then(res, rej); });
+            return p;
+        },
+        yield() { return tasks(() => undefined, 0); },
+    };
+    Object.defineProperty(G, 'scheduler', { value: sched, writable: true, configurable: true });
+}
+const INTERNALS = new WeakMap();
+class ElementInternals {
+    constructor(el) { illegal(); }
+}
+function makeInternals(el) {
+    let i = INTERNALS.get(el);
+    if (i) return i;
+    i = Object.create(ElementInternals.prototype);
+    hidden(i, '_el', el); hidden(i, '_valid', { flags: {}, msg: '' });
+    hidden(i, '_states', new Set());
+    INTERNALS.set(el, i);
+    return i;
+}
+Object.defineProperties(ElementInternals.prototype, {
+    form: { get() { return this._el.closest ? this._el.closest('form') : null; }, configurable: true },
+    shadowRoot: { get() { return this._el.shadowRoot || null; }, configurable: true },
+    labels: { get() { return []; }, configurable: true },
+    states: { get() { return this._states; }, configurable: true },
+    willValidate: { get() { return true; }, configurable: true },
+    validity: { get() { return Object.assign({ valid: !this._valid.msg }, this._valid.flags); }, configurable: true },
+    validationMessage: { get() { return this._valid.msg; }, configurable: true },
+});
+Object.assign(ElementInternals.prototype, {
+    setFormValue() {}, setValidity(flags, msg) { this._valid = { flags: flags || {}, msg: msg || '' }; },
+    checkValidity() { return !this._valid.msg; }, reportValidity() { return !this._valid.msg; },
+});
+Object.defineProperty(HTMLElement.prototype, 'attachInternals', { value() { return makeInternals(this); }, writable: true, configurable: true });
+for (const aria of ['role', 'ariaLabel', 'ariaChecked', 'ariaDisabled', 'ariaExpanded', 'ariaHidden', 'ariaPressed', 'ariaSelected', 'ariaValueNow', 'ariaValueText', 'ariaLive', 'ariaBusy'])
+    Object.defineProperty(ElementInternals.prototype, aria, { get() { return this['_' + aria] === undefined ? null : this['_' + aria]; }, set(v) { hidden(this, '_' + aria, v); }, configurable: true, enumerable: true });
+class VTTCue extends EventTarget {
+    constructor(start, end, text) {
+        super();
+        this.startTime = +start; this.endTime = +end; this.text = String(text); this.id = ''; this.pauseOnExit = false;
+        this.vertical = ''; this.snapToLines = true; this.line = 'auto'; this.lineAlign = 'start'; this.position = 'auto'; this.positionAlign = 'auto'; this.size = 100; this.align = 'center'; this.region = null; this.track = null;
+    }
+    getCueAsHTML() { const f = document.createDocumentFragment(); f.appendChild(document.createTextNode(this.text)); return f; }
+}
+class TextTrackCue extends VTTCue { }
+class TextTrack extends EventTarget {
+    constructor() { illegal(); }
+}
+const navMediaSession = Object.assign({ metadata: null, playbackState: 'none' }, {
+    setActionHandler() {}, setPositionState() {}, setCameraActive() {}, setMicrophoneActive() {},
+});
+class MediaMetadata { constructor(init) { init = init || {}; this.title = init.title || ''; this.artist = init.artist || ''; this.album = init.album || ''; this.artwork = init.artwork || []; } }
+class Notification extends EventTarget {
+    constructor(title) { super(); this.title = String(title); }
+    close() {}
+    static get permission() { return 'denied'; }
+    static requestPermission(cb) { const p = Promise.resolve('denied'); if (typeof cb === 'function') p.then(cb); return p; }
+}
+class Credential { constructor() { illegal(); } }
+class CredentialsContainer {
+    constructor() { illegal(); }
+    get() { return Promise.reject(new DOMException('The credential manager is not available.', 'NotSupportedError')); }
+    create() { return Promise.reject(new DOMException('The credential manager is not available.', 'NotSupportedError')); }
+    store() { return Promise.resolve(); }
+    preventSilentAccess() { return Promise.resolve(); }
+}
+{
+    const cc = Object.create(CredentialsContainer.prototype);
+    Object.defineProperty(navigator, 'credentials', { value: cc, enumerable: true, configurable: true });
+    Object.defineProperty(navigator, 'mediaSession', { value: navMediaSession, enumerable: true, configurable: true });
+}
+// exposed on the global object next to the others
+for (const C of [MessagePort, FileReader, FileList, EventSource, WritableStream, WritableStreamDefaultWriter, TransformStream, TextEncoderStream,
+    TextDecoderStream, CompressionStream, DecompressionStream, MediaQueryListEvent, DragEvent, Touch, TouchList, PerformanceEntry,
+    PerformanceNavigationTiming, PerformanceResourceTiming, PerformancePaintTiming, ElementInternals, VTTCue, TextTrackCue, TextTrack, MediaMetadata,
+    Notification, Credential, CredentialsContainer])
+    Object.defineProperty(G, C.name, { value: C, writable: true, configurable: true, enumerable: false });
+Object.defineProperty(G, 'PerformanceMark', { value: PerfMark, writable: true, configurable: true, enumerable: false });
+Object.defineProperty(G, 'PerformanceMeasure', { value: PerfMeasure, writable: true, configurable: true, enumerable: false });
+Object.defineProperty(G, 'reportError', { value: reportError, writable: true, configurable: true, enumerable: false });
 const console = {};
 for (const [name, lvl] of [['log', 1], ['info', 1], ['debug', 0], ['warn', 2], ['error', 3], ['trace', 0]])
     console[name] = (...a) => W.log(lvl, a.map(fmt).join(' '));
@@ -3986,6 +4607,221 @@ function fmt(v) {
     if (typeof v === 'object' && v !== null) { try { const s = JSON.stringify(v); return s && s.length > 300 ? s.slice(0, 300) + '...' : s; } catch (e) { return Object.prototype.toString.call(v); } }
     return String(v);
 }
+// ---------------------------------------------------------------- crypto.subtle (natives in wjs_crypto.c)
+const HASHES = { 'SHA-1': 0, 'SHA-256': 1, 'SHA-384': 2, 'SHA-512': 3 };
+const HASH_BITS = { 'SHA-1': 160, 'SHA-256': 256, 'SHA-384': 384, 'SHA-512': 512 };
+const subtleBytes = d => {
+    if (d instanceof ArrayBuffer) return new Uint8Array(d);
+    if (ArrayBuffer.isView(d)) return new Uint8Array(d.buffer, d.byteOffset, d.byteLength);
+    throw new TypeError("Failed to execute on 'SubtleCrypto': parameter is not of type '(ArrayBuffer or ArrayBufferView)'.");
+};
+const toAB = u8 => u8.buffer.byteLength === u8.length && u8.byteOffset === 0 ? u8.buffer : u8.slice().buffer;
+const b64uEnc = u8 => btoa(bytesToBinary(u8)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const b64uDec = s => { s = String(s).replace(/-/g, '+').replace(/_/g, '/'); while (s.length % 4) s += '='; const b = atob(s), o = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) o[i] = b.charCodeAt(i); return o; };
+function normAlg(a) {
+    if (typeof a === 'string') a = { name: a };
+    else if (a === null || typeof a !== 'object') throw new TypeError("Algorithm: Unrecognized name");
+    const names = ['SHA-1', 'SHA-256', 'SHA-384', 'SHA-512', 'HMAC', 'AES-CBC', 'AES-CTR', 'AES-GCM', 'PBKDF2', 'HKDF', 'ECDSA', 'ECDH', 'RSA-OAEP', 'RSASSA-PKCS1-V1_5', 'RSA-PSS', 'ED25519', 'X25519', 'AES-KW'];
+    const n = names.find(x => x.toLowerCase() === String(a.name).toLowerCase());
+    if (!n) throw new DOMException('Unrecognized algorithm name', 'NotSupportedError');
+    return Object.assign({}, a, { name: n });
+}
+function hashName(h) {
+    const n = normAlg(h).name;
+    if (!(n in HASHES)) throw new DOMException('Unrecognized hash algorithm', 'NotSupportedError');
+    return n;
+}
+const KEY_TOKEN = {};
+class CryptoKey {
+    constructor(tok, type, extractable, algorithm, usages, raw) {
+        if (tok !== KEY_TOKEN) illegal();
+        Object.defineProperty(this, 'type', { value: type, enumerable: true });
+        Object.defineProperty(this, 'extractable', { value: extractable, enumerable: true });
+        Object.defineProperty(this, 'algorithm', { value: algorithm, enumerable: true });
+        Object.defineProperty(this, 'usages', { value: usages, enumerable: true });
+        hidden(this, '_raw', raw);
+    }
+}
+Object.defineProperty(CryptoKey.prototype, Symbol.toStringTag, { value: 'CryptoKey', configurable: true });
+const mkKey = (type, ext, alg, usages, raw) => new CryptoKey(KEY_TOKEN, type, ext, alg, usages, raw);
+const need = (key, usage, alg) => {
+    if (!(key instanceof CryptoKey)) throw new TypeError("parameter 2 is not of type 'CryptoKey'.");
+    if (alg && key.algorithm.name !== alg) throw new DOMException('key.algorithm does not match that of operation', 'InvalidAccessError');
+    if (!key.usages.includes(usage)) throw new DOMException('key.usages does not permit this operation', 'InvalidAccessError');
+};
+const checkUsages = (usages, allowed, what) => {
+    const u = Array.from(usages || []);
+    for (const x of u) if (!allowed.includes(x)) throw new DOMException("Unsupported key usage for " + what + " key", 'SyntaxError');
+    return Array.from(new Set(u));
+};
+const AES_USAGES = ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey'], HMAC_USAGES = ['sign', 'verify'], KDF_USAGES = ['deriveKey', 'deriveBits'];
+const op = (fn) => new Promise((res, rej) => { try { res(fn()); } catch (e) { rej(e); } });
+const opErr = () => new DOMException('The operation failed for an operation-specific reason', 'OperationError');
+function aesCall(dec, alg, key, data) {
+    const k = key._raw, d = subtleBytes(data), mode = { 'AES-CBC': 0, 'AES-CTR': 1, 'AES-GCM': 2 }[alg.name];
+    let iv, aad, tl = 16, cbits = 64;
+    if (mode === 1) {
+        iv = subtleBytes(alg.counter); cbits = alg.length;
+        if (iv.length !== 16) throw new DOMException('Counter must be 16 bytes', 'OperationError');
+        if (!(cbits >= 1 && cbits <= 128)) throw new DOMException('Counter length must be between 1 and 128', 'OperationError');
+    } else if (mode === 0) {
+        iv = subtleBytes(alg.iv);
+        if (iv.length !== 16) throw new DOMException('The iv must be 16 bytes', 'OperationError');
+    } else {
+        iv = subtleBytes(alg.iv); aad = alg.additionalData === undefined ? undefined : subtleBytes(alg.additionalData);
+        if (alg.tagLength !== undefined) { if (![32, 64, 96, 104, 112, 120, 128].includes(alg.tagLength)) throw new DOMException('Invalid tagLength', 'OperationError'); tl = alg.tagLength / 8; }
+    }
+    const r = W.cryptoAes(dec ? 1 : 0, mode, k, iv, d, aad, tl, cbits);
+    if (r === null) throw opErr();
+    return r;
+}
+function hkdf(hash, ikm, salt, info, bytes) {
+    const h = HASHES[hash], hl = HASH_BITS[hash] / 8;
+    if (bytes > 255 * hl) throw opErr();
+    const prk = new Uint8Array(W.cryptoHmac(h, salt.length ? salt : new Uint8Array(hl), ikm));
+    const out = new Uint8Array(Math.ceil(bytes / hl) * hl);
+    let t = new Uint8Array(0);
+    for (let i = 1; i * hl <= out.length; i++) {
+        const m = new Uint8Array(t.length + info.length + 1);
+        m.set(t); m.set(info, t.length); m[m.length - 1] = i;
+        t = new Uint8Array(W.cryptoHmac(h, prk, m));
+        out.set(t, (i - 1) * hl);
+    }
+    return out.slice(0, bytes).buffer;
+}
+function deriveBits(alg0, key, length) {
+    const alg = normAlg(alg0);
+    if (!(key instanceof CryptoKey)) throw new TypeError("parameter 2 is not of type 'CryptoKey'.");
+    if (alg.name !== key.algorithm.name) throw new DOMException('key.algorithm does not match that of operation', 'InvalidAccessError');
+    if (alg.name === 'PBKDF2') {
+        const hn = hashName(alg.hash);
+        if (!(alg.iterations >= 1)) throw new DOMException('iterations must be at least 1', 'OperationError');
+        if (length === null || length === undefined || length % 8) throw new DOMException('length must be a multiple of 8', 'OperationError');
+        const r = W.cryptoPbkdf2(HASHES[hn], key._raw, subtleBytes(alg.salt), alg.iterations, length / 8);
+        if (r === null) throw opErr();
+        return r;
+    }
+    if (alg.name === 'HKDF') {
+        const hn = hashName(alg.hash);
+        if (length === null || length === undefined || length % 8) throw new DOMException('length must be a multiple of 8', 'OperationError');
+        return hkdf(hn, key._raw, subtleBytes(alg.salt), subtleBytes(alg.info), length / 8);
+    }
+    throw new DOMException('Unsupported derive algorithm', 'NotSupportedError');
+}
+class SubtleCrypto {
+    constructor() { illegal(); }
+    digest(alg, data) {
+        return op(() => {
+            const n = hashName(alg);
+            const r = W.cryptoDigest(HASHES[n], subtleBytes(data));
+            if (r === null) throw opErr();
+            return r;
+        });
+    }
+    importKey(format, keyData, algorithm, extractable, usages) {
+        return op(() => {
+            const alg = normAlg(algorithm);
+            format = String(format);
+            let raw, ualg;
+            if (format === 'raw') raw = subtleBytes(keyData).slice();
+            else if (format === 'jwk') {
+                if (keyData === null || typeof keyData !== 'object') throw new TypeError('JWK must be an object');
+                if (keyData.kty !== 'oct') throw new DOMException('Only symmetric (oct) JWK keys are supported', 'NotSupportedError');
+                if (typeof keyData.k !== 'string') throw new DOMException('JWK missing k', 'DataError');
+                raw = b64uDec(keyData.k);
+                if (keyData.ext === false && extractable) throw new DOMException('JWK ext is false', 'DataError');
+            } else throw new DOMException("Unsupported key format '" + format + "'", 'NotSupportedError');
+            const u = Array.from(usages || []);
+            if (alg.name.startsWith('AES-') && alg.name !== 'AES-KW') {
+                if (![16, 24, 32].includes(raw.length)) throw new DOMException('Invalid AES key length', 'DataError');
+                ualg = { name: alg.name, length: raw.length * 8 };
+                return mkKey('secret', !!extractable, ualg, checkUsages(u, AES_USAGES, alg.name), raw);
+            }
+            if (alg.name === 'HMAC') {
+                const hn = hashName(alg.hash);
+                if (!raw.length) throw new DOMException('Zero-length key is not supported', 'DataError');
+                return mkKey('secret', !!extractable, { name: 'HMAC', hash: { name: hn }, length: alg.length || raw.length * 8 }, checkUsages(u, HMAC_USAGES, 'HMAC'), raw);
+            }
+            if (alg.name === 'PBKDF2' || alg.name === 'HKDF') {
+                if (format !== 'raw') throw new SyntaxError('Key format must be raw');
+                if (extractable) throw new SyntaxError('KDF keys must not be extractable');
+                return mkKey('secret', false, { name: alg.name }, checkUsages(u, KDF_USAGES, alg.name), raw);
+            }
+            throw new DOMException("Unsupported algorithm '" + alg.name + "' for importKey", 'NotSupportedError');
+        });
+    }
+    exportKey(format, key) {
+        return op(() => {
+            if (!(key instanceof CryptoKey)) throw new TypeError("parameter 2 is not of type 'CryptoKey'.");
+            if (!key.extractable) throw new DOMException('key is not extractable', 'InvalidAccessError');
+            format = String(format);
+            if (format === 'raw') return toAB(key._raw.slice());
+            if (format === 'jwk') {
+                const a = key.algorithm, o = { kty: 'oct', k: b64uEnc(key._raw), ext: true, key_ops: key.usages.slice() };
+                o.alg = a.name === 'HMAC' ? 'HS' + a.hash.name.slice(4) : ({ 'AES-CBC': 'A', 'AES-CTR': 'A', 'AES-GCM': 'A' }[a.name] || '') + a.length + ({ 'AES-CBC': 'CBC', 'AES-CTR': 'CTR', 'AES-GCM': 'GCM' }[a.name] || '');
+                return o;
+            }
+            throw new DOMException("Unsupported key format '" + format + "'", 'NotSupportedError');
+        });
+    }
+    generateKey(algorithm, extractable, usages) {
+        return op(() => {
+            const alg = normAlg(algorithm), u = Array.from(usages || []);
+            if (alg.name === 'AES-CBC' || alg.name === 'AES-CTR' || alg.name === 'AES-GCM') {
+                if (![128, 192, 256].includes(alg.length)) throw new DOMException('Invalid AES key length', 'OperationError');
+                const raw = new Uint8Array(alg.length / 8); W.random(raw);
+                return mkKey('secret', !!extractable, { name: alg.name, length: alg.length }, checkUsages(u, AES_USAGES, alg.name), raw);
+            }
+            if (alg.name === 'HMAC') {
+                const hn = hashName(alg.hash), bits = alg.length || (hn === 'SHA-384' || hn === 'SHA-512' ? 1024 : 512);
+                const raw = new Uint8Array(Math.ceil(bits / 8)); W.random(raw);
+                return mkKey('secret', !!extractable, { name: 'HMAC', hash: { name: hn }, length: bits }, checkUsages(u, HMAC_USAGES, 'HMAC'), raw);
+            }
+            throw new DOMException("Unsupported algorithm '" + alg.name + "' for generateKey", 'NotSupportedError');
+        });
+    }
+    encrypt(algorithm, key, data) { return op(() => { const alg = normAlg(algorithm); need(key, 'encrypt', alg.name); return aesCall(false, alg, key, data); }); }
+    decrypt(algorithm, key, data) { return op(() => { const alg = normAlg(algorithm); need(key, 'decrypt', alg.name); return aesCall(true, alg, key, data); }); }
+    sign(algorithm, key, data) {
+        return op(() => {
+            const alg = normAlg(algorithm);
+            need(key, 'sign', alg.name);
+            if (alg.name !== 'HMAC') throw new DOMException('Unsupported sign algorithm', 'NotSupportedError');
+            const r = W.cryptoHmac(HASHES[key.algorithm.hash.name], key._raw, subtleBytes(data));
+            if (r === null) throw opErr();
+            return r;
+        });
+    }
+    verify(algorithm, key, signature, data) {
+        return op(() => {
+            const alg = normAlg(algorithm);
+            need(key, 'verify', alg.name);
+            if (alg.name !== 'HMAC') throw new DOMException('Unsupported verify algorithm', 'NotSupportedError');
+            const mac = new Uint8Array(W.cryptoHmac(HASHES[key.algorithm.hash.name], key._raw, subtleBytes(data))), sig = subtleBytes(signature);
+            let diff = mac.length ^ sig.length;
+            for (let i = 0; i < mac.length; i++) diff |= mac[i] ^ (sig[i] || 0);
+            return diff === 0;
+        });
+    }
+    deriveBits(algorithm, key, length) { return op(() => { need(key, 'deriveBits'); return deriveBits(algorithm, key, length); }); }
+    deriveKey(algorithm, baseKey, derivedKeyType, extractable, usages) {
+        return op(() => {
+            const dt = normAlg(derivedKeyType);
+            let bits;
+            if (dt.name.startsWith('AES-')) bits = dt.length;
+            else if (dt.name === 'HMAC') bits = dt.length || 512;
+            else throw new DOMException('Unsupported derived key type', 'NotSupportedError');
+            need(baseKey, 'deriveKey');
+            const raw = new Uint8Array(deriveBits(algorithm, baseKey, bits));
+            const u = Array.from(usages || []);
+            if (dt.name === 'HMAC') return mkKey('secret', !!extractable, { name: 'HMAC', hash: { name: hashName(dt.hash) }, length: bits }, checkUsages(u, HMAC_USAGES, 'HMAC'), raw);
+            if (![128, 192, 256].includes(bits)) throw new DOMException('Invalid AES key length', 'OperationError');
+            return mkKey('secret', !!extractable, { name: dt.name, length: bits }, checkUsages(u, AES_USAGES, dt.name), raw);
+        });
+    }
+    wrapKey() { return Promise.reject(new DOMException('wrapKey is not supported', 'NotSupportedError')); }
+    unwrapKey() { return Promise.reject(new DOMException('unwrapKey is not supported', 'NotSupportedError')); }
+}
 const crypto = {
     getRandomValues(a) { if (!ArrayBuffer.isView(a)) throw new TypeError('getRandomValues: not a typed array'); W.random(new Uint8Array(a.buffer, a.byteOffset, a.byteLength)); return a; },
     randomUUID() {
@@ -3994,8 +4830,10 @@ const crypto = {
         const h = Array.from(b, x => (x + 256).toString(16).slice(1)).join('');
         return h.slice(0, 8) + '-' + h.slice(8, 12) + '-' + h.slice(12, 16) + '-' + h.slice(16, 20) + '-' + h.slice(20);
     },
-    subtle: { digest() { return Promise.reject(new DOMException('not supported', 'NotSupportedError')); } }
+    subtle: Object.create(SubtleCrypto.prototype)
 };
+Object.defineProperty(G, 'SubtleCrypto', { value: SubtleCrypto, writable: true, configurable: true });
+Object.defineProperty(G, 'CryptoKey', { value: CryptoKey, writable: true, configurable: true });
 class MediaQueryList extends EventTarget {
     constructor(q) { super(); this.media = q; this.onchange = null; }
     get matches() { return W.mq(this.media); }
@@ -4046,8 +4884,6 @@ function getSelection() {
         toString() { return ''; }, getRangeAt() { return new Range(); }, removeAllRanges() {}, addRange() {}, collapse() {}, empty() {},
         selectAllChildren() {}, containsNode() { return false; }, extend() {}, setBaseAndExtent() {} };
 }
-class BroadcastChannel extends EventTarget { constructor(n) { super(); this.name = n; this.onmessage = null; } postMessage() {} close() {} }
-class MessageChannel { constructor() { const mk = () => Object.assign(new EventTarget(), { onmessage: null, postMessage(d) { const o = this._other; setTimeout(() => { const ev = new MessageEvent('message', { data: d }); if (typeof o.onmessage === 'function') o.onmessage(ev); dispatch(o, ev); }, 0); }, start() {}, close() {} }); this.port1 = mk(); this.port2 = mk(); this.port1._other = this.port2; this.port2._other = this.port1; } }
 class WebSocket extends EventTarget {
     constructor(url) { super(); this.url = String(url); this.readyState = 3; this.protocol = ''; this.extensions = ''; this.bufferedAmount = 0; this.binaryType = 'blob'; this.onopen = this.onclose = this.onerror = this.onmessage = null;
         setTimeout(() => { const e = new Event('error'); if (this.onerror) try { this.onerror(e); } catch (x) {} dispatch(this, e); const c = Object.assign(new Event('close'), { code: 1006, reason: '', wasClean: false }); if (this.onclose) try { this.onclose(c); } catch (x) {} dispatch(this, c); }, 0); }

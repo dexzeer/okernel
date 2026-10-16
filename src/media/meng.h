@@ -49,9 +49,15 @@ int  meng_sb_append(struct meng* m, int sb, const uint8_t* data, size_t len);
 void meng_sb_abort(struct meng* m, int sb);
 // Drop buffered packets with start <= pts < end (seconds).
 void meng_remove(struct meng* m, double start, double end);
+// Per source buffer: remove() only touches the track(s) this buffer carries; timestampOffset and appendWindow
+// (seconds) apply to frames appended afterwards.
+void meng_sb_change_type(struct meng* m, int sb);      // the next append starts a new container (sniffed again)
+void meng_sb_remove(struct meng* m, int sb, double start, double end);
+void meng_sb_set_offset(struct meng* m, int sb, double offset, double win_start, double win_end);
 // Bytes of compressed data held (for quota decisions).
 size_t meng_bytes(const struct meng* m);
 void meng_end_of_stream(struct meng* m);
+void meng_reopen(struct meng* m);     // appending after endOfStream(): the stream is not over any more
 void meng_set_duration(struct meng* m, double seconds);
 
 // ---- playback ----

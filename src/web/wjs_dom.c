@@ -5,6 +5,7 @@
 // run, stylesheets/images are picked up and the page re-renders.
 
 #include "wjs_int.h"
+#include "image.h"
 #include "css.h"
 #include "wurl.h"
 
@@ -941,6 +942,24 @@ NATIVE(n_set_mo) {
     return OJS_UNDEFINED;
 }
 
+// zip(mode, format, bytes): mode 0 compress / 1 decompress; format 0 = zlib ("deflate"), 1 = raw ("deflate-raw"), 2 = gzip.
+// Returns an ArrayBuffer, or null when the data is not valid / too big.
+NATIVE(n_zip) {
+    struct wjs* js = JSX(ctx); UNUSED_THIS; (void)js;
+    int32_t mode = 0, fmt = 0;
+    if (argc < 3 || ojs_to_int32(ctx, &mode, argv[0]) < 0 || ojs_to_int32(ctx, &fmt, argv[1]) < 0) return OJS_NULL;
+    size_t len = 0;
+    uint8_t* p = ojs_bytes(ctx, argv[2], &len);
+    if (!p || len > (size_t)1 << 28) return OJS_NULL;
+    int n = 0;
+    uint8_t* o = mode == 0 ? (fmt == 0 ? wdeflate_zlib(p, (int)len, &n) : fmt == 1 ? wdeflate_raw(p, (int)len, &n) : wdeflate_gzip(p, (int)len, &n))
+                           : (fmt == 0 ? winflate_zlib(p, (int)len, &n, 1 << 28) : fmt == 1 ? winflate_raw(p, (int)len, &n, 1 << 28) : winflate_gzip(p, (int)len, &n, 1 << 28));
+    if (!o) return OJS_NULL;
+    ojsv r = ojs_arraybuffer_copy(ctx, o, (size_t)n);
+    w_free(o);
+    return r;
+}
+
 // ---- install ------------------------------------------------------------------------
 
 static const struct ojs_func_entry dom_funcs[] = {
@@ -999,6 +1018,7 @@ static const struct ojs_func_entry dom_funcs[] = {
     { "supports", n_supports, 1 },
     { "setMutationHook", n_set_mo, 1 },
     { "setProtoFor", n_set_proto_for, 1 },
+    { "zip", n_zip, 3 },
 };
 
 void wjs_dom_install(struct wjs* js, ojsv natives) {

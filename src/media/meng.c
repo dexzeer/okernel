@@ -66,6 +66,8 @@ struct sb {
     int index;
     struct meng* m;
     int failed;
+    int64_t off_ns;                     // SourceBuffer.timestampOffset: added to every coded frame
+    int64_t win_s, win_e;               // append window (presentation times, after the offset)
 };
 
 struct meng {
@@ -260,6 +262,19 @@ static void want_decoders(struct meng* m) {
     if (m->vcodec == VC_VP9 && !m->vd) m->vd = vp9_dec_new();
 }
 
+// A source buffer announces a codec other than the one whose packets are queued (changeType() to another
+// container/codec, an ad in H.264 followed by VP9 content): the old packets cannot go through the new decoder.
+static void rq_clear(struct meng* m);
+static void pq_remove(struct pq* q, int64_t start, int64_t end);
+static void codec_switch(struct meng* m, int is_video, int newcodec) {
+    const int64_t lo = -((int64_t)1 << 62), hi = (int64_t)1 << 62;
+    if (is_video) {
+        if (m->vcodec != VC_NONE && m->vcodec != newcodec) { pq_remove(&m->vq, lo, hi); rq_clear(m); }
+    } else if (m->acodec != AC_NONE && m->acodec != newcodec) {
+        pq_remove(&m->aq, lo, hi);
+    }
+}
+
 static void on_tracks(void* u, const struct webm_info* info) {
     struct sb* s = (struct sb*)u;
     struct meng* m = s->m;
@@ -267,6 +282,7 @@ static void on_tracks(void* u, const struct webm_info* info) {
         const struct webm_track* t = &info->tracks[i];
         if (t->type == WEBM_TRACK_AUDIO && (s->kinds & 1) && strcmp(t->codec, "A_OPUS") == 0 &&
             (m->a_owner < 0 || m->a_owner == s->index)) {
+            codec_switch(m, 0, AC_OPUS);
             m->a_present = 1;
             m->acodec = AC_OPUS;
             m->a_owner = s->index;
@@ -279,6 +295,7 @@ static void on_tracks(void* u, const struct webm_info* info) {
             m->delay_ns = frames_to_ns(m->pre_skip);
         } else if (t->type == WEBM_TRACK_VIDEO && (s->kinds & 2) && strcmp(t->codec, "V_VP9") == 0 &&
                    (m->v_owner < 0 || m->v_owner == s->index)) {
+            codec_switch(m, 1, VC_VP9);
             m->v_present = 1;
             m->vcodec = VC_VP9;
             m->v_owner = s->index;
@@ -296,16 +313,18 @@ static void on_frame(void* u, const struct webm_frame* f) {
     struct sb* s = (struct sb*)u;
     struct meng* m = s->m;
     if (!f->len) return;
+    int64_t pts = f->pts_ns + s->off_ns;
+    if (pts < s->win_s || pts >= s->win_e) return;
     if (s->a_track && f->track == s->a_track) {
         int64_t dur = f->duration_ns;
         if (dur <= 0) {                                   // the muxer did not say: the packet knows
             struct opus_packet pk;
             if (opus_parse_packet(f->data, (int)f->len, &pk) == 0) dur = (int64_t)pk.nframes * pk.frame_ms10 * 100000LL;
         }
-        pq_push(&m->aq, f->data, f->len, f->pts_ns, f->pts_ns, dur, f->discard_padding_ns, 1);
+        pq_push(&m->aq, f->data, f->len, pts, pts, dur, f->discard_padding_ns, 1);
     }
     else if (s->v_track && f->track == s->v_track)
-        pq_push(&m->vq, f->data, f->len, f->pts_ns, f->pts_ns, f->duration_ns, 0, f->keyframe);
+        pq_push(&m->vq, f->data, f->len, pts, pts, f->duration_ns, 0, f->keyframe);
 }
 
 // ---- MP4 / ISO base media ----
@@ -324,6 +343,7 @@ static void on_tracks_mp4(void* u, const struct mp4_info* info) {
                 struct resamp* rs = 0;
                 if (aac_sample_rate(ad) != 48000 && !(rs = resamp_new(aac_sample_rate(ad), 48000))) { aac_free(ad); continue; }
                 if (m->ad) aac_free(m->ad);
+                codec_switch(m, 0, AC_AAC);
                 if (m->rs) resamp_free(m->rs);
                 m->ad = ad;
                 m->rs = rs;
@@ -335,6 +355,7 @@ static void on_tracks_mp4(void* u, const struct mp4_info* info) {
                 m->delay_ns = 0;
             } else if (!strcmp(t->codec, "Opus") && t->config && t->config_len >= 11) {
                 // dOpsBox: version, channels, pre_skip (BE16), input rate (BE32), output gain (BE16 Q7.8), mapping family
+                codec_switch(m, 0, AC_OPUS);
                 m->acodec = AC_OPUS;
                 m->pre_skip = t->config[2] << 8 | t->config[3];
                 m->gain_q8 = (int16_t)(t->config[8] << 8 | t->config[9]);
@@ -348,10 +369,12 @@ static void on_tracks_mp4(void* u, const struct mp4_info* info) {
                 struct h264_dec* hd = h264_new();
                 if (!hd) continue;
                 if (h264_set_avcc(hd, t->config, (size_t)t->config_len) < 0) { h264_free(hd); continue; }
+                codec_switch(m, 1, VC_H264);
                 if (m->hd) h264_free(m->hd);
                 m->hd = hd;
                 m->vcodec = VC_H264;
             } else if (!strcmp(t->codec, "vp09")) {
+                codec_switch(m, 1, VC_VP9);
                 m->vcodec = VC_VP9;
             } else continue;
             m->v_present = 1;
@@ -370,10 +393,12 @@ static void on_sample_mp4(void* u, const struct mp4_sample* x) {
     struct sb* s = (struct sb*)u;
     struct meng* m = s->m;
     if (!x->len) return;
+    int64_t pts = x->pts_ns + s->off_ns, dts = x->dts_ns + s->off_ns;
+    if (pts < s->win_s || pts >= s->win_e) return;
     if (s->a_track && x->track == s->a_track)
-        pq_push(&m->aq, x->data, x->len, x->pts_ns, x->pts_ns, x->duration_ns, 0, 1);
+        pq_push(&m->aq, x->data, x->len, pts, pts, x->duration_ns, 0, 1);
     else if (s->v_track && x->track == s->v_track)
-        pq_push(&m->vq, x->data, x->len, x->pts_ns, x->dts_ns, x->duration_ns, 0, x->key);
+        pq_push(&m->vq, x->data, x->len, pts, dts, x->duration_ns, 0, x->key);
 }
 
 struct meng* meng_new(const struct meng_env* env) {
@@ -418,6 +443,7 @@ int meng_sb_add(struct meng* m, int kinds) {
     s->kinds = kinds ? kinds : 3;
     s->m = m;
     s->index = m->nsb;
+    s->win_e = INT64_MAX;
     return m->nsb++;                                      // the container (and its demuxer) is chosen by the first bytes
 }
 
@@ -480,14 +506,42 @@ void meng_sb_abort(struct meng* m, int sb) {
     s->a_track = s->v_track = 0;                  // the next init segment re-announces the tracks
 }
 
+// SourceBuffer.changeType(): the next bytes start a new container (maybe another one): sniff again
+void meng_sb_change_type(struct meng* m, int sb) {
+    if (sb < 0 || sb >= m->nsb) return;
+    struct sb* s = &m->sb[sb];
+    if (s->dm) { webm_free(s->dm); s->dm = 0; }
+    if (s->mp) { mp4_free(s->mp); s->mp = 0; }
+    s->fmt = FMT_UNKNOWN;
+    s->nsniff = 0;
+    s->failed = 0;
+    s->a_track = s->v_track = 0;
+}
+
 void meng_remove(struct meng* m, double start, double end) {
     int64_t s = (int64_t)(start * 1e9), e = end > 1e12 ? (int64_t)1 << 62 : (int64_t)(end * 1e9);
     pq_remove(&m->aq, s, e);
     pq_remove(&m->vq, s, e);
 }
 
+void meng_sb_set_offset(struct meng* m, int sb, double offset, double win_start, double win_end) {
+    if (sb < 0 || sb >= m->nsb) return;
+    struct sb* s = &m->sb[sb];
+    s->off_ns = (int64_t)(offset * 1e9);
+    s->win_s = win_start > 0 ? (int64_t)(win_start * 1e9) : 0;
+    s->win_e = win_end > 1e12 ? INT64_MAX : (int64_t)(win_end * 1e9);
+}
+
+// remove from the queues this source buffer feeds (an audio buffer's remove() must not eat the video)
+void meng_sb_remove(struct meng* m, int sb, double start, double end) {
+    int64_t s = (int64_t)(start * 1e9), e = end > 1e12 ? (int64_t)1 << 62 : (int64_t)(end * 1e9);
+    if (sb == m->a_owner) pq_remove(&m->aq, s, e);
+    if (sb == m->v_owner) pq_remove(&m->vq, s, e);
+}
+
 size_t meng_bytes(const struct meng* m) { return (size_t)m->aq.alen + m->vq.alen; }
 void meng_end_of_stream(struct meng* m) { m->eos = 1; }
+void meng_reopen(struct meng* m) { m->eos = 0; }
 void meng_set_duration(struct meng* m, double seconds) { m->duration = seconds; }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,69 @@
+<!doctype html><html><body><script>
+const out = []; const T = (n, a, b) => { const ok = JSON.stringify(a) === JSON.stringify(b); out.push((ok ? 'ok ' : 'FAIL ') + n + (ok ? '' : ' got ' + JSON.stringify(a) + ' want ' + JSON.stringify(b))); };
+const wait = ms => new Promise(r => setTimeout(r, ms));
+(async () => {
+    // MessageChannel: onmessage starts the port; addEventListener alone does not until start()
+    const mc = new MessageChannel();
+    T('port types', [mc.port1 instanceof MessagePort, typeof MessagePort], [true, 'function']);
+    const got = [];
+    mc.port2.onmessage = e => got.push(e.data);
+    mc.port1.postMessage({ a: [1, 2, { b: 3 }], d: new Date(5) });
+    mc.port1.postMessage('two');
+    await wait(20);
+    T('onmessage delivery', [got.length, got[0].a[2].b, got[0].d.getTime(), got[1]], [2, 3, 5, 'two']);
+    const mc2 = new MessageChannel(); const g2 = [];
+    mc2.port2.addEventListener('message', e => g2.push(e.data));
+    mc2.port1.postMessage(1);
+    await wait(20);
+    T('not started', g2.length, 0);
+    mc2.port2.start();
+    await wait(20);
+    T('started by start()', g2, [1]);
+    let threw = false; try { mc.port1.postMessage(() => 1); } catch (e) { threw = e.name; }
+    T('functions are not cloneable', threw, 'DataCloneError');
+    try { new MessagePort(); } catch (e) { threw = e instanceof TypeError; }
+    T('illegal constructor', threw, true);
+    // BroadcastChannel
+    const a = new BroadcastChannel('x'), b = new BroadcastChannel('x'), c = new BroadcastChannel('y');
+    const gb = [], ga = [], gc = [];
+    b.onmessage = e => gb.push(e.data); a.onmessage = e => ga.push(e.data); c.onmessage = e => gc.push(e.data);
+    a.postMessage({ hi: 1 });
+    await wait(20);
+    T('broadcast reaches others only', [gb, ga.length, gc.length], [[{ hi: 1 }], 0, 0]);
+    b.close(); a.postMessage(2); await wait(20);
+    T('closed channel gets nothing', gb.length, 1);
+    // window.postMessage
+    const gw = [];
+    addEventListener('message', e => gw.push([e.data, e.origin === location.origin]));
+    postMessage('w', '*'); await wait(20);
+    T('window.postMessage', gw, [['w', true]]);
+    // FileReader
+    const fr = new FileReader(); const ev = [];
+    for (const t of ['loadstart', 'progress', 'load', 'loadend']) fr.addEventListener(t, () => ev.push(t));
+    const blob = new Blob(['héllo', new Uint8Array([0, 255])], { type: 'text/plain' });
+    fr.readAsDataURL(blob);
+    await wait(20);
+    T('readAsDataURL', fr.result, 'data:text/plain;base64,' + btoa('hÃ©llo\u0000ÿ'));
+    T('events', ev, ['loadstart', 'progress', 'load', 'loadend']);
+    const f2 = new FileReader(); f2.readAsArrayBuffer(blob); await wait(20);
+    T('readAsArrayBuffer', [f2.result.byteLength, f2.readyState], [8, 2]);
+    const f3 = new FileReader(); f3.readAsText(new Blob(['abc'])); await wait(20);
+    T('readAsText', f3.result, 'abc');
+    const f4 = new FileReader(); f4.readAsBinaryString(new Blob([new Uint8Array([1, 200])])); await wait(20);
+    T('readAsBinaryString', f4.result, '\u0001È');
+    // performance entries
+    performance.mark('m1'); await wait(5); performance.mark('m2');
+    const me = performance.measure('d', 'm1', 'm2');
+    T('measure', [me.entryType, me.name, me.duration > 0, performance.getEntriesByType('mark').length, performance.getEntriesByName('d').length], ['measure', 'd', true, 2, 1]);
+    const seen = [];
+    const po = new PerformanceObserver(list => list.getEntries().forEach(e => seen.push(e.name)));
+    po.observe({ entryTypes: ['mark'] });
+    performance.mark('m3'); await wait(20);
+    T('PerformanceObserver', seen, ['m3']);
+    po.disconnect();
+    // scheduler / reportError
+    T('scheduler.postTask', await scheduler.postTask(() => 7), 7);
+    let rep = 0; addEventListener('error', () => rep++); reportError(new Error('x')); T('reportError dispatches error', rep, 1);
+    console.log('RESULT ' + (out.some(l => l.startsWith('FAIL')) ? 'FAIL' : 'ALLPASS') + '\n' + out.join('\n'));
+})().catch(e => console.log('RESULT FAIL ' + e + (e && e.stack) + '\n' + out.join('\n')));
+</script></body></html>

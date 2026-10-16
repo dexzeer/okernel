@@ -1,0 +1,80 @@
+<!doctype html><html><body><script>
+// crypto.subtle against published test vectors (FIPS 180/197, RFC 2202/4231/5869/7914, NIST SP 800-38A/D)
+const out = []; const T = (n, a, b) => { const ok = JSON.stringify(a) === JSON.stringify(b); out.push((ok ? 'ok ' : 'FAIL ') + n + (ok ? '' : ' got ' + JSON.stringify(a) + ' want ' + JSON.stringify(b))); };
+const hex = ab => Array.from(new Uint8Array(ab), x => (x + 256).toString(16).slice(1)).join('');
+const unhex = h => new Uint8Array(h.match(/../g).map(x => parseInt(x, 16)));
+const enc = s => new TextEncoder().encode(s);
+const S = crypto.subtle;
+(async () => {
+    T('digest sha1', hex(await S.digest('SHA-1', enc('abc'))), 'a9993e364706816aba3e25717850c26c9cd0d89d');
+    T('digest sha256', hex(await S.digest({ name: 'sha-256' }, enc('abc'))), 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+    T('digest sha384', hex(await S.digest('SHA-384', enc('abc'))), 'cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7');
+    T('digest sha512', hex(await S.digest('SHA-512', enc('abc'))), 'ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f');
+    T('digest of a view', hex(await S.digest('SHA-256', new Uint8Array([0, 97, 98, 99, 0]).subarray(1, 4))), 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+    let e = null; try { await S.digest('MD5', enc('x')); } catch (x) { e = x.name; } T('unknown hash', e, 'NotSupportedError');
+    // HMAC
+    const hk = await S.importKey('raw', enc('key'), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+    const mac = await S.sign('HMAC', hk, enc('The quick brown fox jumps over the lazy dog'));
+    T('hmac sha256', hex(mac), 'f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8');
+    T('hmac verify', [await S.verify('HMAC', hk, mac, enc('The quick brown fox jumps over the lazy dog')), await S.verify('HMAC', hk, mac, enc('x'))], [true, false]);
+    const hk1 = await S.importKey('raw', enc('key'), { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+    T('hmac sha1', hex(await S.sign('HMAC', hk1, enc('The quick brown fox jumps over the lazy dog'))), 'de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9');
+    const hk5 = await S.importKey('raw', enc('key'), { name: 'HMAC', hash: 'SHA-512' }, false, ['sign']);
+    T('hmac sha512', hex(await S.sign('HMAC', hk5, enc('The quick brown fox jumps over the lazy dog'))), 'b42af09057bac1e2d41708e48a902e09b5ff7f12ab428a4fe86653c73dd248fb82f948a549f7b791a5b41915ee4d1ec3935357e4e2317250d0372afa2ebeeb3a');
+    e = null; try { await S.sign('HMAC', await S.importKey('raw', enc('k'), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']), enc('x')); } catch (x) { e = x.name; } T('usage enforced', e, 'InvalidAccessError');
+    // PBKDF2
+    const pk = await S.importKey('raw', enc('password'), 'PBKDF2', false, ['deriveBits', 'deriveKey']);
+    T('pbkdf2 1', hex(await S.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: enc('salt'), iterations: 1 }, pk, 256)), '120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b');
+    T('pbkdf2 4096', hex(await S.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt: enc('salt'), iterations: 4096 }, pk, 256)), 'c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a');
+    T('pbkdf2 sha1', hex(await S.deriveBits({ name: 'PBKDF2', hash: 'SHA-1', salt: enc('salt'), iterations: 2 }, pk, 160)), 'ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957');
+    // HKDF (RFC 5869 case 1)
+    const hkk = await S.importKey('raw', unhex('0b'.repeat(22)), 'HKDF', false, ['deriveBits']);
+    T('hkdf', hex(await S.deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: unhex('000102030405060708090a0b0c'), info: unhex('f0f1f2f3f4f5f6f7f8f9') }, hkk, 336)),
+        '3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865');
+    // AES block (FIPS-197) through CBC with a zero IV: the first ciphertext block is the raw block cipher output
+    const pt = unhex('00112233445566778899aabbccddeeff'), zero = new Uint8Array(16);
+    for (const [bits, ct] of [[128, '69c4e0d86a7b0430d8cdb78070b4c55a'], [192, 'dda97ca4864cdfe06eaf70a0ec0d7191'], [256, '8ea2b7ca516745bfeafc49904b496089']]) {
+        const key = await S.importKey('raw', unhex('000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f').slice(0, bits / 8), 'AES-CBC', true, ['encrypt', 'decrypt']);
+        const c = await S.encrypt({ name: 'AES-CBC', iv: zero }, key, pt);
+        T('aes-' + bits + ' block', [hex(c).slice(0, 32), c.byteLength], [ct, 32]);
+        T('aes-' + bits + ' cbc round trip', hex(await S.decrypt({ name: 'AES-CBC', iv: zero }, key, c)), hex(pt));
+    }
+    // CBC (SP 800-38A F.2.1) and CTR (F.5.1)
+    const k128 = unhex('2b7e151628aed2a6abf7158809cf4f3c'), p1 = unhex('6bc1bee22e409f96e93d7e117393172a');
+    const cbck = await S.importKey('raw', k128, 'AES-CBC', false, ['encrypt']);
+    T('cbc vector', hex(await S.encrypt({ name: 'AES-CBC', iv: unhex('000102030405060708090a0b0c0d0e0f') }, cbck, p1)).slice(0, 32), '7649abac8119b246cee98e9b12e9197d');
+    const ctrk = await S.importKey('raw', k128, 'AES-CTR', false, ['encrypt', 'decrypt']);
+    const ctr = unhex('f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff');
+    T('ctr vector', hex(await S.encrypt({ name: 'AES-CTR', counter: ctr, length: 64 }, ctrk, p1)), '874d6191b620e3261bef6864990db6ce');
+    T('ctr partial block', hex(await S.encrypt({ name: 'AES-CTR', counter: ctr, length: 64 }, ctrk, p1.slice(0, 5))), '874d6191b6');
+    // GCM (NIST test case 4, 96-bit IV) and case 5-ish with another IV length through the decrypt direction
+    const gk = await S.importKey('raw', unhex('feffe9928665731c6d6a8f9467308308'), 'AES-GCM', false, ['encrypt', 'decrypt']);
+    const gp = unhex('d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39');
+    const gparams = { name: 'AES-GCM', iv: unhex('cafebabefacedbaddecaf888'), additionalData: unhex('feedfacedeadbeeffeedfacedeadbeefabaddad2'), tagLength: 128 };
+    const gc = await S.encrypt(gparams, gk, gp);
+    T('gcm ciphertext', hex(gc).slice(0, gp.length * 2), '42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091');
+    T('gcm tag', hex(gc).slice(gp.length * 2), '5bc94fbc3221a5db94fae95ae7121a47');
+    T('gcm decrypt', hex(await S.decrypt(gparams, gk, gc)), hex(gp));
+    const tampered = new Uint8Array(gc.slice(0)); tampered[3] ^= 1;
+    e = null; try { await S.decrypt(gparams, gk, tampered); } catch (x) { e = x.name; } T('gcm tamper rejected', e, 'OperationError');
+    // 8-byte IV (GHASH-derived J0), NIST test case 5
+    const g5 = { name: 'AES-GCM', iv: unhex('cafebabefacedbad'), additionalData: unhex('feedfacedeadbeeffeedfacedeadbeefabaddad2') };
+    const g5c = await S.encrypt(g5, gk, gp.slice(0, 60));
+    T('gcm short iv', hex(g5c).slice(0, 120), '61353b4c2806934a777ff51fa22a4755699b2a714fcdc6f83766e5f97b6c742373806900e49f24b22b097544d4896b424989b5e1ebac0f07c23f4598');
+    T('gcm short iv tag', hex(g5c).slice(120), '3612d2e79e3b0785561be14aaca2fccb');
+    // keys: generate, export (raw, jwk), import jwk
+    const ak = await S.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
+    const raw = await S.exportKey('raw', ak);
+    const jwk = await S.exportKey('jwk', ak);
+    T('generated key', [raw.byteLength, jwk.kty, jwk.alg, ak.type, ak.algorithm.length, ak.usages], [32, 'oct', 'A256GCM', 'secret', 256, ['encrypt', 'decrypt']]);
+    const ik = await S.importKey('jwk', jwk, 'AES-GCM', false, ['decrypt', 'encrypt']);
+    const rt = await S.encrypt({ name: 'AES-GCM', iv: new Uint8Array(12) }, ak, enc('hello'));
+    T('jwk import round trip', new TextDecoder().decode(await S.decrypt({ name: 'AES-GCM', iv: new Uint8Array(12) }, ik, rt)), 'hello');
+    e = null; try { await S.exportKey('raw', ik); } catch (x) { e = x.name; } T('non-extractable', e, 'InvalidAccessError');
+    // deriveKey
+    const dk = await S.deriveKey({ name: 'PBKDF2', hash: 'SHA-256', salt: enc('salt'), iterations: 1 }, pk, { name: 'AES-GCM', length: 256 }, true, ['encrypt']);
+    T('deriveKey', hex(await S.exportKey('raw', dk)), '120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b');
+    T('class', [crypto.subtle instanceof SubtleCrypto, ak instanceof CryptoKey], [true, true]);
+    console.log('RESULT ' + (out.some(l => l.startsWith('FAIL')) ? 'FAIL' : 'ALLPASS') + '\n' + out.join('\n'));
+})().catch(e => console.log('RESULT FAIL ' + e + (e && e.stack) + '\n' + out.join('\n')));
+</script></body></html>

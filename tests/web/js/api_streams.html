@@ -1,0 +1,47 @@
+<!doctype html><html><body><script>
+const out = []; const T = (n, a, b) => { const ok = JSON.stringify(a) === JSON.stringify(b); out.push((ok ? 'ok ' : 'FAIL ') + n + (ok ? '' : ' got ' + JSON.stringify(a) + ' want ' + JSON.stringify(b))); };
+async function readAll(rs) { const r = rs.getReader(); const a = []; for (;;) { const x = await r.read(); if (x.done) return a; a.push(x.value); } }
+const cat = parts => { let n = 0; for (const p of parts) n += p.length; const o = new Uint8Array(n); let k = 0; for (const p of parts) { o.set(p, k); k += p.length; } return o; };
+(async () => {
+    // WritableStream
+    const sunk = [];
+    const ws = new WritableStream({ write(c) { sunk.push(c); }, close() { sunk.push('closed'); } });
+    const w = ws.getWriter();
+    await w.write(1); await w.write(2); await w.close();
+    T('WritableStream', sunk, [1, 2, 'closed']);
+    // pipeTo
+    const rs = new ReadableStream({ start(c) { c.enqueue('a'); c.enqueue('b'); c.close(); } });
+    const got = [];
+    await rs.pipeTo(new WritableStream({ write(c) { got.push(c); } }));
+    T('pipeTo', got, ['a', 'b']);
+    // TransformStream + pipeThrough
+    const up = new TransformStream({ transform(c, ctl) { ctl.enqueue(c.toUpperCase()); }, flush(ctl) { ctl.enqueue('!'); } });
+    T('pipeThrough', await readAll(new ReadableStream({ start(c) { c.enqueue('x'); c.enqueue('y'); c.close(); } }).pipeThrough(up)), ['X', 'Y', '!']);
+    // text streams
+    const enc = new ReadableStream({ start(c) { c.enqueue('hé'); c.enqueue('\ud83d'); c.enqueue('\ude00'); c.close(); } }).pipeThrough(new TextEncoderStream());
+    const bytes = cat(await readAll(enc));
+    T('TextEncoderStream', Array.from(bytes), Array.from(new TextEncoder().encode('hé😀')));
+    const dec = new ReadableStream({ start(c) { c.enqueue(new Uint8Array([0xe2, 0x82])); c.enqueue(new Uint8Array([0xac, 0x41])); c.close(); } }).pipeThrough(new TextDecoderStream());
+    T('TextDecoderStream splits multibyte', (await readAll(dec)).join(''), '€A');
+    // compression round trips
+    const src = new TextEncoder().encode('hello hello hello hello, compress me compress me compress me '.repeat(200));
+    for (const f of ['gzip', 'deflate', 'deflate-raw']) {
+        const comp = new ReadableStream({ start(c) { c.enqueue(src.slice(0, 5000)); c.enqueue(src.slice(5000)); c.close(); } }).pipeThrough(new CompressionStream(f));
+        const cbytes = cat(await readAll(comp));
+        const back = cat(await readAll(new ReadableStream({ start(c) { c.enqueue(cbytes); c.close(); } }).pipeThrough(new DecompressionStream(f))));
+        T('round trip ' + f, [back.length === src.length && back.every((v, i) => v === src[i]), cbytes.length < src.length / 4], [true, true]);
+        if (f === 'gzip') T('gzip magic', [cbytes[0], cbytes[1]], [0x1f, 0x8b]);
+    }
+    // a gzip stream made elsewhere ("abc")
+    const known = new Uint8Array([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 0x4b, 0x4c, 0x4a, 6, 0, 0xc2, 0x41, 0x24, 0x35, 3, 0, 0, 0]);
+    T('inflate foreign gzip', new TextDecoder().decode(cat(await readAll(new ReadableStream({ start(c) { c.enqueue(known); c.close(); } }).pipeThrough(new DecompressionStream('gzip'))))), 'abc');
+    let bad = false;
+    try { await readAll(new ReadableStream({ start(c) { c.enqueue(new Uint8Array([1, 2, 3, 4])); c.close(); } }).pipeThrough(new DecompressionStream('gzip'))); } catch (e) { bad = true; }
+    T('bad data rejects', bad, true);
+    let unsupported = false; try { new CompressionStream('br'); } catch (e) { unsupported = e instanceof TypeError; }
+    T('unknown format', unsupported, true);
+    const r = new Response(new Blob(['x'.repeat(10)]).stream());
+    T('Response from stream', typeof r.body, 'object');
+    console.log('RESULT ' + (out.some(l => l.startsWith('FAIL')) ? 'FAIL' : 'ALLPASS') + '\n' + out.join('\n'));
+})().catch(e => console.log('RESULT FAIL ' + e + (e && e.stack) + '\n' + out.join('\n')));
+</script></body></html>

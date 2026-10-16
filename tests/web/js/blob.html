@@ -1,0 +1,28 @@
+<!doctype html><html><body><script>
+// Blob holds bytes (not a decoded string): binary survives construction, slicing, reading, fetch bodies and XHR blob responses.
+const out = [];
+const eq = (n, a, b) => out.push((JSON.stringify(a) === JSON.stringify(b) ? 'ok ' : 'FAIL ') + n + (JSON.stringify(a) === JSON.stringify(b) ? '' : ' got ' + JSON.stringify(a) + ' want ' + JSON.stringify(b)));
+(async () => {
+    const bin = new Uint8Array([0, 1, 2, 0x80, 0xff, 0xfe, 0xc3, 0x28, 10, 13]);
+    const b = new Blob([bin, 'é', new Blob(['xy'])], { type: 'Application/Octet-Stream' });
+    eq('size', b.size, 10 + 2 + 2);
+    eq('type lowercased', b.type, 'application/octet-stream');
+    eq('bytes', Array.from(new Uint8Array(await b.arrayBuffer())).slice(0, 10), Array.from(bin));
+    eq('utf8', Array.from(new Uint8Array(await b.slice(10, 12).arrayBuffer())), [0xc3, 0xa9]);
+    eq('slice neg', await b.slice(-2).text(), 'xy');
+    eq('slice type', b.slice(0, 1, 'text/x').type, 'text/x');
+    eq('text', await new Blob(['héllo']).text(), 'héllo');
+    // stream
+    const r = new Blob([new Uint8Array(100000).fill(7)]).stream().getReader();
+    let total = 0;
+    for (;;) { const x = await r.read(); if (x.done) break; total += x.value.length; }
+    eq('stream', total, 100000);
+    // Response / fetch of a binary blob round trip
+    const resp = new Response(b);
+    const back = await resp.blob();
+    eq('response.blob size', back.size, 14);
+    eq('response.arrayBuffer', Array.from(new Uint8Array(await new Response(bin).arrayBuffer())), Array.from(bin));
+    eq('File', [new File(['ab'], 'a.txt', { lastModified: 5 }).name, new File(['ab'], 'a.txt', { lastModified: 5 }).lastModified, new File(['ab'], 'a.txt').size], ['a.txt', 5, 2]);
+    console.log('RESULT ' + (out.some(l => l.startsWith('FAIL')) ? 'FAIL' : 'ALLPASS') + '\n' + out.join('\n'));
+})().catch(e => console.log('RESULT FAIL ' + e + '\n' + out.join('\n')));
+</script></body></html>

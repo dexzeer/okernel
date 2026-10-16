@@ -1384,6 +1384,7 @@ struct wjs* wjs_new(struct wdoc* doc) {
     wjs_dom_install(js, natives);
     wjs_media_install(js, natives);
     wjs_canvas_install(js, natives);
+    wjs_crypto_install(js, natives);
     js->deadline = wjs_now() + SCRIPT_BUDGET_MS;
     // the prelude evaluates to a function(W, global) that returns the hooks
     ojsv fn = ojs_eval(ctx, wjs_prelude_src, wjs_prelude_len, "<okai-prelude>", OJS_EVAL_SCRIPT | OJS_EVAL_HIDE_SOURCE);
