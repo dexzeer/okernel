@@ -1498,6 +1498,15 @@ void wjs_free(struct wjs* js) {
     w_free(js);
 }
 
+// A hook may have set timers or queued work (a fetch() reaction calling setTimeout(..., 0)): the cached wake-up time has to
+// see them, or the shell sleeps on the old value until some unrelated event (a 15 s timeout, a mouse move) wakes it.
+static void refresh_due(struct wjs* js) {
+    ojsv r = call_hook(js, js->h_nextdue, 0, 0, TASK_BUDGET_MS);
+    int32_t due = -1;
+    ojs_to_int32(js->J, &due, r);
+    js->next_due = due;
+}
+
 void wjs_resource_done(struct wjs* js, int res, int status, const char* headers, const char* body, int len,
                        const char* final_url) {
     if (!js || js->dead) return;
@@ -1541,6 +1550,7 @@ void wjs_resource_done(struct wjs* js, int res, int status, const char* headers,
     a[4] = (body && len >= 0) ? ojs_arraybuffer_copy(ctx, body, (size_t)len) : OJS_NULL;
     a[5] = ojs_string(ctx, final_url ? final_url : "");
     call_hook(js, js->h_fetch, 6, a, TASK_BUDGET_MS);
+    refresh_due(js);
     js->flags |= WJS_DIRTY;
     UNGUARD(js);
 }
@@ -1555,6 +1565,7 @@ void wjs_image_done(struct wjs* js, int slot, int ok) {
         ojsv a[2] = { wjs_wrap(js, el), ojs_bool(ok) };
         call_hook(js, js->h_image, 2, a, TASK_BUDGET_MS);
     }
+    refresh_due(js);
     UNGUARD(js);
 }
 
