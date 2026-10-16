@@ -2,7 +2,7 @@
 
 ## What this is
 
-From-scratch OS in C + x86 assembly. The kernel is okernel, the desktop is **Scrawl**, the browser is **okai** (see HANDOFF.md for the orientation). Two build targets: text mode (VGA text) and desktop mode (1920x1080 GRUB framebuffer). Runs in QEMU. No standard library, no Linux, no BIOS calls in protected mode.
+From-scratch OS in C + x86 assembly. The kernel is okernel, the desktop is **Okapi**, the browser is **okai** (see HANDOFF.md for the orientation). Two build targets: text mode (VGA text) and desktop mode (1920x1080 GRUB framebuffer). Runs in QEMU. No standard library, no Linux, no BIOS calls in protected mode.
 
 ## Build
 

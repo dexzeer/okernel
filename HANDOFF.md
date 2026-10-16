@@ -1,6 +1,6 @@
 # KAnarchy OS — Handoff
 
-**KAnarchy OS** is a from-scratch OS in C and x86 assembly (no libc, no Linux, no third-party code except fonts). The kernel is **okernel** (also the repo folder), the desktop is **Scrawl**, the browser is **okai**. It runs in QEMU (WHPX/KVM), with an optional real-laptop build. Refreshed 2026-10-16.
+**KAnarchy OS** is a from-scratch OS in C and x86 assembly (no libc, no Linux, no third-party code except fonts). The kernel is **okernel** (also the repo folder), the desktop is **Okapi**, the browser is **okai**. It runs in QEMU (WHPX/KVM), with an optional real-laptop build. Refreshed 2026-10-16.
 
 Read order: this file (orientation), `AGENTS.md` (the living rulebook: one bullet per finding, the traps are there), `LAPTOP.md` (real-laptop image), `tests/headless/TESTING.md` (test harness).
 
@@ -20,7 +20,7 @@ Read order: this file (orientation), `AGENTS.md` (the living rulebook: one bulle
 | Kernel | High-half at 0xC0100000, paging, preemptive kernel threads, ring-3 processes (fork/exec/ELF/pipes, syscalls 0-17), VFS + persistent FS on ATA (PFS), spinlocks, segregated-fit heap. |
 | SMP | ACPI/MADT, LAPIC/x2APIC, APs run only `smp_parallel_for` jobs (nothing else is reentrant). LAPIC one-shot timer lets the idle loop sleep during fetches. |
 | Display | Backbuffer with per-row damage spans, framebuffer cursor in the mouse IRQ, write-combining mapping, backends: GRUB framebuffer, virtio-gpu (hardware cursor). Runtime resolution from the bootloader. Intel i915: read-only `gpu` report only. SSE2 only in `simd.c`/`vp9_simd.c`. |
-| **Scrawl** (desktop) | Window manager (`window.c`: cell-grid or pixel-surface windows), cached AA taskbar (window buttons, FPS chip, clock), GNOME-style title bars, wallpaper JPEG, topmost-by-z click routing. No launcher: everything starts from the terminal (`Ctrl+Alt+T` opens another). |
+| **Okapi** (desktop) | Window manager (`window.c`: cell-grid or pixel-surface windows), cached AA taskbar (window buttons, FPS chip, clock), GNOME-style title bars, wallpaper JPEG, topmost-by-z click routing. No launcher: everything starts from the terminal (`Ctrl+Alt+T` opens another). |
 | Input | PS/2 keyboard (queued, dispatched from the main loop), PS/2 mouse with wheel, xHCI USB pointers (HID report parsing, USB2 hubs, hot-plug), I2C-HID touchpad (laptop), USB mass-storage stick log. |
 | Network | e1000 (polled), TCP socket table, DNS cache, DHCP, Wi-Fi RTL8821C (USB stick and the laptop's PCIe card; WPA2, `wifigui` window), TLS 1.3 + Mozilla root store + OCSP, HTTP/2, fetch engine (16 slots, keep-alive, cache, preload scanner, streaming `fetch()` bodies, dead-host fast-fail). |
 | Audio | Intel HD Audio output, polled, 48 kHz stereo; `audio_clock()` is the A/V master clock. |
@@ -49,7 +49,7 @@ Build and test run in WSL (`MSYS_NO_PATHCONV=1 wsl -e bash -lc 'cd /mnt/d/projec
 - **Headless**: `tests/headless/okvm.py` drives QEMU; the serial log is ground truth. `python3 tests/headless/run_suite.py -j3 test_*.py`. Core browser set: `test_okai_{js,interact,frames,media,cache,preload,preview,stream,webapi,postmessage,wasm,longurl,reqheaders}.py`, `test_captcha_ddg`, `test_nav`, `test_errors`, `test_tab_x`, `test_sites.py` (15 real HTTPS sites). Fixed-port suites clash in parallel: rerun a failing one alone.
 - **Windows/WHPX**: `tests/headless/perf_win.ps1 -Accel whpx -Mem 1536 -Urls <url> -Settle N -Shot out.ppm` (YouTube: `https://www.youtube.com/watch?v=aqz-KE-bpKQ`), `-PreCmd "fetchhdr"` logs request heads. Slow-CPU model: `-icount shift=0` (see AGENTS).
 - **Host browser**: `sh tests/web/build.sh`, then `build-host/wbrowse URL|file W H out.ppm secs` (same engine on the host; env `OJS_NOBUDGET`, `OJS_TRACE_THROW`, `OJS_TRACE_MISS`, `WB_EVAL`, `WB_PRE`/`WB_DUMP`). Edge reference tools: `tests/web/trace_edge.mjs`, `headers_edge.mjs`, `surface_make_cmp.py`.
-- Shell commands (Scrawl terminal): `about audio beep clear cpu dhcp disk echo edit exit fetchhdr game gfxcheck gpu help ip ipconfig locktest ls mem neofetch netdrop nettrace okai open ping play prof ps reboot resolve run save shutdown simd smp stopplay sysinfo terminal touchpad uptime usb wifi wifigui`.
+- Shell commands (Okapi terminal): `about audio beep clear cpu dhcp disk echo edit exit fetchhdr game gfxcheck gpu help ip ipconfig locktest ls mem neofetch netdrop nettrace okai open ping play prof ps reboot resolve run save shutdown simd smp stopplay sysinfo terminal touchpad uptime usb wifi wifigui`.
 
 ## Rules that bite (details and the story behind each: AGENTS.md)
 
@@ -91,7 +91,7 @@ Stale objects after a header change (keep `-MMD -MP`); 16-bit offsets in big are
 3. **Net/TLS**: TLS 1.2 + SHA-384 (whatwg.org, baidu.com), real congestion window for non-SLIRP networks.
 4. **JS engine**: lazy function compilation, generational GC, `using`/DisposableStack, remaining test262 edge cases.
 5. **Laptop** (only when the owner asks): verify PCIe Wi-Fi, audio, Intel scanout from our own buffer.
-6. Name `Scrawl` is docs-only so far; wiring it into `about`/`sysinfo`/the terminal prompt is a small change if the owner wants it.
+6. Name `Okapi` is docs-only so far; wiring it into `about`/`sysinfo`/the terminal prompt is a small change if the owner wants it.
 
 ## History (one line each)
 
@@ -102,4 +102,4 @@ Stale objects after a header change (keep `-MMD -MP`); 16-bit offsets in big are
 - 2026-10-10/11: UEFI laptop image, ACPI power, HD Audio, Opus/VP9/H.264/AAC + media engine, Canvas 2D; xHCI pointer driver, I2C touchpad, stick log.
 - 2026-10-12/13: Wi-Fi (USB then PCIe), slow-CPU model, idle LAPIC sleep, iframes, forms/POST, dmccl + game.
 - 2026-10-14/15: page-load speed (cache, preload scanner, HTTP/2, preview), YouTube home/search/consent fixes, layout memo, A/V sync.
-- 2026-10-16: MSE ad hand-over, stale-wake-up and fetch-starvation fixes, big Web API wave (Workers, IndexedDB, SubtleCrypto, WebAssembly, streams), streaming `fetch()`, 8 KB URLs, WebIDL shapes, BotGuard investigation, honest HTTP request metadata; desktop named **Scrawl**.
+- 2026-10-16: MSE ad hand-over, stale-wake-up and fetch-starvation fixes, big Web API wave (Workers, IndexedDB, SubtleCrypto, WebAssembly, streams), streaming `fetch()`, 8 KB URLs, WebIDL shapes, BotGuard investigation, honest HTTP request metadata; desktop named **Okapi**.
