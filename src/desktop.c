@@ -957,6 +957,16 @@ static void shell_execute(int win_id, const char* input) {
             dns_resolve(args);
         }
     }
+    else if (str_eq(cmd_buf, "doh")) {
+        if (str_eq(args, "on")) dns_doh_set(1);
+        else if (str_eq(args, "off")) dns_doh_set(0);
+        char st[96];
+        int n = dns_doh_status(st, sizeof st);
+        window_puts(win_id, st);
+        window_puts(win_id, n ? " (answers received: " : " (no answers received yet");
+        if (n) { char d[12]; int k = 0, v = n; char t[12]; int tl = 0; while (v) { t[tl++] = (char)('0' + v % 10); v /= 10; } while (tl) d[k++] = t[--tl]; d[k] = 0; window_puts(win_id, d); }
+        window_puts(win_id, ")\n");
+    }
     else if (str_eq(cmd_buf, "okai")) {
         // One browser window: reuse it and open the URL as a new tab; with no
         // argument, open the internal homepage.

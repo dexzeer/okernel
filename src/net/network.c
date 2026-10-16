@@ -3,6 +3,7 @@
 #include "../memory.h"
 #include "../crypto/tls_client.h" // http_parse_framing (shared framing)
 #include "e1000.h"
+#include "fetch.h"            // DNS over HTTPS rides the fetch engine
 #include "../rtw/rtw.h"
 #include "../devlog.h"
 #include <stdarg.h>
@@ -506,6 +507,10 @@ struct dns_ent {
     uint32_t sent_tick;          // 0 = not on the wire yet (waiting for ARP)
     uint32_t expire_tick;
     uint32_t used_tick;
+    uint8_t method;              // 0..DOH_N-1: DNS over HTTPS through that server, DNS_M_UDP: plain UDP to the resolver the host gave us
+    uint8_t doh_state;           // 0 none, 1 request to be started, 2 request in flight
+    int16_t doh_h;               // fetch handle while doh_state == 2
+    uint32_t doh_tick;
 };
 static struct dns_ent dns_tab[DNS_SLOTS];
 static uint16_t dns_txid = 0x1234;
@@ -534,7 +539,134 @@ static void dns_notify(struct dns_ent* e) {
     net_event_post(msg);
 }
 
+// ---- DNS over HTTPS (RFC 8484, GET with ?dns=<base64url>) ----
+// A network that tampers with plain DNS (answers NXDOMAIN for youtube.com, or drops it) cannot see inside an HTTPS request to a public
+// resolver. The resolvers are reached by a built-in address (a DoH server's own name cannot be looked up through DoH), the certificate
+// is checked against the NAME like any HTTPS site. Each lookup tries the servers in order, then falls back to plain UDP; two failures in
+// a row switch DoH off for a minute (a network without Internet access must not pay 6 s for every lookup).
+#define DOH_N 3
+static const struct { const char* host; uint32_t ip; } doh_srv[DOH_N] = {
+    {"cloudflare-dns.com", 0x01010101u}, {"dns.google", 0x08080808u}, {"dns.quad9.net", 0x09090909u},
+};
+#define DNS_M_UDP DOH_N
+#define DOH_TIMEOUT_TICKS 350
+#define DOH_SLOT_WAIT_TICKS 200
+static int doh_enabled = 1;
+static uint32_t doh_off_until;
+static uint8_t doh_streak;
+static uint32_t doh_n_ok, doh_n_fail;
+static int doh_usable(void) { return doh_enabled && (int32_t)(tick_count - doh_off_until) >= 0; }
+
+static int doh_bootstrap(const char* host, uint32_t* ip) {
+    for (int i = 0; i < DOH_N; i++)
+        if (dns_host_matches(host, doh_srv[i].host)) { *ip = doh_srv[i].ip; return 1; }
+    return 0;
+}
+
+static int dns_build_query(const struct dns_ent* e, uint8_t* q) {
+    int n = 0;
+    q[n++] = (uint8_t)(e->txid >> 8); q[n++] = (uint8_t)e->txid;
+    q[n++] = 0x01; q[n++] = 0x00;      // standard query, recursion desired
+    q[n++] = 0x00; q[n++] = 0x01;      // 1 question
+    for (int i = 0; i < 6; i++) q[n++] = 0;
+    n += dns_encode_name(e->host, q + n);
+    q[n++] = 0x00; q[n++] = 0x01;      // QTYPE A
+    q[n++] = 0x00; q[n++] = 0x01;      // QCLASS IN
+    return n;
+}
+
+static void dns_send_query(struct dns_ent* e);
+static void handle_dns_response(uint8_t* data, uint16_t len);
+
+// This server did not give an answer: the next one, or plain UDP.
+static void doh_fail(struct dns_ent* e, const char* why) {
+    serial_printf("[dns] DoH %s for '%s': %s\n", doh_srv[e->method < DOH_N ? e->method : 0].host, e->host, why);
+    e->doh_state = 0;
+    doh_n_fail++;
+    if (++doh_streak >= 2) {
+        if (doh_usable()) serial_puts("[dns] DoH unreachable, using plain DNS for a minute\n");
+        doh_off_until = tick_count + 6000;
+    }
+    e->method++;
+    e->tries = 0;
+    if (e->method >= DNS_M_UDP || !doh_usable()) e->method = DNS_M_UDP;
+    dns_send_query(e);
+}
+
+static void doh_step(struct dns_ent* e) {
+    if (e->doh_state == 1) {
+        static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        uint8_t q[300];
+        int n = dns_build_query(e, q);
+        char path[480];
+        int p = 0;
+        for (const char* t = "/dns-query?dns="; *t; ) path[p++] = *t++;
+        for (int i = 0; i < n; i += 3) {
+            uint32_t v = (uint32_t)q[i] << 16 | (i + 1 < n ? (uint32_t)q[i + 1] << 8 : 0) | (i + 2 < n ? q[i + 2] : 0);
+            path[p++] = b64[(v >> 18) & 63]; path[p++] = b64[(v >> 12) & 63];
+            if (i + 1 < n) path[p++] = b64[(v >> 6) & 63];
+            if (i + 2 < n) path[p++] = b64[v & 63];
+        }
+        path[p] = 0;
+        struct fetch_opts o;
+        memset(&o, 0, sizeof o);
+        o.own_accept = 1;
+        o.extra = "Accept: application/dns-message\r\n";
+        int h = fetch_begin(doh_srv[e->method].host, path, 0, 1, &o);
+        if (h < 0) {                                   // every fetch slot is busy: give it a moment, then try the next way
+            if ((uint32_t)(tick_count - e->sent_tick) > DOH_SLOT_WAIT_TICKS) doh_fail(e, "no free request slot");
+            return;
+        }
+        serial_printf("[dns] querying '%s' (DoH %s)...\n", e->host, doh_srv[e->method].host);
+        e->doh_h = (int16_t)h;
+        e->doh_state = 2;
+        e->doh_tick = tick_count;
+        return;
+    }
+    int st = fetch_status(e->doh_h);
+    if (st == FETCH_RUNNING) {
+        if ((uint32_t)(tick_count - e->doh_tick) > DOH_TIMEOUT_TICKS) { fetch_end(e->doh_h); doh_fail(e, "timed out"); }
+        return;
+    }
+    if (st != FETCH_DONE) { fetch_end(e->doh_h); doh_fail(e, "request failed"); return; }
+    int len = 0;
+    char* raw = fetch_response(e->doh_h, &len);
+    int ok = raw && len > 16 && raw[9] == '2' && raw[10] == '0' && raw[11] == '0';
+    if (ok) {
+        len = http_dechunk(raw, len);
+        e->doh_state = 0;
+        handle_dns_response((uint8_t*)raw, (uint16_t)(len > 65535 ? 65535 : len));
+        fetch_end(e->doh_h);
+        if (e->st == DNS_ST_PENDING) doh_fail(e, "unusable answer");
+        else {
+            if (!doh_n_ok) serial_printf("[dns] DoH works (%s)\n", doh_srv[e->method].host);
+            doh_n_ok++;
+            doh_streak = 0;
+        }
+        return;
+    }
+    fetch_end(e->doh_h);
+    doh_fail(e, "bad HTTP status");
+}
+
+void dns_doh_set(int on) { doh_enabled = on; doh_off_until = 0; doh_streak = 0; }
+int dns_doh_status(char* out, int max) {
+    int n = 0;
+    const char* t = !doh_enabled ? "DNS over HTTPS: off" : doh_usable() ? "DNS over HTTPS: on" : "DNS over HTTPS: paused (servers unreachable), plain DNS";
+    while (*t && n < max - 1) out[n++] = *t++;
+    out[n] = 0;
+    return (int)doh_n_ok;
+}
+
 static void dns_send_query(struct dns_ent* e) {
+    if (e->method < DNS_M_UDP && !doh_usable()) e->method = DNS_M_UDP;
+    if (e->method < DNS_M_UDP) {
+        if (e->tries == 0) e->txid = ++dns_txid;
+        e->tries++;
+        e->sent_tick = tick_count ? tick_count : 1;
+        e->doh_state = 1;
+        return;
+    }
     uint8_t target_mac[6];
     uint8_t* dns_hop = next_hop(dns_server_ip);
     if (!arp_resolve(dns_hop, target_mac)) {
@@ -549,14 +681,7 @@ static void dns_send_query(struct dns_ent* e) {
     e->sent_tick = tick_count ? tick_count : 1;
 
     uint8_t q[300];
-    int n = 0;
-    q[n++] = (uint8_t)(e->txid >> 8); q[n++] = (uint8_t)e->txid;
-    q[n++] = 0x01; q[n++] = 0x00;      // standard query, recursion desired
-    q[n++] = 0x00; q[n++] = 0x01;      // 1 question
-    for (int i = 0; i < 6; i++) q[n++] = 0;
-    n += dns_encode_name(e->host, q + n);
-    q[n++] = 0x00; q[n++] = 0x01;      // QTYPE A
-    q[n++] = 0x00; q[n++] = 0x01;      // QCLASS IN
+    int n = dns_build_query(e, q);
     serial_printf("[dns] querying '%s'...\n", e->host);
     udp_send(dns_server_ip, 12345, 53, q, (uint16_t)n);
 }
@@ -564,6 +689,7 @@ static void dns_send_query(struct dns_ent* e) {
 int dns_lookup(const char* host, uint32_t* ip) {
     if (!host || !host[0]) return -1;
     if (net_parse_ip(host, ip)) return 1;
+    if (doh_bootstrap(host, ip)) return 1;
     int free_i = -1, lru_i = -1;
     for (int i = 0; i < DNS_SLOTS; i++) {
         struct dns_ent* e = &dns_tab[i];
@@ -582,12 +708,16 @@ int dns_lookup(const char* host, uint32_t* ip) {
         // expired: query again in place
         e->st = DNS_ST_PENDING;
         e->tries = 0;
+        e->method = 0;
+        if (e->doh_state == 2) fetch_end(e->doh_h);
+        e->doh_state = 0;
         dns_send_query(e);
         return 0;
     }
     int slot = free_i >= 0 ? free_i : lru_i;
     if (slot < 0) return 0;            // every slot is mid-query: try again shortly
     struct dns_ent* e = &dns_tab[slot];
+    if (e->doh_state == 2) fetch_end(e->doh_h);      // an evicted entry must not leave its request behind
     memset(e, 0, sizeof *e);
     net_copy_str(e->host, host);
     e->st = DNS_ST_PENDING;
@@ -620,7 +750,11 @@ static void dns_fail(struct dns_ent* e) {
 static void dns_poll(void) {
     for (int i = 0; i < DNS_SLOTS; i++) {
         struct dns_ent* e = &dns_tab[i];
-        if (e->st != DNS_ST_PENDING) continue;
+        if (e->st != DNS_ST_PENDING) {
+            if (e->doh_state == 2) { fetch_end(e->doh_h); e->doh_state = 0; }
+            continue;
+        }
+        if (e->doh_state) { doh_step(e); continue; }
         if (e->sent_tick == 0) { dns_send_query(e); continue; }
         if ((uint32_t)(tick_count - e->sent_tick) < DNS_RETRY_TICKS) continue;
         if (e->tries >= DNS_MAX_TRIES) dns_fail(e);
