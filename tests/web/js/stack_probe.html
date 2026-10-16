@@ -1,0 +1,6 @@
+<!doctype html><html><body><script>
+function foo() { return new Error().stack; }
+console.log('STACK1 ' + JSON.stringify(foo()));
+console.log('STACK2 ' + JSON.stringify((0, eval)('new Error().stack')));
+console.log('STACK3 ' + JSON.stringify(new Function('return new Error().stack')()));
+</script></body></html>

@@ -571,6 +571,13 @@ int  obj_elems_reserve(ojs* J, struct obj* o, uint32_t n);
 int  obj_append_raw(ojs* J, struct obj* o, pkey k, uint32_t attrs, jv v);
 int  shape_find(const struct shape* s, pkey k);
 jv   obj_get(ojs* J, struct obj* o, pkey k, jv receiver);
+#if !defined(KERNEL) || !KERNEL
+extern int ojs_trace_miss_on;                         // host debugging: OJS_TRACE_MISS (see util.c)
+void ojs_trace_miss(ojs* J, struct obj* o, pkey k, const char* what);
+#define OJS_MISS(J, o, k, what) do { if (ojs_trace_miss_on) ojs_trace_miss((J), (o), (k), (what)); } while (0)
+#else
+#define OJS_MISS(J, o, k, what) ((void)0)
+#endif
 jv   obj_get_v(ojs* J, jv target, pkey k);            // GetV (primitives use their prototype)
 int  obj_set(ojs* J, struct obj* o, pkey k, jv v, jv receiver, int throw_on_fail);   // 1 ok, 0 refused, -1 exc
 int  obj_has(ojs* J, struct obj* o, pkey k);            // 0/1/-1
