@@ -21,9 +21,9 @@
 
 #define MAX_SB 4
 #define MAX_FRAME 6400                  // 120 ms of audio at 48 kHz, and an AAC frame of an 8 kHz stream resampled
-#define AUDIO_TARGET 24000              // frames (500 ms) kept queued in the sound card: a late main loop (page script, layout) must not run it dry
+#define AUDIO_TARGET 72000              // frames (500 ms) kept queued in the sound card: a late main loop (page script, layout) must not run it dry
 #define AUDIO_PER_POLL 8                // packets decoded per poll
-#define HIST_FRAMES 32768               // audio kept to replay after a pause (power of two)
+#define HIST_FRAMES 131072               // audio kept to replay after a pause (power of two)
 #define PREROLL_PACKETS 6               // decoded and thrown away before a seek target
 #define VIDEO_LEAD_NS 20000000LL        // decode a frame this long before it is due
 #define VIDEO_BUDGET_TICKS 3            // ~30 ms of video work per poll

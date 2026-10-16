@@ -287,17 +287,17 @@ int wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout) {
         int t_poll = wjs_now();
         meng_poll(s->m);
         {                                                        // once a second: the frame rate actually reaching the screen
-            static uint32_t last_ms, last_shown, last_dropped;
+            static uint32_t last_ms[WM_MAX], last_shown[WM_MAX], last_dropped[WM_MAX];
             uint32_t nowms = (uint32_t)wjs_now();
-            if (nowms - last_ms >= 1000) {
+            if (nowms - last_ms[i] >= 1000) {
                 uint32_t sh = meng_frames_shown(s->m), dr = meng_frames_dropped(s->m);
                 int dm = (int)(meng_take_decode_ms(s->m) * 10), cm = (int)(meng_take_convert_ms(s->m) * 10);
-                if (last_ms && (sh != last_shown || dr != last_dropped)) {
-                    vid_last.shown = sh - last_shown; vid_last.dropped = dr - last_dropped; vid_last.gap_ms = meng_take_maxgap(s->m) * 10;
+                if (last_ms[i] && (sh != last_shown[i] || dr != last_dropped[i])) {
+                    vid_last.shown = sh - last_shown[i]; vid_last.dropped = dr - last_dropped[i]; vid_last.gap_ms = meng_take_maxgap(s->m) * 10;
                     vid_last.dec_x10 = (uint32_t)dm; vid_last.cvt_x10 = (uint32_t)cm; vid_last.ahead_ms = (uint32_t)(meng_buffered_ahead(s->m) * 1000); meng_take_tile_stats(s->m, &vid_last.tiles_own, &vid_last.tiles_help); meng_take_vp9_profile(s->m, &vid_last.kc_tiles, &vid_last.kc_lf, &vid_last.kc_ext, &vid_last.kc_tsum, &vid_last.kc_tmax); vid_last.underruns = meng_underruns(s->m); vid_last.clock_ms = (int)(meng_current_time(s->m) * 1000); vid_last.valid = 1; vid_fresh = 1;
                 }
-                if (last_ms && (sh != last_shown || dr != last_dropped)) w_log("[media] rate: %u shown/s, %u dropped/s, longest gap %u ms, clock %d ms, underruns %u, decode %d.%d + convert %d.%d ms/frame (session %d)\n", sh - last_shown, dr - last_dropped, vid_last.gap_ms, (int)(meng_current_time(s->m) * 1000), meng_underruns(s->m), dm / 10, dm % 10, cm / 10, cm % 10, i);
-                last_ms = nowms; last_shown = sh; last_dropped = dr;
+                if (last_ms[i] && (sh != last_shown[i] || dr != last_dropped[i])) w_log("[media] rate: %u shown/s, %u dropped/s, longest gap %u ms, clock %d ms, underruns %u, decode %d.%d + convert %d.%d ms/frame (session %d)\n", sh - last_shown[i], dr - last_dropped[i], vid_last.gap_ms, (int)(meng_current_time(s->m) * 1000), meng_underruns(s->m), dm / 10, dm % 10, cm / 10, cm % 10, i);
+                last_ms[i] = nowms; last_shown[i] = sh; last_dropped[i] = dr;
             }
         }
         if (wjs_now() - t_poll >= 20) {                          // a slow pass: say what the session was doing
