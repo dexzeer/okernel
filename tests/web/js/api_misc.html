@@ -1,0 +1,29 @@
+<!doctype html><html><body><script>
+const out = []; const T = (n, a, b) => { const ok = JSON.stringify(a) === JSON.stringify(b); out.push((ok ? 'ok ' : 'FAIL ') + n + (ok ? '' : ' got ' + JSON.stringify(a) + ' want ' + JSON.stringify(b))); };
+(async () => {
+    // Cache API
+    const c = await caches.open('v1');
+    await c.put('/a.txt', new Response('alpha', { headers: { 'content-type': 'text/plain' } }));
+    await c.put(new Request('/b.txt?x=1'), new Response('beta'));
+    T('match', [await (await c.match('/a.txt')).text(), await c.match('/zzz')], ['alpha', undefined]);
+    T('ignoreSearch', await (await c.match('/b.txt', { ignoreSearch: true })).text(), 'beta');
+    T('keys', (await c.keys()).map(r => new URL(r.url).pathname).sort(), ['/a.txt', '/b.txt']);
+    T('delete', [await c.delete('/a.txt'), await c.delete('/a.txt'), (await c.keys()).length], [true, false, 1]);
+    T('storage', [await caches.has('v1'), await caches.has('v2'), await caches.keys(), await caches.delete('v1'), await caches.has('v1')], [true, false, ['v1'], true, false]);
+    let bad = null; try { await c.put('/p', 5); } catch (e) { bad = e instanceof TypeError; } T('put needs a Response', bad, true);
+    // wake lock
+    const wl = await navigator.wakeLock.request('screen');
+    let rel = 0; wl.addEventListener('release', () => rel++);
+    await wl.release();
+    T('wakeLock', [wl.released, wl.type, rel], [true, 'screen', 1]);
+    // ElementInternals + attachInternals
+    class X extends HTMLElement { constructor() { super(); this.i = this.attachInternals(); } }
+    customElements.define('x-int', X);
+    const x = document.createElement('x-int');
+    x.i.setFormValue('v'); x.i.setValidity({ valueMissing: true }, 'need');
+    T('internals', [x.i instanceof ElementInternals, x.i.validationMessage, x.i.checkValidity(), x.attachInternals() === x.i], [true, 'need', false, true]);
+    // navigator extras
+    T('navigator', [typeof navigator.credentials.get, typeof navigator.mediaSession.setActionHandler, Notification.permission], ['function', 'function', 'denied']);
+    console.log('RESULT ' + (out.some(l => l.startsWith('FAIL')) ? 'FAIL' : 'ALLPASS') + '\n' + out.join('\n'));
+})().catch(e => console.log('RESULT FAIL ' + e + (e && e.stack) + '\n' + out.join('\n')));
+</script></body></html>
