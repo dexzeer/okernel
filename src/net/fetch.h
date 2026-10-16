@@ -49,6 +49,7 @@ int   fetch_saw_close(int h);                // authenticated close_notify seen
 // connection is aborted — a half-read response cannot be reused).
 void  fetch_end(int h);
 int   fetch_free_slots(void);
+int   fetch_busy_slots(void);               // requests in flight or waiting for a connection (statistics)
 void  fetch_poll(void);
 // Close every idle pooled connection (fresh handshakes from here on).
 void  fetch_close_idle(void);

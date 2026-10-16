@@ -25,6 +25,7 @@ param(
     ,[string]$ClickAt = ""   # a mouse click on screen: "X,Y@SEC" = click (X,Y) SEC seconds after the navigation (the pointer is first pushed into the top-left corner)
     ,[string]$Display = "none"   # "sdl"/"gtk": a real QEMU window like run-windows.bat (its display refresh and audio mixing share QEMU's main thread: the stutter the headless runs do not show)
     ,[switch]$AudioSdl         # sound through QEMU's SDL backend (as run-windows.bat), not a WAV file
+    ,[switch]$StampVid         # print every [vidfps] line with the host's wall clock (is the media clock running at real time?)
     ,[switch]$Prof            # turn the kernel profiler on (`prof on`): [prof] zone lines once a second
 )
 $ErrorActionPreference = "Stop"
@@ -121,6 +122,7 @@ try {
             foreach ($ln in $lines[0..($lines.Count - 2)]) {
                 if (-not $nav -and $ln.Contains("[okai] navigate")) { $nav = $now }
                 if (-not $nav) { continue }
+                if ($StampVid -and $ln.Contains("[vidfps]")) { "{0:HH:mm:ss.fff}  {1}" -f $now, ($ln -replace 'tiles own.*clock', 'clock') }
                 if (-not $doc -and $ln.Contains("parse: count=")) { $doc = $now }
                 if (-not $rend -and $ln.Contains("[okai] render tab")) { $rend = $now }
                 if ($ln.Contains("[tls-net] queued") -or $ln.Contains("[http] sending")) { $fetches++ }

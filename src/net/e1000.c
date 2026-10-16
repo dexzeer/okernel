@@ -126,6 +126,9 @@ static void print_hex32(uint32_t val) {
     serial_putchar(hex[val & 0xF]);
 }
 
+static struct e1000_stats st;
+static uint64_t st_last_poll;
+
 static void mmio_write(uint32_t offset, uint32_t value) {
     mmio[offset / 4] = value;
 }
@@ -316,6 +319,8 @@ int e1000_send(uint8_t* data, uint32_t len) {
     for (int spin = 0; !(tx_descs[tx_cur].status & TXD_STAT_DD); spin++)
         if (spin > 1000000) return -1;
 
+    st.tx_pkts++;
+    st.tx_bytes += len;
     memcpy(tx_buffers + tx_cur * TX_BUFFER_SIZE, data, len);
     tx_descs[tx_cur].length = (uint16_t)len;
     tx_descs[tx_cur].cmd = 0x01 | 0x02 | 0x08; // EOP + IFCS + RS (report status)
@@ -340,8 +345,22 @@ void net_set_drop_rate(int every_nth) {
     serial_puts("\n");
 }
 
+void e1000_take_stats(struct e1000_stats* out, uint32_t* hw_missed, uint32_t* hw_nobuf) {
+    *out = st;
+    memset(&st, 0, sizeof st);
+    *hw_missed = mmio ? mmio_read(0x4010) : 0;      // MPC: packets missed (no buffer)
+    *hw_nobuf = mmio ? mmio_read(0x40A0) : 0;       // RNBC: receive no-buffers
+}
+
 void e1000_poll(void) {
     if (!mmio) return;
+    {
+        uint32_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        uint64_t now = ((uint64_t)hi << 32) | lo;
+        if (st_last_poll && now - st_last_poll > st.poll_gap_max) st.poll_gap_max = now - st_last_poll;
+        st_last_poll = now;
+    }
 
     // Check for received packets (descriptor memory only — no MMIO read
     // unless a packet is there; the old 500-poll register dump cost four
@@ -390,6 +409,8 @@ void e1000_poll(void) {
             rx_callback(pkt, len - 4);
         }
 
+        st.rx_pkts++;
+        st.rx_bytes += len;
         rx_descs[rx_cur].status = 0;
         rx_descs[rx_cur].length = 0;
         // Release THIS descriptor back to hardware via the TAIL. RDT must
@@ -403,6 +424,7 @@ void e1000_poll(void) {
         rx_cur = (uint16_t)((rx_cur + 1) % NUM_RX_DESCRIPTORS);
         if (++batch >= NUM_RX_DESCRIPTORS) break;   // at most one lap per call
     }
+    if ((uint32_t)batch > st.max_batch) st.max_batch = (uint32_t)batch;
     if (released >= 0) mmio_write16(E1000_RDT, (uint16_t)released);
 }
 
