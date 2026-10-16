@@ -10,7 +10,7 @@
 // TLS handshake. Requests are GETs; the response is the raw HTTP message.
 // Everything is driven by fetch_poll() from the main loop.
 
-#define FETCH_MAX 8
+#define FETCH_MAX 16
 
 #define FETCH_RUNNING 0
 #define FETCH_DONE    1

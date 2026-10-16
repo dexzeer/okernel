@@ -22,14 +22,15 @@
 
 extern uint32_t tick_count;   // 100 Hz
 
-#define CONN_MAX       8          // pooled connections (sockets: TCP_MAX_SOCKS)
+#define CONN_MAX       12         // pooled connections (sockets: TCP_MAX_SOCKS)
 #define CONN_PER_HOST  6          // like browsers
 #define RESP_INIT      (64 * 1024)
 #define RESP_MAX       (8 * 1024 * 1024)
 #define RESP_HEADROOM  (TLS_RECORD_MAX_PAYLOAD + 64)
 #define IDLE_TICKS     3000       // keep-alive: close after 30s unused
 #include "../prof.h"
-#define CONNECT_TICKS  1500       // DNS + TCP connect bound (15s)
+#define CONNECT_TICKS  1500       // DNS + TCP connect bound (15s) for a document navigation
+#define CONNECT_SUB_TICKS 700     // ...for everything else (7s): a dead ad/tracking host must not hold a slot for long
 #define STALL_TICKS    2500       // nothing received for 25s -> fail
 #define STEP_TICKS     3          // TLS work per connection per poll (~30ms)
 
@@ -73,6 +74,7 @@ struct fslot {
     struct fcache_key key;  // cache key (valid when cacheable)
     int cacheable;          // a response to this request may be stored
     int prefetch;           // speculative: frees itself when done
+    int nav;                // a document navigation (never failed fast by the recent-failure list)
     int h2sid;              // HTTP/2: the stream this request travels on
     int h2_over;            // HTTP/2: the response did not fit the buffer
 };
@@ -600,26 +602,50 @@ static void conn_idle(struct fconn* c) {
     }
 }
 
+// Hosts that just failed to resolve or connect: requests to them fail at once for a while instead of each holding a
+// connection slot for the whole DNS/connect bound (an ad or tracking host that is blocked or gone is retried by pages in
+// bursts, and a handful of those starve every other request).
+#define NEG_MAX 16
+static struct { char host[64]; uint32_t until; } neg[NEG_MAX];
+static int neg_blocked(const char* host) {
+    for (int i = 0; i < NEG_MAX; i++)
+        if (neg[i].until && (int32_t)(neg[i].until - tick_count) > 0 && !strncmp(neg[i].host, host, sizeof neg[i].host - 1)) return 1;
+    return 0;
+}
+static void neg_add(const char* host, uint32_t ticks) {
+    int slot = 0;
+    for (int i = 0; i < NEG_MAX; i++) {
+        if (neg[i].until && !strncmp(neg[i].host, host, sizeof neg[i].host - 1)) { slot = i; goto set; }
+        if (!neg[i].until || (int32_t)(neg[i].until - tick_count) <= 0) { slot = i; goto set; }
+        if ((int32_t)(neg[i].until - neg[slot].until) < 0) slot = i;
+    }
+set:
+    strncpy(neg[slot].host, host, sizeof neg[slot].host - 1);
+    neg[slot].host[sizeof neg[slot].host - 1] = 0;
+    neg[slot].until = tick_count + ticks;
+}
+
 static void conn_step(struct fconn* c) {
     struct fslot* s = c->slot >= 0 ? &slots[c->slot] : 0;
     switch (c->st) {
     case CN_DNS: {
         uint32_t ip;
+        if (s && !s->nav && neg_blocked(c->host)) { slot_fail(s, c, 0, "host failed a moment ago"); return; }
         int r = dns_lookup(c->host, &ip);
-        if (r < 0) { slot_fail(s, c, 0, "DNS failed (no A record)"); return; }
+        if (r < 0) { neg_add(c->host, 1000); slot_fail(s, c, 0, "DNS failed (no A record)"); return; }
         if (r > 0) {
             c->ip = ip;
             c->sock = tcp_open(ip, c->port);
             if (c->sock >= 0) { c->st = CN_TCP; return; }   // keep t0: one connect bound
         }
-        if ((uint32_t)(tick_count - c->t0) > CONNECT_TICKS) slot_fail(s, c, 0, "DNS timed out");
+        if ((uint32_t)(tick_count - c->t0) > ((s && s->nav) ? CONNECT_TICKS : CONNECT_SUB_TICKS)) slot_fail(s, c, 0, "DNS timed out");
         return;
     }
     case CN_TCP: {
         int st = tcp_state(c->sock);
         if (st == TCP_STATE_ESTABLISHED) { conn_start_request(c, s); return; }
-        if (tcp_failed(c->sock) || st == TCP_STATE_CLOSED) { slot_fail(s, c, 0, "connect failed"); return; }
-        if ((uint32_t)(tick_count - c->t0) > CONNECT_TICKS) slot_fail(s, c, 0, "connect timed out");
+        if (tcp_failed(c->sock) || st == TCP_STATE_CLOSED) { neg_add(c->host, 500); slot_fail(s, c, 0, "connect failed"); return; }
+        if ((uint32_t)(tick_count - c->t0) > ((s && s->nav) ? CONNECT_TICKS : CONNECT_SUB_TICKS)) { neg_add(c->host, 1500); slot_fail(s, c, 0, "connect timed out"); }
         return;
     }
     case CN_RUN:
@@ -786,6 +812,7 @@ static int begin_request(const char* host, const char* path, uint16_t port, int 
     struct fslot* s = &slots[h];
     memset(s, 0, sizeof *s);
     s->prefetch = prefetch;
+    s->nav = o && o->accept_html;
     if (cacheable) {
         s->key = key;
         s->cacheable = 1;
