@@ -32,6 +32,11 @@ uint64_t audio_clock(void);
 // and wipes what has been played so an underrun plays silence, not a loop.
 void audio_tick(void);
 
+// Test hook: pretend the card consumes `percent`% of 48000 frames per second (0 = measure it, the default).
+void audio_rate_force(uint32_t percent);
+// The measured speed of the card as a Q16 factor (65536 = exactly 48 kHz).
+uint32_t audio_rate_q16(void);
+
 // Master volume 0..100 (codec amplifier gain where the codec has one).
 void audio_set_volume(int percent);
 

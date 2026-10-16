@@ -958,6 +958,26 @@ static void shell_execute(int win_id, const char* input) {
             dns_resolve(args);
         }
     }
+    else if (str_eq(cmd_buf, "audiorate")) {
+        // `audiorate` prints the sound card's measured speed against real time; `audiorate 118` pretends it is 18% fast (tests the
+        // correction: the sound is stretched, the media clock follows); `audiorate 0` measures again
+        if (args[0]) {
+            uint32_t n = 0;
+            for (const char* a = args; *a >= '0' && *a <= '9'; a++) n = n * 10 + (uint32_t)(*a - '0');
+            audio_rate_force(n);
+        }
+        uint32_t r = audio_rate_q16();
+        char t[64];
+        int k = 0;
+        const char* pre = "the card runs at ";
+        while (*pre) t[k++] = *pre++;
+        t[k++] = (char)('0' + (r >> 16) % 10); t[k++] = '.';
+        t[k++] = (char)('0' + ((r & 0xFFFF) * 10 >> 16)); t[k++] = (char)('0' + ((r & 0xFFFF) * 100 / 65536) % 10); t[k++] = (char)('0' + ((r & 0xFFFF) * 1000 / 65536) % 10);
+        const char* post = " x real time\n";
+        while (*post) t[k++] = *post++;
+        t[k] = 0;
+        window_puts(win_id, t);
+    }
     else if (str_eq(cmd_buf, "tickdrop")) {
         uint32_t n = 0;
         for (const char* a = args; *a >= '0' && *a <= '9'; a++) n = n * 10 + (uint32_t)(*a - '0');

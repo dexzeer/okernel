@@ -2,6 +2,8 @@
 // Written from the Intel HDA specification 1.0a. Polled: no interrupts are used;
 // audio_tick() (timer IRQ) tracks the play position.
 #include "audio.h"
+#include "audio_rate.h"
+#include "cpufreq.h"
 #include "lapic.h"
 #include "memlayout.h"
 #include "memory.h"
@@ -66,6 +68,8 @@ static struct {
     uint64_t played_base;         // bytes played at the start of the current lap
     uint32_t underruns;
     int volume;
+    struct arate rate;            // measured speed of the card against real time (audio_rate.h)
+    uint32_t rate_logged;
 } H;
 
 static inline uint32_t rd32(uint32_t o) { return *(volatile uint32_t*)(H.mmio + o); }
@@ -318,6 +322,8 @@ static int stream_setup(void) {
     wr32(b + SD_CTL, ctl | ((uint32_t)STREAM_TAG << 20));
     wr32(b + SD_CTL, (ctl | ((uint32_t)STREAM_TAG << 20)) | 2);     // RUN
     H.wr_abs = 0; H.clean_abs = 0; H.last_lpib = 0; H.played_base = 0; H.underruns = 0;
+    arate_init(&H.rate);
+    H.rate_logged = H.rate.rate_q16;
     return 0;
 }
 
@@ -397,6 +403,22 @@ void audio_tick(void) {
         lo += chunk;
     }
     if (pl > H.clean_abs) H.clean_abs = pl;
+    // the card's speed against real time (see audio_rate.h): the TSC is the reference where it can be trusted
+    {
+        static uint32_t tsc_khz;
+        static int tsc_ok = -1;
+        if (tsc_ok < 0) { tsc_khz = cpufreq_tsc_mhz() * 1000u; tsc_ok = tsc_khz && cpufreq_tsc_reliable(); }
+        if (tsc_ok) {
+            uint32_t lo, hi;
+            __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+            arate_update(&H.rate, pl >> 2, (((uint64_t)hi << 32) | lo) / tsc_khz);
+            if (H.rate.rate_q16 != H.rate_logged) {
+                H.rate_logged = H.rate.rate_q16;
+                serial_printf("[hda] the card runs at %u.%u%u%u x real time%s\n", H.rate.rate_q16 >> 16, (H.rate.rate_q16 & 0xFFFF) * 10 >> 16,
+                              (H.rate.rate_q16 & 0xFFFF) * 100 / 65536 % 10, (H.rate.rate_q16 & 0xFFFF) * 1000 / 65536 % 10, arate_active(&H.rate) ? " (sound is resampled to match)" : "");
+            }
+        }
+    }
 }
 
 // wr_abs is 64-bit: the timer tick must not see it half updated.
@@ -419,9 +441,16 @@ static uint64_t played_abs(void) {
     return base + p;
 }
 
+// Positions and queue lengths are reported in NOMINAL 48 kHz frames: a card that consumes 1.18x too fast is resampled by 1.18 on the way in
+// and its position divided by 1.18 on the way out, so its users (the media engine) see an exact 48 kHz card.
 uint64_t audio_clock(void) {
     if (!H.ready) return 0;
-    return played_abs() >> 2;
+    uint32_t fl;                                         // audio_tick (timer IRQ) updates the rate state
+    __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
+    uint64_t dev = played_abs() >> 2;
+    uint64_t nom = arate_nominal(&H.rate, dev);
+    if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
+    return nom;
 }
 
 // Distance the writer keeps ahead of the DMA read pointer after an underrun
@@ -444,7 +473,7 @@ static uint32_t queued_bytes(void) {
 uint32_t audio_queued(void) {
     if (!H.ready) return 0;
     uint32_t q = queued_bytes();
-    return q > RESYNC_MARGIN ? (q - RESYNC_MARGIN) / 4 : 0;   // real audio only
+    return q > RESYNC_MARGIN ? arate_to_nominal(&H.rate, (q - RESYNC_MARGIN) / 4) : 0;   // real audio only
 }
 
 // Drop everything queued (seek, pause): the writer restarts just ahead of the read pointer and
@@ -454,6 +483,7 @@ void audio_flush(void) {
     uint64_t pl = played_abs();
     uint64_t wr = H.wr_abs;
     set_wr(pl + RESYNC_MARGIN);
+    arate_reset_stream(&H.rate);
     uint64_t lo = pl;
     if (wr > pl + RING_BYTES) wr = pl + RING_BYTES;
     while (lo < wr) {
@@ -468,13 +498,32 @@ void audio_flush(void) {
 uint32_t audio_space(void) {
     if (!H.ready) return 0;
     uint32_t q = queued_bytes();
-    return q + 64 >= RING_BYTES ? 0 : (RING_BYTES - 64 - q) / 4;
+    return q + 64 >= RING_BYTES ? 0 : arate_fit(&H.rate, (RING_BYTES - 64 - q) / 4);
 }
 
 uint32_t audio_write(const int16_t* frames, uint32_t nframes) {
     if (!H.ready || !frames) return 0;
     uint32_t space = audio_space();
     if (nframes > space) nframes = space;
+    if (arate_active(&H.rate)) {                         // the card is not 48 kHz: stretch what is written (audio_rate.h)
+        static int16_t tmp[2 * 2048];
+        uint32_t in_done = 0;
+        while (in_done < nframes) {
+            uint32_t c = nframes - in_done > 800 ? 800 : nframes - in_done;
+            uint32_t m = arate_resample(&H.rate, frames + (size_t)in_done * 2, c, tmp, 2048);
+            uint32_t b = m * 4, d = 0;
+            while (d < b) {
+                uint32_t off = (uint32_t)H.wr_abs & (RING_BYTES - 1);
+                uint32_t chunk = RING_BYTES - off;
+                if (chunk > b - d) chunk = b - d;
+                memcpy(H.ring + off, (const uint8_t*)tmp + d, chunk);
+                set_wr(H.wr_abs + chunk);
+                d += chunk;
+            }
+            in_done += c;
+        }
+        return nframes;
+    }
     uint32_t bytes = nframes * 4, done = 0;
     while (done < bytes) {
         uint32_t off = (uint32_t)H.wr_abs & (RING_BYTES - 1);
@@ -486,6 +535,9 @@ uint32_t audio_write(const int16_t* frames, uint32_t nframes) {
     }
     return nframes;
 }
+
+void audio_rate_force(uint32_t percent) { arate_force(&H.rate, percent ? (uint32_t)(((uint64_t)percent << 16) / 100) : 0); }
+uint32_t audio_rate_q16(void) { return H.rate.rate_q16; }
 
 void audio_set_volume(int percent) {
     if (percent < 0) percent = 0;
