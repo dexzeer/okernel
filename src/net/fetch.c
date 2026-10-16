@@ -1017,6 +1017,8 @@ void fetch_end(int h) {
     s->conn = -1;
 }
 
+int fetch_busy_slots(void) { return FETCH_MAX - fetch_free_slots(); }
+
 int fetch_free_slots(void) {
     int n = 0;
     for (int i = 0; i < FETCH_MAX; i++) if (slots[i].st == SL_FREE) n++;

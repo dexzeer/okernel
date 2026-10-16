@@ -8,6 +8,7 @@
 #include <stdarg.h>
 #include "../io.h"
 #include "../serial.h"
+#include "../cpufreq.h"
 
 static uint8_t our_ip[4] = {10, 0, 2, 15};    // QEMU user-mode default
 static uint8_t gateway_ip[4] = {10, 0, 2, 2};  // QEMU user-mode gateway
@@ -84,7 +85,7 @@ static int seq_lt(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
 // allocated the first time a slot is used and kept for reuse.
 #define TCP_RTX_CAP     16384          // unacked outbound bytes (requests, TLS flights)
 #define TCP_RX_CAP      (256 * 1024)   // receive ring
-#define TCP_REORDER_SLOTS 8
+#define TCP_REORDER_SLOTS 64           // out-of-order segments held per connection (a whole 256 KB window behind one lost segment is ~175)
 #define TCP_REORDER_SEG 1500
 #define TCP_WIN_MAX     65535          // 16-bit window field
 #define TCP_RCV_SHIFT   2              // our scale: 65535 << 2 = 256KB = the receive ring (RFC 7323; one 64KB window caps a 40 ms path at 13 Mbit/s)
@@ -105,6 +106,8 @@ struct tcp_sock {
     uint32_t rtx_last_tick;
     // Peer window (caps our sends; 0 = persist probing)
     uint32_t peer_win, persist_since;
+    uint8_t sack_ok;            // the peer agreed to selective acknowledgements (RFC 2018): our dup ACKs say which ranges we hold
+    uint32_t last_ooo_seq;      // the newest out-of-order segment (reported first)
     uint8_t ws_on, snd_shift;   // window scaling negotiated: we advertise ring_free >> TCP_RCV_SHIFT, the peer's windows are << snd_shift
     // Fast retransmit (pure duplicate ACKs only — see tcp_process_ack)
     uint32_t dup_acks, last_ack_num;
@@ -712,6 +715,9 @@ static struct tcp_sock* sock_get(int s) {
     return &tcp_socks[s];
 }
 
+// Statistics for the once-a-second [net] line (see net_stats_tick): what TCP did in the last second.
+static uint32_t st_in_bytes, st_rto, st_fast, st_ooo, st_ooo_full, st_ring_full, st_dup_rx;
+
 // Free receive-ring space = the window we may advertise.
 static uint32_t tcp_rx_free(const struct tcp_sock* c) {
     uint32_t f = TCP_RX_CAP - c->rx_len;
@@ -728,6 +734,37 @@ static uint16_t tcp_checksum(uint8_t* src_ip, uint8_t* dst_ip, uint8_t* tcp_data
 
 // Largest TCP payload in one Ethernet frame (MTU 1500 - IP 20 - TCP 20).
 #define TCP_SEG_MAX (ETH_FRAME_MAX - 14 - 20 - 20)
+
+// Ranges of data held beyond the hole (RFC 2018 SACK blocks), at most 3, the one with the newest segment first. Without this the sender
+// learns about a loss from duplicate ACKs but not what already arrived, and re-sends everything behind it (a slow link with 1% loss
+// delivered 1/8 of its speed).
+static int tcp_sack_blocks(const struct tcp_sock* c, uint32_t out[3][2]) {
+    uint32_t s[TCP_REORDER_SLOTS], e[TCP_REORDER_SLOTS];
+    int n = 0;
+    for (int i = 0; i < TCP_REORDER_SLOTS; i++)
+        if (c->ro_used[i] && seq_lt(c->ack, c->ro_seq[i])) { s[n] = c->ro_seq[i]; e[n] = c->ro_seq[i] + c->ro_len[i]; n++; }
+    if (!n) return 0;
+    for (int i = 1; i < n; i++) {                                    // insertion sort by distance from the hole
+        uint32_t ks = s[i], ke = e[i];
+        int j = i - 1;
+        while (j >= 0 && (s[j] - c->ack) > (ks - c->ack)) { s[j + 1] = s[j]; e[j + 1] = e[j]; j--; }
+        s[j + 1] = ks; e[j + 1] = ke;
+    }
+    uint32_t bs[TCP_REORDER_SLOTS], be[TCP_REORDER_SLOTS];
+    int nb = 0;
+    for (int i = 0; i < n; i++) {
+        if (nb && (s[i] - c->ack) <= (be[nb - 1] - c->ack)) { if ((e[i] - c->ack) > (be[nb - 1] - c->ack)) be[nb - 1] = e[i]; }
+        else { bs[nb] = s[i]; be[nb] = e[i]; nb++; }
+    }
+    int first = 0;
+    for (int i = 0; i < nb; i++)
+        if ((c->last_ooo_seq - bs[i]) < (be[i] - bs[i])) { first = i; break; }
+    int k = 0;
+    out[k][0] = bs[first]; out[k][1] = be[first]; k++;
+    for (int i = 0; i < nb && k < 3; i++)
+        if (i != first) { out[k][0] = bs[i]; out[k][1] = be[i]; k++; }
+    return k;
+}
 
 // One segment. data_len MUST be <= TCP_SEG_MAX: the frame is a 1514-byte
 // stack buffer (a 1.6KB request once overflowed it and smashed the stack).
@@ -747,7 +784,9 @@ static void tcp_send_one(struct tcp_sock* c, uint32_t seq_num, uint32_t ack_num,
     struct eth_header* eth = (struct eth_header*)frame;
     build_eth_header(eth, target_mac, nic_mac(), 0x0800);
 
-    uint16_t tcp_hdr_len = (flags & 0x02) ? 28 : 20;
+    uint32_t sack[3][2];
+    int nsack = (c->sack_ok && (flags & 0x12) == 0x10 && data_len == 0) ? tcp_sack_blocks(c, sack) : 0;
+    uint16_t tcp_hdr_len = (flags & 0x02) ? 32 : nsack ? (uint16_t)(24 + 8 * nsack) : 20;
     struct ip_header* ip = (struct ip_header*)(frame + sizeof(struct eth_header));
     ip->version_ihl = 0x45;
     ip->tos = 0;
@@ -781,11 +820,23 @@ static void tcp_send_one(struct tcp_sock* c, uint32_t seq_num, uint32_t ack_num,
     tcp[14] = (uint8_t)(wire >> 8); tcp[15] = (uint8_t)wire;
     tcp[16] = 0; tcp[17] = 0;
     tcp[18] = 0; tcp[19] = 0;
-    if (tcp_hdr_len == 28) {             // MSS + window scale options (SYN only)
+    if (flags & 0x02) {                  // MSS, SACK permitted, window scale (SYN only)
         tcp[20] = 2; tcp[21] = 4;
         tcp[22] = (uint8_t)(TCP_SEG_MAX >> 8); tcp[23] = (uint8_t)TCP_SEG_MAX;
-        tcp[24] = 1;                     // NOP
-        tcp[25] = 3; tcp[26] = 3; tcp[27] = TCP_RCV_SHIFT;
+        tcp[24] = 4; tcp[25] = 2;        // SACK permitted
+        tcp[26] = 1;                     // NOP
+        tcp[27] = 3; tcp[28] = 3; tcp[29] = TCP_RCV_SHIFT;
+        tcp[30] = 1; tcp[31] = 1;        // NOP NOP: pad to 32
+    } else if (nsack) {
+        tcp[20] = 1; tcp[21] = 1;        // NOP NOP
+        tcp[22] = 5; tcp[23] = (uint8_t)(2 + 8 * nsack);
+        for (int b = 0; b < nsack; b++) {
+            uint8_t* p = tcp + 24 + 8 * b;
+            for (int k = 0; k < 2; k++) {
+                uint32_t v = sack[b][k];
+                p[4 * k] = (uint8_t)(v >> 24); p[4 * k + 1] = (uint8_t)(v >> 16); p[4 * k + 2] = (uint8_t)(v >> 8); p[4 * k + 3] = (uint8_t)v;
+            }
+        }
     }
     if (data_len) memcpy(tcp + tcp_hdr_len, data, data_len);
     uint16_t cksum = tcp_checksum(our_ip, c->dst_ip, tcp, tcp_hdr_len + data_len);
@@ -989,6 +1040,7 @@ static void tcp_process_ack(struct tcp_sock* c, uint32_t ack_num, uint16_t seg_p
         if (ack_num == c->last_ack_num && c->dup_acks < 100) c->dup_acks++;
         else if (ack_num != c->last_ack_num) { c->last_ack_num = ack_num; c->dup_acks = 1; }
         if (c->dup_acks == 3) {
+            st_fast++;
             serial_puts("[tcp] fast rtx (3 dup ACKs)\n");
             c->rtx_tries++;
             tcp_rtx_arm(c);
@@ -1061,9 +1113,11 @@ static int tcp_reorder_store(struct tcp_sock* c, uint32_t seq, const uint8_t* pa
             c->ro_seq[i] = seq;
             c->ro_len[i] = plen;
             c->ro_used[i] = 1;
+            st_ooo++;
             return 1;
         }
     }
+    st_ooo_full++;                       // every out-of-order slot is taken: this segment is thrown away and has to be sent again
     return 0;
 }
 
@@ -1076,7 +1130,8 @@ static void tcp_deliver_in_order(struct tcp_sock* c, const uint8_t* payload, uin
     uint32_t took = tcp_rx_put(c, payload, plen);
     c->ack += took;
     c->ack_pending = 1;
-    if (took < plen) return;             // ring full: the rest is retransmitted
+    st_in_bytes += took;
+    if (took < plen) { st_ring_full++; return; }             // ring full: the rest is retransmitted
     for (;;) {
         int found = -1;
         for (int i = 0; i < TCP_REORDER_SLOTS; i++)
@@ -1158,6 +1213,7 @@ void tcp_handle_packet(uint8_t* src_ip, uint8_t* data, uint32_t len) {
                 if (kind == 0) break;
                 if (kind == 1) { o++; continue; }
                 if (o + 1 >= data_offset || data[o + 1] < 2) break;
+                if (kind == 4 && data[o + 1] == 2) c->sack_ok = 1;
                 if (kind == 3 && data[o + 1] == 3 && o + 2 < data_offset) {
                     c->ws_on = 1;
                     c->snd_shift = data[o + 2] > 14 ? 14 : data[o + 2];
@@ -1200,6 +1256,7 @@ void tcp_handle_packet(uint8_t* src_ip, uint8_t* data, uint32_t len) {
         } else {
             if (!tcp_reorder_store(c, seq_num, payload, payload_len) && net_trace)
                 serial_puts("[tcp] reorder full, dropping gap segment\n");
+            c->last_ooo_seq = seq_num;
             tcp_send_ctl(c, 0x10);
         }
     }
@@ -1260,6 +1317,7 @@ static void tcp_poll(void) {
             continue;
         }
         c->rtx_tries++;
+        st_rto++;
         if (c->rtx_tries > 1 && c->rtx_timeout < TCP_RTO_MAX) c->rtx_timeout = (uint16_t)(c->rtx_timeout * 2);
         tcp_rtx_arm(c);
         if (net_trace || c->rtx_tries > 2) serial_printf("[tcp] s%d retransmit #%d\n", i, c->rtx_tries);
@@ -1507,7 +1565,32 @@ static void wifi_watch(void) {
 
 // Timers and retries (called from the main loop right after e1000_poll, so
 // the ACKs owed for the batch just received go out together).
+// Once a second, only when something happened: how much arrived, what the network made TCP do (timeouts, fast retransmits, segments that
+// came out of order or had no slot to wait in), how much sits unread in the receive rings (the application is the bottleneck) and how
+// the card and the polling loop coped (a late poll lets the ring overflow and the card drops packets).
+extern int fetch_busy_slots(void);
+static void net_stats_tick(void) {
+    static uint32_t next;
+    if ((int)(tick_count - next) < 0) return;
+    next = tick_count + 100;
+    struct e1000_stats ns;
+    uint32_t missed = 0, nobuf = 0;
+    e1000_take_stats(&ns, &missed, &nobuf);
+    uint32_t backlog = 0, bmax = 0;
+    int socks = 0;
+    for (int i = 0; i < TCP_MAX_SOCKS; i++)
+        if (tcp_socks[i].used) { socks++; backlog += tcp_socks[i].rx_len; if (tcp_socks[i].rx_len > bmax) bmax = tcp_socks[i].rx_len; }
+    if (!ns.rx_pkts && !ns.tx_pkts && !st_rto && !st_fast) return;
+    uint32_t mhz = cpufreq_tsc_mhz();
+    uint32_t gap_ms = mhz ? (uint32_t)(ns.poll_gap_max / ((uint64_t)mhz * 1000)) : 0;
+    serial_printf("[net] rx %u KB (%u pkts) tx %u KB (%u pkts) | tcp in %u KB rto %u fast %u ooo %u ooo-full %u ring-full %u | unread %u KB (max %u KB) socks %d fetch %d | nic max-batch %u missed %u nobuf %u poll-gap %ums\n",
+                  ns.rx_bytes >> 10, ns.rx_pkts, ns.tx_bytes >> 10, ns.tx_pkts, st_in_bytes >> 10, st_rto, st_fast, st_ooo, st_ooo_full, st_ring_full,
+                  backlog >> 10, bmax >> 10, socks, fetch_busy_slots(), ns.max_batch, missed, nobuf, gap_ms);
+    st_in_bytes = st_rto = st_fast = st_ooo = st_ooo_full = st_ring_full = st_dup_rx = 0;
+}
+
 void net_poll(void) {
+    net_stats_tick();
     wifi_watch();
     dhcp_poll();
     tcp_poll();
