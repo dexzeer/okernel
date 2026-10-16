@@ -1,0 +1,7 @@
+<!doctype html><html><body style="margin:0;background:#000">
+<video id="v" src="v720.webm" autoplay width="1240" height="700"></video>
+<iframe src="https://www.youtube.com/watch?v=aqz-KE-bpKQ" width="600" height="400" style="position:absolute;left:1260px;top:0"></iframe>
+<script>
+var v = document.getElementById('v');
+setInterval(function () { console.log('T ' + v.currentTime.toFixed(2) + ' rs=' + v.readyState); }, 4000);
+</script></body></html>
