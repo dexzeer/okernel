@@ -105,7 +105,7 @@ src/gamewin.o: src/gamewin.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
 src/game/levels.o: src/game/levels.asm games/level1.dmccl games/level2.dmccl games/level3.dmccl games/level4.dmccl
 	$(AS) $(ASFLAGS) $< -o $@
-DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/pcix.o src/acpi_pm.o src/xhci.o src/wifigui.o src/rtw/rtw_hw.o src/rtw/rtw_pci.o src/rtw/rtw_wifi.o src/rtw/wsta.o src/rtw/wcrypto.o src/rtw/rtw_tables.o src/rtw/rtwfw.o src/hid.o src/devlog.o src/dwi2c.o src/hidi2c.o src/ptp.o src/i2caml.o src/i2chid.o src/klog.o src/virtio.o src/vgpu.o src/i915.o src/cpufreq.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
+DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/audio_rate.o src/pcix.o src/acpi_pm.o src/xhci.o src/wifigui.o src/rtw/rtw_hw.o src/rtw/rtw_pci.o src/rtw/rtw_wifi.o src/rtw/wsta.o src/rtw/wcrypto.o src/rtw/rtw_tables.o src/rtw/rtwfw.o src/hid.o src/devlog.o src/dwi2c.o src/hidi2c.o src/ptp.o src/i2caml.o src/i2chid.o src/klog.o src/virtio.o src/vgpu.o src/i915.o src/cpufreq.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
               src/font_data.o $(WEB_OBJ) $(OJS_OBJ) \
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/aes.o src/crypto/chacha20.o src/crypto/poly1305.o \
@@ -211,6 +211,8 @@ media-tests:
 	gcc -m32 -O1 -fsanitize=address,undefined -o build-host/t_webm_unit tests/media/test_webm_unit.c src/media/webm.c -lm
 	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_webm_fuzz tests/media/fuzz_webm.c src/media/webm.c -lm
 	@set -e; for f in tests/media/vec/webm_*.webm; do n=$${f%.webm}; ASAN_OPTIONS=detect_leaks=0 ./build-host/t_webm $$n.webm $$n.pkts | tail -n 1 | sed "s|^|$$n: |"; done
+	gcc -m32 -O1 -fsanitize=address,undefined -o build-host/t_arate tests/test_arate.c src/audio_rate.c -lm
+	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_arate | tail -n 1
 	gcc -m32 -O1 -msse2 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_vcvt tests/media/test_vcvt.c src/media/vcvt.c
 	./build-host/t_vcvt | tail -n 1
 	gcc -m32 -O2 -msse2 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_vp9_lf tests/media/test_vp9_lf.c src/media/vp9_simd.c
