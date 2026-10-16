@@ -23,6 +23,8 @@ static const uint32_t vga_palette[256] = {
 // Active display backend (virtio-gpu / Intel GPU) or NULL = the GRUB framebuffer.
 static const struct display_ops* disp = 0;
 
+const char* graphics_display_name(void) { return disp ? disp->name : "GRUB framebuffer"; }
+
 // Framebuffer and backbuffer
 static uint8_t* framebuffer = 0;
 static uint32_t fb_pitch = 0;

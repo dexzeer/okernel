@@ -147,6 +147,60 @@ void smp_parallel_for(smp_fn fn, void* ctx, uint32_t n, uint32_t grain) {
     spin_unlock(&pub_lock);
 }
 
+// Asynchronous single jobs live in their own small mailbox ring, not in the broadcast job slots: an AP that is busy or asleep only ever looks
+// at the NEWEST published generation, so a job announced through `smp_gen` is lost when another one is published before an AP wakes (the
+// self test found it with 8 jobs in a row). Mailbox entries are claimed one by one with a compare-and-swap, so each runs exactly once.
+#define NASYNC 8u
+struct aent { volatile uint32_t state, seq; smp_fn fn; void* ctx; };      // state: 0 free, 1 pending, 2 running, 3 done (reusable)
+static struct aent aents[NASYNC];
+static uint32_t async_seq;
+
+int smp_async_start(smp_fn fn, void* ctx, struct smp_async* h) {
+    if (!fn || !h || ncpu_total < 2 || smp_on_ap()) return -1;
+    spin_lock(&pub_lock);
+    struct aent* e = 0;
+    uint32_t idx = 0;
+    for (uint32_t i = 0; i < NASYNC; i++)
+        if (aents[i].state == 0 || aents[i].state == 3) { e = &aents[i]; idx = i; break; }
+    if (!e) { spin_unlock(&pub_lock); return -1; }
+    uint32_t seq = ++async_seq & 0x1FFFFFFFu;
+    if (seq == 0) seq = ++async_seq & 0x1FFFFFFFu;
+    e->seq = seq;
+    e->fn = fn; e->ctx = ctx;
+    mb();
+    e->state = 1;
+    mb();
+    lapic_ipi_others(LAPIC_VEC_WAKE);
+    spin_unlock(&pub_lock);
+    h->g = (seq << 3) | idx;
+    return 0;
+}
+
+int smp_async_done(const struct smp_async* h) {
+    struct aent* e = &aents[h->g & (NASYNC - 1)];
+    mb();
+    if (e->seq != (h->g >> 3)) return 1;          // the entry was recycled: the job finished long ago
+    return e->state == 3;
+}
+
+static int async_ready(void) {
+    for (uint32_t i = 0; i < NASYNC; i++) if (aents[i].state == 1) return 1;
+    return 0;
+}
+
+static void async_run(uint32_t cpu) {
+    for (uint32_t i = 0; i < NASYNC; i++) {
+        struct aent* e = &aents[i];
+        if (e->state == 1 && __sync_bool_compare_and_swap(&e->state, 1, 2)) {
+            smp_fn fn = e->fn;
+            void* ctx = e->ctx;
+            fn(ctx, 0, cpu);
+            mb();
+            e->state = 3;
+        }
+    }
+}
+
 // ---- AP side ------------------------------------------------------------
 
 static void ap_worker(int idx) {
@@ -156,11 +210,14 @@ static void ap_worker(int idx) {
         for (;;) {
             __asm__ volatile("cli" ::: "memory");
             g = smp_gen;
-            if (g != seen) break;
+            if (g != seen || async_ready()) break;
             __asm__ volatile("sti; hlt" ::: "memory");   // the IPI wakes us
         }
-        seen = g;
-        job_join(g, (uint32_t)idx);
+        if (g != seen) {
+            seen = g;
+            job_join(g, (uint32_t)idx);
+        }
+        async_run((uint32_t)idx);
     }
 }
 
@@ -359,6 +416,15 @@ static void t_sse_fn(void* c, uint32_t i, uint32_t cpu) {
     for (uint32_t k = 0; k < T_SSE_BLK / 4; k++) if (((uint32_t*)d)[k] != (0xA5A5A5A5u ^ i)) { __sync_fetch_and_add(&t->bad, 1); break; }
 }
 
+struct t_async { volatile uint32_t v, cpu, tag; };
+static void t_async_fn(void* c, uint32_t i, uint32_t cpu) {
+    struct t_async* t = (struct t_async*)c;
+    (void)i;
+    t->cpu = cpu;
+    for (volatile uint32_t k = 0; k < 20000; k++) { }
+    t->v = 1000u + t->tag;
+}
+
 static void t_nest_inner(void* c, uint32_t i, uint32_t cpu) { (void)c; (void)i; (void)cpu; __sync_fetch_and_add(&t_counter, 1); }
 static void t_nest_outer(void* c, uint32_t i, uint32_t cpu) {
     (void)c; (void)i; (void)cpu;
@@ -436,6 +502,25 @@ int smp_selftest(void (*out)(const char*, void*), void* ud) {
         }
         if (t.src) kfree(t.src);
         if (t.dst) kfree(t.dst);
+    }
+    // G: asynchronous single jobs (what the video worker uses)
+    if (ncpu_total > 1) {
+        struct t_async ta[8];
+        struct smp_async h[8];
+        int ok = 1;
+        for (int round = 0; round < 50 && ok; round++) {
+            for (int k = 0; k < 8; k++) { ta[k].v = 0; ta[k].cpu = 0; ta[k].tag = (uint32_t)k; }
+            int started = 0;
+            for (int k = 0; k < 8; k++) if (smp_async_start(t_async_fn, &ta[k], &h[k]) == 0) started++;
+            uint64_t t0 = tsc();
+            for (int k = 0; k < 8 && ok; k++) {
+                while (!smp_async_done(&h[k])) { relax(); if (tsc() - t0 > 20000000000ull) { ok = 0; break; } }
+                if (ok && (ta[k].v != 1000u + (uint32_t)k || ta[k].cpu == 0 || ta[k].cpu >= SMP_MAX_CPUS)) ok = 0;
+            }
+            if (started != 8) ok = 0;
+        }
+        kfmt(b, sizeof b, "G async jobs: %s", ok ? "ok" : "FAIL"); out(b, ud);
+        if (!ok) fails++;
     }
     // E: speed
     {

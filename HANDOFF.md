@@ -26,7 +26,7 @@ Read order: this file (orientation), `AGENTS.md` (the living rulebook: one bulle
 | Audio | Intel HD Audio output, polled, 48 kHz stereo; `audio_clock()` is the A/V master clock. |
 | **okai** (browser) | Firefox-style chrome (`okai_ui.c`), tabs, forms incl. POST, cookies, iframes (+ cross-frame `postMessage`), 8 KB URLs and big cookie jars. Engine in `src/web`: WHATWG parser, CSS cascade, block/inline/flex/grid/table layout, AA painter, TrueType, images, SVG, Canvas 2D, WebAssembly (V8-verified), Workers, IndexedDB, SubtleCrypto, streams, MSE. |
 | JS | **ojs**, our engine (`src/ojs`): ES2025, test262 ~98.9%, mark-sweep GC with conservative stack scan, x87 doubles. One realm per document. |
-| Media | Own decoders: VP9, H.264, Opus (CELT), AAC-LC; WebM/MP4 demux; `meng` playback engine under `<video>`/MSE and the `play` command. YouTube plays 25-50 s, then the attestation wall (below). |
+| Media | Own decoders: VP9, H.264, Opus (CELT), AAC-LC; WebM/MP4 demux; `meng` playback engine under `<video>`/MSE and the `play` command. VP9 decodes on a second CPU (`-smp`, `run-windows.bat` passes `-smp 4`): 720p60 plays at 60 shown/s, 1080p60 at 15-35; SSE2 colour conversion, bilinear scaling and loop filter. YouTube plays 25-50 s, then the attestation wall (below). |
 | Game | `dmccl` (the owner's language, rewritten in C) + 2D physics + "KAnarchy Wheels" (`game`). |
 | Text mode | Separate small VGA-text build (`make text`); also a framebuffer-text report kernel for UEFI laptops. |
 
@@ -68,7 +68,7 @@ Build and test run in WSL (`MSYS_NO_PATHCONV=1 wsl -e bash -lc 'cd /mnt/d/projec
 
 ## YouTube and the attestation wall
 
-Watch pages load, search works, video plays smoothly (28-31 fps, A/V in sync, streaming fetch, MSE ad hand-over fixed, Range-streamed long videos). After ~25-50 s the video servers answer 107/123-byte refusals and `youtubei/v1/player` returns a 549-byte error: BotGuard's token is not accepted. Signing in does not change it (sign-in itself works since URLs are 8 KB and cookies uncapped).
+Watch pages load, search works, video plays smoothly (30 fps steady with `-smp 4`, A/V in sync, streaming fetch, MSE ad hand-over fixed, Range-streamed long videos). TCP window scaling (RFC 7323, shift 2 = the 256 KB receive ring) let YouTube's bandwidth estimate rise: the player now climbs 240p -> 360p -> 480p in the first seconds (it stayed on 240p with the 64 KB window). The player picks resolution from its own estimate and the player size; we do not force formats. After ~25-50 s the video servers answer 107/123-byte refusals and `youtubei/v1/player` returns a 549-byte error: BotGuard's token is not accepted. Signing in does not change it (sign-in itself works since URLs are 8 KB and cookies uncapped).
 
 Measured, not solved (AGENTS "Why is YouTube's BotGuard token rejected"): BotGuard runs to completion here and produces a snapshot the same size as Edge's, but it computes its signals inside its own VM, so API traces cannot show what it dislikes. Fixed on the way: wire User-Agent now equals `navigator.userAgent`, `Accept-Language`, `Referer`, Fetch Metadata, Origin on unsafe methods, WebIDL shapes. Remaining differences from Edge: no Trusted Types, no `Intl`, no WebGL/Web Audio, a stub `about:blank` iframe window, the JS engine itself (not V8). Policy: no spoofing, no Chrome identity.
 
@@ -91,7 +91,9 @@ Stale objects after a header change (keep `-MMD -MP`); 16-bit offsets in big are
 3. **Net/TLS**: TLS 1.2 + SHA-384 (whatwg.org, baidu.com), real congestion window for non-SLIRP networks.
 4. **JS engine**: lazy function compilation, generational GC, `using`/DisposableStack, remaining test262 edge cases.
 5. **Laptop** (only when the owner asks): verify PCIe Wi-Fi, audio, Intel scanout from our own buffer.
-6. Name `Okapi` is docs-only so far; wiring it into `about`/`sysinfo`/the terminal prompt is a small change if the owner wants it.
+6. `sysinfo`/`about` say Okapi and show CPU (brand, MHz, count, speed factor), RAM + heap use, display backend, network + IP, audio, uptime (`sysinfo_text()` in desktop.c).
+7. **YouTube masthead / search bar vanishing after sign-in (owner's report): most likely fixed, unverified while signed in.** Cause found while logged out: the `Safari/537.36` token in our UA made YouTube serve its polyfilled legacy page, which hydrated halfway (masthead without hamburger/logo/placeholder, page 1225 px tall); and `<link>` elements never fired `load`, which stalled the player start-up. Both fixed (AGENTS "Why YouTube rendered half-built"). If the search bar still disappears after a real sign-in, look at the hit list in the serial log first: the masthead boxes (hamburger x=24, search input x=657, y=16) should be in it.
+8. Cosmetic YouTube leftovers: doubled consent buttons (a `dom-repeat` stamping twice), Shorts shelf titles overlap in the sidebar.
 
 ## History (one line each)
 

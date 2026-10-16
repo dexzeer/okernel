@@ -303,6 +303,7 @@ NATIVE(n_slow) {                // how many times slower than a fast desktop the
     (void)this_val; (void)argc; (void)argv; (void)ctx;
     return ojs_int(BUDGET_SCALE);
 }
+NATIVE(n_worker) { (void)this_val; (void)argc; (void)argv; (void)ctx; return ojs_int(wjs_media_worker()); }
 NATIVE(n_resolve) {
     (void)this_val;
     struct wjs* js = JSX(ctx);
@@ -472,6 +473,7 @@ static const struct ojs_func_entry env_funcs[] = {
     { "log", n_log, 2 },
     { "now", n_now, 0 },
     { "slow", n_slow, 0 },
+    { "worker", n_worker, 0 },
     { "resolve", n_resolve, 2 },
     { "docURL", n_doc_url, 0 },
     { "baseURL", n_base_url, 0 },
@@ -1604,6 +1606,36 @@ void wjs_image_done(struct wjs* js, int slot, int ok) {
     UNGUARD(js);
 }
 
+// <link rel=stylesheet> load/error: the stylesheet fetch belongs to the document, the event to the script world. The event is queued and
+// fired from wjs_run (a task of its own: the caller may be in the middle of rebuilding styles). Pages wait for it: YouTube's player loader
+// appends a <link id=player-css> and holds the whole player start-up until it fires `load`.
+void wjs_link_event(struct wjs* js, int el, int ok) {
+    if (!js || js->dead || el < 0 || !js->d || el >= js->d->nn) return;
+    if (!wjs_grow_nodes(js)) return;
+    if (js->node_flags[el] & NF_LINKEVT) return;
+    if (js->nlink_q >= 32) return;                       // dropped: the next style rebuild asks again (the flag is not set)
+    js->node_flags[el] |= NF_LINKEVT;
+    js->link_q[js->nlink_q] = el;
+    js->link_ok[js->nlink_q] = (uint8_t)(ok != 0);
+    js->nlink_q++;
+}
+
+static void link_events_flush(struct wjs* js) {
+    int n = js->nlink_q;
+    if (n <= 0) return;
+    int q[32]; uint8_t ok[32];
+    memcpy(q, js->link_q, (size_t)n * sizeof q[0]);
+    memcpy(ok, js->link_ok, (size_t)n);
+    js->nlink_q = 0;
+    for (int i = 0; i < n; i++) {
+        if (q[i] >= js->d->nn || !wdom_is(js->d, q[i], T_link)) continue;
+        ojsv a[2] = { wjs_wrap(js, q[i]), ojs_bool(ok[i]) };
+        call_hook(js, js->h_image, 2, a, TASK_BUDGET_MS);
+    }
+    js->flags |= WJS_DIRTY;
+    refresh_due(js);
+}
+
 static int any_script_pending(struct wjs* js) {
     for (int i = 0; i < js->nsc; i++)
         if (js->sc[i].state == SS_FETCH || js->sc[i].state == SS_READY) return 1;
@@ -1627,6 +1659,7 @@ int wjs_run(struct wjs* js, int budget_ms) {
         js->deadline = 0;
         if (ojs_jobs_pending(js->J)) over = 1;
     }
+    if (js->nlink_q && js->dcl_fired) link_events_flush(js);
     // 1. parser-blocking scripts, in document order
     while (js->next_block < js->nsc && !over) {
         struct wjs_script* s = &js->sc[js->next_block];
@@ -1734,6 +1767,7 @@ static uint32_t obs_signature(struct wjs* js) {
 int wjs_next_due(struct wjs* js) {
     if (!js || js->dead) return -1;
     if (js->J && ojs_jobs_pending(js->J)) return 0;
+    if (js->nlink_q && js->dcl_fired) return 0;                           // stylesheet load/error events are waiting
     if (js->obs_active && obs_signature(js) != js->obs_sig) return 0;    // observers have something to re-measure
     // fetched modules wait to be compiled (dependency discovery) in wjs_run
     for (int i = 0; i < js->nmod; i++) if (js->mods[i].state == SS_READY && !js->mods[i].scanned) return 0;

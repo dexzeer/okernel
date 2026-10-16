@@ -1,0 +1,10 @@
+<!doctype html><html><head><style>input{display:inline-block;width:100px;height:20px}</style></head>
+<body><form id=f><input type=hidden id=h value=x><input type=HIDDEN id=h2 value=y><input type=text id=t></form>
+<script>
+var r=[];
+function d(id){return getComputedStyle(document.getElementById(id)).display;}
+r.push(d('h')==='none'?'PASS hidden none':'FAIL hidden '+d('h'));
+r.push(d('h2')==='none'?'PASS HIDDEN none':'FAIL HIDDEN '+d('h2'));
+r.push(d('t')==='inline-block'?'PASS text visible':'FAIL text '+d('t'));
+console.log(r.join('\n'));console.log('RESULT '+(r.join().indexOf('FAIL')<0?'ALLPASS':'FAILED'));
+</script></body></html>

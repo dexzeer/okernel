@@ -46,6 +46,7 @@ struct wjs_dyn {
 #define NF_STARTED 0x01  // script "already started"
 #define NF_PARSER  0x02  // parser-inserted script
 #define NF_IMGEVT  0x04  // load/error already fired for this <img>
+#define NF_LINKEVT 0x08  // load/error already queued for this <link rel=stylesheet>
 
 #define WJS_LOG_MAX 400
 #define WJS_DBG_MAX 1500          // engine trace lines (W.log level 4)
@@ -66,6 +67,9 @@ struct wjs {
     ojsv h_msg;              // prelude hook: a message from another frame arrived (data, origin, kind, node)
     ojsv h_dispatch, h_ui, h_fetch, h_nextdue, h_rundue, h_frame, h_dcl, h_load,
          h_script, h_image, h_proto, h_report, h_mo, h_click, h_ready, h_obs;
+    int link_q[32];          // <link rel=stylesheet> elements whose load/error event waits for the next task (wjs_link_event)
+    uint8_t link_ok[32];
+    int nlink_q;
     int obs_active;          // the page has Resize/IntersectionObserver targets (the prelude says so: W.obsActive)
     uint32_t obs_sig;        // layout epoch / scroll / viewport the observers last measured
     ojsv rej[2 * WJS_REJ_MAX]; // rejected promises with no handler yet: {promise, reason} pairs (a root range)

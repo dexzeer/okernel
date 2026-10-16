@@ -8,7 +8,13 @@
 #include "resample.h"
 #include "vp9.h"
 #include "h264.h"
+#include "vcvt.h"
 #include "msys.h"
+#ifdef KERNEL
+#include "../smp.h"
+#elif defined(MENG_PTHREAD)
+#include <pthread.h>
+#endif
 #if defined(MENG_TRACE) || defined(MENG_VTRACE)
 #include <stdio.h>
 #endif
@@ -32,6 +38,92 @@
 static inline int64_t frames_to_ns(int64_t f) { return f * NS_NUM / NS_DEN; }
 static inline int64_t ns_to_frames(int64_t ns) { return ns * NS_DEN / NS_NUM; }
 
+// Scratch for colour conversion + scaling. One per user (the engine itself, and the decode worker): nothing in it is shared.
+struct vscratch {
+    uint32_t* cvt;                      // source-size ARGB, when the output size differs
+    size_t cvt_cap;                     // pixels
+    uint8_t* scal;                      // vcvt_scale() scratch
+    size_t scal_cap;                    // bytes
+};
+
+struct range { int64_t s, e; };
+#define MAX_RANGES 64
+
+static void vs_free(struct vscratch* v);
+static void vw_free(struct meng* m);
+static void vw_sync(struct meng* m);
+static void vw_reset(struct meng* m);
+static int vw_pending(const struct meng* m);
+
+// ---- video decode worker: types ----
+// With a second CPU the VP9 decoder and the colour conversion run on an AP while the boot CPU keeps the page, the sound and the
+// clock going. The boot CPU copies a few packets into a job, hands it over (one asynchronous SMP job) and presents finished pictures
+// when their time comes. While a job runs the boot CPU touches none of what the job uses: the packets are copies, the pictures go
+// into private ring slots, the decoder belongs to the job. Seeks and teardown wait for it (vw_sync).
+#define VW_RING 4                       // converted pictures waiting for their presentation time
+#define VW_BATCH 4                      // packets per job
+#define VW_AHEAD_NS 40000000LL          // decode this far beyond the presentation lead
+#define VW_MIN_SHOW_NS 25000000LL       // behind: convert (and show) a picture at least this often
+
+struct vslot {
+    uint32_t* px;
+    size_t cap;                         // pixels
+    int w, h, src_w, src_h;
+    int64_t pts;
+    volatile int state;                 // 0 free, 1 claimed by the running job, 2 ready (written by the job, released by the engine)
+};
+
+struct vjob {
+    struct vp9_dec* vd;
+    uint32_t (*ticks)(void);
+    uint8_t* data;                      // copies of the packets, one after the other
+    size_t dcap;
+    int n, cur;
+    struct { uint32_t off, len; int64_t pts; uint8_t convert, slot; } pk[VW_BATCH];
+    int ow, oh;                         // output size (0 = the picture's own)
+    struct vslot* slots;
+    struct vscratch vs;                 // the job's conversion scratch
+    uint32_t dec_ticks, n_decoded, n_dropped;
+    int error;
+};
+
+static void vw_run(void* ctx, uint32_t item, uint32_t cpu);
+
+#ifdef KERNEL
+struct vhandle { struct smp_async a; };
+static int vh_can(void) { return smp_ncpu() > 1 && !smp_on_ap(); }
+static int vh_start(struct vhandle* h, void* ctx) { return smp_async_start(vw_run, ctx, &h->a); }
+static int vh_done(struct vhandle* h) { return smp_async_done(&h->a); }
+#elif defined(MENG_PTHREAD)
+struct vhandle { pthread_t t; volatile int done; int live; void* ctx; };
+static int vh_can(void) { return 1; }
+static void* vh_thread(void* p) { struct vhandle* h = (struct vhandle*)p; vw_run(h->ctx, 0, 1); __sync_synchronize(); h->done = 1; return 0; }
+static int vh_start(struct vhandle* h, void* ctx) {
+    h->done = 0; h->ctx = ctx; h->live = 1;
+    if (pthread_create(&h->t, 0, vh_thread, h)) { h->live = 0; return -1; }
+    return 0;
+}
+static int vh_done(struct vhandle* h) {
+    if (!h->done) return 0;
+    if (h->live) { pthread_join(h->t, 0); h->live = 0; }
+    return 1;
+}
+#else
+struct vhandle { int unused; };
+static int vh_can(void) { return 1; }
+static int vh_start(struct vhandle* h, void* ctx) { (void)h; vw_run(ctx, 0, 0); return 0; }      // the host has no second CPU in the tests: the job runs at once
+static int vh_done(struct vhandle* h) { (void)h; return 1; }
+#endif
+
+struct vwork {
+    struct vjob job;
+    struct vslot slot[VW_RING];
+    struct vhandle h;
+    int busy;
+    int64_t last_conv_pts;              // presentation time of the last picture handed to the converter
+    int dead;                           // a job never finished: its memory is abandoned, the worker is off for good
+};
+
 struct mpkt {
     uint32_t off, len;
     int64_t pts_ns;
@@ -48,6 +140,7 @@ struct pq {
     uint32_t n, cap;
     uint32_t next;                      // decode cursor
     uint32_t dead_bytes;
+    uint32_t gen;                       // bumped whenever the set of packets changes (the buffered-range cache keys on it)
 };
 
 enum { FMT_UNKNOWN = 0, FMT_WEBM = 1, FMT_MP4 = 2 };
@@ -129,8 +222,15 @@ struct meng {
     int out_w, out_h;
     uint32_t* fb;
     int fb_cap;
-    uint32_t* cvt;                      // source-size ARGB scratch for upscaled output
-    int cvt_cap;
+    struct vscratch vs;                 // conversion scratch for the inline (main thread) path
+    struct vwork vw;                    // the decode worker (VP9 with a second CPU)
+    int vw_on;
+    struct {                            // buffered ranges of both queues: recomputed only when a queue changed (a poll used to walk every packet, ~20,000 times a second)
+        int valid, n, ap, vp;
+        uint32_t ag, vg;
+        int64_t delay;
+        struct range r[MAX_RANGES];
+    } rc;
     struct meng_frame frame;
     int frame_valid;
     int skip_present;
@@ -167,6 +267,7 @@ static void pq_truncate(struct pq* q, int64_t from) {
         q->n = k;
         q->alen = k ? q->pk[k - 1].off + q->pk[k - 1].len : 0;
         if (q->next > k) q->next = k;
+        q->gen++;
     }
 }
 
@@ -198,11 +299,13 @@ static int pq_push(struct pq* q, const uint8_t* data, size_t len, int64_t pts, i
     p->key = (uint8_t)key;
     p->dead = 0;
     q->alen += (uint32_t)len;
+    q->gen++;
     return 0;
 }
 
 // Remove packets in [start, end) and compact the arena when enough of it is dead.
 static void pq_remove(struct pq* q, int64_t start, int64_t end) {
+    q->gen++;
     for (uint32_t i = 0; i < q->n; i++) {
         struct mpkt* p = &q->pk[i];
         if (!p->dead && p->pts_ns >= start && p->pts_ns < end) {
@@ -401,6 +504,10 @@ static void on_sample_mp4(void* u, const struct mp4_sample* x) {
         pq_push(&m->vq, x->data, x->len, pts, dts, x->duration_ns, 0, x->key);
 }
 
+static int g_async = -1;                // meng_set_async(): -1 = automatic (a second CPU), 0 = never, 1 = always
+static int vw_wanted(void) { return g_async >= 0 ? g_async && vh_can() : vh_can(); }
+void meng_set_async(int mode) { g_async = mode; }
+
 struct meng* meng_new(const struct meng_env* env) {
     struct meng* m = (struct meng*)MEDIA_ALLOC(sizeof *m);
     if (!m) return 0;
@@ -409,6 +516,7 @@ struct meng* meng_new(const struct meng_env* env) {
     m->rate = 1.0;
     m->a_owner = m->v_owner = -1;
     m->duration = __builtin_nan("");
+    m->vw_on = vw_wanted();
     return m;
 }
 
@@ -430,10 +538,11 @@ void meng_free(struct meng* m) {
     if (m->od) opus_dec_free(m->od);
     if (m->ad) aac_free(m->ad);
     if (m->rs) resamp_free(m->rs);
+    vw_free(m);
     if (m->vd) vp9_dec_free(m->vd);
     if (m->hd) h264_free(m->hd);
     if (m->fb) MEDIA_FREE(m->fb);
-    if (m->cvt) MEDIA_FREE(m->cvt);
+    vs_free(&m->vs);
     MEDIA_FREE(m);
 }
 
@@ -576,8 +685,6 @@ double meng_current_time(struct meng* m) { return (double)(m->clock_running ? cl
 // ---------------------------------------------------------------------------
 // buffered ranges (seconds): the intersection of the audio and video ranges
 
-struct range { int64_t s, e; };
-
 static int pq_ranges(const struct pq* q, struct range* out, int max, int64_t shift) {
     int n = 0;
     int open = 0;
@@ -598,8 +705,7 @@ static int pq_ranges(const struct pq* q, struct range* out, int max, int64_t shi
     return n;
 }
 
-#define MAX_RANGES 64
-static int all_ranges(const struct meng* m, struct range* out) {
+static int all_ranges_compute(const struct meng* m, struct range* out) {
     struct range a[MAX_RANGES], v[MAX_RANGES];
     int na = m->a_present ? pq_ranges(&m->aq, a, MAX_RANGES, m->delay_ns) : 0;
     int nv = m->v_present ? pq_ranges(&m->vq, v, MAX_RANGES, 0) : 0;
@@ -613,6 +719,19 @@ static int all_ranges(const struct meng* m, struct range* out) {
             if (e > s && n < MAX_RANGES) out[n++] = (struct range){s, e};
         }
     return n;
+}
+
+static int all_ranges(const struct meng* cm, struct range* out) {
+    struct meng* m = (struct meng*)cm;                   // the cache is a pure memo of what the queues say
+    if (!m->rc.valid || m->rc.ag != m->aq.gen || m->rc.vg != m->vq.gen || m->rc.delay != m->delay_ns ||
+        m->rc.ap != m->a_present || m->rc.vp != m->v_present) {
+        m->rc.n = all_ranges_compute(m, m->rc.r);
+        m->rc.ag = m->aq.gen; m->rc.vg = m->vq.gen; m->rc.delay = m->delay_ns;
+        m->rc.ap = m->a_present; m->rc.vp = m->v_present;
+        m->rc.valid = 1;
+    }
+    memcpy(out, m->rc.r, (size_t)m->rc.n * sizeof *out);
+    return m->rc.n;
 }
 
 int meng_buffered(const struct meng* m, int index, double* start, double* end) {
@@ -842,178 +961,108 @@ static void audio_seek(struct meng* m, int64_t t) {
 
 static inline uint8_t clamp8(int v) { return (uint8_t)(v < 0 ? 0 : v > 255 ? 255 : v); }
 
-// Upscaled output (the usual case: a 640x360 video painted at 1341x754): the colour conversion runs on the SOURCE pixels (a
-// quarter of the work or less) and the picture is then stretched by nearest-neighbour copying, which gives the same pixels as
-// converting every output pixel from its source pixel. Returns the scratch buffer (w x h ARGB), or 0 if there is no memory.
-static uint32_t* cvt_scratch(struct meng* m, int w, int h) {
-    if (w * h > m->cvt_cap) {
-        if (m->cvt) MEDIA_FREE(m->cvt);
-        m->cvt = (uint32_t*)MEDIA_ALLOC((size_t)w * h * 4);
-        m->cvt_cap = m->cvt ? w * h : 0;
+static uint32_t* vs_cvt(struct vscratch* v, int w, int h) {
+    size_t need = (size_t)w * (size_t)h;
+    if (need > v->cvt_cap) {
+        if (v->cvt) MEDIA_FREE(v->cvt);
+        v->cvt = (uint32_t*)MEDIA_ALLOC(need * 4);
+        v->cvt_cap = v->cvt ? need : 0;
     }
-    return m->cvt;
+    return v->cvt;
 }
 
-static void stretch_rows(uint32_t* out, int ow, int oh, const uint32_t* src, int w, int h) {
-    static int xmap[4096];
-    int fw = ow > 4096 ? 4096 : ow;
-    for (int x = 0; x < fw; x++) xmap[x] = (int)(((int64_t)x * w) / ow);
-    int prev = -1;
-    for (int y = 0; y < oh; y++) {
-        int syy = (int)(((int64_t)y * h) / oh);
-        uint32_t* o = out + (size_t)y * ow;
-        if (syy == prev) { memcpy(o, o - ow, (size_t)fw * 4); continue; }      // the same source row again: copy the row just made
-        const uint32_t* r = src + (size_t)syy * w;
-        for (int x = 0; x < fw; x++) o[x] = r[xmap[x]];
-        prev = syy;
+static void* vs_scal(struct vscratch* v, size_t need) {
+    if (need > v->scal_cap) {
+        if (v->scal) MEDIA_FREE(v->scal);
+        v->scal = (uint8_t*)MEDIA_ALLOC(need);
+        v->scal_cap = v->scal ? need : 0;
     }
+    return v->scal;
+}
+
+static void vs_free(struct vscratch* v) {
+    if (v->cvt) MEDIA_FREE(v->cvt);
+    if (v->scal) MEDIA_FREE(v->scal);
+    memset(v, 0, sizeof *v);
+}
+
+// A decoded VP9 image as ARGB at ow x oh (`out` holds ow*oh pixels): colour conversion at the source size (SSE2), then a bilinear
+// scale when the sizes differ. Touches nothing but its arguments, so the decode worker can run it on another CPU. 0 = done.
+static int image_to_argb(const struct vp9_image* img, uint32_t* out, int ow, int oh, struct vscratch* vs) {
+    int cs = img->color_space;
+    int hd = cs == 2 || cs == 5 || (cs != 1 && cs != 3 && cs != 4 && img->height >= 720);
+    struct vcvt_cs mx;
+    vcvt_matrix(&mx, hd, img->full_range);
+    int w = img->width, h = img->height;
+    const uint16_t* pl[3] = { img->plane[0], img->plane[1], img->plane[2] };
+    int sh = img->bit_depth - 8;
+    if (ow == w && oh == h) {
+        vcvt_yuv_rows(out, (size_t)w, pl, img->stride, w, 0, h, img->subsampling_x, img->subsampling_y, sh, &mx);
+        return 0;
+    }
+    uint32_t* tmp = vs_cvt(vs, w, h);
+    void* sc = vs_scal(vs, vcvt_scale_scratch(w, ow));
+    if (!tmp || !sc) return -1;
+    vcvt_yuv_rows(tmp, (size_t)w, pl, img->stride, w, 0, h, img->subsampling_x, img->subsampling_y, sh, &mx);
+    vcvt_scale(out, ow, oh, tmp, w, h, sc);
+    return 0;
+}
+
+static int pic_to_argb(const struct h264_pic* pic, uint32_t* out, int ow, int oh, struct vscratch* vs) {
+    int cs = pic->color_space;      // matrix_coefficients: 1 BT.709, 5/6 BT.601, 9 BT.2020, 2 = not specified
+    int hd = cs == 1 || cs == 9 || ((cs != 5 && cs != 6 && cs != 7) && pic->height >= 720);
+    struct vcvt_cs mx;
+    vcvt_matrix(&mx, hd, pic->full_range);
+    int w = pic->width, h = pic->height;
+    const uint8_t* pl[3] = { pic->plane[0], pic->plane[1], pic->plane[2] };
+    if (ow == w && oh == h) {
+        vcvt_yuv8_rows(out, (size_t)w, pl, pic->stride, w, 0, h, 1, 1, &mx);
+        return 0;
+    }
+    uint32_t* tmp = vs_cvt(vs, w, h);
+    void* sc = vs_scal(vs, vcvt_scale_scratch(w, ow));
+    if (!tmp || !sc) return -1;
+    vcvt_yuv8_rows(tmp, (size_t)w, pl, pic->stride, w, 0, h, 1, 1, &mx);
+    vcvt_scale(out, ow, oh, tmp, w, h, sc);
+    return 0;
+}
+
+static int fb_ensure(struct meng* m, int ow, int oh) {
+    if (ow * oh > m->fb_cap) {
+        if (m->fb) MEDIA_FREE(m->fb);
+        m->fb = (uint32_t*)MEDIA_ALLOC((size_t)ow * oh * 4);
+        m->fb_cap = m->fb ? ow * oh : 0;
+    }
+    return m->fb != 0;
+}
+
+static void frame_publish(struct meng* m, uint32_t* px, int ow, int oh, int w, int h) {
+    m->frame.px = px;
+    m->frame.w = ow;
+    m->frame.h = oh;
+    m->frame.src_w = w;
+    m->frame.src_h = h;
+    m->frame.serial++;
+    m->frame_valid = 1;
 }
 
 static void convert_frame(struct meng* m, const struct vp9_image* img) {
     int ow = m->out_w ? m->out_w : img->width, oh = m->out_h ? m->out_h : img->height;
     if (ow < 2) ow = 2;
     if (oh < 2) oh = 2;
-    if (ow * oh > m->fb_cap) {
-        if (m->fb) MEDIA_FREE(m->fb);
-        m->fb = (uint32_t*)MEDIA_ALLOC((size_t)ow * oh * 4);
-        m->fb_cap = m->fb ? ow * oh : 0;
-        if (!m->fb) return;
-    }
-    int cs = img->color_space;
-    int full = img->full_range;
-    int hd = cs == 2 || cs == 5 || (cs != 1 && cs != 3 && cs != 4 && img->height >= 720);
-    int ky, rv, gu, gv, bu, yoff;
-    if (hd) {
-        if (full) { ky = 256; rv = 403; gu = 48; gv = 120; bu = 475; yoff = 0; }
-        else { ky = 298; rv = 459; gu = 55; gv = 136; bu = 541; yoff = 16; }
-    } else {
-        if (full) { ky = 256; rv = 359; gu = 88; gv = 183; bu = 454; yoff = 0; }
-        else { ky = 298; rv = 409; gu = 100; gv = 208; bu = 516; yoff = 16; }
-    }
-    int sh = img->bit_depth - 8;
-    int sx = img->subsampling_x, sy = img->subsampling_y;
-    int w = img->width, h = img->height;
-    if (ow * oh > 2 * w * h && ow <= 4096) {
-        uint32_t* tmp = cvt_scratch(m, w, h);
-        if (tmp) {
-            for (int y = 0; y < h; y++) {
-                const uint16_t* yr = img->plane[0] + (size_t)y * img->stride[0];
-                const uint16_t* ur = img->plane[1] + (size_t)(y >> sy) * img->stride[1];
-                const uint16_t* vr = img->plane[2] + (size_t)(y >> sy) * img->stride[2];
-                uint32_t* o = tmp + (size_t)y * w;
-                for (int x = 0; x < w; x++) {
-                    int yy = (yr[x] >> sh) - yoff, uu = (ur[x >> sx] >> sh) - 128, vv = (vr[x >> sx] >> sh) - 128;
-                    int base = ky * yy + 128;
-                    int r = (base + rv * vv) >> 8, g = (base - gu * uu - gv * vv) >> 8, b = (base + bu * uu) >> 8;
-                    o[x] = 0xFF000000u | (uint32_t)clamp8(r) << 16 | (uint32_t)clamp8(g) << 8 | clamp8(b);
-                }
-            }
-            stretch_rows(m->fb, ow, oh, tmp, w, h);
-            goto done;
-        }
-    }
-    static int xmap[4096];
-    int fw = ow > 4096 ? 4096 : ow;
-    for (int x = 0; x < fw; x++) xmap[x] = (int)(((int64_t)x * w) / ow);
-    for (int y = 0; y < oh; y++) {
-        int syy = (int)(((int64_t)y * h) / oh);
-        const uint16_t* yr = img->plane[0] + (size_t)syy * img->stride[0];
-        const uint16_t* ur = img->plane[1] + (size_t)(syy >> sy) * img->stride[1];
-        const uint16_t* vr = img->plane[2] + (size_t)(syy >> sy) * img->stride[2];
-        uint32_t* o = m->fb + (size_t)y * ow;
-        for (int x = 0; x < fw; x++) {
-            int sxx = xmap[x];
-            int yy = (yr[sxx] >> sh) - yoff;
-            int uu = (ur[sxx >> sx] >> sh) - 128;
-            int vv = (vr[sxx >> sx] >> sh) - 128;
-            int base = ky * yy + 128;
-            int r = (base + rv * vv) >> 8;
-            int g = (base - gu * uu - gv * vv) >> 8;
-            int b = (base + bu * uu) >> 8;
-            o[x] = 0xFF000000u | (uint32_t)clamp8(r) << 16 | (uint32_t)clamp8(g) << 8 | clamp8(b);
-        }
-    }
-done:
-    m->frame.px = m->fb;
-    m->frame.w = ow;
-    m->frame.h = oh;
-    m->frame.src_w = w;
-    m->frame.src_h = h;
-    m->frame.serial++;
-    m->frame_valid = 1;
+    if (!fb_ensure(m, ow, oh)) return;
+    if (image_to_argb(img, m->fb, ow, oh, &m->vs)) return;
+    frame_publish(m, m->fb, ow, oh, img->width, img->height);
 }
 
-// 8-bit 4:2:0 H.264 picture -> ARGB at the output size (same arithmetic as convert_frame)
+// 8-bit 4:2:0 H.264 picture -> ARGB at the output size
 static void convert_frame8(struct meng* m, const struct h264_pic* pic) {
     int ow = m->out_w ? m->out_w : pic->width, oh = m->out_h ? m->out_h : pic->height;
     if (ow < 2) ow = 2;
     if (oh < 2) oh = 2;
-    if (ow * oh > m->fb_cap) {
-        if (m->fb) MEDIA_FREE(m->fb);
-        m->fb = (uint32_t*)MEDIA_ALLOC((size_t)ow * oh * 4);
-        m->fb_cap = m->fb ? ow * oh : 0;
-        if (!m->fb) return;
-    }
-    int cs = pic->color_space;      // matrix_coefficients: 1 BT.709, 5/6 BT.601, 9 BT.2020, 2 = not specified
-    int full = pic->full_range;
-    int hd = cs == 1 || cs == 9 || ((cs != 5 && cs != 6 && cs != 7) && pic->height >= 720);
-    int ky, rv, gu, gv, bu, yoff;
-    if (hd) {
-        if (full) { ky = 256; rv = 403; gu = 48; gv = 120; bu = 475; yoff = 0; }
-        else { ky = 298; rv = 459; gu = 55; gv = 136; bu = 541; yoff = 16; }
-    } else {
-        if (full) { ky = 256; rv = 359; gu = 88; gv = 183; bu = 454; yoff = 0; }
-        else { ky = 298; rv = 409; gu = 100; gv = 208; bu = 516; yoff = 16; }
-    }
-    int w = pic->width, h = pic->height;
-    if (ow * oh > 2 * w * h && ow <= 4096) {
-        uint32_t* tmp = cvt_scratch(m, w, h);
-        if (tmp) {
-            for (int y = 0; y < h; y++) {
-                const uint8_t* yr = pic->plane[0] + (size_t)y * pic->stride[0];
-                const uint8_t* ur = pic->plane[1] + (size_t)(y >> 1) * pic->stride[1];
-                const uint8_t* vr = pic->plane[2] + (size_t)(y >> 1) * pic->stride[2];
-                uint32_t* o = tmp + (size_t)y * w;
-                for (int x = 0; x < w; x++) {
-                    int yy = yr[x] - yoff, uu = ur[x >> 1] - 128, vv = vr[x >> 1] - 128;
-                    int base = ky * yy + 128;
-                    int r = (base + rv * vv) >> 8, g = (base - gu * uu - gv * vv) >> 8, b = (base + bu * uu) >> 8;
-                    o[x] = 0xFF000000u | (uint32_t)clamp8(r) << 16 | (uint32_t)clamp8(g) << 8 | clamp8(b);
-                }
-            }
-            stretch_rows(m->fb, ow, oh, tmp, w, h);
-            goto done;
-        }
-    }
-    static int xmap[4096];
-    int fw = ow > 4096 ? 4096 : ow;
-    for (int x = 0; x < fw; x++) xmap[x] = (int)(((int64_t)x * w) / ow);
-    for (int y = 0; y < oh; y++) {
-        int syy = (int)(((int64_t)y * h) / oh);
-        const uint8_t* yr = pic->plane[0] + (size_t)syy * pic->stride[0];
-        const uint8_t* ur = pic->plane[1] + (size_t)(syy >> 1) * pic->stride[1];
-        const uint8_t* vr = pic->plane[2] + (size_t)(syy >> 1) * pic->stride[2];
-        uint32_t* o = m->fb + (size_t)y * ow;
-        for (int x = 0; x < fw; x++) {
-            int sxx = xmap[x];
-            int yy = yr[sxx] - yoff;
-            int uu = ur[sxx >> 1] - 128;
-            int vv = vr[sxx >> 1] - 128;
-            int base = ky * yy + 128;
-            int r = (base + rv * vv) >> 8;
-            int g = (base - gu * uu - gv * vv) >> 8;
-            int b = (base + bu * uu) >> 8;
-            o[x] = 0xFF000000u | (uint32_t)clamp8(r) << 16 | (uint32_t)clamp8(g) << 8 | clamp8(b);
-        }
-    }
-done:
-    m->frame.px = m->fb;
-    m->frame.w = ow;
-    m->frame.h = oh;
-    m->frame.src_w = w;
-    m->frame.src_h = h;
-    m->frame.serial++;
-    m->frame_valid = 1;
+    if (!fb_ensure(m, ow, oh)) return;
+    if (pic_to_argb(pic, m->fb, ow, oh, &m->vs)) return;
+    frame_publish(m, m->fb, ow, oh, pic->width, pic->height);
 }
 
 // H.264 delivers pictures in decoding order: they wait here until their presentation time (the container's pts).
@@ -1107,9 +1156,201 @@ static int video_decode_one_raw(struct meng* m) {
     return 1;
 }
 
+// ---- video decode worker ----
+
+static void vw_on_image(void* u, const struct vp9_image* img) {
+    struct vjob* j = (struct vjob*)u;
+    j->n_decoded++;
+    if (!j->pk[j->cur].convert) { j->n_dropped++; return; }
+    struct vslot* s = &j->slots[j->pk[j->cur].slot];
+    if (s->state != 1) { j->n_dropped++; return; }                    // a second picture from the same packet: the first stays
+    int ow = j->ow ? j->ow : img->width, oh = j->oh ? j->oh : img->height;
+    if (ow < 2) ow = 2;
+    if (oh < 2) oh = 2;
+    size_t need = (size_t)ow * (size_t)oh;
+    if (need > s->cap) {
+        uint32_t* p = (uint32_t*)MEDIA_ALLOC(need * 4);
+        if (!p) { j->n_dropped++; return; }
+        if (s->px) MEDIA_FREE(s->px);
+        s->px = p;
+        s->cap = need;
+    }
+    if (image_to_argb(img, s->px, ow, oh, &j->vs)) { j->n_dropped++; return; }
+    s->w = ow; s->h = oh; s->src_w = img->width; s->src_h = img->height;
+    s->pts = j->pk[j->cur].pts;
+    __sync_synchronize();
+    s->state = 2;
+}
+
+// the job: decode the packets in order (on an AP, interrupts off: no logging, no engine calls)
+static void vw_run(void* ctx, uint32_t item, uint32_t cpu) {
+    (void)item; (void)cpu;
+    struct vjob* j = (struct vjob*)ctx;
+    for (j->cur = 0; j->cur < j->n; j->cur++) {
+        uint32_t t0 = j->ticks();
+        int rc = vp9_decode(j->vd, j->data + j->pk[j->cur].off, j->pk[j->cur].len, vw_on_image, j);
+        j->dec_ticks += j->ticks() - t0;
+        if (rc < 0) j->error = 1;
+    }
+}
+
+static int vw_pending(const struct meng* m) {
+    if (m->vw.busy) return 1;
+    for (int i = 0; i < VW_RING; i++) if (m->vw.slot[i].state == 2) return 1;
+    return 0;
+}
+
+// the job is over: its counters become the engine's, slots it claimed but never filled (hidden frames) are free again
+static void vw_adopt(struct meng* m) {
+    struct vwork* w = &m->vw;
+    __sync_synchronize();
+    m->v_decoded += w->job.n_decoded;
+    m->v_dropped += w->job.n_dropped;
+    m->v_dec_ticks += w->job.dec_ticks;
+    m->v_dec_n += (uint32_t)w->job.n;
+    if (w->job.error) m->error = MENG_ERR_DECODE;
+    for (int i = 0; i < VW_RING; i++) if (w->slot[i].state == 1) w->slot[i].state = 0;
+    w->busy = 0;
+}
+
+// wait for the running job (seek, teardown, an inline decode)
+static void vw_sync(struct meng* m) {
+    struct vwork* w = &m->vw;
+    if (!w->busy) return;
+    uint32_t t0 = m->env.ticks();
+    while (!vh_done(&w->h)) {
+        __asm__ volatile("pause" ::: "memory");
+        if ((uint32_t)(m->env.ticks() - t0) > 500u) {                 // 5 s: the CPU running it is gone. Abandon its memory, never touch the decoder again
+            w->dead = 1;
+            w->busy = 0;
+            m->vw_on = 0;
+            m->vd = 0;
+            m->error = MENG_ERR_DECODE;
+            return;
+        }
+    }
+    vw_adopt(m);
+}
+
+static void vw_reset(struct meng* m) {                               // seek: forget every picture in flight
+    vw_sync(m);
+    for (int i = 0; i < VW_RING; i++) m->vw.slot[i].state = 0;
+}
+
+static void vw_free(struct meng* m) {
+    vw_sync(m);
+    struct vwork* w = &m->vw;
+    if (w->dead) return;
+    for (int i = 0; i < VW_RING; i++) if (w->slot[i].px) MEDIA_FREE(w->slot[i].px);
+    if (w->job.data) MEDIA_FREE(w->job.data);
+    vs_free(&w->job.vs);
+    memset(w, 0, sizeof *w);
+}
+
+// show the newest ready picture whose time has come (a copy into the stable frame buffer the page reads); older ones were never shown
+static void vw_present(struct meng* m, int64_t limit) {
+    struct vwork* w = &m->vw;
+    int best = -1;
+    for (int i = 0; i < VW_RING; i++)
+        if (w->slot[i].state == 2 && w->slot[i].pts <= limit && (best < 0 || w->slot[i].pts > w->slot[best].pts)) best = i;
+    if (best < 0) return;
+    struct vslot* b = &w->slot[best];
+    for (int i = 0; i < VW_RING; i++)
+        if (w->slot[i].state == 2 && w->slot[i].pts < b->pts) { w->slot[i].state = 0; m->v_dropped++; }
+    if (!fb_ensure(m, b->w, b->h)) { b->state = 0; return; }
+    memcpy(m->fb, b->px, (size_t)b->w * (size_t)b->h * 4);
+    frame_publish(m, m->fb, b->w, b->h, b->src_w, b->src_h);
+    b->state = 0;
+    m->v_shown++;
+    uint32_t t = m->env.ticks();
+    if (m->v_last_show && t - m->v_last_show > m->v_maxgap && t - m->v_last_show < 100000) m->v_maxgap = t - m->v_last_show;
+    m->v_last_show = t;
+}
+
+// hand the next few due packets to the worker
+static void vw_submit(struct meng* m, int64_t now) {
+    struct vwork* w = &m->vw;
+    if (w->busy || w->dead || !m->vd) return;
+    uint32_t sel[VW_BATCH];
+    int nsel = 0, nfree = 0;
+    for (int i = 0; i < VW_RING; i++) if (w->slot[i].state == 0) nfree++;
+    uint32_t k = vq_live(m, m->vq.next);
+    size_t total = 0;
+    const int64_t horizon = now + VIDEO_LEAD_NS + VW_AHEAD_NS;
+    while (k < m->vq.n && nsel < VW_BATCH && nsel < nfree) {
+        const struct mpkt* pk = &m->vq.pk[k];
+        if (vkey(m, pk) > horizon) break;
+        sel[nsel++] = k;
+        total += pk->len;
+        k = vq_live(m, k + 1);
+    }
+    if (!nsel) return;
+    struct vjob* j = &w->job;
+    if (total > j->dcap) {
+        uint8_t* p = (uint8_t*)MEDIA_ALLOC(total + 4096);
+        if (!p) return;
+        if (j->data) MEDIA_FREE(j->data);
+        j->data = p;
+        j->dcap = total + 4096;
+    }
+    size_t off = 0;
+    int si = 0;
+    for (int i = 0; i < nsel; i++) {
+        const struct mpkt* pk = &m->vq.pk[sel[i]];
+        memcpy(j->data + off, m->vq.arena + pk->off, pk->len);
+        j->pk[i].off = (uint32_t)off;
+        j->pk[i].len = pk->len;
+        j->pk[i].pts = pk->pts_ns;
+        // a picture is converted unless the next one is already due as well (it would never be seen) - but while the decoder is behind,
+        // still convert one every VW_MIN_SHOW_NS of media time, or nothing would ever reach the screen
+        uint32_t nx = i + 1 < nsel ? sel[i + 1] : k;
+        int superseded = nx < m->vq.n && vkey(m, &m->vq.pk[nx]) <= now + VIDEO_LEAD_NS;
+        j->pk[i].convert = !superseded || pk->pts_ns - w->last_conv_pts >= VW_MIN_SHOW_NS || pk->pts_ns < w->last_conv_pts;
+        if (j->pk[i].convert) w->last_conv_pts = pk->pts_ns;
+        while (w->slot[si].state != 0) si++;
+        j->pk[i].slot = (uint8_t)si;
+        w->slot[si].state = 1;
+        w->slot[si].pts = pk->pts_ns;
+        off += pk->len;
+    }
+    j->vd = m->vd;
+    j->ticks = m->env.ticks;
+    j->n = nsel;
+    j->cur = 0;
+    j->ow = m->out_w;
+    j->oh = m->out_h;
+    j->slots = w->slot;
+    j->dec_ticks = j->n_decoded = j->n_dropped = 0;
+    j->error = 0;
+    m->vq.next = k;
+    m->have_last_img = 0;                                            // the decoder's picture is about to change under it
+    w->busy = 1;
+    if (vh_start(&w->h, j) != 0) {                                   // could not hand it over: do it here
+        vw_run(j, 0, 0);
+        vw_adopt(m);
+    }
+}
+
+static void vw_pump(struct meng* m, int64_t now) {
+    struct vwork* w = &m->vw;
+    if (w->busy && vh_done(&w->h)) vw_adopt(m);
+    vw_present(m, now + VIDEO_LEAD_NS);
+    if (w->busy) return;
+    m->vq.next = vq_live(m, m->vq.next);
+    if (m->vq.next < m->vq.n && vkey(m, &m->vq.pk[m->vq.next]) + LATE_JUMP_NS < now) {
+        // more than a second behind: decoding every frame in between only falls further behind. Continue from the newest key
+        // frame that is already due (the pictures between are dropped)
+        uint32_t k = pq_find_key(&m->vq, now);
+        if (k < m->vq.n && k > m->vq.next) { m->v_dropped += k - m->vq.next; m->vq.next = k; }
+    }
+    vw_submit(m, now);
+}
+
 static void video_pump(struct meng* m, int64_t now) {
     uint32_t t0 = m->env.ticks();
+    if (m->vw_on && m->vcodec == VC_VP9 && m->vd && !m->seeking) { vw_pump(m, now); return; }
     if (m->seeking) {
+        vw_sync(m);                                          // the decoder is used here directly
         // decode from the keyframe up to the frame at the seek target; only the last of them is shown
         int first = 1, n = 0;
         int need_first = m->vcodec == VC_H264 && !m->have_cur_pic && !m->frame_valid;   // nothing shown yet: the decoder holds pictures back (reorder depth), so go on until one comes out
@@ -1175,6 +1416,7 @@ static void video_seek(struct meng* m, int64_t t) {
     if (!m->v_present) return;
     uint32_t k = pq_find_key(&m->vq, t);
     m->vq.next = k < m->vq.n ? k : m->vq.n;
+    vw_reset(m);
     if (m->vd) vp9_dec_reset(m->vd);
     if (m->hd) { h264_reset(m->hd); rq_clear(m); }
     m->seeking = 1;
@@ -1288,7 +1530,7 @@ void meng_poll(struct meng* m) {
         int past_dur = dur == dur && t >= (int64_t)(dur * 1e9);
         int drained = (!m->a_present || !m->env.audio_ready || !m->env.audio_ready() ||
                        (m->aq.next >= m->aq.n && !m->pend_len && m->env.audio_queued() == 0)) &&
-                      (!m->v_present || m->vq.next >= m->vq.n);
+                      (!m->v_present || (m->vq.next >= m->vq.n && !vw_pending(m)));
         if (m->eos && (past_data || past_dur) && drained) {
             m->pos_ns = t;
             clock_stop(m);
@@ -1324,6 +1566,8 @@ double meng_take_decode_ms(struct meng* m) {            // average ms per decode
     return r;
 }
 uint32_t meng_take_maxgap(struct meng* m) { uint32_t g = m->v_maxgap; m->v_maxgap = 0; return g; }
+int meng_have_worker(void) { return vw_wanted(); }
+int meng_relaxed(const struct meng* m) { return !m->v_present || (m->vw_on && m->vcodec == VC_VP9 && !m->seeking); }
 uint32_t meng_audio_frames(const struct meng* m) { return m->a_frames_out; }
 
 int meng_video_size(const struct meng* m, int* w, int* h) {
@@ -1341,6 +1585,11 @@ void meng_set_output_size(struct meng* m, int w, int h) {
     m->out_h = h;
     if (changed && m->vcodec == VC_H264 && m->have_cur_pic) convert_frame8(m, &m->cur_pic);
     else if (changed && m->have_last_img) convert_frame(m, &m->last_img);
+    else if (changed && m->vw_on && m->frame_valid && !m->playing && m->vcodec == VC_VP9 && m->v_present) {
+        // the worker owns the decoder's picture: a paused video gets its frame again at the new size by decoding up to it
+        vw_sync(m);
+        video_seek(m, m->pos_ns);
+    }
 }
 
 const struct meng_frame* meng_get_frame(const struct meng* m) { return m->frame_valid ? &m->frame : 0; }

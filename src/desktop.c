@@ -653,21 +653,105 @@ static void put_uint(char* buf, uint32_t val) {
     buf[i] = 0;
 }
 
+// ---- system information (shell `sysinfo` / `neofetch` and the System Info window) -------------------------------------
+// One text block built from live facts (CPU, memory, display backend, network, audio, uptime), shown in both places.
+
+struct sxb { char* p; int n, cap; };
+static void sx_s(struct sxb* b, const char* s) { while (*s && b->n < b->cap - 1) b->p[b->n++] = *s++; b->p[b->n] = 0; }
+static void sx_u(struct sxb* b, uint32_t v) { char t[16]; put_uint(t, v); sx_s(b, t); }
+static void sx_pad(struct sxb* b, const char* label) {         // "Label    " (9 columns)
+    int l = 0;
+    while (label[l]) l++;
+    sx_s(b, label);
+    for (; l < 9; l++) sx_s(b, " ");
+}
+
+// CPUID brand string (leaves 0x80000002-4), leading blanks removed; "" when the CPU has none
+static void sx_cpu_brand(char* out, int cap) {
+    uint32_t r[13];
+    uint32_t max;
+    out[0] = 0;
+    __asm__ volatile("cpuid" : "=a"(max) : "a"(0x80000000u) : "ebx", "ecx", "edx");
+    if (max < 0x80000004u) return;
+    for (uint32_t i = 0; i < 3; i++)
+        __asm__ volatile("cpuid" : "=a"(r[i * 4]), "=b"(r[i * 4 + 1]), "=c"(r[i * 4 + 2]), "=d"(r[i * 4 + 3]) : "a"(0x80000002u + i));
+    r[12] = 0;
+    const char* s = (const char*)r;
+    while (*s == ' ') s++;
+    int n = 0;
+    while (s[n] && n < cap - 1) { out[n] = s[n]; n++; }
+    while (n > 0 && out[n - 1] == ' ') n--;
+    out[n] = 0;
+}
+
+static void sysinfo_text(char* out, int cap) {
+    struct sxb b = { out, 0, cap };
+    out[0] = 0;
+    sx_s(&b, "KAnarchy OS - Okapi desktop\n");
+    sx_s(&b, "---------------------------\n");
+    sx_pad(&b, "OS");      sx_s(&b, "KAnarchy OS, build " __DATE__ " " __TIME__ "\n");
+    sx_pad(&b, "Kernel");  sx_s(&b, "okernel (32-bit x86, high-half, preemptive, SMP)\n");
+    char brand[56];
+    sx_cpu_brand(brand, sizeof brand);
+    sx_pad(&b, "CPU");
+    sx_s(&b, brand[0] ? brand : "unknown x86 CPU");
+    sx_s(&b, "\n");
+    sx_pad(&b, "");
+    uint32_t mhz = cpufreq_mhz();
+    if (mhz) { sx_u(&b, mhz); sx_s(&b, " MHz, "); }
+    sx_u(&b, (uint32_t)smp_ncpu());
+    sx_s(&b, smp_ncpu() == 1 ? " CPU, speed x" : " CPUs, speed x");
+    sx_u(&b, (uint32_t)cpufreq_slow_factor());
+    sx_s(&b, "\n");
+    sx_pad(&b, "Memory");
+    {
+        uint32_t ht, hu, hp, hl;
+        heap_stats(&ht, &hu, &hp, &hl);
+        sx_u(&b, pmm_get_total_pages() * 4 / 1024);
+        sx_s(&b, " MB RAM, heap ");
+        sx_u(&b, hu / (1024 * 1024));
+        sx_s(&b, " / ");
+        sx_u(&b, ht / (1024 * 1024));
+        sx_s(&b, " MB used (peak ");
+        sx_u(&b, hp / (1024 * 1024));
+        sx_s(&b, ")\n");
+    }
+    sx_pad(&b, "Display");
+    sx_u(&b, (uint32_t)gfx_w); sx_s(&b, "x"); sx_u(&b, (uint32_t)gfx_h);
+    sx_s(&b, ", "); sx_s(&b, graphics_display_name());
+    sx_s(&b, "\n");
+    sx_pad(&b, "Network");
+    if (rtw_net_up()) sx_s(&b, "Wi-Fi (Realtek RTL8821C)");
+    else if (e1000_present()) sx_s(&b, "Intel e1000 Ethernet");
+    else sx_s(&b, "none");
+    {
+        uint8_t* ip = net_get_ip();
+        if (ip[0] | ip[1] | ip[2] | ip[3]) {
+            sx_s(&b, ", ");
+            for (int i = 0; i < 4; i++) { if (i) sx_s(&b, "."); sx_u(&b, ip[i]); }
+        }
+    }
+    sx_s(&b, "\n");
+    sx_pad(&b, "Audio");   sx_s(&b, audio_ready() ? "Intel HD Audio, running\n" : "none\n");
+    sx_pad(&b, "Browser"); sx_s(&b, "okai (own HTML/CSS/ojs JavaScript engine, TLS 1.3, HTTP/2)\n");
+    sx_pad(&b, "Uptime");
+    {
+        uint32_t sec = tick_count / 100;
+        sx_u(&b, sec / 3600); sx_s(&b, "h ");
+        sx_u(&b, (sec % 3600) / 60); sx_s(&b, "m ");
+        sx_u(&b, sec % 60); sx_s(&b, "s\n");
+    }
+    sx_pad(&b, "Shell");   sx_s(&b, "Okapi terminal - type help for the commands\n");
+}
+
 static void open_sysinfo(void) {
     if (info_win >= 0) return; // Already open
-    info_win = window_create("System Info", 600, 80, 700, 500);
+    info_win = window_create("System Info", 520, 80, 940, 410);
     window_set_close_button(info_win, 1);
     window_set_minimize_button(info_win, 1);
-    window_puts(info_win, "KAnarchy OS v0.8\n");
-    window_puts(info_win, "Desktop Edition\n\n");
-    window_puts(info_win, "Resolution: 1920x1080\n");
-    window_puts(info_win, "Shell: kanarchy sh\n");
-    window_puts(info_win, "Commands: help, clear,\n");
-    window_puts(info_win, "echo, mem, uptime,\n");
-    window_puts(info_win, "about, neofetch,\n");
-    window_puts(info_win, "terminal, exit,\n");
-    window_puts(info_win, "sysinfo, reboot,\n");
-    window_puts(info_win, "shutdown\n");
+    static char text[1024];
+    sysinfo_text(text, sizeof text);
+    window_puts(info_win, text);
 }
 
 static void close_sysinfo(void) {
@@ -1121,22 +1205,13 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, " |_|\\_\\  /_/   \\_\\ |_| |_|  \\__,_|  |_|     \\___|  |_| |_|   \\__, |\n");
         window_puts(win_id, "                            |___/                            |___/\n\n");
         window_set_text_color(win_id, 15, 0); // White
-        window_puts(win_id, "KAnarchy OS v0.8 - Desktop Edition\n");
+        window_puts(win_id, "KAnarchy OS - Okapi desktop\n");
         window_puts(win_id, "Built from scratch in C and x86 assembly\n");
     }
     else if (str_eq(cmd_buf, "neofetch") || str_eq(cmd_buf, "sysinfo")) {
-        window_puts(win_id, "KAnarchy OS v0.8\n");
-        window_puts(win_id, "Kernel: okernel v0.8\n");
-        window_puts(win_id, "Resolution: 1920x1080 (2x scale)\n");
-        window_puts(win_id, "Shell: kanarchy sh\n");
-        window_puts(win_id, "Memory: ");
-        uint32_t total = pmm_get_total_pages() * 4 / 1024;
-        uint32_t used = pmm_get_used_pages() * 4 / 1024;
-        char buf[16];
-        put_uint(buf, used); window_puts(win_id, buf);
-        window_puts(win_id, "/");
-        put_uint(buf, total); window_puts(win_id, buf);
-        window_puts(win_id, "MB\n");
+        static char text[1024];
+        sysinfo_text(text, sizeof text);
+        window_puts(win_id, text);
         open_sysinfo();
     }
     else if (str_eq(cmd_buf, "terminal")) {

@@ -11,6 +11,7 @@ static const char UA_CSS[] =
 "head,link,meta,script,style,title,template,base,basefont,datalist,noembed,noframes,param,rp,"
 "area,[hidden],input[type=hidden],option,embed[hidden],source,track{display:none}"
 "dialog:not([open]){display:none}"
+"input[type=hidden i]{display:none!important}"
 "li{display:list-item}"
 "table{display:table}caption{display:table-caption}colgroup{display:table-column-group}"
 "col{display:table-column}thead{display:table-header-group}tbody{display:table-row-group}"

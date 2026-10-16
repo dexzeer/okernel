@@ -86,7 +86,8 @@ static int seq_lt(uint32_t a, uint32_t b) { return (int32_t)(a - b) < 0; }
 #define TCP_RX_CAP      (256 * 1024)   // receive ring
 #define TCP_REORDER_SLOTS 8
 #define TCP_REORDER_SEG 1500
-#define TCP_WIN_MAX     65535          // no window scaling: 16-bit window
+#define TCP_WIN_MAX     65535          // 16-bit window field
+#define TCP_RCV_SHIFT   2              // our scale: 65535 << 2 = 256KB = the receive ring (RFC 7323; one 64KB window caps a 40 ms path at 13 Mbit/s)
 
 struct tcp_sock {
     uint8_t used;
@@ -104,6 +105,7 @@ struct tcp_sock {
     uint32_t rtx_last_tick;
     // Peer window (caps our sends; 0 = persist probing)
     uint32_t peer_win, persist_since;
+    uint8_t ws_on, snd_shift;   // window scaling negotiated: we advertise ring_free >> TCP_RCV_SHIFT, the peer's windows are << snd_shift
     // Fast retransmit (pure duplicate ACKs only — see tcp_process_ack)
     uint32_t dup_acks, last_ack_num;
     // RTT estimation (Jacobson/Karels, ticks)
@@ -713,7 +715,8 @@ static struct tcp_sock* sock_get(int s) {
 // Free receive-ring space = the window we may advertise.
 static uint32_t tcp_rx_free(const struct tcp_sock* c) {
     uint32_t f = TCP_RX_CAP - c->rx_len;
-    return f > TCP_WIN_MAX ? TCP_WIN_MAX : f;
+    uint32_t max = c->ws_on ? ((uint32_t)TCP_WIN_MAX << TCP_RCV_SHIFT) : TCP_WIN_MAX;
+    return f > max ? max : f;
 }
 
 static int tcp_is_local(const uint8_t* ip) {
@@ -744,7 +747,7 @@ static void tcp_send_one(struct tcp_sock* c, uint32_t seq_num, uint32_t ack_num,
     struct eth_header* eth = (struct eth_header*)frame;
     build_eth_header(eth, target_mac, nic_mac(), 0x0800);
 
-    uint16_t tcp_hdr_len = (flags & 0x02) ? 24 : 20;
+    uint16_t tcp_hdr_len = (flags & 0x02) ? 28 : 20;
     struct ip_header* ip = (struct ip_header*)(frame + sizeof(struct eth_header));
     ip->version_ihl = 0x45;
     ip->tos = 0;
@@ -772,13 +775,17 @@ static void tcp_send_one(struct tcp_sock* c, uint32_t seq_num, uint32_t ack_num,
     // we can keep (the old fixed 32KB window over a ring that could fill
     // while the main loop rendered meant ACKed-then-dropped bytes).
     uint32_t win = tcp_rx_free(c);
-    c->adv_win = win;
-    tcp[14] = (uint8_t)(win >> 8); tcp[15] = (uint8_t)win;
+    uint32_t wire = (flags & 0x02) ? (win > TCP_WIN_MAX ? TCP_WIN_MAX : win)            // a SYN's window is never scaled
+                                   : (c->ws_on ? win >> TCP_RCV_SHIFT : win);
+    c->adv_win = c->ws_on && !(flags & 0x02) ? wire << TCP_RCV_SHIFT : wire;             // what the peer was really told
+    tcp[14] = (uint8_t)(wire >> 8); tcp[15] = (uint8_t)wire;
     tcp[16] = 0; tcp[17] = 0;
     tcp[18] = 0; tcp[19] = 0;
-    if (tcp_hdr_len == 24) {             // MSS option (SYN only)
+    if (tcp_hdr_len == 28) {             // MSS + window scale options (SYN only)
         tcp[20] = 2; tcp[21] = 4;
         tcp[22] = (uint8_t)(TCP_SEG_MAX >> 8); tcp[23] = (uint8_t)TCP_SEG_MAX;
+        tcp[24] = 1;                     // NOP
+        tcp[25] = 3; tcp[26] = 3; tcp[27] = TCP_RCV_SHIFT;
     }
     if (data_len) memcpy(tcp + tcp_hdr_len, data, data_len);
     uint16_t cksum = tcp_checksum(our_ip, c->dst_ip, tcp, tcp_hdr_len + data_len);
@@ -1127,7 +1134,7 @@ void tcp_handle_packet(uint8_t* src_ip, uint8_t* data, uint32_t len) {
     if (data_offset < 20 || data_offset > len) return;
     uint16_t payload_len = (uint16_t)(len - data_offset);
     const uint8_t* payload = data + data_offset;
-    c->peer_win = ((uint32_t)data[14] << 8) | data[15];
+    c->peer_win = (((uint32_t)data[14] << 8) | data[15]) << c->snd_shift;
     if (c->peer_win != 0) c->persist_since = 0;
     if (net_trace)
         serial_printf("[tcp] s%d flags=%x seq=%x ack=%x plen=%u state=%d\n", (int)(c - tcp_socks),
@@ -1146,6 +1153,17 @@ void tcp_handle_packet(uint8_t* src_ip, uint8_t* data, uint32_t len) {
     if (c->state == TCP_STATE_SYN_SENT) {
         if ((flags & 0x12) == 0x12 && ack_num == c->snd_una + 1) {   // SYN+ACK for our SYN
             c->ack = seq_num + 1;
+            for (uint32_t o = 20; o < data_offset;) {          // options: only window scale matters (the peer must offer it for us to use ours)
+                uint8_t kind = data[o];
+                if (kind == 0) break;
+                if (kind == 1) { o++; continue; }
+                if (o + 1 >= data_offset || data[o + 1] < 2) break;
+                if (kind == 3 && data[o + 1] == 3 && o + 2 < data_offset) {
+                    c->ws_on = 1;
+                    c->snd_shift = data[o + 2] > 14 ? 14 : data[o + 2];
+                }
+                o += data[o + 1];
+            }
             c->state = TCP_STATE_ESTABLISHED;
             tcp_process_ack(c, ack_num, 0);
             tcp_send_ctl(c, 0x10);

@@ -1,0 +1,20 @@
+<!doctype html><html><head><script src="dup_a.js"></script></head><body>
+<link id="pre" rel="stylesheet" href="dup_c.css">
+<script>
+var r = [];
+function done() {
+  r.push(window.__dupRuns === 2 ? 'PASS second script element executed too' : 'FAIL runs=' + window.__dupRuns);
+  console.log(r.join('\n')); console.log('RESULT ' + (r.join().indexOf('FAIL') < 0 ? 'ALLPASS' : 'FAILED'));
+}
+var loaded = 0, want = 3;
+function one(what) { r.push('PASS ' + what + ' load fired'); if (++loaded === want) done(); }
+var s = document.createElement('script'); s.src = 'dup_a.js'; s.addEventListener('load', function () { one('duplicate script'); });
+s.addEventListener('error', function () { r.push('FAIL duplicate script error'); loaded++; });
+document.head.appendChild(s);
+var l = document.createElement('link'); l.rel = 'stylesheet'; l.href = 'dup_c.css'; l.addEventListener('load', function () { one('dynamic link'); });
+l.addEventListener('error', function () { r.push('FAIL link error'); loaded++; });
+document.head.appendChild(l);
+var l2 = document.createElement('link'); l2.rel = 'stylesheet'; l2.href = 'dup_c.css?x=1'; l2.addEventListener('load', function () { one('dynamic link 2'); });
+document.head.appendChild(l2);
+setTimeout(function () { if (loaded < want) { r.push('FAIL timeout loaded=' + loaded); done(); } }, 5000);
+</script></body></html>

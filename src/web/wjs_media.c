@@ -323,6 +323,19 @@ int wjs_media_any(struct wjs* js) {
     return 0;
 }
 
+int wjs_media_worker(void) { return meng_have_worker(); }
+
+// Every session that is playing could do with a poll every few milliseconds instead of every main-loop pass (VP9 decoded on another CPU,
+// audio only): the loop may sleep in short timed waits.
+int wjs_media_relaxed(struct wjs* js) {
+    if (!js || js->dead || !js->media) return 0;
+    for (int i = 0; i < WM_MAX; i++) {
+        struct wmedia* s = &js->media[i];
+        if (s->m && ((!meng_paused(s->m) && meng_ready_state(s->m) >= MENG_FUTURE) || meng_seeking(s->m)) && !meng_relaxed(s->m)) return 0;
+    }
+    return !(js->canvas && wjs_canvas_pending(js));
+}
+
 // Does any session need the main loop to keep spinning?
 int wjs_media_active(struct wjs* js) {
     if (js && !js->dead && js->canvas && wjs_canvas_pending(js)) return 1;

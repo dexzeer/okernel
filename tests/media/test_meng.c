@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef MENG_PTHREAD
+#include <unistd.h>
+#endif
 #include "../../src/media/meng.h"
 
 static int failures;
@@ -70,6 +73,9 @@ static void step(struct meng* m) {
     tick++;
     dev_pos += 480;                      // 10 ms of playback
     meng_poll(m);
+#ifdef MENG_PTHREAD
+    usleep(3000);                        // the decode worker is a real thread here: give it real time to overlap with the next poll
+#endif
 }
 
 static void feed_all(struct meng* m, int sb, const uint8_t* d, long n, long chunk, int steps_between) {
@@ -281,8 +287,9 @@ static int frame_matches(const struct meng_frame* f, const uint8_t* yuv, int w, 
     return bad;
 }
 
-static void test_video(void) {
-    printf("video: playback, pause on a frame, seek, output size\n");
+static void test_video(int worker) {
+    printf("video: playback, pause on a frame, seek, output size (%s)\n", worker ? "decode worker" : "inline");
+    meng_set_async(worker);
     long n, yn;
     uint8_t* file = slurp("vp9_inter.webm", &n);
     uint8_t* yuv = slurp("vp9_inter.yuv", &yn);
@@ -324,9 +331,11 @@ static void test_video(void) {
           "ended at %f of %f", meng_current_time(m), meng_duration(m));
     // output size: nearest-neighbour scaling to half size
     meng_set_output_size(m, 160, 90);
+    for (int i = 0; i < 40; i++) step(m);                      // a paused worker-decoded video gets its frame again at the new size
     const struct meng_frame* f = meng_get_frame(m);
     CHECK(f && f->w == 160 && f->h == 90, "output size not applied");
     meng_free(m);
+    meng_set_async(-1);
     free(file);
     free(yuv);
 }
@@ -507,7 +516,8 @@ int main(int argc, char** argv) {
     test_pause_resume();
     test_underrun();
     test_seek_audio();
-    test_video();
+    test_video(0);
+    test_video(1);
     test_buffered_and_remove();
     test_mp4_video("meng_h264.mp4", "meng_h264.yuv", 6000, 0);
     test_mp4_video("meng_h264_frag.mp4", "meng_h264.yuv", 3333, 2);

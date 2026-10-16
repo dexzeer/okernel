@@ -19,10 +19,16 @@ param(
     [string]$AudioWav = "", # record what the guest plays (HD Audio) into this WAV
     [string[]]$Extra = @(),  # more QEMU arguments, e.g. -Extra "-icount","shift=0,sleep=off" (a guest of ~1 GIPS: a weak laptop)
     [int]$Slow = 1           # wait-time multiplier for slow guests (-icount)
+    ,[int]$Smp = 1             # guest CPUs (-smp N); the video decode worker needs at least 2
     ,[string]$PreCmd = ""      # typed into the terminal before okai starts, e.g. "cpu slow 6"
+    ,[string]$ShotAt = ""    # extra screendumps this many seconds after the navigation, e.g. "8 14 22" (needs -Shot: files <Shot>.<N>s.ppm)
+    ,[string]$ClickAt = ""   # a mouse click on screen: "X,Y@SEC" = click (X,Y) SEC seconds after the navigation (the pointer is first pushed into the top-left corner)
     ,[switch]$Prof            # turn the kernel profiler on (`prof on`): [prof] zone lines once a second
 )
 $ErrorActionPreference = "Stop"
+$ShotTimes = @($ShotAt -split '[ ,;]+' | Where-Object { $_ } | ForEach-Object { [double]$_ })
+$ClickX = 0; $ClickY = 0; $ClickT = -1
+if ($ClickAt -match '^(\d+),(\d+)@([\d.]+)$') { $ClickX = [int]$Matches[1]; $ClickY = [int]$Matches[2]; $ClickT = [double]$Matches[3] }
 $Urls = @($Urls | ForEach-Object { $_ -split "," } | Where-Object { $_ })
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $iso = if ($Iso) { $Iso } else { Join-Path $root "kanarchy-desktop.iso" }
@@ -35,6 +41,7 @@ $qargs = @("-accel", $Accel, "-m", "$Mem", "-cdrom", $iso, "-boot", "d", "-vga",
           "-device", "e1000,netdev=net0", "-netdev", "user,id=net0",
           "-serial", "file:$log", "-display", "none", "-no-reboot",
           "-monitor", "tcp:127.0.0.1:$Port,server,nowait")
+if ($Smp -gt 1) { $qargs += @("-smp", "$Smp") }
 if ($Extra) { $qargs += $Extra }
 if ($AudioWav) { $qargs += @("-audiodev", "wav,id=a0,path=$AudioWav", "-device", "intel-hda", "-device", "hda-output,audiodev=a0") }
 $p = Start-Process -FilePath $Qemu -ArgumentList $qargs -PassThru -WindowStyle Hidden
@@ -58,6 +65,24 @@ function Read-Log {
     # QEMU holds the file open for writing: read with shared access
     $fs = [System.IO.File]::Open($log, "Open", "Read", "ReadWrite")
     try { (New-Object System.IO.StreamReader($fs)).ReadToEnd() } finally { $fs.Close() }
+}
+function Take-Shot([string]$path) {
+    $c = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $Port)
+    $w = New-Object System.IO.StreamWriter($c.GetStream())
+    $w.Write("screendump $path`n"); $w.Flush(); Start-Sleep -Seconds 2; $c.Close()
+}
+function Hmp([string[]]$cmds) {
+    $c = New-Object System.Net.Sockets.TcpClient("127.0.0.1", $Port)
+    $w = New-Object System.IO.StreamWriter($c.GetStream())
+    foreach ($m in $cmds) { $w.Write("$m`n"); $w.Flush(); Start-Sleep -Milliseconds 25 }
+    Start-Sleep -Milliseconds 200; $c.Close()
+}
+function Click-Screen([int]$x, [int]$y) {
+    $cmds = @()
+    for ($i = 0; $i -lt 30; $i++) { $cmds += "mouse_move -100 -100" }     # corner (0,0)
+    $rx = $x; $ry = $y
+    while ($rx -gt 0 -or $ry -gt 0) { $dx = [Math]::Min(100, $rx); $dy = [Math]::Min(100, $ry); $cmds += "mouse_move $dx $dy"; $rx -= $dx; $ry -= $dy }
+    $cmds += "mouse_button 1"; Hmp $cmds; Start-Sleep -Milliseconds 150; Hmp @("mouse_button 0")
 }
 function Wait-For([string]$pat, [int]$sec) {
     $t = [DateTime]::Now
@@ -98,6 +123,11 @@ try {
                 if ($ln.Contains("[tls-net] queued") -or $ln.Contains("[http] sending")) { $fetches++ }
                 if ($act.IsMatch($ln)) { $last = $now }
             }
+            if ($nav -and $Shot -and $ShotTimes.Count -gt 0 -and ($now - $nav).TotalSeconds -ge $ShotTimes[0]) {
+                Take-Shot ("{0}.{1}s.ppm" -f [IO.Path]::ChangeExtension($Shot, $null).TrimEnd('.'), $ShotTimes[0])
+                $ShotTimes = @($ShotTimes | Select-Object -Skip 1)
+            }
+            if ($nav -and $ClickT -ge 0 -and ($now - $nav).TotalSeconds -ge $ClickT) { Click-Screen $ClickX $ClickY; $ClickT = -1; $last = [DateTime]::Now }
             if ($nav -and ($now - $last).TotalSeconds -gt $Settle) { break }
             Start-Sleep -Milliseconds 50
         }

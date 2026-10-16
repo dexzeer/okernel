@@ -3,6 +3,7 @@
 // run and the sample filters are applied in a loop.
 
 #include "vp9_int.h"
+#include "vp9_simd.h"
 
 static void loop_filter_frame_init(struct vp9_dec* d) {
     int n_shift = d->loop_filter_level >> 5;
@@ -32,7 +33,7 @@ static void loop_filter_frame_init(struct vp9_dec* d) {
 // sample filtering (8.8.5); `q` points at q0 and `step` is the distance between samples across the edge.
 // The thresholds are scaled to the bit depth once per edge run (lf_params), the function is inlined into one loop per filter
 // size (so the size tests fold away), and the wide filters use running sums instead of re-adding 15 taps per output.
-struct lf_params { int limit, blimit, thresh, one, lo, hi, off, sh, bd; };
+#define lf_params vp9_lf_p
 
 #define ABSD(a, b) ((a) > (b) ? (a) - (b) : (b) - (a))
 
@@ -90,7 +91,7 @@ static inline __attribute__((always_inline)) void sample_filter(pel* q, ptrdiff_
     }
 }
 
-static void superblock_filter(struct vp9_dec* d, int plane, int pass, int row, int col) {
+static void superblock_filter(struct vp9_dec* d, int plane, int pass, int row, int col, int simd) {
     struct vp9_buf* b = d->cur;
     int sub_x = plane ? d->subsampling_x : 0, sub_y = plane ? d->subsampling_y : 0;
     int dx = pass == 0;
@@ -164,8 +165,9 @@ static void superblock_filter(struct vp9_dec* d, int plane, int pass, int row, i
             pel* p = base + (ptrdiff_t)(y >> sub_y) * stride + (x >> sub_x);
             int bsh = d->bit_depth - 8;
             struct lf_params P = { limit << bsh, blimit << bsh, thresh << bsh, 1 << bsh, -(1 << (d->bit_depth - 1)),
-                                   (1 << (d->bit_depth - 1)) - 1, 0x80 << bsh, bsh, d->bit_depth };
-            if (fsize == TX_4X4) { for (int k = 0; k < count; k++) sample_filter(p + k * along, step, TX_4X4, &P); }
+                                   (1 << (d->bit_depth - 1)) - 1, 0x80 << bsh };
+            if (count == 8 && simd) vp9_simd_lf_run(p, step, along, fsize, &P);          // eight lines at once (the frame edge leaves shorter runs to the scalar loops)
+            else if (fsize == TX_4X4) { for (int k = 0; k < count; k++) sample_filter(p + k * along, step, TX_4X4, &P); }
             else if (fsize == TX_8X8) { for (int k = 0; k < count; k++) sample_filter(p + k * along, step, TX_8X8, &P); }
             else { for (int k = 0; k < count; k++) sample_filter(p + k * along, step, TX_16X16, &P); }
         }
@@ -174,8 +176,9 @@ static void superblock_filter(struct vp9_dec* d, int plane, int pass, int row, i
 
 void vp9_loop_filter_frame(struct vp9_dec* d) {
     loop_filter_frame_init(d);
+    int simd = vp9_simd_ok();
     for (int row = 0; row < d->mi_rows; row += 8)
         for (int col = 0; col < d->mi_cols; col += 8)
             for (int plane = 0; plane < 3; plane++)
-                for (int pass = 0; pass < 2; pass++) superblock_filter(d, plane, pass, row, col);
+                for (int pass = 0; pass < 2; pass++) superblock_filter(d, plane, pass, row, col, simd);
 }
