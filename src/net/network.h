@@ -94,6 +94,9 @@ int arp_resolve(uint8_t* ip, uint8_t* mac);
 int dns_lookup(const char* host, uint32_t* ip);
 // Shell `resolve`: look up and post "Resolved: a.b.c.d" as a net event.
 int dns_resolve(const char* hostname);
+// DNS over HTTPS (on by default; plain UDP DNS is the fallback). Shell `doh [on|off]`.
+void dns_doh_set(int on);
+int  dns_doh_status(char* out, int max);   // text; returns the number of answers received over DoH so far
 int net_parse_ip(const char* s, uint32_t* out); // "a.b.c.d" -> host-order IP (0 = fail)
 
 // ---- TCP sockets ----

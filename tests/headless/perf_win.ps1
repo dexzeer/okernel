@@ -18,6 +18,7 @@ param(
     [string]$Shot = "",    # screendump (PPM) of the last page once it settled
     [string]$AudioWav = "", # record what the guest plays (HD Audio) into this WAV
     [string[]]$Extra = @(),  # more QEMU arguments, e.g. -Extra "-icount","shift=0,sleep=off" (a guest of ~1 GIPS: a weak laptop)
+    [string]$NetDev = "user,id=net0",   # QEMU -netdev argument (e.g. "user,id=net0,restrict=on": no Internet)
     [int]$Slow = 1           # wait-time multiplier for slow guests (-icount)
     ,[int]$Smp = 1             # guest CPUs (-smp N); the video decode worker needs at least 2
     ,[string]$PreCmd = ""      # typed into the terminal before okai starts, e.g. "cpu slow 6"
@@ -41,7 +42,7 @@ $log = Join-Path $out ("perf_{0}_{1}.log" -f $Accel, $Port)
 Remove-Item $log -ErrorAction SilentlyContinue
 
 $qargs = @("-accel", $Accel, "-m", "$Mem", "-cdrom", $iso, "-boot", "d", "-vga", "std",
-          "-device", "e1000,netdev=net0", "-netdev", "user,id=net0",
+          "-device", "e1000,netdev=net0", "-netdev", $NetDev,
           "-serial", "file:$log", "-display", $Display, "-no-reboot",
           "-monitor", "tcp:127.0.0.1:$Port,server,nowait")
 if ($Smp -gt 1) { $qargs += @("-smp", "$Smp") }
