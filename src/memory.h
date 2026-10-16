@@ -22,5 +22,6 @@ void* krealloc(void* ptr, uint32_t size);
 void kfree(void* ptr);
 uint32_t ksize(void* ptr);   // usable bytes of a live block (0 if invalid)
 void heap_stats(uint32_t* total, uint32_t* used, uint32_t* peak, uint32_t* largest_free);
+int  heap_pretouch(uint32_t budget_cycles);   // idle loop: back the heap pages with RAM ahead of the allocator (see memory.c); 1 = more to do
 
 #endif

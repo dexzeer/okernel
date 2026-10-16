@@ -373,8 +373,14 @@ static void trace(ojs* J, struct gch* g) {
 
 static void drain(ojs* J) {
     struct gc_heap* H = J->heap;
+    uint32_t traced = 0;
     for (;;) {
-        while (H->msp > 0) trace(J, (struct gch*)H->mstack[--H->msp]);
+        while (H->msp > 0) {
+            trace(J, (struct gch*)H->mstack[--H->msp]);
+            // marking a heap of 100+ MB takes 100-300 ms: let the host keep its sound card and video going (its answer is ignored:
+            // a script past its deadline is stopped by the next check of the interpreter)
+            if (!(++traced & 8191) && J->interrupt) (void)J->interrupt(J, J->interrupt_op);
+        }
         if (!H->mark_overflow) break;
         // the mark stack overflowed: rescan the heap for marked objects
         // and retrace them (their children may have been dropped)

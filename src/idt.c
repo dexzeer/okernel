@@ -399,6 +399,11 @@ void isr_handler(int int_num) {
     while (1) { __asm__ volatile("hlt"); }
 }
 
+// Stall sampler (prof.c, desktop build only; weak so the text build links without it)
+extern volatile int prof_on __attribute__((weak));
+void stall_sample(uint32_t eip, uint32_t cs, uint32_t esp) __attribute__((weak));
+extern volatile uint32_t irq_last_eip, irq_last_cs, irq_last_esp;      // saved by the IRQ stub (isr.asm)
+
 // Called from IRQ stubs
 void irq_handler(int irq) {
     // Canary: the stub clears DF (cld) before calling C. A set DF here means
@@ -417,6 +422,7 @@ void irq_handler(int irq) {
     int irq_num = irq - 32;
     if (irq_num >= 8) outb(0xA0, 0x20);
     outb(0x20, 0x20);
+    if (irq_num == 0 && &prof_on && prof_on && stall_sample) stall_sample(irq_last_eip, irq_last_cs & 0xFFFF, irq_last_esp);   // frame: arg, ds, pusha x8, int no, err, EIP, CS
     if (irq_num >= 0 && irq_num < 16 && irq_handlers[irq_num]) {
         irq_handlers[irq_num]();
     }

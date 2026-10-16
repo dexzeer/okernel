@@ -30,4 +30,13 @@ static inline uint64_t prof_tsc(void) {
 // Log and reset (called once a second by the main loop).
 void prof_report(void);
 
+// Stall sampler (with `prof on`): the main loop and the media service stamp `stall_beat` (tick_count) whenever they run; the timer
+// IRQ, finding the stamp older than 100 ms while the loop is not halted, records the interrupted EIP. The loop prints the histogram
+// when it comes back: `[stall] N samples: eip xCount ...` (resolve the addresses with `nm -n kanarchy-desktop.bin`: where the time goes
+// when a pass takes longer than it should).
+extern volatile uint32_t stall_beat;
+extern volatile int stall_halted;
+void stall_sample(uint32_t eip, uint32_t cs, uint32_t esp);
+void stall_report(void);
+
 #endif
