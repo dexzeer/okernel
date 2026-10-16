@@ -2,7 +2,7 @@
 
 #define Q16 65536u
 #define WINDOW_MS 3000u            // length of one measurement window
-#define DEAD_BAND (Q16 * 15u / 1000u)   // within 1.5% of nominal: leave the card alone
+#define DEAD_BAND (Q16 * 5u / 100u)    // within 5% of nominal: leave the card alone (a busy host makes the backend jitter by a few %; the clock follows the card anyway, a 3% speed error is inaudible)
 #define AGREE (Q16 / 100u)         // two windows must agree within 1%
 
 static uint32_t absdiff(uint32_t a, uint32_t b) { return a > b ? a - b : b - a; }

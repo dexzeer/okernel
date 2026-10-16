@@ -42,6 +42,12 @@ int main(void) {
     arate_init(&a);
     run_card(&a, 0.988, 30, &step, &act);
     CHECK(!arate_active(&a), "1.2%% slow made active");
+    arate_init(&a);
+    run_card(&a, 1.03, 30, &step, &act);
+    CHECK(!arate_active(&a), "3%% fast made active");
+    arate_init(&a);
+    run_card(&a, 1.08, 30, &step, &act);
+    CHECK(arate_active(&a) && fabs(a.rate_q16 / 65536.0 - 1.08) < 0.005, "8%% fast not corrected (%.4f)", a.rate_q16 / 65536.0);
 
     // 2. a fast card (the 1.18 seen on the user's machine) is found within two windows and the clock never jumps
     arate_init(&a);

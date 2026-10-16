@@ -9,10 +9,10 @@
 // 1.18x the kernel's clock on a Windows host (QEMU's audio backend, host timer granularity). Everything above the driver (the media
 // engine) assumes 48 kHz and slaves the video to the card's position, so a card that really consumes frames faster plays everything
 // too fast. The driver therefore compares the card's position with the CPU's cycle counter (real time) over windows of a few seconds;
-// when two consecutive windows agree that the card runs more than 1.5% off nominal it
+// when two consecutive windows agree that the card runs more than 5% off nominal it
 //   - resamples what is written (linear interpolation) by that factor, so the sound has the right pitch and speed again, and
 //   - reports positions in NOMINAL frames (device frames / factor, integrated so a change of the factor never makes the clock jump),
-// which makes the card look like a perfect 48 kHz one to its users. A card within 1.5% is passed through untouched.
+// which makes the card look like a perfect 48 kHz one to its users. A card within 5% is passed through untouched.
 
 struct arate {
     uint32_t rate_q16;        // device frames consumed per nominal frame (65536 = exact)
