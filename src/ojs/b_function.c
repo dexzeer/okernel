@@ -113,7 +113,7 @@ jv list_from_array_like(ojs* J, jv v) {
         int holes = 0;
         for (uint32_t i = 0; i < (uint32_t)n; i++) if (o->elems[i] == JV_HOLE) { holes = 1; break; }
         if (!holes) {
-            memcpy(a->elems, o->elems, (size_t)n * sizeof(jv));
+            if (n) memcpy(a->elems, o->elems, (size_t)n * sizeof(jv));
             a->elen = a->alen = (uint32_t)n;
             return jv_from_obj(a);
         }

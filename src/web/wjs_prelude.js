@@ -5815,6 +5815,314 @@ class WakeLockSentinel extends EventTarget {
 for (const C of [Cache, CacheStorage, WakeLockSentinel]) Object.defineProperty(G, C.name, { value: C, writable: true, configurable: true, enumerable: false });
 Object.defineProperty(G, 'caches', { value: Object.create(CacheStorage.prototype), writable: true, configurable: true, enumerable: true });
 
+// ---------------------------------------------------------------- WebAssembly (core in wasm.c, natives in wjs_wasm.c)
+// MVP + sign-extension, saturating float-to-int, multi-value, bulk memory, reference types. No SIMD, threads, exceptions,
+// tail calls, memory64 or GC: such modules fail to compile with a CompileError, as in an older browser.
+const WA_KIND_NAMES = ['function', 'table', 'memory', 'global'];
+class WACompileError extends Error { constructor(m) { super(m); Object.defineProperty(this, 'name', { value: 'CompileError', configurable: true, writable: true }); } }
+class WALinkError extends Error { constructor(m) { super(m); Object.defineProperty(this, 'name', { value: 'LinkError', configurable: true, writable: true }); } }
+class WARuntimeError extends Error { constructor(m) { super(m); Object.defineProperty(this, 'name', { value: 'RuntimeError', configurable: true, writable: true }); } }
+const waBytes = (src, what) => {
+    let u8;
+    if (src instanceof ArrayBuffer) u8 = new Uint8Array(src);
+    else if (ArrayBuffer.isView(src)) u8 = new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
+    else throw new TypeError(what + ': Argument 0 must be a buffer source');
+    return u8.slice().buffer;
+};
+const EXTERNS = [null];               // externref values by handle (never released: references are small and pages short-lived)
+const EXTERN_IDS = new Map();
+const waExtern = v => { if (v === null) return 0; if (EXTERN_IDS.has(v)) return EXTERN_IDS.get(v); EXTERNS.push(v); if (typeof v !== 'object' && typeof v !== 'function') EXTERN_IDS.set(v, EXTERNS.length - 1); return EXTERNS.length - 1; };
+const FN_OF = new WeakMap();          // exported wasm function -> fn id
+const FN_OBJ = new Map();             // fn id -> exported function object
+const HOSTS = [];                     // host function table of the interpreter: { fn, params, results }
+function waToBigInt(v) {
+    if (typeof v === 'bigint') return v;
+    if (typeof v === 'boolean') return v ? 1n : 0n;
+    if (typeof v === 'string') { try { return BigInt(v); } catch (e) { throw new SyntaxError("Cannot convert " + v + " to a BigInt"); } }
+    throw new TypeError('Cannot convert ' + String(v) + ' to a BigInt');
+}
+// ToWebAssemblyValue: write one JS value into slot i of a DataView
+function waPut(dv, i, ch, v) {
+    const o = i * 8;
+    switch (ch) {
+    case 'i': dv.setInt32(o, v | 0, true); break;
+    case 'I': dv.setBigInt64(o, BigInt.asIntN(64, waToBigInt(v)), true); break;
+    case 'f': dv.setFloat32(o, +v, true); break;
+    case 'F': dv.setFloat64(o, +v, true); break;
+    case 'r': {
+        if (v === null) { dv.setUint32(o, 0, true); break; }
+        const id = typeof v === 'function' ? FN_OF.get(v) : undefined;
+        if (id === undefined) throw new TypeError('WebAssembly: function-typed values must be null or an exported WebAssembly function');
+        dv.setUint32(o, id, true);
+        break;
+    }
+    default: dv.setUint32(o, waExtern(v), true);
+    }
+}
+function waGet(dv, i, ch) {
+    const o = i * 8;
+    switch (ch) {
+    case 'i': return dv.getInt32(o, true);
+    case 'I': return dv.getBigInt64(o, true);
+    case 'f': return dv.getFloat32(o, true);
+    case 'F': return dv.getFloat64(o, true);
+    case 'r': { const id = dv.getUint32(o, true); return id ? wrapWasmFn(id) : null; }
+    default: { const h = dv.getUint32(o, true); return EXTERNS[h]; }
+    }
+}
+function wrapWasmFn(id, nameIdx) {
+    let f = FN_OBJ.get(id);
+    if (f) return f;
+    const sig = W.wasmFnSig(id), gt = sig.indexOf('>');
+    const params = sig.slice(0, gt), results = sig.slice(gt + 1);
+    f = function (...args) {
+        const buf = new ArrayBuffer(Math.max(8, params.length * 8)), dv = new DataView(buf);
+        for (let i = 0; i < params.length; i++) waPut(dv, i, params[i], args[i]);
+        const r = W.wasmCall(id, buf);
+        if (typeof r === 'string') { if (r === 'call stack exhausted') throw new RangeError('Maximum call stack size exceeded'); throw new WARuntimeError(r); }
+        if (!results.length) return undefined;
+        const rv = new DataView(r);
+        if (results.length === 1) return waGet(rv, 0, results[0]);
+        const out = [];
+        for (let i = 0; i < results.length; i++) out.push(waGet(rv, i, results[i]));
+        return out;
+    };
+    Object.defineProperty(f, 'name', { value: String(nameIdx === undefined ? id : nameIdx), configurable: true });
+    Object.defineProperty(f, 'length', { value: params.length, configurable: true });
+    FN_OF.set(f, id);
+    FN_OBJ.set(id, f);
+    return f;
+}
+let waHostSet = false;
+const waHost = (hostId, argBuf) => {
+    const h = HOSTS[hostId];
+    const dv = new DataView(argBuf);
+    const args = [];
+    for (let i = 0; i < h.params.length; i++) args.push(waGet(dv, i, h.params[i]));
+    const r = h.fn(...args);
+    const n = h.results.length;
+    if (!n) return undefined;
+    const buf = new ArrayBuffer(n * 8), out = new DataView(buf);
+    if (n === 1) waPut(out, 0, h.results[0], r);
+    else {
+        if (r === null || r === undefined || typeof r[Symbol.iterator] !== 'function') throw new TypeError('multi-value host function must return an iterable');
+        const vals = Array.from(r);
+        if (vals.length !== n) throw new TypeError('multi-value host function returned ' + vals.length + ' values, expected ' + n);
+        for (let i = 0; i < n; i++) waPut(out, i, h.results[i], vals[i]);
+    }
+    return buf;
+};
+function waEnsure() { if (!waHostSet) { waHostSet = true; W.wasmSetHost(waHost); } }
+const waU32 = (v, what) => { const n = Number(v); if (!Number.isFinite(n) || n < 0 || n > 4294967295) throw new TypeError(what + ': value ' + String(v) + ' is out of range for an unsigned 32-bit integer'); return Math.trunc(n); };
+const WA_TOKEN = {};
+const MEM_OBJ = new Map(), TAB_OBJ = new Map(), GLOB_OBJ = new Map();
+class WAMemory {
+    constructor(desc, tok) {
+        if (tok === WA_TOKEN) { hidden(this, '_id', desc); return; }
+        if (desc === null || typeof desc !== 'object') throw new TypeError("WebAssembly.Memory(): Argument 0 must be a memory descriptor");
+        const init = desc.initial !== undefined ? desc.initial : desc.minimum;
+        if (init === undefined) throw new TypeError("WebAssembly.Memory(): Property 'initial' is required");
+        const max = desc.maximum === undefined ? -1 : +desc.maximum;
+        if (!(+init >= 0) || +init > 65536 || (max >= 0 && (max < +init || max > 65536))) throw new RangeError("WebAssembly.Memory(): Property 'initial': value " + init + " is above the upper bound 65536");
+        waEnsure();
+        const id = W.wasmMemNew(+init >>> 0, max);
+        if (!id) throw new RangeError('WebAssembly.Memory(): could not allocate memory');
+        hidden(this, '_id', id);
+        MEM_OBJ.set(id, this);
+    }
+    get buffer() { return W.wasmMemBuf(this._id); }
+    grow(delta) {
+        const r = W.wasmMemGrow(this._id, waU32(delta, 'WebAssembly.Memory.grow()'));
+        if (r < 0) throw new RangeError('WebAssembly.Memory.grow(): Maximum memory size exceeded');
+        return r;
+    }
+}
+const memObj = id => { let m = MEM_OBJ.get(id); if (!m) { m = new WAMemory(id, WA_TOKEN); MEM_OBJ.set(id, m); } return m; };
+const waRefChar = e => e === 'anyfunc' || e === 'funcref' ? 'r' : e === 'externref' ? 'e' : null;
+class WATable {
+    constructor(desc, init, tok) {
+        if (tok === WA_TOKEN) { hidden(this, '_id', desc); return; }
+        if (desc === null || typeof desc !== 'object') throw new TypeError("WebAssembly.Table(): Argument 0 must be a table descriptor");
+        const ch = waRefChar(desc.element);
+        if (!ch) throw new TypeError("WebAssembly.Table(): Descriptor property 'element' must be 'anyfunc' or 'externref'");
+        const initial = desc.initial !== undefined ? desc.initial : desc.minimum;
+        if (initial === undefined) throw new TypeError("WebAssembly.Table(): Property 'initial' is required");
+        const max = desc.maximum === undefined ? -1 : +desc.maximum;
+        if (!(+initial >= 0) || +initial > 10000000 || (max >= 0 && max < +initial)) throw new RangeError("WebAssembly.Table(): Property 'initial' is out of range");
+        let v = 0;
+        if (init !== undefined) { const b = new ArrayBuffer(8), dv = new DataView(b); waPut(dv, 0, ch, init); v = dv.getUint32(0, true); }
+        else if (ch === 'e') v = waExtern(undefined);
+        waEnsure();
+        const id = W.wasmTabNew(ch, +initial >>> 0, max, v);
+        if (!id) throw new RangeError('WebAssembly.Table(): could not allocate the table');
+        hidden(this, '_id', id);
+        TAB_OBJ.set(id, this);
+    }
+    get length() { return W.wasmTabLen(this._id); }
+    get(i) {
+        const info = W.wasmTabInfo(this._id), v = W.wasmTabGet(this._id, waU32(i, 'WebAssembly.Table.get()'));
+        if (v < 0) throw new RangeError('WebAssembly.Table.get(): invalid address ' + i + ' in ' + (info[0] === 'r' ? 'funcref' : 'externref') + ' table of size ' + info[1]);
+        return info[0] === 'r' ? (v ? wrapWasmFn(v) : null) : EXTERNS[v];
+    }
+    set(i, v) {
+        i = waU32(i, 'WebAssembly.Table.set()');
+        const info = W.wasmTabInfo(this._id);
+        let slot = 0;
+        if (arguments.length < 2 && info[0] === 'e') v = undefined;
+        if (!(info[0] === 'r' && (v === null || v === undefined))) { const b = new ArrayBuffer(8), dv = new DataView(b); waPut(dv, 0, info[0], v === undefined && info[0] === 'r' ? null : v); slot = dv.getUint32(0, true); }
+        if (!W.wasmTabSet(this._id, waU32(i, 'WebAssembly.Table.set()'), slot)) throw new RangeError('WebAssembly.Table.set(): invalid address ' + i + ' in table of size ' + info[1]);
+    }
+    grow(delta, init) {
+        const info = W.wasmTabInfo(this._id);
+        let slot = 0;
+        if (init !== undefined) { const b = new ArrayBuffer(8), dv = new DataView(b); waPut(dv, 0, info[0], init); slot = dv.getUint32(0, true); }
+        const r = W.wasmTabGrow(this._id, waU32(delta, 'WebAssembly.Table.grow()'), slot);
+        if (r < 0) throw new RangeError('WebAssembly.Table.grow(): failed to grow table by ' + delta);
+        return r;
+    }
+}
+const tabObj = id => { let t = TAB_OBJ.get(id); if (!t) { t = new WATable(id, undefined, WA_TOKEN); TAB_OBJ.set(id, t); } return t; };
+const WA_TYPES = { i32: 'i', i64: 'I', f32: 'f', f64: 'F', anyfunc: 'r', funcref: 'r', externref: 'e' };
+const WA_TYPE_NAMES = { i: 'i32', I: 'i64', f: 'f32', F: 'f64', r: 'anyfunc', e: 'externref' };
+class WAGlobal {
+    constructor(desc, v, tok) {
+        if (tok === WA_TOKEN) { hidden(this, '_id', desc); return; }
+        if (desc === null || typeof desc !== 'object') throw new TypeError("WebAssembly.Global(): Argument 0 must be a global descriptor");
+        const ch = WA_TYPES[desc.value];
+        if (!ch) throw new TypeError("WebAssembly.Global(): Descriptor property 'value' must be a WebAssembly type");
+        const buf = new ArrayBuffer(8), dv = new DataView(buf);
+        if (v === undefined) { if (ch === 'e') waPut(dv, 0, 'e', undefined); else if (ch === 'I') dv.setBigInt64(0, 0n, true); else waPut(dv, 0, ch, ch === 'r' ? null : 0); }
+        else waPut(dv, 0, ch, v);
+        waEnsure();
+        const id = W.wasmGlobNew(ch, !!desc.mutable, buf);
+        if (!id) throw new RangeError('WebAssembly.Global(): could not allocate the global');
+        hidden(this, '_id', id);
+        GLOB_OBJ.set(id, this);
+    }
+    get value() { const info = W.wasmGlobInfo(this._id); return waGet(new DataView(W.wasmGlobGet(this._id)), 0, info[0]); }
+    set value(v) {
+        const info = W.wasmGlobInfo(this._id);
+        if (!info[1]) throw new TypeError("WebAssembly.Global.value: Can't set the value of an immutable global.");
+        const b = new ArrayBuffer(8);
+        waPut(new DataView(b), 0, info[0], v);
+        W.wasmGlobSet(this._id, b);
+    }
+    valueOf() { return this.value; }
+}
+const globObj = id => { let g = GLOB_OBJ.get(id); if (!g) { g = new WAGlobal(id, undefined, WA_TOKEN); GLOB_OBJ.set(id, g); } return g; };
+for (const [C, n] of [[WAMemory, 'WebAssembly.Memory'], [WATable, 'WebAssembly.Table'], [WAGlobal, 'WebAssembly.Global']])
+    Object.defineProperty(C.prototype, Symbol.toStringTag, { value: n, configurable: true });
+class WAModule {
+    constructor(bytes) {
+        if (arguments.length === 0) throw new TypeError('WebAssembly.Module(): Argument 0 must be a buffer source');
+        waEnsure();
+        const r = W.wasmModule(waBytes(bytes, 'WebAssembly.Module()'));
+        if (typeof r === 'string') throw new WACompileError('WebAssembly.Module(): ' + r);
+        hidden(this, '_id', r);
+    }
+    static exports(m) { if (!(m instanceof WAModule)) throw new TypeError('WebAssembly.Module.exports(): Argument 0 must be a WebAssembly.Module'); return W.wasmExports(m._id).map(e => ({ name: e[0], kind: WA_KIND_NAMES[e[1]] })); }
+    static imports(m) { if (!(m instanceof WAModule)) throw new TypeError('WebAssembly.Module.imports(): Argument 0 must be a WebAssembly.Module'); return W.wasmImports(m._id).map(e => ({ module: e[0], name: e[1], kind: WA_KIND_NAMES[e[2]] })); }
+    static customSections(m, name) { if (!(m instanceof WAModule)) throw new TypeError('WebAssembly.Module.customSections(): Argument 0 must be a WebAssembly.Module'); if (name === undefined) throw new TypeError('WebAssembly.Module.customSections(): Argument 1 is required'); return W.wasmCustom(m._id, String(name)); }
+}
+Object.defineProperty(WAModule.prototype, Symbol.toStringTag, { value: 'WebAssembly.Module', configurable: true });
+function waInstantiate(mod, importObject, ctx) {
+    const imps = W.wasmImports(mod._id), ids = [];
+    if (imps.length && (importObject === undefined || importObject === null || typeof importObject !== 'object')) throw new TypeError(ctx + ': Imports argument must be present and must be an object');
+    imps.forEach((im, i) => {
+        const [modName, name, kind] = im;
+        const ns = importObject[modName];
+        const where = ctx + ': Import #' + i + ' module="' + modName + '"';
+        if (ns === null || (typeof ns !== 'object' && typeof ns !== 'function')) throw new TypeError(where + ': module is not an object or function');
+        const v = ns[name];
+        const w2 = where + ' ' + (kind === 0 ? 'function' : WA_KIND_NAMES[kind]) + '="' + name + '"';
+        if (kind === 0) {
+            if (typeof v !== 'function') throw new WALinkError(w2 + ': function import requires a callable');
+            if (FN_OF.has(v)) { ids.push(FN_OF.get(v)); return; }
+            const sig = im[3], gt = sig.indexOf('>');
+            HOSTS.push({ fn: v, params: sig.slice(0, gt), results: sig.slice(gt + 1) });
+            const fid = W.wasmHostFn(sig, HOSTS.length - 1);
+            if (!fid) throw new WARuntimeError('out of memory');
+            ids.push(fid);
+        } else if (kind === 1) {
+            if (!(v instanceof WATable)) throw new WALinkError(w2 + ': table import requires a WebAssembly.Table');
+            ids.push(v._id);
+        } else if (kind === 2) {
+            if (!(v instanceof WAMemory)) throw new WALinkError(w2 + ': memory import must be a WebAssembly.Memory object');
+            ids.push(v._id);
+        } else {
+            const ch = im[3], mut = im[4];
+            if (v instanceof WAGlobal) ids.push(v._id);
+            else {
+                if (mut) throw new WALinkError(w2 + ': imported mutable global must be a WebAssembly.Global object');
+                if (ch === 'I' && typeof v !== 'bigint') throw new WALinkError(w2 + ': global import must be a BigInt');
+                if ((ch === 'i' || ch === 'f' || ch === 'F') && typeof v !== 'number') throw new WALinkError(w2 + ': global import must be a number');
+                const b = new ArrayBuffer(8);
+                waPut(new DataView(b), 0, ch, v);
+                const gid = W.wasmGlobNew(ch, false, b);
+                ids.push(gid);
+            }
+        }
+    });
+    const r = W.wasmInstantiate(mod._id, ids);
+    if (r[0] === '1') throw new WALinkError(ctx + ': ' + r[1]);
+    if (r[0] === '2') throw new WARuntimeError(ctx + ': ' + r[1]);
+    const exports = Object.create(null);
+    for (const e of r[1]) {
+        let v;
+        if (e[1] === 0) v = wrapWasmFn(e[2], e[4]);
+        else if (e[1] === 1) v = tabObj(e[2]);
+        else if (e[1] === 2) v = memObj(e[2]);
+        else v = globObj(e[2]);
+        Object.defineProperty(exports, e[0], { value: v, enumerable: true, writable: false, configurable: false });
+    }
+    Object.freeze(exports);
+    return exports;
+}
+class WAInstance {
+    constructor(module, importObject) {
+        if (!(module instanceof WAModule)) throw new TypeError('WebAssembly.Instance(): Argument 0 must be a WebAssembly.Module');
+        const exports = waInstantiate(module, importObject, 'WebAssembly.Instance()');
+        Object.defineProperty(this, 'exports', { value: exports, enumerable: true, configurable: true, writable: false });
+    }
+}
+Object.defineProperty(WAInstance.prototype, Symbol.toStringTag, { value: 'WebAssembly.Instance', configurable: true });
+const WebAssemblyNS = {
+    Module: WAModule, Instance: WAInstance, Memory: WAMemory, Table: WATable, Global: WAGlobal,
+    CompileError: WACompileError, LinkError: WALinkError, RuntimeError: WARuntimeError,
+    validate(bytes) {
+        waEnsure();
+        const r = W.wasmModule(waBytes(bytes, 'WebAssembly.validate()'));
+        return typeof r !== 'string';
+    },
+    compile(bytes) { return new Promise((res, rej) => { try { res(new WAModule(bytes)); } catch (e) { rej(e); } }); },
+    instantiate(src, imports) {
+        return new Promise((res, rej) => {
+            setTimeout(() => {
+                try {
+                    if (src instanceof WAModule) { res(new WAInstance(src, imports)); return; }
+                    const module = new WAModule(src);
+                    res({ module, instance: new WAInstance(module, imports) });
+                } catch (e) { rej(e); }
+            }, 0);
+        });
+    },
+    compileStreaming(source) {
+        return Promise.resolve(source).then(resp => {
+            if (!(resp instanceof Response)) throw new TypeError('WebAssembly.compileStreaming(): Argument 0 must be a Response or a Promise for a Response');
+            if (!/^application\/wasm(;|$)/i.test(resp.headers.get('content-type') || '')) throw new TypeError("WebAssembly.compileStreaming(): Incorrect response MIME type. Expected 'application/wasm'.");
+            return resp.arrayBuffer().then(b => new WAModule(b));
+        });
+    },
+    instantiateStreaming(source, imports) {
+        return WebAssemblyNS.compileStreaming(source).then(module => ({ module, instance: new WAInstance(module, imports) }));
+    },
+};
+Object.defineProperty(WebAssemblyNS, Symbol.toStringTag, { value: 'WebAssembly', configurable: true });
+for (const k of Object.keys(WebAssemblyNS)) Object.defineProperty(WebAssemblyNS, k, { enumerable: false });
+const nameOf = { Module: 'Module', Instance: 'Instance', Memory: 'Memory', Table: 'Table', Global: 'Global', CompileError: 'CompileError', LinkError: 'LinkError', RuntimeError: 'RuntimeError' };
+for (const k of Object.keys(nameOf)) Object.defineProperty(WebAssemblyNS[k], 'name', { value: nameOf[k], configurable: true });
+Object.defineProperty(G, 'WebAssembly', { value: WebAssemblyNS, writable: true, configurable: true, enumerable: false });
+
 // window properties
 function Window() { illegal(); }
 Window.prototype = Object.create(EventTarget.prototype, { constructor: { value: Window, writable: true, configurable: true } });

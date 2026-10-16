@@ -101,6 +101,15 @@ static void trace_throw(ojs* J, jv v) {
         int lines = 0;
         for (char* p = d; *p; p++) if (*p == '\n' && ++lines == (mode > 1 ? 4 : 1)) { *p = 0; break; }
         fprintf(stderr, "THROW %s\n", d);
+        if (mode > 1 && d[0] == '<') {
+            fprintf(stderr, "      raw value %016llx\n", (unsigned long long)v);
+            jv m = ojs_get(J, v, "message");
+            if (!ojs_is_exception(m)) { char* ms = ojs_to_cstring(J, m, 0); if (ms) { fprintf(stderr, "      message: %s\n", ms); ojs_free_cstring(J, ms); } }
+            else J->has_exc = 0;
+            jv nm = ojs_get(J, v, "name");
+            if (!ojs_is_exception(nm)) { char* ms = ojs_to_cstring(J, nm, 0); if (ms) { fprintf(stderr, "      name: %s\n", ms); ojs_free_cstring(J, ms); } }
+            else J->has_exc = 0;
+        }
         ojs_free_cstring(J, d);
     }
     busy = 0;

@@ -53,6 +53,7 @@ struct wjs_dyn {
 
 struct wmedia;               // media sessions (wjs_media.c)
 struct wcvs;                 // canvases (wjs_canvas.c)
+struct wwasm;                // WebAssembly (wjs_wasm.c)
 
 #define WJS_MQ_MAX 16          // outgoing frame messages waiting for the shell
 struct wjs {
@@ -115,6 +116,7 @@ struct wjs {
     int nmq;
     struct wmedia* media;    // WM_MAX sessions, lazily allocated
     struct wcvs* canvas;     // 2D canvases (wjs_canvas.c), lazily allocated
+    struct wwasm* wasm;      // WebAssembly store (wjs_wasm.c), lazily allocated
     // stats
     int nlog, nerrors, nscripts_run;
 };
@@ -138,6 +140,9 @@ const uint32_t* wjs_media_frame(struct wjs* js, int sess, int* w, int* h);   // 
 // canvas natives + teardown + publishing (wjs_canvas.c)
 void    wjs_canvas_install(struct wjs* js, ojsv natives);
 void    wjs_crypto_install(struct wjs* js, ojsv natives);    // crypto.subtle natives (wjs_crypto.c)
+void    wjs_wasm_install(struct wjs* js, ojsv natives);      // WebAssembly natives (wjs_wasm.c)
+void    wjs_wasm_free(struct wjs* js);
+int     wjs_interrupt_poll(struct wjs* js);                  // time budget / yield check for long native loops (nonzero: abort)
 void    wjs_canvas_free(struct wjs* js);
 int     wjs_canvas_poll(struct wjs* js, struct wjs_rect* out, int max, int* n);
 int     wjs_canvas_pending(struct wjs* js);

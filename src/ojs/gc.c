@@ -327,7 +327,8 @@ static struct gch* find_object(ojs* J, uintptr_t w) {
 void gc_scan_conservative(ojs* J, const void* lo, const void* hi);
 static void scan_conservative(ojs* J, const void* lo, const void* hi) { gc_scan_conservative(J, lo, hi); }
 
-void gc_scan_conservative(ojs* J, const void* lo, const void* hi) {
+// reads raw stack words: AddressSanitizer's redzones between locals would be reported otherwise
+__attribute__((no_sanitize_address)) void gc_scan_conservative(ojs* J, const void* lo, const void* hi) {
     uintptr_t a = ((uintptr_t)lo + 3) & ~(uintptr_t)3;
     for (; a + 4 <= (uintptr_t)hi; a += 4) {
         uintptr_t w = *(const uint32_t*)a;

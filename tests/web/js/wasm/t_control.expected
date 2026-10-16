@@ -1,0 +1,19 @@
+fac 1n 1n 120n 2432902008176640000n -4249290049419214848n
+fib [0,1,1,2,55,6765,102334155]
+sum 1 55 5050
+dispatch [10,20,30,99,99,99,99]
+nest 8 5 5
+sel 7 7
+count -27 -26 -25
+pair [11,20] [-2,-6]
+blockparams 10 0
+ci 10 4 21
+ci-traps RuntimeError RuntimeError RuntimeError
+table 4 true 6 null RangeError
+unr RuntimeError
+stack RangeError
+early 6 5
+sigmismatch RuntimeError
+afternull RuntimeError
+exports 18 true null function 1 0
+WASM-DONE
