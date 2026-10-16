@@ -62,6 +62,7 @@ struct wjs {
     ojs* J;                  // the realm (NULL: not created / failed)
     // values below are GC roots (registered in wjs_new)
     ojsv hooks;              // object returned by the prelude
+    ojsv h_fhead, h_fdata;   // prelude hooks: streaming fetch head / body piece
     ojsv h_msg;              // prelude hook: a message from another frame arrived (data, origin, kind, node)
     ojsv h_dispatch, h_ui, h_fetch, h_nextdue, h_rundue, h_frame, h_dcl, h_load,
          h_script, h_image, h_proto, h_report, h_mo, h_click, h_ready, h_obs;

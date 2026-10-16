@@ -117,7 +117,7 @@ static uint8_t* engine_stack;
 static int in_engine;
 
 enum { JOB_LOAD, JOB_FETCH_DONE, JOB_PAINT, JOB_PAINT_STALE, JOB_HIT, JOB_RECT, JOB_ANCHOR, JOB_INFLATE, JOB_LINKS,
-       JOB_JS_RUN, JOB_JS_EVENT, JOB_ELEM_AT, JOB_FREE, JOB_MEDIA, JOB_JS_MESSAGE };
+       JOB_JS_RUN, JOB_JS_EVENT, JOB_ELEM_AT, JOB_FREE, JOB_MEDIA, JOB_JS_MESSAGE, JOB_FETCH_HEAD, JOB_FETCH_DATA };
 
 struct job {
     int op;
@@ -169,6 +169,12 @@ static void job_entry(void* p) {
     }
     case JOB_ELEM_AT:
         j->result = wdoc_hit_element(j->doc, j->x, j->y);
+        break;
+    case JOB_FETCH_HEAD:        // a streaming fetch(): the response head (result: WJS_* flags, -1 = refused)
+        j->result = wdoc_fetch_head(j->doc, j->id, j->status, j->headers, j->final_url);
+        break;
+    case JOB_FETCH_DATA:        // ...and a piece of its body
+        j->result = wdoc_fetch_chunk(j->doc, j->id, j->bytes, j->len);
         break;
     case JOB_JS_MESSAGE: {      // a window.postMessage from another frame (data, origins, sender kind/node)
         struct wjs* js = wdoc_js(j->doc);
@@ -306,6 +312,9 @@ struct resp_info {
     char location[OKAI_URL_LEN];
 };
 
+static inline int w_ishex_c(int c) { return (c >= '0' && c <= '9') || ((c | 32) >= 'a' && (c | 32) <= 'f'); }
+static inline int w_hexval_c(int c) { return c <= '9' ? c - '0' : (c | 32) - 'a' + 10; }
+
 static int header_end(const char* r, int len) {
     for (int i = 0; i + 3 < len; i++)
         if (r[i] == '\r' && r[i + 1] == '\n' && r[i + 2] == '\r' && r[i + 3] == '\n') return i;
@@ -428,6 +437,16 @@ struct oreq {
     int scan_res;              // resources handed to the cache so far
     uint32_t t_start;          // tick the request was made
     int previewed;             // main document: a preview of the partial download was built
+    // streaming fetch() (the script reads Response.body): the body is handed over while it downloads
+    int stream;                // the script asked for it
+    int s_state;               // 0 waiting for the head, 1 streaming, 2 not streamed (redirect, encoded, refused)
+    int s_hlen;                // bytes of the response head (with the blank line)
+    int s_chunked, s_clen;     // transfer-encoding: chunked / content-length (-1 none)
+    int s_raw;                 // raw body bytes consumed
+    uint32_t s_sent;           // decoded body bytes delivered
+    uint32_t s_tick;           // do not deliver small pieces before this tick
+    int ck_st;                 // chunked decoder: 0 size, 1 LF after size, 2 data, 3 CR after data, 4 LF after data, 5 done
+    uint32_t ck_size, ck_left;
     char url[OKAI_URL_LEN];
 };
 static struct oreq reqs[FETCH_MAX];
@@ -468,6 +487,9 @@ static struct oreq* req_new(int bi, int tab, struct wdoc* doc, int sub_id, const
         q->scan_res = 0;
         q->t_start = tick_count;
         q->previewed = 0;
+        q->stream = sub_id >= 0 && doc && wdoc_res_stream(doc, sub_id);
+        q->s_state = 0; q->s_hlen = 0; q->s_chunked = 0; q->s_clen = -1; q->s_raw = 0; q->s_sent = 0; q->s_tick = 0;
+        q->ck_st = 0; q->ck_size = q->ck_left = 0;
         scopy(q->url, url, OKAI_URL_LEN);
         return q;
     }
@@ -687,6 +709,134 @@ static void main_preview(struct oreq* q, const char* html, int hn, const struct 
     if (T->doc && wdoc_pending_css(T->doc) > 0) request_render(T, CSS_WAIT_TICKS);
     else request_render(T, 0);
     serial_printf("[okai] preview of %d bytes while the document downloads\n", cut);
+}
+
+static void js_apply(int id, int tab, int flags);
+static int slot_valid(struct okai* b, int slot);
+// ---- streaming fetch(): head and body pieces while the response downloads ----
+
+// incremental chunked decoder: consumes raw bytes, appends decoded ones to out; 0 while more input is needed, 1 at the last chunk
+static int ck_feed(struct oreq* q, const uint8_t* in, int n, uint8_t* out, int* used, int* outn) {
+    int i = 0, o = 0;
+    while (i < n && q->ck_st != 5) {
+        uint8_t c = in[i];
+        switch (q->ck_st) {
+        case 0:
+            if (c == '\r') q->ck_st = 1;
+            else if (c == ';') { q->ck_st = 6; }
+            else if (c == '\n') q->ck_st = q->ck_size ? 2 : 5, q->ck_left = q->ck_size;
+            else if (w_ishex_c(c)) q->ck_size = q->ck_size * 16 + (uint32_t)w_hexval_c(c);
+            i++;
+            break;
+        case 6:                                             // chunk extension: skip to the end of the line
+            if (c == '\r') q->ck_st = 1;
+            i++;
+            break;
+        case 1:
+            i++;
+            if (c == '\n') { q->ck_left = q->ck_size; q->ck_st = q->ck_size ? 2 : 5; }
+            break;
+        case 2: {
+            uint32_t take = q->ck_left < (uint32_t)(n - i) ? q->ck_left : (uint32_t)(n - i);
+            memcpy(out + o, in + i, take);
+            o += (int)take; i += (int)take; q->ck_left -= take;
+            if (!q->ck_left) q->ck_st = 3;
+            break;
+        }
+        case 3: i++; q->ck_st = c == '\r' ? 4 : (c == '\n' ? 0 : 3); if (c == '\n') q->ck_size = 0; break;
+        case 4: i++; q->ck_st = 0; q->ck_size = 0; break;
+        }
+    }
+    *used = i;
+    *outn = o;
+    return q->ck_st == 5;
+}
+
+// One streaming step. `r`/`len`: the response so far (a peek while running, the complete message at the end); final = the
+// transfer is over (deliver whatever is left whatever its size). Returns 1 when the body is complete.
+static void req_stream_step(struct oreq* q, const char* r, int len, int final) {
+    struct okai* b = okai_get(q->bi);
+    if (!b || q->tab < 0 || q->tab >= OKAI_SLOTS || !slot_valid(b, q->tab)) return;
+    struct okai_tab* T = &b->tabs[q->tab];
+    if (T->doc != q->doc || T->closing) return;
+    if (q->s_state == 0) {
+        int he = header_end(r, len);
+        if (he < 0) return;
+        struct resp_info ri;
+        parse_resp(r, he, &ri);
+        const char* v;
+        int bo = he + (r[he] == 13 ? 4 : 2);
+        int enc = header_get(r, he, "content-encoding", &v) > 0 && !iprefix(v, "identity");
+        q->s_chunked = header_get(r, he, "transfer-encoding", &v) > 0 && iprefix(v, "chunked");
+        q->s_clen = -1;
+        if (header_get(r, he, "content-length", &v) > 0) { int n = 0; for (int k = 0; v[k] >= '0' && v[k] <= '9' && k < 10; k++) n = n * 10 + (v[k] - '0'); q->s_clen = n; }
+        if (ri.status < 200 || (ri.status >= 300 && ri.status <= 399) || enc || ri.status == 204 || ri.status == 304
+            || (q->s_clen >= 0 && q->s_clen < 65536)) { q->s_state = 2; return; }       // small known-size bodies take the plain path
+        static char hdrs[8192];
+        int s0 = 0;
+        while (s0 < he && r[s0] != '\n') s0++;
+        s0++;
+        int n = he > s0 ? he - s0 : 0;
+        if (n > (int)sizeof hdrs - 1) n = (int)sizeof hdrs - 1;
+        if (n > 0) memcpy(hdrs, r + s0, n);
+        hdrs[n > 0 ? n : 0] = 0;
+        struct job j;
+        memset(&j, 0, sizeof j);
+        j.op = JOB_FETCH_HEAD;
+        j.doc = q->doc;
+        j.id = q->sub_id;
+        j.status = ri.status;
+        j.headers = hdrs;
+        j.final_url = q->url;
+        run_job(&j);
+        if (j.result < 0) { q->s_state = 2; return; }
+        q->s_state = 1;
+        q->s_hlen = bo;
+        q->s_raw = 0;
+        js_apply((int)(b - okais), q->tab, j.result);
+    }
+    if (q->s_state != 1) return;
+    int avail = len - q->s_hlen - q->s_raw;
+    if (avail <= 0) return;
+    if (!final && avail < 8192 && (int)(tick_count - q->s_tick) < 0) return;       // small pieces wait a little: one JS call per ~50 ms
+    static uint8_t buf[65536];
+    const uint8_t* raw = (const uint8_t*)r + q->s_hlen + q->s_raw;
+    while (avail > 0) {
+        int used = 0, out = 0;
+        if (q->s_chunked) ck_feed(q, raw, avail > 65000 ? 65000 : avail, buf, &used, &out);
+        else {
+            used = avail > 65536 ? 65536 : avail;
+            if (q->s_clen >= 0 && (uint32_t)q->s_sent + (uint32_t)used > (uint32_t)q->s_clen) used = (int)((uint32_t)q->s_clen - q->s_sent);
+            memcpy(buf, raw, used);
+            out = used;
+        }
+        if (used <= 0) break;
+        raw += used; avail -= used; q->s_raw += used;
+        if (out > 0) {
+            struct job j;
+            memset(&j, 0, sizeof j);
+            j.op = JOB_FETCH_DATA;
+            j.doc = q->doc;
+            j.id = q->sub_id;
+            j.bytes = (const char*)buf;
+            j.len = out;
+            run_job(&j);
+            q->s_sent += (uint32_t)out;
+            js_apply((int)(b - okais), q->tab, j.result);
+            if (T->doc != q->doc) return;
+        }
+    }
+    q->s_tick = tick_count + 5;
+}
+
+static void req_stream(struct oreq* q) {
+    if (!q->stream || q->s_state == 2 || q->h < 0 || fetch_status(q->h) != FETCH_RUNNING) return;
+    int got = fetch_progress(q->h);
+    if (got <= q->s_hlen + q->s_raw && q->s_state == 1) return;
+    int len;
+    const char* r = fetch_peek(q->h, &len);
+    if (!r) return;
+    req_stream_step(q, r, len, 0);
 }
 
 static void main_preload(struct oreq* q) {
@@ -1901,6 +2051,8 @@ static int sub_done(struct okai_tab* T, struct oreq* q, int st, char* resp, int 
         parse_resp(resp, len, &ri);
         status = ri.status;
         store_cookies(q->url, resp, len);
+        if (q->stream && q->s_state == 1) req_stream_step(q, resp, len, 1);       // the rest of the body
+        else if (q->stream && q->s_state == 0) q->s_state = 2;
         // raw header lines (after the status line) for scripts (XHR
         // getResponseHeader, CORS)
         if (kind == WDOC_RK_REQ || kind == WDOC_RK_SCRIPT) {
@@ -1929,6 +2081,10 @@ static int sub_done(struct okai_tab* T, struct oreq* q, int st, char* resp, int 
                 serial_printf("[okai] sub-res redirect -> %s\n", abs);
                 return 1;
             }
+        } else if (q->stream && q->s_state == 1) {
+            j.bytes = "";
+            j.len = WDOC_STREAM_END;               // everything went out piece by piece
+            j.status = status;
         } else if ((status >= 200 && status <= 299) || (kind == WDOC_RK_REQ && status >= 200)) {
             // requests see error statuses too (XHR status 404 + body)
             body = resp_body(resp, len, &ri, &blen, &heap);
@@ -1938,7 +2094,7 @@ static int sub_done(struct okai_tab* T, struct oreq* q, int st, char* resp, int 
             j.status = status;
         }
     }
-    if (status == 0 && !q->retried) {
+    if (status == 0 && !q->retried && !(q->stream && q->s_state == 1)) {
         // transport blip (reset, stale connection): retry once
         q->retried = 1;
         serial_printf("[okai] sub-res retry %s\n", q->url);
@@ -1974,6 +2130,7 @@ static void navigate_slot(int id, int slot, const char* url, int push);
 // A script's outgoing messages (wjs_take_message) are handed to the realm of the frame they address. The receiving
 // realm checks the target origin and builds the MessageEvent; the shell only moves bytes between documents.
 static void js_apply(int id, int tab, int flags);
+static int slot_valid(struct okai* b, int slot);
 static void frames_route_messages(int bi, int slot) {
     static int depth;
     struct okai* b = &okais[bi];
@@ -2362,6 +2519,8 @@ void okai_poll(void) {
         if (reqs[i].used && reqs[i].h >= 0) req_poll(&reqs[i]);
     for (int i = 0; i < FETCH_MAX; i++)
         if (reqs[i].used && reqs[i].h >= 0 && reqs[i].sub_id < 0) main_preload(&reqs[i]);
+    for (int i = 0; i < FETCH_MAX; i++)
+        if (reqs[i].used && reqs[i].h >= 0 && reqs[i].stream) req_stream(&reqs[i]);
     // Main documents first (active tabs first).
     for (int pass = 0; pass < 2; pass++)
         for (int bi = 0; bi < MAX_OKAIS; bi++) {

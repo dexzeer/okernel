@@ -384,6 +384,7 @@ NATIVE(n_fetch) {
     int id = -1;
     if (url && method && headers) id = wdoc_res_request(js->doc, url, method, headers, body, (int)bl);
     if (id >= 0) js->flags |= WJS_FETCH;
+    if (id >= 0 && argc > 4 && ojs_to_bool(ctx, argv[4])) wdoc_res_request_stream(js->doc, id);
     if (url) ojs_free_cstring(ctx, (char*)url);
     if (method) ojs_free_cstring(ctx, (char*)method);
     if (headers) ojs_free_cstring(ctx, (char*)headers);
@@ -476,7 +477,7 @@ static const struct ojs_func_entry env_funcs[] = {
     { "navigate", n_navigate, 2 },
     { "pushURL", n_push_url, 2 },
     { "historyGo", n_history_go, 1 },
-    { "fetch", n_fetch, 4 },
+    { "fetch", n_fetch, 5 },
     { "store", n_store, 4 },
     { "cookie", n_cookie, 1 },
     { "random", n_random, 1 },
@@ -1379,7 +1380,7 @@ struct wjs* wjs_new(struct wdoc* doc) {
     js->t0 = wjs_now();
     js->hooks = OJS_UNDEFINED;
     for (int i = 0; i < 2 * WJS_REJ_MAX; i++) js->rej[i] = OJS_UNDEFINED;
-    ojsv* hv[] = { &js->hooks, &js->h_msg, &js->h_dispatch, &js->h_ui, &js->h_fetch, &js->h_nextdue, &js->h_rundue, &js->h_frame,
+    ojsv* hv[] = { &js->hooks, &js->h_msg, &js->h_fhead, &js->h_fdata, &js->h_dispatch, &js->h_ui, &js->h_fetch, &js->h_nextdue, &js->h_rundue, &js->h_frame,
                    &js->h_dcl, &js->h_load, &js->h_script, &js->h_image, &js->h_proto, &js->h_report,
                    &js->h_mo, &js->h_click, &js->h_ready, &js->h_obs, &js->proto_svg, &js->proto_svgroot,
                    &js->proto_math, &js->proto_text, &js->proto_comment, &js->proto_doc, &js->proto_frag };
@@ -1447,7 +1448,7 @@ struct wjs* wjs_new(struct wdoc* doc) {
         { &js->h_dcl, "fireDCL" }, { &js->h_load, "fireLoad" }, { &js->h_script, "scriptEvent" },
         { &js->h_image, "imageEvent" }, { &js->h_proto, "protoFor" }, { &js->h_report, "report" },
         { &js->h_mo, "moChildList" }, { &js->h_click, "dispatchClick" }, { &js->h_ready, "setReady" },
-        { &js->h_obs, "observersCheck" }, { &js->h_msg, "onFrameMessage" } };
+        { &js->h_obs, "observersCheck" }, { &js->h_msg, "onFrameMessage" }, { &js->h_fhead, "onFetchHead" }, { &js->h_fdata, "onFetchData" } };
     for (unsigned i = 0; i < sizeof hk / sizeof hk[0]; i++) {
         ojsv v = ojs_get(ctx, hooks, hk[i].name);
         if (ojs_is_exception(v)) { ojs_take_exception(ctx); v = OJS_UNDEFINED; }
@@ -1557,6 +1558,33 @@ void wjs_resource_done(struct wjs* js, int res, int status, const char* headers,
     refresh_due(js);
     js->flags |= WJS_DIRTY;
     UNGUARD(js);
+}
+
+int wjs_fetch_head(struct wjs* js, int res, int status, const char* headers, const char* url) {
+    if (!js || js->dead || ojs_is_undefined(js->h_fhead)) return -1;
+    GUARD(js, -1);
+    ojs* ctx = js->J;
+    ojsv a[5] = { ojs_int(res), ojs_int(status), ojs_string(ctx, status == 200 ? "OK" : ""), ojs_string(ctx, headers ? headers : ""), ojs_string(ctx, url ? url : "") };
+    call_hook(js, js->h_fhead, 5, a, TASK_BUDGET_MS);
+    refresh_due(js);
+    js->flags |= WJS_DIRTY;
+    UNGUARD(js);
+    int f = js->flags;
+    js->flags = 0;
+    return f;
+}
+
+int wjs_fetch_chunk(struct wjs* js, int res, const char* data, int len) {
+    if (!js || js->dead || ojs_is_undefined(js->h_fdata) || len <= 0) return 0;
+    GUARD(js, 0);
+    ojs* ctx = js->J;
+    ojsv a[2] = { ojs_int(res), ojs_arraybuffer_copy(ctx, data, (size_t)len) };
+    call_hook(js, js->h_fdata, 2, a, TASK_BUDGET_MS);
+    refresh_due(js);
+    UNGUARD(js);
+    int f = js->flags;
+    js->flags = 0;
+    return f;
 }
 
 void wjs_image_done(struct wjs* js, int slot, int ok) {

@@ -93,6 +93,13 @@ struct wjs* wdoc_js(struct wdoc* d);     // NULL when scripting is off (see wjs.
 void wdoc_set_scroll(struct wdoc* d, int y);   // shell scroll (window.scrollY)
 void wdoc_set_focus(struct wdoc* d, int node); // focused control (activeElement)
 int  wdoc_res_kind(struct wdoc* d, int id);
+// Streaming fetch(): the script wants the body as it arrives. The shell delivers the head (status, raw header lines) once, then
+// pieces of the body, then wdoc_fetch_done2(len = WDOC_STREAM_END) when the transfer is complete.
+#define WDOC_STREAM_END (-3)
+int  wdoc_res_request_stream(struct wdoc* d, int id);                                       // mark a request as streaming (from the script's fetch call)
+int  wdoc_res_stream(struct wdoc* d, int id);                                              // the script asked to stream this request
+int  wdoc_fetch_head(struct wdoc* d, int id, int status, const char* headers, const char* final_url);   // returns WJS_* flags, or -1: refused (CORS) - do not stream
+int  wdoc_fetch_chunk(struct wdoc* d, int id, const char* bytes, int len);                 // returns WJS_* flags
 // Request details of a resource (RES_REQ may carry method/headers/body).
 int  wdoc_fetch_info(struct wdoc* d, int id, const char** method, const char** headers,
                      const char** body, int* blen);
