@@ -1305,7 +1305,7 @@ methods(HM, {
 
 const MS = new WeakMap();            // media element -> state
 const MEDIA_ACTIVE = new Set();      // elements with an engine session
-const OBJURLS = new Map();           // blob: URL -> MediaSource
+const OBJURLS = new Map();           // blob: URL -> MediaSource | Blob
 let mediaTimer = 0, objSeq = 1;
 function mst(el) {
     let s = MS.get(el);
@@ -1430,6 +1430,13 @@ function mediaLoad(el) {
     s.netState = 2;
     fire(el, 'loadstart');
     const gen = s.gen;
+    if (/^blob:/i.test(src) && OBJURLS.get(src) instanceof Blob) {
+        // a Blob behind the URL is an ordinary progressive file: startRequest() serves blob: URLs (with Range)
+        if (!mediaSession(el, s)) { mediaFail(el, s, 4, 'no media session available'); return; }
+        mediaStream(el, s, gen, src, W.mediaAddSb(s.id, 3));
+        if (W.getAttr(el, 'autoplay') !== null) setTimeout(() => { if (s.gen === gen && s.paused) el.play().catch(() => {}); }, 0);
+        return;
+    }
     if (/^blob:/i.test(src)) {
         const ms = OBJURLS.get(src);
         if (!ms) { setTimeout(() => { if (s.gen === gen) mediaFail(el, s, 4, 'MEDIA_ELEMENT_ERROR: Media load rejected by URL safety check'); }, 0); return; }
@@ -1843,7 +1850,10 @@ class MediaSource extends EventTarget {
 }
 function mediaObjURL(obj) {
     if (obj instanceof MediaSource) return obj._objUrl();
-    return 'blob:' + location.origin + '/' + crypto.randomUUID();
+    if (!(obj instanceof Blob)) throw new TypeError("Failed to execute 'createObjectURL' on 'URL': Overload resolution failed.");
+    const u = 'blob:' + location.origin + '/' + crypto.randomUUID();
+    OBJURLS.set(u, obj);
+    return u;
 }
 function mediaDecodingInfo(cfg) {
     let ok = false, smooth = false;
@@ -3192,10 +3202,31 @@ function startRequest(method, url, headers, body, handler) {
     let hasType = false;
     for (const [k, v] of headers) { hs.push(k + ': ' + v); if (k.toLowerCase() === 'content-type') hasType = true; }
     if (ctype && !hasType) hs.push('Content-Type: ' + ctype);
+    if (/^blob:/i.test(String(url))) { serveBlobURL(String(url), headers, handler); return; }
     const id = W.fetch(String(url), String(method).toUpperCase(), hs.join('\r\n'), bodyStr);
     if (id < 0) { setTimeout(() => handler(0, '', '', null, url), 0); return; }
     PENDING.set(id, handler);
     if (/\/videoplayback/.test(url)) { PTIME.set(id, W.now()); mlog('request ' + id + ' ' + method + ' videoplayback' + (bodyStr && bodyStr.byteLength !== undefined ? ' body=' + bodyStr.byteLength : '')); }
+}
+// fetch()/XHR of a blob: URL made by URL.createObjectURL(blob): answered here, with Range support
+function serveBlobURL(url, headers, handler) {
+    const o = OBJURLS.get(url);
+    let range = null;
+    for (const [k, v] of headers) if (k.toLowerCase() === 'range') range = /^bytes=(\d*)-(\d*)$/.exec(String(v).trim());
+    setTimeout(() => {
+        if (!(o instanceof Blob)) { handler(0, '', '', null, url); return; }
+        const all = o._b;
+        let a = 0, b = all.length, status = 200, hdr = 'Content-Type: ' + (o.type || '');
+        if (range && (range[1] !== '' || range[2] !== '')) {
+            if (range[1] === '') { a = Math.max(0, all.length - +range[2]); }
+            else { a = +range[1]; b = range[2] === '' ? all.length : Math.min(all.length, +range[2] + 1); }
+            if (a >= all.length) { handler(416, 'Range Not Satisfiable', 'Content-Range: bytes */' + all.length, new ArrayBuffer(0), url); return; }
+            status = 206;
+            hdr += '\r\nContent-Range: bytes ' + a + '-' + (b - 1) + '/' + all.length;
+        }
+        hdr += '\r\nContent-Length: ' + (b - a);
+        handler(status, status === 200 ? 'OK' : 'Partial Content', hdr, all.slice(a, b).buffer, url);
+    }, 0);
 }
 const PTIME = new Map();
 // C: a request finished
@@ -4895,6 +4926,408 @@ function postMessage(data, origin) {
     setTimeout(() => dispatch(G, new MessageEvent('message', { data, origin: location.origin, source: G })), 0);
 }
 
+// ---------------------------------------------------------------- Web Workers
+// A worker runs in this realm (one engine, one thread) inside a sandbox: the script is compiled as the body of a
+// function whose `with (scope)` block makes `scope` - a WorkerGlobalScope holding only what a worker may see - win every
+// identifier lookup. `window`, `document` and the other page-only globals are shadowed with undefined, `self`/`this`/
+// `globalThis` are the scope, and top-level declarations of a script are exported to the scope when it has run (so
+// importScripts() libraries that define globals work). Limits: classic scripts only (no `type: 'module'`), importScripts()
+// is synchronous in a real worker, so every importScripts('literal') is fetched before the script starts (a computed URL
+// that was not found by that scan throws NetworkError), and a worker shares the page's CPU: a busy loop blocks the page.
+const WORKER_HIDE = ['window', 'document', 'parent', 'top', 'frames', 'opener', 'frameElement', 'localStorage', 'sessionStorage', 'alert', 'confirm', 'prompt',
+    'requestAnimationFrame', 'cancelAnimationFrame', 'customElements', 'getComputedStyle', 'matchMedia', 'getSelection', 'innerWidth', 'innerHeight',
+    'outerWidth', 'outerHeight', 'screen', 'history', 'open', 'print', 'focus', 'blur', 'scrollTo', 'scroll', 'scrollBy', 'devicePixelRatio', 'visualViewport',
+    'Node', 'Element', 'HTMLElement', 'Document', 'Window', 'DocumentFragment', 'MutationObserver', 'IntersectionObserver', 'ResizeObserver', 'DOMParser',
+    'XMLSerializer', 'HTMLCanvasElement', 'HTMLVideoElement', 'HTMLAudioElement', 'MediaSource', 'SourceBuffer', 'Storage', 'requestIdleCallback', 'cancelIdleCallback'];
+const WORKER_SHARE = ['Event', 'CustomEvent', 'ErrorEvent', 'ProgressEvent', 'MessageEvent', 'EventTarget', 'DOMException', 'URL', 'URLSearchParams', 'Headers', 'Request',
+    'Response', 'Blob', 'File', 'FileReader', 'FormData', 'AbortController', 'AbortSignal', 'TextEncoder', 'TextDecoder', 'ReadableStream', 'WritableStream', 'TransformStream',
+    'TextEncoderStream', 'TextDecoderStream', 'CompressionStream', 'DecompressionStream', 'MessageChannel', 'MessagePort', 'BroadcastChannel', 'XMLHttpRequest',
+    'Performance', 'PerformanceObserver', 'OffscreenCanvas', 'ImageData', 'ImageBitmap', 'createImageBitmap', 'CanvasRenderingContext2D', 'Path2D', 'DOMMatrix', 'DOMPoint',
+    'SubtleCrypto', 'CryptoKey', 'EventSource', 'WebSocket', 'structuredClone', 'atob', 'btoa', 'queueMicrotask', 'crypto', 'performance', 'console', 'Intl', 'WebAssembly',
+    'indexedDB', 'IDBKeyRange', 'caches', 'reportError', 'isSecureContext', 'origin', 'crossOriginIsolated', 'scheduler'];
+
+// names declared at the top level of a script (var/let/const/function/class), best effort: a small tokenizer that skips
+// strings, comments, template literals and regex literals and watches the bracket depth
+function topLevelNames(src) {
+    const names = [];
+    let i = 0, depth = 0, lastSig = '', atStmt = true;
+    const n = src.length, idStart = /[A-Za-z_$ -￿]/, idPart = /[A-Za-z0-9_$ -￿]/;
+    const word = () => { let j = i; while (j < n && idPart.test(src[j])) j++; return src.slice(i, j); };
+    const skipWs = j => { while (j < n && /\s/.test(src[j])) j++; return j; };
+    while (i < n) {
+        const c = src[i];
+        if (c === '/' && src[i + 1] === '/') { while (i < n && src[i] !== '\n') i++; continue; }
+        if (c === '/' && src[i + 1] === '*') { const e = src.indexOf('*/', i + 2); i = e < 0 ? n : e + 2; continue; }
+        if (c === '"' || c === "'") { i++; while (i < n && src[i] !== c) { if (src[i] === '\\') i++; i++; } i++; lastSig = 'a'; atStmt = false; continue; }
+        if (c === '`') {                      // template literal (nested ${ } handled by depth counting of braces inside)
+            i++;
+            let d = 0;
+            while (i < n) {
+                if (src[i] === '\\') { i += 2; continue; }
+                if (d === 0 && src[i] === '`') break;
+                if (src[i] === '$' && src[i + 1] === '{') { d++; i += 2; continue; }
+                if (d > 0 && src[i] === '}') { d--; i++; continue; }
+                i++;
+            }
+            i++; lastSig = 'a'; atStmt = false; continue;
+        }
+        if (c === '/' && !/[A-Za-z0-9_$)\]]/.test(lastSig)) {   // regex literal
+            i++;
+            let cls = false;
+            while (i < n && (cls || src[i] !== '/') && src[i] !== '\n') { if (src[i] === '\\') i++; else if (src[i] === '[') cls = true; else if (src[i] === ']') cls = false; i++; }
+            i++; lastSig = 'a'; atStmt = false; continue;
+        }
+        if (c === '{' || c === '(' || c === '[') { depth++; lastSig = c; atStmt = c === '{'; i++; continue; }
+        if (c === '}' || c === ')' || c === ']') { depth--; lastSig = c; atStmt = c === '}' && depth === 0; i++; continue; }
+        if (c === ';') { lastSig = c; atStmt = true; i++; continue; }
+        if (c === '\n') { i++; if (depth === 0 && /[A-Za-z0-9_$)\]}'"`]/.test(lastSig)) atStmt = true; continue; }
+        if (/\s/.test(c)) { i++; continue; }
+        if (idStart.test(c)) {
+            const w = word();
+            const stmtStart = atStmt && depth === 0;
+            i += w.length;
+            if (stmtStart && (w === 'var' || w === 'let' || w === 'const')) {
+                // declarators: name [= expr] {, name [= expr]}
+                for (;;) {
+                    let j = skipWs(i);
+                    if (idStart.test(src[j] || '')) { const s0 = i; i = j; const nm = word(); names.push(nm); i += nm.length; void s0; }
+                    else break;
+                    // skip the initialiser up to a depth-0 ',' (next declarator) or the end of the statement
+                    let d2 = 0, found = false;
+                    while (i < n) {
+                        const ch = src[i];
+                        if (ch === '"' || ch === "'") { i++; while (i < n && src[i] !== ch) { if (src[i] === '\\') i++; i++; } i++; continue; }
+                        if (ch === '`') { i++; while (i < n && src[i] !== '`') { if (src[i] === '\\') i++; i++; } i++; continue; }
+                        if (ch === '(' || ch === '{' || ch === '[') d2++;
+                        else if (ch === ')' || ch === '}' || ch === ']') { if (d2 === 0) break; d2--; }
+                        else if (d2 === 0 && ch === ',') { i++; found = true; break; }
+                        else if (d2 === 0 && (ch === ';' || ch === '\n')) {
+                            if (ch === '\n') { const k = skipWs(i); if (/[+\-*\/%&|^?:.,=<>(\[`]/.test(src[k] || ';') && !/^(\+\+|--)/.test(src.slice(k, k + 2))) { i = k; continue; } }
+                            break;
+                        }
+                        i++;
+                    }
+                    if (!found) break;
+                }
+                lastSig = ';'; atStmt = true; continue;
+            }
+            if (stmtStart && (w === 'function' || w === 'class' || (w === 'async' && /^\s+function\b/.test(src.slice(i, i + 12))))) {
+                let j = skipWs(i);
+                if (w === 'async') { j = skipWs(j + 8); }
+                if (src[j] === '*') j = skipWs(j + 1);
+                if (idStart.test(src[j] || '')) { i = j; const nm = word(); names.push(nm); i += nm.length; }
+                lastSig = 'a'; atStmt = false; continue;
+            }
+            lastSig = 'a'; atStmt = false;
+            continue;
+        }
+        lastSig = c; atStmt = false; i++;
+    }
+    return Array.from(new Set(names)).filter(x => !/^(arguments|eval|undefined|NaN|Infinity)$/.test(x));
+}
+function importScriptsList(src) {
+    const out = [];
+    const re = /\bimportScripts\s*\(([^)]*)\)/g;
+    let m;
+    while ((m = re.exec(src))) for (const q of m[1].matchAll(/(["'`])((?:\\.|(?!\1).)*)\1/g)) out.push(q[2]);
+    return out;
+}
+class WorkerGlobalScope extends EventTarget { constructor() { illegal(); } }
+class DedicatedWorkerGlobalScope extends WorkerGlobalScope { constructor() { illegal(); } }
+class SharedWorkerGlobalScope extends WorkerGlobalScope { constructor() { illegal(); } }
+defineHandlers(WorkerGlobalScope.prototype);
+for (const k of ['onconnect', 'onlanguagechange', 'onrejectionhandled', 'onunhandledrejection', 'onmessageerror'])
+    Object.defineProperty(WorkerGlobalScope.prototype, k, { configurable: true, enumerable: true, get() { const m = HANDLERS.get(this); return (m && m.get(k.slice(2))) || null; }, set(f) { let m = HANDLERS.get(this); if (!m) HANDLERS.set(this, m = new Map()); m.set(k.slice(2), typeof f === 'function' ? f : null); } });
+
+function fetchScriptText(abs) {
+    if (/^blob:/i.test(abs)) { const o = OBJURLS.get(abs); return o instanceof Blob ? Promise.resolve(o._text()) : Promise.reject(new Error('network error: ' + abs)); }
+    if (/^data:/i.test(abs)) {
+        const i = abs.indexOf(','), meta = abs.slice(5, i), body = abs.slice(i + 1);
+        try { return Promise.resolve(/;base64$/i.test(meta) ? new TextDecoder().decode(Uint8Array.from(atob(body), c => c.charCodeAt(0))) : decodeURIComponent(body)); } catch (e) { return Promise.reject(e); }
+    }
+    return fetch(abs).then(r => { if (!r.ok) throw new Error('network error: HTTP ' + r.status + ' for ' + abs); return r.text(); });
+}
+// everything a worker script needs from the network before it can start: itself and (recursively) importScripts('literals')
+function loadWorkerScripts(abs, depth, texts) {
+    if (texts.has(abs)) return Promise.resolve();
+    texts.set(abs, null);
+    return fetchScriptText(abs).then(text => {
+        texts.set(abs, text);
+        if (depth > 8) return;
+        const subs = [];
+        for (const u of importScriptsList(text)) { const r = W.resolve(u, abs) || u; subs.push(loadWorkerScripts(r, depth + 1, texts).catch(() => {})); }
+        return Promise.all(subs);
+    });
+}
+
+const WORKERS = new Set();
+function makeWorkerScope(Kind, abs, name, hooks) {
+    const timers = new Set();
+    const scope = Object.create(Kind.prototype);
+    const u = new URL(abs);
+    const loc = { href: u.href, origin: u.origin, protocol: u.protocol, host: u.host, hostname: u.hostname, port: u.port, pathname: u.pathname, search: u.search, hash: u.hash, toString() { return u.href; } };
+    const nav = { userAgent: navigator.userAgent, language: navigator.language, languages: navigator.languages, onLine: true, hardwareConcurrency: navigator.hardwareConcurrency,
+        platform: navigator.platform, appVersion: navigator.appVersion, locks: navigator.locks, storage: navigator.storage, permissions: navigator.permissions };
+    const def = (k, v) => Object.defineProperty(scope, k, { value: v, writable: true, configurable: true, enumerable: true });
+    for (const k of WORKER_HIDE) def(k, undefined);
+    for (const k of WORKER_SHARE) if (G[k] !== undefined) def(k, G[k]);
+    def('self', scope); def('globalThis', scope); def('name', name || ''); def('location', loc); def('navigator', nav);
+    def('Worker', G.Worker); def('SharedWorker', undefined);
+    def('WorkerGlobalScope', WorkerGlobalScope); def(Kind.name, Kind);
+    const guard = f => typeof f === 'function' ? (...x) => { try { f(...x); } catch (e) { hooks.error(e); } } : f;
+    def('setTimeout', (f, ms, ...a) => { const id = setTimeout(typeof f === 'function' ? (...x) => { timers.delete(id); guard(f)(...x); } : f, ms, ...a); timers.add(id); return id; });
+    def('setInterval', (f, ms, ...a) => { const id = setInterval(guard(f), ms, ...a); timers.add(id); return id; });
+    def('clearTimeout', id => { timers.delete(id); clearTimeout(id); });
+    def('clearInterval', id => { timers.delete(id); clearInterval(id); });
+    def('fetch', (i, o) => fetch(i instanceof Request ? i : new URL(String(i), abs).href, o));
+    def('close', () => hooks.close());
+    def('postMessage', (d, t) => hooks.post(d, t));
+    def('importScripts', (...urls) => { for (const x of urls) hooks.importScript(String(x)); });
+    def('onerror', null);
+    hidden(scope, '_timers', timers);
+    return scope;
+}
+// ECMAScript intrinsics a worker script may name (everything else it reads from the scope object or is undefined)
+const WORKER_INTRINSICS = new Set(('Object Function Array String Number Boolean Symbol BigInt Math JSON Date RegExp Error TypeError RangeError SyntaxError ReferenceError EvalError URIError ' +
+    'AggregateError Map Set WeakMap WeakSet WeakRef FinalizationRegistry Promise Proxy Reflect ArrayBuffer SharedArrayBuffer DataView Int8Array Uint8Array Uint8ClampedArray Int16Array ' +
+    'Uint16Array Int32Array Uint32Array Float32Array Float64Array BigInt64Array BigUint64Array Atomics Iterator isNaN isFinite parseInt parseFloat encodeURI encodeURIComponent ' +
+    'decodeURI decodeURIComponent escape unescape eval NaN Infinity undefined').split(' '));
+const workerHandler = {
+    has(t, k) { return typeof k === 'string' && k !== 'arguments'; },
+    get(t, k) {
+        if (typeof k !== 'string') return undefined;
+        if (k in t) {
+            const v = Reflect.get(t, k, t);
+            // methods inherited from EventTarget must run on the scope, not on the proxy the `with` hands them
+            return typeof v === 'function' && !Object.prototype.hasOwnProperty.call(t, k) ? v.bind(t) : v;
+        }
+        return WORKER_INTRINSICS.has(k) ? G[k] : undefined;
+    },
+    set(t, k, v) { return Reflect.set(t, k, v, t); },
+    deleteProperty(t, k) { return Reflect.deleteProperty(t, k); },
+};
+function runInWorkerScope(scope, src, filename) {
+    // Every identifier lookup of the script passes the proxy first (so assignments to undeclared names and top-level `var`s land on the
+    // scope, never on the page); let/const/class/function declared in the script's block are found before it. Those are exported to the
+    // scope after the run, for the importScripts() scripts that follow.
+    const names = topLevelNames(src);
+    const exp = names.length ? '\n;' + names.map(n => 'try{__x(' + JSON.stringify(n) + ',' + n + ')}catch(e){}').join('') : '';
+    const fn = new Function('__s', 'with (__s) {\n' + src + exp + '\n}\n//# sourceURL=' + filename);
+    if (!scope._px) hidden(scope, '_px', new Proxy(scope, workerHandler));
+    hidden(scope, '__x', (k, v) => { if (v !== undefined) Object.defineProperty(scope, k, { value: v, writable: true, configurable: true, enumerable: true }); });
+    fn.call(scope, scope._px);
+}
+
+class AbstractWorker extends EventTarget { }
+class Worker extends AbstractWorker {
+    constructor(url, opts) {
+        if (arguments.length === 0) throw new TypeError("Failed to construct 'Worker': 1 argument required, but only 0 present.");
+        super();
+        const abs = W.resolve(String(url)) || String(url);
+        if (opts && opts.type === 'module') throw new DOMException("Failed to construct 'Worker': module workers are not supported", 'NotSupportedError');
+        if (!/^(blob|data):/i.test(abs) && new URL(abs).origin !== location.origin)
+            throw new DOMException("Failed to construct 'Worker': Script at '" + abs + "' cannot be accessed from origin '" + location.origin + "'.", 'SecurityError');
+        hidden(this, '_dead', false); hidden(this, '_inbox', []); hidden(this, '_scope', null); hidden(this, '_ready', false);
+        this.onmessage = null; this.onerror = null; this.onmessageerror = null;
+        const texts = new Map();
+        const self = this;
+        const hooks = {
+            post(d) { const c = structuredClone(d); setTimeout(() => { if (!self._dead) dispatch(self, new MessageEvent('message', { data: c, origin: '' })); }, 0); },
+            close() { self.terminate(); },
+            error(e) { fail(e); },
+            importScript(u) {
+                const r = W.resolve(u, abs) || u, text = texts.get(r);
+                if (text === undefined || text === null) throw new DOMException("Failed to execute 'importScripts' on 'WorkerGlobalScope': The script at '" + r + "' failed to load (only literal importScripts URLs are supported).", 'NetworkError');
+                runInWorkerScope(self._scope, text, r);
+            },
+        };
+        const fail = e => {
+            if (self._dead) return;
+            const ev = new ErrorEvent('error', { message: String(e && e.message || e), filename: abs, error: e });
+            W.log(3, 'Worker ' + abs + ': ' + String(e && e.message || e));
+            dispatch(self, ev);
+        };
+        loadWorkerScripts(abs, 0, texts).then(() => {
+            if (self._dead) return;
+            const scope = makeWorkerScope(DedicatedWorkerGlobalScope, abs, opts && opts.name, hooks);
+            self._scope = scope;
+            try { runInWorkerScope(scope, texts.get(abs), abs); } catch (e) { fail(e); }
+            self._ready = true;
+            for (const d of self._inbox.splice(0)) self._deliver(d);
+        }, fail);
+        WORKERS.add(this);
+    }
+    _deliver(d) {
+        const scope = this._scope;
+        setTimeout(() => {
+            if (this._dead) return;
+            try { dispatch(scope, new MessageEvent('message', { data: structuredClone(d), origin: '' })); } catch (e) { report(e, 'worker message'); }
+        }, 0);
+    }
+    postMessage(d, transfer) {
+        if (arguments.length === 0) throw new TypeError("Failed to execute 'postMessage' on 'Worker': 1 argument required, but only 0 present.");
+        const c = structuredClone(d);
+        if (this._dead) return;
+        if (this._ready) this._deliver(c); else this._inbox.push(c);
+    }
+    terminate() {
+        this._dead = true;
+        WORKERS.delete(this);
+        if (this._scope) for (const id of this._scope._timers) { clearTimeout(id); clearInterval(id); }
+    }
+}
+defineHandlers(Worker.prototype);
+const SHARED = new Map();
+class SharedWorker extends AbstractWorker {
+    constructor(url, opts) {
+        if (arguments.length === 0) throw new TypeError("Failed to construct 'SharedWorker': 1 argument required, but only 0 present.");
+        super();
+        const abs = W.resolve(String(url)) || String(url);
+        const name = typeof opts === 'string' ? opts : (opts && opts.name) || '';
+        if (!/^(blob|data):/i.test(abs) && new URL(abs).origin !== location.origin)
+            throw new DOMException("Failed to construct 'SharedWorker': Script at '" + abs + "' cannot be accessed from origin '" + location.origin + "'.", 'SecurityError');
+        const key = abs + '\n' + name;
+        let sw = SHARED.get(key);
+        const ch = new MessageChannel();
+        this.port = ch.port1;
+        if (!sw) {
+            sw = { scope: null, queue: [], ready: false };
+            SHARED.set(key, sw);
+            const texts = new Map();
+            const hooks = { post() {}, close() {}, error(e) { W.log(3, 'SharedWorker ' + abs + ': ' + String(e && e.message || e)); }, importScript(u) { const r = W.resolve(u, abs) || u, t = texts.get(r); if (t == null) throw new DOMException('importScripts: not preloaded', 'NetworkError'); runInWorkerScope(sw.scope, t, r); } };
+            loadWorkerScripts(abs, 0, texts).then(() => {
+                sw.scope = makeWorkerScope(SharedWorkerGlobalScope, abs, name, hooks);
+                try { runInWorkerScope(sw.scope, texts.get(abs), abs); } catch (e) { report(e, 'SharedWorker'); }
+                sw.ready = true;
+                for (const p of sw.queue.splice(0)) connectShared(sw, p);
+            }, e => W.log(3, 'SharedWorker ' + abs + ': ' + String(e && e.message || e)));
+        }
+        if (sw.ready) connectShared(sw, ch.port2); else sw.queue.push(ch.port2);
+    }
+}
+function connectShared(sw, port) {
+    setTimeout(() => { const ev = new MessageEvent('connect', { ports: [port] }); dispatch(sw.scope, ev); }, 0);
+}
+for (const C of [Worker, SharedWorker, WorkerGlobalScope, DedicatedWorkerGlobalScope, SharedWorkerGlobalScope, AbstractWorker])
+    Object.defineProperty(G, C.name, { value: C, writable: true, configurable: true, enumerable: false });
+
+// ---------------------------------------------------------------- windows of other frames: window.parent / top, iframe.contentWindow
+// Frames are separate documents with their own realms, so another frame's window is a RemoteWindow: it carries postMessage()
+// (routed by the shell to the other realm) and the identity properties; its document and script objects are not reachable.
+const FRAME_DEPTH = W.frameDepth();
+const REMOTE_TOKEN = {};
+const REMOTES = new WeakMap();
+class RemoteWindow {
+    constructor(tok, kind, node) {
+        if (tok !== REMOTE_TOKEN) illegal();
+        hidden(this, '_kind', kind); hidden(this, '_node', node);
+    }
+    postMessage(msg, opts, transfer) {
+        if (arguments.length === 0) throw new TypeError("Failed to execute 'postMessage' on 'Window': 1 argument required, but only 0 present.");
+        let target = opts && typeof opts === 'object' && !Array.isArray(opts) ? opts.targetOrigin : opts;
+        if (target === undefined) target = '/';
+        target = String(target);
+        if (target !== '*' && target !== '/') {
+            let u = null;
+            try { u = new URL(target); } catch (e) { /* below */ }
+            if (!u || u.origin === 'null') throw new DOMException("Failed to execute 'postMessage' on 'Window': Invalid target origin '" + target + "' in a call to 'postMessage'.", 'SyntaxError');
+            target = u.origin;
+        } else if (target === '/') target = location.origin;
+        const data = xser(msg);
+        W.postFrameMsg(this._kind, this._node === null ? -1 : this._node, data, target);
+    }
+    get closed() { return false; }
+    get length() { return 0; }
+    get window() { return this; }
+    get self() { return this; }
+    get parent() { return FRAME_DEPTH > 0 ? remoteWindow(0, null) : G; }
+    get top() { return FRAME_DEPTH > 0 ? remoteWindow(1, null) : G; }
+    get opener() { return null; }
+    get frames() { return this; }
+    get location() { throw new DOMException("Blocked a frame from accessing a cross-origin frame.", 'SecurityError'); }
+    get document() { throw new DOMException("Blocked a frame from accessing a cross-origin frame.", 'SecurityError'); }
+    focus() {}
+    blur() {}
+    close() {}
+}
+Object.defineProperty(RemoteWindow.prototype, Symbol.toStringTag, { value: 'Window', configurable: true });
+function remoteWindow(kind, el) {
+    if (kind === 2) {
+        let r = REMOTES.get(el);
+        if (!r) REMOTES.set(el, r = new RemoteWindow(REMOTE_TOKEN, 2, el));
+        return r;
+    }
+    const key = kind === 0 || FRAME_DEPTH === 1 ? PARENT_KEY : TOP_KEY;
+    let r = REMOTES.get(key);
+    if (!r) REMOTES.set(key, r = new RemoteWindow(REMOTE_TOKEN, kind, null));
+    return r;
+}
+const PARENT_KEY = {}, TOP_KEY = {};
+// structured clone across realms: a tagged JSON text
+function xser(v) {
+    let budget = 20000;
+    const enc = (x, d) => {
+        if (--budget < 0 || d > 200) throw new DOMException('The object could not be cloned (too large or cyclic).', 'DataCloneError');
+        switch (typeof x) {
+        case 'undefined': return { $: 'u' };
+        case 'boolean': case 'string': return x;
+        case 'number': return Number.isFinite(x) && !Object.is(x, -0) ? x : { $: 'n', v: Object.is(x, -0) ? '-0' : String(x) };
+        case 'bigint': return { $: 'i', v: String(x) };
+        case 'function': case 'symbol': throw new DOMException('could not be cloned.', 'DataCloneError');
+        }
+        if (x === null) return null;
+        if (x instanceof Date) return { $: 'D', v: x.getTime() };
+        if (x instanceof RegExp) return { $: 'R', s: x.source, f: x.flags };
+        if (x instanceof Map) return { $: 'M', v: Array.from(x, ([k, y]) => [enc(k, d + 1), enc(y, d + 1)]) };
+        if (x instanceof Set) return { $: 'S', v: Array.from(x, y => enc(y, d + 1)) };
+        if (x instanceof ArrayBuffer) return { $: 'B', v: btoa(bytesToBinary(new Uint8Array(x))) };
+        if (ArrayBuffer.isView(x)) return { $: 'V', t: x.constructor.name, v: btoa(bytesToBinary(new Uint8Array(x.buffer, x.byteOffset, x.byteLength))) };
+        if (x instanceof Blob) return { $: 'L', t: x.type, v: btoa(bytesToBinary(x._b)) };
+        if (x instanceof Error) return { $: 'E', n: x.name, m: x.message, s: x.stack };
+        if (x instanceof Node || x instanceof Window) throw new DOMException('could not be cloned.', 'DataCloneError');
+        if (Array.isArray(x)) { const a = []; for (let i = 0; i < x.length; i++) a.push(enc(x[i], d + 1)); return a; }
+        const o = {};
+        for (const k of Object.keys(x)) o[k] = enc(x[k], d + 1);
+        return Object.prototype.hasOwnProperty.call(o, '$') ? { $: 'O', v: o } : o;
+    };
+    return JSON.stringify(enc(v, 0));
+}
+function xdes(text) {
+    const b64 = s => { const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u; };
+    const dec = x => {
+        if (x === null || typeof x !== 'object') return x;
+        if (Array.isArray(x)) return x.map(dec);
+        switch (x.$) {
+        case 'u': return undefined;
+        case 'n': return x.v === '-0' ? -0 : +x.v;
+        case 'i': return BigInt(x.v);
+        case 'D': return new Date(x.v);
+        case 'R': return new RegExp(x.s, x.f);
+        case 'M': return new Map(x.v.map(([k, y]) => [dec(k), dec(y)]));
+        case 'S': return new Set(x.v.map(dec));
+        case 'B': return b64(x.v).buffer;
+        case 'V': { const u = b64(x.v), C = G[x.t] || Uint8Array; return new C(u.buffer, 0, u.length / (C.BYTES_PER_ELEMENT || 1)); }
+        case 'L': return new Blob([b64(x.v)], { type: x.t });
+        case 'E': { const E = G[x.n] && G[x.n].prototype instanceof Error ? G[x.n] : Error; const e = new E(x.m); if (x.s) try { e.stack = x.s; } catch (_) {} return e; }
+        case 'O': { const o = {}; for (const k of Object.keys(x.v)) o[k] = dec(x.v[k]); return o; }
+        }
+        const o = {};
+        for (const k of Object.keys(x)) o[k] = dec(x[k]);
+        return o;
+    };
+    return dec(JSON.parse(text));
+}
+// the shell delivers a message from another frame
+function onFrameMessage(data, fromOrigin, targetOrigin, srcKind, srcEl) {
+    const own = location.origin;
+    if (targetOrigin !== '*' && targetOrigin !== own) return;           // addressed to another origin: dropped, as a browser does
+    let v;
+    try { v = xdes(data); } catch (e) { dispatch(G, new MessageEvent('messageerror', { origin: fromOrigin })); return; }
+    const source = srcKind === 2 && srcEl ? remoteWindow(2, srcEl) : remoteWindow(0, null);
+    dispatch(G, new MessageEvent('message', { data: v, origin: fromOrigin, source }));
+}
+accessor(HTMLIFrameElement.prototype, 'contentWindow', function () { return this.isConnected && this.getAttribute('src') ? remoteWindow(2, this) : null; });
+
 // window properties
 function Window() { illegal(); }
 Window.prototype = Object.create(EventTarget.prototype, { constructor: { value: Window, writable: true, configurable: true } });
@@ -4955,6 +5388,10 @@ accessor(G, 'screenTop', () => 0);
 accessor(G, 'event', () => undefined);
 Object.setPrototypeOf(G, Window.prototype);
 defineHandlers(G);
+if (FRAME_DEPTH > 0) {          // an <iframe> document: its parent and top windows are other realms
+    Object.defineProperty(G, 'parent', { get: () => remoteWindow(0, null), configurable: true, enumerable: true });
+    Object.defineProperty(G, 'top', { get: () => remoteWindow(1, null), configurable: true, enumerable: true });
+}
 // ---------------------------------------------------------------- Intl (en-US, UTC)
 // ojs ships no Intl: a compact en-US implementation of the parts pages
 // use (dates, relative times, numbers, plurals, lists).
@@ -5286,5 +5723,5 @@ function activate(el) {
 
 // hide the natives; freeze what pages must not break
 return { dispatch, uiEvent, onFetch, nextDue, runDue, runFrame, fireDCL, fireLoad, setReady, scriptEvent, imageEvent,
-         protoFor, report, moChildList, ceConnect, ceUpgradeTree, dispatchClick, observersCheck };
+         protoFor, report, moChildList, ceConnect, ceUpgradeTree, dispatchClick, observersCheck, onFrameMessage };
 })

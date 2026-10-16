@@ -82,7 +82,35 @@ int ojs_snprintf(char* out, int cap, const char* fmt, ...) {
 
 jv err_new(ojs* J, int ne, jv message);     // b_error.c (ne < 0: plain Error)
 
+#if !defined(KERNEL) || !KERNEL
+// host debugging: OJS_TRACE_THROW=1 prints every exception when it is thrown, caught or not (which web API did a script
+// probe and find missing?); OJS_TRACE_THROW=2 also prints the first stack lines
+#include <stdlib.h>
+#include <stdio.h>
+char* ojs_describe(ojs* J, jv v);
+void ojs_free_cstring(ojs* J, char* s);
+static void trace_throw(ojs* J, jv v) {
+    static int mode = -1, busy;
+    if (mode < 0) { const char* e = getenv("OJS_TRACE_THROW"); mode = e ? atoi(e) : 0; }
+    if (!mode || busy) return;
+    busy = 1;
+    jv saved = J->exc; int had = J->has_exc;
+    char* d = ojs_describe(J, v);
+    J->exc = saved; J->has_exc = had;
+    if (d) {
+        int lines = 0;
+        for (char* p = d; *p; p++) if (*p == '\n' && ++lines == (mode > 1 ? 4 : 1)) { *p = 0; break; }
+        fprintf(stderr, "THROW %s\n", d);
+        ojs_free_cstring(J, d);
+    }
+    busy = 0;
+}
+#endif
+
 jv ojs_throw(ojs* J, jv v) {
+#if !defined(KERNEL) || !KERNEL
+    trace_throw(J, v);
+#endif
     J->exc = v;
     J->has_exc = 1;
     return JV_EXC;

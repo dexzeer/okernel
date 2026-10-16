@@ -54,12 +54,14 @@ struct wjs_dyn {
 struct wmedia;               // media sessions (wjs_media.c)
 struct wcvs;                 // canvases (wjs_canvas.c)
 
+#define WJS_MQ_MAX 16          // outgoing frame messages waiting for the shell
 struct wjs {
     struct wdoc* doc;
     struct wdom* d;
     ojs* J;                  // the realm (NULL: not created / failed)
     // values below are GC roots (registered in wjs_new)
     ojsv hooks;              // object returned by the prelude
+    ojsv h_msg;              // prelude hook: a message from another frame arrived (data, origin, kind, node)
     ojsv h_dispatch, h_ui, h_fetch, h_nextdue, h_rundue, h_frame, h_dcl, h_load,
          h_script, h_image, h_proto, h_report, h_mo, h_click, h_ready, h_obs;
     int obs_active;          // the page has Resize/IntersectionObserver targets (the prelude says so: W.obsActive)
@@ -108,6 +110,9 @@ struct wjs {
     int focus_set;
     int hist_delta;
     int submit_form, submit_btn;
+    // window.postMessage between frames: outgoing messages wait here for the shell to route them
+    struct { int kind, node; char* origin; char* data; int len; } mq[WJS_MQ_MAX];
+    int nmq;
     struct wmedia* media;    // WM_MAX sessions, lazily allocated
     struct wcvs* canvas;     // 2D canvases (wjs_canvas.c), lazily allocated
     // stats

@@ -68,6 +68,13 @@ void wjs_media_tick(struct wjs* js);         // advance the sessions (decode, au
 int  wjs_media_active(struct wjs* js);       // something is playing: keep the main loop running
 int  wjs_media_any(struct wjs* js);          // sessions exist (loading, paused...): poll them now and then
 
+// Frames: window.postMessage across <iframe> documents. A script's outgoing message is taken by the shell
+// (kind 0 = to the parent, 1 = to the top document, 2 = to the child frame whose <iframe> element is `node`),
+// delivered to the other realm, and shown there as a MessageEvent whose source is the sending frame.
+int  wjs_take_message(struct wjs* js, int* kind, int* node, char* origin, int ocap, char** data, int* len);   // data: w_malloc'ed (w_free it)
+// src_kind: 0 = the message comes from the parent/top, 2 = from the child frame at <iframe> node src_node.
+int  wjs_deliver_message(struct wjs* js, const char* data, int len, const char* from_origin, const char* target_origin, int src_kind, int src_node);
+
 // Stats line for diagnostics ("scripts=.. errors=.. heap=..KB").
 void wjs_stats(struct wjs* js, char* out, int cap);
 

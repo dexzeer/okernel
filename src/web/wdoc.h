@@ -30,6 +30,8 @@ struct wdoc_hit {
 };
 
 struct wdoc* wdoc_new(void);
+void wdoc_set_frame(struct wdoc* d, int depth);   // nesting depth of an <iframe> document (0 = top level); set right after wdoc_new
+int  wdoc_frame_depth(struct wdoc* d);
 void wdoc_free(struct wdoc* d);
 // Parse a document. charset: from the HTTP Content-Type (may be NULL).
 int  wdoc_load(struct wdoc* d, const char* url, const char* html, int len, const char* charset);
