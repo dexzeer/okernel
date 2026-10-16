@@ -612,6 +612,7 @@ static void shell_execute_run(int win_id, const char *rest) {
     }
 }
 
+void timekeeping_test_drop(uint32_t n);   // timer interrupts lost on purpose (see on_timer)
 static void shell_execute(int win_id, const char* input);
 
 static volatile int gfxsum_pending, gfxsum_y0, gfxsum_y1;
@@ -956,6 +957,12 @@ static void shell_execute(int win_id, const char* input) {
             window_puts(win_id, "...\n");
             dns_resolve(args);
         }
+    }
+    else if (str_eq(cmd_buf, "tickdrop")) {
+        uint32_t n = 0;
+        for (const char* a = args; *a >= '0' && *a <= '9'; a++) n = n * 10 + (uint32_t)(*a - '0');
+        timekeeping_test_drop(n);
+        window_puts(win_id, n ? "losing timer interrupts (test)\n" : "timer interrupts normal\n");
     }
     else if (str_eq(cmd_buf, "memtouch")) {
         // How much does the FIRST write to a page of RAM cost? (a hypervisor backs guest memory lazily: one trap per 4 KB page)
@@ -1561,8 +1568,35 @@ static void on_keypress(char c, int alt) {
     }
 }
 
+// The 100 Hz tick counter is the kernel's clock (Date.now(), timers, timeouts, the clock in the taskbar). QEMU on Windows delivers its PIT
+// interrupts from a host timer of coarse resolution and loses some when the host is busy: the kernel clock was measured 15% slow (the media
+// clock, which follows the sound card, ran 1.18 s per kernel second), so every page timer and everything YouTube compares against the
+// media time ran slow. The interrupt count is therefore only a lower bound: when the TSC says more time has passed, the counter jumps to it.
+static uint64_t tk_tsc0;
+static uint32_t tk_div;                  // TSC cycles per tick (0 = TSC not used)
+static uint32_t pit_ticks, tk_base, tk_lost_logged, tk_irq;
+static uint32_t tk_test_drop;            // shell `tickdrop N`: lose every Nth timer interrupt (what a busy host does to QEMU), to test the correction
+void timekeeping_test_drop(uint32_t n) { tk_test_drop = n; }
+static void timekeeping_init(void) {
+    uint32_t mhz = cpufreq_tsc_mhz();
+    if (!mhz || !cpufreq_tsc_reliable()) return;
+    tk_tsc0 = rdtsc_now();
+    tk_div = mhz * 10000u;
+    pit_ticks = tk_base = tick_count;
+}
+
 static void on_timer(void) {
-    tick_count++;
+    if (!(tk_test_drop && ++tk_irq % tk_test_drop == 0)) pit_ticks++;
+    uint32_t now_tick = pit_ticks;
+    if (tk_div) {
+        uint32_t want = tk_base + (uint32_t)((rdtsc_now() - tk_tsc0) / tk_div);
+        if ((int32_t)(want - now_tick) > 0) now_tick = want;
+        if (!((now_tick / 100) % 10) && now_tick / 100 != tk_lost_logged && now_tick - pit_ticks > 20) {   // every 10 s: how much did the interrupts lose
+            tk_lost_logged = now_tick / 100;
+            serial_printf("[time] %u of %u ticks were not delivered (%u%%)\n", now_tick - pit_ticks, now_tick, (now_tick - pit_ticks) * 100 / now_tick);
+        }
+    }
+    tick_count = now_tick;
     audio_tick();           // HD Audio play position (no-op without audio)
     // Scheduler tick FIRST (cheap, runs at IRQ): count down the running
     // user process's slice and round-robin on expiry. No-op when only the
@@ -1799,6 +1833,7 @@ void kernel_main(uint32_t mboot_phys) {
     // Wake the other CPUs (they only run smp_parallel_for jobs). Interrupts are
     // still off; the PIT is programmed, so the boot CPU's tick is unaffected.
     cpufreq_init();    // measure the core clock and request the top ratio (Atom); the other CPUs repeat the request as they start
+    timekeeping_init();   // from here the tick counter cannot fall behind the TSC (see on_timer)
     wjs_host.budget_scale = cpufreq_slow_factor();   // a slow CPU gets proportionally longer script time budgets
     smp_init();
     audio_init();      // HD Audio output (QEMU: -device intel-hda -device hda-output); failure leaves the system silent

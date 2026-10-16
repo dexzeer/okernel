@@ -204,6 +204,18 @@ void cpufreq_report(char* buf, int cap) {
 
 uint32_t cpufreq_mhz(void) { return core_mhz; }
 uint32_t cpufreq_tsc_mhz(void) { return tsc_mhz; }
+
+// May the TSC serve as a wall clock? Under a hypervisor it is the host's steady counter; on real hardware only a CPU that says its
+// TSC is invariant (CPUID 0x80000007 EDX bit 8) keeps one rate through frequency changes and idle states.
+int cpufreq_tsc_reliable(void) {
+    uint32_t a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+    if (c & (1u << 31)) return 1;                       // running under a hypervisor
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000u), "c"(0));
+    if (a < 0x80000007u) return 0;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000007u), "c"(0));
+    return (d >> 8) & 1;
+}
 int cpufreq_slow_factor(void) { return bench_factor; }
 
 
