@@ -431,6 +431,38 @@ NATIVE(n_utf8dec) {
     return ojs_string_len(ctx, s, len);
 }
 
+// postFrameMsg(kind, node, data, targetOrigin): queue a message for the shell to route to another frame
+NATIVE(n_post_frame) {
+    (void)this_val;
+    struct wjs* js = JSX(ctx);
+    int32_t kind = 0, node = -1;
+    if (argc < 4 || ojs_to_int32(ctx, &kind, argv[0]) < 0) return OJS_FALSE;
+    if (ojs_is_object(argv[1])) node = wjs_node_of(js, argv[1]);
+    else if (ojs_to_int32(ctx, &node, argv[1]) < 0) return OJS_FALSE;
+    if (js->nmq >= WJS_MQ_MAX) return OJS_FALSE;
+    size_t dl = 0, ol = 0;
+    const char* d = ojs_to_cstring(ctx, argv[2], &dl);
+    if (!d) return OJS_EXCEPTION;
+    const char* o = ojs_to_cstring(ctx, argv[3], &ol);
+    if (!o) { ojs_free_cstring(ctx, (char*)d); return OJS_EXCEPTION; }
+    int ok = 0;
+    if (dl < (4u << 20) && ol < 512) {
+        char* dm = (char*)w_malloc(dl + 1);
+        char* om = (char*)w_malloc(ol + 1);
+        if (dm && om) {
+            memcpy(dm, d, dl); dm[dl] = 0;
+            memcpy(om, o, ol); om[ol] = 0;
+            int i = js->nmq++;
+            js->mq[i].kind = kind; js->mq[i].node = node; js->mq[i].data = dm; js->mq[i].len = (int)dl; js->mq[i].origin = om;
+            ok = 1;
+        } else { w_free(dm); w_free(om); }
+    }
+    ojs_free_cstring(ctx, (char*)d);
+    ojs_free_cstring(ctx, (char*)o);
+    return ok ? OJS_TRUE : OJS_FALSE;
+}
+NATIVE(n_frame_depth) { (void)this_val; (void)argc; (void)argv; struct wjs* js = JSX(ctx); return ojs_int(js && js->doc ? wdoc_frame_depth(js->doc) : 0); }
+
 static const struct ojs_func_entry env_funcs[] = {
     { "log", n_log, 2 },
     { "now", n_now, 0 },
@@ -446,6 +478,8 @@ static const struct ojs_func_entry env_funcs[] = {
     { "store", n_store, 4 },
     { "cookie", n_cookie, 1 },
     { "random", n_random, 1 },
+    { "postFrameMsg", n_post_frame, 4 },
+    { "frameDepth", n_frame_depth, 0 },
     { "utf8enc", n_utf8enc, 1 },
     { "utf8dec", n_utf8dec, 1 },
 };
@@ -1343,7 +1377,7 @@ struct wjs* wjs_new(struct wdoc* doc) {
     js->t0 = wjs_now();
     js->hooks = OJS_UNDEFINED;
     for (int i = 0; i < 2 * WJS_REJ_MAX; i++) js->rej[i] = OJS_UNDEFINED;
-    ojsv* hv[] = { &js->hooks, &js->h_dispatch, &js->h_ui, &js->h_fetch, &js->h_nextdue, &js->h_rundue, &js->h_frame,
+    ojsv* hv[] = { &js->hooks, &js->h_msg, &js->h_dispatch, &js->h_ui, &js->h_fetch, &js->h_nextdue, &js->h_rundue, &js->h_frame,
                    &js->h_dcl, &js->h_load, &js->h_script, &js->h_image, &js->h_proto, &js->h_report,
                    &js->h_mo, &js->h_click, &js->h_ready, &js->h_obs, &js->proto_svg, &js->proto_svgroot,
                    &js->proto_math, &js->proto_text, &js->proto_comment, &js->proto_doc, &js->proto_frag };
@@ -1410,7 +1444,7 @@ struct wjs* wjs_new(struct wdoc* doc) {
         { &js->h_dcl, "fireDCL" }, { &js->h_load, "fireLoad" }, { &js->h_script, "scriptEvent" },
         { &js->h_image, "imageEvent" }, { &js->h_proto, "protoFor" }, { &js->h_report, "report" },
         { &js->h_mo, "moChildList" }, { &js->h_click, "dispatchClick" }, { &js->h_ready, "setReady" },
-        { &js->h_obs, "observersCheck" } };
+        { &js->h_obs, "observersCheck" }, { &js->h_msg, "onFrameMessage" } };
     for (unsigned i = 0; i < sizeof hk / sizeof hk[0]; i++) {
         ojsv v = ojs_get(ctx, hooks, hk[i].name);
         if (ojs_is_exception(v)) { ojs_take_exception(ctx); v = OJS_UNDEFINED; }
@@ -1441,6 +1475,8 @@ void wjs_free(struct wjs* js) {
         }
     }
 #endif
+    for (int i = 0; i < js->nmq; i++) { w_free(js->mq[i].data); w_free(js->mq[i].origin); }
+    js->nmq = 0;
     // the realm owns every value; freeing it releases them all at once
     wjs_media_free(js);
     wjs_canvas_free(js);
@@ -1678,6 +1714,40 @@ int wjs_event(struct wjs* js, int node, const char* type, int x, int y, int butt
                      ojs_int(y), ojs_int(button), ojs_int(key) };
     ojsv r = call_hook(js, js->h_ui, 6, a, TASK_BUDGET_MS);
     if (prevented && ojs_is_bool(r) && !ojs_to_bool(ctx, r)) *prevented = 1;
+    {
+        ojsv r2 = call_hook(js, js->h_nextdue, 0, 0, TASK_BUDGET_MS);
+        int32_t due = -1;
+        ojs_to_int32(ctx, &due, r2);
+        js->next_due = due;
+    }
+    UNGUARD(js);
+    int f = js->flags;
+    js->flags = 0;
+    return f;
+}
+
+int wjs_take_message(struct wjs* js, int* kind, int* node, char* origin, int ocap, char** data, int* len) {
+    if (!js || js->nmq <= 0) return 0;
+    *kind = js->mq[0].kind;
+    *node = js->mq[0].node;
+    int ol = (int)strlen(js->mq[0].origin);
+    if (ol >= ocap) ol = ocap - 1;
+    memcpy(origin, js->mq[0].origin, (size_t)ol);
+    origin[ol] = 0;
+    *data = js->mq[0].data;
+    *len = js->mq[0].len;
+    w_free(js->mq[0].origin);
+    for (int i = 1; i < js->nmq; i++) js->mq[i - 1] = js->mq[i];
+    js->nmq--;
+    return 1;
+}
+
+int wjs_deliver_message(struct wjs* js, const char* data, int len, const char* from_origin, const char* target_origin, int src_kind, int src_node) {
+    if (!js || js->dead || ojs_is_undefined(js->h_msg)) return 0;
+    GUARD(js, 0);
+    ojs* ctx = js->J;
+    ojsv a[6] = { ojs_string_len(ctx, data, (size_t)len), ojs_string(ctx, from_origin), ojs_string(ctx, target_origin), ojs_int(src_kind), src_kind == 2 && src_node >= 0 ? wjs_wrap(js, src_node) : OJS_NULL, OJS_UNDEFINED };
+    call_hook(js, js->h_msg, 5, a, TASK_BUDGET_MS);
     {
         ojsv r2 = call_hook(js, js->h_nextdue, 0, 0, TASK_BUDGET_MS);
         int32_t due = -1;

@@ -1,0 +1,22 @@
+<!doctype html>
+<html><head><title>pm parent</title></head>
+<body style="margin:8px;background:#eef">
+<h1>postMessage parent</h1>
+<iframe id="f" src="pm_child.html" width="400" height="200"></iframe>
+<script>
+const log = m => console.log('PMP ' + m);
+const f = document.getElementById('f');
+let got = 0;
+window.addEventListener('message', e => {
+    got++;
+    log('got ' + JSON.stringify(e.data) + ' origin=' + e.origin + ' fromFrame=' + (e.source === f.contentWindow));
+    if (e.data && e.data.hello) {
+        // the child is up: send it three messages (one with a wrong target origin: must not arrive)
+        f.contentWindow.postMessage({ n: 1, d: new Date(5), m: new Map([[1, 2]]) }, location.origin);
+        f.contentWindow.postMessage({ n: 'wrong-origin' }, 'http://evil.example');
+        e.source.postMessage({ n: 2 }, '*');
+    }
+});
+log('start top=' + (window.top === window) + ' parent=' + (window.parent === window));
+</script>
+</body></html>

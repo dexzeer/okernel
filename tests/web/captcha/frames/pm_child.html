@@ -1,0 +1,15 @@
+<!doctype html>
+<html><head><title>pm child</title></head>
+<body style="margin:0;background:#fde"><h2>pm child</h2>
+<script>
+const log = m => console.log('PMC ' + m);
+let n = 0;
+log('start framed=' + (window.parent !== window) + ' sameTopParent=' + (window.top === window.parent));
+window.addEventListener('message', e => {
+    n++;
+    log('got ' + JSON.stringify(e.data) + ' origin=' + e.origin + ' ' + (e.data && e.data.d instanceof Date ? 'date=' + e.data.d.getTime() + ' map=' + Array.from(e.data.m).join(';') : ''));
+    if (n === 2) parent.postMessage({ done: n }, '*');
+});
+parent.postMessage({ hello: 1 }, '*');
+</script>
+</body></html>

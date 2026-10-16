@@ -117,7 +117,7 @@ static uint8_t* engine_stack;
 static int in_engine;
 
 enum { JOB_LOAD, JOB_FETCH_DONE, JOB_PAINT, JOB_PAINT_STALE, JOB_HIT, JOB_RECT, JOB_ANCHOR, JOB_INFLATE, JOB_LINKS,
-       JOB_JS_RUN, JOB_JS_EVENT, JOB_ELEM_AT, JOB_FREE, JOB_MEDIA };
+       JOB_JS_RUN, JOB_JS_EVENT, JOB_ELEM_AT, JOB_FREE, JOB_MEDIA, JOB_JS_MESSAGE };
 
 struct job {
     int op;
@@ -170,6 +170,11 @@ static void job_entry(void* p) {
     case JOB_ELEM_AT:
         j->result = wdoc_hit_element(j->doc, j->x, j->y);
         break;
+    case JOB_JS_MESSAGE: {      // a window.postMessage from another frame (data, origins, sender kind/node)
+        struct wjs* js = wdoc_js(j->doc);
+        j->result = js ? wjs_deliver_message(js, j->bytes, j->len, j->url, j->charset, j->x, j->y) : 0;
+        break;
+    }
     case JOB_MEDIA: {
         struct wjs* js = wdoc_js(j->doc);
         j->result = js ? wjs_media_poll(js, j->rects, j->len, &j->nrects) : 0;
@@ -1076,6 +1081,7 @@ static void tab_load_html(int id, int tab, const char* html, int len, const char
     frames_drop_children(id, tab);                    // the frames of the document being replaced
     if (!T->doc) T->doc = wdoc_new();
     if (!T->doc) { serial_puts("[okai] out of memory (wdoc_new)\n"); return; }
+    wdoc_set_frame(T->doc, slot_is_frame(tab) ? T->frame_depth : 0);     // window.parent / window.top exist inside <iframe>s
     wdoc_set_scripting(T->doc, scripts);
     T->js_next_tick = 0;
     T->js_scroll_evt = 0;
@@ -1964,6 +1970,56 @@ static void submit_form_node(int id, struct okai_tab* T, int form, int submitter
 static void navigate_ex(int id, const char* url, int push);
 static void navigate_slot(int id, int slot, const char* url, int push);
 
+// ---- window.postMessage between frames ----
+// A script's outgoing messages (wjs_take_message) are handed to the realm of the frame they address. The receiving
+// realm checks the target origin and builds the MessageEvent; the shell only moves bytes between documents.
+static void js_apply(int id, int tab, int flags);
+static void frames_route_messages(int bi, int slot) {
+    static int depth;
+    struct okai* b = &okais[bi];
+    struct okai_tab* S = &b->tabs[slot];
+    if (!S->doc || depth > 3) return;
+    struct wjs* sjs = wdoc_js(S->doc);
+    if (!sjs) return;
+    int kind, node, guard = 0, len;
+    char target[160], from[160];
+    char* data;
+    depth++;
+    while (guard++ < 8 && wjs_take_message(sjs, &kind, &node, target, sizeof target, &data, &len)) {
+        url_origin(S->url, from, sizeof from);
+        int dst = -1, src_kind = 0, src_node = -1;
+        if (kind == 2) {
+            for (int s2 = OKAI_MAX_TABS; s2 < OKAI_SLOTS; s2++)
+                if (b->tabs[s2].frame_used && b->tabs[s2].parent_slot == slot && b->tabs[s2].parent_node == node) { dst = s2; break; }
+            src_kind = 0;
+        } else if (slot_is_frame(slot)) {
+            dst = kind == 1 ? S->top_tab : S->parent_slot;
+            int cur = slot;
+            while (b->tabs[cur].parent_slot != dst && slot_is_frame(b->tabs[cur].parent_slot)) cur = b->tabs[cur].parent_slot;
+            src_kind = 2;
+            src_node = b->tabs[cur].parent_node;
+        }
+        struct okai_tab* D = dst >= 0 ? &b->tabs[dst] : 0;
+        if (D && D->doc && D->load_state == 1 && wdoc_js(D->doc) && (!slot_is_frame(dst) || D->frame_used)) {
+            struct job j;
+            memset(&j, 0, sizeof j);
+            j.op = JOB_JS_MESSAGE;
+            j.doc = D->doc;
+            j.bytes = data;
+            j.len = len;
+            j.url = from;
+            j.charset = target;
+            j.x = src_kind;
+            j.y = src_node;
+            run_job(&j);
+            js_apply(bi, dst, j.result);
+            D->js_next_tick = 0;
+        }
+        kfree(data);
+    }
+    depth--;
+}
+
 // Apply what a realm entry asked for (WJS_* flags).
 static void js_apply(int id, int tab, int flags) {
     struct okai* b = &okais[id];
@@ -2026,6 +2082,7 @@ static void js_apply(int id, int tab, int flags) {
             }
         }
     }
+    frames_route_messages(id, tab);
 }
 
 // Dispatch a UI event to the page (node -1 = window). Returns 1 when a

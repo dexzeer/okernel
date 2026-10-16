@@ -1,0 +1,58 @@
+<!doctype html><html><body><script>
+const out = []; const T = (n, a, b) => { const ok = JSON.stringify(a) === JSON.stringify(b); out.push((ok ? 'ok ' : 'FAIL ') + n + (ok ? '' : ' got ' + JSON.stringify(a) + ' want ' + JSON.stringify(b))); };
+const wait = ms => new Promise(r => setTimeout(r, ms));
+const ask = (w, msg, ms) => new Promise((res, rej) => { const t = setTimeout(() => rej(new Error('worker timeout')), ms || 2000); w.onmessage = e => { clearTimeout(t); res(e.data); }; w.postMessage(msg); });
+(async () => {
+    // a worker from a blob: environment, globals, structured messages, onmessage assignment
+    const src = [
+        'var counter = 0; let note = "n";',
+        'function bump(n) { counter += n; return counter; }',
+        'onmessage = function (e) {',
+        '  if (e.data.cmd === "env") postMessage({ win: typeof window, doc: typeof document, self: self === globalThis && this === self, sc: typeof importScripts,',
+        '     wgs: self instanceof WorkerGlobalScope, dwgs: self instanceof DedicatedWorkerGlobalScope, loc: location.pathname.slice(-4), ua: typeof navigator.userAgent, name: self.name });',
+        '  else if (e.data.cmd === "bump") postMessage(bump(e.data.n));',
+        '  else if (e.data.cmd === "clone") postMessage({ d: e.data.d.getTime(), m: Array.from(e.data.m), buf: new Uint8Array(e.data.b)[2] });',
+        '  else if (e.data.cmd === "timer") setTimeout(function () { postMessage("late"); }, 20);',
+        '  else if (e.data.cmd === "crypto") crypto.subtle.digest("SHA-256", new TextEncoder().encode("abc")).then(function (h) { postMessage(new Uint8Array(h)[0]); });',
+        '  else if (e.data.cmd === "leak") postMessage(typeof counter + typeof leaked);',
+        '};',
+        'leaked = 1;',
+    ].join('\n');
+    const url = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+    const w = new Worker(url, { name: 'wk' });
+    const env = await ask(w, { cmd: 'env' });
+    T('env details', [env.win, env.doc, env.self, env.sc, env.wgs, env.dwgs, env.ua, env.name], ['undefined', 'undefined', true, 'function', true, true, 'string', 'wk']);
+    T('state in the worker', [await ask(w, { cmd: 'bump', n: 2 }), await ask(w, { cmd: 'bump', n: 3 })], [2, 5]);
+    T('no leak into the page', [typeof counter, typeof bump, typeof onmessage === 'undefined' ? 'u' : typeof window.onmessage, typeof leaked], ['undefined', 'undefined', 'object', 'undefined']);
+    const cl = await ask(w, { cmd: 'clone', d: new Date(77), m: new Map([[1, 2]]), b: new Uint8Array([1, 2, 9]).buffer });
+    T('structured clone both ways', cl, { d: 77, m: [[1, 2]], buf: 9 });
+    T('worker timers', await ask(w, { cmd: 'timer' }), 'late');
+    T('worker crypto', await ask(w, { cmd: 'crypto' }), 0xba);
+    T('top-level var and an undeclared assignment live on the worker scope', await ask(w, { cmd: 'leak' }), 'numbernumber');
+    // terminate: no more answers
+    w.terminate();
+    let got = false; w.onmessage = () => { got = true; }; w.postMessage({ cmd: 'bump', n: 1 }); await wait(60);
+    T('terminate', got, false);
+    // addEventListener + postMessage inside + error event
+    const w2 = new Worker(URL.createObjectURL(new Blob(['addEventListener("message", e => postMessage("echo:" + e.data)); setTimeout(() => { throw new Error("boom"); }, 10);'])));
+    let err = null; w2.onerror = e => { err = e.message; };
+    T('addEventListener in worker', await ask(w2, 'hi'), 'echo:hi');
+    await wait(100);
+    T('errors surface', typeof err, 'string');
+    w2.terminate();
+    // importScripts of a literal URL (served next to the page) and a worker file by URL
+    const w3 = new Worker('worker_main.js');
+    T('worker file + importScripts', await ask(w3, 'go'), ['lib:2', 'main', 3]);
+    w3.terminate();
+    // cross-origin refused, module refused
+    let ce = null; try { new Worker('http://example.org/x.js'); } catch (e) { ce = e.name; }
+    T('cross-origin', ce, 'SecurityError');
+    ce = null; try { new Worker(url, { type: 'module' }); } catch (e) { ce = e.name; }
+    T('module workers refused', ce, 'NotSupportedError');
+    // SharedWorker
+    const sw = new SharedWorker(URL.createObjectURL(new Blob(['var n = 0; onconnect = function (e) { var p = e.ports[0]; p.onmessage = function (m) { n++; p.postMessage(m.data + ":" + n); }; };'])));
+    const sres = await new Promise(r => { sw.port.onmessage = e => r(e.data); sw.port.postMessage('x'); });
+    T('SharedWorker', sres, 'x:1');
+    console.log('RESULT ' + (out.some(l => l.startsWith('FAIL')) ? 'FAIL' : 'ALLPASS') + '\n' + out.join('\n'));
+})().catch(e => console.log('RESULT FAIL ' + e + (e && e.stack) + '\n' + out.join('\n')));
+</script></body></html>

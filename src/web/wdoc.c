@@ -66,6 +66,7 @@ struct wdoc {
     struct wpaint_env env;
     // scripting
     int scripting;          // run page scripts (set before wdoc_load)
+    int frame_depth;        // 0 = top-level document, n = nested n deep inside <iframe>s (window.parent/top exist)
     struct wjs* js;
     int scroll_y;           // last painted scroll (window.scrollY)
     int focus;              // focused control (document.activeElement), -1
@@ -414,6 +415,9 @@ struct wdoc* wdoc_new(void) {
     d->li.for_url = lay_img_url;
     return d;
 }
+
+void wdoc_set_frame(struct wdoc* d, int depth) { if (d) d->frame_depth = depth; }
+int wdoc_frame_depth(struct wdoc* d) { return d ? d->frame_depth : 0; }
 
 static void doc_clear(struct wdoc* d) {
     if (d->js) wjs_free(d->js);   // first: it holds references into the DOM
