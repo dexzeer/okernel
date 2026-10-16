@@ -1860,7 +1860,10 @@ function mediaDecodingInfo(cfg) {
     const v = cfg && cfg.video, a = cfg && cfg.audio;
     if ((v || a) && (!v || mimeKinds(v.contentType) & 2) && (!a || mimeKinds(a.contentType) & 1)) {
         ok = true;
-        smooth = !v || (v.width * v.height <= (levelCap() >= 99 ? 1280 * 720 : levelCap() >= 31 ? 1280 * 720 : levelCap() >= 30 ? 854 * 480 : 480 * 360) && (v.framerate || 30) <= 30);
+        // what plays smoothly: with the video decoded on another CPU, 1080p30 or 720p60; on one CPU 720p30 (less on a slow one)
+        const px = v ? v.width * v.height : 0, fps = (v && v.framerate) || 30, wk = W.worker() && levelCap() >= 99;
+        smooth = !v || (wk ? (fps <= 30 ? px <= 1920 * 1080 : fps <= 60 && px <= 1280 * 720)
+                           : (px <= (levelCap() >= 31 ? 1280 * 720 : levelCap() >= 30 ? 854 * 480 : 480 * 360) && fps <= 30));
     }
     return Promise.resolve({ supported: ok, smooth, powerEfficient: false });
 }
@@ -6538,7 +6541,7 @@ function fireLoad() {
 // C: an external/dynamic <script> finished (fires load/error on the element)
 function scriptEvent(el, ok) { dispatch(el, new Event(ok ? 'load' : 'error')); }
 // C: an <img> finished loading (or failed)
-function imageEvent(el, ok) { dispatch(el, new Event(ok ? 'load' : 'error')); }
+function imageEvent(el, ok) { dispatch(el, new Event(ok ? 'load' : 'error')); }   // also <link rel=stylesheet> (wjs_link_event)
 // C: UI events from the shell
 function uiEvent(target, type, x, y, button, key) {
     let ev;

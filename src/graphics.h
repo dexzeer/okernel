@@ -7,6 +7,7 @@
 // in graphics_init. Everything sizes itself from these; 1920x1080 is only the
 // value used before graphics_init and the mode the wallpaper is authored for.
 extern int gfx_w, gfx_h;
+const char* graphics_display_name(void);     // active display backend ("GRUB framebuffer", "virtio-gpu", ...)
 #define SCREEN_W gfx_w
 #define SCREEN_H gfx_h
 #define SCREEN_W_MAX 4096     // largest mode accepted (static tables use these)

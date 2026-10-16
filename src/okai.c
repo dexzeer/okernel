@@ -3553,7 +3553,10 @@ int okai_wants_cpu(void) {
                 timed = 1;                                        // coalescing delay: wait for it, do not spin
             }
             if (okai_tab_busy(id, t)) io_wait = 1;                // requests in flight: waiting for the network, not for the CPU
-            if (t < OKAI_MAX_TABS && RT->doc && RT->load_state == 1 && !RT->closing && wjs_media_active(wdoc_js(RT->doc))) return 1;
+            if (t < OKAI_MAX_TABS && RT->doc && RT->load_state == 1 && !RT->closing && wjs_media_active(wdoc_js(RT->doc))) {
+                if (wjs_media_relaxed(wdoc_js(RT->doc))) timed = 1;     // the decoder runs elsewhere: a poll every few ms, not every pass
+                else return 1;
+            }
             // page JS with work due right now (js_pump runs it every iteration): the active tab and its frames
             if (slot_is_active(b, t) && RT->doc && RT->load_state == 1 && !RT->closing) {
                 struct wjs* js = wdoc_js(RT->doc);

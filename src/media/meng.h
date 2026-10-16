@@ -67,6 +67,9 @@ void meng_seek(struct meng* m, double seconds);
 void meng_set_volume(struct meng* m, double volume, int muted);
 void meng_set_rate(struct meng* m, double rate);        // 0.25 .. 4 (audio keeps its pitch only at 1)
 void meng_poll(struct meng* m);                         // call often from the main loop
+void meng_set_async(int mode);                         // VP9 decode worker: -1 automatic (a second CPU), 0 off, 1 on (tests); applies to engines created afterwards
+int  meng_have_worker(void);                           // VP9 is decoded on another CPU (a second CPU is running)
+int  meng_relaxed(const struct meng* m);               // polling every few ms is enough (the decode runs on another CPU, or there is no video): the main loop may sleep between polls
 void meng_set_governor(int on);                         // slow CPU: video gets a share of the CPU (cool-down after a long pass, skip to the newest due key frame when a second behind)
 
 // ---- state ----

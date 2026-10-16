@@ -14,7 +14,7 @@ const edge = 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe'
 const port = 9333 + Math.floor(Math.random() * 200);
 const prof = mkdtempSync(join(tmpdir(), 'edge_trace_'));
 const args = ['--remote-debugging-port=' + port, '--user-data-dir=' + prof, '--no-first-run', '--no-default-browser-check',
-    '--disable-extensions', '--disable-quic', '--window-size=1280,800', 'about:blank'];
+    '--disable-extensions', '--disable-quic', '--window-size=' + (process.env.EDGE_SIZE || '1280,800'), 'about:blank'];
 if (process.env.EDGE_PROXY) args.unshift('--proxy-server=' + process.env.EDGE_PROXY);
 if (mode !== 'headed') args.unshift('--headless=new');
 const proc = spawn(edge, args, { stdio: 'ignore' });

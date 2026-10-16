@@ -449,12 +449,34 @@ static void doc_clear(struct wdoc* d) {
 // pending one, or queue a new fetch.
 static void add_sheet_ordered(struct wdoc* d, const char* text, int len, const char* base, int32_t order,
                               const char* media, int mlen);
+static int rel_has(const char* rel, int rl, const char* word);
+static int cur_link_el = -1;      // collect_styles: the <link> whose sheet css_request is asked for (-1: an @import)
+
+// Tell the script realm that every <link rel=stylesheet> pointing at `url` has loaded (ok) or failed.
+static void link_events(struct wdoc* d, const char* url, int ok) {
+    if (!d->js || !d->d) return;
+    struct wdom* dom = d->d;
+    char abs[2048];
+    for (int el = dom->n[0].first; el >= 0; el = wdom_next(dom, el, 0)) {
+        if (dom->n[el].type != WN_ELEM || dom->n[el].ns != NS_HTML || dom->n[el].tag != T_link) continue;
+        int rl, hl;
+        const char* rel = wdom_attr(dom, el, A_rel, &rl);
+        const char* href = wdom_attr(dom, el, A_href, &hl);
+        if (!rel || !href || !rel_has(rel, rl, "stylesheet")) continue;
+        if (wurl_resolve(d->base, href, hl, abs, sizeof abs) <= 0 || strcmp(abs, url)) continue;
+        wjs_link_event(d->js, el, ok);
+    }
+}
+
 static void css_request(struct wdoc* d, const char* url, int32_t order, const char* media, int mlen) {
     for (int i = 0; i < d->nres; i++) {
         struct wres* r = &d->res[i];
         if (r->kind != RES_CSS || strcmp(r->url, url)) continue;
         if (r->state == RS_DONE) {
             if (r->text) add_sheet_ordered(d, r->text, r->tlen, r->url, order, media, mlen);
+            if (cur_link_el >= 0 && d->js) wjs_link_event(d->js, cur_link_el, 1);    // a link added after its sheet was fetched
+        } else if (r->state == RS_FAILED) {
+            if (cur_link_el >= 0 && d->js) wjs_link_event(d->js, cur_link_el, 0);
         } else if (r->state <= RS_INFLIGHT) {
             r->order = order;
             int m = mlen < 95 ? mlen : 95;
@@ -560,7 +582,9 @@ static void collect_styles(struct wdoc* d) {
             int ml;
             const char* media = wdom_attr(dom, el, A_media, &ml);
             if (media && (w_ieq(media, ml, "print") || w_ieq(media, ml, "speech"))) continue;
+            cur_link_el = el;
             css_request(d, abs, idx * 1024, media, media ? ml : 0);
+            cur_link_el = -1;
         }
     }
 }
@@ -787,6 +811,7 @@ void wdoc_fetch_done2(struct wdoc* d, int id, const char* bytes, int len, const 
     }
     if (failed) {
         r->state = RS_FAILED;
+        if (r->kind == RES_CSS) link_events(d, r->url, 0);
         if (r->kind == RES_IMG && r->img >= 0) {
             d->img[r->img].state = 2;
             if (d->js) wjs_image_done(d->js, r->img, 0);
@@ -799,6 +824,7 @@ void wdoc_fetch_done2(struct wdoc* d, int id, const char* bytes, int len, const 
         if (r->text) { memcpy(r->text, bytes, len); r->text[len] = 0; r->tlen = len; }
         add_sheet_ordered(d, bytes, len, r->url, r->order, r->media[0] ? r->media : 0, (int)strlen(r->media));
         d->layout_dirty = 1;
+        link_events(d, r->url, 1);
     } else if (r->img >= 0) {
         img_decode_into(d, r->img, bytes, len);
         d->layout_dirty = 1;

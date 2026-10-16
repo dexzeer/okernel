@@ -46,6 +46,7 @@ int  wjs_fetch_head(struct wjs* js, int res, int status, const char* headers, co
 int  wjs_fetch_chunk(struct wjs* js, int res, const char* data, int len);
 // An image resource finished: fire load/error on <img> elements using it.
 void wjs_image_done(struct wjs* js, int slot, int ok);
+void wjs_link_event(struct wjs* js, int el, int ok);    // a <link rel=stylesheet> finished loading (ok) or failed: queues its load/error event (once per element)
 // Run what is due (scripts in order, timers, animation frames, lifecycle
 // events) within roughly budget_ms. Returns WJS_* flags.
 int  wjs_run(struct wjs* js, int budget_ms);
@@ -70,6 +71,8 @@ int  wjs_take_history(struct wjs* js, int* delta);
 struct wjs_rect { int x, y, w, h, fixed; };
 int  wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout);
 void wjs_media_tick(struct wjs* js);         // advance the sessions (decode, audio feed) from inside a running script
+int  wjs_media_worker(void);                  // video is decoded on another CPU
+int  wjs_media_relaxed(struct wjs* js);      // ...but a poll every few ms is enough (decode on another CPU / audio only)
 int  wjs_media_active(struct wjs* js);       // something is playing: keep the main loop running
 int  wjs_media_any(struct wjs* js);          // sessions exist (loading, paused...): poll them now and then
 

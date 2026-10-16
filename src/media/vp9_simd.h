@@ -13,4 +13,11 @@ int  vp9_simd_ok(void);
 void vp9_simd_filter_h(const uint16_t* src, ptrdiff_t ss, uint16_t* dst, ptrdiff_t ds, int w, int h, const int16_t* k, int maxv);
 void vp9_simd_filter_v(const uint16_t* src, ptrdiff_t ss, uint16_t* dst, ptrdiff_t ds, int w, int h, const int16_t* k, int maxv);
 
+// Loop filter (spec 8.8.5) for one run of EIGHT sample lines along an edge: `q` points at q0 of the first line, `step` is the distance
+// between samples across the edge (1 = a vertical edge), `along` the distance between the lines. fsize: 0 = 4-tap, 1 = up to 8, 2 = up to 16.
+// The thresholds are already scaled to the bit depth. Bit-exact with the scalar filter in vp9_lf.c.
+struct vp9_lf_p { int limit, blimit, thresh, one, lo, hi, off; };
+void vp9_simd_lf_run(uint16_t* q, ptrdiff_t step, ptrdiff_t along, int fsize, const struct vp9_lf_p* P);
+
+
 #endif
