@@ -5328,6 +5328,422 @@ function onFrameMessage(data, fromOrigin, targetOrigin, srcKind, srcEl) {
 }
 accessor(HTMLIFrameElement.prototype, 'contentWindow', function () { return this.isConnected && this.getAttribute('src') ? remoteWindow(2, this) : null; });
 
+// ---------------------------------------------------------------- IndexedDB (in memory, per origin, gone when the tab closes)
+// Databases live in this realm. Transactions run their requests in order on timer ticks and finish (complete / abort) when
+// nothing is queued any more. Keys are numbers, strings, Dates, ArrayBuffers and arrays of those, compared as the spec says.
+const IDB_DBS = new Map();     // name -> { name, version, stores: Map(name -> store model) }
+const idbType = k => typeof k === 'number' ? 1 : k instanceof Date ? 2 : typeof k === 'string' ? 3 : k instanceof ArrayBuffer || ArrayBuffer.isView(k) ? 4 : Array.isArray(k) ? 5 : 0;
+function idbCmp(a, b) {
+    const ta = idbType(a), tb = idbType(b);
+    if (!ta || !tb) throw new DOMException('The parameter is not a valid key.', 'DataError');
+    if (ta !== tb) return ta < tb ? -1 : 1;
+    switch (ta) {
+    case 1: return a < b ? -1 : a > b ? 1 : 0;
+    case 2: { const x = a.getTime(), y = b.getTime(); return x < y ? -1 : x > y ? 1 : 0; }
+    case 3: return a < b ? -1 : a > b ? 1 : 0;
+    case 4: { const x = subtleBytes(a), y = subtleBytes(b), n = Math.min(x.length, y.length); for (let i = 0; i < n; i++) if (x[i] !== y[i]) return x[i] < y[i] ? -1 : 1; return x.length < y.length ? -1 : x.length > y.length ? 1 : 0; }
+    default: { const n = Math.min(a.length, b.length); for (let i = 0; i < n; i++) { const c = idbCmp(a[i], b[i]); if (c) return c; } return a.length < b.length ? -1 : a.length > b.length ? 1 : 0; }
+    }
+}
+function idbValidKey(k, throwing) {
+    const t = idbType(k);
+    let ok = t > 0 && !(t === 1 && k !== k) && !(t === 2 && k.getTime() !== k.getTime());
+    if (ok && t === 5) ok = k.every(x => idbValidKey(x, false));
+    if (!ok && throwing) throw new DOMException('The parameter is not a valid key.', 'DataError');
+    return ok;
+}
+function idbKeyFromPath(v, path) {
+    if (Array.isArray(path)) { const out = []; for (const p of path) { const k = idbKeyFromPath(v, p); if (k === undefined) return undefined; out.push(k); } return out; }
+    if (path === '') return v;
+    let cur = v;
+    for (const part of String(path).split('.')) {
+        if (cur === null || cur === undefined || (typeof cur !== 'object' && typeof cur !== 'string')) return undefined;
+        if (!(part in Object(cur))) { if (part === 'length' && typeof cur === 'string') { cur = cur.length; continue; } return undefined; }
+        cur = cur[part];
+    }
+    return cur;
+}
+function idbInject(v, path, key) {
+    const parts = String(path).split('.');
+    let cur = v;
+    for (let i = 0; i < parts.length - 1; i++) { if (cur[parts[i]] === undefined) cur[parts[i]] = {}; cur = cur[parts[i]]; }
+    cur[parts[parts.length - 1]] = key;
+}
+class IDBKeyRange {
+    constructor() { illegal(); }
+    static only(v) { idbValidKey(v, true); return idbMakeRange(v, v, false, false); }
+    static lowerBound(v, open) { idbValidKey(v, true); return idbMakeRange(v, undefined, !!open, true); }
+    static upperBound(v, open) { idbValidKey(v, true); return idbMakeRange(undefined, v, true, !!open); }
+    static bound(l, u, lo, uo) {
+        idbValidKey(l, true); idbValidKey(u, true);
+        const c = idbCmp(l, u);
+        if (c > 0 || (c === 0 && (lo || uo))) throw new DOMException('The lower key is greater than the upper key.', 'DataError');
+        return idbMakeRange(l, u, !!lo, !!uo);
+    }
+    includes(k) { idbValidKey(k, true); return idbInRange(this, k); }
+}
+function idbMakeRange(lower, upper, lowerOpen, upperOpen) {
+    const r = Object.create(IDBKeyRange.prototype);
+    Object.defineProperties(r, { lower: { value: lower, enumerable: true }, upper: { value: upper, enumerable: true }, lowerOpen: { value: lowerOpen, enumerable: true }, upperOpen: { value: upperOpen, enumerable: true } });
+    return r;
+}
+function idbInRange(r, k) {
+    if (r === undefined || r === null) return true;
+    if (r.lower !== undefined) { const c = idbCmp(k, r.lower); if (c < 0 || (c === 0 && r.lowerOpen)) return false; }
+    if (r.upper !== undefined) { const c = idbCmp(k, r.upper); if (c > 0 || (c === 0 && r.upperOpen)) return false; }
+    return true;
+}
+const idbRange = q => q === undefined || q === null ? null : q instanceof IDBKeyRange ? q : (idbValidKey(q, true), IDBKeyRange.only(q));
+
+class IDBRequest extends EventTarget {
+    constructor() { super(); this.result = undefined; this.error = null; this.source = null; this.transaction = null; this.readyState = 'pending'; this.onsuccess = null; this.onerror = null; }
+}
+class IDBOpenDBRequest extends IDBRequest { constructor() { super(); this.onupgradeneeded = null; this.onblocked = null; } }
+for (const C of [IDBRequest, IDBOpenDBRequest]) defineHandlers(C.prototype);
+for (const n of ['success', 'upgradeneeded', 'blocked', 'versionchange', 'complete']) if (!EVENT_NAMES.includes(n)) EVENT_NAMES.push(n);
+for (const C of [IDBRequest, IDBOpenDBRequest]) defineHandlers(C.prototype);
+
+class IDBTransaction extends EventTarget {
+    constructor(db, names, mode) {
+        super();
+        this.db = db; this.mode = mode; this.error = null; this.durability = 'default';
+        hidden(this, '_aborted', false); hidden(this, '_names', names); hidden(this, '_q', []); hidden(this, '_done', false); hidden(this, '_sched', false); hidden(this, '_undo', []); hidden(this, '_active', true);
+        this.oncomplete = this.onerror = this.onabort = null;
+        setTimeout(() => this._kick(), 0);
+    }
+    get objectStoreNames() { return Object.assign(Array.from(this._names), { contains(n) { return this.includes(n); }, item(i) { return this[i] || null; } }); }
+    objectStore(name) {
+        if (this._done) throw new DOMException('The transaction has finished.', 'InvalidStateError');
+        if (!this._names.includes(String(name))) throw new DOMException("The specified object store was not found.", 'NotFoundError');
+        return new IDBObjectStore(this, this.db._m.stores.get(String(name)));
+    }
+    _add(req, fn) {
+        if (this._done) throw new DOMException('The transaction has finished.', 'TransactionInactiveError');
+        this._q.push({ req, fn });
+        this._kick();
+        return req;
+    }
+    _kick() {
+        if (this._sched || this._done) return;
+        this._sched = true;
+        setTimeout(() => { this._sched = false; this._run(); }, 0);
+    }
+    _run() {
+        if (this._done) return;
+        const job = this._q.shift();
+        if (!job) { this._finish(null); return; }
+        const { req, fn } = job;
+        let res, err = null;
+        try { res = fn(); } catch (e) { err = e instanceof DOMException ? e : new DOMException(String(e && e.message || e), 'UnknownError'); }
+        req.readyState = 'done';
+        this._active = true;
+        if (err) {
+            req.error = err; req.result = undefined;
+            const ev = new Event('error', { bubbles: true, cancelable: true });
+            dispatch(req, ev);
+            if (!ev.defaultPrevented) { this._abort(err); return; }
+        } else {
+            req.result = res;
+            dispatch(req, new Event('success'));
+        }
+        this._active = false;
+        this._kick();
+    }
+    _finish(err) {
+        if (this._done) return;
+        this._done = true;
+        if (err) { for (let i = this._undo.length - 1; i >= 0; i--) this._undo[i](); this.error = err; }
+        this._q.length = 0;
+        dispatch(this, new Event(err === null ? 'complete' : 'abort', { bubbles: err !== null }));
+        if (this._onfinish) this._onfinish();
+    }
+    _abort(err) {
+        if (this._done) return;
+        this._done = true;
+        this._aborted = true;
+        for (let i = this._undo.length - 1; i >= 0; i--) this._undo[i]();
+        this.error = err || null;
+        this._q.length = 0;
+        setTimeout(() => {      // events are asynchronous: a handler assigned right after abort() still sees them
+            if (err) dispatch(this, new Event('error', { bubbles: true }));
+            dispatch(this, new Event('abort', { bubbles: true }));
+            if (this._onfinish) this._onfinish();
+        }, 0);
+    }
+    abort() { if (this._done) throw new DOMException('The transaction has already finished.', 'InvalidStateError'); this._abort(null); }
+    commit() { if (this._done) throw new DOMException('The transaction has already finished.', 'InvalidStateError'); }
+}
+defineHandlers(IDBTransaction.prototype);
+
+function idbStoreModel(name, keyPath, autoInc) { return { name, keyPath, autoInc, recs: [], next: 1, indexes: new Map() }; }
+// records of a store: sorted array of { k, v }; indexes: { name, keyPath, unique, multi }
+const idbFind = (recs, k) => { let lo = 0, hi = recs.length; while (lo < hi) { const mid = (lo + hi) >> 1; if (idbCmp(recs[mid].k, k) < 0) lo = mid + 1; else hi = mid; } return lo; };
+function idbIndexKeys(ix, v) {
+    let k = idbKeyFromPath(v, ix.keyPath);
+    if (k === undefined) return [];
+    if (ix.multi && Array.isArray(k)) { const out = [], seen = []; for (const x of k) if (idbValidKey(x, false) && !seen.some(y => idbCmp(x, y) === 0)) { seen.push(x); out.push(x); } return out; }
+    return idbValidKey(k, false) ? [k] : [];
+}
+class IDBObjectStore {
+    constructor(tx, m) { hidden(this, '_tx', tx); hidden(this, '_m', m); this.transaction = tx; }
+    get name() { return this._m.name; }
+    get keyPath() { return this._m.keyPath; }
+    get autoIncrement() { return this._m.autoInc; }
+    get indexNames() { return Object.assign(Array.from(this._m.indexes.keys()).sort(), { contains(n) { return this.includes(n); } }); }
+    _req() { const r = new IDBRequest(); r.source = this; r.transaction = this._tx; return r; }
+    _write(v, key, noOverwrite) {
+        const tx = this._tx, m = this._m;
+        if (tx.mode === 'readonly') throw new DOMException('The transaction is read-only.', 'ReadOnlyError');
+        let k = key;
+        v = structuredClone(v);
+        if (m.keyPath !== null) {
+            if (key !== undefined) throw new DOMException('The object store uses in-line keys and the key parameter was provided.', 'DataError');
+            k = idbKeyFromPath(v, m.keyPath);
+            if (k === undefined) {
+                if (!m.autoInc) throw new DOMException('Evaluating the object store\'s key path did not yield a value.', 'DataError');
+                k = null;
+            } else idbValidKey(k, true);
+        } else if (key === undefined) { if (!m.autoInc) throw new DOMException('The object store uses out-of-line keys and has no key generator and the key parameter was not provided.', 'DataError'); k = null; }
+        else idbValidKey(k, true);
+        return tx._add(this._req(), () => {
+            let kk = k, bumped = null;
+            if (kk === null) { kk = m.next++; bumped = true; if (m.keyPath !== null) idbInject(v, m.keyPath, kk); }
+            else if (m.autoInc && typeof kk === 'number' && kk >= m.next) { bumped = m.next; m.next = Math.floor(kk) + 1; }
+            const i = idbFind(m.recs, kk), exists = i < m.recs.length && idbCmp(m.recs[i].k, kk) === 0;
+            if (exists && noOverwrite) throw new DOMException('A record with the given key already exists in the object store.', 'ConstraintError');
+            // unique indexes
+            for (const ix of m.indexes.values()) if (ix.unique) for (const ik of idbIndexKeys(ix, v)) for (const r of m.recs) if (r.k !== (exists ? m.recs[i].k : undefined) && idbIndexKeys(ix, r.v).some(x => idbCmp(x, ik) === 0)) throw new DOMException('Unable to add key to index \'' + ix.name + '\': at least one key does not satisfy the uniqueness requirements.', 'ConstraintError');
+            const prev = exists ? m.recs[i] : null;
+            if (exists) m.recs[i] = { k: kk, v }; else m.recs.splice(i, 0, { k: kk, v });
+            tx._undo.push(() => { const j = idbFind(m.recs, kk); if (prev) m.recs[j] = prev; else m.recs.splice(j, 1); if (bumped) m.next = Math.max(1, m.next - 1); });
+            return kk;
+        });
+    }
+    add(v, key) { return this._write(v, key, true); }
+    put(v, key) { return this._write(v, key, false); }
+    get(q) { const r = idbRange(q); if (!r) throw new DOMException('The parameter is not a valid key.', 'DataError'); return this._tx._add(this._req(), () => { const x = this._m.recs.find(x => idbInRange(r, x.k)); return x === undefined ? undefined : structuredClone(x.v); }); }
+    getKey(q) { const r = idbRange(q); if (!r) throw new DOMException('The parameter is not a valid key.', 'DataError'); return this._tx._add(this._req(), () => { const x = this._m.recs.find(x => idbInRange(r, x.k)); return x === undefined ? undefined : x.k; }); }
+    getAll(q, count) { const r = idbRange(q); return this._tx._add(this._req(), () => this._m.recs.filter(x => idbInRange(r, x.k)).slice(0, count || undefined).map(x => structuredClone(x.v))); }
+    getAllKeys(q, count) { const r = idbRange(q); return this._tx._add(this._req(), () => this._m.recs.filter(x => idbInRange(r, x.k)).slice(0, count || undefined).map(x => x.k)); }
+    count(q) { const r = idbRange(q); return this._tx._add(this._req(), () => this._m.recs.filter(x => idbInRange(r, x.k)).length); }
+    delete(q) {
+        if (this._tx.mode === 'readonly') throw new DOMException('The transaction is read-only.', 'ReadOnlyError');
+        const r = idbRange(q);
+        if (!r) throw new DOMException('The parameter is not a valid key.', 'DataError');
+        return this._tx._add(this._req(), () => { const m = this._m, gone = m.recs.filter(x => idbInRange(r, x.k)); m.recs = m.recs.filter(x => !idbInRange(r, x.k)); this._tx._undo.push(() => { m.recs = m.recs.concat(gone).sort((a, b) => idbCmp(a.k, b.k)); }); return undefined; });
+    }
+    clear() {
+        if (this._tx.mode === 'readonly') throw new DOMException('The transaction is read-only.', 'ReadOnlyError');
+        return this._tx._add(this._req(), () => { const m = this._m, old = m.recs; m.recs = []; this._tx._undo.push(() => { m.recs = old; }); return undefined; });
+    }
+    openCursor(q, dir) { return this._cursor(q, dir, true, null); }
+    openKeyCursor(q, dir) { return this._cursor(q, dir, false, null); }
+    _cursor(q, dir, withValue, index) { return idbOpenCursor(this, this._tx, q, dir || 'next', withValue, index); }
+    createIndex(name, keyPath, opts) {
+        const tx = this._tx;
+        if (!tx._upgrade) throw new DOMException('The database is not running a version change transaction.', 'InvalidStateError');
+        name = String(name);
+        if (this._m.indexes.has(name)) throw new DOMException('An index with the specified name already exists.', 'ConstraintError');
+        const ix = { name, keyPath, unique: !!(opts && opts.unique), multi: !!(opts && opts.multiEntry) };
+        if (ix.multi && Array.isArray(keyPath)) throw new DOMException('multiEntry cannot be used with an array key path.', 'InvalidAccessError');
+        for (const r of this._m.recs) if (ix.unique) { const ks = idbIndexKeys(ix, r.v); for (const k of ks) if (this._m.recs.some(o => o !== r && idbIndexKeys(ix, o.v).some(x => idbCmp(x, k) === 0))) throw new DOMException('Unable to add key to index: uniqueness.', 'ConstraintError'); }
+        this._m.indexes.set(name, ix);
+        return new IDBIndex(this, ix);
+    }
+    index(name) { const ix = this._m.indexes.get(String(name)); if (!ix) throw new DOMException("The specified index was not found.", 'NotFoundError'); return new IDBIndex(this, ix); }
+    deleteIndex(name) { if (!this._tx._upgrade) throw new DOMException('The database is not running a version change transaction.', 'InvalidStateError'); if (!this._m.indexes.delete(String(name))) throw new DOMException('The specified index was not found.', 'NotFoundError'); }
+}
+class IDBIndex {
+    constructor(store, ix) { hidden(this, '_s', store); hidden(this, '_ix', ix); this.objectStore = store; }
+    get name() { return this._ix.name; } get keyPath() { return this._ix.keyPath; } get unique() { return this._ix.unique; } get multiEntry() { return this._ix.multi; }
+    _entries(r) {
+        const out = [];
+        for (const x of this._s._m.recs) for (const ik of idbIndexKeys(this._ix, x.v)) if (idbInRange(r, ik)) out.push({ ik, pk: x.k, v: x.v });
+        out.sort((a, b) => idbCmp(a.ik, b.ik) || idbCmp(a.pk, b.pk));
+        return out;
+    }
+    _req() { const r = new IDBRequest(); r.source = this; r.transaction = this._s._tx; return r; }
+    get(q) { const r = idbRange(q); return this._s._tx._add(this._req(), () => { const e = this._entries(r)[0]; return e ? structuredClone(e.v) : undefined; }); }
+    getKey(q) { const r = idbRange(q); return this._s._tx._add(this._req(), () => { const e = this._entries(r)[0]; return e ? e.pk : undefined; }); }
+    getAll(q, n) { const r = idbRange(q); return this._s._tx._add(this._req(), () => this._entries(r).slice(0, n || undefined).map(e => structuredClone(e.v))); }
+    getAllKeys(q, n) { const r = idbRange(q); return this._s._tx._add(this._req(), () => this._entries(r).slice(0, n || undefined).map(e => e.pk)); }
+    count(q) { const r = idbRange(q); return this._s._tx._add(this._req(), () => this._entries(r).length); }
+    openCursor(q, dir) { return idbOpenCursor(this._s, this._s._tx, q, dir || 'next', true, this); }
+    openKeyCursor(q, dir) { return idbOpenCursor(this._s, this._s._tx, q, dir || 'next', false, this); }
+}
+class IDBCursor {
+    constructor() { illegal(); }
+    continue(key) { return this._step(key, 1); }
+    advance(n) { n = Math.trunc(+n); if (!(n > 0)) throw new TypeError("Failed to execute 'advance' on 'IDBCursor': A count argument with value 0 (zero) was passed, but the count argument must be greater than zero."); return this._step(undefined, n); }
+    continuePrimaryKey(key, pk) { return this._step(key, 1, pk); }
+    update(v) {
+        const st = this._store, c = this;
+        if (st._tx.mode === 'readonly') throw new DOMException('The transaction is read-only.', 'ReadOnlyError');
+        if (!this._withValue) throw new DOMException('The cursor is a key cursor.', 'InvalidStateError');
+        return st._tx._add(st._req(), () => {
+            const m = st._m, i = idbFind(m.recs, c._pk), old = m.recs[i];
+            const nv = structuredClone(v);
+            if (m.keyPath !== null && idbCmp(idbKeyFromPath(nv, m.keyPath), c._pk) !== 0) throw new DOMException('The effective key of the object does not match the cursor position.', 'DataError');
+            m.recs[i] = { k: c._pk, v: nv };
+            st._tx._undo.push(() => { m.recs[idbFind(m.recs, c._pk)] = old; });
+            return c._pk;
+        });
+    }
+    delete() {
+        const st = this._store, c = this;
+        if (st._tx.mode === 'readonly') throw new DOMException('The transaction is read-only.', 'ReadOnlyError');
+        return st._tx._add(st._req(), () => { const m = st._m, i = idbFind(m.recs, c._pk); const old = m.recs[i]; m.recs.splice(i, 1); st._tx._undo.push(() => { m.recs.splice(idbFind(m.recs, c._pk), 0, old); }); return undefined; });
+    }
+}
+function idbOpenCursor(store, tx, q, dir, withValue, index) {
+    const r = idbRange(q), req = new IDBRequest();
+    req.source = index || store; req.transaction = tx;
+    const prev = dir === 'prev' || dir === 'prevunique', uniq = dir === 'nextunique' || dir === 'prevunique';
+    const list = () => {
+        if (index) return index._entries(r).map(e => ({ k: e.ik, pk: e.pk, v: e.v }));
+        return store._m.recs.filter(x => idbInRange(r, x.k)).map(x => ({ k: x.k, pk: x.k, v: x.v }));
+    };
+    let snapshot = null, pos = -1;
+    const cursor = Object.create(IDBCursor.prototype);
+    hidden(cursor, '_store', store); hidden(cursor, '_withValue', withValue);
+    cursor.source = index || store; cursor.direction = dir;
+    const place = () => {
+        if (pos < 0 || pos >= snapshot.length) { req.result = null; return false; }
+        const e = snapshot[pos];
+        hidden(cursor, '_pk', e.pk);
+        Object.defineProperty(cursor, 'key', { value: e.k, configurable: true, enumerable: true });
+        Object.defineProperty(cursor, 'primaryKey', { value: e.pk, configurable: true, enumerable: true });
+        if (withValue) Object.defineProperty(cursor, 'value', { value: structuredClone(e.v), configurable: true, enumerable: true });
+        req.result = cursor;
+        return true;
+    };
+    hidden(cursor, '_step', (key, n, pk) => {
+        if (snapshot === null || pos < 0) throw new DOMException('The cursor is being iterated or has iterated past its end.', 'InvalidStateError');
+        hidden(cursor, '_busy', true);
+        req.readyState = 'pending';
+        tx._add(req, () => {
+            const startKey = snapshot[pos].k;
+            for (let step = 0; step < n; step++) {
+                do { pos += 1; } while (pos >= 0 && pos < snapshot.length && ((uniq && idbCmp(snapshot[pos].k, startKey) === 0) || (key !== undefined && (prev ? idbCmp(snapshot[pos].k, key) > 0 : idbCmp(snapshot[pos].k, key) < 0)) ));
+                if (pos < 0 || pos >= snapshot.length) break;
+            }
+            if (!place()) pos = -2;
+            return req.result;
+        });
+        return undefined;
+    });
+    tx._add(req, () => {
+        snapshot = list();
+        if (prev) snapshot.reverse();
+        pos = 0;
+        if (uniq) { const seen = []; snapshot = snapshot.filter(e => { if (seen.some(k => idbCmp(k, e.k) === 0)) return false; seen.push(e.k); return true; }); }
+        if (!place()) pos = -2;
+        return req.result;
+    });
+    return req;
+}
+class IDBDatabase extends EventTarget {
+    constructor(m) {
+        super();
+        hidden(this, '_m', m); hidden(this, '_closed', false); hidden(this, '_open', new Set());
+        this.onabort = this.onclose = this.onerror = this.onversionchange = null;
+    }
+    get name() { return this._m.name; } get version() { return this._m.version; }
+    get objectStoreNames() { return Object.assign(Array.from(this._m.stores.keys()).sort(), { contains(n) { return this.includes(n); }, item(i) { return this[i] || null; } }); }
+    createObjectStore(name, opts) {
+        const tx = this._upgradeTx;
+        if (!tx || tx._done) throw new DOMException('The database is not running a version change transaction.', 'InvalidStateError');
+        name = String(name);
+        if (this._m.stores.has(name)) throw new DOMException('A store with the specified name already exists.', 'ConstraintError');
+        const kp = opts && opts.keyPath !== undefined && opts.keyPath !== null ? opts.keyPath : null, ai = !!(opts && opts.autoIncrement);
+        if (ai && (kp === '' || Array.isArray(kp))) throw new DOMException('The autoIncrement option was set but the keyPath is empty or an array.', 'InvalidAccessError');
+        const m = idbStoreModel(name, kp, ai);
+        this._m.stores.set(name, m);
+        tx._names.push(name);
+        return new IDBObjectStore(tx, m);
+    }
+    deleteObjectStore(name) {
+        const tx = this._upgradeTx;
+        if (!tx || tx._done) throw new DOMException('The database is not running a version change transaction.', 'InvalidStateError');
+        if (!this._m.stores.delete(String(name))) throw new DOMException('The specified object store was not found.', 'NotFoundError');
+        tx._names.splice(tx._names.indexOf(String(name)), 1);
+    }
+    transaction(names, mode) {
+        if (this._closed) throw new DOMException('The database connection is closing.', 'InvalidStateError');
+        names = Array.isArray(names) ? names.map(String) : [String(names)];
+        if (!names.length) throw new DOMException('The storeNames parameter was empty.', 'InvalidAccessError');
+        for (const n of names) if (!this._m.stores.has(n)) throw new DOMException("One of the specified object stores was not found.", 'NotFoundError');
+        const tx = new IDBTransaction(this, names, mode || 'readonly');
+        this._open.add(tx);
+        tx._onfinish = () => this._open.delete(tx);
+        return tx;
+    }
+    close() { this._closed = true; }
+}
+defineHandlers(IDBDatabase.prototype);
+class IDBFactory {
+    constructor() { illegal(); }
+    open(name, version) {
+        name = String(name);
+        if (version !== undefined && (!(+version >= 1) || !Number.isFinite(+version))) throw new TypeError("Failed to execute 'open' on 'IDBFactory': The version provided must be a positive integer.");
+        const req = new IDBOpenDBRequest();
+        setTimeout(() => {
+            let m = IDB_DBS.get(name);
+            const want = version === undefined ? (m ? m.version : 1) : Math.floor(+version);
+            if (m && want < m.version) {
+                req.error = new DOMException('The requested version (' + want + ') is less than the existing version (' + m.version + ').', 'VersionError');
+                req.readyState = 'done';
+                dispatch(req, new Event('error', { bubbles: true, cancelable: true }));
+                return;
+            }
+            const created = !m;
+            if (!m) { m = { name, version: 0, stores: new Map(), conns: new Set() }; IDB_DBS.set(name, m); }
+            const db = new IDBDatabase(m);
+            const finish = () => { m.conns.add(db); req.result = db; req.readyState = 'done'; dispatch(req, new Event('success')); };
+            if (want > m.version) {
+                const old = m.version;
+                for (const c of m.conns) if (!c._closed && c.onversionchange) { try { c.onversionchange(Object.assign(new Event('versionchange'), { oldVersion: old, newVersion: want })); } catch (e) { report(e); } }
+                const tx = new IDBTransaction(db, Array.from(m.stores.keys()), 'versionchange');
+                tx._upgrade = true; db._upgradeTx = tx;
+                const snapshot = JSON.stringify([old]);
+                void snapshot;
+                m.version = want;
+                req.result = db; req.readyState = 'done'; req.transaction = tx;
+                const ev = Object.assign(new Event('upgradeneeded'), { oldVersion: old, newVersion: want });
+                try { dispatch(req, ev); } catch (e) { report(e, 'upgradeneeded'); }
+                tx._onfinish = () => {
+                    db._upgradeTx = null; req.transaction = null;
+                    if (tx.error !== null || tx._aborted) { if (created) IDB_DBS.delete(name); else m.version = old; req.result = undefined; req.error = new DOMException('The upgrade transaction was aborted.', 'AbortError'); dispatch(req, new Event('error', { bubbles: true })); }
+                    else finish();
+                };
+                tx._kick();
+                if (tx._q.length === 0) setTimeout(() => tx._kick(), 0);
+                return;
+            }
+            finish();
+        }, 0);
+        return req;
+    }
+    deleteDatabase(name) {
+        name = String(name);
+        const req = new IDBOpenDBRequest();
+        setTimeout(() => {
+            const m = IDB_DBS.get(name), old = m ? m.version : 0;
+            if (m) { for (const c of m.conns) c._closed = true; IDB_DBS.delete(name); }
+            req.result = undefined; req.readyState = 'done';
+            dispatch(req, Object.assign(new Event('success'), { oldVersion: old, newVersion: null }));
+        }, 0);
+        return req;
+    }
+    databases() { return Promise.resolve(Array.from(IDB_DBS.values(), m => ({ name: m.name, version: m.version }))); }
+    cmp(a, b) { idbValidKey(a, true); idbValidKey(b, true); return idbCmp(a, b); }
+}
+const indexedDBInstance = Object.create(IDBFactory.prototype);
+for (const C of [IDBKeyRange, IDBRequest, IDBOpenDBRequest, IDBTransaction, IDBObjectStore, IDBIndex, IDBCursor, IDBDatabase, IDBFactory])
+    Object.defineProperty(G, C.name, { value: C, writable: true, configurable: true, enumerable: false });
+Object.defineProperty(G, 'indexedDB', { value: indexedDBInstance, writable: true, configurable: true, enumerable: true });
+Object.defineProperty(G, 'IDBCursorWithValue', { value: IDBCursor, writable: true, configurable: true, enumerable: false });
+
 // window properties
 function Window() { illegal(); }
 Window.prototype = Object.create(EventTarget.prototype, { constructor: { value: Window, writable: true, configurable: true } });

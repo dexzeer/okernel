@@ -1,0 +1,95 @@
+<!doctype html><html><body><script>
+const out = []; const T = (n, a, b) => { const ok = JSON.stringify(a) === JSON.stringify(b); out.push((ok ? 'ok ' : 'FAIL ') + n + (ok ? '' : ' got ' + JSON.stringify(a) + ' want ' + JSON.stringify(b))); };
+const rq = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+const done = tx => new Promise((res, rej) => { tx.oncomplete = () => res('complete'); tx.onabort = () => rej(tx.error || new Error('abort')); });
+(async () => {
+    T('keys', [indexedDB.cmp(1, 2), indexedDB.cmp('a', 'b'), indexedDB.cmp(5, 'a'), indexedDB.cmp([1, 2], [1, 3]), indexedDB.cmp(new Date(5), new Date(5))], [-1, -1, -1, -1, 0]);
+    // open + upgrade
+    const open = indexedDB.open('test', 1);
+    let upgraded = null;
+    open.onupgradeneeded = e => {
+        upgraded = [e.oldVersion, e.newVersion];
+        const db = open.result;
+        const s = db.createObjectStore('people', { keyPath: 'id' });
+        s.createIndex('byName', 'name');
+        s.createIndex('byAge', 'age', { unique: false });
+        s.put({ id: 1, name: 'Ann', age: 30 });
+        db.createObjectStore('log', { autoIncrement: true });
+    };
+    const db = await rq(open);
+    T('upgrade', [upgraded, db.name, db.version, Array.from(db.objectStoreNames)], [[0, 1], 'test', 1, ['log', 'people']]);
+    // readwrite transaction
+    let tx = db.transaction(['people', 'log'], 'readwrite');
+    const p = tx.objectStore('people'), l = tx.objectStore('log');
+    p.add({ id: 2, name: 'Bob', age: 25, tags: ['x', 'y'] });
+    p.put({ id: 3, name: 'Cy', age: 30 });
+    const k1 = await rq(l.add('first')), k2 = await rq(l.add('second'));
+    T('autoincrement keys', [k1, k2], [1, 2]);
+    await done(tx);
+    tx = db.transaction('people');
+    const s = tx.objectStore('people');
+    T('get / getAll / count', [await rq(s.get(2)), (await rq(s.getAll())).map(x => x.id), await rq(s.count()), await rq(s.get(99))], [{ id: 2, name: 'Bob', age: 25, tags: ['x', 'y'] }, [1, 2, 3], 3, undefined]);
+    T('ranges', [(await rq(s.getAll(IDBKeyRange.bound(2, 3)))).map(x => x.id), (await rq(s.getAllKeys(IDBKeyRange.lowerBound(2, true)))), (await rq(s.getAllKeys(IDBKeyRange.upperBound(2)))), IDBKeyRange.only(5).includes(5)], [[2, 3], [3], [1, 2], true]);
+    T('index lookups', [(await rq(s.index('byName').get('Cy'))).id, (await rq(s.index('byAge').getAll(30))).map(x => x.name), await rq(s.index('byAge').count()), (await rq(s.index('byAge').getAllKeys()))], [3, ['Ann', 'Cy'], 3, [2, 1, 3]]);
+    // cursors
+    const seen = [];
+    await new Promise(res => { const c = s.openCursor(); c.onsuccess = () => { const cur = c.result; if (!cur) return res(); seen.push(cur.key + ':' + cur.value.name); cur.continue(); }; });
+    T('cursor forward', seen, ['1:Ann', '2:Bob', '3:Cy']);
+    const rev = [];
+    await new Promise(res => { const c = s.openCursor(null, 'prev'); c.onsuccess = () => { const cur = c.result; if (!cur) return res(); rev.push(cur.key); cur.continue(); }; });
+    T('cursor prev', rev, [3, 2, 1]);
+    const idxSeen = [];
+    await new Promise(res => { const c = s.index('byAge').openCursor(); c.onsuccess = () => { const cur = c.result; if (!cur) return res(); idxSeen.push(cur.key + '/' + cur.primaryKey); cur.continue(); }; });
+    T('index cursor order', idxSeen, ['25/2', '30/1', '30/3']);
+    const adv = [];
+    await new Promise(res => { const c = s.openCursor(); let first = true; c.onsuccess = () => { const cur = c.result; if (!cur) return res(); adv.push(cur.key); if (first) { first = false; cur.advance(2); } else cur.continue(); }; });
+    T('advance', adv, [1, 3]);
+    // update / delete through a cursor, delete / clear, constraint error, abort rolls back
+    tx = db.transaction('people', 'readwrite');
+    const ps = tx.objectStore('people');
+    await new Promise(res => { const c = ps.openCursor(); c.onsuccess = () => { const cur = c.result; if (!cur) return res(); if (cur.key === 1) cur.update({ id: 1, name: 'Anna', age: 31 }); if (cur.key === 3) cur.delete(); cur.continue(); }; });
+    await done(tx);
+    tx = db.transaction('people');
+    T('cursor update/delete', (await rq(tx.objectStore('people').getAll())).map(x => x.name), ['Anna', 'Bob']);
+    tx = db.transaction('people', 'readwrite');
+    let dup = null;
+    const addReq = tx.objectStore('people').add({ id: 1, name: 'dup' });
+    addReq.onerror = e => { dup = addReq.error.name; e.preventDefault(); };
+    await done(tx);
+    T('ConstraintError', dup, 'ConstraintError');
+    tx = db.transaction('people', 'readwrite');
+    tx.objectStore('people').put({ id: 50, name: 'gone' });
+    tx.abort();
+    await new Promise(r => { tx.onabort = r; });
+    tx = db.transaction('people');
+    T('abort rolls back', await rq(tx.objectStore('people').get(50)), undefined);
+    tx = db.transaction('people', 'readwrite');
+    let ro = null; const t2 = db.transaction('people'); try { t2.objectStore('people').put({ id: 9 }); } catch (e) { ro = e.name; }
+    T('read-only transaction', ro, 'ReadOnlyError');
+    tx.objectStore('people').clear();
+    await done(tx);
+    T('clear', await rq(db.transaction('people').objectStore('people').count()), 0);
+    // version upgrade keeps data, deleteObjectStore
+    db.close();
+    const open2 = indexedDB.open('test', 3);
+    open2.onupgradeneeded = e => { open2.result.deleteObjectStore('log'); open2.result.createObjectStore('extra', { keyPath: ['a', 'b'] }).put({ a: 1, b: 2, v: 'ab' }); };
+    const db2 = await rq(open2);
+    T('second upgrade', [db2.version, Array.from(db2.objectStoreNames)], [3, ['extra', 'people']]);
+    T('compound key path', (await rq(db2.transaction('extra').objectStore('extra').get([1, 2]))).v, 'ab');
+    const old = indexedDB.open('test', 1); let verr = null; old.onerror = () => { verr = old.error.name; };
+    await new Promise(r => setTimeout(r, 30));
+    T('lower version refused', verr, 'VersionError');
+    db2.close();
+    await rq(indexedDB.deleteDatabase('test'));
+    T('databases()', (await indexedDB.databases()).length, 0);
+    // values are copies; errors
+    const o3 = indexedDB.open('copy', 1); o3.onupgradeneeded = () => o3.result.createObjectStore('s');
+    const d3 = await rq(o3);
+    const obj = { n: 1 };
+    const t3 = d3.transaction('s', 'readwrite'); t3.objectStore('s').put(obj, 'k'); obj.n = 2; await done(t3);
+    T('stored value is a copy', (await rq(d3.transaction('s').objectStore('s').get('k'))).n, 1);
+    let dce = null; try { d3.transaction('s', 'readwrite').objectStore('s').put({ f() {} }, 'z'); } catch (e) { dce = e.name; }
+    T('uncloneable value', dce, 'DataCloneError');
+    console.log('RESULT ' + (out.some(l => l.startsWith('FAIL')) ? 'FAIL' : 'ALLPASS') + '\n' + out.join('\n'));
+})().catch(e => console.log('RESULT FAIL ' + e + (e && e.stack) + '\n' + out.join('\n')));
+</script></body></html>
