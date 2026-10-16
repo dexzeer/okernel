@@ -16,6 +16,7 @@ void cpufreq_init_ap(void);
 void cpufreq_report(char* buf, int cap);
 uint32_t cpufreq_mhz(void);            // last measured core clock in MHz (0 = unknown)
 uint32_t cpufreq_tsc_mhz(void);        // TSC rate in MHz (0 = unknown)
+int      cpufreq_tsc_reliable(void);   // the TSC may serve as a wall clock (hypervisor, or invariant TSC)
 int cpufreq_slow_factor(void);         // 1 = fast machine ... 16 = very slow: JS and task budgets scale by this (see cpufreq.c)
 int cpufreq_msr_selftest(void);        // 1 = a missing MSR faulted harmlessly and a present one read fine
 
