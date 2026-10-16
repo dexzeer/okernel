@@ -269,8 +269,8 @@ const EVENT_NAMES = ['abort', 'animationend', 'animationiteration', 'animationst
     'seeking', 'stalled', 'suspend', 'volumechange', 'waiting', 'sourceopen', 'sourceended', 'sourceclose', 'updatestart',
     'update', 'updateend', 'addsourcebuffer', 'removesourcebuffer', 'submit', 'timeupdate', 'toggle', 'touchcancel', 'touchend', 'touchmove',
     'touchstart', 'transitionend', 'unload', 'visibilitychange', 'wheel'];
-function defineHandlers(proto) {
-    for (const name of EVENT_NAMES) {
+function defineHandlers(proto, names) {
+    for (const name of names || EVENT_NAMES) {
         Object.defineProperty(proto, 'on' + name, {
             configurable: true, enumerable: true,
             get() { const m = HANDLERS.get(this); const h = m && m.get(name); return h === undefined ? (inlineHandler(this, name) || null) : h; },
@@ -1864,7 +1864,9 @@ function mediaDecodingInfo(cfg) {
     }
     return Promise.resolve({ supported: ok, smooth, powerEfficient: false });
 }
-for (const C of [MediaSource, SourceBuffer, SourceBufferList]) defineHandlers(C.prototype);
+defineHandlers(MediaSource.prototype, ['sourceopen', 'sourceended', 'sourceclose']);
+defineHandlers(SourceBuffer.prototype, ['updatestart', 'update', 'updateend', 'error', 'abort']);
+defineHandlers(SourceBufferList.prototype, ['addsourcebuffer', 'removesourcebuffer']);
 const HC = HTMLCanvasElement.prototype;
 // ---------------------------------------------------------------- canvas 2D
 // CanvasRenderingContext2D over the software canvas natives (wjs_canvas.c / wcanvas.c): this side keeps
@@ -4100,7 +4102,22 @@ accessor(D, 'styleSheets', function () {
 });
 
 // ---------------------------------------------------------------- window
-const navigator = {
+// WebIDL shape of a singleton interface (navigator, screen, performance): the instance owns nothing, every attribute is a getter
+// on the interface's prototype and every operation a method there (Object.getOwnPropertyNames(navigator) is [] in a browser).
+function idlInstance(C, data) {
+    const inst = Object.create(C.prototype);
+    for (const k of Object.keys(data)) {
+        const v = data[k];
+        if (typeof v === 'function') Object.defineProperty(C.prototype, k, { value: v, writable: true, enumerable: true, configurable: true });
+        else idlGet(C.prototype, k, () => data[k]);
+    }
+    return inst;
+}
+function idlGet(proto, k, fn) {
+    const g = Object.getOwnPropertyDescriptor({ get [k]() { return fn(); } }, k).get;
+    Object.defineProperty(proto, k, { get: g, set: undefined, enumerable: true, configurable: true });
+}
+const navData = {
     userAgent: 'Mozilla/5.0 (X11; okernel i686) AppleWebKit/537.36 (KHTML, like Gecko) okai/0.6 Safari/537.36',
     appName: 'Netscape', appCodeName: 'Mozilla', appVersion: '5.0 (X11; okernel i686)', product: 'Gecko', productSub: '20030107',
     vendor: 'okernel', vendorSub: '', platform: 'Linux i686', language: 'en-US', languages: ['en-US', 'en'],
@@ -4121,14 +4138,18 @@ const navigator = {
     getBattery() { return Promise.resolve(battery); },   // a desktop: on mains power
     getGamepads() { return []; }
 };
+const Navigator = sub('Navigator', Object);
+const navigator = idlInstance(Navigator, navData);
 const BatteryManager = sub('BatteryManager', EventTarget);
 const battery = Object.create(BatteryManager.prototype);
 for (const [k, v] of [['charging', true], ['chargingTime', 0], ['dischargingTime', Infinity], ['level', 1]])
     accessor(BatteryManager.prototype, k, function () { return v; });
 for (const k of ['onchargingchange', 'onchargingtimechange', 'ondischargingtimechange', 'onlevelchange']) battery[k] = null;
-const screen = { width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, availLeft: 0, availTop: 0,
+const screenData = { width: 1920, height: 1080, availWidth: 1920, availHeight: 1040, availLeft: 0, availTop: 0,
     colorDepth: 24, pixelDepth: 24, orientation: { type: 'landscape-primary', angle: 0, addEventListener() {}, removeEventListener() {} } };
-const performance = Object.assign(new EventTarget(), {
+const Screen = sub('Screen', Object);
+const screen = idlInstance(Screen, screenData);
+const perfData = {
     now() { return W.now(); },
     timeOrigin: Date.now() - W.now(),
     timing: { navigationStart: Date.now() - W.now(), fetchStart: 0, domLoading: 0, domInteractive: 0, domComplete: 0, loadEventStart: 0, loadEventEnd: 0, responseStart: 0, responseEnd: 0, connectStart: 0, connectEnd: 0, requestStart: 0, domainLookupStart: 0, domainLookupEnd: 0, redirectStart: 0, redirectEnd: 0, unloadEventStart: 0, unloadEventEnd: 0, secureConnectionStart: 0, domContentLoadedEventStart: 0, domContentLoadedEventEnd: 0 },
@@ -4140,7 +4161,9 @@ const performance = Object.assign(new EventTarget(), {
     getEntriesByName() { return []; },
     toJSON() { return {}; },
     memory: { jsHeapSizeLimit: 67108864, totalJSHeapSize: 0, usedJSHeapSize: 0 }
-});
+};
+const Performance = sub('Performance', EventTarget);
+const performance = idlInstance(Performance, perfData);
 // ---------------------------------------------------------------- messaging: MessageChannel / MessagePort / BroadcastChannel
 const PORT_TOKEN = {};
 class MessagePort extends EventTarget {
@@ -4168,7 +4191,7 @@ class MessagePort extends EventTarget {
     start() { this._on = true; this._kick(); }
     close() { this._closed = true; this._q.length = 0; }
 }
-defineHandlers(MessagePort.prototype);
+defineHandlers(MessagePort.prototype, ['message', 'messageerror']);
 {
     const d = Object.getOwnPropertyDescriptor(MessagePort.prototype, 'onmessage');
     Object.defineProperty(MessagePort.prototype, 'onmessage', { configurable: true, enumerable: true, get: d.get, set(f) { d.set.call(this, f); if (typeof f === 'function') this.start(); } });
@@ -4201,7 +4224,7 @@ class BroadcastChannel extends EventTarget {
     }
     close() { this._closed = true; const s = BC_ALL.get(this.name); if (s) s.delete(this); }
 }
-defineHandlers(BroadcastChannel.prototype);
+defineHandlers(BroadcastChannel.prototype, ['message', 'messageerror']);
 
 // ---------------------------------------------------------------- FileReader / FileList
 function bytesToBinary(u8) {
@@ -4247,7 +4270,7 @@ class FileReader extends EventTarget {
     }
 }
 FileReader.EMPTY = 0; FileReader.LOADING = 1; FileReader.DONE = 2;
-defineHandlers(FileReader.prototype);
+defineHandlers(FileReader.prototype, ['loadstart', 'progress', 'load', 'abort', 'error', 'loadend']);
 class FileList {
     constructor() { illegal(); }
     get length() { return this._a.length; }
@@ -4318,7 +4341,7 @@ class EventSource extends EventTarget {
     close() { this.readyState = 2; this._gen++; }
 }
 EventSource.CONNECTING = 0; EventSource.OPEN = 1; EventSource.CLOSED = 2;
-defineHandlers(EventSource.prototype);
+defineHandlers(EventSource.prototype, ['open', 'message', 'error']);
 // ---------------------------------------------------------------- streams: WritableStream, TransformStream, pipes, text + compression streams
 class WritableStreamDefaultWriter {
     constructor(st) {
@@ -4556,7 +4579,7 @@ function perfMeasure(name, a, b) {
     return e;
 }
 const navEntry = () => perfEntry(PerformanceNavigationTiming.prototype, { name: W.docURL(), entryType: 'navigation', startTime: 0, duration: W.now(), type: 'navigate', redirectCount: 0, initiatorType: 'navigation', nextHopProtocol: 'h2' });
-Object.assign(performance, {
+Object.assign(Performance.prototype, {
     mark: perfMark, measure: perfMeasure,
     clearMarks(n) { for (let i = PERF_ENTRIES.length - 1; i >= 0; i--) if (PERF_ENTRIES[i].entryType === 'mark' && (n === undefined || PERF_ENTRIES[i].name === String(n))) PERF_ENTRIES.splice(i, 1); },
     clearMeasures(n) { for (let i = PERF_ENTRIES.length - 1; i >= 0; i--) if (PERF_ENTRIES[i].entryType === 'measure' && (n === undefined || PERF_ENTRIES[i].name === String(n))) PERF_ENTRIES.splice(i, 1); },
@@ -4670,8 +4693,8 @@ class CredentialsContainer {
 }
 {
     const cc = Object.create(CredentialsContainer.prototype);
-    Object.defineProperty(navigator, 'credentials', { value: cc, enumerable: true, configurable: true });
-    Object.defineProperty(navigator, 'mediaSession', { value: navMediaSession, enumerable: true, configurable: true });
+    idlGet(Navigator.prototype, 'credentials', () => cc);
+    idlGet(Navigator.prototype, 'mediaSession', () => navMediaSession);
 }
 // exposed on the global object next to the others
 for (const C of [MessagePort, FileReader, FileList, EventSource, WritableStream, WritableStreamDefaultWriter, TransformStream, TextEncoderStream,
@@ -5234,7 +5257,7 @@ class Worker extends AbstractWorker {
         if (this._scope) for (const id of this._scope._timers) { clearTimeout(id); clearInterval(id); }
     }
 }
-defineHandlers(Worker.prototype);
+defineHandlers(Worker.prototype, ['error', 'message', 'messageerror']);
 const SHARED = new Map();
 class SharedWorker extends AbstractWorker {
     constructor(url, opts) {
@@ -5457,9 +5480,8 @@ class IDBRequest extends EventTarget {
     constructor() { super(); this.result = undefined; this.error = null; this.source = null; this.transaction = null; this.readyState = 'pending'; this.onsuccess = null; this.onerror = null; }
 }
 class IDBOpenDBRequest extends IDBRequest { constructor() { super(); this.onupgradeneeded = null; this.onblocked = null; } }
-for (const C of [IDBRequest, IDBOpenDBRequest]) defineHandlers(C.prototype);
-for (const n of ['success', 'upgradeneeded', 'blocked', 'versionchange', 'complete']) if (!EVENT_NAMES.includes(n)) EVENT_NAMES.push(n);
-for (const C of [IDBRequest, IDBOpenDBRequest]) defineHandlers(C.prototype);
+defineHandlers(IDBRequest.prototype, ['success', 'error']);
+defineHandlers(IDBOpenDBRequest.prototype, ['blocked', 'upgradeneeded']);
 
 class IDBTransaction extends EventTarget {
     constructor(db, names, mode) {
@@ -5531,7 +5553,7 @@ class IDBTransaction extends EventTarget {
     abort() { if (this._done) throw new DOMException('The transaction has already finished.', 'InvalidStateError'); this._abort(null); }
     commit() { if (this._done) throw new DOMException('The transaction has already finished.', 'InvalidStateError'); }
 }
-defineHandlers(IDBTransaction.prototype);
+defineHandlers(IDBTransaction.prototype, ['abort', 'complete', 'error']);
 
 function idbStoreModel(name, keyPath, autoInc) { return { name, keyPath, autoInc, recs: [], next: 1, indexes: new Map() }; }
 // records of a store: sorted array of { k, v }; indexes: { name, keyPath, unique, multi }
@@ -5738,7 +5760,7 @@ class IDBDatabase extends EventTarget {
     }
     close() { this._closed = true; }
 }
-defineHandlers(IDBDatabase.prototype);
+defineHandlers(IDBDatabase.prototype, ['abort', 'close', 'error', 'versionchange']);
 class IDBFactory {
     constructor() { illegal(); }
     open(name, version) {
@@ -5867,7 +5889,7 @@ class WakeLockSentinel extends EventTarget {
             return Promise.resolve(s);
         },
     };
-    Object.defineProperty(navigator, 'wakeLock', { value: wl, enumerable: true, configurable: true });
+    idlGet(Navigator.prototype, 'wakeLock', () => wl);
 }
 for (const C of [Cache, CacheStorage, WakeLockSentinel]) Object.defineProperty(G, C.name, { value: C, writable: true, configurable: true, enumerable: false });
 Object.defineProperty(G, 'caches', { value: Object.create(CacheStorage.prototype), writable: true, configurable: true, enumerable: true });
@@ -6211,8 +6233,8 @@ const win = {
     XMLHttpRequest, TextEncoder, TextDecoder, Storage, MutationObserver, MutationRecord, IntersectionObserver, IntersectionObserverEntry, ResizeObserver,
     CustomElementRegistry, MediaQueryList, PerformanceObserver, Range, TreeWalker, NodeIterator: TreeWalker, NodeFilter,
     DOMParser, XMLSerializer, FontFace, BroadcastChannel, MessageChannel, WebSocket,
-    CSSStyleSheet, StyleSheet, CSSRule, Window, Navigator: function Navigator() { illegal(); },
-    Screen: function Screen() { illegal(); }, Performance: function Performance() { illegal(); },
+    CSSStyleSheet, StyleSheet, CSSRule, Window, Navigator,
+    Screen, Performance,
     Crypto: function Crypto() { illegal(); }, Selection: function Selection() { illegal(); },
     NamedNodeMap: function NamedNodeMap() { illegal(); }, DOMStringMap: function DOMStringMap() { illegal(); },
     StyleSheetList: function StyleSheetList() { illegal(); }, MediaList: function MediaList() { illegal(); },
