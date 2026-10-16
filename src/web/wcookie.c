@@ -6,7 +6,7 @@
 #define MAX_COOKIES 400
 #define MAX_NAME 256
 #define MAX_VALUE 4096
-#define MAX_HEADER_COOKIES 64
+#define MAX_HEADER_COOKIES 128
 
 struct wck {
     char* name;

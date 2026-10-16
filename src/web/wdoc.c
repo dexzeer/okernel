@@ -46,8 +46,8 @@ struct wdimg {
 };
 
 struct wdoc {
-    char url[2048];
-    char base[2048];
+    char url[8192];
+    char base[8192];
     int has_base_el;        // <base href> present (pushState keeps it)
     struct wdom* d;
     struct wstyleset* ss;
