@@ -116,6 +116,12 @@ irq_common_stub:
     mov gs, ax
 
     cld                 ; DF=0 for C (see isr_common_stub)
+    mov eax, [esp + 44]    ; interrupted EIP / CS (4 ds + 32 pusha + 8 int no/err): the stall sampler (prof.c) reads them
+    mov [irq_last_eip], eax
+    mov eax, [esp + 48]
+    mov [irq_last_cs], eax
+    lea eax, [esp + 56]    ; the interrupted ESP (same-privilege interrupt: nothing was switched)
+    mov [irq_last_esp], eax
     push dword [esp + 36]  ; push interrupt number (4 ds + 32 pusha = 36)
     call irq_handler
     add esp, 4
@@ -293,6 +299,12 @@ global user_park_ret_pending
 user_park_ret_pending: resd 1
 global user_park_retval
 user_park_retval: resd 1
+global irq_last_eip
+irq_last_eip: resd 1
+global irq_last_cs
+irq_last_cs: resd 1
+global irq_last_esp
+irq_last_esp: resd 1
 
 ; Prevent executable stack warning (must be LAST — code after it lands non-executable; see AGENTS.md)
 section .note.GNU-stack noalloc noexec nowrite progbits

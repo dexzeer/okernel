@@ -60,10 +60,10 @@ static int vw_pending(const struct meng* m);
 // clock going. The boot CPU copies a few packets into a job, hands it over (one asynchronous SMP job) and presents finished pictures
 // when their time comes. While a job runs the boot CPU touches none of what the job uses: the packets are copies, the pictures go
 // into private ring slots, the decoder belongs to the job. Seeks and teardown wait for it (vw_sync).
-#define VW_RING 6                       // pictures in flight: being decoded, waiting for a converter, converted and waiting for their time
+#define VW_RING 12                       // pictures in flight: being decoded, waiting for a converter, converted and waiting for their time
 #define VW_CONV 2                       // colour-conversion jobs at once (each on its own CPU when there are enough)
-#define VW_BATCH 3                      // packets per decode job
-#define VW_AHEAD_NS 40000000LL          // decode this far beyond the presentation lead
+#define VW_BATCH 8                      // packets per decode job
+#define VW_AHEAD_NS 150000000LL         // decode this far beyond the presentation lead
 #define VW_MIN_SHOW_NS 25000000LL       // behind: convert (and show) a picture at least this often
 
 struct vslot {

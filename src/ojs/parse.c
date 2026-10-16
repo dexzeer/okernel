@@ -19,6 +19,10 @@ struct arena_chunk { struct arena_chunk* next; size_t used, cap; uint8_t data[];
 
 void* arena_alloc(struct parser* P, size_t n) {
     n = (n + 7) & ~(size_t)7;
+    // parsing a multi-megabyte script takes a second or more without running a single JS instruction: tell the host now and then
+    // (its answer is ignored here; the interpreter checks the script's deadline again as soon as the code runs)
+    static uint32_t nalloc;
+    if (!(++nalloc & 16383) && P->J && P->J->interrupt) (void)P->J->interrupt(P->J, P->J->interrupt_op);
     struct arena_chunk* c = P->arena;
     if (!c || c->used + n > c->cap) {
         size_t cap = n > 65536 - sizeof(struct arena_chunk) ? n : 65536 - sizeof(struct arena_chunk);

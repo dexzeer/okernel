@@ -957,6 +957,28 @@ static void shell_execute(int win_id, const char* input) {
             dns_resolve(args);
         }
     }
+    else if (str_eq(cmd_buf, "memtouch")) {
+        // How much does the FIRST write to a page of RAM cost? (a hypervisor backs guest memory lazily: one trap per 4 KB page)
+        int mb = args[0] ? 0 : 32;
+        for (const char* a = args; *a >= '0' && *a <= '9'; a++) mb = mb * 10 + (*a - '0');
+        if (mb < 1) mb = 1;
+        if (mb > 256) mb = 256;
+        uint8_t* p = (uint8_t*)kmalloc((size_t)mb << 20);
+        if (!p) { window_puts(win_id, "out of memory\n"); }
+        else {
+            uint32_t mhz = cpufreq_tsc_mhz();
+            uint64_t t0 = rdtsc_now();
+            for (size_t i = 0; i < ((size_t)mb << 20); i += 4096) p[i] = 1;      // first touch of every page
+            uint64_t t1 = rdtsc_now();
+            for (size_t i = 0; i < ((size_t)mb << 20); i += 4096) p[i] = 2;      // second write
+            uint64_t t2 = rdtsc_now();
+            uint32_t pages = (uint32_t)(((size_t)mb << 20) >> 12);
+            serial_printf("[memtouch] %u MB: first touch %u cycles/page (%u us), second %u cycles/page\n", mb,
+                          (uint32_t)((t1 - t0) / pages), mhz ? (uint32_t)((t1 - t0) / pages / mhz) : 0, (uint32_t)((t2 - t1) / pages));
+            kfree(p);
+            window_puts(win_id, "see the serial log: [memtouch]\n");
+        }
+    }
     else if (str_eq(cmd_buf, "doh")) {
         if (str_eq(args, "on")) dns_doh_set(1);
         else if (str_eq(args, "off")) dns_doh_set(0);
@@ -1909,6 +1931,8 @@ void kernel_main(uint32_t mboot_phys) {
     static uint64_t halted_cyc = 0, busy_t0 = 0;
     while (1) {
         main_loops++;
+        if (prof_on) stall_report();
+        stall_beat = tick_count;
         { PROF_BEGIN(PZ_KEYS); keys_dispatch(); PROF_END(PZ_KEYS); }
         // Ring-3 entry drain: the shell (and fork) stage pid+eip+esp+window
         // into the entry run queue; here is plain ring-0 thread context, so
@@ -2917,14 +2941,20 @@ void kernel_main(uint32_t mboot_phys) {
             ow_now != 1 && !mplay_wants_cpu() && ((!net_wait && !timed_wait) || lapic_timer_available())) {
             if (net_wait) lapic_timer_oneshot_us(500);
             else if (timed_wait) lapic_timer_oneshot_us(3000);
+            {   // idle: pay the hypervisor's first-touch cost of heap pages now instead of in the middle of a page load (memory.c)
+                uint32_t mhz = cpufreq_tsc_mhz();
+                heap_pretouch(mhz ? mhz * (net_wait || timed_wait ? 300u : 6000u) : 400000u);   // 0.3 ms between packet polls, 6 ms when fully idle
+            }
             uint64_t h0 = rdtsc_now();
             // A key queued after this iteration's dispatch must not sleep
             // until the next timer tick: check with interrupts off, then
             // "sti; hlt" (sti's one-instruction shadow makes the pair atomic
             // — an IRQ in between still wakes the hlt).
             __asm__ volatile("cli" ::: "memory");
+            stall_halted = 1;
             if (key_head == key_tail) __asm__ volatile("sti; hlt" ::: "memory");
             else __asm__ volatile("sti" ::: "memory");
+            stall_halted = 0;
             halted_cyc += rdtsc_now() - h0;
             if (prof_on) { prof_cyc[PZ_HALT] += rdtsc_now() - h0; prof_cnt[PZ_HALT]++; }
         }

@@ -430,6 +430,29 @@ void* krealloc(void* ptr, uint32_t size) {
     return q;
 }
 
+// Under a hypervisor guest RAM is backed lazily, one trap per 4 KB page (WHPX: ~70,000 cycles = 19 us for the first write to a page,
+// 46 cycles for the next; `memtouch`). A page load that grows the JS heap by 170 MB stalled the main loop for seconds in memset/gc_alloc,
+// freezing the video and starving the sound. The idle loop therefore writes a zero to every heap page ahead of the allocator
+// (kmalloc carves blocks from the LOW end of the free space) with a lock-prefixed add of 0: atomic, value unchanged, so it is safe on
+// memory that is in use or being freed on another CPU. Returns 1 while pages remain.
+static uint32_t pretouch_next, pretouch_t0;
+int heap_pretouch(uint32_t budget_cycles) {
+    if (!heap_start || heap_end - heap_start < 2 * PAGE_SIZE) return 0;
+    if (!pretouch_next) { pretouch_next = heap_start & ~(PAGE_SIZE - 1); pretouch_t0 = 1; }
+    if (pretouch_next >= heap_end - PAGE_SIZE) return 0;
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    uint64_t t0 = ((uint64_t)hi << 32) | lo, tn = t0;
+    do {
+        __asm__ volatile("lock addl $0, (%0)" : : "r"(pretouch_next) : "memory", "cc");
+        pretouch_next += PAGE_SIZE;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        tn = ((uint64_t)hi << 32) | lo;
+    } while (pretouch_next < heap_end - PAGE_SIZE && tn - t0 < budget_cycles);
+    if (pretouch_next >= heap_end - PAGE_SIZE) { serial_printf("[mem] heap pre-touched (%u MB)\n", (heap_end - heap_start) >> 20); return 0; }
+    return 1;
+}
+
 void heap_stats(uint32_t* total, uint32_t* used, uint32_t* peak, uint32_t* largest_free) {
     if (heap_start == 0) heap_init();
     uint32_t fl = irq_save(); spin_lock(&heap_lock);

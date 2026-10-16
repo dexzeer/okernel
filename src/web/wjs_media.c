@@ -64,10 +64,23 @@ static double num(ojs* ctx, int argc, ojsv* argv, int i, double dflt) {
     return d;
 }
 
+// Every realm that owns media sessions. A script running in ONE document (an ad frame, YouTube's helper iframes) must keep the
+// sessions of the OTHERS going too (wjs_media_tick), or a video in the parent freezes for as long as the child's script runs.
+#define WM_REALMS 16
+static struct wjs* media_realms[WM_REALMS];
+static void realm_register(struct wjs* js) {
+    for (int i = 0; i < WM_REALMS; i++) if (media_realms[i] == js) return;
+    for (int i = 0; i < WM_REALMS; i++) if (!media_realms[i]) { media_realms[i] = js; return; }
+}
+static void realm_unregister(struct wjs* js) {
+    for (int i = 0; i < WM_REALMS; i++) if (media_realms[i] == js) media_realms[i] = 0;
+}
+
 NATIVE(n_media_new) {
     struct wjs* js = JSX(ctx); UNUSED_THIS; (void)argc; (void)argv;
     if (!js->media) js->media = (struct wmedia*)w_calloc(WM_MAX, sizeof(struct wmedia));
     if (!js->media) return ojs_int(0);
+    realm_register(js);
     for (int i = 0; i < WM_MAX; i++) {
         struct wmedia* s = &js->media[i];
         if (s->m) continue;
@@ -219,6 +232,7 @@ void wjs_media_install(struct wjs* js, ojsv natives) {
 
 void wjs_media_free(struct wjs* js) {
     if (!js->media) return;
+    realm_unregister(js);
     for (int i = 0; i < WM_MAX; i++) sess_free(&js->media[i]);
     w_free(js->media);
     js->media = 0;
@@ -252,8 +266,23 @@ int wjs_media_take_present(struct wjs_present* out) {
     return 1;
 }
 
-void wjs_media_tick(struct wjs* js) {
-    if (!js || js->dead || !js->media) return;
+static void media_tick_realm(struct wjs* js);
+#ifdef KERNEL
+extern volatile uint32_t stall_beat;
+extern uint32_t tick_count;
+#endif
+void wjs_media_tick(struct wjs* running) {
+    (void)running;
+#ifdef KERNEL
+    stall_beat = tick_count;                 // the media service ran: not a stall (see prof.h)
+#endif
+    for (int r = 0; r < WM_REALMS; r++) {
+        struct wjs* js = media_realms[r];
+        if (js && !js->dead && js->media) media_tick_realm(js);
+    }
+}
+
+static void media_tick_realm(struct wjs* js) {
     for (int i = 0; i < WM_MAX; i++) {
         struct wmedia* s = &js->media[i];
         if (!s->m) continue;
