@@ -23,6 +23,7 @@
 // capped at 900KB of it.
 #include "okai.h"
 #include "prof.h"
+#include "cpufreq.h"
 #include "window.h"
 #include "graphics.h"
 #include "theme.h"
@@ -2469,8 +2470,16 @@ static void vid_second(void) {
     vid_put(vid_text, &n, "  drop "); vid_putu(vid_text, &n, st.dropped);
     vid_put(vid_text, &n, "  gap "); vid_putu(vid_text, &n, st.gap_ms); vid_put(vid_text, &n, "ms");
     vid_put(vid_text, &n, "  buf "); vid_putu(vid_text, &n, st.ahead_ms / 1000); vid_put(vid_text, &n, "."); vid_putu(vid_text, &n, st.ahead_ms / 100 % 10); vid_put(vid_text, &n, "s");
-    serial_printf("[vidfps] dec %u paint %u scr %u drop %u gap %ums decode %u.%u + convert %u.%u ms tiles own %u helped %u kcyc/frame tiles %u (sum %u max %u) lf %u ext %u clock %dms underruns %u buffered %ums rtc %u\n", st.shown, paint, scr, st.dropped,
-                  st.gap_ms, st.dec_x10 / 10, st.dec_x10 % 10, st.cvt_x10 / 10, st.cvt_x10 % 10, st.tiles_own, st.tiles_help, st.kc_tiles, st.kc_tsum, st.kc_tmax, st.kc_lf, st.kc_ext, st.clock_ms, st.underruns, st.ahead_ms, (unsigned)(okai_epoch() % 100000));
+    // Three clocks to tell "the tick counter is slow" from "the sound card runs fast": the media clock (the card), rtc (the 100 Hz tick
+    // counter, seconds) and tsc (the CPU's cycle counter, ms: real time on every hypervisor, calibrated once at boot).
+    uint32_t tsc_ms = 0;
+    {
+        uint32_t lo, hi, mhz = cpufreq_tsc_mhz();
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        if (mhz) tsc_ms = (uint32_t)((((uint64_t)hi << 32 | lo) / ((uint64_t)mhz * 1000)) % 100000000u);
+    }
+    serial_printf("[vidfps] dec %u paint %u scr %u drop %u gap %ums decode %u.%u + convert %u.%u ms tiles own %u helped %u kcyc/frame tiles %u (sum %u max %u) lf %u ext %u clock %dms underruns %u buffered %ums rtc %u tsc %ums\n", st.shown, paint, scr, st.dropped,
+                  st.gap_ms, st.dec_x10 / 10, st.dec_x10 % 10, st.cvt_x10 / 10, st.cvt_x10 % 10, st.tiles_own, st.tiles_help, st.kc_tiles, st.kc_tsum, st.kc_tmax, st.kc_lf, st.kc_ext, st.clock_ms, st.underruns, st.ahead_ms, (unsigned)(okai_epoch() % 100000), tsc_ms);
 }
 // A frame that was decoded while a page script runs (wjs_media_tick): copy it into the page picture and put it on the screen now.
 // Only its rectangle is touched and nothing of the page is called; the normal media_pump repaints it with the page's overlays later.
