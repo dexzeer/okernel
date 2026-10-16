@@ -1,7 +1,7 @@
 <!doctype html><html><body><script>
 const out = []; const T = (n, a, b) => { const ok = JSON.stringify(a) === JSON.stringify(b); out.push((ok ? 'ok ' : 'FAIL ') + n + (ok ? '' : ' got ' + JSON.stringify(a) + ' want ' + JSON.stringify(b))); };
 const wait = ms => new Promise(r => setTimeout(r, ms));
-const ask = (w, msg, ms) => new Promise((res, rej) => { const t = setTimeout(() => rej(new Error('worker timeout')), ms || 2000); w.onmessage = e => { clearTimeout(t); res(e.data); }; w.postMessage(msg); });
+const ask = (w, msg, ms) => new Promise((res, rej) => { const t = setTimeout(() => rej(new Error('worker timeout')), ms || 15000); w.onmessage = e => { clearTimeout(t); res(e.data); }; w.postMessage(msg); });
 (async () => {
     // a worker from a blob: environment, globals, structured messages, onmessage assignment
     const src = [

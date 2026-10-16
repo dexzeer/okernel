@@ -3265,10 +3265,11 @@ class Headers {
     entries() { return Array.from(this._m.entries()).sort((a, b) => a[0] < b[0] ? -1 : 1)[Symbol.iterator](); }
     [Symbol.iterator]() { return this.entries(); }
 }
+let blobEnc = null;
 const blobBytes = p => p instanceof Blob ? p._b
     : p instanceof ArrayBuffer ? new Uint8Array(p)
     : ArrayBuffer.isView(p) ? new Uint8Array(p.buffer, p.byteOffset, p.byteLength)
-    : new TextEncoder().encode(String(p));
+    : (blobEnc || (blobEnc = new TextEncoder())).encode(String(p));
 class Blob {
     constructor(parts, opts) {
         if (parts !== undefined && (parts === null || typeof parts !== 'object' || typeof parts[Symbol.iterator] !== 'function'))
