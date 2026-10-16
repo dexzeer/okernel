@@ -1,0 +1,55 @@
+<!doctype html>
+<html><head><title>mse offset</title></head>
+<body style="margin:0;background:#fff">
+<video id="v" muted style="width:320px;height:180px;display:block"></video>
+<script>
+// timestampOffset / appendWindow / per-buffer remove(): the same 3 s clip is appended twice, the second time
+// 3 s later (how an ad and the content, or two periods, share one MediaSource timeline).
+const v = document.getElementById('v');
+const log = m => console.log(m);
+for (const e of ['loadedmetadata', 'canplay', 'playing', 'ended', 'seeking', 'seeked', 'error', 'waiting'])
+    v.addEventListener(e, () => log('EV ' + e + ' t=' + v.currentTime.toFixed(2) + ' rs=' + v.readyState + (v.error ? ' err=' + v.error.code + ' ' + v.error.message : '')));
+const ms = new MediaSource();
+v.src = URL.createObjectURL(ms);
+const rng = tr => { const a = []; for (let i = 0; i < tr.length; i++) a.push(tr.start(i).toFixed(1) + '-' + tr.end(i).toFixed(1)); return a.join(',') || 'none'; };
+function append(sb, buf) {
+    return new Promise(res => { sb.addEventListener('updateend', res, { once: true }); sb.appendBuffer(buf); });
+}
+ms.addEventListener('sourceopen', async () => {
+    const vs = ms.addSourceBuffer('video/webm; codecs="vp9"');
+    const as = ms.addSourceBuffer('audio/webm; codecs="opus"');
+    const [vb, ab] = await Promise.all([fetch('../../media/vec/webm_video_only.webm').then(r => r.arrayBuffer()), fetch('../../media/vec/webm_audio_only.webm').then(r => r.arrayBuffer())]);
+    await append(vs, vb); await append(as, ab);
+    log('first: video ' + rng(vs.buffered) + ' audio ' + rng(as.buffered));
+    vs.abort(); as.abort();
+    vs.timestampOffset = 3; as.timestampOffset = 3;
+    await append(vs, vb); await append(as, ab);
+    log('second: video ' + rng(vs.buffered) + ' audio ' + rng(as.buffered) + ' element ' + rng(v.buffered));
+    // remove on the audio buffer only: the video stays
+    as.remove(0, 1.5);
+    await new Promise(r => as.addEventListener('updateend', r, { once: true }));
+    log('after audio remove: video ' + rng(vs.buffered) + ' audio ' + rng(as.buffered));
+    // window: nothing outside [8, 10) may enter
+    vs.abort();
+    vs.timestampOffset = 9; vs.appendWindowStart = 8; vs.appendWindowEnd = 10;
+    await append(vs, vb);
+    log('window: video ' + rng(vs.buffered));
+    // put the audio back and play the first copy through
+    as.abort(); as.timestampOffset = 0; await append(as, ab);
+    log('audio refilled: ' + rng(as.buffered));
+    ms.duration = 6; ms.endOfStream();
+    // appending after endOfStream() re-opens the stream
+    vs.abort(); vs.appendWindowStart = 0; vs.appendWindowEnd = Infinity; vs.timestampOffset = 6;
+    await append(vs, vb);
+    log('reopened: ' + ms.readyState + ' video ' + rng(vs.buffered));
+    ms.duration = 9;
+    as.abort(); as.timestampOffset = 6; await append(as, ab);
+    ms.endOfStream();
+    v.play();
+}, { once: true });
+v.addEventListener('ended', () => {
+    const q = v.getVideoPlaybackQuality();
+    log('RESULT t=' + v.currentTime.toFixed(2) + ' dur=' + v.duration.toFixed(2) + ' frames=' + q.totalVideoFrames);
+});
+</script>
+</body></html>

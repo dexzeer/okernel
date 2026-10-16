@@ -14,4 +14,9 @@ uint8_t* winflate_zlib(const uint8_t* in, int len, int* out_len, int max_out);
 uint8_t* winflate_gzip(const uint8_t* in, int len, int* out_len, int max_out);
 uint8_t* winflate_raw(const uint8_t* in, int len, int* out_len, int max_out);
 
+// deflate encoders (CompressionStream): one fixed-Huffman block, valid output of any size. Heap result or NULL.
+uint8_t* wdeflate_raw(const uint8_t* in, int len, int* out_len);
+uint8_t* wdeflate_zlib(const uint8_t* in, int len, int* out_len);
+uint8_t* wdeflate_gzip(const uint8_t* in, int len, int* out_len);
+
 #endif

@@ -122,11 +122,20 @@ NATIVE(n_media_abort) {
 
 NATIVE(n_media_remove) {
     SESS(s);
-    meng_remove(s->m, num(ctx, argc, argv, 1, 0), num(ctx, argc, argv, 2, 0));
+    if (argc >= 4) meng_sb_remove(s->m, (int)num(ctx, argc, argv, 3, 0), num(ctx, argc, argv, 1, 0), num(ctx, argc, argv, 2, 0));
+    else meng_remove(s->m, num(ctx, argc, argv, 1, 0), num(ctx, argc, argv, 2, 0));
     return OJS_UNDEFINED;
 }
 
-NATIVE(n_media_eos) { SESS(s); (void)argc; meng_end_of_stream(s->m); return OJS_UNDEFINED; }
+NATIVE(n_media_sb_type) { SESS(s); meng_sb_change_type(s->m, (int)num(ctx, argc, argv, 1, 0)); return OJS_UNDEFINED; }
+
+NATIVE(n_media_sb_opts) {
+    SESS(s);
+    meng_sb_set_offset(s->m, (int)num(ctx, argc, argv, 1, 0), num(ctx, argc, argv, 2, 0), num(ctx, argc, argv, 3, 0), num(ctx, argc, argv, 4, 1e13));
+    return OJS_UNDEFINED;
+}
+
+NATIVE(n_media_eos) { SESS(s); if (argc >= 2 && num(ctx, argc, argv, 1, 1) == 0) meng_reopen(s->m); else meng_end_of_stream(s->m); return OJS_UNDEFINED; }
 NATIVE(n_media_duration) { SESS(s); meng_set_duration(s->m, num(ctx, argc, argv, 1, __builtin_nan(""))); return OJS_UNDEFINED; }
 NATIVE(n_media_play) { SESS(s); (void)argc; meng_play(s->m); return OJS_UNDEFINED; }
 NATIVE(n_media_pause) { SESS(s); (void)argc; meng_pause(s->m); return OJS_UNDEFINED; }
@@ -186,8 +195,10 @@ static const struct ojs_func_entry media_funcs[] = {
     { "mediaAddSb", n_media_add_sb, 2 },
     { "mediaAppend", n_media_append, 3 },
     { "mediaAbort", n_media_abort, 2 },
-    { "mediaRemove", n_media_remove, 3 },
-    { "mediaEos", n_media_eos, 1 },
+    { "mediaRemove", n_media_remove, 4 },
+    { "mediaSbOpts", n_media_sb_opts, 5 },
+    { "mediaSbType", n_media_sb_type, 2 },
+    { "mediaEos", n_media_eos, 2 },
     { "mediaDuration", n_media_duration, 2 },
     { "mediaPlay", n_media_play, 1 },
     { "mediaPause", n_media_pause, 1 },

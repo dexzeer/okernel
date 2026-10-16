@@ -1086,3 +1086,140 @@ int wimage_decode(const uint8_t* data, int len, int max_dim, int* w, int* h, uin
     }
     return 1;
 }
+
+// ---------------------------------------------------------------------------
+// deflate encoder (RFC 1951): greedy LZ77 over hash chains, one fixed-Huffman block. For CompressionStream
+// and friends; ratio is modest, output is always valid zlib / gzip / raw deflate.
+
+struct dbw { uint8_t* b; uint32_t n, cap; uint32_t acc; int nacc; int fail; };
+
+static void dbw_bits(struct dbw* w, uint32_t v, int n) {     // LSB first
+    w->acc |= v << w->nacc;
+    w->nacc += n;
+    while (w->nacc >= 8) {
+        if (w->n >= w->cap) { w->fail = 1; return; }
+        w->b[w->n++] = (uint8_t)w->acc;
+        w->acc >>= 8;
+        w->nacc -= 8;
+    }
+}
+static void dbw_code(struct dbw* w, uint32_t code, int n) {  // Huffman codes go MSB first
+    uint32_t r = 0;
+    for (int i = 0; i < n; i++) r |= ((code >> i) & 1u) << (n - 1 - i);
+    dbw_bits(w, r, n);
+}
+static void dbw_lit(struct dbw* w, int s) {                  // fixed literal/length code of symbol s
+    if (s < 144) dbw_code(w, 0x30u + s, 8);
+    else if (s < 256) dbw_code(w, 0x190u + (s - 144), 9);
+    else if (s < 280) dbw_code(w, (uint32_t)(s - 256), 7);
+    else dbw_code(w, 0xC0u + (s - 280), 8);
+}
+
+static const uint16_t d_lbase[29] = {3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258};
+static const uint8_t d_lext[29] = {0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0};
+static const uint16_t d_dbase[30] = {1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577};
+static const uint8_t d_dext[30] = {0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13};
+
+static uint32_t d_hash(const uint8_t* p) { return ((uint32_t)p[0] << 8 ^ (uint32_t)p[1] << 4 ^ p[2] ^ (uint32_t)p[1] << 12) & 0xFFFF; }
+
+uint8_t* wdeflate_raw(const uint8_t* in, int len, int* out_len) {
+    if (len < 0 || len > (1 << 28)) return 0;
+    struct dbw w = {0};
+    w.cap = (uint32_t)len + ((uint32_t)len >> 3) + 64;
+    w.b = (uint8_t*)w_malloc(w.cap);
+    int32_t* head = (int32_t*)w_malloc(65536 * sizeof(int32_t));
+    int32_t* prev = (int32_t*)w_malloc(32768 * sizeof(int32_t));
+    if (!w.b || !head || !prev) { w_free(w.b); w_free(head); w_free(prev); return 0; }
+    for (int i = 0; i < 65536; i++) head[i] = -1;
+    for (int i = 0; i < 32768; i++) prev[i] = -1;
+    dbw_bits(&w, 1, 1);          // BFINAL
+    dbw_bits(&w, 1, 2);          // BTYPE = fixed Huffman
+    int i = 0;
+    while (i < len && !w.fail) {
+        int best = 0, bd = 0;
+        if (i + 3 <= len) {
+            int32_t cand = head[d_hash(in + i)];
+            int chain = 24, maxl = len - i < 258 ? len - i : 258;
+            while (cand >= 0 && i - cand <= 32768 && chain-- > 0) {
+                int l = 0;
+                while (l < maxl && in[cand + l] == in[i + l]) l++;
+                if (l > best) { best = l; bd = i - cand; if (l >= maxl) break; }
+                int32_t nx = prev[cand & 32767];
+                if (nx >= cand) break;
+                cand = nx;
+            }
+        }
+        int adv = 1;
+        if (best >= 3) {
+            int lc = 28;
+            while (d_lbase[lc] > best) lc--;
+            dbw_lit(&w, 257 + lc);
+            if (d_lext[lc]) dbw_bits(&w, (uint32_t)(best - d_lbase[lc]), d_lext[lc]);
+            int dc = 29;
+            while (d_dbase[dc] > bd) dc--;
+            dbw_code(&w, (uint32_t)dc, 5);
+            if (d_dext[dc]) dbw_bits(&w, (uint32_t)(bd - d_dbase[dc]), d_dext[dc]);
+            adv = best;
+        } else dbw_lit(&w, in[i]);
+        for (int k = 0; k < adv; k++) {
+            int p = i + k;
+            if (p + 3 <= len) { uint32_t h = d_hash(in + p); prev[p & 32767] = head[h]; head[h] = p; }
+        }
+        i += adv;
+    }
+    dbw_lit(&w, 256);
+    if (w.nacc > 0) dbw_bits(&w, 0, 8 - w.nacc);
+    w_free(head);
+    w_free(prev);
+    if (w.fail) { w_free(w.b); return 0; }
+    *out_len = (int)w.n;
+    return w.b;
+}
+
+static uint32_t crc_tab[256];
+static int crc_ready;
+static uint32_t crc32_of(const uint8_t* p, int n) {
+    if (!crc_ready) {
+        for (uint32_t i = 0; i < 256; i++) { uint32_t c = i; for (int k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320u ^ (c >> 1) : c >> 1; crc_tab[i] = c; }
+        crc_ready = 1;
+    }
+    uint32_t c = 0xFFFFFFFFu;
+    for (int i = 0; i < n; i++) c = crc_tab[(c ^ p[i]) & 255] ^ (c >> 8);
+    return ~c;
+}
+static uint32_t adler32_of(const uint8_t* p, int n) {
+    uint32_t a = 1, b = 0;
+    for (int i = 0; i < n; i++) { a = (a + p[i]) % 65521u; b = (b + a) % 65521u; }
+    return b << 16 | a;
+}
+
+uint8_t* wdeflate_zlib(const uint8_t* in, int len, int* out_len) {
+    int n = 0;
+    uint8_t* d = wdeflate_raw(in, len, &n);
+    if (!d) return 0;
+    uint8_t* o = (uint8_t*)w_malloc((size_t)n + 6);
+    if (!o) { w_free(d); return 0; }
+    o[0] = 0x78; o[1] = 0x9C;
+    memcpy(o + 2, d, (size_t)n);
+    uint32_t a = adler32_of(in, len);
+    o[n + 2] = (uint8_t)(a >> 24); o[n + 3] = (uint8_t)(a >> 16); o[n + 4] = (uint8_t)(a >> 8); o[n + 5] = (uint8_t)a;
+    w_free(d);
+    *out_len = n + 6;
+    return o;
+}
+
+uint8_t* wdeflate_gzip(const uint8_t* in, int len, int* out_len) {
+    int n = 0;
+    uint8_t* d = wdeflate_raw(in, len, &n);
+    if (!d) return 0;
+    uint8_t* o = (uint8_t*)w_malloc((size_t)n + 18);
+    if (!o) { w_free(d); return 0; }
+    static const uint8_t hdr[10] = {0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 0xFF};
+    memcpy(o, hdr, 10);
+    memcpy(o + 10, d, (size_t)n);
+    uint32_t c = crc32_of(in, len), sz = (uint32_t)len;
+    for (int k = 0; k < 4; k++) { o[10 + n + k] = (uint8_t)(c >> (8 * k)); o[14 + n + k] = (uint8_t)(sz >> (8 * k)); }
+    w_free(d);
+    *out_len = n + 18;
+    return o;
+}

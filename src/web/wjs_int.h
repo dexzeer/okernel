@@ -132,6 +132,7 @@ void    wjs_media_free(struct wjs* js);
 const uint32_t* wjs_media_frame(struct wjs* js, int sess, int* w, int* h);   // current video frame of a session (ARGB), or NULL
 // canvas natives + teardown + publishing (wjs_canvas.c)
 void    wjs_canvas_install(struct wjs* js, ojsv natives);
+void    wjs_crypto_install(struct wjs* js, ojsv natives);    // crypto.subtle natives (wjs_crypto.c)
 void    wjs_canvas_free(struct wjs* js);
 int     wjs_canvas_poll(struct wjs* js, struct wjs_rect* out, int max, int* n);
 int     wjs_canvas_pending(struct wjs* js);

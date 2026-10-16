@@ -1,0 +1,37 @@
+<!doctype html>
+<html><head><title>mse changeType</title></head>
+<body style="margin:0;background:#fff">
+<video id="v" muted style="width:320px;height:180px;display:block"></video>
+<script>
+// changeType(): one pair of SourceBuffers takes an MP4 (H.264 + AAC) first and a WebM (VP9 + Opus) after it, 3 s later on the
+// timeline. The second container must be recognised (the demuxer is chosen from the first bytes after changeType).
+const v = document.getElementById('v');
+const log = m => console.log(m);
+for (const e of ['loadedmetadata', 'playing', 'ended', 'seeked', 'error'])
+    v.addEventListener(e, () => log('EV ' + e + ' t=' + v.currentTime.toFixed(2) + ' rs=' + v.readyState + (v.error ? ' err=' + v.error.code + ' ' + v.error.message : '')));
+const ms = new MediaSource();
+v.src = URL.createObjectURL(ms);
+const rng = tr => { const a = []; for (let i = 0; i < tr.length; i++) a.push(tr.start(i).toFixed(1) + '-' + tr.end(i).toFixed(1)); return a.join(',') || 'none'; };
+const append = (sb, b) => new Promise(r => { sb.addEventListener('updateend', r, { once: true }); sb.appendBuffer(b); });
+const get = u => fetch(u).then(r => r.arrayBuffer());
+ms.addEventListener('sourceopen', async () => {
+    const vs = ms.addSourceBuffer('video/mp4; codecs="avc1.64001e"'), as = ms.addSourceBuffer('audio/mp4; codecs="mp4a.40.2"');
+    const [vm, am, vw, aw] = await Promise.all([get('../../media/vec/meng_h264_frag.mp4'), get('../../media/vec/meng_aac_frag.mp4'),
+        get('../../media/vec/webm_video_only.webm'), get('../../media/vec/webm_audio_only.webm')]);
+    await append(vs, vm); await append(as, am);
+    log('mp4: video ' + rng(vs.buffered) + ' audio ' + rng(as.buffered));
+    vs.abort(); as.abort();
+    vs.changeType('video/webm; codecs="vp9"'); as.changeType('audio/webm; codecs="opus"');
+    vs.timestampOffset = 3; as.timestampOffset = 3;
+    await append(vs, vw); await append(as, aw);
+    log('webm: video ' + rng(vs.buffered) + ' audio ' + rng(as.buffered));
+    ms.duration = 6; ms.endOfStream();
+    v.currentTime = 3;
+    v.play();
+}, { once: true });
+v.addEventListener('ended', () => {
+    const q = v.getVideoPlaybackQuality();
+    log('RESULT t=' + v.currentTime.toFixed(2) + ' frames=' + q.totalVideoFrames + ' size=' + v.videoWidth + 'x' + v.videoHeight);
+});
+</script>
+</body></html>

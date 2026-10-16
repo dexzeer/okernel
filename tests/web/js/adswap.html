@@ -1,0 +1,35 @@
+<!doctype html>
+<html><head><title>ad then content</title></head>
+<body style="margin:0;background:#fff">
+<video id="v" muted style="width:320px;height:180px;display:block"></video>
+<script>
+// What a player does around an ad: a progressive file (the ad) plays to its end on the element, then the SAME element
+// is pointed at a MediaSource (the content), that one ends, and a plain file follows. Every stage must start and finish.
+const v = document.getElementById('v');
+const log = m => console.log(m);
+let stage = 0;
+for (const e of ['loadstart', 'loadedmetadata', 'playing', 'ended', 'error', 'emptied'])
+    v.addEventListener(e, () => log('EV' + stage + ' ' + e + ' t=' + v.currentTime.toFixed(2) + ' rs=' + v.readyState + (v.error ? ' err=' + v.error.code + ' ' + v.error.message : '')));
+function content() {
+    const ms = new MediaSource();
+    v.src = URL.createObjectURL(ms);
+    ms.addEventListener('sourceopen', async () => {
+        const vs = ms.addSourceBuffer('video/webm; codecs="vp9"'), as = ms.addSourceBuffer('audio/webm; codecs="opus"');
+        const [vb, ab] = await Promise.all([fetch('../../media/vec/webm_video_only.webm').then(r => r.arrayBuffer()), fetch('../../media/vec/webm_audio_only.webm').then(r => r.arrayBuffer())]);
+        const app = (sb, b) => new Promise(r => { sb.addEventListener('updateend', r, { once: true }); sb.appendBuffer(b); });
+        await app(vs, vb); await app(as, ab);
+        ms.duration = 3; ms.endOfStream();
+        v.play().catch(e => log('play rejected ' + e));
+    }, { once: true });
+}
+v.addEventListener('ended', () => {
+    log('STAGE ' + stage + ' ended dur=' + v.duration.toFixed(2) + ' frames=' + v.getVideoPlaybackQuality().totalVideoFrames);
+    stage++;
+    if (stage === 1) content();
+    else if (stage === 2) { v.src = '../../media/vec/webm_av.webm'; v.play().catch(e => log('play rejected ' + e)); }
+    else log('RESULT ALLSTAGES');
+});
+v.src = '../../media/vec/meng_av.mp4';
+v.play().catch(e => log('play rejected ' + e));
+</script>
+</body></html>
