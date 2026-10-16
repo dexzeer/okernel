@@ -39,7 +39,7 @@
 #define SD_BDPL  0x18
 #define SD_BDPU  0x1C
 
-#define RING_BYTES  (128u * 1024u)
+#define RING_BYTES  (512u * 1024u)       // 2.7 s of 48 kHz stereo: a page script / layout that holds the main loop for a second or two must not run the card dry
 #define BDL_ENTRIES 4u
 #define STREAM_TAG  1
 
