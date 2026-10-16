@@ -19,12 +19,12 @@ WWW = os.path.join(OUTDIR, "www-media")
 shutil.rmtree(WWW, ignore_errors=True)
 os.makedirs(os.path.join(WWW, "web", "js"))
 os.makedirs(os.path.join(WWW, "media", "vec"))
-for p in ("media.html", "mse.html"):
+for p in ("media.html", "mse.html", "mse_offset.html", "mse_changetype.html", "adswap.html"):
     shutil.copy(os.path.join(ROOT, "tests", "web", "js", p), os.path.join(WWW, "web", "js", p))
 # the same page on the 10 s clip: long enough to take screenshots while it plays
 html = open(os.path.join(ROOT, "tests", "web", "js", "media.html")).read().replace("webm_av.webm", "webm_av_long.webm")
 open(os.path.join(WWW, "web", "js", "media_long.html"), "w").write(html)
-for v in ("webm_av.webm", "webm_av_long.webm", "webm_video_only.webm", "webm_audio_only.webm"):
+for v in ("webm_av.webm", "webm_av_long.webm", "webm_video_only.webm", "webm_audio_only.webm", "meng_av.mp4", "meng_h264_frag.mp4", "meng_aac_frag.mp4"):
     if not os.path.exists(os.path.join(VEC, v)):
         print(f"SKIP  {v} missing (run tests/media/gen_webm_vectors.py)")
         sys.exit(0)
@@ -106,6 +106,15 @@ try:
     for l in re.findall(r"\[js\][^\n]*", log)[-20:]:
         print("   ", l)
 
+    # 3. what an ad -> content hand-over exercises: timestampOffset / append windows / per-buffer remove / endOfStream reopen,
+    #    changeType between containers, and one <video> element switching sources (progressive MP4 -> MediaSource -> WebM file)
+    for page, want in (("mse_offset.html", "RESULT t=9.00 dur=9.00 frames="), ("mse_changetype.html", "RESULT t=6.00 frames=90 size=320x180"), ("adswap.html", "RESULT ALLSTAGES")):
+        time.sleep(1)
+        vm.type_string("g")
+        time.sleep(0.5)
+        vm.type_string(base + page + "\n", delay=0.05)
+        step(page + " in the kernel", vm.wait_for(want, timeout=120))
+    log = vm.serial()
     bad = [l for l in log.splitlines()
            if "kmalloc FAIL" in l or "bad or double free" in l or "PAGE FAULT" in l.upper() or
            "abort()" in l or ("EXCEPTION" in l.upper() and "#" in l)]
