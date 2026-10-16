@@ -155,6 +155,8 @@ static int interrupt_cb(ojs* J, void* op) {
     return 0;
 }
 
+int wjs_interrupt_poll(struct wjs* js) { return js && js->J ? interrupt_cb(js->J, js) : 0; }
+
 static void flush_rejections(struct wjs* js);
 // Every promise job gets its own time budget (a framework's initial render is thousands of chained jobs: one
 // budget for the whole checkpoint killed the page's state half-way). A checkpoint that runs longer than
@@ -1419,6 +1421,7 @@ struct wjs* wjs_new(struct wdoc* doc) {
     wjs_media_install(js, natives);
     wjs_canvas_install(js, natives);
     wjs_crypto_install(js, natives);
+    wjs_wasm_install(js, natives);
     js->deadline = wjs_now() + SCRIPT_BUDGET_MS;
     // the prelude evaluates to a function(W, global) that returns the hooks
     ojsv fn = ojs_eval(ctx, wjs_prelude_src, wjs_prelude_len, "<okai-prelude>", OJS_EVAL_SCRIPT | OJS_EVAL_HIDE_SOURCE);
@@ -1478,6 +1481,7 @@ void wjs_free(struct wjs* js) {
     for (int i = 0; i < js->nmq; i++) { w_free(js->mq[i].data); w_free(js->mq[i].origin); }
     js->nmq = 0;
     // the realm owns every value; freeing it releases them all at once
+    wjs_wasm_free(js);
     wjs_media_free(js);
     wjs_canvas_free(js);
     if (js->J) ojs_free(js->J);

@@ -1,0 +1,40 @@
+mix 10.75 ["mix",1,"2n",3.5,4.25]
+i64-needs-bigint TypeError
+i64-wrap 5 -9223372036854776000
+multi [6,10]
+ext true null undefined 7 s 7
+exception boom9 9 true
+tick [tick,tick]
+reenter 50 30 1 12 function
+funcref 1 0 TypeError true 70
+arity 0 10 50 60 30 10 -10
+Module.imports [{"module":"a","name":"f","kind":"function"},{"module":"a","name":"g","kind":"global"},{"module":"b","name":"t","kind":"table"},{"module":"b","name":"m","kind":"memory"}]
+Module.exports [{"name":"x","kind":"function"},{"name":"y","kind":"global"}]
+customSections [[1,2,3],[4]] 0
+validate true true false false
+CompileError CompileError TypeError TypeError true CompileError
+validation [false,false,false,false,false,false,false] [true,true,false]
+start [start]
+start-trap RuntimeError
+link TypeError TypeError LinkError LinkError LinkError
+globals 42 undefined 100 102 2.5 true true ok
+global-link LinkError LinkError LinkError LinkError
+Global 1.100000023841858 2.200000047683716 -9223372036854775808n -9223372036854775808n 0 0 TypeError TypeError true undefined
+table0 1 true 101 1 true
+table-grow 1 3 3 null 3 -1 6 RangeError
+table-copy true RuntimeError RuntimeError
+table-fill true true true null RuntimeError
+table-set true null RangeError TypeError TypeError
+externref true str 7 true RuntimeError
+etab true 3 3 g 4
+Table init TypeError TypeError RangeError null
+table-link LinkError LinkError LinkError
+chain 201 true
+chain-mismatch LinkError
+instantiate instance,module true true 20
+instantiate-module true function
+compile true
+instantiate-error CompileError
+instantiate-import-error TypeError
+namespace [object WebAssembly] [object WebAssembly.Table] [object Object] function Module RuntimeError
+WASM-DONE
