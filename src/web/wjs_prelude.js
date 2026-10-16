@@ -3188,7 +3188,9 @@ function runFrame(now) {
 
 // ---------------------------------------------------------------- fetch / XHR
 const PENDING = new Map();    // request id -> handler(status, statusText, headersRaw, body:ArrayBuffer, url)
-function startRequest(method, url, headers, body, handler) {
+const HEADS = new Map();      // request id -> head handler of a streaming fetch(): (status, statusText, headersRaw, stream, url, id)
+const STREAMS = new Map();    // request id -> controller of the Response body stream being filled
+function startRequest(method, url, headers, body, handler, headHandler) {
     let bodyStr = null, ctype = null;      // bodyStr: a string, or the bytes of an ArrayBuffer / view
     if (body !== null && body !== undefined) {
         if (typeof body === 'string') { bodyStr = body; ctype = 'text/plain;charset=UTF-8'; }
@@ -3203,9 +3205,10 @@ function startRequest(method, url, headers, body, handler) {
     for (const [k, v] of headers) { hs.push(k + ': ' + v); if (k.toLowerCase() === 'content-type') hasType = true; }
     if (ctype && !hasType) hs.push('Content-Type: ' + ctype);
     if (/^blob:/i.test(String(url))) { serveBlobURL(String(url), headers, handler); return; }
-    const id = W.fetch(String(url), String(method).toUpperCase(), hs.join('\r\n'), bodyStr);
+    const id = W.fetch(String(url), String(method).toUpperCase(), hs.join('\r\n'), bodyStr, !!headHandler);
     if (id < 0) { setTimeout(() => handler(0, '', '', null, url), 0); return; }
     PENDING.set(id, handler);
+    if (headHandler) HEADS.set(id, headHandler);
     if (/\/videoplayback/.test(url)) { PTIME.set(id, W.now()); mlog('request ' + id + ' ' + method + ' videoplayback' + (bodyStr && bodyStr.byteLength !== undefined ? ' body=' + bodyStr.byteLength : '')); }
 }
 // fetch()/XHR of a blob: URL made by URL.createObjectURL(blob): answered here, with Range support
@@ -3229,8 +3232,33 @@ function serveBlobURL(url, headers, handler) {
     }, 0);
 }
 const PTIME = new Map();
+// C: the head of a streaming fetch() arrived (the body follows in onFetchData pieces, the end through onFetch)
+function onFetchHead(id, status, statusText, headersRaw, url) {
+    const hh = HEADS.get(id);
+    HEADS.delete(id);
+    if (!hh || !PENDING.has(id)) return;
+    let ctl;
+    const stream = new ReadableStream({ start(c) { ctl = c; } });
+    STREAMS.set(id, ctl);
+    if (PTIME.has(id)) mlog('response ' + id + ' status=' + status + ' head after ' + (W.now() - PTIME.get(id)) + 'ms (streaming)');
+    hh(status, statusText, headersRaw, stream, url, id);
+}
+function onFetchData(id, buf) {
+    const c = STREAMS.get(id);
+    if (!c) return;
+    try { c.enqueue(new Uint8Array(buf)); } catch (e) { STREAMS.delete(id); }
+}
 // C: a request finished
 function onFetch(id, status, statusText, headersRaw, body, url) {
+    HEADS.delete(id);
+    const sc = STREAMS.get(id);
+    if (sc) {                      // the end of a streamed body
+        STREAMS.delete(id);
+        PENDING.delete(id);
+        if (PTIME.has(id)) { mlog('response ' + id + ' status=' + status + ' streamed, done in ' + (W.now() - PTIME.get(id)) + 'ms'); PTIME.delete(id); }
+        try { if (status > 0) sc.close(); else sc.error(new TypeError('network error')); } catch (e) { }
+        return;
+    }
     const h = PENDING.get(id);
     if (PTIME.has(id)) { mlog('response ' + id + ' status=' + status + ' bytes=' + (body ? body.byteLength : -1) + ' in ' + (W.now() - PTIME.get(id)) + 'ms' + (h ? '' : ' (nobody waiting)')); PTIME.delete(id); }
     if (!h) return;
@@ -3489,6 +3517,7 @@ class Response {
     get ok() { return this.status >= 200 && this.status < 300; }
     get body() {
         if (this._body === null) return null;
+        if (this._body instanceof ReadableStream) return this._body;
         if (!this._stream) {
             const self = this;
             const b = this._body;
@@ -3514,14 +3543,36 @@ class Response {
     _consume() {
         if (this.bodyUsed) return Promise.reject(new TypeError('body stream already read'));
         this.bodyUsed = true;
-        return Promise.resolve(this._body);
+        const b = this._body;
+        if (b instanceof ReadableStream) {
+            if (b.locked) return Promise.reject(new TypeError('body stream is locked'));
+            const r = b.getReader(), parts = [];
+            let n = 0;
+            const step = () => r.read().then(x => {
+                if (x.done) {
+                    const all = new Uint8Array(n);
+                    let o = 0;
+                    for (const p of parts) { all.set(p, o); o += p.length; }
+                    return all.buffer;
+                }
+                const c = blobBytes(x.value);
+                parts.push(c); n += c.length;
+                return step();
+            });
+            return step();
+        }
+        return Promise.resolve(b);
     }
     text() { return this._consume().then(b => b === null ? '' : typeof b === 'string' ? b : b instanceof Blob ? b._text() : new TextDecoder().decode(b)); }
     json() { return this.text().then(t => JSON.parse(t)); }
     arrayBuffer() { return this._consume().then(b => b === null ? new ArrayBuffer(0) : typeof b === 'string' ? new TextEncoder().encode(b).buffer : b instanceof ArrayBuffer ? b : b instanceof Blob ? b._b.slice().buffer : ArrayBuffer.isView(b) ? new Uint8Array(b.buffer, b.byteOffset, b.byteLength).slice().buffer : new TextEncoder().encode(String(b)).buffer); }
     blob() { return this._consume().then(b => new Blob(b === null ? [] : [b], { type: this.headers.get('content-type') || '' })); }
     formData() { return this.text().then(t => { const f = new FormData(); for (const [k, v] of new URLSearchParams(t)) f.append(k, v); return f; }); }
-    clone() { return new Response(this._body, { status: this.status, statusText: this.statusText, headers: new Headers(this.headers), url: this.url }); }
+    clone() {
+        let b = this._body;
+        if (b instanceof ReadableStream) { const t = b.tee(); b = t[1]; this._body = t[0]; }
+        return new Response(b, { status: this.status, statusText: this.statusText, headers: new Headers(this.headers), url: this.url });
+    }
     static json(data, init) { const r = new Response(JSON.stringify(data), init); r.headers.set('content-type', 'application/json'); return r; }
     static error() { const r = new Response(null, { status: 0 }); r.type = 'error'; return r; }
     static redirect(url, status) { return new Response(null, { status: status || 302, headers: { location: String(url) } }); }
@@ -3550,8 +3601,9 @@ function fetch(input, init) {
         let req;
         try { req = new Request(input, init); } catch (e) { reject(e); return; }
         if (req.signal.aborted) { reject(req.signal.reason); return; }
-        let done = false;
-        req.signal.addEventListener('abort', () => { if (!done) { done = true; if (/videoplayback/.test(req.url)) mlog('fetch aborted'); reject(req.signal.reason); } });
+        let done = false, sid;
+        const sidOf = () => sid;
+        req.signal.addEventListener('abort', () => { if (done && STREAMS.has(sidOf())) { const c = STREAMS.get(sidOf()); STREAMS.delete(sidOf()); try { c.error(req.signal.reason); } catch (e) { } } if (!done) { done = true; if (/videoplayback/.test(req.url)) mlog('fetch aborted'); reject(req.signal.reason); } });
         if (/^data:/i.test(req.url)) {
             const m = /^data:([^,]*?)(;base64)?,(.*)$/is.exec(req.url);
             if (!m) { reject(new TypeError('Failed to fetch')); return; }
@@ -3564,6 +3616,11 @@ function fetch(input, init) {
             done = true;
             if (!status) { reject(new TypeError('Failed to fetch')); return; }
             resolve(new Response(body, { status, statusText, headers: parseHeaders(raw), url: url || req.url }));
+        }, (status, statusText, raw, stream, url, id) => {
+            if (done) return;
+            done = true;
+            sid = id;
+            resolve(new Response(stream, { status, statusText, headers: parseHeaders(raw), url: url || req.url }));
         });
     });
 }
@@ -6517,6 +6574,6 @@ function activate(el) {
 }
 
 // hide the natives; freeze what pages must not break
-return { dispatch, uiEvent, onFetch, nextDue, runDue, runFrame, fireDCL, fireLoad, setReady, scriptEvent, imageEvent,
+return { dispatch, uiEvent, onFetch, onFetchHead, onFetchData, nextDue, runDue, runFrame, fireDCL, fireLoad, setReady, scriptEvent, imageEvent,
          protoFor, report, moChildList, ceConnect, ceUpgradeTree, dispatchClick, observersCheck, onFrameMessage };
 })

@@ -39,6 +39,10 @@ void wjs_scan_scripts(struct wjs* js);
 // A script / request resource finished (status 0 = network failure).
 void wjs_resource_done(struct wjs* js, int res, int status, const char* headers,
                        const char* body, int len, const char* final_url);
+// Streaming fetch(): the head of a response (status, raw header lines) and then pieces of its body; the end comes
+// through wjs_resource_done with len = -3. Both return WJS_* flags.
+int  wjs_fetch_head(struct wjs* js, int res, int status, const char* headers, const char* url);
+int  wjs_fetch_chunk(struct wjs* js, int res, const char* data, int len);
 // An image resource finished: fire load/error on <img> elements using it.
 void wjs_image_done(struct wjs* js, int slot, int ok);
 // Run what is due (scripts in order, timers, animation frames, lifecycle
