@@ -978,6 +978,17 @@ static void shell_execute(int win_id, const char* input) {
         t[k] = 0;
         window_puts(win_id, t);
     }
+    else if (str_eq(cmd_buf, "audiotest")) {
+        // for audio experiments: no speed correction, and the card position is traced once 8 s of sound have played
+        audio_rate_force(100);
+        audio_trace(1);
+        window_puts(win_id, "audio test armed\n");
+    }
+    else if (str_eq(cmd_buf, "audiotrace")) {
+        // `audiotrace` records the sound card's position at 400 timer ticks; `audiotrace dump` prints it to the serial log
+        if (str_eq(args, "dump")) { audio_trace(0); window_puts(win_id, "trace printed to the serial log\n"); }
+        else { audio_trace(1); window_puts(win_id, "recording 400 ticks; run `audiotrace dump` after ~5 s\n"); }
+    }
     else if (str_eq(cmd_buf, "tickdrop")) {
         uint32_t n = 0;
         for (const char* a = args; *a >= '0' && *a <= '9'; a++) n = n * 10 + (uint32_t)(*a - '0');
