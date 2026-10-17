@@ -104,6 +104,7 @@ uint32_t meng_audio_frames(const struct meng* m);       // audio frames handed t
 
 // ---- video output ----
 void meng_set_output_size(struct meng* m, int w, int h);        // 0,0 = native size
+void meng_set_frame_budget(size_t bytes);     // memory the converted pictures in flight may take (fewer ring slots when they are big)
 const struct meng_frame* meng_get_frame(const struct meng* m);  // NULL until the first frame
 int  meng_video_size(const struct meng* m, int* w, int* h);     // from the track header; 0 if no video known
 
