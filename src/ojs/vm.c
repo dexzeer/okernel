@@ -174,15 +174,48 @@ void frame_trace(ojs* J, struct gch* g) {
 
 // ---------------------------------------------------------------- upvalues
 
+// A frame that captures many of its variables (the wrapper function of a bundle has thousands) would walk its whole open list for every capture:
+// past UIDX_MIN open upvalues the frame gets a slot -> upvalue table, so a lookup is one load and a new upvalue is linked after the
+// nearest open one above it (the list stays ordered by address, close_upvals pops a prefix).
+#define UIDX_MIN 24
 static struct upval* find_upval(ojs* J, struct ojs_frame* f, jv* slot) {
+    if (f->uidx) {
+        size_t i = (size_t)(slot - f->locals);
+        if (i < f->uidx_n) {
+            struct upval* u = f->uidx[i];
+            if (u) return u;
+            struct upval* hi = 0;
+            for (size_t k = i + 1; k < f->uidx_n; k++) if (f->uidx[k]) { hi = f->uidx[k]; break; }
+            u = (struct upval*)gc_alloc(J, GT_UPVAL, sizeof(struct upval));
+            if (!u) return 0;
+            u->loc = slot;
+            if (hi) { u->next_open = hi->next_open; hi->next_open = u; }
+            else { u->next_open = f->open; f->open = u; }
+            f->uidx[i] = u;
+            return u;
+        }
+    }
     struct upval** pp = &f->open;
-    while (*pp && (*pp)->loc > slot) pp = &(*pp)->next_open;
+    uint32_t steps = 0;
+    while (*pp && (*pp)->loc > slot) { pp = &(*pp)->next_open; steps++; }
     if (*pp && (*pp)->loc == slot) return *pp;
     struct upval* u = (struct upval*)gc_alloc(J, GT_UPVAL, sizeof(struct upval));
     if (!u) return 0;
     u->loc = slot;
     u->next_open = *pp;
     *pp = u;
+    if (steps >= UIDX_MIN && !f->uidx && !(f->flags & FRF_HEAP) && f->t && f->t->nlocals > UIDX_MIN) {
+        struct upval** tab = (struct upval**)ojs_sys_malloc(sizeof(struct upval*) * f->t->nlocals);
+        if (tab) {
+            memset(tab, 0, sizeof(struct upval*) * f->t->nlocals);
+            for (struct upval* o = f->open; o; o = o->next_open) {
+                size_t i = (size_t)(o->loc - f->locals);
+                if (i < f->t->nlocals) tab[i] = o;
+            }
+            f->uidx = tab;
+            f->uidx_n = f->t->nlocals;
+        }
+    }
     return u;
 }
 
@@ -192,11 +225,13 @@ void close_upvals(ojs* J, struct ojs_frame* f, jv* from) {
     (void)J;
     while (f->open && f->open->loc >= from) {
         struct upval* u = f->open;
+        if (f->uidx) { size_t i = (size_t)(u->loc - f->locals); if (i < f->uidx_n) f->uidx[i] = 0; }
         u->closed = *u->loc;
         u->loc = &u->closed;
         f->open = u->next_open;
         u->next_open = 0;
     }
+    if (f->uidx && !f->open) { ojs_sys_free(f->uidx); f->uidx = 0; f->uidx_n = 0; }
 }
 
 // ---------------------------------------------------------------- function objects

@@ -475,6 +475,9 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
 #define SLOW() (slow ? slow : (slow = step_stub(c, ord)))
 #define NEXT_L (ord + 1)
     c->nnative++;
+#if !(defined(KERNEL) && KERNEL)
+    { static int nonative = -1; if (nonative < 0) nonative = getenv("OJS_JIT_NONATIVE") != 0; if (nonative && op != OP_RETURN && op != OP_RETURN_UNDEF) goto generic; }       // measuring: every instruction through vm_step
+#endif
     switch (op) {
     case OP_NOP: case OP_DEBUGGER: case OP_NOP_END: case OP_LINE: break;
     case OP_UNDEF: push_const(c, ST(d), 0, V_SPECIAL); break;
@@ -1003,7 +1006,13 @@ static jv jit_run_frame(ojs* J, struct ojs_frame* f) {
 
 // Compiled code asks for one instruction to be run by the interpreter (mode 1: unwind an exception first). Returns the native address to
 // continue at, or 0 when the function is over (*res = its result, JV_EXC for an exception nobody catches).
+#if !(defined(KERNEL) && KERNEL)
+static unsigned long long step_count[256];
+#endif
 void* jit_step(ojs* J, struct ojs_frame* f, void* resume, const uint8_t* resume_pc, jv* res, int mode) {
+#if !(defined(KERNEL) && KERNEL)
+    if (!mode) step_count[*f->pc]++; else step_count[0]++;
+#endif
     int r = vm_step(J, f, res, mode);
     if (r) return 0;
     if (f->pc == resume_pc) return resume;
@@ -1017,6 +1026,10 @@ void* jit_step(ojs* J, struct ojs_frame* f, void* resume, const uint8_t* resume_
 #if !(defined(KERNEL) && KERNEL)
 __attribute__((destructor)) static void jit_stats_dump(void) {
     if (!getenv("OJS_JIT_STATS")) return;
+    { unsigned long long tot = 0; for (int i = 0; i < 256; i++) tot += step_count[i];
+      fprintf(stderr, "[jit] %llu steps through the interpreter\n", tot);
+      for (int r = 0; r < 25; r++) { int b = -1; for (int i = 0; i < 256; i++) if (step_count[i] && (b < 0 || step_count[i] > step_count[b])) b = i;
+        if (b < 0) break; fprintf(stderr, "[jit]   %-18s %llu\n", b == 0 ? "(call exception)" : op_name(b), step_count[b]); step_count[b] = 0; } }
     fprintf(stderr, "[jit] compiled %u in %.0f ms, rejected %u, %llu bytes of code, %llu instructions (%llu native, %llu via the interpreter)\n",
             ojs_jit_stats.compiled, jit_ms, ojs_jit_stats.rejected, (unsigned long long)ojs_jit_stats.code_bytes,
             (unsigned long long)ojs_jit_stats.instructions, (unsigned long long)ojs_jit_stats.native, (unsigned long long)ojs_jit_stats.stepped);

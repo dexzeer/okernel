@@ -208,6 +208,8 @@ struct ojs_frame {
     jv resume_value;
     int ystar_mode;             // yield* : how the delegate is resumed (0 next, 1 throw, 2 return)
     int ystar_phase;            // async yield*: 0 call the delegate, 1 awaited its result, 2 awaited a return value, 3 awaited close
+    struct upval** uidx;        // plain frames with many open upvalues: slot -> its open upvalue (find_upval; freed when the last one closes)
+    uint32_t uidx_n;
 };
 #define FRF_HEAP     0x01       // locals/stack live in a GT_FRAME heap block
 #define FRF_CTOR     0x02       // [[Construct]] call
