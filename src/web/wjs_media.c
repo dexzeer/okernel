@@ -29,6 +29,7 @@ static void* audio_owner;
 
 #if defined(KERNEL) && KERNEL
 #include "../audio.h"
+#include "../memory.h"
 extern uint32_t tick_count;
 int mplay_active(void);
 static uint32_t env_ticks(void) { return tick_count; }
@@ -243,6 +244,23 @@ void wjs_media_free(struct wjs* js) {
 
 // Largest frame the engine is asked to produce (4 bytes a pixel).
 #define MAX_OUT_PX (2048 * 1152)
+// How many pixels one converted frame may have: the engine keeps a dozen of them in flight (VW_RING slots), so what is left of the
+// kernel heap decides. A fullscreen click on a 1915x1077 page asked for 8.2 MB per slot (a dozen slots) with 167 MB free: every allocation failed and the
+// video died (323 [diag] kmalloc FAIL lines).
+static int64_t out_budget_px(void) {
+#if defined(KERNEL) && KERNEL
+    uint32_t total, used, peak, lf;
+    heap_stats(&total, &used, &peak, &lf);
+    uint32_t freeb = total > used ? total - used : 0;
+    // pictures in flight may take a quarter of what is free (fewer slots when they are big, see meng.c); only when almost nothing is
+    // left is the picture itself made smaller (the page painter scales it, which is much slower than the converters)
+    size_t b = freeb / 4;
+    meng_set_frame_budget(b < (24u << 20) ? (24u << 20) : b > (120u << 20) ? (120u << 20) : b);
+    return freeb < 70u * 1024 * 1024 ? 1280 * 720 : MAX_OUT_PX;
+#else
+    return MAX_OUT_PX;
+#endif
+}
 
 const uint32_t* wjs_media_frame(struct wjs* js, int sess, int* w, int* h) {
     if (!js || !js->media || sess < 1 || sess > WM_MAX || !js->media[sess - 1].m) return 0;
@@ -363,13 +381,15 @@ int wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout) {
             if (wdoc_video_set(js->doc, s->node, f->px, f->w, f->h)) { relayout = 1; continue; }
             if (!wdoc_video_dest(js->doc, s->node, &dx, &dy, &dw, &dh, &fixed) || dw <= 0 || dh <= 0) continue;
             s->dest_ok = 1; s->dest_x = dx; s->dest_y = dy; s->dest_w = dw; s->dest_h = dh; s->dest_fixed = fixed;
-            s->dest_ok = 1; s->dest_x = dx; s->dest_y = dy; s->dest_w = dw; s->dest_h = dh; s->dest_fixed = fixed;
-            if ((dw != s->out_w || dh != s->out_h) && (int64_t)dw * dh <= MAX_OUT_PX) {
+            int ow = dw, oh = dh;
+            int64_t budget = out_budget_px();
+            while ((int64_t)ow * oh > budget && ow > 16 && oh > 16) { ow = ow * 7 / 8; oh = oh * 7 / 8; }   // fullscreen: a smaller frame, the painter scales it up
+            if (ow != s->out_w || oh != s->out_h) {
                 // the engine converts straight to the size the element is painted at (no resampling in
                 // the page painter); the converted frame comes back as the next serial
-                s->out_w = dw;
-                s->out_h = dh;
-                meng_set_output_size(s->m, dw, dh);
+                s->out_w = ow;
+                s->out_h = oh;
+                meng_set_output_size(s->m, ow, oh);
                 continue;
             }
             if (n < max) {

@@ -1409,6 +1409,11 @@ static void vw_present(struct meng* m, int64_t limit) {
     m->v_last_show = t;
 }
 
+// How much memory the converted pictures in flight may take (set by the shell from what is left of the heap): a fullscreen 1915x1077 picture is
+// 8.2 MB and the ring holds a dozen, which ate a nearly full heap and killed the video. With big pictures fewer slots are used (3 at least).
+static size_t frame_budget = 96u << 20;
+void meng_set_frame_budget(size_t bytes) { frame_budget = bytes; }
+
 // hand the next few due packets to the worker
 static void vw_submit(struct meng* m, int64_t now) {
     struct vwork* w = &m->vw;
@@ -1416,6 +1421,15 @@ static void vw_submit(struct meng* m, int64_t now) {
     uint32_t sel[VW_BATCH];
     int nsel = 0, nfree = 0;
     for (int i = 0; i < VW_RING; i++) if (w->slot[i].state == 0) nfree++;
+    {
+        int inuse = VW_RING - nfree;
+        size_t px = m->out_w > 0 && m->out_h > 0 ? (size_t)m->out_w * (size_t)m->out_h : m->frame.src_w > 0 && m->frame.src_h > 0 ? (size_t)m->frame.src_w * (size_t)m->frame.src_h : (size_t)1280 * 720;
+        size_t slot_bytes = px * 4 + px * 3 / 2 * 2;                   // converted picture + the copied YUV planes (16 bit)
+        int cap = slot_bytes ? (int)(frame_budget / slot_bytes) : VW_RING;
+        if (cap < 3) cap = 3;
+        if (cap > VW_RING) cap = VW_RING;
+        if (nfree > cap - inuse) nfree = cap - inuse > 0 ? cap - inuse : 0;
+    }
     uint32_t k = vq_live(m, m->vq.next);
     size_t total = 0;
     const int64_t horizon = now + VIDEO_LEAD_NS + VW_AHEAD_NS;
