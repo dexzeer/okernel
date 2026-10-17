@@ -4,6 +4,7 @@
 #include "gc_int.h"
 #include "atoms.h"
 #include "builtins.h"
+#include "jit.h"
 
 #define JV_GENRET JV_MAKE(TAG_SPECIAL, 6)     // internal: generator return in progress
 
@@ -494,6 +495,7 @@ jv vm_run_script(ojs* J, struct ftempl* t, jv this_v) {
 }
 
 jv vm_run(ojs* J, struct ojs_frame* f);
+static jv jit_run_frame(ojs* J, struct ojs_frame* f);
 
 // the common call: a plain JS function (not a class constructor, generator or async
 // function) called without new - vm_call + call_closure without their dispatch
@@ -515,10 +517,13 @@ static inline jv call_plain(ojs* J, struct func* fn, jv this_v, int argc, jv* ar
     if (!block) { J->call_depth--; return JV_EXC; }
     struct ojs_frame f;
     frame_init(J, &f, fn, block, n, this_v, argc, argv, JV_UNDEFINED);
-    jv r = vm_run(J, &f);
+    jv r = (t->jit && ojs_jit_mode) ? jit_run_frame(J, &f) : vm_run(J, &f);
     vstack_free(J, block);
     J->call_depth--;
     return r;
 }
 
+static int jit_hot(ojs* J, struct ftempl* t);
+static jv jit_exec(ojs* J, struct ojs_frame* f, void* target);
 #include "vm_run.c"
+#include "jit.c"

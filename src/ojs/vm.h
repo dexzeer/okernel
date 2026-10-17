@@ -104,7 +104,8 @@ struct upval_desc { uint16_t from_local; uint16_t index; };
 // receiver's prototype, checked by identity) whose shape was hshape. Globals: holder
 // is the lexical environment or the global object; aux the lexical binding count
 // a global object hit was made at (a later `let` of the same name shadows it).
-struct ic { struct shape* shape; struct obj* holder; struct shape* hshape; struct obj* proto; pkey key; uint32_t slot, aux, epoch; };
+struct ic { struct shape* shape; struct obj* holder; struct shape* hshape; struct obj* proto; pkey key; uint32_t slot, aux, epoch;
+               struct shape* fshape; uint32_t fslot; };   // fshape: compiled code (jit.c) reads the own data property fslot of objects of exactly this shape without any further check (0: no such fast path)
 #define IC_WAYS 2                // entries per site (a site that sees two shapes stays cached); see vm_helpers.c
 #define IC_NONE 0xFFFF
 
@@ -140,6 +141,9 @@ struct ftempl {
     uint32_t nic;               //   traced by the collector, so what they name stays alive) 
     uint8_t* param_map;         // mapped arguments: 1 if parameter i is its name's binding (gc bytes)
     struct srctext* srct;       // compact copy of the source (then source is NULL; srctext.c)
+    struct jitcode* jit;        // compiled code (jit.c), freed by the finalizer
+    uint32_t hot;               // calls and loop iterations counted towards compiling it
+    uint8_t jit_bad;            // compiling failed: do not try again
 };
 
 // srctext.c: a script's source kept as UTF-8 for its compiled templates

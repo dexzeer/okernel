@@ -15,6 +15,7 @@
 #include "ojs_int.h"
 #include "gc_int.h"
 #include "atoms.h"
+#include "jit.h"
 
 struct class_ops class_ops[OC_COUNT];
 
@@ -266,6 +267,11 @@ void obj_trace(ojs* J, struct obj* o) {
 }
 
 void gc_finalize(ojs* J, struct gch* g) {
+    if (g->type == GT_FTEMPL) {
+        struct ftempl* t = (struct ftempl*)g;
+        if (t->jit) { jit_free(t->jit); t->jit = 0; }
+        return;
+    }
     if (g->type == GT_OBJ) {
         struct obj* o = (struct obj*)g;
         if (class_ops[obj_class(o)].finalize) class_ops[obj_class(o)].finalize(J, o);

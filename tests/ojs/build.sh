@@ -31,5 +31,5 @@ for f in $SRCS; do
 done
 if stale $OUT/kmath.o $OUT/kmath.d; then gcc $CFLAGS -DKMATH_NO_STD_NAMES -MMD -MF $OUT/kmath.d -c src/kmath.c -o $OUT/kmath.o; fi
 if stale $OUT/run.o $OUT/run.d; then gcc $CFLAGS -MMD -MF $OUT/run.d -c tests/ojs/run.c -o $OUT/run.o; fi
-gcc $CFLAGS -no-pie $OBJS $OUT/kmath.o $OUT/run.o -o build-host/ojs_run -lm -pthread
-echo built build-host/ojs_run
+gcc $CFLAGS -no-pie $OBJS $OUT/kmath.o $OUT/run.o -o ${OUTBIN:-build-host/ojs_run} -lm -pthread
+echo built ${OUTBIN:-build-host/ojs_run}

@@ -92,9 +92,10 @@ static inline int ic_get_str(ojs* J, struct ftempl* t, uint32_t i, jv* out) {
 
 // the way to write into: the one already holding shape s, else a free one, else the older one (the newest entry lives in way 0)
 static struct ic* ic_way(struct ic* e, struct shape* s) {
-    for (int w = 0; w < IC_WAYS; w++) if (e[w].shape == s) return &e[w];
-    for (int w = 0; w < IC_WAYS; w++) if (!e[w].shape) { memmove(e + 1, e, (size_t)w * sizeof *e); return e; }
+    for (int w = 0; w < IC_WAYS; w++) if (e[w].shape == s) { e[w].fshape = 0; return &e[w]; }       // (the filler sets fshape again if the entry qualifies)
+    for (int w = 0; w < IC_WAYS; w++) if (!e[w].shape) { memmove(e + 1, e, (size_t)w * sizeof *e); e->fshape = 0; return e; }
     memmove(e + 1, e, (size_t)(IC_WAYS - 1) * sizeof *e);
+    e->fshape = 0;
     return e;
 }
 
@@ -162,6 +163,7 @@ static void ic_fill_get(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, pke
     e->slot = slot;
     e->aux = acc ? 2 : 0;
     e->epoch = J->proto_epoch;
+    if (!h && !acc && !s->dict) { e->fshape = s; e->fslot = slot; }      // compiled code: an own data property of a shared shape
 }
 
 // cached [[Set]]: an own writable data property, the addition of a property (the shape after it is cached), or a setter. Returns 1 when done,
@@ -232,6 +234,7 @@ static void ic_fill_put(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, pke
         e->shape = s; e->holder = h; e->hshape = 0; e->proto = h ? o->proto : 0;
         e->aux = acc ? 3 : 0;
         e->key = k; e->slot = slot; e->epoch = J->proto_epoch;
+        if (!h && !acc && !s->dict) { e->fshape = s; e->fslot = slot; }      // compiled code: an own writable data property of a shared shape
         return;
     }
     // the shape moved: if exactly one property was appended to a shared shape, remember the transition. It stays valid while the prototype
