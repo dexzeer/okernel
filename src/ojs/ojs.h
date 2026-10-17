@@ -55,6 +55,7 @@ struct ojs_stats {
     size_t heap_bytes, live_bytes;
     int gc_count;
     double gc_ms;
+    double gc_mark_ms;
     unsigned long long total_alloc;
     size_t live_by_type[16];    // after the last GC: str rope sym bigint obj shape ftempl upval valarr bytes ptrarr maptab module frame
 };

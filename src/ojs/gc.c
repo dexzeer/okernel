@@ -545,6 +545,7 @@ void gc_collect(ojs* J) {
     finreg_process(J);      // may mark held values of dead targets (callbacks queued)
     drain(J);
     weak_clear_dead(J);     // WeakMap entries / WeakRef targets that died
+    J->gc_mark_ms += ojs_sys_time_ms() - t0;
     atoms_sweep(J);
     size_t live = sweep(J);
     release_chunks(J);

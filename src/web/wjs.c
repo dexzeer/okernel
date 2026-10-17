@@ -1933,6 +1933,18 @@ void wjs_stats(struct wjs* js, char* out, int cap) {
         do { d[dl++] = (char)('0' + v % 10); v /= 10; } while (v);
         while (dl && n < cap - 4) out[n++] = d[--dl];
     }
+    {   // what the live heap is made of (KB) and what the collector cost so far: where memory and GC time go
+        const char* tn[9] = { " [str=", " obj=", " shape=", " code=", " arr=", " bytes=", " ptrs=", " gcms=", " markms=" };
+        static const int ti[7] = { 0, 4, 5, 6, 8, 9, 10 };      // GT_STR, GT_OBJ, GT_SHAPE, GT_FTEMPL, GT_VALARR, GT_BYTES, GT_PTRARR (minus one)
+        for (int k = 0; k < 9 && n < cap - 24; k++) {
+            for (const char* p = tn[k]; *p && n < cap - 24; p++) out[n++] = *p;
+            unsigned v = k < 7 ? (unsigned)(st.live_by_type[ti[k]] >> 10) : k == 7 ? (unsigned)st.gc_ms : (unsigned)st.gc_mark_ms;
+            char d[12]; int dl = 0;
+            do { d[dl++] = (char)('0' + v % 10); v /= 10; } while (v);
+            while (dl && n < cap - 4) out[n++] = d[--dl];
+        }
+        if (n < cap - 4) out[n++] = ']';
+    }
     if (js->dead && n < cap - 8) { memcpy(out + n, " dead", 5); n += 5; }
     out[n] = 0;
 }

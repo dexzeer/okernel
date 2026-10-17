@@ -460,6 +460,7 @@ struct ojs {
     struct obj* fin_regs;           // FinalizationRegistry objects
     int gc_count;
     double gc_ms;                // time spent collecting (wall clock)
+    double gc_mark_ms;           // of which marking (roots + drain + weak structures)
     uint64_t total_alloc;
     // host classes
     struct ojs_class_def* host_classes;
