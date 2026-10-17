@@ -978,6 +978,11 @@ static void shell_execute(int win_id, const char* input) {
         t[k] = 0;
         window_puts(win_id, t);
     }
+    else if (str_eq(cmd_buf, "progress")) {
+        // `progress off` / `progress on`: whether style, layout and paint passes keep the video going (okai.c render_progress); for A/B tests
+        okai_set_render_progress(!str_eq(args, "off"));
+        window_puts(win_id, str_eq(args, "off") ? "render progress hook off\n" : "render progress hook on\n");
+    }
     else if (str_eq(cmd_buf, "audiotest")) {
         // for audio experiments: no speed correction, and the card position is traced once 8 s of sound have played
         audio_rate_force(100);

@@ -722,6 +722,7 @@ static void lay_box_impl(struct wlayout* L, int bi, int32_t avail, int32_t force
 #define MEMO_KEEP (BF_EMPTY | BF_HEIGHT_DEF | BF_LAID)
 int lay_memo_enabled = 1;      // host A/B testing (tests/web/wbrowse.c: WB_NOMEMO=1)
 void lay_box(struct wlayout* L, int bi, int32_t avail, int32_t forced_w, int32_t forced_h) {
+    W_PROGRESS();
     struct lbox* b = &L->b[bi];
     int memo = lay_memo_enabled && b->kind == LB_BLOCK && !(b->flags & (BF_ABS | BF_FLOAT | BF_INLINE_LEVEL)) && lay_is_bfc(L, bi);
     if (memo && b->mo_ok && b->mo_av == avail && b->mo_fw == forced_w && b->mo_fh == forced_h && b->mo_cbh == b->cbh &&

@@ -124,6 +124,7 @@ struct okai {
 };
 
 void okai_init(void);
+void okai_set_render_progress(int on);    // test hook, see okai.c render_progress
 int okai_open(const char* url);
 void okai_close(int id);
 // Active tab of a okai (the page being displayed / fetched).

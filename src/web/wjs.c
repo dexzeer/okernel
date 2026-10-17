@@ -37,6 +37,8 @@ void wjs_selq_forget(struct wdom* d);
 #define MAX_MODULES      512
 
 struct wjs_host wjs_host;
+void (*w_progress_hook)(void);
+uint32_t w_progress_n;
 
 // ---- host services ----------------------------------------------------------------
 
@@ -151,7 +153,7 @@ static int interrupt_cb(ojs* J, void* op) {
     if (js->deadline && now > js->deadline) { js->interrupted = 1; return 1; }
     if (wjs_host.yield) {
         static int last_yield;
-        if (now - last_yield >= 20 || now < last_yield) { last_yield = now; wjs_media_tick(js); wjs_host.yield(); }
+        if (now - last_yield >= 10 || now < last_yield) { last_yield = now; wjs_media_tick(js); wjs_host.yield(); }
     }
     return 0;
 }

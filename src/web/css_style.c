@@ -2643,6 +2643,7 @@ void css_compute_all(struct wstyleset* ss, int vw, int vh) {
     // iterate children of the document
     int node = d->n[0].first;
     while (node >= 0) {
+        W_PROGRESS();
         int descend = 0;
         if (d->n[node].type == WN_ELEM) {
             // parent style: nearest element frame

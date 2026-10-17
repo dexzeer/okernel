@@ -364,6 +364,7 @@ void wpaint(const struct wlayout* L, struct wsurf* s, int scroll_y, const struct
     int32_t scroll_lu = PX(scroll_y);
     for (int i = 0; i < n; i++) {
         const struct ditem* d = &it[i];
+        W_PROGRESS();
         int32_t oy = d->fixed ? 0 : scroll_lu;
         if (d->kind == DI_UNCLIP) {
             if (nclip > 0) { nclip--; ws_pop_clip(s, clips[nclip]); }
