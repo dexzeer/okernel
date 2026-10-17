@@ -42,7 +42,8 @@ static inline int ic_slot_ok(const struct shape* s, uint32_t slot, pkey k) {
     return !s->dict || (slot < s->nprops && s->props[slot].key == k && !(s->props[slot].attrs & PA_ACCESSOR));
 }
 
-// cached [[Get]] of a named property on an ordinary object
+// cached [[Get]] of a named property on an ordinary object. Returns 1 with the value in *out, 2 with the GETTER in *out (the caller calls it with the
+// receiver; undefined getters answer 1/undefined), 0 for a miss.
 static inline int ic_get(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, jv* out) {
     if (!t->ic || i >= t->nic) return 0;
     struct ic* e = IC_AT(t, i);
@@ -51,14 +52,23 @@ static inline int ic_get(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, jv
     for (int w = 0; w < IC_WAYS; w++, e++) {
         if (e->shape != s) continue;
         struct obj* h = e->holder;
+        jv v;
         if (!h) {
-            if (!ic_slot_ok(s, e->slot, e->key)) return 0;
-            *out = o->slots[e->slot];
-            return 1;
+            if (e->aux == 2) v = o->slots[e->slot];         // own accessor (shared shapes only)
+            else {
+                if (!ic_slot_ok(s, e->slot, e->key)) return 0;
+                *out = o->slots[e->slot];
+                return 1;
+            }
+        } else {
+            if (o->proto != e->proto || e->epoch != J->proto_epoch) return 0;
+            v = h->slots[e->slot];
+            if (e->aux != 2) { *out = v; return 1; }
         }
-        if (o->proto != e->proto || e->epoch != J->proto_epoch) return 0;
-        *out = h->slots[e->slot];
-        return 1;
+        v = ((struct accessor*)jv_obj(v))->get;
+        if (jv_is_undef(v)) { *out = JV_UNDEFINED; return 1; }
+        *out = v;
+        return 2;
     }
     return 0;
 }
@@ -110,12 +120,12 @@ static void ic_fill_get_str(ojs* J, struct ftempl* t, uint32_t i, pkey k) {
 
 // the first prototype of o's chain that has k (a data property), or 0; *slot its slot. Fails (returns -1) when something on the way makes the
 // answer depend on more than shapes: an exotic object, an accessor, an array's "length"
-static int ic_chain_find(ojs* J, struct obj* o, pkey k, struct obj** holder, uint32_t* slot) {
+static int ic_chain_find(ojs* J, struct obj* o, pkey k, struct obj** holder, uint32_t* slot, int* accessor) {
     for (struct obj* p = o->proto; p; p = p->proto) {
         if ((p->flags & OF_EXOTIC) || (obj_class(p) == OC_ARRAY && k == A(length))) return -1;
         int j = shape_find(p->shape, k);
         if (j >= 0) {
-            if (p->shape->props[j].attrs & PA_ACCESSOR) return -1;
+            *accessor = (p->shape->props[j].attrs & PA_ACCESSOR) != 0;
             *holder = p;
             *slot = (uint32_t)j;
             return 1;
@@ -131,12 +141,15 @@ static void ic_fill_get(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, pke
     int j = shape_find(s, k);
     struct obj* h = 0;
     uint32_t slot;
+    int acc = 0;
     if (j < 0) {
         // a chain hit holds while the receiver's shape is a function of its own keys (not a dictionary it mutates in place)
-        if (s->dict || ic_chain_find(J, o, k, &h, &slot) != 1) return;
+        if (s->dict || ic_chain_find(J, o, k, &h, &slot, &acc) != 1) return;
         if (!(h->flags & OF_PROTO)) return;            // (always true: it is somebody's prototype; the epoch relies on it)
-    } else if (s->props[j].attrs & PA_ACCESSOR) return;
-    else slot = (uint32_t)j;
+    } else {
+        slot = (uint32_t)j;
+        if (s->props[j].attrs & PA_ACCESSOR) { if (s->dict) return; acc = 1; }
+    }
     struct ic* e = ic_entry(J, t, i);
     if (!e) return;
     e = ic_way(e, s);
@@ -147,19 +160,32 @@ static void ic_fill_get(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, pke
     e->aux = 0;
     e->key = k;
     e->slot = slot;
+    e->aux = acc ? 2 : 0;
     e->epoch = J->proto_epoch;
 }
 
-// cached [[Set]]: an own writable data property, or the addition of a property (the shape after it is cached)
-static inline int ic_put(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, jv v) {
+// cached [[Set]]: an own writable data property, the addition of a property (the shape after it is cached), or a setter. Returns 1 when done,
+// 2 with the SETTER in *setter (the caller calls it with the receiver and the value), 0 for a miss.
+static inline int ic_put(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, jv v, jv* setter) {
     if (!t->ic || i >= t->nic) return 0;
     struct ic* e = IC_AT(t, i);
     struct shape* s = o->shape;
     if (o->flags & OF_EXOTIC) return 0;
     for (int w = 0; w < IC_WAYS; w++, e++) {
         if (e->shape != s) continue;
+        if (e->aux == 3) {                              // a setter, own or inherited
+            jv a;
+            if (e->holder) {
+                if (o->proto != e->proto || e->epoch != J->proto_epoch) return 0;
+                a = e->holder->slots[e->slot];
+            } else a = o->slots[e->slot];
+            jv st = ((struct accessor*)jv_obj(a))->set;
+            if (jv_is_undef(st)) return 0;
+            *setter = st;
+            return 2;
+        }
         if (e->holder) return 0;
-        if (e->aux) {                                   // a property is added: the shape transition is known to be valid
+        if (e->aux == 1) {                              // a property is added: the shape transition is known to be valid
             if (o->proto != e->proto || e->epoch != J->proto_epoch || (o->flags & (OF_PROTO | OF_EXTENSIBLE)) != OF_EXTENSIBLE) return 0;
             uint32_t idx = e->slot;
             if (!o->slots || idx >= valarr_cap(o->slots)) {
@@ -183,14 +209,29 @@ static inline int ic_put(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, jv
 static void ic_fill_put(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, pkey k, struct shape* before) {
     if (i >= t->nic || (o->flags & OF_EXOTIC) || PK_IS_INDEX(k)) return;
     struct shape* s = o->shape;
-    if (s == before) {                                 // the property existed: cache the slot
+    if (s == before) {                                 // nothing was added: the property existed (own or inherited)
         int j = shape_find(s, k);
-        if (j < 0 || (s->props[j].attrs & (PA_ACCESSOR | PA_WRITABLE)) != PA_WRITABLE) return;
+        struct obj* h = 0;
+        uint32_t slot;
+        int acc = 0;
+        if (j >= 0) {
+            slot = (uint32_t)j;
+            uint32_t at = s->props[j].attrs;
+            if (at & PA_ACCESSOR) { if (s->dict) return; acc = 1; }
+            else if ((at & PA_WRITABLE) != PA_WRITABLE) return;
+        } else {                                       // an inherited setter (an inherited data property would have been added to o)
+            if (s->dict || ic_chain_find(J, o, k, &h, &slot, &acc) != 1 || !acc || !(h->flags & OF_PROTO)) return;
+        }
+        if (acc) {
+            struct obj* holder = h ? h : o;
+            if (jv_is_undef(((struct accessor*)jv_obj(holder->slots[slot]))->set)) return;
+        }
         struct ic* e = ic_entry(J, t, i);
         if (!e) return;
         e = ic_way(e, s);
-        e->shape = s; e->holder = 0; e->hshape = 0; e->proto = 0; e->aux = 0;
-        e->key = k; e->slot = (uint32_t)j; e->epoch = 0;
+        e->shape = s; e->holder = h; e->hshape = 0; e->proto = h ? o->proto : 0;
+        e->aux = acc ? 3 : 0;
+        e->key = k; e->slot = slot; e->epoch = J->proto_epoch;
         return;
     }
     // the shape moved: if exactly one property was appended to a shared shape, remember the transition. It stays valid while the prototype
