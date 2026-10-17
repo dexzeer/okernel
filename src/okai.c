@@ -1163,6 +1163,7 @@ void okai_set_render_progress(int on) { w_progress_hook = on ? render_progress :
 void okai_init(void) {
     wjs_host.yield = engine_pump;
     w_progress_hook = render_progress;
+    wjs_sys_parallel_init();
     wjs_host.now_ms = okai_now_ms;
     wjs_host.random = okai_js_random;
     wjs_host.log = okai_js_log;

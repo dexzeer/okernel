@@ -62,6 +62,12 @@ struct ojs_stats {
 };
 #define OJS_STATS_TYPES "str rope sym bigint obj shape ftempl upval valarr bytes ptrarr maptab module frame"
 void   ojs_get_stats(ojs* J, struct ojs_stats* st);
+// Let the collector mark on several threads: ncpu() = how many may work at once (1 = none); run(fn, ctx, n) calls fn(ctx, i, is_main) for
+// i in [0, n) CONCURRENTLY (all of them must make progress together; one of them runs on the calling thread, is_main = 1 there) and returns when
+// all have returned.
+extern void (*ojs_gc_report)(int parallel, double total_ms, double mark_ms, size_t live, size_t heap);   // set by the embedder to log collections
+void   ojs_set_parallel_min(size_t heap_bytes);   // collections of smaller heaps are not parallel (default 24 MB; tests use 0)
+void   ojs_set_parallel(int (*ncpu)(void), void (*run)(void (*fn)(void* ctx, int item, int is_main), void* ctx, int n));
 int    ojs_where(ojs* J, char* out, int cap);           // innermost JS function "name file:line:col" (profiling)   // heap_bytes: pages + large blocks held; live: after the last GC
 
 // ---- roots (values stored outside the C stack)

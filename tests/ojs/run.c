@@ -12,6 +12,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
+#include <pthread.h>
+#include <unistd.h>
 #include "../../src/ojs/ojs.h"
 #include "../../src/ojs/ojs_sys.h"
 
@@ -294,7 +296,29 @@ static int test262(const char* harness) {
     return 0;
 }
 
+// parallel marking on host threads (OJS_GCTHREADS=n, default: the number of CPUs; 1 = off)
+static int host_ncpu(void) {
+    const char* e = getenv("OJS_GCTHREADS");
+    int n = e ? atoi(e) : (int)sysconf(_SC_NPROCESSORS_ONLN);
+    return n < 1 ? 1 : n > 8 ? 8 : n;
+}
+struct hjob { void (*fn)(void*, int, int); void* ctx; int item; };
+static void* host_thread(void* a) { struct hjob* j = (struct hjob*)a; j->fn(j->ctx, j->item, 0); return 0; }
+static void host_run(void (*fn)(void*, int, int), void* ctx, int n) {
+    pthread_t th[8];
+    struct hjob jobs[8];
+    int started = 0;
+    for (int i = 1; i < n && i < 8; i++) {
+        jobs[i].fn = fn; jobs[i].ctx = ctx; jobs[i].item = i;
+        if (pthread_create(&th[i], 0, host_thread, &jobs[i]) == 0) started |= 1 << i;
+    }
+    fn(ctx, 0, 1);
+    for (int i = 1; i < n && i < 8; i++) if (started & (1 << i)) pthread_join(th[i], 0);
+}
+
 int main(int argc, char** argv) {
+    ojs_set_parallel(host_ncpu, host_run);
+    if (getenv("OJS_GCPAR_MIN")) ojs_set_parallel_min((size_t)atoi(getenv("OJS_GCPAR_MIN")) << 20);
     set_x87();
     if (argc > 2 && !strcmp(argv[1], "--test262")) return test262(argv[2]);
     int module = 0, strict = 0, rc = 0;

@@ -144,6 +144,7 @@ struct gch {
 };
 
 struct ojs;   // runtime + realm (one per page)
+struct marker;  // gc.c: a mark stack
 typedef struct ojs ojs;
 
 void* gc_ext_alloc(ojs* J, size_t n);                   // zeroed ArrayBuffer storage, NULL at the limit
@@ -459,6 +460,7 @@ struct ojs {
     struct weak_list* weak_maps;    // WeakMap/WeakSet tables (ephemeron processing)
     struct obj* weak_refs;          // list of WeakRef objects
     struct obj* fin_regs;           // FinalizationRegistry objects
+    struct marker* mk;              // the mark stack gc_mark_* push on (the collector's own, or a parallel worker's)
     uint32_t proto_epoch;           // bumped whenever an OF_PROTO object's properties or prototype change: proto-chain inline caches check it
     uint32_t ic_stat[8];            // inline cache statistics (OJS_ICSTATS): hits, own hits, proto hits, polymorphic hits, fills, slow gets
     int gc_count;
