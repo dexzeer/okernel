@@ -524,6 +524,10 @@ static inline jv call_plain(ojs* J, struct func* fn, jv this_v, int argc, jv* ar
 }
 
 static int jit_hot(ojs* J, struct ftempl* t);
+#ifdef OJS_JIT_CHECK
+static void jit_check_depth(struct ftempl* t, uint32_t pc_off, int depth);
+#endif
+static int jit_osr(ojs* J, struct ojs_frame* f, struct ftempl* t, uint8_t* pc, jv* res);
 static jv jit_exec(ojs* J, struct ojs_frame* f, void* target);
 #include "vm_run.c"
 #include "jit.c"

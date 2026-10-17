@@ -980,6 +980,17 @@ static void shell_execute(int win_id, const char* input) {
         t[k] = 0;
         window_puts(win_id, t);
     }
+    else if (str_eq(cmd_buf, "jit")) {
+        // `jit on` (tiered: hot functions are compiled to machine code), `jit off`, `jit eager` (everything at its first call), `jit N` (calls before a function is compiled)
+        extern void ojs_jit_set_mode(int), ojs_jit_set_threshold(uint32_t), ojs_jit_report(char*, int);
+        if (str_eq(args, "on")) ojs_jit_set_mode(1);
+        else if (str_eq(args, "off")) ojs_jit_set_mode(0);
+        else if (str_eq(args, "eager")) ojs_jit_set_mode(2);
+        else if (args[0] >= '0' && args[0] <= '9') { uint32_t n = 0; for (const char* a = args; *a >= '0' && *a <= '9'; a++) n = n * 10 + (uint32_t)(*a - '0'); ojs_jit_set_threshold(n); }
+        char t[256];
+        ojs_jit_report(t, sizeof t);
+        window_puts(win_id, t);
+    }
     else if (str_eq(cmd_buf, "gcpar")) {
         // `gcpar off` marks the page JS heap on one CPU only, `gcpar on` (default) on every CPU: [js-gc] lines in the serial log show the pause
         wjs_sys_parallel_gc(!str_eq(args, "off"));
