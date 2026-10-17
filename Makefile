@@ -157,6 +157,8 @@ web-tests:
 	sh tests/ojs/build.sh && ./build-host/ojs_run tests/ojs/smoke.js | tail -n 1 | grep 'ALL OK'
 	OJS_MEMLIMIT=64 ./build-host/ojs_run tests/ojs/memlimit.js | grep 'ALL OK'
 	./build-host/ojs_run tests/ojs/manyconsts.js | grep 'ALL OK'
+	./build-host/ojs_run tests/ojs/ic_semantics.js | grep 'ALL OK'
+	OJS_GCSTRESS=3 ./build-host/ojs_run tests/ojs/ic_semantics.js | grep 'ALL OK'
 
 # ---- Host tests (no QEMU; run from repo root — suites load tests/fixtures/*) ----
 # Offline must-pass: tls_crypto, css, subres, pki, adversarial (fast -O2 build;

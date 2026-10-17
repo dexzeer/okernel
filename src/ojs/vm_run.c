@@ -347,7 +347,11 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             uint32_t ici = rd16(pc + 4);
             pc += 6;
             a = TOP;
-            if (jv_is_obj(a) && ic_get(J, t, ici, jv_obj(a), &v)) { TOP = v; break; }
+            if (jv_is_obj(a)) {
+                int ich = ic_get(J, t, ici, jv_obj(a), &v);
+                if (ich == 1) { TOP = v; break; }
+                if (ich == 2) { SYNC(); v = ojs_call_v(J, v, a, 0, 0); CHECK(v); TOP = v; break; }   // cached getter
+            }
             SYNC();
             pkey k = atom_key(J, nm);
             v = get_prop(J, a, k);
@@ -361,7 +365,11 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             uint32_t ici = rd16(pc + 4);
             pc += 6;
             a = TOP;
-            if (jv_is_obj(a) ? ic_get(J, t, ici, jv_obj(a), &v) : jv_is_str(a) && ic_get_str(J, t, ici, &v)) { TOP = v; PUSH(a); break; }
+            if (jv_is_obj(a)) {
+                int ich = ic_get(J, t, ici, jv_obj(a), &v);
+                if (ich == 1) { TOP = v; PUSH(a); break; }
+                if (ich == 2) { SYNC(); v = ojs_call_v(J, v, a, 0, 0); CHECK(v); TOP = v; PUSH(a); break; }
+            } else if (jv_is_str(a) && ic_get_str(J, t, ici, &v)) { TOP = v; PUSH(a); break; }
             SYNC();
             pkey k = atom_key(J, nm);
             v = get_prop(J, a, k);
@@ -378,7 +386,12 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             pc += 6;
             b = sp[-1];
             a = sp[-2];
-            if (jv_is_obj(a) && ic_put(J, t, ici, jv_obj(a), b)) { sp--; TOP = b; break; }
+            if (jv_is_obj(a)) {
+                jv stt;
+                int icp = ic_put(J, t, ici, jv_obj(a), b, &stt);
+                if (icp == 1) { sp--; TOP = b; break; }
+                if (icp == 2) { SYNC(); jv rr = ojs_call_v(J, stt, a, 1, &b); CHECK(rr); sp--; TOP = b; break; }   // cached setter
+            }
             SYNC();
             b = POP();
             a = TOP;
