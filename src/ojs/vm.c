@@ -134,7 +134,20 @@ void ftempl_trace(ojs* J, struct gch* g) {
     gc_mark_ptr(J, t->source);
     gc_mark_bytes(J, t->param_map);
     gc_mark_bytes(J, t->srct);
-    t->ic = 0;   // caches may name objects this collection frees: start over
+    J->ic_stat[6] += t->nic * IC_WAYS;
+    if (t->ic) {   // the caches keep what they name alive (so they survive collections)
+        gc_mark_bytes(J, t->ic);
+        struct ic* e = t->ic;
+        for (uint32_t i = 0; i < t->nic * IC_WAYS; i++, e++) {
+            if (!e->shape) continue;                       // an empty way: nothing to keep
+            J->ic_stat[7]++;
+            if ((uintptr_t)e->shape > 4096) gc_mark_ptr(J, e->shape);
+            gc_mark_ptr(J, e->holder);
+            gc_mark_ptr(J, e->hshape);
+            gc_mark_ptr(J, e->proto);
+            if (e->key) gc_mark_pkey(J, e->key);
+        }
+    }
 }
 
 void upval_trace(ojs* J, struct gch* g) {

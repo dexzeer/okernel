@@ -1538,7 +1538,7 @@ int b_typed_init(ojs* J) {
         if (!p) return -1;
         struct obj* c = def_ctor(J, ta_ctor, TNAME[t], 3, t, p);
         if (!c) return -1;
-        c->proto = tac;
+        set_proto_raw(J, c, tac);
         I->ta_proto[t] = p;
         I->ta_ctor[t] = c;
         jv bpe = jv_from_int(TSIZE[t]);

@@ -122,6 +122,7 @@ void ojs_get_stats(ojs* J, struct ojs_stats* st) {
     st->gc_count = J->gc_count;
     st->gc_ms = J->gc_ms;
     st->gc_mark_ms = J->gc_mark_ms;
+    for (int i = 0; i < 8; i++) st->ic_stat[i] = J->ic_stat[i];
     st->total_alloc = J->total_alloc;
     for (int i = 0; i < 16; i++) st->live_by_type[i] = J->heap ? gc_live_of_type(J, i + 1) : 0;
 }

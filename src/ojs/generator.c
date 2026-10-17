@@ -555,7 +555,7 @@ void b_generator_classes(void) {
 static int make_fn_family(ojs* J, const char* name, int kind, struct obj* fn_proto, struct obj* instance_proto, struct obj** ctor_out) {
     struct obj* c = new_native_ctor(J, genfn_ctor, name, 1, kind, 0);
     if (!c) return -1;
-    c->proto = J->I.function_ctor;
+    set_proto_raw(J, c, J->I.function_ctor);
     if (obj_define_value(J, c, A(prototype), jv_from_obj(fn_proto), 0) < 0) return -1;
     if (obj_define_value(J, fn_proto, A(constructor), jv_from_obj(c), PA_CONFIGURABLE) < 0) return -1;
     if (instance_proto && obj_define_value(J, fn_proto, A(prototype), jv_from_obj(instance_proto), PA_CONFIGURABLE) < 0) return -1;

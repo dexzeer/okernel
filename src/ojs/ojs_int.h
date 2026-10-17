@@ -328,6 +328,7 @@ enum {
 #define OF_CLASS_CTOR   0x0200   // class constructor (not callable without new)
 #define OF_IS_ERROR     0x0400
 #define OF_INDEX_KEYS   0x1000   // an array-index key was ever stored in the shape (slow elements)
+#define OF_PROTO        0x2000   // some object has this one as its prototype: changing its shape or its own prototype bumps J->proto_epoch (inline caches)
 
 struct obj {
     struct gch h;               // h.aux = class (OC_*)
@@ -458,6 +459,8 @@ struct ojs {
     struct weak_list* weak_maps;    // WeakMap/WeakSet tables (ephemeron processing)
     struct obj* weak_refs;          // list of WeakRef objects
     struct obj* fin_regs;           // FinalizationRegistry objects
+    uint32_t proto_epoch;           // bumped whenever an OF_PROTO object's properties or prototype change: proto-chain inline caches check it
+    uint32_t ic_stat[8];            // inline cache statistics (OJS_ICSTATS): hits, own hits, proto hits, polymorphic hits, fills, slow gets
     int gc_count;
     double gc_ms;                // time spent collecting (wall clock)
     double gc_mark_ms;           // of which marking (roots + drain + weak structures)
@@ -620,5 +623,12 @@ int  set_fn_name(ojs* J, struct obj* f, jv name, const char* prefix);
 int  set_fn_length(ojs* J, struct obj* f, double len);
 void run_jobs(ojs* J);
 void enqueue_job(ojs* J, jv fn, int argc, jv* argv);
+
+// Assign an object's prototype outside obj_set_proto (fresh constructors, class heritage): keeps OF_PROTO and the inline-cache epoch right.
+static inline void set_proto_raw(ojs* J, struct obj* o, struct obj* p) {
+    if (o->flags & OF_PROTO) J->proto_epoch++;
+    if (p) p->flags |= OF_PROTO;
+    o->proto = p;
+}
 
 #endif
