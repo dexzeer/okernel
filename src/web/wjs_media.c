@@ -249,14 +249,22 @@ void wjs_media_free(struct wjs* js) {
 // video died (323 [diag] kmalloc FAIL lines).
 static int64_t out_budget_px(void) {
 #if defined(KERNEL) && KERNEL
-    uint32_t total, used, peak, lf;
-    heap_stats(&total, &used, &peak, &lf);
+    static uint32_t last_tick = 0xFFFFFFFFu;
+    static int64_t last_px = MAX_OUT_PX;
+    static int last_tick_logged;
+    if (last_tick != 0xFFFFFFFFu && (uint32_t)(wjs_now() - last_tick) < 500) return last_px;   // not per frame (and never the free-list walk: largest_free = NULL)
+    last_tick = (uint32_t)wjs_now();
+    uint32_t total, used;
+    heap_stats(&total, &used, 0, 0);
     uint32_t freeb = total > used ? total - used : 0;
-    // pictures in flight may take a quarter of what is free (fewer slots when they are big, see meng.c); only when almost nothing is
+    // pictures in flight may take a third of what is free (fewer slots when they are big, see meng.c); only when almost nothing is
     // left is the picture itself made smaller (the page painter scales it, which is much slower than the converters)
-    size_t b = freeb / 4;
-    meng_set_frame_budget(b < (24u << 20) ? (24u << 20) : b > (120u << 20) ? (120u << 20) : b);
-    return freeb < 70u * 1024 * 1024 ? 1280 * 720 : MAX_OUT_PX;
+    size_t b = freeb >= 100u * 1024 * 1024 ? (size_t)1 << 30 : freeb / 3;   // below 100 MB: limit the ring; otherwise the full one (an allocation that fails shrinks the picture, see meng.c)
+    meng_set_frame_budget(b);
+    int64_t np = freeb < 70u * 1024 * 1024 ? 1280 * 720 : MAX_OUT_PX;
+    if (np != last_px || last_tick_logged++ == 0) w_log("[media] frame memory: %u MB free of %u MB, output limit %d px, ring budget %u MB\n", freeb >> 20, total >> 20, (int)np, (unsigned)(b >> 20));
+    last_px = np;
+    return last_px;
 #else
     return MAX_OUT_PX;
 #endif
