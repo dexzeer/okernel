@@ -491,3 +491,237 @@ void wpaint(const struct wlayout* L, struct wsurf* s, int scroll_y, const struct
     while (nclip > 0) { nclip--; ws_pop_clip(s, clips[nclip]); }
     ws_pop_clip(s, old);
 }
+
+// ---- damage-based repaint ----------------------------------------------------------------------------------------------------------
+// A page that changes a little (a spinner, a progress bar, a counter) used to be repainted completely: 155 repaints of a 1916x936 view
+// took 6.4 s of a 18 s YouTube load (41 ms each). The painter keeps a signature per display item from its last paint; when the
+// surface and the scroll position are the same, only the rectangles of items that appeared, vanished or changed are repainted (every item
+// that touches such a rectangle is drawn again, clipped to it, so the result is identical to a full paint). Anything not understood
+// (reordered items, a changed background, too much damage) falls back to the full paint.
+int wpaint_inc_enabled = 1;
+int wpaint_dbg;
+
+static uint32_t hm(uint32_t h, uint32_t v) { h ^= v; h *= 16777619u; h ^= h >> 15; return h; }
+
+static uint32_t item_sig(const struct wlayout* L, const struct ditem* d, const char* text, const struct wpaint_env* env, int* always, int* margin) {
+    uint32_t h = 2166136261u;
+    h = hm(h, d->kind | (uint32_t)d->fixed << 8 | (uint32_t)d->alpha << 16);
+    h = hm(h, (uint32_t)d->x); h = hm(h, (uint32_t)d->y); h = hm(h, (uint32_t)d->w); h = hm(h, (uint32_t)d->h);
+    h = hm(h, d->color); h = hm(h, (uint32_t)d->a); h = hm(h, (uint32_t)d->b); h = hm(h, (uint32_t)d->ref);
+    *always = 0;
+    *margin = 2;
+    switch (d->kind) {
+    case DI_RECT:
+        if (d->ref >= 0) { const int32_t* r = wlay_radii(L, d->ref); for (int i = 0; i < 4; i++) h = hm(h, (uint32_t)r[i]); }
+        break;
+    case DI_BORDER: {
+        const struct dborder* b = wlay_border(L, d->ref);
+        if (b) { for (int i = 0; i < 4; i++) { h = hm(h, (uint32_t)b->w[i]); h = hm(h, b->c[i]); h = hm(h, b->s[i]); h = hm(h, (uint32_t)b->r[i]); } }
+        break;
+    }
+    case DI_TEXT: {
+        const struct dtext* t = wlay_text_ref(L, d->ref);
+        if (t) {
+            h = hm(h, t->family | (uint32_t)t->bold << 8 | (uint32_t)t->italic << 16 | (uint32_t)t->deco << 24);
+            h = hm(h, t->px | (uint32_t)t->deco_style << 16);
+            h = hm(h, (uint32_t)t->letter_sp); h = hm(h, (uint32_t)t->word_sp); h = hm(h, t->deco_color); h = hm(h, (uint32_t)t->width);
+            for (uint32_t i = 0; i < t->tl; i++) h = hm(h, (uint8_t)text[t->t0 + i]);
+        }
+        *margin = 4 + (t ? t->px / 4 : 0);                 // italic overhang, descenders, decorations
+        break;
+    }
+    case DI_IMAGE:
+    case DI_BGIMG: {
+        int id = d->a;
+        if (d->kind == DI_BGIMG) {
+            const struct dbgimg* g = wlay_bgimg(L, d->ref);
+            if (g) { id = g->img; h = hm(h, (uint32_t)g->ix); h = hm(h, (uint32_t)g->iy); h = hm(h, (uint32_t)g->iw); h = hm(h, (uint32_t)g->ih); h = hm(h, g->repeat); }
+        }
+        uint32_t s = env && env->image_sig ? env->image_sig(env->ctx, id) : 0;
+        if (!s) *always = 1; else h = hm(h, s);
+        break;
+    }
+    case DI_GRAD: {
+        const struct wgrad* g = env && env->ss ? css_grad(env->ss, d->a) : 0;
+        if (g) {
+            h = hm(h, (uint32_t)g->angle); h = hm(h, g->nstops | (uint32_t)g->repeating << 8 | (uint32_t)g->radial << 16);
+            for (int i = 0; i < g->nstops && i < CSS_MAX_STOPS; i++) { h = hm(h, g->color[i]); h = hm(h, (uint32_t)g->pos[i]); }
+        }
+        break;
+    }
+    case DI_SHADOW: {
+        const struct dshadow* sh = wlay_shadow(L, d->ref);
+        if (sh) {
+            h = hm(h, (uint32_t)sh->blur); h = hm(h, (uint32_t)sh->spread); h = hm(h, (uint32_t)sh->ox); h = hm(h, (uint32_t)sh->oy);
+            for (int i = 0; i < 4; i++) h = hm(h, (uint32_t)sh->r[i]);
+            int e = LU_ROUND(sh->blur) * 2 + LU_ROUND(sh->spread > 0 ? sh->spread : 0) + LU_ROUND(sh->ox < 0 ? -sh->ox : sh->ox) + LU_ROUND(sh->oy < 0 ? -sh->oy : sh->oy);
+            *margin = e + 4;
+        }
+        break;
+    }
+    case DI_SVG:
+        *always = 1;                                          // its picture depends on DOM state the list does not carry
+        break;
+    case DI_CLIP:
+        if (d->ref >= 0) { const int32_t* r = wlay_radii(L, d->ref); for (int i = 0; i < 4; i++) h = hm(h, (uint32_t)r[i]); }
+        break;
+    default:
+        break;
+    }
+    return h;
+}
+
+struct drect { int x0, y0, x1, y1; };
+
+// Which cache painted last into a surface: tabs share one page surface, so another document's picture may be there.
+static struct { const uint32_t* px; const void* owner; } surf_owner[16];
+static int owner_ok(const uint32_t* px, const void* pc) {
+    for (int i = 0; i < 16; i++) if (surf_owner[i].px == px) return surf_owner[i].owner == pc;
+    return 0;
+}
+static void owner_set(const uint32_t* px, const void* pc) {
+    static int next;
+    for (int i = 0; i < 16; i++) if (surf_owner[i].px == px) { surf_owner[i].owner = pc; return; }
+    surf_owner[next & 15].px = px; surf_owner[next & 15].owner = pc; next++;
+}
+
+static void item_rect(const struct ditem* d, int32_t scroll_lu, int margin, int sw, int sh, struct drect* r) {
+    int32_t oy = d->fixed ? 0 : scroll_lu;
+    int x = LU_ROUND(d->x), y = LU_ROUND(d->y - oy);
+    int w = LU_ROUND(d->x + d->w) - x, h = LU_ROUND(d->y - oy + d->h) - y;
+    r->x0 = x - margin; r->y0 = y - margin; r->x1 = x + (w > 0 ? w : 1) + margin; r->y1 = y + (h > 0 ? h : 1) + margin;
+    if (d->kind == DI_TEXT) { r->y0 -= margin; r->y1 += margin; }   // the item's own box is the line box; glyphs may leave it a little
+    if (r->x0 < 0) r->x0 = 0;
+    if (r->y0 < 0) r->y0 = 0;
+    if (r->x1 > sw) r->x1 = sw;
+    if (r->y1 > sh) r->y1 = sh;
+}
+
+static void pc_store(struct wpaint_cache* pc, int n, const uint32_t* sig, const uint8_t* alw, const struct drect* rc, const struct wsurf* s, int scroll, uint32_t bg) {
+    if (n > pc->cap) {
+        int nc = n + n / 2 + 64;
+        uint32_t* a = (uint32_t*)w_realloc(pc->sig, (size_t)nc * 4);
+        if (a) pc->sig = a;
+        uint8_t* b = (uint8_t*)w_realloc(pc->always, (size_t)nc);
+        if (b) pc->always = b;
+        struct drect* c = (struct drect*)w_realloc(pc->rect, (size_t)nc * sizeof(struct drect));
+        if (c) pc->rect = (void*)c;
+        if (!a || !b || !c) { pc->valid = 0; return; }
+        pc->cap = nc;
+    }
+    memcpy(pc->sig, sig, (size_t)n * 4);
+    memcpy(pc->always, alw, (size_t)n);
+    memcpy(pc->rect, rc, (size_t)n * sizeof(struct drect));
+    pc->n = n; pc->scroll = scroll; pc->w = s->w; pc->h = s->h; pc->px = s->px; pc->bg = bg; pc->valid = 1;
+}
+
+void wpaint_cache_free(struct wpaint_cache* pc) {
+    w_free(pc->sig); w_free(pc->always); w_free(pc->rect);
+    memset(pc, 0, sizeof *pc);
+}
+
+struct sref { uint32_t sig; int idx; };
+// insertion/shell sort (no libc qsort in the kernel)
+static void sref_sort(struct sref* a, int n) {
+    for (int gap = n / 2; gap > 0; gap /= 2)
+        for (int i = gap; i < n; i++) {
+            struct sref t = a[i];
+            int j = i;
+            while (j >= gap && (a[j - gap].sig > t.sig || (a[j - gap].sig == t.sig && a[j - gap].idx > t.idx))) { a[j] = a[j - gap]; j -= gap; }
+            a[j] = t;
+        }
+}
+
+#define MAX_DMG 48
+static void dmg_add(struct drect* dm, int* nd, const struct drect* r) {
+    if (r->x0 >= r->x1 || r->y0 >= r->y1) return;
+    for (int i = 0; i < *nd; i++) {                               // merge with a rectangle it touches (8 px slack)
+        struct drect* q = &dm[i];
+        if (r->x0 <= q->x1 + 8 && r->x1 >= q->x0 - 8 && r->y0 <= q->y1 + 8 && r->y1 >= q->y0 - 8) {
+            if (r->x0 < q->x0) q->x0 = r->x0;
+            if (r->y0 < q->y0) q->y0 = r->y0;
+            if (r->x1 > q->x1) q->x1 = r->x1;
+            if (r->y1 > q->y1) q->y1 = r->y1;
+            return;
+        }
+    }
+    if (*nd < MAX_DMG) { dm[(*nd)++] = *r; return; }
+    dm[0].x0 = dm[0].x0 < r->x0 ? dm[0].x0 : r->x0;               // out of slots: grow the first one over everything
+    dm[0].y0 = dm[0].y0 < r->y0 ? dm[0].y0 : r->y0;
+    dm[0].x1 = dm[0].x1 > r->x1 ? dm[0].x1 : r->x1;
+    dm[0].y1 = dm[0].y1 > r->y1 ? dm[0].y1 : r->y1;
+}
+
+// Returns the number of surface pixels repainted (the whole surface for a full paint).
+long wpaint_inc(const struct wlayout* L, struct wsurf* s, int scroll_y, const struct wpaint_env* env, struct wpaint_cache* pc) {
+    const long total = (long)s->w * s->h;
+    const struct ditem* it;
+    int n = wlay_items(L, &it);
+    const char* text = wlay_text(L);
+    uint32_t bg = wlay_canvas_bg(L);
+    int32_t scroll_lu = PX(scroll_y);
+    int whole_clip = s->cx0 == 0 && s->cy0 == 0 && s->cx1 == s->w && s->cy1 == s->h;
+    uint32_t* sig = (uint32_t*)w_malloc((size_t)(n + 1) * 4);
+    uint8_t* alw = (uint8_t*)w_malloc((size_t)n + 1);
+    struct drect* rc = (struct drect*)w_malloc((size_t)(n + 1) * sizeof(struct drect));
+    if (!sig || !alw || !rc) { w_free(sig); w_free(alw); w_free(rc); pc->valid = 0; wpaint(L, s, scroll_y, env); return total; }
+    for (int i = 0; i < n; i++) {
+        int always, margin;
+        sig[i] = item_sig(L, &it[i], text, env, &always, &margin);
+        alw[i] = (uint8_t)always;
+        item_rect(&it[i], scroll_lu, margin, s->w, s->h, &rc[i]);
+    }
+    long painted = total;
+    int incremental = 0;
+    if (wpaint_dbg) w_log("[paint] call: n=%d cache valid=%d n=%d scroll %d/%d size %dx%d/%dx%d same_px=%d clip_whole=%d\n", n, pc->valid, pc->n, pc->scroll, scroll_y, pc->w, pc->h, s->w, s->h, pc->px == s->px, whole_clip);
+    if (wpaint_inc_enabled && pc->valid && owner_ok(s->px, pc) && whole_clip && pc->scroll == scroll_y && pc->w == s->w && pc->h == s->h && pc->px == s->px && pc->bg == bg && n > 0) {
+        // match the items of the last paint with the new ones (equal signature, k-th with k-th), stable order required
+        struct sref* o = (struct sref*)w_malloc((size_t)(pc->n + 1) * sizeof(struct sref));
+        struct sref* nw = (struct sref*)w_malloc((size_t)(n + 1) * sizeof(struct sref));
+        uint8_t* om = (uint8_t*)w_calloc((size_t)pc->n + 1, 1);
+        uint8_t* nm = (uint8_t*)w_calloc((size_t)n + 1, 1);
+        int* map = (int*)w_malloc((size_t)(pc->n + 1) * sizeof(int));          // old index -> new index
+        const struct drect* orc = (const struct drect*)pc->rect;
+        if (o && nw && om && nm && map) {
+            int no = 0, nn = 0;
+            for (int i = 0; i < pc->n; i++) if (!pc->always[i]) { o[no].sig = pc->sig[i]; o[no].idx = i; no++; }
+            for (int i = 0; i < n; i++) if (!alw[i]) { nw[nn].sig = sig[i]; nw[nn].idx = i; nn++; }
+            sref_sort(o, no);
+            sref_sort(nw, nn);
+            int a = 0, b = 0, ordered = 1;
+            for (int i = 0; i < pc->n; i++) map[i] = -1;
+            while (a < no && b < nn) {
+                if (o[a].sig < nw[b].sig) a++;
+                else if (o[a].sig > nw[b].sig) b++;
+                else { om[o[a].idx] = 1; nm[nw[b].idx] = 1; map[o[a].idx] = nw[b].idx; a++; b++; }
+            }
+            int last = -1;
+            for (int i = 0; i < pc->n; i++) if (map[i] >= 0) { if (map[i] < last) { ordered = 0; break; } last = map[i]; }
+            if (wpaint_dbg) { int uo = 0, un = 0; for (int i = 0; i < pc->n; i++) if (!om[i]) uo++; for (int i = 0; i < n; i++) if (!nm[i]) un++; w_log("[paint] diff: unmatched old %d new %d, ordered %d\n", uo, un, ordered); }
+            if (ordered) {
+                struct drect dm[MAX_DMG];
+                int nd = 0;
+                for (int i = 0; i < pc->n; i++) if (!om[i]) dmg_add(dm, &nd, &orc[i]);
+                for (int i = 0; i < n; i++) if (!nm[i]) dmg_add(dm, &nd, &rc[i]);
+                long area = 0;
+                for (int i = 0; i < nd; i++) area += (long)(dm[i].x1 - dm[i].x0) * (dm[i].y1 - dm[i].y0);
+                if (area * 10 < total * 6) {                                    // less than 60% of the surface: repaint just those
+                    if (wpaint_dbg) for (int i = 0; i < nd; i++) w_log("[paint] damage rect %d: %d,%d - %d,%d\n", i, dm[i].x0, dm[i].y0, dm[i].x1, dm[i].y1);
+                    for (int i = 0; i < nd; i++) {
+                        s->cx0 = dm[i].x0; s->cy0 = dm[i].y0; s->cx1 = dm[i].x1; s->cy1 = dm[i].y1;
+                        wpaint(L, s, scroll_y, env);
+                    }
+                    ws_reset_clip(s);
+                    painted = area;
+                    incremental = 1;
+                }
+            }
+        }
+        w_free(o); w_free(nw); w_free(om); w_free(nm); w_free(map);
+    }
+    if (!incremental) wpaint(L, s, scroll_y, env);
+    if (whole_clip) { pc_store(pc, n, sig, alw, rc, s, scroll_y, bg); owner_set(s->px, pc); }
+    else pc->valid = 0;
+    w_free(sig); w_free(alw); w_free(rc);
+    return painted;
+}

@@ -55,6 +55,7 @@ struct wdoc {
     int vw, vh;
     int style_dirty, layout_dirty;
     uint32_t layout_epoch;  // counts finished layouts (script observers re-measure when it moves)
+    struct wpaint_cache pc; // what the last full paint left in the surface (damage-based repaint)
     struct wres* res;
     int nres, capres;
     struct wdimg* img;
@@ -392,6 +393,16 @@ static int lay_img_url(void* ctx, const char* url, int* w, int* h) {
     return slot;
 }
 
+// Identity of what image `id` paints, for the damage-based repaint: 0 = it changes without the layout noticing (video frames, canvases).
+static uint32_t paint_img_sig(void* ctx, int id) {
+    struct wdoc* d = (struct wdoc*)ctx;
+    if (id < 0 || id >= d->nimg || d->img[id].state != 1) return 1;
+    if (d->img[id].ext) return 0;
+    uint32_t h = (uint32_t)(uintptr_t)d->img[id].px * 2654435761u;
+    h ^= (uint32_t)d->img[id].w * 40503u ^ (uint32_t)d->img[id].h << 16 ^ (uint32_t)d->img[id].svg_scale << 8;
+    return h | 2;
+}
+
 static const struct wimg* paint_img(void* ctx, int id) {
     struct wdoc* d = (struct wdoc*)ctx;
     static struct wimg tmp;
@@ -489,6 +500,7 @@ static void css_request(struct wdoc* d, const char* url, int32_t order, const ch
 }
 
 void wdoc_free(struct wdoc* d) {
+    if (d) wpaint_cache_free(&d->pc);
     if (!d) return;
     doc_clear(d);
     w_free(d);
@@ -882,15 +894,68 @@ void wdoc_paint_stale(struct wdoc* d, struct wsurf* s, int scroll_y) {
     wpaint(d->L, s, scroll_y, &d->env);
 }
 
+long wdoc_last_painted_px;
+void wdoc_paint_invalidate(struct wdoc* d) { if (d) d->pc.valid = 0; }     // the surface was cleared or changed behind the painter's back
+int wdoc_paint_check;       // 1 = after every damage-based repaint also paint everything and compare (reports [paint] MISMATCH)
+
 void wdoc_paint(struct wdoc* d, struct wsurf* s, int scroll_y) {
     d->scroll_y = scroll_y;
     wdoc_update(d);
-    if (!d->L) { ws_fill_rect(s, 0, 0, s->w, s->h, 0xFFFFFFFF); return; }
+    if (!d->L) { ws_fill_rect(s, 0, 0, s->w, s->h, 0xFFFFFFFF); d->pc.valid = 0; return; }
     d->env.ss = d->ss;
     d->env.d = d->d;
     d->env.image = paint_img;
+    d->env.image_sig = paint_img_sig;
     d->env.ctx = d;
-    wpaint(d->L, s, scroll_y, &d->env);
+    if (s->cx0 != 0 || s->cy0 != 0 || s->cx1 != s->w || s->cy1 != s->h) {      // a band or a rectangle: the surface is no longer what the cache describes
+        d->pc.valid = 0;
+        wpaint(d->L, s, scroll_y, &d->env);
+        wdoc_last_painted_px = (long)(s->cx1 - s->cx0) * (s->cy1 - s->cy0);
+        return;
+    }
+    wpaint_dbg = wdoc_paint_check;
+    wdoc_last_painted_px = wpaint_inc(d->L, s, scroll_y, &d->env, &d->pc);
+    if (wdoc_paint_check && wdoc_last_painted_px < (long)s->w * s->h) {
+        uint32_t* ref = (uint32_t*)w_malloc((size_t)s->w * (size_t)s->h * 4);
+        if (ref) {
+            struct wsurf r = *s;
+            r.px = ref; r.stride = s->w;
+            ws_reset_clip(&r);
+            wpaint(d->L, &r, scroll_y, &d->env);
+            long bad = 0; int fx = -1, fy = -1;
+            for (int y = 0; y < s->h; y++)
+                for (int x = 0; x < s->w; x++)
+                    if (((s->px[(size_t)y * s->stride + x] ^ ref[(size_t)y * s->w + x]) & 0xFFFFFF) && ++bad == 1) { fx = x; fy = y; }
+            if (bad) {
+                w_log("[paint] MISMATCH: %d px differ after a damage repaint of %d px (first at %d,%d)\n", (int)bad, (int)wdoc_last_painted_px, fx, fy);
+                {   // is a full paint repeatable at all?
+                    uint32_t* ref2 = (uint32_t*)w_malloc((size_t)s->w * (size_t)s->h * 4);
+                    if (ref2) {
+                        struct wsurf r2 = *s;
+                        r2.px = ref2; r2.stride = s->w;
+                        ws_reset_clip(&r2);
+                        wpaint(d->L, &r2, scroll_y, &d->env);
+                        int diff = 0;
+                        for (size_t i = 0; i < (size_t)s->w * (size_t)s->h; i++) if ((ref[i] ^ ref2[i]) & 0xFFFFFF) diff++;
+                        w_log("[paint]   two full paints differ in %d px; ours %x, full %x at the first mismatch\n", diff,
+                              (unsigned)(s->px[(size_t)fy * s->stride + fx] & 0xFFFFFF), (unsigned)(ref[(size_t)fy * s->w + fx] & 0xFFFFFF));
+                        w_free(ref2);
+                    }
+                }
+                const struct ditem* it;
+                int n = wlay_items(d->L, &it), shown = 0;
+                for (int i = 0; i < n && shown < 8; i++) {      // what is painted there
+                    int32_t oy = it[i].fixed ? 0 : PX(scroll_y);
+                    int x0 = LU_ROUND(it[i].x), y0 = LU_ROUND(it[i].y - oy), x1 = LU_ROUND(it[i].x + it[i].w), y1 = LU_ROUND(it[i].y - oy + it[i].h);
+                    if (fx >= x0 - 4 && fx <= x1 + 4 && fy >= y0 - 4 && fy <= y1 + 4) {
+                        w_log("[paint]   item %d kind=%d at %d,%d %dx%d a=%d ref=%d fixed=%d\n", i, it[i].kind, x0, y0, x1 - x0, y1 - y0, (int)it[i].a, (int)it[i].ref, it[i].fixed);
+                        shown++;
+                    }
+                }
+            }
+            w_free(ref);
+        }
+    }
 }
 
 int wdoc_hit(struct wdoc* d, int x, int y, int scroll_y, struct wdoc_hit* out) {

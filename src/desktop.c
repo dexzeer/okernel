@@ -9,6 +9,8 @@
 #include "graphics.h"
 #include "web/image.h"
 #include "web/wjs.h"
+#include "web/wdoc.h"
+#include "web/paint.h"
 #include "window.h"
 #include "paging.h"
 #include "memlayout.h"
@@ -977,6 +979,13 @@ static void shell_execute(int win_id, const char* input) {
         while (*post) t[k++] = *post++;
         t[k] = 0;
         window_puts(win_id, t);
+    }
+    else if (str_eq(cmd_buf, "damage")) {
+        // `damage off` repaints whole pages every time, `damage check` compares every damage-based repaint with a full paint
+        // ([paint] MISMATCH in the serial log), `damage on` is the default
+        wpaint_inc_enabled = !str_eq(args, "off");
+        wdoc_paint_check = str_eq(args, "check");
+        window_puts(win_id, str_eq(args, "off") ? "damage-based repaint off\n" : str_eq(args, "check") ? "damage-based repaint on, checked against full paints\n" : "damage-based repaint on\n");
     }
     else if (str_eq(cmd_buf, "progress")) {
         // `progress off` / `progress on`: whether style, layout and paint passes keep the video going (okai.c render_progress); for A/B tests

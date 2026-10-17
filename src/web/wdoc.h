@@ -50,6 +50,9 @@ int  wdoc_height(struct wdoc* d);        // document height px
 int  wdoc_width(struct wdoc* d);
 void wdoc_paint(struct wdoc* d, struct wsurf* s, int scroll_y);
 void wdoc_paint_stale(struct wdoc* d, struct wsurf* s, int scroll_y);   // from the existing layout, never relayouts (video frames)
+void wdoc_paint_invalidate(struct wdoc* d);   // call after clearing or otherwise changing a surface the doc painted into
+extern long wdoc_last_painted_px;     // pixels the last wdoc_paint drew (the whole surface for a full paint)
+extern int wdoc_paint_check;           // 1: compare every damage-based repaint with a full paint (reports [paint] MISMATCH)
 // Hit test at viewport (x, y) with the given scroll. Returns kind.
 int  wdoc_hit(struct wdoc* d, int x, int y, int scroll_y, struct wdoc_hit* out);
 const char* wdoc_title(struct wdoc* d);

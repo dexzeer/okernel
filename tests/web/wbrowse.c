@@ -364,6 +364,12 @@ again:
     s.px = calloc((size_t)vw * hh, 4);
     ws_reset_clip(&s);
     wdoc_paint(d, &s, 0);
+    if (getenv("WB_PAINT")) {                  // WB_PAINT=N: paint the first viewport N more times (profiling the painter)
+        int n = atoi(getenv("WB_PAINT"));
+        double p0 = now_ms();
+        for (int i = 0; i < n; i++) wdoc_paint(d, &s, 0);
+        printf("WB paint x%d: %.1f ms each (%dx%d)\n", n, (now_ms() - p0) / (n ? n : 1), vw, hh);
+    }
     double t3 = now_ms();
     save_ppm(out, &s);
     char stats[256], jst[256] = "";

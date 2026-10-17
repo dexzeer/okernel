@@ -31,6 +31,10 @@ for v in ("webm_av.webm", "webm_av_long.webm", "webm_video_only.webm", "webm_aud
     shutil.copy(os.path.join(VEC, v), os.path.join(WWW, "media", "vec", v))
 
 import numpy as np
+
+# Two CPUs unless the caller says otherwise: with one emulated CPU the 30 fps clips leave no headroom (decode ~10 ms per frame under TCG on
+# the same CPU as the page) and the exact frame counts below flip with unrelated changes; the real machine runs with -smp 4.
+os.environ.setdefault("OKVM_SMP", "2")
 srv = subprocess.Popen([sys.executable, "-m", "http.server", "8002", "--directory", WWW],
                        stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
 time.sleep(1)
