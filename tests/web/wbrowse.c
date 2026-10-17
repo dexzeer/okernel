@@ -372,7 +372,7 @@ again:
     }
     double t3 = now_ms();
     save_ppm(out, &s);
-    char stats[256], jst[256] = "";
+    char stats[256], jst[512] = "";
     wdoc_stats(d, stats, sizeof stats);
     if (js) wjs_stats(js, jst, sizeof jst);
     printf("WB %s: %s doc_h=%d | %s | parse=%.0fms net+js=%.0fms paint=%.0fms fetched=%d failed=%d title=\"%s\"\n",

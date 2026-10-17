@@ -127,7 +127,7 @@ static int callee_text(ojs* J, int ctor, char* out, int cap) {
 }
 
 static void line_col(struct str* src, uint32_t pos, int* line, int* col);
-static void t_line_col(struct ftempl* t, uint32_t pos, int* line, int* col);
+static void t_line_col(ojs* J, struct ftempl* t, uint32_t pos, int* line, int* col);
 static int t_has_source(struct ftempl* t) { return t->source || t->srct; }
 
 // the innermost running function as "name file:line:col" (host profiling aid)
@@ -137,7 +137,7 @@ int ojs_where(ojs* J, char* out, int cap) {
     if (!f || cap < 8) return 0;
     struct ftempl* t = f->t;
     int line = 0, col = 0;
-    if (t_has_source(t)) t_line_col(t, pos_of(t, (uint32_t)(f->pc - t->code)), &line, &col);
+    if (t_has_source(t)) t_line_col(J, t, pos_of(t, (uint32_t)(f->pc - t->code)), &line, &col);
     struct sbuf b;
     sb_init(J, &b);
     if (t->name && str_len(t->name)) sb_put_str(&b, t->name); else sb_puts(&b, "<anon>");
@@ -178,18 +178,56 @@ static void line_col(struct str* src, uint32_t pos, int* line, int* col) {
 }
 
 // line_col over a template's source, whichever form it has
-static void t_line_col(struct ftempl* t, uint32_t pos, int* line, int* col) {
-    if (t->source) { line_col(t->source, pos, line, col); return; }
-    int l = 1, c = 1;
-    struct srccur cur;
-    srccur_init(&cur, t->srct, 0);
-    for (uint32_t i = 0; i < pos; i++) {
-        uint32_t u = srccur_next(&cur);
-        if (u == 0xFFFFFFFFu) break;
-        if (u == '\n') { l++; c = 1; } else c++;
+// Line starts of a source, built once: an error's stack used to rescan the whole script (3 MB for YouTube) from the start for every frame,
+// 4 ms per Error.stack read. A tiny cache keyed by the source object; an entry is dropped whenever a collection ran (the key could be gone).
+struct linecache { const void* key; ojs* J; int gc; uint32_t n, len; uint32_t* starts; };
+static struct linecache lcache[4];
+static int lcache_next;
+static struct linecache* lines_of(ojs* J, struct ftempl* t) {
+    const void* key = t->source ? (const void*)t->source : (const void*)t->srct;
+    for (int i = 0; i < 4; i++)
+        if (lcache[i].key == key && lcache[i].J == J && lcache[i].gc == J->gc_count && lcache[i].starts) return &lcache[i];
+    struct linecache* c = &lcache[lcache_next++ & 3];
+    if (c->starts) ojs_sys_free(c->starts);
+    memset(c, 0, sizeof *c);
+    uint32_t cap = 256, n = 0, i = 0;
+    uint32_t* st = (uint32_t*)ojs_sys_malloc(cap * 4);
+    if (!st) return 0;
+    st[n++] = 0;
+    if (t->source) {
+        uint32_t len = str_len(t->source);
+        for (; i < len; i++)
+            if (str_at(t->source, i) == '\n') {
+                if (n == cap) { cap *= 2; uint32_t* g = (uint32_t*)ojs_sys_realloc(st, cap * 4); if (!g) { ojs_sys_free(st); return 0; } st = g; }
+                st[n++] = i + 1;
+            }
+    } else {
+        struct srccur cur;
+        srccur_init(&cur, t->srct, 0);
+        for (;; i++) {
+            uint32_t u = srccur_next(&cur);
+            if (u == 0xFFFFFFFFu) break;
+            if (u == '\n') {
+                if (n == cap) { cap *= 2; uint32_t* g = (uint32_t*)ojs_sys_realloc(st, cap * 4); if (!g) { ojs_sys_free(st); return 0; } st = g; }
+                st[n++] = i + 1;
+            }
+        }
     }
-    *line = l;
-    *col = c;
+    c->key = key; c->J = J; c->gc = J->gc_count; c->n = n; c->len = i; c->starts = st;
+    return c;
+}
+
+static void t_line_col(ojs* J, struct ftempl* t, uint32_t pos, int* line, int* col) {
+    struct linecache* c = lines_of(J, t);
+    if (!c) {                                                 // out of memory: the slow way for plain strings
+        if (t->source) line_col(t->source, pos, line, col); else { *line = 1; *col = 1; }
+        return;
+    }
+    if (pos > c->len) pos = c->len;
+    uint32_t lo = 0, hi = c->n;                               // the last line start <= pos
+    while (hi - lo > 1) { uint32_t mid = (lo + hi) / 2; if (c->starts[mid] <= pos) lo = mid; else hi = mid; }
+    *line = (int)lo + 1;
+    *col = (int)(pos - c->starts[lo]) + 1;
 }
 
 // "Name: message" header (Error.prototype.toString semantics, without calls)
@@ -225,7 +263,7 @@ static jv format_stack(ojs* J, struct errobj* e) {
         else sb_puts(&b, "<anonymous>");
         if (t_has_source(t)) {
             int line, col;
-            t_line_col(t, pos_of(t, off), &line, &col);
+            t_line_col(J, t, pos_of(t, off), &line, &col);
             char buf[32];
             ojs_snprintf(buf, sizeof buf, ":%d:%d", line, col);
             sb_puts(&b, buf);
