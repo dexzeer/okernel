@@ -104,7 +104,8 @@ struct upval_desc { uint16_t from_local; uint16_t index; };
 // receiver's prototype, checked by identity) whose shape was hshape. Globals: holder
 // is the lexical environment or the global object; aux the lexical binding count
 // a global object hit was made at (a later `let` of the same name shadows it).
-struct ic { struct shape* shape; struct obj* holder; struct shape* hshape; pkey key; uint32_t slot, aux; };
+struct ic { struct shape* shape; struct obj* holder; struct shape* hshape; struct obj* proto; pkey key; uint32_t slot, aux, epoch; };
+#define IC_WAYS 2                // entries per site (a site that sees two shapes stays cached); see vm_helpers.c
 #define IC_NONE 0xFFFF
 
 #define POS_CALLEE 0x80000000u   // line table: the call's callee is a plain name at this position
@@ -135,8 +136,8 @@ struct ftempl {
     struct str* filename;
     struct str* source;         // the whole source text (Function.prototype.toString)
     uint32_t src_start, src_end;
-    struct ic* ic;              // inline caches, one per property/global site (gc bytes; made on first
-    uint32_t nic;               //   use, dropped by every collection so they never hold stale pointers)
+    struct ic* ic;              // inline caches: IC_WAYS entries per property/global site (gc bytes; made on first use;
+    uint32_t nic;               //   traced by the collector, so what they name stays alive) 
     uint8_t* param_map;         // mapped arguments: 1 if parameter i is its name's binding (gc bytes)
     struct srctext* srct;       // compact copy of the source (then source is NULL; srctext.c)
 };

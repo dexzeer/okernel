@@ -426,7 +426,7 @@ int b_error_init(ojs* J) {
         if (!p) return -1;
         struct obj* c = def_ctor(J, error_ctor, NE_NAMES[i], i == NE_AGGREGATE ? 2 : 1, i, p);
         if (!c) return -1;
-        c->proto = ec;   // NativeError constructors inherit from Error
+        set_proto_raw(J, c, ec);   // NativeError constructors inherit from Error
         J->I.native_error_proto[i] = p;
         J->I.native_error_ctor[i] = c;
         if (obj_define_value(J, p, A(name), str_value(J, NE_NAMES[i]), PA_HIDDEN) < 0) return -1;

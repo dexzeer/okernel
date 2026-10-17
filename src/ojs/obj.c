@@ -124,10 +124,14 @@ static struct shape* shape_transition(ojs* J, struct shape* s, pkey k, uint32_t 
     return c;
 }
 
+// A prototype's properties are part of every inline cache that resolved a name through it: any change bumps the epoch they check.
+static inline void proto_touch(ojs* J, struct obj* o) { if (o->flags & OF_PROTO) J->proto_epoch++; }
+
 // give o its own mutable copy of its shape
 static int make_dict(ojs* J, struct obj* o) {
     struct shape* s = o->shape;
     if (s->dict) return 0;
+    proto_touch(J, o);
     struct shape* d = shape_alloc(J, s->nprops, s->nprops + 4);
     if (!d) return -1;
     if (s->nprops) memcpy(d->props, s->props, (size_t)s->nprops * sizeof(struct prop));
@@ -139,6 +143,7 @@ static int make_dict(ojs* J, struct obj* o) {
 
 // append a property slot; returns slot index or -1 (exception)
 static int shape_append(ojs* J, struct obj* o, pkey k, uint32_t attrs) {
+    proto_touch(J, o);
     if (PK_IS_INDEX(k)) o->flags |= OF_INDEX_KEYS;   // (fast array appends check prototypes for this)
     struct shape* s = o->shape;
     if (!s->dict && s->nprops >= SHAPE_MAX_SHARED && make_dict(J, o) < 0) return -1;
@@ -178,6 +183,7 @@ static int shape_append(ojs* J, struct obj* o, pkey k, uint32_t attrs) {
 }
 
 static int shape_remove(ojs* J, struct obj* o, int idx) {
+    proto_touch(J, o);
     if (make_dict(J, o) < 0) return -1;
     struct shape* s = o->shape;
     uint32_t n = s->nprops;
@@ -190,6 +196,7 @@ static int shape_remove(ojs* J, struct obj* o, int idx) {
 
 static int shape_set_attrs(ojs* J, struct obj* o, int idx, uint32_t attrs) {
     if (o->shape->props[idx].attrs == attrs) return 0;
+    proto_touch(J, o);
     if (make_dict(J, o) < 0) return -1;
     o->shape->props[idx].attrs = attrs;
     return 0;
@@ -218,6 +225,7 @@ struct obj* obj_new(ojs* J, struct obj* proto, int cls, size_t size) {
     o->flags = OF_EXTENSIBLE | OF_ARRAY_FAST;
     o->shape = J->I.empty_shape;
     o->proto = proto;
+    if (proto) proto->flags |= OF_PROTO;
     if (class_ops[cls].finalize) o->h.gcflags |= GCF_FINAL;
     if (class_ops[cls].get_own || class_ops[cls].get || class_ops[cls].define_own || class_ops[cls].own_keys)
         o->flags |= OF_EXOTIC;
@@ -996,6 +1004,8 @@ int obj_set_proto(ojs* J, struct obj* o, struct obj* proto) {
         if (p == o) return 0;
         if ((p->flags & OF_EXOTIC) && class_ops[obj_class(p)].get_proto) break;   // proxies end the check
     }
+    proto_touch(J, o);                       // everything below o now resolves differently
+    if (proto) proto->flags |= OF_PROTO;
     o->proto = proto;
     return 1;
 }

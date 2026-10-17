@@ -347,7 +347,7 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             uint32_t ici = rd16(pc + 4);
             pc += 6;
             a = TOP;
-            if (jv_is_obj(a) && ic_get(t, ici, jv_obj(a), &v)) { TOP = v; break; }
+            if (jv_is_obj(a) && ic_get(J, t, ici, jv_obj(a), &v)) { TOP = v; break; }
             SYNC();
             pkey k = atom_key(J, nm);
             v = get_prop(J, a, k);
@@ -361,7 +361,7 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             uint32_t ici = rd16(pc + 4);
             pc += 6;
             a = TOP;
-            if (jv_is_obj(a) ? ic_get(t, ici, jv_obj(a), &v) : jv_is_str(a) && ic_get_str(J, t, ici, &v)) { TOP = v; PUSH(a); break; }
+            if (jv_is_obj(a) ? ic_get(J, t, ici, jv_obj(a), &v) : jv_is_str(a) && ic_get_str(J, t, ici, &v)) { TOP = v; PUSH(a); break; }
             SYNC();
             pkey k = atom_key(J, nm);
             v = get_prop(J, a, k);
@@ -378,14 +378,15 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             pc += 6;
             b = sp[-1];
             a = sp[-2];
-            if (jv_is_obj(a) && ic_put(t, ici, jv_obj(a), b)) { sp--; TOP = b; break; }
+            if (jv_is_obj(a) && ic_put(J, t, ici, jv_obj(a), b)) { sp--; TOP = b; break; }
             SYNC();
             b = POP();
             a = TOP;
             pkey k = atom_key(J, nm);
+            struct shape* before = jv_is_obj(a) ? jv_obj(a)->shape : 0;
             CHECKI(put_prop(J, a, k, b, strict));
             TOP = b;
-            if (jv_is_obj(a)) ic_fill_put(J, t, ici, jv_obj(a), k);
+            if (jv_is_obj(a)) ic_fill_put(J, t, ici, jv_obj(a), k, before);
             break;
         }
         case OP_GET_ELEM: L_OP_GET_ELEM: {   // [obj, key] -> [value]
@@ -945,7 +946,7 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         }
         case OP_SET_PROTO_LIT: L_OP_SET_PROTO_LIT: {   // [obj, proto] -> [obj]
             b = POP();
-            if (jv_is_obj(b) || jv_is_null(b)) jv_obj(TOP)->proto = jv_is_null(b) ? 0 : jv_obj(b);
+            if (jv_is_obj(b) || jv_is_null(b)) set_proto_raw(J, jv_obj(TOP), jv_is_null(b) ? 0 : jv_obj(b));
             break;
         }
         case OP_COPY_DATA_PROPS: L_OP_COPY_DATA_PROPS: {   // [target, source] -> [target]
