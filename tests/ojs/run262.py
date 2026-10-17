@@ -15,6 +15,7 @@ ap.add_argument("--t262", default=os.path.expanduser("~/test262"))
 ap.add_argument("--list-fails", default=None)
 ap.add_argument("--timeout", type=float, default=10.0)
 ap.add_argument("--bin", default="build-host/ojs_run")
+ap.add_argument("--stderr", default=None, help="append the engine's stderr to this file (default: discarded)")
 ap.add_argument("--depth", type=int, default=3, help="directory depth of the summary")
 ap.add_argument("--from-fails", default=None, help="rerun the tests listed in a --list-fails file")
 ap.add_argument("--match", default=None, help="only reasons matching this regex (with --from-fails)")
@@ -95,7 +96,7 @@ for i in range(len(jobs)):
 
 def start():
     return subprocess.Popen([args.bin, "--test262", HARNESS], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, bufsize=0)
+                            stderr=(open(args.stderr, "ab") if args.stderr else subprocess.DEVNULL), bufsize=0)
 
 def worker():
     proc = start()

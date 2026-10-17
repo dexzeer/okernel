@@ -255,6 +255,43 @@ static void ic_fill_put(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, pke
     e->key = k; e->slot = idx; e->epoch = J->proto_epoch;
 }
 
+
+// DEFINE_FIELD [obj, v] -> [obj] (object literals, class fields): CreateDataProperty adds a property. The entry remembers the shape transition; unlike
+// a [[Set]] nothing on the prototype chain matters. Not for prototypes (OF_PROTO objects bump the inline cache epoch when they change) or exotic objects.
+static inline int ic_define(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, jv v) {
+    if (!t->ic || i >= t->nic) return 0;
+    if ((o->flags & (OF_EXOTIC | OF_PROTO | OF_EXTENSIBLE)) != OF_EXTENSIBLE) return 0;
+    struct ic* e = IC_AT(t, i);
+    struct shape* s = o->shape;
+    for (int w = 0; w < IC_WAYS; w++, e++) {
+        if (e->shape != s) continue;
+        uint32_t idx = e->slot;
+        if (!o->slots || idx >= valarr_cap(o->slots)) {
+            uint32_t cap = o->slots ? valarr_cap(o->slots) : 0;
+            jv* ns = valarr_grow(J, o->slots, cap, cap < 4 ? 4 : cap * 2, JV_UNDEFINED);
+            if (!ns) { take_exc(J); return 0; }
+            o->slots = ns;
+        }
+        o->slots[idx] = v;
+        o->shape = e->hshape;
+        return 1;
+    }
+    return 0;
+}
+
+static void ic_fill_define(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, pkey k, struct shape* before) {
+    if (i >= t->nic || (o->flags & (OF_EXOTIC | OF_PROTO)) || PK_IS_INDEX(k) || !before) return;
+    struct shape* s = o->shape;
+    if (before->dict || s->dict || s->parent != before || s->nprops != before->nprops + 1) return;
+    uint32_t idx = before->nprops;
+    if (s->props[idx].key != k || s->props[idx].attrs != PA_DEFAULT) return;
+    struct ic* e = ic_entry(J, t, i);
+    if (!e) return;
+    e = ic_way(e, before);
+    e->shape = before; e->holder = 0; e->proto = 0; e->hshape = s; e->aux = 1;
+    e->key = k; e->slot = idx; e->epoch = 0;
+}
+
 // globals: a binding of the global lexical environment, or a data property of the
 // global object while no lexical binding was added since (aux: their count then)
 static inline int ic_global_get(ojs* J, struct ftempl* t, uint32_t i, jv* out) {

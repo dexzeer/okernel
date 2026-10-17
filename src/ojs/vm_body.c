@@ -30,6 +30,12 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
 #define CHECK(x) do { if ((x) == JV_EXC) goto exception; } while (0)
 #define CHECKI(x) do { if ((x) < 0) goto exception; } while (0)
 #define JUMP(off) (pc += (int32_t)(off))
+#if !VM_STEP
+// a loop that has run often enough continues in compiled code: its operand stack is in the frame and every instruction start has native code
+#define OSR_CHECK() do { if (ojs_jit_mode && !t->jit_bad) { SYNC(); if (jit_osr(J, f, t, pc, &result)) goto done; } } while (0)
+#else
+#define OSR_CHECK() ((void)0)
+#endif
 
 #if !VM_STEP
     // compiled code: a function that has been called often enough runs natively (jit.c); the interpreter takes over for what it does not compile
@@ -161,6 +167,9 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
 #if VM_STEP
         if (stepped) { f->pc = pc; f->sp = sp; return 0; }
         stepped = 1;
+#endif
+#if defined(OJS_JIT_CHECK) && !VM_STEP
+        jit_check_depth(t, (uint32_t)(pc - code), (int)(sp - f->stack));
 #endif
         // f->sp is only synced where it matters (SYNC before calls, suspension, exit):
         // the collector scans whole VM stack chunks and running heap frames
@@ -726,6 +735,7 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             pc += 4;
             if (off < 0 && --J->interrupt_counter == 0) { SYNC(); if (interrupt_check(J) < 0) goto exception; }
             JUMP(off);
+            if (off < 0) OSR_CHECK();
             break;
         }
 // comparison results are booleans: test them without a call
@@ -738,6 +748,7 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             if (TRUTHY(a)) {
                 if (off < 0 && --J->interrupt_counter == 0) { SYNC(); if (interrupt_check(J) < 0) goto exception; }
                 JUMP(off);
+                if (off < 0) OSR_CHECK();
             }
             break;
         }
@@ -923,10 +934,15 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         }
         case OP_DEFINE_FIELD: L_OP_DEFINE_FIELD: {   // [obj, v] -> [obj]
             jv nm = consts[rd32(pc)];
-            pc += 4;
+            uint32_t ici = rd16(pc + 4);
+            pc += 6;
+            if (ic_define(J, t, ici, jv_obj(sp[-2]), sp[-1])) { sp--; break; }
             SYNC();
             b = POP();
-            CHECKI(create_data_property_or_throw(J, jv_obj(TOP), atom_key(J, nm), b));
+            pkey k = atom_key(J, nm);
+            struct shape* before = jv_obj(TOP)->shape;
+            CHECKI(create_data_property_or_throw(J, jv_obj(TOP), k, b));
+            ic_fill_define(J, t, ici, jv_obj(TOP), k, before);
             break;
         }
         case OP_DEFINE_ELEM: L_OP_DEFINE_ELEM: {   // [obj, key, v] -> [obj]
@@ -1449,4 +1465,5 @@ suspend:
 #undef CHECK
 #undef CHECKI
 #undef JUMP
+#undef OSR_CHECK
 }

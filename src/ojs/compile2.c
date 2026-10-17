@@ -1416,6 +1416,7 @@ static struct ftempl* compile_class_init(struct cfunc* parent, struct node* cls,
             if (m->b) comp_expr_named(c, m->b, a); else op(c, OP_UNDEF, 1);
             // CreateDataPropertyOrThrow (not a [[Set]]): DEFINE_FIELD with the throwing flag
             op32(c, OP_DEFINE_FIELD, atom_const(c, a), -1);
+            put16(c, new_ic(c));
         }
         op(c, OP_POP, -1);
     }

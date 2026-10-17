@@ -80,6 +80,20 @@ class OkVM:
             time.sleep(0.5)
         if not os.path.exists(self.SOCK):
             raise RuntimeError("QEMU monitor socket never appeared")
+        if os.environ.get("OKVM_PRECMD"):   # shell commands typed once the desktop is up (before the test's own, which wait 10 s), separated by ';': OKVM_PRECMD='jit eager'
+            import threading
+            def _pre():
+                end = time.time() + 60
+                while time.time() < end:
+                    try:
+                        if "[mem] heap" in open(self.LOG, errors="replace").read(): break
+                    except OSError: pass
+                    time.sleep(0.5)
+                time.sleep(7)
+                for c in os.environ["OKVM_PRECMD"].split(";"):
+                    self.type_string(c.strip() + "\n")
+                    time.sleep(1.5)
+            threading.Thread(target=_pre, daemon=True).start()
 
     # ---- QEMU monitor (HMP) ----------------------------------------------
 

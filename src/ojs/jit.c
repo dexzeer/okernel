@@ -13,11 +13,15 @@
 #include <sys/mman.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #endif
 
 int ojs_jit_mode = 0;
 uint32_t ojs_jit_threshold = 40;
 struct jit_stats ojs_jit_stats;
+#if !(defined(KERNEL) && KERNEL)
+static double jit_ms;
+#endif
 
 static void* exec_alloc(size_t n) {
 #if defined(KERNEL) && KERNEL
@@ -76,6 +80,7 @@ static int jit_ic_get(ojs* J, struct ftempl* t, uint32_t ici, jv* slot) {
     *slot = v;
     return 1;
 }
+static int jit_ic_define(ojs* J, struct ftempl* t, uint32_t ici, jv* slot) { return ic_define(J, t, ici, jv_obj(slot[0]), slot[1]); }
 static int jit_ic_put(ojs* J, struct ftempl* t, uint32_t ici, jv* slot) {
     jv a = slot[0], b = slot[1], setter;
     if (!jv_is_obj(a) || ic_put(J, t, ici, jv_obj(a), b, &setter) != 1) return 0;
@@ -752,6 +757,13 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         CPY(ST(O), ST(V));
         break;
     }
+    case OP_DEFINE_FIELD: {             // [obj, v] -> [obj]
+        uint32_t ici = rd16(ip + 5);
+        if (!t->ic || ici >= t->nic) goto generic;
+        call_ic_helper(c, (const void*)jit_ic_define, ici, d - 2);
+        test_rr(c, EAX, EAX); jcc(c, CC_E, SLOW());
+        break;
+    }
     case OP_GET_GLOBAL: {
         uint32_t ici = rd16(ip + 5);
         if (!t->ic || ici >= t->nic) goto generic;
@@ -807,7 +819,20 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
 }
 
 // ---- the whole function
+static int jit_compile_(ojs* J, struct ftempl* t);
 int jit_compile(ojs* J, struct ftempl* t) {
+#if !(defined(KERNEL) && KERNEL)
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int r = jit_compile_(J, t);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    jit_ms += (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    return r;
+#else
+    return jit_compile_(J, t);
+#endif
+}
+static int jit_compile_(ojs* J, struct ftempl* t) {
     if (t->jit) return 0;
     if (t->flags & (TF_GENERATOR | TF_ASYNC | TF_SCRIPT | TF_MODULE | TF_EVAL | TF_DEFAULT_CTOR)) return -1;
     struct cg c;
@@ -947,6 +972,20 @@ static int jit_hot(ojs* J, struct ftempl* t) {
     return t->jit != 0;
 }
 
+// a loop back-edge in the interpreter: compile the function once it is hot and carry on in native code from the loop head. 1: the function ran
+// to its end there (*res is its result)
+static int jit_osr(ojs* J, struct ojs_frame* f, struct ftempl* t, uint8_t* pc, jv* res) {
+    if (!t->jit) {
+        if (f->resume_mode || (t->flags & (TF_GENERATOR | TF_ASYNC))) return 0;
+        if (ojs_jit_mode < 2 && ++t->hot < ojs_jit_threshold) return 0;
+        if (jit_compile(J, t) < 0) { t->jit_bad = 1; return 0; }
+    }
+    void* a = jit_native_at(t->jit, (uint32_t)(pc - t->code));
+    if (!a) return 0;
+    *res = jit_exec(J, f, a);
+    return 1;
+}
+
 static jv jit_exec(ojs* J, struct ojs_frame* f, void* target) {
     return ((jv (*)(ojs*, struct ojs_frame*, void*))f->t->jit->entry)(J, f, target);
 }
@@ -978,8 +1017,50 @@ void* jit_step(ojs* J, struct ojs_frame* f, void* resume, const uint8_t* resume_
 #if !(defined(KERNEL) && KERNEL)
 __attribute__((destructor)) static void jit_stats_dump(void) {
     if (!getenv("OJS_JIT_STATS")) return;
-    fprintf(stderr, "[jit] compiled %u, rejected %u, %llu bytes of code, %llu instructions (%llu native, %llu via the interpreter)\n",
-            ojs_jit_stats.compiled, ojs_jit_stats.rejected, (unsigned long long)ojs_jit_stats.code_bytes,
+    fprintf(stderr, "[jit] compiled %u in %.0f ms, rejected %u, %llu bytes of code, %llu instructions (%llu native, %llu via the interpreter)\n",
+            ojs_jit_stats.compiled, jit_ms, ojs_jit_stats.rejected, (unsigned long long)ojs_jit_stats.code_bytes,
             (unsigned long long)ojs_jit_stats.instructions, (unsigned long long)ojs_jit_stats.native, (unsigned long long)ojs_jit_stats.stepped);
 }
 #endif
+
+#ifdef OJS_JIT_CHECK
+// test builds: every instruction the interpreter executes is compared with the statically computed stack depth of the analysis
+static struct { struct ftempl* t; struct jan an; int ok; } chk_cache[8192];
+static unsigned chk_n;
+static void jit_check_depth(struct ftempl* t, uint32_t pc_off, int depth) {
+    static unsigned last;
+    unsigned i = last;
+    if (i >= chk_n || chk_cache[i].t != t) for (i = 0; i < chk_n; i++) if (chk_cache[i].t == t) break;
+    last = i;
+    if (i == chk_n) {
+        if (chk_n == sizeof chk_cache / sizeof chk_cache[0]) return;
+        chk_cache[i].t = t;
+        chk_cache[i].ok = jan_run(t, &chk_cache[i].an) == 0;
+        chk_n++;
+    }
+    if (!chk_cache[i].ok) return;
+    struct jan* a = &chk_cache[i].an;
+    uint32_t o = pc_off <= a->ord_pc[a->ni] ? a->pc_ord[pc_off] : ~0u;      // (the length of the code when it was analysed)
+    if (o == ~0u || a->depth[o] != depth) {           // (a collected template's address may have been reused: analyse again before believing it)
+        jan_free(a);
+        chk_cache[i].ok = jan_run(t, a) == 0;
+        if (!chk_cache[i].ok) return;
+        o = a->pc_ord[pc_off];
+    }
+    if (o == ~0u) { fprintf(stderr, "[jit-check] pc %u is not an instruction start\n", pc_off); abort(); }
+    if (a->depth[o] != depth) {
+        fprintf(stderr, "[jit-check] %s at pc %u: interpreter depth %d, analysis %d\n", op_name(t->code[pc_off]), pc_off, depth, a->depth[o]);
+        abort();
+    }
+}
+#endif
+
+// shell command `jit`: the mode and what has been compiled
+void ojs_jit_set_mode(int m) { ojs_jit_mode = m; }
+void ojs_jit_report(char* buf, int cap) {
+    ojs_snprintf(buf, cap, "JIT %s: %u functions compiled (%u refused), %u KB of code, %u instructions, %u translated, %u run by the interpreter; threshold %u\n",
+                 ojs_jit_mode == 0 ? "off" : ojs_jit_mode == 1 ? "on" : "eager", ojs_jit_stats.compiled, ojs_jit_stats.rejected,
+                 (unsigned)(ojs_jit_stats.code_bytes >> 10), (unsigned)ojs_jit_stats.instructions, (unsigned)ojs_jit_stats.native,
+                 (unsigned)ojs_jit_stats.stepped, ojs_jit_threshold);
+}
+void ojs_jit_set_threshold(uint32_t n) { ojs_jit_threshold = n; }

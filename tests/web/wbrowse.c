@@ -263,6 +263,7 @@ again:
     wdoc_load(d, url, html, len, 0);
     double t1 = now_ms();
     int fetched = 0, failed = 0, js_runs = 0;
+    double js_ms = 0, up_ms = 0;                 // time spent inside the engine: page scripts, and re-rendering after them
     double deadline = now_ms() + seconds * 1000;
     double mid_at = getenv("WB_MID_EVAL") ? now_ms() + (getenv("WB_MID_AFTER") ? atof(getenv("WB_MID_AFTER")) : 6000) : 0;   // WB_MID_EVAL=file.js: run it once, WB_MID_AFTER ms after the start, WHILE the load loop (timers, fetches) keeps running
     char rurl[4096];
@@ -313,7 +314,8 @@ again:
         if (js) {
             double tr = now_ms();
             int f = wjs_run(js, 500);
-            if (f & WJS_DIRTY) wdoc_update(d);        // the shell re-renders after script changes (observers measure the new layout)
+            js_ms += now_ms() - tr;
+            if (f & WJS_DIRTY) { double tu = now_ms(); wdoc_update(d); up_ms += now_ms() - tu; }        // the shell re-renders after script changes (observers measure the new layout)
             js_runs++;
             if (getenv("WB_TRACE") && now_ms() - tr > 50) printf("[trace] wjs_run %.0fms flags=%x\n", now_ms() - tr, f);
             char nav[2048];
@@ -375,8 +377,8 @@ again:
     char stats[256], jst[512] = "";
     wdoc_stats(d, stats, sizeof stats);
     if (js) wjs_stats(js, jst, sizeof jst);
-    printf("WB %s: %s doc_h=%d | %s | parse=%.0fms net+js=%.0fms paint=%.0fms fetched=%d failed=%d title=\"%s\"\n",
-           argv[1], stats, dh, jst, t1 - t0, t2 - t1, t3 - t2, fetched, failed, wdoc_title(d));
+    printf("WB %s: %s doc_h=%d | %s | parse=%.0fms net+js=%.0fms (scripts %.0fms, updates %.0fms) paint=%.0fms fetched=%d failed=%d title=\"%s\"\n",
+           argv[1], stats, dh, jst, t1 - t0, t2 - t1, js_ms, up_ms, t3 - t2, fetched, failed, wdoc_title(d));
     if (getenv("WB_DUMP")) {
         struct wbuf { char* p; int len, cap; } b = { 0, 0, 0 };
         (void)b;

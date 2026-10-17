@@ -726,6 +726,7 @@ static void comp_object(struct cfunc* c, struct node* n) {
             } else {
                 comp_expr_named(c, p->b, a);
                 op32(c, OP_DEFINE_FIELD, atom_const(c, a), -1);
+                put16(c, new_ic(c));
             }
             break;
         }
