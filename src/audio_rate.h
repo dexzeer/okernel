@@ -24,6 +24,8 @@ struct arate {
     uint32_t last_meas_q16;   // the previous window's result (0 = none)
     int win_valid;
     int forced;               // test hook: the factor is fixed
+    int observe_only;         // measure and report (measured_q16) but never change the factor
+    uint32_t measured_q16;    // the last result two agreeing windows produced (0 = none yet)
     // resampler state (linear interpolation, positions in input frames, Q16, relative to the current chunk: index -1 = prev)
     int32_t pos_q16;
     int16_t prev[2];
@@ -47,5 +49,20 @@ uint32_t arate_resample(struct arate* a, const int16_t* in, uint32_t n, int16_t*
 void arate_reset_stream(struct arate* a);       // flush: forget the interpolation history
 // Test hook: force the factor (q16), 0 = measure again.
 void arate_force(struct arate* a, uint32_t rate_q16);
+
+// Smoothing of the position a card reports. An emulated card moves its position in bursts (QEMU's HD Audio model: a few ticks at 1.4x
+// speed, then ticks without any movement); a video paced by that shows frames at irregular intervals. The smoothed clock runs at real
+// time (`now_us`, microseconds from a trustworthy cycle counter), is pulled toward the card's position with a time constant of 250 ms,
+// never goes backwards and never gets more than 20 ms ahead of the card. A jump of the card's position (flush, seek, a long stall)
+// restarts it.
+struct aclk {
+    int valid;
+    uint64_t us;          // time of the last call
+    uint64_t est_q8;      // the estimate in frames, Q8
+    uint64_t last;        // the last value returned
+};
+
+void aclk_reset(struct aclk* c);
+uint64_t aclk_smooth(struct aclk* c, uint64_t raw_frames, uint64_t now_us);
 
 #endif

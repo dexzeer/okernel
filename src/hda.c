@@ -1,6 +1,7 @@
 // Intel High Definition Audio controller + generic codec driver (output only).
 // Written from the Intel HDA specification 1.0a. Polled: no interrupts are used;
 // audio_tick() (timer IRQ) tracks the play position.
+#include "ac97.h"
 #include "audio.h"
 #include "audio_rate.h"
 #include "cpufreq.h"
@@ -67,6 +68,7 @@ static struct {
     uint32_t last_lpib;
     uint64_t played_base;         // bytes played at the start of the current lap
     uint32_t underruns;
+    int ac97;                     // 1 = the backend is the AC'97 controller (ac97.c), not HD Audio
     int volume;
     struct arate rate;            // measured speed of the card against real time (audio_rate.h)
     uint32_t rate_logged;
@@ -323,6 +325,7 @@ static int stream_setup(void) {
     wr32(b + SD_CTL, (ctl | ((uint32_t)STREAM_TAG << 20)) | 2);     // RUN
     H.wr_abs = 0; H.clean_abs = 0; H.last_lpib = 0; H.played_base = 0; H.underruns = 0;
     arate_init(&H.rate);
+    H.rate.observe_only = 1;                               // see audio_rate.h: the measurement is reported, never applied
     H.rate_logged = H.rate.rate_q16;
     return 0;
 }
@@ -331,9 +334,35 @@ static int stream_setup(void) {
 
 int audio_ready(void) { return H.ready; }
 
+// AC'97 backend: the same ring and queue logic, the controller of ac97.c underneath.
+static int ac97_start(void) {
+    if (!ac97_exists()) return -1;
+    H.ring = (uint8_t*)aligned(&H.ring_alloc, RING_BYTES, 128);
+    uint8_t* bdl = (uint8_t*)aligned(&H.bdl_alloc, 256, 8);
+    if (!H.ring || !bdl) return -1;
+    if (ac97_init(H.ring, RING_BYTES, bdl) != 0) {
+        kfree(H.ring_alloc); kfree(H.bdl_alloc);
+        H.ring = 0; H.ring_alloc = 0; H.bdl_alloc = 0;
+        return -1;
+    }
+    H.ac97 = 1;
+    H.wr_abs = 0; H.clean_abs = 0; H.last_lpib = 0; H.played_base = 0; H.underruns = 0;
+    arate_init(&H.rate);
+    H.rate.observe_only = 1;                               // see audio_rate.h: the measurement is reported, never applied
+    H.rate_logged = H.rate.rate_q16;
+    H.volume = 100;
+    H.ready = 1;
+    serial_puts("[hda] AC'97 audio output running (48 kHz, 16 bit, stereo)\n");
+    return 0;
+}
+
 int audio_init(void) {
     struct pci_loc loc;
-    if (!pcix_find_class(0x04, 0x03, 0, &loc)) { serial_puts("[hda] no HD Audio controller\n"); return -1; }
+    if (!pcix_find_class(0x04, 0x03, 0, &loc)) {
+        if (ac97_start() == 0) return 0;
+        serial_puts("[hda] no HD Audio controller\n");
+        return -1;
+    }
     H.loc = loc;
     pcix_enable(loc, 1);
     int is_mem, above;
@@ -375,7 +404,21 @@ int audio_init(void) {
 }
 
 // Hardware read position within the ring, with a sanity clamp.
-static uint32_t lpib(void) { uint32_t p = rd32(H.sd + SD_LPIB); return p >= RING_BYTES ? 0 : p; }
+static uint32_t lpib(void) { uint32_t p = H.ac97 ? ac97_pos() : rd32(H.sd + SD_LPIB); return p >= RING_BYTES ? 0 : p; }
+
+// Position trace (shell `audiotrace`): the card's position at each timer tick against the cycle counter, to see HOW it advances.
+#define TR_N 400
+static uint32_t tr_us[TR_N], tr_pos[TR_N];
+static int tr_n, tr_state;                                // 0 off, 1 recording, 2 full
+void audio_trace(int cmd) {
+    if (cmd == 1) { tr_n = 0; tr_state = 3; return; }                     // armed: recording starts once 8 s of sound have been consumed
+    if (cmd == 2) { tr_n = 0; tr_state = 1; return; }
+    if (tr_state != 2) { serial_puts("[hda-trace] not ready\n"); return; }
+    serial_puts("[hda-trace] t_us lpib_bytes\n");
+    for (int i = 0; i < TR_N; i++) serial_printf("[hda-trace] %u %u\n", tr_us[i], tr_pos[i]);
+    serial_puts("[hda-trace] end\n");
+    tr_state = 0;
+}
 
 // Called from the timer IRQ: lap counting (lpib wraps) and wiping what has been
 // played, so an underrun plays silence instead of looping stale audio. Only
@@ -384,7 +427,17 @@ static uint32_t lpib(void) { uint32_t p = rd32(H.sd + SD_LPIB); return p >= RING
 // the writer is that far ahead.
 void audio_tick(void) {
     if (!H.ready) return;
+    if (H.ac97) ac97_tick();
     uint32_t p = lpib();
+    if (tr_state == 3 && H.played_base + p > 48000ull * 4 * 8) tr_state = 1;
+    if (tr_state == 1) {
+        uint32_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        uint32_t mhz = cpufreq_tsc_mhz();
+        tr_us[tr_n] = mhz ? (uint32_t)((((uint64_t)hi << 32) | lo) / mhz) : 0;
+        tr_pos[tr_n] = p;
+        if (++tr_n == TR_N) { tr_state = 2; audio_trace(0); }
+    }
     if (p < H.last_lpib) H.played_base += RING_BYTES;    // wrapped
     H.last_lpib = p;
     uint64_t pl = H.played_base + p;
@@ -412,10 +465,12 @@ void audio_tick(void) {
             uint32_t lo, hi;
             __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
             arate_update(&H.rate, pl >> 2, (((uint64_t)hi << 32) | lo) / tsc_khz);
-            if (H.rate.rate_q16 != H.rate_logged) {
-                H.rate_logged = H.rate.rate_q16;
-                serial_printf("[hda] the card runs at %u.%u%u%u x real time%s\n", H.rate.rate_q16 >> 16, (H.rate.rate_q16 & 0xFFFF) * 10 >> 16,
-                              (H.rate.rate_q16 & 0xFFFF) * 100 / 65536 % 10, (H.rate.rate_q16 & 0xFFFF) * 1000 / 65536 % 10, arate_active(&H.rate) ? " (sound is resampled to match)" : "");
+            uint32_t mq = H.rate.observe_only ? H.rate.measured_q16 : H.rate.rate_q16;
+            if (mq && mq != H.rate_logged) {
+                H.rate_logged = mq;
+                serial_printf("[hda] the card runs at %u.%u%u%u x real time%s\n", mq >> 16, (mq & 0xFFFF) * 10 >> 16,
+                              (mq & 0xFFFF) * 100 / 65536 % 10, (mq & 0xFFFF) * 1000 / 65536 % 10,
+                              mq == 65536 ? "" : H.rate.observe_only ? " (not corrected: stretching the sound makes it worse; in QEMU use -device AC97)" : " (sound is resampled to match)");
             }
         }
     }
@@ -443,12 +498,34 @@ static uint64_t played_abs(void) {
 
 // Positions and queue lengths are reported in NOMINAL 48 kHz frames: a card that consumes 1.18x too fast is resampled by 1.18 on the way in
 // and its position divided by 1.18 on the way out, so its users (the media engine) see an exact 48 kHz card.
+//
+// The position an emulated card reports is not smooth: QEMU's HD Audio model moves it in bursts (measured under WHPX: 3-4 ticks at 1.4x
+// speed, then 1-3 ticks without any movement), so a video paced by the raw position showed frames at irregular intervals (gaps of 60-90 ms
+// in a 24 fps picture). The clock the media engine sees is therefore smoothed: it runs at real time (cycle counter) and is pulled toward
+// the card's position with a time constant of 250 ms, never backwards and never more than 20 ms ahead of the card.
+static struct aclk sm;
+
+static uint64_t tsc_us(void) {
+    static uint32_t mhz;
+    if (!mhz) mhz = cpufreq_tsc_mhz();
+    if (!mhz) return 0;
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return (((uint64_t)hi << 32) | lo) / mhz;
+}
+
+static uint64_t smooth_clock(uint64_t raw) {                     // interrupts are off
+    static int ok = -1;
+    if (ok < 0) ok = cpufreq_tsc_mhz() && cpufreq_tsc_reliable();
+    return ok ? aclk_smooth(&sm, raw, tsc_us()) : raw;
+}
+
 uint64_t audio_clock(void) {
     if (!H.ready) return 0;
     uint32_t fl;                                         // audio_tick (timer IRQ) updates the rate state
     __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
     uint64_t dev = played_abs() >> 2;
-    uint64_t nom = arate_nominal(&H.rate, dev);
+    uint64_t nom = smooth_clock(arate_nominal(&H.rate, dev));
     if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
     return nom;
 }
@@ -537,13 +614,14 @@ uint32_t audio_write(const int16_t* frames, uint32_t nframes) {
 }
 
 void audio_rate_force(uint32_t percent) { arate_force(&H.rate, percent ? (uint32_t)(((uint64_t)percent << 16) / 100) : 0); }
-uint32_t audio_rate_q16(void) { return H.rate.rate_q16; }
+uint32_t audio_rate_q16(void) { return arate_active(&H.rate) || !H.rate.measured_q16 ? H.rate.rate_q16 : H.rate.measured_q16; }
 
 void audio_set_volume(int percent) {
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
     H.volume = percent;
     if (!H.ready) return;
+    if (H.ac97) { ac97_set_volume(percent); return; }
     uint32_t r;
     for (int i = 0; i < H.pathlen; i++) {
         int nid = H.path[i];
@@ -595,6 +673,7 @@ void audio_beep(int hz, int ms) {
 
 void audio_describe(void (*out)(const char*, void*), void* ud) {
     char b[120];
+    if (H.ac97) { out("AC'97 controller (see the [hda] lines in the serial log)", ud); return; }
     if (!H.mmio) { out("no HD Audio controller probed", ud); return; }
     int n = 0;
     const char* s = H.ready ? "running" : "not running";

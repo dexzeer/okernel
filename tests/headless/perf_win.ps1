@@ -26,6 +26,8 @@ param(
     ,[string]$ClickAt = ""   # a mouse click on screen: "X,Y@SEC" = click (X,Y) SEC seconds after the navigation (the pointer is first pushed into the top-left corner)
     ,[string]$Display = "none"   # "sdl"/"gtk": a real QEMU window like run-windows.bat (its display refresh and audio mixing share QEMU's main thread: the stutter the headless runs do not show)
     ,[switch]$AudioSdl         # sound through QEMU's SDL backend (as run-windows.bat), not a WAV file
+    ,[string]$AudioCard = "hda"   # the emulated sound card: "hda" (Intel HD Audio) or "ac97"
+    ,[string]$AudioDev = ""    # a full -audiodev argument (with id=a0), e.g. "sdl,id=a0,out.frequency=48000" (implies the HD Audio card like -AudioSdl)
     ,[switch]$StampVid         # print every [vidfps] line with the host's wall clock (is the media clock running at real time?)
     ,[switch]$Prof            # turn the kernel profiler on (`prof on`): [prof] zone lines once a second
 )
@@ -47,8 +49,10 @@ $qargs = @("-accel", $Accel, "-m", "$Mem", "-cdrom", $iso, "-boot", "d", "-vga",
           "-monitor", "tcp:127.0.0.1:$Port,server,nowait")
 if ($Smp -gt 1) { $qargs += @("-smp", "$Smp") }
 if ($Extra) { $qargs += $Extra }
-if ($AudioSdl) { $qargs += @("-audiodev", "sdl,id=a0", "-device", "intel-hda", "-device", "hda-output,audiodev=a0") }
-if ($AudioWav) { $qargs += @("-audiodev", "wav,id=a0,path=$AudioWav", "-device", "intel-hda", "-device", "hda-output,audiodev=a0") }
+$cardArgs = if ($AudioCard -eq "ac97") { @("-device", "AC97,audiodev=a0") } else { @("-device", "intel-hda", "-device", "hda-output,audiodev=a0") }
+if ($AudioSdl) { $qargs += @("-audiodev", "sdl,id=a0,out.buffer-length=120000") + $cardArgs }
+if ($AudioDev) { $qargs += @("-audiodev", $AudioDev) + $cardArgs }
+if ($AudioWav) { $qargs += @("-audiodev", "wav,id=a0,path=$AudioWav") + $cardArgs }
 $p = Start-Process -FilePath $Qemu -ArgumentList $qargs -PassThru -WindowStyle $(if ($Display -eq 'none') { 'Hidden' } else { 'Normal' })
 
 function Send-Keys([string]$s) {

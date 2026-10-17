@@ -34,6 +34,7 @@ void audio_tick(void);
 
 // Test hook: pretend the card consumes `percent`% of 48000 frames per second (0 = measure it, the default).
 void audio_rate_force(uint32_t percent);
+void audio_trace(int cmd);                       // 1 = record the card position for 400 ticks, 0 = print it
 // The measured speed of the card as a Q16 factor (65536 = exactly 48 kHz).
 uint32_t audio_rate_q16(void);
 

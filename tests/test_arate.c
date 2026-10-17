@@ -156,6 +156,63 @@ int main(void) {
         CHECK((uint64_t)n * 77332 / 65536 <= space, "fit(%u)=%u too many", space, n);
     }
 
+    // 8b. observe-only (what the HD Audio driver uses): the measurement is reported, the factor never changes
+    arate_init(&a);
+    a.observe_only = 1;
+    run_card(&a, 1.18, 30, &step, &act);
+    CHECK(!arate_active(&a) && a.rate_q16 == 65536, "observe-only changed the factor (%u)", a.rate_q16);
+    CHECK(fabs(a.measured_q16 / 65536.0 - 1.18) < 0.005, "observe-only measured %.4f", a.measured_q16 / 65536.0);
+    CHECK(arate_nominal(&a, a.dev_last + 48000) - arate_nominal(&a, a.dev_last) == 48000, "observe-only: the clock is the raw device clock");
+    arate_init(&a);
+    a.observe_only = 1;
+    run_card(&a, 1.0, 20, &step, &act);
+    CHECK(a.measured_q16 == 65536 && !arate_active(&a), "observe-only on an exact card: %u", a.measured_q16);
+
+    // 9. the smoothed clock: a card that moves its position in bursts (QEMU HD Audio: ticks of 960 frames, then nothing) gives a steady clock
+    {
+        static const int burst[10] = {960, 0, 960, 480, 0, 960, 480, 0, 480, 480};      // frames per 10 ms tick, 480 on average
+        struct aclk c;
+        aclk_reset(&c);
+        uint64_t raw = 0, prev = 0;
+        double worst_dev = 0, worst_step = 0, raw_worst = 0;
+        static uint64_t out_at[20001];
+        for (int t = 0; t <= 20000; t++) {
+            if (t && t % 10 == 0) raw += burst[(t / 10) % 10];
+            uint64_t o = aclk_smooth(&c, raw, (uint64_t)t * 1000);
+            out_at[t] = o;
+            CHECK(o >= prev, "clock went backwards at %d ms (%llu < %llu)", t, (unsigned long long)o, (unsigned long long)prev);
+            CHECK(o <= raw + 960, "clock %llu is more than 20 ms ahead of the card %llu", (unsigned long long)o, (unsigned long long)raw);
+            prev = o;
+            if (t > 2000) {
+                double d = fabs((double)o - t * 48.0);
+                if (d > worst_dev) worst_dev = d;
+                double r = fabs((double)raw - t * 48.0);
+                if (r > raw_worst) raw_worst = r;
+            }
+        }
+        for (int t = 2000; t + 10 <= 20000; t++) {
+            double s = fabs((double)(out_at[t + 10] - out_at[t]) - 480.0);
+            if (s > worst_step) worst_step = s;
+        }
+        CHECK(worst_dev < 700, "smoothed clock is %.0f frames off real time (the raw position is %.0f off)", worst_dev, raw_worst);
+        CHECK(worst_step < 400, "smoothed clock advances %.0f frames off 480 per 10 ms", worst_step);
+        printf("smoothed clock: worst %.0f frames from real time (raw position %.0f), worst 10 ms step error %.0f\n", worst_dev, raw_worst, worst_step);
+        // a jump of the position (flush, seek, long stall) restarts it at once, forward and backward
+        uint64_t o = aclk_smooth(&c, raw + 100000, 20001000ull);
+        CHECK(o == raw + 100000, "jump forward: %llu", (unsigned long long)o);
+        o = aclk_smooth(&c, raw + 50000, 20002000ull);
+        CHECK(o == raw + 50000, "jump back: %llu", (unsigned long long)o);
+        // a card that really runs 1.19x fast: the clock follows it (time constant 250 ms), never leads it by more than 20 ms
+        aclk_reset(&c);
+        uint64_t r2 = 0, o2 = 0;
+        for (int t = 0; t <= 10000; t++) {
+            r2 = (uint64_t)(t * 48.0 * 1.19);
+            o2 = aclk_smooth(&c, r2, (uint64_t)t * 1000);
+            CHECK(o2 <= r2 + 960, "fast card: clock ahead by %lld", (long long)(o2 - r2));
+        }
+        CHECK(r2 - o2 < 15000, "fast card: clock lags by %llu frames after 10 s", (unsigned long long)(r2 - o2));
+    }
+
     printf(fails ? "test_arate: %d FAILED\n" : "test_arate: PASS\n", fails);
     return fails != 0;
 }

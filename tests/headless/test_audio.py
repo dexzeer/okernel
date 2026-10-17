@@ -29,7 +29,7 @@ try:
     vm.wait_for("[mem] heap", timeout=60)
     time.sleep(10)
     log = vm.serial()
-    if "[hda] audio output running" not in log:
+    if "[hda] audio output running" not in log and "[hda] AC'97 audio output running" not in log:
         print("  FAIL  HD Audio did not start:", re.findall(r"\[hda\][^\n]*", log)[:6]); ok = False
     else:
         print("  driver:", re.findall(r"\[hda\] (?:codec|output path)[^\n]*", log))

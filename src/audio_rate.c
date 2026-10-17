@@ -19,6 +19,8 @@ void arate_init(struct arate* a) {
     a->last_meas_q16 = 0;
     a->win_valid = 0;
     a->forced = 0;
+    a->observe_only = 0;
+    a->measured_q16 = 0;
     set_rate(a, Q16);
     arate_reset_stream(a);
 }
@@ -52,7 +54,8 @@ void arate_update(struct arate* a, uint64_t dev_frames, uint64_t real_ms) {
     if (a->last_meas_q16 && absdiff(meas, a->last_meas_q16) <= AGREE) {
         uint32_t avg = (meas + a->last_meas_q16) / 2;
         uint32_t nr = absdiff(avg, Q16) < DEAD_BAND ? Q16 : avg;
-        if (nr != a->rate_q16 && (nr == Q16 || absdiff(nr, a->rate_q16) > Q16 / 500u)) set_rate(a, nr);
+        if (a->observe_only) a->measured_q16 = nr;
+        else if (nr != a->rate_q16 && (nr == Q16 || absdiff(nr, a->rate_q16) > Q16 / 500u)) set_rate(a, nr);
     }
     a->last_meas_q16 = meas;
 }
@@ -103,4 +106,24 @@ uint32_t arate_resample(struct arate* a, const int16_t* in, uint32_t n, int16_t*
     else pos -= (uint64_t)n << 16;
     a->pos_q16 = (int32_t)pos;
     return outn;
+}
+
+void aclk_reset(struct aclk* c) { c->valid = 0; c->us = c->est_q8 = c->last = 0; }
+
+uint64_t aclk_smooth(struct aclk* c, uint64_t raw, uint64_t now) {
+    if (!c->valid || raw + 4800 < (c->est_q8 >> 8) || raw > (c->est_q8 >> 8) + 24000) {   // first call, or a jump: start afresh
+        c->valid = 1; c->us = now; c->est_q8 = raw << 8; c->last = raw;
+        return raw;
+    }
+    uint64_t dt = now > c->us ? now - c->us : 0;
+    c->us = now;
+    if (dt > 250000) dt = 250000;
+    c->est_q8 += dt * 48 * 256 / 1000;                                 // real time at 48 kHz
+    int64_t err = (int64_t)(raw << 8) - (int64_t)c->est_q8;
+    c->est_q8 = (uint64_t)((int64_t)c->est_q8 + err * (int64_t)dt / 250000);
+    uint64_t r = c->est_q8 >> 8;
+    if (r > raw + 960) r = raw + 960;
+    if (r < c->last) r = c->last;
+    c->last = r;
+    return r;
 }
