@@ -5,6 +5,10 @@
 #include "atoms.h"
 #include "builtins.h"
 #include "parse.h"
+#include "jit.h"
+#if !(defined(KERNEL) && KERNEL)
+#include <stdlib.h>
+#endif
 
 int atoms_init(ojs* J);
 struct ftempl* compile_script(ojs* J, struct parser* P);
@@ -34,6 +38,9 @@ void api_classes(void) { }
 
 ojs* ojs_new(void) {
     classes_init();
+#if !(defined(KERNEL) && KERNEL)
+    { const char* je = getenv("OJS_JIT"); if (je) ojs_jit_mode = atoi(je); const char* jt = getenv("OJS_JIT_THRESHOLD"); if (jt) ojs_jit_threshold = (uint32_t)atoi(jt); }
+#endif
     ojs* J = (ojs*)ojs_sys_malloc(sizeof(ojs));
     if (!J) return 0;
     memset(J, 0, sizeof *J);
