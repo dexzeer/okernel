@@ -1424,10 +1424,15 @@ static void vw_submit(struct meng* m, int64_t now) {
     {
         int inuse = VW_RING - nfree;
         size_t px = m->out_w > 0 && m->out_h > 0 ? (size_t)m->out_w * (size_t)m->out_h : m->frame.src_w > 0 && m->frame.src_h > 0 ? (size_t)m->frame.src_w * (size_t)m->frame.src_h : (size_t)1280 * 720;
-        size_t slot_bytes = px * 4 + px * 3 / 2 * 2;                   // converted picture + the copied YUV planes (16 bit)
+        size_t spx = m->frame.src_w > 0 && m->frame.src_h > 0 ? (size_t)m->frame.src_w * (size_t)m->frame.src_h : px;
+        size_t slot_bytes = px * 4 + spx * 3;                          // converted picture + the copied YUV planes (source size, 16 bit)
         int cap = slot_bytes ? (int)(frame_budget / slot_bytes) : VW_RING;
-        if (cap < 3) cap = 3;
+        if (cap < 6) cap = 6;
         if (cap > VW_RING) cap = VW_RING;
+#if defined(KERNEL) && KERNEL
+        { static int last_cap = VW_RING; extern void serial_printf(const char*, ...);       // say when the ring is limited by memory
+          if (cap != last_cap) { last_cap = cap; serial_printf("[media] frame ring limited to %d slots (%u KB per picture, budget %u MB)\n", cap, (unsigned)(slot_bytes >> 10), (unsigned)(frame_budget >> 20)); } }
+#endif
         if (nfree > cap - inuse) nfree = cap - inuse > 0 ? cap - inuse : 0;
     }
     uint32_t k = vq_live(m, m->vq.next);
@@ -1522,7 +1527,12 @@ static void vw_convert(struct meng* m, int64_t now) {
         size_t need = (size_t)s->ow * (size_t)s->oh;
         if (need > s->cap) {
             uint32_t* p = (uint32_t*)MEDIA_ALLOC(need * 4);
-            if (!p) { s->state = 0; m->v_dropped++; continue; }
+            if (!p) {
+                // no (contiguous) memory for a picture this big - a fullscreen click on a nearly full, fragmented heap killed the video with 323 failed
+                // 8 MB allocations: make the output smaller (the page painter scales it) instead of dropping every frame
+                if (m->out_w > 320 && m->out_h > 180) { m->out_w = m->out_w * 7 / 8; m->out_h = m->out_h * 7 / 8; }
+                s->state = 0; m->v_dropped++; continue;
+            }
             if (s->px) MEDIA_FREE(s->px);
             s->px = p;
             s->cap = need;
