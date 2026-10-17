@@ -1618,8 +1618,8 @@ void okai_render_content(int id) {
         run_job(&j);
         T->links_hash = (uint32_t)j.result;
     } else {
-        serial_printf("[okai] render tab=%d doc_h=%d scroll=%d in %dms\n", b->active_tab,
-                      T->content_height, T->scroll_y, (int)(tick_count - t0) * 10);
+        serial_printf("[okai] render tab=%d doc_h=%d scroll=%d in %dms painted %dKpx\n", b->active_tab,
+                      T->content_height, T->scroll_y, (int)(tick_count - t0) * 10, (int)(wdoc_last_painted_px / 1000));
         if (wdoc_js(T->doc)) {
             // scripts move content: re-log the regions when they changed
             memset(&j, 0, sizeof j);
@@ -1882,6 +1882,7 @@ static void frame_render(int bi, int slot) {
         if (!F->fpx) { serial_printf("[okai] frame bitmap alloc failed (%dx%d)\n", w, h); return; }
     }
     for (int i = 0; i < w * h; i++) F->fpx[i] = 0xFFFFFFFFu;
+    wdoc_paint_invalidate(F->doc);                                   // the bitmap was just cleared
     struct wsurf s;
     s.px = F->fpx;
     s.w = w;

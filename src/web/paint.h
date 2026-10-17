@@ -12,7 +12,25 @@ struct wpaint_env {
     struct wdom* d;                      // inline SVG
     const struct wimg* (*image)(void* ctx, int id);
     void* ctx;
+    uint32_t (*image_sig)(void* ctx, int id);   // identity of what image `id` would draw (0 = it changes by itself: always repaint)
 };
+
+// What the last paint left in the surface (see wpaint_inc in paint.c).
+struct wpaint_cache {
+    uint32_t* sig;
+    uint8_t* always;
+    void* rect;                                 // struct drect[] (paint.c)
+    int n, cap, scroll, w, h;
+    const uint32_t* px;
+    uint32_t bg;
+    int valid;
+};
+extern int wpaint_inc_enabled;
+extern int wpaint_dbg;         // log the damage rectangles
+void wpaint_cache_free(struct wpaint_cache* pc);
+// Like wpaint, but repaints only what changed since the last call with the same cache when that gives the same picture. Returns the
+// number of pixels painted. The surface must still hold what the last call left (video rectangles aside: those are ext images).
+long wpaint_inc(const struct wlayout* L, struct wsurf* s, int scroll_y, const struct wpaint_env* env, struct wpaint_cache* pc);
 
 // Paint the display list into s. The surface shows document rows
 // [scroll_y, scroll_y + s->h) (px); fixed items ignore the scroll. The
