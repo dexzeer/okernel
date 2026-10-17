@@ -3,6 +3,7 @@
 
 #include "wcommon.h"
 #include "../ojs/ojs_sys.h"
+#include "../ojs/ojs.h"
 
 void* ojs_sys_malloc(size_t n) { return w_malloc(n ? n : 1); }
 void* ojs_sys_realloc(void* p, size_t n) { return w_realloc(p, n ? n : 1); }
@@ -53,3 +54,28 @@ double ojs_sys_time_ms(void) {
 }
 #endif
 int ojs_sys_tz_offset(double utc_ms, int is_local) { (void)utc_ms; (void)is_local; return 0; }
+
+// Parallel garbage collection: the collector (src/ojs/gc.c) marks on every CPU the SMP job system offers. The workers run on the APs
+// (and one on the calling CPU) and only read the JS heap and set mark bits: no serial output, no page state, no JS.
+#if defined(KERNEL) && KERNEL
+#include "../smp.h"
+struct kgc_job { void (*fn)(void* ctx, int item, int is_main); void* ctx; };
+static void kgc_adapter(void* ctx, uint32_t item, uint32_t cpu) {
+    struct kgc_job* j = (struct kgc_job*)ctx;
+    j->fn(j->ctx, (int)item, cpu == 0);
+}
+static int kgc_on = 1;
+static int kgc_ncpu(void) { return kgc_on ? smp_ncpu() : 1; }
+void wjs_sys_parallel_gc(int on) { kgc_on = on; }
+static void kgc_run(void (*fn)(void*, int, int), void* ctx, int n) {
+    struct kgc_job j = { fn, ctx };
+    smp_parallel_for(kgc_adapter, &j, (uint32_t)n, 1);
+}
+static void kgc_report(int par, double ms, double mark_ms, size_t live, size_t heap) {
+    if (ms >= 30) w_log("[js-gc] %d ms (mark %d)%s, live %u MB of %u MB\n", (int)ms, (int)mark_ms, par ? " parallel" : "", (unsigned)(live >> 20), (unsigned)(heap >> 20));
+}
+void wjs_sys_parallel_init(void) { ojs_set_parallel(kgc_ncpu, kgc_run); ojs_gc_report = kgc_report; }
+#else
+void wjs_sys_parallel_init(void) {}
+void wjs_sys_parallel_gc(int on) { (void)on; }
+#endif

@@ -18,6 +18,10 @@
 
 #include "ojs_int.h"
 #include "gc_int.h"
+#if !defined(KERNEL) || !KERNEL
+#include <stdio.h>
+#include <stdlib.h>
+#endif
 
 #if UINTPTR_MAX != 0xFFFFFFFFu
 #error "ojs's conservative collector assumes 32-bit pointers"
@@ -54,6 +58,27 @@ struct large {
     void* raw;
 };
 
+// The embedder may offer worker threads for marking (ojs_set_parallel); without it, or with one CPU, the collector marks alone.
+static int (*par_ncpu_fn)(void);
+void (*ojs_gc_report)(int parallel, double total_ms, double mark_ms, size_t live, size_t heap);   // optional: called after every collection
+void (*ojs_par_run)(void (*fn)(void* ctx, int item, int is_main), void* ctx, int n);
+void ojs_set_parallel(int (*ncpu)(void), void (*run)(void (*fn)(void*, int, int), void*, int)) { par_ncpu_fn = ncpu; ojs_par_run = run; }
+static int ojs_par_ncpu(void) { return par_ncpu_fn ? par_ncpu_fn() : 1; }
+static size_t par_min_heap = 24u << 20;   // below this a collection is too short to be worth waking the other CPUs
+void ojs_set_parallel_min(size_t bytes) { par_min_heap = bytes; }
+#define PAR_MIN_HEAP par_min_heap
+
+// A mark stack. The collector has one for the calling thread; parallel marking gives every worker its own (see par_worker).
+struct marker {
+    void** stack;
+    int sp, cap;
+    int overflow;               // a push failed (out of memory): the heap is rescanned for marked objects after the phase
+    int par;                    // marking in parallel: mark bits are set atomically
+    unsigned traced;            // objects traced (statistics)
+    uint8_t pad[104];           // 128 bytes in all: workers update their own sp on every object, neighbours must not share its cache line
+};
+
+
 struct gc_heap {
     uint32_t owned[(1u << (32 - PAGE_SHIFT)) / 32];   // page bitmap over 4 GB
     struct page* pages[NCLASSES];        // class -> page list
@@ -62,8 +87,7 @@ struct gc_heap {
     struct page* spare;                  // carved, unused pages
     struct large* large;
     int nlarge, caplarge;
-    void** mstack;                       // mark stack
-    int msp, mcap;
+    struct marker m0;                    // the calling thread's mark stack
     int mark_overflow;
     size_t live_after_gc;
     size_t live_by_type[GT_COUNT];
@@ -207,6 +231,7 @@ void gc_init(ojs* J) {
     }
     J->heap = H;
     J->gc_threshold = 8u << 20;
+    J->mk = &H->m0;
 }
 
 size_t gc_size(const void* p) {
@@ -273,24 +298,24 @@ void* gc_alloc(ojs* J, int type, size_t size) {
 
 // ---------------------------------------------------------------- marking
 
-static void mpush(ojs* J, void* p) {
-    struct gc_heap* H = J->heap;
-    if (H->msp >= H->mcap) {
-        int nc = H->mcap ? H->mcap * 2 : 4096;
-        void** t = (void**)ojs_sys_realloc(H->mstack, (size_t)nc * sizeof(void*));
-        if (!t) { H->mark_overflow = 1; return; }   // rescan later
-        H->mstack = t;
-        H->mcap = nc;
+static void mpush(struct marker* mk, void* p) {
+    if (mk->sp >= mk->cap) {
+        int nc = mk->cap ? mk->cap * 2 : 4096;
+        void** t = (void**)ojs_sys_realloc(mk->stack, (size_t)nc * sizeof(void*));
+        if (!t) { mk->overflow = 1; return; }   // rescan later
+        mk->stack = t;
+        mk->cap = nc;
     }
-    H->mstack[H->msp++] = p;
+    mk->stack[mk->sp++] = p;
 }
 
 void gc_mark_ptr(ojs* J, void* p) {
     if (!p) return;
     struct gch* g = (struct gch*)p;
     if (g->gcflags & GCF_MARK) return;
-    g->gcflags |= GCF_MARK;
-    mpush(J, p);
+    struct marker* mk = J->mk;
+    g->gcflags |= GCF_MARK;      // (parallel marking: two workers may both see it unmarked and both trace it - harmless, marking is idempotent, and no other flag changes during a collection)
+    mpush(mk, p);
 }
 
 void gc_mark_value(ojs* J, jv v) {
@@ -373,14 +398,16 @@ static void trace(ojs* J, struct gch* g) {
 
 static void drain(ojs* J) {
     struct gc_heap* H = J->heap;
+    struct marker* mk = J->mk;
     uint32_t traced = 0;
     for (;;) {
-        while (H->msp > 0) {
-            trace(J, (struct gch*)H->mstack[--H->msp]);
+        while (mk->sp > 0) {
+            trace(J, (struct gch*)mk->stack[--mk->sp]);
             // marking a heap of 100+ MB takes 100-300 ms: let the host keep its sound card and video going (its answer is ignored:
             // a script past its deadline is stopped by the next check of the interpreter)
             if (!(++traced & 8191) && J->interrupt) (void)J->interrupt(J, J->interrupt_op);
         }
+        if (mk->overflow) { mk->overflow = 0; H->mark_overflow = 1; }
         if (!H->mark_overflow) break;
         // the mark stack overflowed: rescan the heap for marked objects
         // and retrace them (their children may have been dropped)
@@ -397,6 +424,167 @@ static void drain(ojs* J) {
         }
     }
 }
+
+
+// ---------------------------------------------------------------- parallel marking
+//
+// Marking is 80% of a collection and bound by memory latency, so it scales with the number of CPUs that chase pointers at the same time.
+// The embedder supplies the executor (ojs_set_parallel): n workers run concurrently, one of them on the calling thread. Each worker has a
+// private mark stack and marks through a private copy of the runtime struct (only J->mk differs), so gc_mark_ptr needs no thread-local
+// storage. Mark bits are set with an atomic OR (only for objects that looked unmarked). Idle workers take chunks of pointers from a shared
+// pool; busy workers put chunks there when somebody is idle. The trace functions are pure (they only read objects and call gc_mark_*), the
+// roots, the conservative stack scan, ephemerons, finalization registries and the sweep stay on the calling thread.
+
+#define PAR_CHUNK 256
+#define PAR_MAXW 8
+
+struct gc_par {
+    volatile int lock;
+    void** buf;                     // pool storage: cap chunks of PAR_CHUNK pointers
+    int* nbuf;                      // entries in each chunk
+    int np, cap;
+    volatile int nstarted, nidle, done, overflow;
+    ojs* J;
+    struct marker mk[PAR_MAXW];
+};
+
+static inline void par_lock(volatile int* l) {
+    while (__atomic_exchange_n(l, 1, __ATOMIC_ACQUIRE)) while (*l) __asm__ volatile("pause");
+}
+static inline void par_unlock(volatile int* l) { __atomic_store_n(l, 0, __ATOMIC_RELEASE); }
+
+// room for n more entries on the marker's stack
+static int mk_reserve(struct marker* mk, int n) {
+    if (mk->sp + n <= mk->cap) return 1;
+    int nc = mk->cap ? mk->cap : 4096;
+    while (nc < mk->sp + n) nc *= 2;
+    void** t = (void**)ojs_sys_realloc(mk->stack, (size_t)nc * sizeof(void*));
+    if (!t) return 0;
+    mk->stack = t;
+    mk->cap = nc;
+    return 1;
+}
+
+// give half of a long stack (its oldest entries: the biggest subtrees) to the pool
+static void par_share(struct gc_par* P, struct marker* mk) {
+    par_lock(&P->lock);
+    if (P->np < P->cap && mk->sp > 2 * PAR_CHUNK) {
+        void** dst = P->buf + (size_t)P->np * PAR_CHUNK;
+        memcpy(dst, mk->stack, PAR_CHUNK * sizeof(void*));
+        memmove(mk->stack, mk->stack + PAR_CHUNK, (size_t)(mk->sp - PAR_CHUNK) * sizeof(void*));
+        mk->sp -= PAR_CHUNK;
+        P->nbuf[P->np++] = PAR_CHUNK;
+    }
+    par_unlock(&P->lock);
+}
+
+// (P->lock held, P->np > 0) move the newest chunk to the marker's stack
+static int par_take(struct gc_par* P, struct marker* mk) {
+    int n = P->nbuf[P->np - 1];
+    if (!mk_reserve(mk, n)) { mk->overflow = 1; P->np--; return 0; }       // dropped: the serial rescan after the phase picks it up
+    memcpy(mk->stack + mk->sp, P->buf + (size_t)(P->np - 1) * PAR_CHUNK, (size_t)n * sizeof(void*));
+    mk->sp += n;
+    P->np--;
+    return 1;
+}
+
+static void par_worker(void* ctx, int item, int is_main) {
+    struct gc_par* P = (struct gc_par*)ctx;
+    if (item < 0 || item >= PAR_MAXW) return;
+    struct marker* mk = &P->mk[item];
+    ojs Jw = *P->J;                                   // this worker's view of the runtime: same everything, its own marker
+    Jw.mk = mk;
+    mk->par = 1;
+    par_lock(&P->lock);
+    P->nstarted++;
+    par_unlock(&P->lock);
+    uint32_t traced = 0;
+    for (;;) {
+        while (mk->sp > 0) {
+            struct gch* g = (struct gch*)mk->stack[--mk->sp];
+            trace(&Jw, g);
+            mk->traced++;
+            if (mk->sp > 2 * PAR_CHUNK && P->np == 0 && P->nidle > 0) par_share(P, mk);   // only when somebody waits and nothing is waiting for them
+            // the calling thread keeps the host's pointer, sound card and video going, like the serial marker does
+            if (is_main && !(++traced & 8191) && P->J->interrupt) (void)P->J->interrupt(P->J, P->J->interrupt_op);
+        }
+        par_lock(&P->lock);
+        if (P->np > 0) { par_take(P, mk); par_unlock(&P->lock); continue; }
+        P->nidle++;
+        if (P->nidle == P->nstarted) P->done = 1;      // everybody who ever started is idle and nothing is waiting: finished
+        par_unlock(&P->lock);
+        int again = 0;
+        while (!P->done) {
+            if (P->np > 0) {
+                par_lock(&P->lock);
+                if (P->np > 0) { P->nidle--; par_take(P, mk); again = 1; }
+                par_unlock(&P->lock);
+                if (again) break;
+            }
+            __asm__ volatile("pause");
+            if (is_main && P->J->interrupt && !(++traced & 4095)) (void)P->J->interrupt(P->J, P->J->interrupt_op);
+        }
+        if (!again) break;
+    }
+    if (mk->overflow) P->overflow = 1;
+    mk->par = 0;
+}
+
+// Drain the main marker's stack with all CPUs. Returns 1 if it ran in parallel.
+static int par_drain(ojs* J) {
+    struct gc_heap* H = J->heap;
+    int nw = ojs_par_ncpu();
+    if (nw < 2 || !ojs_par_run || J->mk->sp < 1) return 0;
+    if (nw > PAR_MAXW) nw = PAR_MAXW;
+    struct marker* m0 = J->mk;
+    int chunks = (m0->sp + PAR_CHUNK - 1) / PAR_CHUNK + 64;
+    struct gc_par* P = (struct gc_par*)ojs_sys_malloc(sizeof *P);
+    if (!P) return 0;
+    memset(P, 0, sizeof *P);
+    P->buf = (void**)ojs_sys_malloc((size_t)chunks * PAR_CHUNK * sizeof(void*));
+    P->nbuf = (int*)ojs_sys_malloc((size_t)chunks * sizeof(int));
+    if (!P->buf || !P->nbuf) { ojs_sys_free(P->buf); ojs_sys_free(P->nbuf); ojs_sys_free(P); return 0; }
+    P->cap = chunks;
+    P->J = J;
+    while (m0->sp > 0) {                               // the roots become chunks for whoever starts first
+        int n = m0->sp < PAR_CHUNK ? m0->sp : PAR_CHUNK;
+        memcpy(P->buf + (size_t)P->np * PAR_CHUNK, m0->stack + (m0->sp - n), (size_t)n * sizeof(void*));
+        P->nbuf[P->np++] = n;
+        m0->sp -= n;
+    }
+    ojs_par_run(par_worker, P, nw);
+#if !defined(KERNEL) || !KERNEL
+    if (getenv("OJS_GCPAR_TRACE")) { fprintf(stderr, "[gc]   workers traced:"); for (int i = 0; i < PAR_MAXW; i++) fprintf(stderr, " %u", P->mk[i].traced); fprintf(stderr, "  started %d\n", P->nstarted); }
+#endif
+    if (P->overflow) H->mark_overflow = 1;
+    for (int i = 0; i < PAR_MAXW; i++) ojs_sys_free(P->mk[i].stack);
+    ojs_sys_free(P->buf);
+    ojs_sys_free(P->nbuf);
+    ojs_sys_free(P);
+    return 1;
+}
+
+
+#if !defined(KERNEL) || !KERNEL
+// Debug check of the parallel marker (OJS_GCPAR_VERIFY=1): trace every marked object again, serially; any child that is still unmarked was
+// missed by the workers. Aborts with a report.
+static void par_verify(ojs* J) {
+    struct gc_heap* H = J->heap;
+    struct marker* mk = &H->m0;
+    int missed = 0;
+    for (int c = 0; c < NCLASSES; c++)
+        for (struct page* p = H->pages[c]; p; p = p->next)
+            for (uint32_t i = 0; i < p->nobj; i++) {
+                struct gch* g = (struct gch*)(p->data + (size_t)i * p->objsize);
+                if (g->type != GT_FREE && (g->gcflags & GCF_MARK)) { trace(J, g); missed += mk->sp; while (mk->sp > 0) { struct gch* m = (struct gch*)mk->stack[--mk->sp]; (void)m; } }
+            }
+    for (int i = 0; i < H->nlarge; i++) {
+        struct gch* g = (struct gch*)H->large[i].p;
+        if (g->gcflags & GCF_MARK) { trace(J, g); missed += mk->sp; mk->sp = 0; }
+    }
+    if (missed) { fprintf(stderr, "[gc] PARALLEL MARK MISSED %d objects\n", missed); abort(); }
+}
+#endif
 
 static void __attribute__((noinline)) mark_stack(ojs* J) {
     // spill callee-saved registers into this frame, then scan from here
@@ -532,10 +720,23 @@ void gc_collect(ojs* J) {
     if (J->in_gc || !H) return;
     J->in_gc = 1;
     double t0 = ojs_sys_time_ms();
-    H->msp = 0;
+    H->m0.sp = 0;
+    H->m0.overflow = 0;
+    H->m0.par = 0;
     H->mark_overflow = 0;
+    J->mk = &H->m0;
     mark_roots(J);
+    double tp0 = ojs_sys_time_ms();
+    int was_par = 0;
+    if (J->heap_bytes >= PAR_MIN_HEAP) was_par = par_drain(J);       // the big part of the work, on every CPU the embedder offers
+    double tp1 = ojs_sys_time_ms();
+#if !defined(KERNEL) || !KERNEL
+    if (was_par && getenv("OJS_GCPAR_VERIFY")) par_verify(J);
+#endif
     drain(J);
+#if !defined(KERNEL) || !KERNEL
+    if (getenv("OJS_GCPAR_TRACE")) fprintf(stderr, "[gc] roots %.1f ms, parallel phase %.1f ms (%d), rest %.1f ms\n", tp0 - t0, tp1 - tp0, was_par, ojs_sys_time_ms() - tp1);
+#endif
     // weak structures: ephemerons may mark more (loop until stable)
     for (;;) {
         int more = weak_process_ephemerons(J);
@@ -546,6 +747,7 @@ void gc_collect(ojs* J) {
     drain(J);
     weak_clear_dead(J);     // WeakMap entries / WeakRef targets that died
     J->gc_mark_ms += ojs_sys_time_ms() - t0;
+    double tm1 = ojs_sys_time_ms();
     atoms_sweep(J);
     size_t live = sweep(J);
     release_chunks(J);
@@ -559,6 +761,7 @@ void gc_collect(ojs* J) {
     J->gc_threshold = th;
     J->gc_count++;
     J->gc_ms += ojs_sys_time_ms() - t0;
+    if (ojs_gc_report) ojs_gc_report(was_par, ojs_sys_time_ms() - t0, tm1 - t0, live, J->heap_bytes);
     J->in_gc = 0;
 }
 
@@ -589,7 +792,7 @@ void gc_free_all(ojs* J) {
         c = n;
     }
     ojs_sys_free(H->large);
-    ojs_sys_free(H->mstack);
+    ojs_sys_free(H->m0.stack);
     ojs_sys_free(H);
     J->heap = 0;
 }

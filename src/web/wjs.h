@@ -72,6 +72,8 @@ struct wjs_rect { int x, y, w, h, fixed; };
 int  wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout);
 void wjs_media_tick(struct wjs* js);         // advance the sessions (decode, audio feed) from inside a running script
 void wjs_media_service(void);               // the same from inside a style/layout/paint pass (never reads the document)
+void wjs_sys_parallel_init(void);           // let the JS collector mark on all CPUs (kernel; a no-op on the host)
+void wjs_sys_parallel_gc(int on);           // shell `gcpar on|off`: switch the parallel marking for A/B runs
 int  wjs_media_worker(void);                  // video is decoded on another CPU
 // A video frame that came out of the decoder while a page script was running: the shell blits it at once, without waiting for the script
 // (a script can run for seconds, and the picture used to freeze meanwhile). px is the engine's stable frame buffer, w x h = the painted size.

@@ -980,6 +980,11 @@ static void shell_execute(int win_id, const char* input) {
         t[k] = 0;
         window_puts(win_id, t);
     }
+    else if (str_eq(cmd_buf, "gcpar")) {
+        // `gcpar off` marks the page JS heap on one CPU only, `gcpar on` (default) on every CPU: [js-gc] lines in the serial log show the pause
+        wjs_sys_parallel_gc(!str_eq(args, "off"));
+        window_puts(win_id, str_eq(args, "off") ? "JS garbage collection: one CPU\n" : "JS garbage collection: all CPUs\n");
+    }
     else if (str_eq(cmd_buf, "damage")) {
         // `damage off` repaints whole pages every time, `damage check` compares every damage-based repaint with a full paint
         // ([paint] MISMATCH in the serial log), `damage on` is the default
