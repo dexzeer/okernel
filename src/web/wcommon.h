@@ -37,6 +37,12 @@
 #define LU_FLOOR(v) ((v) >> 6)      // LU -> px (floor; arithmetic shift)
 #define LU_ROUND(v) (((v) + 32) >> 6)
 
+// Long engine passes (style, layout, paint) call W_PROGRESS() in their loops: every 256th call the shell gets a chance to keep the video
+// decoder, the sound card and the picture going (okai sets w_progress_hook; it rate-limits itself). No hook = no cost beyond a test.
+extern void (*w_progress_hook)(void);
+extern uint32_t w_progress_n;
+#define W_PROGRESS() do { if (w_progress_hook && (++w_progress_n & 255u) == 0) w_progress_hook(); } while (0)
+
 #define W_MIN(a, b) ((a) < (b) ? (a) : (b))
 #define W_MAX(a, b) ((a) > (b) ? (a) : (b))
 #define W_CLAMP(v, lo, hi) ((v) < (lo) ? (lo) : (v) > (hi) ? (hi) : (v))

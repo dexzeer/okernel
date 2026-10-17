@@ -1147,8 +1147,22 @@ static void engine_pump(void) {
     pumping = 0;
 }
 
+// Style / layout / paint passes call W_PROGRESS() in their loops (wcommon.h): about every 10 ms (the tick) keep the video going - decode ahead, feed
+// the sound card, and put a due frame on the screen - so a 40-100 ms render does not become a 40-100 ms hole in a 25 fps picture.
+static void render_progress(void) {
+    static uint32_t last;
+    uint32_t now = (uint32_t)okai_now_ms();
+    if ((uint32_t)(now - last) < 10) return;
+    last = now;
+    wjs_media_service();
+    engine_pump();
+}
+
+void okai_set_render_progress(int on) { w_progress_hook = on ? render_progress : 0; }
+
 void okai_init(void) {
     wjs_host.yield = engine_pump;
+    w_progress_hook = render_progress;
     wjs_host.now_ms = okai_now_ms;
     wjs_host.random = okai_js_random;
     wjs_host.log = okai_js_log;

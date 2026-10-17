@@ -17,6 +17,7 @@ struct wmedia {
     uint32_t pres_serial;     // last frame handed to the shell while a script was running (wjs_media_tick)
     int out_w, out_h;         // output size requested from the engine
     int audio;                // this session owns the sound card
+    int dest_ok, dest_x, dest_y, dest_w, dest_h, dest_fixed;   // where the element was last painted (used while a render is in progress and the layout cannot be asked)
 };
 
 #define JSX(ctx) ((struct wjs*)ojs_get_opaque(ctx))
@@ -267,6 +268,7 @@ int wjs_media_take_present(struct wjs_present* out) {
 }
 
 static void media_tick_realm(struct wjs* js);
+static int tick_light;                       // 1 = called from inside a style/layout/paint pass: do not read the document
 #ifdef KERNEL
 extern volatile uint32_t stall_beat;
 extern uint32_t tick_count;
@@ -282,6 +284,13 @@ void wjs_media_tick(struct wjs* running) {
     }
 }
 
+// From inside a style/layout/paint pass (W_PROGRESS): the same service, but the document is not touched.
+void wjs_media_service(void) {
+    tick_light = 1;
+    wjs_media_tick(0);
+    tick_light = 0;
+}
+
 static void media_tick_realm(struct wjs* js) {
     for (int i = 0; i < WM_MAX; i++) {
         struct wmedia* s = &js->media[i];
@@ -293,7 +302,15 @@ static void media_tick_realm(struct wjs* js) {
         const struct meng_frame* f = meng_get_frame(s->m);
         if (!f || !f->px || f->serial == s->pres_serial || f->serial == s->serial) continue;
         int dx, dy, dw, dh, fixed;
-        if (!wdoc_video_dest(js->doc, s->node, &dx, &dy, &dw, &dh, &fixed) || dw != f->w || dh != f->h) continue;
+        if (tick_light) {
+            if (!s->dest_ok) continue;
+            dx = s->dest_x; dy = s->dest_y; dw = s->dest_w; dh = s->dest_h; fixed = s->dest_fixed;
+            if (dw != f->w || dh != f->h) continue;
+        } else {
+            if (!wdoc_video_dest(js->doc, s->node, &dx, &dy, &dw, &dh, &fixed)) { s->dest_ok = 0; continue; }
+            s->dest_ok = 1; s->dest_x = dx; s->dest_y = dy; s->dest_w = dw; s->dest_h = dh; s->dest_fixed = fixed;
+            if (dw != f->w || dh != f->h) continue;
+        }
         pend.px = f->px; pend.w = f->w; pend.h = f->h; pend.x = dx; pend.y = dy; pend.fixed = fixed; pend.doc = js->doc;
         pend_valid = 1;
         s->pres_serial = f->serial;
@@ -345,6 +362,8 @@ int wjs_media_poll(struct wjs* js, struct wjs_rect* out, int max, int* nout) {
             s->serial = f->serial;
             if (wdoc_video_set(js->doc, s->node, f->px, f->w, f->h)) { relayout = 1; continue; }
             if (!wdoc_video_dest(js->doc, s->node, &dx, &dy, &dw, &dh, &fixed) || dw <= 0 || dh <= 0) continue;
+            s->dest_ok = 1; s->dest_x = dx; s->dest_y = dy; s->dest_w = dw; s->dest_h = dh; s->dest_fixed = fixed;
+            s->dest_ok = 1; s->dest_x = dx; s->dest_y = dy; s->dest_w = dw; s->dest_h = dh; s->dest_fixed = fixed;
             if ((dw != s->out_w || dh != s->out_h) && (int64_t)dw * dh <= MAX_OUT_PX) {
                 // the engine converts straight to the size the element is painted at (no resampling in
                 // the page painter); the converted frame comes back as the next serial
