@@ -157,6 +157,11 @@ static uint32_t async_seq;
 
 int smp_async_start(smp_fn fn, void* ctx, struct smp_async* h) {
     if (!fn || !h || ncpu_total < 2) return -1;        // (an AP may post too: a decode job asks idle CPUs to help with its tiles)
+    // The boot CPU holds pub_lock for the whole of smp_parallel_for. Code running inside such a job (the collector's marking calls the host's
+    // interrupt hook, which services the video decoder, which posts a job) must not wait for it: the lock is not recursive and the boot CPU
+    // would wait for itself forever (the kernel froze when a collection of a big heap ran while a video played). Refuse; callers run the work
+    // themselves.
+    if (bsp_in_job && !smp_on_ap()) return -1;
     spin_lock(&pub_lock);
     struct aent* e = 0;
     uint32_t idx = 0;
@@ -417,6 +422,12 @@ static void t_sse_fn(void* c, uint32_t i, uint32_t cpu) {
 }
 
 struct t_async { volatile uint32_t v, cpu, tag; };
+static volatile int t_inner_async_rc;
+static void t_post_inside(void* c, uint32_t i, uint32_t cpu) {      // an item of a parallel job posting an async job (the boot CPU's own item)
+    static struct smp_async h;
+    (void)c; (void)i;
+    if (cpu == 0) t_inner_async_rc = smp_async_start(t_post_inside, 0, &h) == -1 ? 1 : 2;
+}
 static void t_async_fn(void* c, uint32_t i, uint32_t cpu) {
     struct t_async* t = (struct t_async*)c;
     (void)i;
@@ -521,6 +532,13 @@ int smp_selftest(void (*out)(const char*, void*), void* ud) {
         }
         kfmt(b, sizeof b, "G async jobs: %s", ok ? "ok" : "FAIL"); out(b, ud);
         if (!ok) fails++;
+    }
+    // H: posting an async job from inside a parallel job on the boot CPU must fail at once, not wait for the lock the job itself holds
+    if (ncpu_total > 1) {
+        t_inner_async_rc = 0;
+        for (int tries = 0; tries < 50 && !t_inner_async_rc; tries++) smp_parallel_for(t_post_inside, 0, 256, 1);   // (the boot CPU must get at least one item)
+        kfmt(b, sizeof b, "H async post inside a job refused: %s", t_inner_async_rc == 1 ? "ok" : "FAIL"); out(b, ud);
+        if (t_inner_async_rc != 1) fails++;
     }
     // E: speed
     {
