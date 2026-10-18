@@ -23,7 +23,16 @@ struct jit_stats ojs_jit_stats;
 static double jit_ms;
 #endif
 
-static void* exec_alloc(size_t n) {
+// Machine code lives in pools of whole pages that hold nothing else. Mixing it with data pages is expensive twice over: an emulator that
+// translates guest code (QEMU's TCG) invalidates its translations on every write to such a page (the page-JS tests ran 9x slower), and a
+// CPU treats a store near code it is executing as self-modifying code and flushes its pipeline. The heap's own allocator would put the
+// bytes next to other objects.
+#define POOL_BYTES (256 * 1024)
+struct jpool { struct jpool* next; uint8_t* raw; uint8_t* base; size_t size, used; uint32_t live; };
+static struct jpool* pools;
+static struct jpool* pool_cur;
+
+static void* raw_alloc(size_t n) {
 #if defined(KERNEL) && KERNEL
     return ojs_sys_malloc(n);       // the kernel's pages are all executable
 #else
@@ -31,7 +40,7 @@ static void* exec_alloc(size_t n) {
     return p == MAP_FAILED ? 0 : p;
 #endif
 }
-static void exec_free(void* p, size_t n) {
+static void raw_free(void* p, size_t n) {
 #if defined(KERNEL) && KERNEL
     (void)n;
     ojs_sys_free(p);
@@ -40,9 +49,37 @@ static void exec_free(void* p, size_t n) {
 #endif
 }
 
+static void* code_alloc(size_t n, struct jpool** out) {
+    n = (n + 63) & ~(size_t)63;
+    struct jpool* p = pool_cur;
+    if (!p || p->size - p->used < n) {
+        size_t sz = n > POOL_BYTES ? ((n + 4095) & ~(size_t)4095) : POOL_BYTES;
+        p = (struct jpool*)ojs_sys_malloc(sizeof *p);
+        if (!p) return 0;
+        p->raw = (uint8_t*)raw_alloc(sz + 4096);
+        if (!p->raw) { ojs_sys_free(p); return 0; }
+        p->base = (uint8_t*)(((uintptr_t)p->raw + 4095) & ~(uintptr_t)4095);     // whole pages: nothing else shares them
+        p->size = sz; p->used = 0; p->live = 0;
+        p->next = pools; pools = p;
+        pool_cur = p;
+    }
+    void* m = p->base + p->used;
+    p->used += n;
+    p->live++;
+    *out = p;
+    return m;
+}
+static void code_release(struct jpool* p) {
+    if (!p || --p->live) return;
+    if (p == pool_cur) { p->used = 0; return; }            // keep the current pool for the next function
+    for (struct jpool** pp = &pools; *pp; pp = &(*pp)->next) if (*pp == p) { *pp = p->next; break; }
+    raw_free(p->raw, p->size + 4096);
+    ojs_sys_free(p);
+}
+
 void jit_free(struct jitcode* c) {
     if (!c) return;
-    if (c->mem) exec_free(c->mem, c->size);
+    code_release((struct jpool*)c->pool);
     ojs_sys_free(c->pcs);
     ojs_sys_free(c->addr);
     ojs_sys_free(c);
@@ -916,18 +953,19 @@ static int jit_compile_(ojs* J, struct ftempl* t) {
     // place it
     {
         size_t size = c.n;
-        uint8_t* mem = (uint8_t*)exec_alloc(size);
+        struct jpool* pool = 0;
+        uint8_t* mem = (uint8_t*)code_alloc(size, &pool);
         if (!mem) goto out;
         memcpy(mem, c.b, size);
         for (uint32_t i = 0; i < c.nrel; i++) {
             uint32_t tgt = c.lab[c.rel[i].lab];
-            if (tgt == ~0u) { exec_free(mem, size); goto out; }
+            if (tgt == ~0u) { code_release(pool); goto out; }
             uint32_t v = tgt - (c.rel[i].pos + 4);
             memcpy(mem + c.rel[i].pos, &v, 4);
         }
         for (uint32_t i = 0; i < c.nabs; i++) {
             uint32_t tgt = c.lab[c.abs[i].lab];
-            if (tgt == ~0u) { exec_free(mem, size); goto out; }
+            if (tgt == ~0u) { code_release(pool); goto out; }
             uint32_t v = (uint32_t)(uintptr_t)mem + tgt;
             memcpy(mem + c.abs[i].pos, &v, 4);
         }
@@ -940,10 +978,10 @@ static int jit_compile_(ojs* J, struct ftempl* t) {
         for (uint32_t o = 0; o < ni; o++) if (c.an.depth[o] >= 0) nmap++;
         uint32_t* pcs = (uint32_t*)ojs_sys_malloc((nmap + 1) * sizeof(uint32_t));
         void** addr = (void**)ojs_sys_malloc((nmap + 1) * sizeof(void*));
-        if (!jc || !pcs || !addr) { ojs_sys_free(jc); ojs_sys_free(pcs); ojs_sys_free(addr); exec_free(mem, size); goto out; }
+        if (!jc || !pcs || !addr) { ojs_sys_free(jc); ojs_sys_free(pcs); ojs_sys_free(addr); code_release(pool); goto out; }
         uint32_t k = 0;
         for (uint32_t o = 0; o < ni; o++) if (c.an.depth[o] >= 0) { pcs[k] = c.an.ord_pc[o]; addr[k] = mem + c.lab[o]; k++; }
-        jc->mem = mem; jc->size = size; jc->entry = mem; jc->start = mem + c.lab[0];
+        jc->mem = mem; jc->pool = pool; jc->size = size; jc->entry = mem; jc->start = mem + c.lab[0];
         jc->n = nmap; jc->pcs = pcs; jc->addr = addr;
         t->jit = jc;
         t->h.gcflags |= GCF_FINAL;
