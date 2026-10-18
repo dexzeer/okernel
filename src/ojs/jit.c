@@ -16,7 +16,11 @@
 #include <time.h>
 #endif
 
-int ojs_jit_mode = 0;
+#if defined(KERNEL) && KERNEL
+int ojs_jit_mode = 1;               // the kernel compiles hot functions by default (shell `jit off` to turn it off)
+#else
+int ojs_jit_mode = 0;               // the host engine: OJS_JIT=1|2
+#endif
 uint32_t ojs_jit_threshold = 40;
 struct jit_stats ojs_jit_stats;
 #if !(defined(KERNEL) && KERNEL)
