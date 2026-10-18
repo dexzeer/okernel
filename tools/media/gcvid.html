@@ -1,0 +1,13 @@
+<!doctype html><html><body style="margin:0;background:#000">
+<video id="v" src="v720.webm" autoplay muted width="640" height="360"></video>
+<script>
+var keep = [];
+for (var i = 0; i < 450000; i++) keep.push({ a: i, b: 'x' + i, c: [i, i + 1] });
+console.log('GCVID live heap built');
+var n = 0, junk;
+setInterval(function () {
+  for (var k = 0; k < 60000; k++) junk = { p: k, q: [k, k] };
+  n++;
+  if (n % 10 === 0) console.log('GCVID tick ' + n + ' t=' + document.getElementById('v').currentTime.toFixed(2));
+}, 50);
+</script></body></html>
