@@ -214,6 +214,71 @@ static int jit_h_closure(ojs* J, struct ojs_frame* f, jv* s, uint32_t k) {      
     s[0] = jv_from_obj(&fn->base);
     return 1;
 }
+static int jit_h_plus(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) {
+    (void)f; (void)arg;
+    jv v = to_number(J, s[0]);
+    if (v == JV_EXC) return 0;
+    s[0] = v;
+    return 1;
+}
+static int jit_h_getiter(ojs* J, struct ojs_frame* f, jv* s, uint32_t async) {
+    (void)f;
+    jv v = iter_get(J, s[0], (int)async);
+    if (v == JV_EXC) return 0;
+    s[0] = v;
+    return 1;
+}
+static int jit_h_forinstart(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) {
+    (void)f; (void)arg;
+    jv v = for_in_start(J, s[0]);
+    if (v == JV_EXC) return 0;
+    s[0] = v;
+    return 1;
+}
+static int jit_h_arguments(ojs* J, struct ojs_frame* f, jv* s, uint32_t mapped) {   // pushes into s[0]
+    jv v = make_arguments(J, f, (int)mapped);
+    if (v == JV_EXC) return 0;
+    s[0] = v;
+    return 1;
+}
+// loops over iterators: 0 = exception, 1 = a value was pushed (s[1]), 2 = finished (jump)
+static int jit_h_forofstep(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) {
+    (void)f; (void)arg;
+    jv v = iter_step_value(J, (struct iterrec*)jv_obj(s[0]));
+    if (v == JV_EXC) return 0;
+    if (v == JV_HOLE) return 2;
+    s[1] = v;
+    return 1;
+}
+static int jit_h_itervalue(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) {
+    (void)f; (void)arg;
+    jv v = iter_step_value(J, (struct iterrec*)jv_obj(s[0]));
+    if (v == JV_EXC) return 0;
+    s[1] = v == JV_HOLE ? JV_UNDEFINED : v;
+    return 1;
+}
+static int jit_h_forinnext(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) {
+    (void)f; (void)arg;
+    jv v = for_in_next(J, s[0]);
+    if (v == JV_EXC) return 0;
+    if (v == JV_HOLE) return 2;
+    s[1] = v;
+    return 1;
+}
+// typeof of an undeclared global must not throw
+static int jit_h_typeofglobal(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) {
+    (void)arg;
+    struct ftempl* t = f->t;
+    const uint8_t* ip = f->pc - 7;
+    jv nm = t->consts[rd32(ip + 1)], v;
+    uint32_t ici = rd16(ip + 5);
+    if (ic_global_get(J, t, ici, &v)) { s[0] = v; return 1; }
+    v = global_get(J, jv_str(nm), 1);
+    if (v == JV_EXC) return 0;
+    s[0] = v;
+    ic_fill_global(J, t, ici, atom_key(J, nm), 0);
+    return 1;
+}
 // GET_FIELD / GET_FIELD_KEEP / PUT_FIELD when the inline check missed: the cache through C, then the generic lookup (and fill the cache)
 static int jit_h_getfield(ojs* J, struct ojs_frame* f, jv* s, uint32_t keepflag) {
     struct ftempl* t = f->t;
@@ -848,6 +913,29 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         store_bool_cl(c, d - 1); jmp(c, NEXT_L);
         bind(c, gen);
         call_op_helper(c, ord, d, (const void*)jit_h_not, d - 1, 0);
+        break;
+    }
+    case OP_PLUS: call_op_helper(c, ord, d, (const void*)jit_h_plus, d - 1, 0); break;
+    case OP_GET_ITER: call_op_helper(c, ord, d, (const void*)jit_h_getiter, d - 1, 0); break;
+    case OP_FOR_IN_START: call_op_helper(c, ord, d, (const void*)jit_h_forinstart, d - 1, 0); break;
+    case OP_ARGUMENTS: call_op_helper(c, ord, d, (const void*)jit_h_arguments, d, ip[1]); break;
+    case OP_ITER_VALUE: call_op_helper(c, ord, d, (const void*)jit_h_itervalue, d - 1, 0); break;
+    case OP_TYPEOF_GLOBAL: call_op_helper(c, ord, d, (const void*)jit_h_typeofglobal, d, 0); break;
+    case OP_FOR_OF_STEP: case OP_FOR_IN_NEXT: {
+        int32_t off = (int32_t)rd32(ip + 1);
+        uint32_t tgt = c->an.pc_ord[c->an.ord_pc[ord] + 5 + off];
+        call_op_helper(c, ord, d, op == OP_FOR_OF_STEP ? (const void*)jit_h_forofstep : (const void*)jit_h_forinnext, d - 1, 0);
+        alu_ri(c, 7, EAX, 2); jcc(c, CC_E, tgt);
+        break;
+    }
+    case OP_THIS_FUNC: {
+        uint32_t none = new_label(c);
+        mov_rm(c, EAX, EDI, F_OFF(fn));
+        mov_ri(c, EDX, V_OBJ);
+        test_rr(c, EAX, EAX); jcc(c, CC_NE, none);
+        mov_ri(c, EDX, V_SPECIAL);              // no function: undefined (EAX is 0)
+        bind(c, none);
+        store_slot(c, ST(d), EAX, EDX);
         break;
     }
     case OP_TYPEOF: call_op_helper(c, ord, d, (const void*)jit_h_typeof, d - 1, 0); break;
