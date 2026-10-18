@@ -226,6 +226,30 @@ static void test_underrun(void) {
     free(file);
 }
 
+// play() before any data: the media time stays at 0 until data arrives, then playback starts from 0 (not from the wall time that passed)
+static void test_play_before_data(void) {
+    printf("play before data: no time passes until something can be played\n");
+    long n;
+    uint8_t* file = slurp("webm_remux_celt_fb_st.webm", &n);
+    reset_card();
+    struct meng* m = meng_new(&env);
+    int sb = meng_sb_add(m, 3);
+    meng_play(m);
+    for (int i = 0; i < 300; i++) step(m);                 // three seconds with nothing appended
+    CHECK(meng_current_time(m) == 0.0, "time ran to %.3f s with no data", meng_current_time(m));
+    feed_all(m, sb, file, n, 8000, 0);
+    meng_end_of_stream(m);
+    for (int i = 0; i < 20; i++) step(m);
+    double t = meng_current_time(m);
+    CHECK(t < 0.5, "playback started %.3f s in instead of at the beginning", t);
+    CHECK(t > 0.0, "playback did not start (%.3f s)", t);
+    for (int i = 0; i < 400 && !meng_ended(m); i++) step(m);
+    CHECK(meng_ended(m), "did not end");
+    printf("  time after data arrived %.3f s\n", t);
+    meng_free(m);
+    free(file);
+}
+
 static void test_seek_audio(void) {
     printf("seek: the audio resumes at the target\n");
     long n;
@@ -515,6 +539,7 @@ int main(int argc, char** argv) {
     test_progressive_audio();
     test_pause_resume();
     test_underrun();
+    test_play_before_data();
     test_seek_audio();
     test_video(0);
     test_video(1);
