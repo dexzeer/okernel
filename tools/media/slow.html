@@ -1,0 +1,7 @@
+<!doctype html><html><body style="margin:0;background:#000">
+<video id="v" src="v720.webm" autoplay muted width="640" height="360"></video>
+<script>
+var v = document.getElementById('v');
+['play','waiting','loadedmetadata','canplay','playing','seeking','seeked'].forEach(function (n) { v.addEventListener(n, function () { console.log('SLOW ' + n + ' t=' + v.currentTime.toFixed(2) + ' rs=' + v.readyState); }); });
+setInterval(function () { console.log('SLOW T ' + v.currentTime.toFixed(2) + ' rs=' + v.readyState + ' paused=' + v.paused); }, 1000);
+</script></body></html>

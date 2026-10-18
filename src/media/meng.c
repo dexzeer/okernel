@@ -776,6 +776,18 @@ static void clock_start(struct meng* m, int64_t at) {
     m->audio_started = 0;
 }
 
+// Start the clock at `at`, but only when there is something to play: before the container's tracks are known (nothing appended yet) the
+// media time must not run (a browser holds currentTime at 0 until data arrives). meng_poll resumes it through the same path as a stall, once
+// 0.3 s are buffered. Without this a YouTube video whose first segment took 3 s to arrive started 3 s in and dropped 60 frames per second
+// racing to catch up.
+static void clock_start_or_hold(struct meng* m, int64_t at) {
+    if (m->tracks_known) { clock_start(m, at); return; }
+    m->pos_ns = at;
+    m->clock_running = 0;
+    m->audio_started = 0;
+    m->stalled = 1;
+}
+
 static void clock_stop(struct meng* m) {
     if (m->clock_running) m->pos_ns = clock_now(m);
     m->clock_running = 0;
@@ -1657,7 +1669,7 @@ void meng_play(struct meng* m) {
     m->stalled = 0;
     int64_t at = m->clock_running ? clock_now(m) : m->pos_ns;
     if (m->a_present && !m->audio_cursor_valid) audio_seek(m, at);
-    clock_start(m, at);
+    clock_start_or_hold(m, at);
 }
 
 void meng_pause(struct meng* m) {
@@ -1677,7 +1689,7 @@ void meng_seek(struct meng* m, double seconds) {
     m->clock_running = 0;
     audio_seek(m, t);
     video_seek(m, t);
-    if (running) clock_start(m, t);
+    if (running) clock_start_or_hold(m, t);
 }
 
 void meng_set_volume(struct meng* m, double volume, int muted) {
