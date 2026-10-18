@@ -105,25 +105,7 @@ static int jit_gl_get(ojs* J, struct ftempl* t, uint32_t ici, jv* dst) {
 }
 static int jit_gl_put(ojs* J, struct ftempl* t, uint32_t ici, jv* top) { return ic_global_put(J, t, ici, *top); }
 
-// the inline cache of a GET_FIELD / PUT_FIELD site when the inline check of the compiled code failed (prototype hits, string receivers, the
-// second way ...). `slot` is the object's stack slot (for a put the value follows it); the result replaces it.
-static int jit_ic_get(ojs* J, struct ftempl* t, uint32_t ici, jv* slot) {
-    jv a = *slot, v;
-    if (jv_is_obj(a)) {
-        if (ic_get(J, t, ici, jv_obj(a), &v) != 1) return 0;
-    } else if (jv_is_str(a)) {
-        if (!ic_get_str(J, t, ici, &v)) return 0;
-    } else return 0;
-    *slot = v;
-    return 1;
-}
 static int jit_ic_define(ojs* J, struct ftempl* t, uint32_t ici, jv* slot) { return ic_define(J, t, ici, jv_obj(slot[0]), slot[1]); }
-static int jit_ic_put(ojs* J, struct ftempl* t, uint32_t ici, jv* slot) {
-    jv a = slot[0], b = slot[1], setter;
-    if (!jv_is_obj(a) || ic_put(J, t, ici, jv_obj(a), b, &setter) != 1) return 0;
-    slot[0] = b;
-    return 1;
-}
 
 // OP_CALL / OP_CALL_METHOD / OP_NEW: f->pc and f->sp are set; args points at the first argument, [-2] is the function, [-1] this / new.target
 static jv jit_call(ojs* J, struct ojs_frame* f, jv* args, int argc) {
@@ -140,6 +122,139 @@ static jv jit_new(ojs* J, struct ojs_frame* f, jv* args, int argc) {
     jv a = args[-2], b = args[-1];
     if (!is_constructor(a)) { throw_not_callable(J, a, 1); return JV_EXC; }
     return vm_call(J, a, JV_UNDEFINED, argc, args, b);
+}
+
+// ---- the slow roads of instructions the compiled code handles inline for the common types. Same contract for all of them: f->pc / f->sp are
+// set (the sp the interpreter has when the instruction starts), `s` is the lowest operand slot, the result replaces the operands; 0 =
+// an exception is pending (the caller jumps to the unwinder), 1 = done.
+
+static int jit_h_truthy(jv* p) { return to_boolean(*p); }       // JF / JT on a value that is not a bool / int: never throws, never allocates
+static int jit_h_not(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) { (void)J; (void)f; (void)arg; s[0] = jv_bool(!to_boolean(s[0])); return 1; }
+static int jit_h_typeof(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) { (void)f; (void)arg; s[0] = typeof_value(J, s[0]); return 1; }
+static int jit_h_seq(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) {         // arg 1: !==
+    (void)f;
+    int r = strict_equals(J, s[0], s[1]);
+    s[0] = jv_bool(arg ? !r : r);
+    return 1;
+}
+static int jit_h_eq(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) {          // arg 1: !=
+    (void)f;
+    int r = loose_equals(J, s[0], s[1]);
+    if (r < 0) return 0;
+    s[0] = jv_bool(arg ? !r : r);
+    return 1;
+}
+static int jit_h_arith(ojs* J, struct ojs_frame* f, jv* s, uint32_t op) {
+    (void)f;
+    jv a = s[0], b = s[1], v;
+    if (jv_is_number(a) && jv_is_number(b) && (op == OP_ADD || op == OP_SUB || op == OP_MUL || op == OP_DIV)) {
+        double x = jv_num(a), y = jv_num(b);
+        s[0] = jv_number(op == OP_ADD ? x + y : op == OP_SUB ? x - y : op == OP_MUL ? x * y : x / y);
+        return 1;
+    }
+    v = op_binary(J, (int)op, a, b);
+    if (v == JV_EXC) return 0;
+    s[0] = v;
+    return 1;
+}
+static int jit_h_getelem(ojs* J, struct ojs_frame* f, jv* s, uint32_t keep) {    // [obj, key] -> [value]  (keep: [value, obj])
+    (void)f;
+    jv a = s[0], v = get_elem(J, a, s[1]);
+    if (v == JV_EXC) return 0;
+    s[0] = v;
+    if (keep) s[1] = a;
+    return 1;
+}
+static int jit_h_putelem(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) {     // [obj, key, value] -> [value]
+    (void)arg;
+    if (put_elem(J, s[0], s[1], s[2], (f->t->flags & TF_STRICT) != 0) < 0) return 0;
+    s[0] = s[2];
+    return 1;
+}
+static int jit_h_instanceof(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) {
+    (void)f; (void)arg;
+    int r = instance_of(J, s[0], s[1]);
+    if (r < 0) return 0;
+    s[0] = jv_bool(r);
+    return 1;
+}
+static int jit_h_in(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) {
+    (void)f; (void)arg;
+    if (!jv_is_obj(s[1])) { throw_type(J, "Cannot use 'in' operator to search for a key in a non-object"); return 0; }
+    pkey k = pkey_from_value(J, s[0]);
+    if (!k) return 0;
+    int r = obj_has(J, jv_obj(s[1]), k);
+    if (r < 0) return 0;
+    s[0] = jv_bool(r);
+    return 1;
+}
+static int jit_h_object(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) {      // pushes into s[0]
+    (void)f; (void)arg;
+    struct obj* o = obj_new_plain(J);
+    if (!o) return 0;
+    s[0] = jv_from_obj(o);
+    return 1;
+}
+static int jit_h_array(ojs* J, struct ojs_frame* f, jv* s, uint32_t n) {         // the n elements start at s
+    (void)f;
+    jv v = array_from_stack(J, s, (int)n);
+    if (v == JV_EXC) return 0;
+    s[0] = v;
+    return 1;
+}
+static int jit_h_closure(ojs* J, struct ojs_frame* f, jv* s, uint32_t k) {       // pushes into s[0]
+    struct ftempl* t = f->t;
+    struct func* fn = closure_new(J, (struct ftempl*)JV_PTR(t->consts[k]), f, 0);
+    if (!fn) return 0;
+    if (fn->t->flags & (TF_ARROW | TF_METHOD | TF_FIELD_INIT | TF_STATIC_INIT)) {
+        if (t->home_slot >= 0 && (fn->t->flags & TF_ARROW)) fn->home = f->locals[t->home_slot];
+        else if (fn->t->flags & TF_ARROW) fn->home = f->fn ? f->fn->home : JV_UNDEFINED;
+        if (fn->t->flags & TF_ARROW) fn->this_val = f->this_v;
+    }
+    s[0] = jv_from_obj(&fn->base);
+    return 1;
+}
+// GET_FIELD / GET_FIELD_KEEP / PUT_FIELD when the inline check missed: the cache through C, then the generic lookup (and fill the cache)
+static int jit_h_getfield(ojs* J, struct ojs_frame* f, jv* s, uint32_t keepflag) {
+    struct ftempl* t = f->t;
+    const uint8_t* ip = f->pc - 7;                                // opcode, u32 name, u16 cache index
+    jv nm = t->consts[rd32(ip + 1)], a = s[0], v;
+    uint32_t ici = rd16(ip + 5);
+    if (jv_is_obj(a)) {
+        int ich = ic_get(J, t, ici, jv_obj(a), &v);
+        if (ich == 1) goto done;
+        if (ich == 2) { v = ojs_call_v(J, v, a, 0, 0); if (v == JV_EXC) return 0; goto done; }
+    } else if (jv_is_str(a) && ic_get_str(J, t, ici, &v)) goto done;
+    {
+        pkey k = atom_key(J, nm);
+        v = get_prop(J, a, k);
+        if (v == JV_EXC) return 0;
+        if (jv_is_obj(a)) ic_fill_get(J, t, ici, jv_obj(a), k);
+        else if (keepflag && jv_is_str(a)) ic_fill_get_str(J, t, ici, k);
+    }
+done:
+    s[0] = v;
+    if (keepflag) s[1] = a;
+    return 1;
+}
+static int jit_h_putfield(ojs* J, struct ojs_frame* f, jv* s, uint32_t arg) {    // [obj, value] -> [value]
+    (void)arg;
+    struct ftempl* t = f->t;
+    const uint8_t* ip = f->pc - 7;
+    jv nm = t->consts[rd32(ip + 1)], a = s[0], b = s[1];
+    uint32_t ici = rd16(ip + 5);
+    if (jv_is_obj(a)) {
+        jv stt;
+        int icp = ic_put(J, t, ici, jv_obj(a), b, &stt);
+        if (icp == 1) { s[0] = b; return 1; }
+        if (icp == 2) { jv rr = ojs_call_v(J, stt, a, 1, &b); if (rr == JV_EXC) return 0; s[0] = b; return 1; }
+    }
+    pkey k = atom_key(J, nm);
+    struct shape* before = jv_is_obj(a) ? jv_obj(a)->shape : 0;
+    if (put_prop(J, a, k, b, (t->flags & TF_STRICT) != 0) < 0) return 0;
+    s[0] = b;
+    if (jv_is_obj(a)) ic_fill_put(J, t, ici, jv_obj(a), k, before);
+    return 1;
 }
 
 // ---------------------------------------------------------------- analysis: stack depth of every instruction
@@ -488,6 +603,21 @@ static void call_ic_helper(struct cg* c, const void* fn, uint32_t ici, int slot_
     call_c(c, fn);
 }
 
+// call one of the jit_h_* slow roads: f->pc = the next instruction, f->sp = the stack top before the instruction, `slot_k` = the lowest operand;
+// an exception (answer 0) goes to the unwinder
+static void call_op_helper(struct cg* c, uint32_t ord, int d, const void* fn, int slot_k, uint32_t arg) {
+    mov_mi(c, EDI, F_OFF(pc), (uint32_t)(uintptr_t)(c->t->code + c->an.ord_pc[ord + 1]));
+    lea(c, EAX, EBX, (int32_t)(8 * (c->nl + (uint32_t)d)));
+    mov_mr(c, EDI, F_OFF(sp), EAX);
+    mov_mr(c, ESP, 0, ESI);
+    mov_mr(c, ESP, 4, EDI);
+    lea(c, EAX, EBX, (int32_t)(8 * (c->nl + (uint32_t)slot_k)));
+    mov_mr(c, ESP, 8, EAX);
+    mov_mi(c, ESP, 12, arg);
+    call_c(c, fn);
+    test_rr(c, EAX, EAX); jcc(c, CC_E, c->L_exc);
+}
+
 static void guard_int(struct cg* c, int d_slot_k, uint32_t slow) {            // jump to `slow` unless stack entry k holds an int
     alu_mi(c, 7, SLOT_HI(d_slot_k), (int32_t)V_INT);
     jcc(c, CC_NE, slow);
@@ -508,8 +638,8 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
     (void)J;
     const uint8_t* ip = t->code + c->an.ord_pc[ord];
     int op = ip[0];
-    uint32_t slow = 0;
-#define SLOW() (slow ? slow : (slow = step_stub(c, ord)))
+    uint32_t slow = 0, slowl = 0;       // slowl: a slow road of its own (a call into C) that replaces the interpreter step
+#define SLOW() (slowl ? slowl : slow ? slow : (slow = step_stub(c, ord)))
 #define NEXT_L (ord + 1)
     c->nnative++;
 #if !(defined(KERNEL) && KERNEL)
@@ -600,7 +730,12 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         jcc(c, CC_NE, notspecial);
         alu_mi(c, 7, SLOT_LO(d - 1), 3); jcc(c, CC_E, istrue); jmp(c, isfalse);        // only `true` is truthy among the specials
         bind(c, notspecial);
-        alu_ri(c, 7, EAX, (int32_t)V_INT); jcc(c, CC_NE, SLOW());
+        uint32_t isint = new_label(c);
+        alu_ri(c, 7, EAX, (int32_t)V_INT); jcc(c, CC_E, isint);
+        lea(c, EAX, EBX, (int32_t)(8 * (c->nl + (uint32_t)(d - 1)))); mov_mr(c, ESP, 0, EAX);       // anything else: to_boolean in C
+        call_c(c, (const void*)jit_h_truthy);
+        test_rr(c, EAX, EAX); jcc(c, CC_NE, istrue); jmp(c, isfalse);
+        bind(c, isint);
         alu_mi(c, 7, SLOT_LO(d - 1), 0); jcc(c, CC_E, isfalse);
         bind(c, istrue);
         if (jump_if_true) {
@@ -627,6 +762,8 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         break;
     }
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_BAND: case OP_BOR: case OP_BXOR: {
+        uint32_t hl = new_label(c);
+        slowl = hl;
         guard_int(c, d - 2, SLOW()); guard_int(c, d - 1, SLOW());
         mov_rm(c, EAX, SLOT_LO(d - 2));
         if (op == OP_MUL) {
@@ -638,33 +775,110 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
             if (op == OP_ADD || op == OP_SUB) jcc(c, CC_O, SLOW());
         }
         mov_mr(c, SLOT_LO(d - 2), EAX);
+        jmp(c, NEXT_L);
+        bind(c, hl);
+        call_op_helper(c, ord, d, (const void*)jit_h_arith, d - 2, (uint32_t)op);
+        slowl = 0;
         break;
     }
     case OP_SHL: case OP_SAR: case OP_SHR: {
+        uint32_t hl = new_label(c);
+        slowl = hl;
         guard_int(c, d - 2, SLOW()); guard_int(c, d - 1, SLOW());
         mov_rm(c, ECX, SLOT_LO(d - 1));
         mov_rm(c, EAX, SLOT_LO(d - 2));
         shift_cl(c, op == OP_SHL ? 4 : op == OP_SAR ? 7 : 5, EAX);
         if (op == OP_SHR) { test_rr(c, EAX, EAX); jcc(c, CC_S, SLOW()); }      // above INT32_MAX: a double
         mov_mr(c, SLOT_LO(d - 2), EAX);
+        jmp(c, NEXT_L);
+        bind(c, hl);
+        call_op_helper(c, ord, d, (const void*)jit_h_arith, d - 2, (uint32_t)op);
+        slowl = 0;
+        break;
+    }
+    case OP_DIV: {
+        call_op_helper(c, ord, d, (const void*)jit_h_arith, d - 2, (uint32_t)op);
         break;
     }
     case OP_MOD: {
+        uint32_t hl = new_label(c);
+        slowl = hl;
         guard_int(c, d - 2, SLOW()); guard_int(c, d - 1, SLOW());
         mov_rm(c, EAX, SLOT_LO(d - 2)); test_rr(c, EAX, EAX); jcc(c, CC_S, SLOW());
         mov_rm(c, ECX, SLOT_LO(d - 1)); test_rr(c, ECX, ECX); jcc(c, CC_LE, SLOW());
         mov_ri(c, EDX, 0);
         unary(c, 6, ECX);                                                  // div ecx: edx = eax % ecx
         mov_mr(c, SLOT_LO(d - 2), EDX);
+        jmp(c, NEXT_L);
+        bind(c, hl);
+        call_op_helper(c, ord, d, (const void*)jit_h_arith, d - 2, (uint32_t)op);
+        slowl = 0;
         break;
     }
     case OP_LT: case OP_LE: case OP_GT: case OP_GE: case OP_EQ: case OP_NE: case OP_SEQ: case OP_SNE: {
-        guard_int(c, d - 2, SLOW()); guard_int(c, d - 1, SLOW());
+        int eqop = (op == OP_EQ || op == OP_NE || op == OP_SEQ || op == OP_SNE);
+        uint32_t hl = eqop ? new_label(c) : 0;      // equality: the C helper for anything that is not two ints
+        if (eqop) {
+        slowl = hl;
+            guard_int(c, d - 2, SLOW()); guard_int(c, d - 1, SLOW());
+        slowl = 0;
+        } else {
+            guard_int(c, d - 2, SLOW()); guard_int(c, d - 1, SLOW());
+        }
         mov_rm(c, EAX, SLOT_LO(d - 2));
         alu_rm(c, 0x3B, EAX, SLOT_LO(d - 1));
         int cc = op == OP_LT ? CC_L : op == OP_LE ? CC_LE : op == OP_GT ? CC_G : op == OP_GE ? CC_GE : (op == OP_EQ || op == OP_SEQ) ? CC_E : CC_NE;
         setcc(c, cc, ECX);
         store_bool_cl(c, d - 2);
+        if (hl) {
+            jmp(c, NEXT_L);
+            bind(c, hl);
+            call_op_helper(c, ord, d, (op == OP_EQ || op == OP_NE) ? (const void*)jit_h_eq : (const void*)jit_h_seq, d - 2, (op == OP_NE || op == OP_SNE));
+        }
+        break;
+    }
+    case OP_NOT: {
+        uint32_t notsp = new_label(c), gen = new_label(c);
+        alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_SPECIAL); jcc(c, CC_NE, notsp);
+        alu_mi(c, 7, SLOT_LO(d - 1), 3); setcc(c, CC_NE, ECX);
+        store_bool_cl(c, d - 1); jmp(c, NEXT_L);
+        bind(c, notsp);
+        alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_INT); jcc(c, CC_NE, gen);
+        alu_mi(c, 7, SLOT_LO(d - 1), 0); setcc(c, CC_E, ECX);
+        store_bool_cl(c, d - 1); jmp(c, NEXT_L);
+        bind(c, gen);
+        call_op_helper(c, ord, d, (const void*)jit_h_not, d - 1, 0);
+        break;
+    }
+    case OP_TYPEOF: call_op_helper(c, ord, d, (const void*)jit_h_typeof, d - 1, 0); break;
+    case OP_INSTANCEOF: call_op_helper(c, ord, d, (const void*)jit_h_instanceof, d - 2, 0); break;
+    case OP_IN: call_op_helper(c, ord, d, (const void*)jit_h_in, d - 2, 0); break;
+    case OP_OBJECT: call_op_helper(c, ord, d, (const void*)jit_h_object, d, 0); break;
+    case OP_ARRAY: { uint32_t n = rd16(ip + 1); call_op_helper(c, ord, d, (const void*)jit_h_array, d - (int)n, n); break; }
+    case OP_CLOSURE: call_op_helper(c, ord, d, (const void*)jit_h_closure, d, rd32(ip + 1)); break;
+    case OP_TO_PROPKEY: {
+        alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_INT); jcc(c, CC_E, NEXT_L);
+        alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_STR); jcc(c, CC_E, NEXT_L);
+        alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_SYM); jcc(c, CC_NE, SLOW());
+        break;
+    }
+    case OP_GET_UPV_CHK: case OP_PUT_UPV_CHK: {         // u16 slot, u32 name: a hole is a binding in its temporal dead zone
+        uint32_t i = rd16(ip + 1);
+        mov_rm(c, EAX, EDI, F_OFF(fn));
+        mov_rm(c, EAX, EAX, (int32_t)offsetof(struct func, upv));
+        mov_rm(c, EAX, EAX, (int32_t)(4 * i));
+        mov_rm(c, EAX, EAX, (int32_t)offsetof(struct upval, loc));
+        uint32_t ok = new_label(c);
+        alu_mi(c, 7, EAX, 4, (int32_t)V_SPECIAL); jcc(c, CC_NE, ok);
+        alu_mi(c, 7, EAX, 0, 4); jcc(c, CC_E, SLOW());
+        bind(c, ok);
+        if (op == OP_GET_UPV_CHK) {
+            mov_rm(c, ECX, EAX, 0); mov_mr(c, SLOT_LO(d), ECX);
+            mov_rm(c, ECX, EAX, 4); mov_mr(c, SLOT_HI(d), ECX);
+        } else {
+            mov_rm(c, ECX, SLOT_LO(d - 1)); mov_mr(c, EAX, 0, ECX);
+            mov_rm(c, ECX, SLOT_HI(d - 1)); mov_mr(c, EAX, 4, ECX);
+        }
         break;
     }
     case OP_IS_UNDEF: {
@@ -757,8 +971,11 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         CPY(ST(O), ST(V));
         break;
     }
+    case OP_GET_ELEM_KEEP: call_op_helper(c, ord, d, (const void*)jit_h_getelem, d - 2, 1); break;
     case OP_GET_ELEM: {                 // [obj, key] -> [value]: an element of a dense array
         int O = d - 2, K = d - 1;
+        uint32_t hl = new_label(c);
+        slowl = hl;
         guard_int(c, K, SLOW());
         alu_mi(c, 7, SLOT_HI(O), (int32_t)V_OBJ); jcc(c, CC_NE, SLOW());
         mov_rm(c, EAX, SLOT_LO(O));
@@ -774,10 +991,16 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         alu_ri(c, 7, EAX, 4); jcc(c, CC_E, SLOW());                      // a hole: the prototype chain may have the element
         bind(c, ok);
         mov_mr(c, SLOT_LO(O), EAX); mov_mr(c, SLOT_HI(O), EDX);
+        jmp(c, NEXT_L);
+        bind(c, hl);
+        call_op_helper(c, ord, d, (const void*)jit_h_getelem, d - 2, 0);
+        slowl = 0;
         break;
     }
     case OP_PUT_ELEM: {                 // [obj, key, value] -> [value]: overwriting an element of a dense array
         int O = d - 3, K = d - 2, V = d - 1;
+        uint32_t hl = new_label(c);
+        slowl = hl;
         guard_int(c, K, SLOW());
         alu_mi(c, 7, SLOT_HI(O), (int32_t)V_OBJ); jcc(c, CC_NE, SLOW());
         mov_rm(c, EAX, SLOT_LO(O));
@@ -795,6 +1018,10 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         mov_rm(c, ECX, SLOT_LO(V)); mov_mr(c, EAX, 0, ECX);
         mov_rm(c, ECX, SLOT_HI(V)); mov_mr(c, EAX, 4, ECX);
         CPY(ST(O), ST(V));
+        jmp(c, NEXT_L);
+        bind(c, hl);
+        call_op_helper(c, ord, d, (const void*)jit_h_putelem, d - 3, 0);
+        slowl = 0;
         break;
     }
     case OP_DEFINE_FIELD: {             // [obj, v] -> [obj]
@@ -919,12 +1146,14 @@ static int jit_compile_(ojs* J, struct ftempl* t) {
         uint32_t o = c.stub_list[i];
         int dd = c.an.depth[o];
         bind(&c, c.stub[o]);
-        if (c.skind[o] == 1) {          // GET_FIELD: the cache through C first
-            call_ic_helper(&c, (const void*)jit_ic_get, rd16(t->code + c.an.ord_pc[o] + 5), dd - 1);
-            test_rr(&c, EAX, EAX); jcc(&c, CC_NE, o + 1);
+        if (c.skind[o] == 1) {          // GET_FIELD: the cache through C, then the generic lookup
+            call_op_helper(&c, o, dd, (const void*)jit_h_getfield, dd - 1, t->code[c.an.ord_pc[o]] == OP_GET_FIELD_KEEP);
+            jmp(&c, o + 1);
+            continue;
         } else if (c.skind[o] == 2) {   // PUT_FIELD
-            call_ic_helper(&c, (const void*)jit_ic_put, rd16(t->code + c.an.ord_pc[o] + 5), dd - 2);
-            test_rr(&c, EAX, EAX); jcc(&c, CC_NE, o + 1);
+            call_op_helper(&c, o, dd, (const void*)jit_h_putfield, dd - 2, 0);
+            jmp(&c, o + 1);
+            continue;
         }
         gen_step(&c, o, dd);
     }
