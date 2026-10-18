@@ -13,6 +13,7 @@
 
 struct jitcode {
     uint8_t* mem;               // the executable block
+    void* pool;                 // the page pool it was carved from
     size_t size;
     void* entry;                // jv entry(ojs* J, struct ojs_frame* f, void* target): runs the frame from `target` to the end
     void* start;                // native address of the first instruction
