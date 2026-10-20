@@ -423,6 +423,7 @@ struct oreq {
     int bi, tab;               // window + tab index (kept in sync on close)
     struct wdoc* doc;          // document a resource belongs to (NULL = main)
     int sub_id;                // wdoc resource id, -1 = the main document
+    int rk;                    // WDOC_RK_* kind of the resource, -1 = a document (Sec-Fetch-Dest / Mode)
     int https;
     int redirects, retried;
     int cors;                  // script request (fetch/XHR): send Origin cross-origin
@@ -473,6 +474,7 @@ static struct oreq* req_new(int bi, int tab, struct wdoc* doc, int sub_id, const
         q->tab = tab;
         q->doc = doc;
         q->sub_id = sub_id;
+        q->rk = (sub_id >= 0 && doc) ? wdoc_res_kind(doc, sub_id) : -1;
         q->https = url_is_https(url);
         q->redirects = q->retried = 0;
         q->cors = 0;
@@ -521,10 +523,124 @@ static int header_forbidden(const char* n, int nl) {
     return 0;
 }
 
+// ---- the metadata every browser sends with a request --------------------------------------------------------------
+// Referer (default policy strict-origin-when-cross-origin: full URL to the same origin, the origin alone elsewhere, nothing on an
+// https -> http downgrade), Fetch Metadata (Sec-Fetch-Dest/Mode/Site/User, to https and loopback only), Upgrade-Insecure-Requests on
+// navigations and Origin on unsafe methods. Standard web-platform behaviour of every current browser; no client hints, no brand.
+
+static const char* site_tail(const char* host) {            // the last two labels (eTLD+1 approximation); an IP stays whole
+    const char *last = 0, *prev = 0;
+    int digits = 1;
+    for (const char* p = host; *p; p++) {
+        if (*p == '.') { prev = last; last = p; }
+        if (!(*p >= '0' && *p <= '9') && *p != '.') digits = 0;
+    }
+    if (digits) return host;
+    return prev ? prev + 1 : host;
+}
+
+static const char* fetch_site(const char* from, const char* target) {
+    char oa[256], ob[256];
+    url_origin(from, oa, sizeof oa);
+    url_origin(target, ob, sizeof ob);
+    if (oa[0] && !strcmp(oa, ob)) return "same-origin";
+    char ha[128], hb[128], sa[16], sb[16];
+    if (wurl_host(from, ha, sizeof ha) > 0 && wurl_host(target, hb, sizeof hb) > 0) {
+        wurl_scheme(from, sa, sizeof sa);
+        wurl_scheme(target, sb, sizeof sb);
+        if (!strcmp(sa, sb) && !strcmp(site_tail(ha), site_tail(hb))) return "same-site";
+    }
+    return "cross-site";
+}
+
+static int url_trustworthy(const char* u) {                 // https, or http to the loopback host
+    if (url_is_https(u)) return 1;
+    char h[128];
+    if (wurl_host(u, h, sizeof h) <= 0) return 0;
+    return !strcmp(h, "localhost") || !strcmp(h, "127.0.0.1") || !strcmp(h, "[::1]");
+}
+
+static int make_referer(const char* from, const char* target, char* out, int cap) {
+    if (!from || !from[0] || !url_is_http(from) || !target) return 0;
+    if (url_is_https(from) && !url_is_https(target)) return 0;
+    char oa[256], ob[256];
+    url_origin(from, oa, sizeof oa);
+    url_origin(target, ob, sizeof ob);
+    if (!oa[0]) return 0;
+    int len = 0;
+    while (from[len] && from[len] != '#') len++;
+    if (oa[0] && !strcmp(oa, ob) && len <= 4000 && len < cap - 1) {
+        memcpy(out, from, (size_t)len);
+        out[len] = 0;
+        return len;
+    }
+    int ol = (int)strlen(oa);
+    if (ol + 2 > cap) return 0;
+    memcpy(out, oa, (size_t)ol);
+    out[ol] = '/';
+    out[ol + 1] = 0;
+    return ol + 1;
+}
+
+static int has_hdr(const char* buf, int n, const char* name) {   // a "Name:" line in the block (case-insensitive)
+    int ln = (int)strlen(name);
+    for (int i = 0; i + ln < n; ) {
+        int k = 0;
+        while (k < ln && lower((unsigned char)buf[i + k]) == lower((unsigned char)name[k])) k++;
+        if (k == ln && buf[i + ln] == ':') return 1;
+        while (i < n && buf[i] != '\n') i++;
+        i++;
+    }
+    return 0;
+}
+
+static void hput(char* buf, int* np, int cap, const char* a, const char* b) {
+    int la = (int)strlen(a), lb = b ? (int)strlen(b) : 0;
+    if (*np + la + lb + 2 >= cap) return;
+    memcpy(buf + *np, a, (size_t)la);
+    if (lb) memcpy(buf + *np + la, b, (size_t)lb);
+    *np += la + lb;
+    buf[(*np)++] = '\r';
+    buf[(*np)++] = '\n';
+}
+
+static void add_request_meta(struct oreq* q, const char* top, const char* method, char* buf, int* np, int cap) {
+    int nav = q->rk < 0 && !q->speculative;
+    struct okai_tab* T = (q->bi >= 0 && q->bi < MAX_OKAIS && q->tab >= 0 && q->tab < OKAI_SLOTS) ? &okais[q->bi].tabs[q->tab] : 0;
+    const char* from = 0;
+    int user = 0, frame = 0;
+    if (nav) {
+        if (T) {
+            from = T->nav_from[0] ? T->nav_from : 0;
+            user = T->nav_user;
+            frame = T->is_frame;
+            if (!from && frame && T->parent_slot >= 0 && T->parent_slot < OKAI_SLOTS) from = okais[q->bi].tabs[T->parent_slot].url;
+        }
+    } else from = q->doc ? wdoc_url(q->doc) : top;
+    static char ref[4200];
+    if (!has_hdr(buf, *np, "Referer") && make_referer(from, q->url, ref, sizeof ref)) hput(buf, np, cap, "Referer: ", ref);
+    if (url_trustworthy(q->url)) {
+        const char* dest = nav ? (frame ? "iframe" : "document") : q->rk == WDOC_RK_CSS ? "style" : q->rk == WDOC_RK_IMG ? "image"
+                         : q->rk == WDOC_RK_SCRIPT ? "script" : "empty";
+        const char* mode = nav ? "navigate" : q->rk == WDOC_RK_REQ ? "cors" : (q->rk == WDOC_RK_SCRIPT && q->cors) ? "cors" : "no-cors";
+        const char* site = (nav && !from) ? "none" : fetch_site(from ? from : q->url, q->url);
+        hput(buf, np, cap, "Sec-Fetch-Dest: ", dest);
+        hput(buf, np, cap, "Sec-Fetch-Mode: ", mode);
+        hput(buf, np, cap, "Sec-Fetch-Site: ", site);
+        if (nav && user) hput(buf, np, cap, "Sec-Fetch-User: ", "?1");
+    }
+    if (nav) hput(buf, np, cap, "Upgrade-Insecure-Requests: ", "1");
+    else if (from && method && strcmp(method, "GET") && strcmp(method, "HEAD") && !has_hdr(buf, *np, "Origin")) {
+        char og[256];
+        url_origin(from, og, sizeof og);
+        if (og[0]) hput(buf, np, cap, "Origin: ", og);
+    }
+}
+
 static int req_fetch(struct oreq* q, const char* top) {
     char host[128];
     static char path[OKAI_URL_LEN];
-    static char cookie_hdr[NET_EXTRA_MAX + 8192];
+    static char cookie_hdr[NET_EXTRA_MAX + 16384];
     if (wurl_host(q->url, host, sizeof host) <= 0) return -1;
     if (wurl_path(q->url, path, sizeof path) <= 0) { path[0] = '/'; path[1] = 0; }
     int port = wurl_port(q->url);
@@ -536,7 +652,7 @@ static int req_fetch(struct oreq* q, const char* top) {
     o.extra = 0;
     int n = 0;
     memcpy(cookie_hdr, "Cookie: ", 8);
-    int cl = wcookie_header(q->url, top, cookie_hdr + 8, (int)sizeof cookie_hdr - 2400);
+    int cl = wcookie_header(q->url, top, cookie_hdr + 8, (int)sizeof cookie_hdr - 7000);
     if (cl > 0) {
         n = 8 + cl;
         cookie_hdr[n++] = '\r';
@@ -604,6 +720,7 @@ static int req_fetch(struct oreq* q, const char* top) {
             cookie_hdr[n++] = '\n';
         }
     }
+    add_request_meta(q, top, o.method ? o.method : "GET", cookie_hdr, &n, (int)sizeof cookie_hdr - 8);
     cookie_hdr[n] = 0;
     if (n > 0) o.extra = cookie_hdr;
     o.cache = (q->speculative || (q->doc != 0 && q->sub_id >= 0)) && !o.method && !o.body;       // sub-resources, not documents
@@ -640,6 +757,7 @@ static int preload_emit(void* c, const char* url, int kind) {
     tmp.h = -1;
     tmp.sub_id = -1;
     tmp.speculative = 1;
+    tmp.rk = kind == PSCAN_CSS ? WDOC_RK_CSS : kind == PSCAN_SCRIPT ? WDOC_RK_SCRIPT : WDOC_RK_IMG;
     scopy(tmp.url, url, OKAI_URL_LEN);
     int r = req_fetch(&tmp, P->top);
     if (r == -2) { P->blocked = 1; return 1; }          // no room in the fetch engine right now: offer it again later
@@ -2146,6 +2264,11 @@ static void sub_landed(struct okai_tab* T, int kind) {
 static void set_focus(int id, struct okai_tab* T, int node);
 static void submit_form_node(int id, struct okai_tab* T, int form, int submitter, int fire_event);
 static void navigate_ex(int id, const char* url, int push);
+// who starts the next navigation (consumed by navigate_slot): the page a link / form / script came from, and whether a user
+// gesture did it. Nothing set = typed address, reload or history (Sec-Fetch-Site: none, no Referer).
+static char nav_ctx_from[OKAI_URL_LEN];
+static int nav_ctx_user;
+static void nav_ctx_set(const char* from, int user) { scopy(nav_ctx_from, from ? from : "", sizeof nav_ctx_from); nav_ctx_user = user; }
 static void navigate_slot(int id, int slot, const char* url, int push);
 
 // ---- window.postMessage between frames ----
@@ -2257,6 +2380,7 @@ static void js_apply(int id, int tab, int flags) {
                 }
             } else {
                 serial_printf("[okai] script navigation%s -> %s\n", frame ? " (frame)" : "", u);
+                nav_ctx_set(T->url, 0);
                 navigate_slot(id, tab, u, !rep && !frame);
             }
         }
@@ -2760,6 +2884,9 @@ static void navigate_slot(int id, int slot, const char* url, int push) {
     char norm[OKAI_URL_LEN];
     okai_normalize_https(url, norm, OKAI_URL_LEN);
     scopy(T->url, norm, OKAI_URL_LEN);
+    scopy(T->nav_from, nav_ctx_from, OKAI_URL_LEN);
+    T->nav_user = nav_ctx_user;
+    nav_ctx_set(0, 0);
     if (push && !frame) {
         if (T->history_count > 0 && T->history_pos < T->history_count - 1)
             T->history_count = T->history_pos + 1;    // drop forward history
@@ -3005,6 +3132,7 @@ static void submit_form_node(int id, struct okai_tab* T, int form, int submitter
         static char referer[OKAI_URL_LEN];
         scopy(referer, T->url, sizeof referer);
         serial_printf("[okai] submit form (POST, %d bytes) -> %s\n", ql, action);
+        nav_ctx_set(T->url, 1);
         navigate_slot(id, slot_of(&okais[id], T), action, 1);                       // resets the tab's load state (and any older POST body)
         T->post_body = (char*)kmalloc((size_t)ql + 1);
         if (T->post_body) {
@@ -3021,6 +3149,7 @@ static void submit_form_node(int id, struct okai_tab* T, int form, int submitter
     for (int i = 0; q[i] && ul < OKAI_URL_LEN - 1; i++) url[ul++] = q[i];
     url[ul] = 0;
     serial_printf("[okai] submit form -> %s\n", url);
+    nav_ctx_set(T->url, 1);
     navigate_slot(id, slot_of(&okais[id], T), url, 1);
 }
 
@@ -3213,6 +3342,7 @@ static int tab_click(int id, int slot, int x, int y, int mx, int my) {
                 return 1;
             }
         }
+        nav_ctx_set(T->url, 1);
         navigate_slot(id, slot, hit.href, !slot_is_frame(slot));
         return 1;
     }

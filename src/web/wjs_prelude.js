@@ -4121,8 +4121,8 @@ function idlGet(proto, k, fn) {
     Object.defineProperty(proto, k, { get: g, set: undefined, enumerable: true, configurable: true });
 }
 const navData = {
-    userAgent: 'Mozilla/5.0 (X11; okernel i686) AppleWebKit/537.36 (KHTML, like Gecko) okai/0.6 Safari/537.36',
-    appName: 'Netscape', appCodeName: 'Mozilla', appVersion: '5.0 (X11; okernel i686)', product: 'Gecko', productSub: '20030107',
+    userAgent: W.userAgent(),     // the same string the HTTP User-Agent header carries (src/web/wua.h)
+    appName: 'Netscape', appCodeName: 'Mozilla', appVersion: W.userAgent().replace(/^Mozilla\//, ''), product: 'Gecko', productSub: '20030107',
     vendor: 'okernel', vendorSub: '', platform: 'Linux i686', language: 'en-US', languages: ['en-US', 'en'],
     cookieEnabled: true, onLine: true, doNotTrack: '1', hardwareConcurrency: 1, maxTouchPoints: 0, deviceMemory: 1,
     pdfViewerEnabled: false, webdriver: false, plugins: [], mimeTypes: [],
