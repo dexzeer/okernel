@@ -1,0 +1,12 @@
+<!DOCTYPE html>
+<html><body><p>a worker global exposes the ECMAScript intrinsics as properties (reCAPTCHA: g.Math == Math)</p>
+<script>
+var src = "var r = [typeof globalThis, typeof self, self.Math == Math, globalThis.Math == Math, self.JSON === JSON, typeof self.Object, Object.keys(self).indexOf('Math') < 0];" +
+          "postMessage(r);";
+var w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+w.onmessage = function (e) {
+    var want = JSON.stringify(['object', 'object', true, true, true, 'function', true]);
+    console.log('RESULT ' + (JSON.stringify(e.data) === want ? 'ALLPASS' : 'FAIL ' + JSON.stringify(e.data)));
+};
+w.onerror = function (e) { console.log('RESULT FAIL error ' + e.message); };
+</script></body></html>

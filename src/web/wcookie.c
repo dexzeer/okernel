@@ -96,7 +96,7 @@ static long long parse_http_date(const char* s, int n) {
     long long y = year - (month < 2);
     long long era = (y >= 0 ? y : y - 399) / 400;
     long long yoe = y - era * 400;
-    int mp = (month + 9) % 12;
+    int mp = (month + 10) % 12;   // month is 0-based here (Mar = 0 in the shifted year)
     long long doy = (153 * mp + 2) / 5 + day - 1;
     long long doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     long long days = era * 146097 + doe - 719468;

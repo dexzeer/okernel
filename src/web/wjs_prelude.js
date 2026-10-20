@@ -5155,6 +5155,8 @@ function makeWorkerScope(Kind, abs, name, hooks) {
     const def = (k, v) => Object.defineProperty(scope, k, { value: v, writable: true, configurable: true, enumerable: true });
     for (const k of WORKER_HIDE) def(k, undefined);
     for (const k of WORKER_SHARE) if (G[k] !== undefined) def(k, G[k]);
+    // self.Math, globalThis.JSON ... are real properties of a worker global (reCAPTCHA finds its global with `g.Math == Math`)
+    for (const k of WORKER_INTRINSICS) if (k !== 'NaN' && k !== 'Infinity' && k !== 'undefined' && G[k] !== undefined) hidden(scope, k, G[k]);
     def('self', scope); def('globalThis', scope); def('name', name || ''); def('location', loc); def('navigator', nav);
     def('Worker', G.Worker); def('SharedWorker', undefined);
     def('WorkerGlobalScope', WorkerGlobalScope); def(Kind.name, Kind);
@@ -6250,6 +6252,8 @@ for (const k of Object.keys(win)) {
     if (win[k] === undefined) continue;
     Object.defineProperty(G, k, { value: win[k], writable: true, configurable: true, enumerable: false });
 }
+// window.location = url (and a bare `location = url`) navigates: [PutForwards=href]. go-away's js-refresh step is exactly this.
+accessor(G, 'location', () => location, v => { location.href = v; });
 accessor(G, 'innerWidth', () => W.view()[0]);
 accessor(G, 'innerHeight', () => W.view()[1]);
 accessor(G, 'outerWidth', () => W.view()[0]);
