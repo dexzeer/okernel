@@ -138,11 +138,15 @@ web-tests:
 	$(WEB_HOST_CC) -o build-host/t_webcss tests/web/test_css.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_webcss | tail -n 2
 	$(WEB_HOST_CC) -o build-host/t_font tests/web/test_font.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_font | tail -n 2
 	$(WEB_HOST_CC) -o build-host/t_lazy tests/web/test_lazy.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_lazy | tail -n 2
+	gcc -m32 -O1 -Isrc -o build-host/t_cookie tests/web/test_cookie.c src/web/wcookie.c src/web/wurl.c && ./build-host/t_cookie | tail -n 1
 	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_hpack tests/test_hpack.c && ASAN_OPTIONS=detect_leaks=1 ./build-host/t_hpack | tail -n 1
 	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_h2 tests/test_h2.c && ASAN_OPTIONS=detect_leaks=1 ./build-host/t_h2 | tail -n 1
 	$(WEB_HOST_CC) -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_pscan tests/web/test_pscan.c src/web/pscan.c src/web/wurl.c && ./build-host/t_pscan | tail -n 1
 	./build-host/wbrowse tests/web/js/basic.html 800 600 build-host/js-basic.ppm 3 | grep RESULT
 	./build-host/wbrowse tests/web/js/fragparse.html 640 400 build-host/js-frag.ppm 3 | grep 'RESULT ALLPASS'
+	./build-host/wbrowse tests/web/js/loc_assign_window.html 400 300 build-host/js-locw.ppm 3 | grep 'script navigation -> file:///verify?a=1&b=2'
+	./build-host/wbrowse tests/web/js/loc_assign_bare.html 400 300 build-host/js-locb.ppm 3 | grep 'script navigation -> file:///verify?a=1&b=2'
+	./build-host/wbrowse tests/web/js/worker_global.html 400 200 build-host/js-wg.ppm 4 | grep 'RESULT ALLPASS'
 	./build-host/wbrowse tests/web/js/tostr.html 640 400 build-host/js-tostr.ppm 3 | grep 'RESULT ALLPASS'
 	./build-host/wbrowse tests/web/js/observers.html 800 600 build-host/js-obs.ppm 4 | grep 'RESULT ALLPASS'
 	./build-host/wbrowse tests/web/js/ce_import.html 800 600 build-host/js-ce.ppm 3 | grep 'RESULT ALLPASS'
