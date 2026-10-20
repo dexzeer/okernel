@@ -146,6 +146,7 @@ web-tests:
 	./build-host/wbrowse tests/web/js/fragparse.html 640 400 build-host/js-frag.ppm 3 | grep 'RESULT ALLPASS'
 	./build-host/wbrowse tests/web/js/loc_assign_window.html 400 300 build-host/js-locw.ppm 3 | grep 'script navigation -> file:///verify?a=1&b=2'
 	./build-host/wbrowse tests/web/js/loc_assign_bare.html 400 300 build-host/js-locb.ppm 3 | grep 'script navigation -> file:///verify?a=1&b=2'
+	./build-host/wbrowse tests/web/js/worker_global.html 400 200 build-host/js-wg.ppm 4 | grep 'RESULT ALLPASS'
 	./build-host/wbrowse tests/web/js/tostr.html 640 400 build-host/js-tostr.ppm 3 | grep 'RESULT ALLPASS'
 	./build-host/wbrowse tests/web/js/observers.html 800 600 build-host/js-obs.ppm 4 | grep 'RESULT ALLPASS'
 	./build-host/wbrowse tests/web/js/ce_import.html 800 600 build-host/js-ce.ppm 3 | grep 'RESULT ALLPASS'
