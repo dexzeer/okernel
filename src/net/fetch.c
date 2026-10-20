@@ -19,6 +19,7 @@
 #include "../crypto/tls_client.h"
 #include "fcache.h"
 #include "h2.h"
+#include "../web/wua.h"
 
 extern uint32_t tick_count;   // 100 Hz
 
@@ -870,7 +871,8 @@ static int begin_request(const char* host, const char* path, uint16_t port, int 
         pb[k] = 0;
         put(s->req, &n, cap, pb);
     }
-    put(s->req, &n, cap, "\r\nUser-Agent: okernel/0.4\r\n");
+    put(s->req, &n, cap, "\r\nUser-Agent: " OKAI_USER_AGENT "\r\n");
+    put(s->req, &n, cap, "Accept-Language: " OKAI_ACCEPT_LANGUAGE "\r\n");
     if (!(o && o->own_accept)) put(s->req, &n, cap, o && o->accept_html ? NET_ACCEPT_HTML : "Accept: */*\r\n");
     if (o && o->gzip) put(s->req, &n, cap, "Accept-Encoding: gzip\r\n");
     if (o && o->extra) put(s->req, &n, cap, o->extra);
