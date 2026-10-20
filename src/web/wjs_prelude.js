@@ -6250,6 +6250,8 @@ for (const k of Object.keys(win)) {
     if (win[k] === undefined) continue;
     Object.defineProperty(G, k, { value: win[k], writable: true, configurable: true, enumerable: false });
 }
+// window.location = url (and a bare `location = url`) navigates: [PutForwards=href]. go-away's js-refresh step is exactly this.
+accessor(G, 'location', () => location, v => { location.href = v; });
 accessor(G, 'innerWidth', () => W.view()[0]);
 accessor(G, 'innerHeight', () => W.view()[1]);
 accessor(G, 'outerWidth', () => W.view()[0]);
