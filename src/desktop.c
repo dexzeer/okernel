@@ -912,11 +912,6 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, ip_buf);
         window_puts(win_id, "\n");
     }
-    else if (str_eq(cmd_buf, "fetchhdr")) {
-        // Log the head of every request that leaves (serial: [fetch-head]); cookies reduced to their size
-        fetch_log_heads = !fetch_log_heads;
-        window_puts(win_id, fetch_log_heads ? "Request-head logging on (serial).\n" : "Request-head logging off.\n");
-    }
     else if (str_eq(cmd_buf, "vp9par")) {
         // VP9 tile columns and loop filter on several CPUs (needs -smp 3 or more); `vp9par off` / `vp9par on`
         if (str_eq(args, "off")) meng_set_parallel(0);

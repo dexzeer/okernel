@@ -19,7 +19,6 @@
 #include "../crypto/tls_client.h"
 #include "fcache.h"
 #include "h2.h"
-#include "../web/wua.h"
 
 extern uint32_t tick_count;   // 100 Hz
 
@@ -758,41 +757,6 @@ void fetch_poll(void) {
 
 // ---- public API ----------------------------------------------------------------------
 
-// Does the "Name: value\r\n..." block carry a header of this (lowercase) name?
-static int extra_has(const char* extra, const char* lname) {
-    int ln = (int)strlen(lname);
-    for (const char* p = extra; *p;) {
-        int i = 0;
-        while (i < ln && p[i] && (p[i] | 32) == lname[i]) i++;
-        if (i == ln && p[ln] == ':') return 1;
-        while (*p && *p != '\n') p++;
-        if (*p) p++;
-    }
-    return 0;
-}
-
-// Debug (shell `fetchhdr`): log every request head that leaves, Cookie values reduced to their length.
-int fetch_log_heads;
-static void log_head(const uint8_t* req, uint32_t len) {
-    uint32_t i = 0;
-    while (i < len) {
-        uint32_t e = i;
-        while (e < len && req[e] != '\n') e++;
-        uint32_t le = e > i && req[e - 1] == '\r' ? e - 1 : e;
-        if (le == i) break;                                   // blank line: end of the head
-        if (le - i > 7 && (req[i] | 32) == 'c' && (req[i + 1] | 32) == 'o' && (req[i + 2] | 32) == 'o' && req[i + 6] == 'e' && req[i + 7] == ':')
-            serial_printf("[fetch-head]   Cookie: <%u bytes>\n", (unsigned)(le - i - 8));
-        else {
-            char ln[304];
-            uint32_t l = le - i > 300 ? 300 : le - i;
-            memcpy(ln, req + i, l);
-            ln[l] = 0;
-            serial_printf("[fetch-head]   %s\n", ln);
-        }
-        i = e + 1;
-    }
-}
-
 static void put(uint8_t* b, uint32_t* n, uint32_t cap, const char* s) {
     while (*s && *n < cap) b[(*n)++] = (uint8_t)*s++;
 }
@@ -906,8 +870,7 @@ static int begin_request(const char* host, const char* path, uint16_t port, int 
         pb[k] = 0;
         put(s->req, &n, cap, pb);
     }
-    put(s->req, &n, cap, "\r\nUser-Agent: " OKAI_USER_AGENT "\r\n");
-    if (!(o && o->extra && extra_has(o->extra, "accept-language"))) put(s->req, &n, cap, "Accept-Language: " OKAI_ACCEPT_LANGUAGE "\r\n");
+    put(s->req, &n, cap, "\r\nUser-Agent: okernel/0.4\r\n");
     if (!(o && o->own_accept)) put(s->req, &n, cap, o && o->accept_html ? NET_ACCEPT_HTML : "Accept: */*\r\n");
     if (o && o->gzip) put(s->req, &n, cap, "Accept-Encoding: gzip\r\n");
     if (o && o->extra) put(s->req, &n, cap, o->extra);
@@ -929,7 +892,6 @@ static int begin_request(const char* host, const char* path, uint16_t port, int 
     put(s->req, &n, cap, "\r\n");
     if (blen && n + blen <= cap) { memcpy(s->req + n, o->body, blen); n += blen; }
     s->req_len = n;
-    if (fetch_log_heads) { serial_printf("[fetch-head] %s\n", host); log_head(s->req, n); }
     {   // log name: host + path prefix
         int k = 0;
         for (const char* p = host; *p && k < 60; p++) s->what[k++] = *p;
