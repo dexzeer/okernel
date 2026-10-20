@@ -41,7 +41,7 @@ jv global_get(ojs* J, struct str* name, int typeof_mode) {
     }
     int h = obj_has(J, g, k);
     if (h < 0) return JV_EXC;
-    if (!h) { OJS_MISS(J, g, k, typeof_mode ? "typeof" : "ident"); return typeof_mode ? JV_UNDEFINED : not_defined(J, name); }
+    if (!h) return typeof_mode ? JV_UNDEFINED : not_defined(J, name);
     return obj_get(J, g, k, jv_from_obj(g));
 }
 

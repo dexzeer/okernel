@@ -58,6 +58,5 @@ void  fetch_close_idle(void);
 // 0 if there is nothing to do (cached / already in flight), -1 if there is no spare capacity right now (try again later).
 int   fetch_prefetch(const char* host, const char* path, uint16_t port, int https, const struct fetch_opts* o);
 void  fetch_cache_clear(void);
-extern int fetch_log_heads;           // debug: log request heads (shell `fetchhdr`)
 
 #endif

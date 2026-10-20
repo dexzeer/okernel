@@ -88,8 +88,6 @@ struct okai_tab {
     char* post_body;
     int post_len;
     char post_ref[OKAI_URL_LEN];  // page the form was on (Referer / Origin of the POST)
-    char nav_from[OKAI_URL_LEN];  // page that started the pending navigation (Referer, Sec-Fetch-Site); empty = typed address, reload, history
-    int nav_user;                 // ...by a user gesture (Sec-Fetch-User: ?1)
     // iframe documents live in slots >= OKAI_MAX_TABS (never shifted by tab closes); the page pipeline treats them like tabs
     int is_frame, frame_used;
     int top_tab;          // visible tab whose page this frame belongs to

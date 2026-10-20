@@ -17,7 +17,6 @@
 #include "wurl.h"
 #include "css.h"
 #include "wcookie.h"
-#include "wua.h"
 
 #if !(defined(KERNEL) && KERNEL)
 #include <time.h>
@@ -335,7 +334,6 @@ NATIVE(n_resolve) {
     ojs_free_cstring(ctx, (char*)s);
     return r;
 }
-NATIVE(n_user_agent) { (void)this_val; (void)argc; (void)argv; return ojs_string(ctx, OKAI_USER_AGENT); }
 NATIVE(n_doc_url) { (void)this_val; (void)argc; (void)argv; return ojs_string(ctx, wdoc_url(JSX(ctx)->doc)); }
 NATIVE(n_base_url) { (void)this_val; (void)argc; (void)argv; return ojs_string(ctx, wdoc_base(JSX(ctx)->doc)); }
 NATIVE(n_referrer) { (void)this_val; (void)argc; (void)argv; return ojs_string(ctx, ""); }
@@ -481,7 +479,6 @@ static const struct ojs_func_entry env_funcs[] = {
     { "baseURL", n_base_url, 0 },
     { "referrer", n_referrer, 0 },
     { "navigate", n_navigate, 2 },
-    { "userAgent", n_user_agent, 0 },
     { "pushURL", n_push_url, 2 },
     { "historyGo", n_history_go, 1 },
     { "fetch", n_fetch, 5 },
@@ -1962,21 +1959,6 @@ void wjs_stats(struct wjs* js, char* out, int cap) {
 
 #if !(defined(KERNEL) && KERNEL)
 // Host diagnostics (tests/web/wbrowse.c, WB_EVAL): run a snippet in the page's realm and log its result.
-char* wjs_debug_eval_str(struct wjs* js, const char* src) {
-    if (!js || !js->J) return 0;
-    ojs* ctx = js->J;
-    js->deadline = 0;
-    ojsv r = ojs_eval(ctx, src, strlen(src), "<eval>", OJS_EVAL_SCRIPT);
-    if (ojs_is_exception(r)) { wjs_report_exception(js, "<eval>"); return 0; }
-    size_t n = 0;
-    char* t = ojs_to_cstring(ctx, r, &n);
-    if (!t) return 0;
-    char* out = (char*)malloc(n + 1);
-    if (out) { memcpy(out, t, n); out[n] = 0; }
-    ojs_free_cstring(ctx, t);
-    return out;
-}
-
 void wjs_debug_eval(struct wjs* js, const char* src) {
     if (!js || !js->J) return;
     ojs* ctx = js->J;

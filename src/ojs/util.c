@@ -114,52 +114,6 @@ static void trace_throw(ojs* J, jv v) {
     }
     busy = 0;
 }
-
-// host debugging: OJS_TRACE_MISS=1 prints every distinct failed property lookup ("get") and failed `in` test ("has") with the
-// receiver's constructor name - which browser features a page probes for and does not find. `typeof chrome` / `chrome` on the
-// global object arrive with the receiver "window". Lines: "MISS get Navigator.userAgentData".
-int ojs_trace_miss_on = -1;
-#define MISS_SLOTS 262144
-void ojs_trace_miss(ojs* J, struct obj* o, pkey k, const char* what) {
-    static int busy, armed;
-    static char* tab;                                   // hash set of the distinct lines already printed
-    static int count;
-    if (ojs_trace_miss_on < 0) { const char* e = getenv("OJS_TRACE_MISS"); ojs_trace_miss_on = e ? 1 : 0; armed = e && e[0] == '2'; }
-    if (!ojs_trace_miss_on || busy || PK_IS_INDEX(k) || count >= MISS_SLOTS / 2) return;
-    busy = 1;
-    jv saved = J->exc; int had = J->has_exc;
-    jv ks = pkey_to_string(J, k);
-    char* kn = jv_is_str(ks) ? ojs_to_cstring(J, ks, 0) : 0;
-    if (kn) {
-        if (!armed) { if (!strcmp(kn, "__traceReady")) armed = 1; }       // OJS_TRACE_MISS=1: silent until the tracer's marker; =2: from the start
-        else {
-            const char* cn = "?";
-            char* cs = 0;
-            if (o == J->I.global) cn = "window";
-            else {
-                jv c = ord_get(J, o, A(constructor), jv_from_obj(o));
-                if (c != JV_EXC && jv_is_obj(c)) {
-                    jv n = ord_get(J, jv_obj(c), A(name), c);
-                    if (n != JV_EXC && jv_is_str(n)) { cs = ojs_to_cstring(J, n, 0); if (cs) cn = cs; }
-                }
-            }
-            char line[160];
-            snprintf(line, sizeof line, "%s %s.%s", what, cn, kn);
-            if (cs) ojs_free_cstring(J, cs);
-            if (!tab) tab = (char*)calloc(MISS_SLOTS, 1);
-            if (tab) {
-                unsigned h = 2166136261u;
-                for (const char* p = line; *p; p++) h = (h ^ (unsigned char)*p) * 16777619u;
-                unsigned slot = h & (MISS_SLOTS - 1);
-                while (tab[slot] && tab[slot] != (char)(h >> 24 | 1)) slot = (slot + 1) & (MISS_SLOTS - 1);
-                if (!tab[slot]) { tab[slot] = (char)(h >> 24 | 1); count++; fprintf(stderr, "MISS %s\n", line); }
-            }
-        }
-        ojs_free_cstring(J, kn);
-    }
-    J->exc = saved; J->has_exc = had;
-    busy = 0;
-}
 #endif
 
 jv ojs_throw(ojs* J, jv v) {
