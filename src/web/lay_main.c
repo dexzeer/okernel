@@ -861,6 +861,7 @@ static void lay_box_impl(struct wlayout* L, int bi, int32_t avail, int32_t force
     if (forced_h >= 0) H = forced_h;
     else if (s->height.t == WL_LEN && (s->height.pct == 0 || b->cbh >= 0)) {
         H = wl_resolve(s->height, b->cbh >= 0 ? b->cbh : 0, 0) + (bb ? 0 : extra_h);
+        if (H < extra_h) H = extra_h;      // border-box: the content height clamps at 0, padding/border stay (video.js height:0 + padding-top)
     } else if (is_abs && (b->flags & BF_HEIGHT_DEF)) H = b->h;
     if (H >= 0) {
         b->h = H;
@@ -913,6 +914,7 @@ static void lay_box_impl(struct wlayout* L, int bi, int32_t avail, int32_t force
             int32_t mx = wl_resolve(s->max_h, b->cbh >= 0 ? b->cbh : 0, 0) + (bb ? 0 : extra_h);
             if (H > mx) H = mx;
         }
+        if (H < extra_h) H = extra_h;
         b->h = H;
         if (H > 0) b->flags &= ~BF_EMPTY;
     } else {

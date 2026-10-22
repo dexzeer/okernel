@@ -1,0 +1,28 @@
+<!doctype html>
+<html><head><title>media_autoplay</title></head>
+<body>
+<video id="a" autoplay muted src="../../media/vec/webm_av.webm" style="width:160px;height:90px"></video>
+<video id="b" autoplay muted src="../../media/vec/webm_av.webm" style="width:160px;height:90px"></video>
+<script>
+// autoplay starts at HAVE_ENOUGH_DATA, not right after the load: a player library initialised a moment later (video.js on
+// Invidious) must still see play/playing. pause() before that point clears the autoplaying flag.
+let fails = 0;
+function check(name, ok) { if (!ok) fails++; console.log((ok ? 'PASS ' : 'FAIL ') + name); }
+const a = document.getElementById('a'), b = document.getElementById('b');
+const log = [];
+for (const e of ['play', 'playing', 'canplaythrough']) a.addEventListener(e, () => log.push(e + '@' + a.readyState));
+let bPlayed = false;
+b.addEventListener('play', () => { bPlayed = true; });
+b.addEventListener('loadstart', () => b.pause(), { once: true });   // loading, no data yet
+setTimeout(() => {
+    check('autoplay has not started before the data is there: paused=' + a.paused + ' rs=' + a.readyState, a.readyState === 4 || a.paused);
+}, 0);
+setTimeout(() => {
+    check('play fired once with HAVE_ENOUGH_DATA, then playing: ' + log.join(','),
+          log.filter(x => x.startsWith('play@')).length === 1 && log.indexOf('play@4') >= 0 && log.indexOf('playing@4') > log.indexOf('play@4'));
+    check('the element is playing: paused=' + a.paused + ' t=' + a.currentTime.toFixed(2), !a.paused && a.currentTime > 0);
+    check('pause() before the data cancelled autoplay: paused=' + b.paused + ' played=' + bPlayed, b.paused && !bPlayed && b.readyState === 4);
+    console.log('RESULT ' + (fails ? 'FAIL ' + fails : 'ALLPASS'));
+}, 2000);
+</script>
+</body></html>

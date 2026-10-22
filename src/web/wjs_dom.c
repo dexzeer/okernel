@@ -80,6 +80,7 @@ static ojsv proto_for(struct wjs* js, int node) {
         int ns = d->n[node].ns;
         if (ns == NS_SVG) slot = wjs_str_eq(name, nl, "svg") ? &js->proto_svgroot : &js->proto_svg;
         else if (ns == NS_MATH) slot = &js->proto_math;
+        else if (ns == NS_XML) slot = &js->proto_xml;
         else {
             int custom = 0;
             for (int i = 0; i < nl; i++) if (name[i] == '-') custom = 1;
@@ -340,7 +341,7 @@ NATIVE(n_create) {
     int a = l ? watom_intern(&js->d->atoms, name, (int)l) : 0;
     ojs_free_cstring(ctx, (char*)name);
     if (!a) return ojs_throw_type_error(ctx, "too many names");
-    int el = wdom_create_element(js->d, ns == 1 ? NS_SVG : ns == 2 ? NS_MATH : NS_HTML, a);
+    int el = wdom_create_element(js->d, ns == 1 ? NS_SVG : ns == 2 ? NS_MATH : ns == 3 ? NS_XML : NS_HTML, a);
     if (el < 0) return ojs_throw_oom(ctx);
     return wjs_wrap(js, el);
 }
@@ -742,6 +743,18 @@ static const char* const DISPLAY_NAMES[] = { "none", "inline", "block", "inline-
 static const char* const POS_NAMES[] = { "static", "relative", "absolute", "fixed", "sticky" };
 static const char* const OV_NAMES[] = { "visible", "hidden", "scroll", "auto", "clip" };
 
+// [position, border-top px, border-left px] of a rendered element, or null: the offsetParent / offsetTop walk needs only
+// these, for every ancestor, and building the full computed-style object each time is far too slow for it
+NATIVE(n_cbox) {
+    struct wjs* js = JSX(ctx); UNUSED_THIS; ARG_NODE(0, n);
+    const struct wstyle* s = js->d->n[n].type == WN_ELEM && wdom_is_connected(js->d, n) ? wdoc_style_of(js->doc, n) : 0;
+    if (!s) return OJS_NULL;
+    ojsv a = ojs_array(ctx);
+    ojs_set_index(ctx, a, 0, ojs_int(s->position));
+    ojs_set_index(ctx, a, 1, ojs_int((s->bw[0] + 32) >> 6));      // whole px (the engine is integer-only)
+    ojs_set_index(ctx, a, 2, ojs_int((s->bw[3] + 32) >> 6));
+    return a;
+}
 NATIVE(n_cstyle) {
     struct wjs* js = JSX(ctx); UNUSED_THIS; ARG_NODE(0, n);
     ojsv o = ojs_object(ctx);
@@ -1004,6 +1017,7 @@ static const struct ojs_func_entry dom_funcs[] = {
     { "scroll", n_scroll, 1 },
     { "hit", n_hit, 2 },
     { "cstyle", n_cstyle, 1 },
+    { "cbox", n_cbox, 1 },
     { "cssVar", n_css_var, 2 },
     { "imgSize", n_img_size, 1 },
     { "focus", n_focus, 2 },

@@ -2717,6 +2717,21 @@ static void main_complete(int bi, int tab, struct oreq* cur, int st, char* resp,
 
 // Check one request for completion.
 static void req_poll(struct oreq* q) {
+    if (q->sub_id >= 0 && q->doc && wdoc_res_cancelled(q->doc, q->sub_id)) {
+        struct oreq cur = *q;      // detach, end the transfer (an HTTP/2 stream is reset, an HTTP/1.1 connection closed)
+        q->used = 0;
+        q->h = -1;
+        fetch_end(cur.h);
+        serial_printf("[okai] request cancelled by the page: %s\n", cur.url);
+        struct okai* b = okai_get(cur.bi);
+        if (!b || cur.tab < 0 || cur.tab >= OKAI_SLOTS || !slot_valid(b, cur.tab)) return;
+        struct okai_tab* T = &b->tabs[cur.tab];
+        if (T->doc != cur.doc || T->closing) return;
+        wdoc_fetch_done2(T->doc, cur.sub_id, 0, -1, 0, 0, 0, 0);
+        T->sub_inflight--;
+        sub_landed(T, WDOC_RK_REQ);
+        return;
+    }
     int fst = fetch_status(q->h);
     if (fst == FETCH_RUNNING) return;
     struct oreq cur = *q;          // detach: the slot is free from here on

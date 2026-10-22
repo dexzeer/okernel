@@ -788,13 +788,24 @@ static void request_key(struct fcache_key* k, const char* host, const char* path
     }
 }
 
+// A ranged request is never answered from (or stored into) the cache: the key is the URL, and a stored whole-body 200 handed to a
+// `Range: bytes=0-739` request makes a player that walks a file in byte ranges get the whole file again for every piece.
+static int has_range_header(const char* extra) {
+    for (const char* p = extra; p && *p; ) {
+        if ((p[0] | 32) == 'r' && (p[1] | 32) == 'a' && (p[2] | 32) == 'n' && (p[3] | 32) == 'g' && (p[4] | 32) == 'e' && p[5] == ':') return 1;
+        while (*p && *p != '\n') p++;
+        while (*p == '\r' || *p == '\n') p++;
+    }
+    return 0;
+}
+
 static int begin_request(const char* host, const char* path, uint16_t port, int https,
                          const struct fetch_opts* o, int prefetch) {
     if (!host || !host[0]) return -1;
     if (!path || !path[0]) path = "/";
     uint16_t eport = port ? port : (uint16_t)(https ? 443 : 80);
     const char* meth = o && o->method && o->method[0] ? o->method : "GET";
-    int cacheable = o && o->cache && !strcmp(meth, "GET") && !(o->body && o->body_len);
+    int cacheable = o && o->cache && !strcmp(meth, "GET") && !(o->body && o->body_len) && !has_range_header(o ? o->extra : 0);
     struct fcache_key key;
     if (cacheable) {
         request_key(&key, host, path, eport, https, o);

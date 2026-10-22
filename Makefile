@@ -144,6 +144,10 @@ web-tests:
 	$(WEB_HOST_CC) -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_pscan tests/web/test_pscan.c src/web/pscan.c src/web/wurl.c && ./build-host/t_pscan | tail -n 1
 	./build-host/wbrowse tests/web/js/basic.html 800 600 build-host/js-basic.ppm 3 | grep RESULT
 	./build-host/wbrowse tests/web/js/fragparse.html 640 400 build-host/js-frag.ppm 3 | grep 'RESULT ALLPASS'
+	./build-host/wbrowse tests/web/js/bbox_spacing.html 640 400 build-host/js-bbox.ppm 3 | grep 'RESULT ALLPASS'
+	./build-host/wbrowse tests/web/js/media_loadstart.html 300 200 build-host/js-mls.ppm 2 | grep 'RESULT ALLPASS'
+	./build-host/wbrowse tests/web/js/event_enum.html 300 200 build-host/js-evenum.ppm 2 | grep 'RESULT ALLPASS'
+	./build-host/wbrowse tests/web/js/xml_offset_xhr.html 640 400 build-host/js-xox.ppm 3 | grep 'RESULT ALLPASS'
 	./build-host/wbrowse tests/web/js/loc_assign_window.html 400 300 build-host/js-locw.ppm 3 | grep 'script navigation -> file:///verify?a=1&b=2'
 	./build-host/wbrowse tests/web/js/loc_assign_bare.html 400 300 build-host/js-locb.ppm 3 | grep 'script navigation -> file:///verify?a=1&b=2'
 	./build-host/wbrowse tests/web/js/worker_global.html 400 200 build-host/js-wg.ppm 4 | grep 'RESULT ALLPASS'

@@ -100,6 +100,9 @@ int  wdoc_res_kind(struct wdoc* d, int id);
 // pieces of the body, then wdoc_fetch_done2(len = WDOC_STREAM_END) when the transfer is complete.
 #define WDOC_STREAM_END (-3)
 int  wdoc_res_request_stream(struct wdoc* d, int id);                                       // mark a request as streaming (from the script's fetch call)
+int  wdoc_res_request_nocors(struct wdoc* d, int id);                                       // a media element's own load: skip the CORS check
+int  wdoc_res_cancel(struct wdoc* d, int id);                                              // the page aborted a request (XHR abort, AbortController)
+int  wdoc_res_cancelled(struct wdoc* d, int id);                                           // ... the host drops its transfer
 int  wdoc_res_stream(struct wdoc* d, int id);                                              // the script asked to stream this request
 int  wdoc_fetch_head(struct wdoc* d, int id, int status, const char* headers, const char* final_url);   // returns WJS_* flags, or -1: refused (CORS) - do not stream
 int  wdoc_fetch_chunk(struct wdoc* d, int id, const char* bytes, int len);                 // returns WJS_* flags

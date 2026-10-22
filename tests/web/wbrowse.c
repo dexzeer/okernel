@@ -73,6 +73,7 @@ static int http_get(const char* url, const char* method, const char* req_headers
     snprintf(kin, sizeof kin, "o3 %s %s %s %s", method, url, cookie, g_top_url ? g_top_url : "");
     unsigned long long kh = fnv(kin);
     for (int bi = 0; body && bi < blen; bi++) { kh ^= (unsigned char)body[bi]; kh *= 1099511628211ULL; }
+    for (const char* hp = req_headers; hp && *hp; hp++) { kh ^= (unsigned char)*hp; kh *= 1099511628211ULL; }   // Range etc. select a different answer
     snprintf(key, sizeof key, "%016llx", kh);
     snprintf(bpath, sizeof bpath, "%s/%s.body", cdir, key);
     snprintf(hpath, sizeof hpath, "%s/%s.hdr", cdir, key);

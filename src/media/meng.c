@@ -245,6 +245,8 @@ struct sb {
     int failed;
     int64_t off_ns;                     // SourceBuffer.timestampOffset: added to every coded frame
     int64_t win_s, win_e;               // append window (presentation times, after the offset)
+    uint8_t* v_inband;                  // SPS/PPS of a new H.264 init segment (another quality level), as length-prefixed NAL
+    int v_inband_len;                   // units: they go in front of the next video sample, so the switch lands exactly there
 };
 
 struct meng {
@@ -269,6 +271,7 @@ struct meng {
     int rs_primed;
     struct vp9_dec* vd;
     struct h264_dec* hd;
+    int v_nls;                          // NAL length size of the running H.264 stream (avcC lengthSizeMinusOne + 1)
     struct h264_pic rq[RQ_MAX];         // decoded pictures (copies of the descriptors, each holding a frame reference) not yet shown
     int nrq;
     struct h264_pic cur_pic;            // the picture behind the current frame
@@ -533,6 +536,44 @@ static void on_frame(void* u, const struct webm_frame* f) {
 
 // ---- MP4 / ISO base media ----
 
+// The parameter sets of an avcC as NAL units with an nls-byte length prefix (the sample format), kept on the source buffer for the
+// next video sample. Players switch quality by appending another init segment to the same SourceBuffer while frames of the old
+// level are still queued: replacing the decoder there decoded those frames with the new SPS/PPS (garbage), and swapped the
+// decoder under the video worker. In band, the new parameter sets take effect exactly at the first frame of the new level.
+static int sb_set_inband(struct sb* s, const uint8_t* p, size_t len, int nls) {
+    if (len < 7 || p[0] != 1) return -1;
+    size_t i = 5, need = 0;
+    for (int pass = 0; pass < 2; pass++) {
+        int cnt = pass ? (i < len ? p[i++] : 0) : (p[i++] & 31);
+        for (int k = 0; k < cnt; k++) {
+            if (i + 2 > len) return -1;
+            size_t n = ((size_t)p[i] << 8) | p[i + 1];
+            i += 2;
+            if (i + n > len) return -1;
+            need += (size_t)nls + n;
+            i += n;
+        }
+    }
+    uint8_t* b = (uint8_t*)MEDIA_ALLOC(need ? need : 1);
+    if (!b) return -1;
+    size_t o = 0;
+    i = 5;
+    for (int pass = 0; pass < 2; pass++) {
+        int cnt = pass ? p[i++] : (p[i++] & 31);
+        for (int k = 0; k < cnt; k++) {
+            size_t n = ((size_t)p[i] << 8) | p[i + 1];
+            i += 2;
+            for (int q = nls - 1; q >= 0; q--) b[o++] = (uint8_t)(n >> (8 * q));
+            for (size_t q = 0; q < n; q++) b[o++] = p[i + q];
+            i += n;
+        }
+    }
+    if (s->v_inband) MEDIA_FREE(s->v_inband);
+    s->v_inband = b;
+    s->v_inband_len = (int)o;
+    return 0;
+}
+
 static void on_tracks_mp4(void* u, const struct mp4_info* info) {
     struct sb* s = (struct sb*)u;
     struct meng* m = s->m;
@@ -571,12 +612,20 @@ static void on_tracks_mp4(void* u, const struct mp4_info* info) {
             s->a_track = t->id;
         } else if (t->type == MP4_TRACK_VIDEO && (s->kinds & 2) && (m->v_owner < 0 || m->v_owner == s->index)) {
             if ((!strcmp(t->codec, "avc1") || !strcmp(t->codec, "avc3")) && t->config && t->config_len > 6) {
-                struct h264_dec* hd = h264_new();
-                if (!hd) continue;
-                if (h264_set_avcc(hd, t->config, (size_t)t->config_len) < 0) { h264_free(hd); continue; }
-                codec_switch(m, 1, VC_H264);
-                if (m->hd) h264_free(m->hd);
-                m->hd = hd;
+                int nls = (t->config[4] & 3) + 1;
+                if (m->hd && m->vcodec == VC_H264 && m->v_owner == s->index && nls == m->v_nls &&
+                    sb_set_inband(s, t->config, (size_t)t->config_len, nls) == 0) {
+                    // the same stream at another quality level: the running decoder takes the new SPS/PPS in band
+                } else {
+                    struct h264_dec* hd = h264_new();
+                    if (!hd) continue;
+                    if (h264_set_avcc(hd, t->config, (size_t)t->config_len) < 0) { h264_free(hd); continue; }
+                    codec_switch(m, 1, VC_H264);
+                    if (m->hd) h264_free(m->hd);
+                    m->hd = hd;
+                    m->v_nls = nls;
+                    if (s->v_inband) { MEDIA_FREE(s->v_inband); s->v_inband = 0; s->v_inband_len = 0; }
+                }
                 m->vcodec = VC_H264;
             } else if (!strcmp(t->codec, "vp09")) {
                 codec_switch(m, 1, VC_VP9);
@@ -602,8 +651,22 @@ static void on_sample_mp4(void* u, const struct mp4_sample* x) {
     if (pts < s->win_s || pts >= s->win_e) return;
     if (s->a_track && x->track == s->a_track)
         pq_push(&m->aq, x->data, x->len, pts, pts, x->duration_ns, 0, 1);
-    else if (s->v_track && x->track == s->v_track)
+    else if (s->v_track && x->track == s->v_track) {
+        if (s->v_inband) {               // the first frame after a quality switch carries the new SPS/PPS
+            uint8_t* b = (uint8_t*)MEDIA_ALLOC((size_t)s->v_inband_len + x->len);
+            if (b) {
+                memcpy(b, s->v_inband, (size_t)s->v_inband_len);
+                memcpy(b + s->v_inband_len, x->data, x->len);
+                pq_push(&m->vq, b, (size_t)s->v_inband_len + x->len, pts, dts, x->duration_ns, 0, x->key);
+                MEDIA_FREE(b);
+                MEDIA_FREE(s->v_inband);
+                s->v_inband = 0;
+                s->v_inband_len = 0;
+                return;
+            }
+        }
         pq_push(&m->vq, x->data, x->len, pts, dts, x->duration_ns, 0, x->key);
+    }
 }
 
 static int g_async = -1;                // meng_set_async(): -1 = automatic (a second CPU), 0 = never, 1 = always
@@ -634,6 +697,7 @@ void meng_free(struct meng* m) {
     for (int i = 0; i < m->nsb; i++) {
         if (m->sb[i].dm) webm_free(m->sb[i].dm);
         if (m->sb[i].mp) mp4_free(m->sb[i].mp);
+        if (m->sb[i].v_inband) MEDIA_FREE(m->sb[i].v_inband);
     }
     pq_free(&m->aq);
     pq_free(&m->vq);

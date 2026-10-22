@@ -1,0 +1,34 @@
+<!doctype html>
+<html><head><title>media_loadstart</title></head>
+<body>
+<video id="v" muted></video>
+<script>
+// emptied/loadstart are queued tasks, never fired inside the src setter or load(). video.js 7 does
+//   changingSrc_ = true; el.src = url; changingSrc_ = false;
+// and a play() parked on 'loadstart' re-checks the flag: a synchronous loadstart left the player on its poster forever.
+let fails = 0;
+function check(name, ok) { if (!ok) fails++; console.log((ok ? 'PASS ' : 'FAIL ') + name); }
+const v = document.getElementById('v');
+const seen = [];
+let changing = false;
+v.addEventListener('loadstart', () => seen.push('loadstart' + (changing ? '(changing)' : '')));
+v.addEventListener('emptied', () => seen.push('emptied' + (changing ? '(changing)' : '')));
+changing = true;
+v.src = 'nope-a.webm';
+changing = false;
+check('no loadstart inside the src setter', seen.length === 0);
+setTimeout(() => {
+    check('loadstart arrives after the setter returned: ' + seen.join(','), seen.join(',') === 'loadstart');
+    seen.length = 0;
+    changing = true;
+    v.src = 'nope-b.webm';           // a second load: emptied then loadstart, both queued
+    v.load();                        // and a third one at once: the second load's tasks are dropped
+    changing = false;
+    check('nothing synchronous on a reload', seen.length === 0);
+    setTimeout(() => {
+        check('one emptied + one loadstart for the reload pair: ' + seen.join(','), seen.join(',') === 'emptied,loadstart');
+        console.log('RESULT ' + (fails ? 'FAIL ' + fails : 'ALLPASS'));
+    }, 50);
+}, 50);
+</script>
+</body></html>

@@ -1,0 +1,37 @@
+<!doctype html>
+<html><head><title>bbox_spacing</title><style>
+body { margin: 0; font: 16px sans-serif; }
+.fluid { box-sizing: border-box; height: 0; padding-top: 100px; width: 200px; background: #000; }
+.maxh { box-sizing: border-box; max-height: 10px; padding: 20px 0 30px; width: 200px; }
+.bord { box-sizing: border-box; height: 5px; border: 8px solid red; width: 200px; }
+.grid { letter-spacing: -.31em; word-spacing: -.43em; }
+.unit { letter-spacing: normal; word-spacing: normal; }
+.t { display: inline-block; white-space: nowrap; }
+</style></head>
+<body>
+<!-- video.js .vjs-fluid: border-box, height 0, the aspect ratio in padding-top -->
+<div id="fluid" class="fluid"></div>
+<div id="maxh" class="maxh"></div>
+<div id="bord" class="bord"></div>
+<!-- Pure grids: .pure-g collapses the gaps with negative spacing, every .pure-u-* resets it with 'normal' -->
+<div><span id="plain" class="t">INVIDIOUS search LOG IN</span></div>
+<div class="grid"><div><span id="reset" class="t unit">INVIDIOUS search LOG IN</span></div></div>
+<div class="grid"><div class="unit"><span id="inh" class="t">INVIDIOUS search LOG IN</span></div></div>
+<div class="grid"><div><span id="neg" class="t">INVIDIOUS search LOG IN</span></div></div>
+<script>
+let fails = 0;
+function check(name, got, want) {
+    const ok = got === want;
+    if (!ok) fails++;
+    console.log((ok ? 'PASS ' : 'FAIL ') + name + ': got ' + got + ' want ' + want);
+}
+const h = id => document.getElementById(id).offsetHeight, w = id => document.getElementById(id).offsetWidth;
+check('border-box height:0 + padding-top:100px', h('fluid'), 100);
+check('border-box max-height below the padding', h('maxh'), 50);
+check('border-box height below the borders', h('bord'), 16);
+check('letter-spacing:normal resets an inherited negative value', w('reset'), w('plain'));
+check('the reset inherits to children', w('inh'), w('plain'));
+check('without a reset the spacing stays negative', w('neg') < w('plain'), true);
+console.log('RESULT ' + (fails ? 'FAIL ' + fails : 'ALLPASS'));
+</script>
+</body></html>

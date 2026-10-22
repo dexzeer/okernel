@@ -19,6 +19,7 @@
 #define NS_HTML 0
 #define NS_SVG  1
 #define NS_MATH 2
+#define NS_XML  3     // any other namespace (DOMParser XML documents): names are kept exactly as written
 
 // node flags
 #define WNF_WS        0x01   // text node is whitespace-only

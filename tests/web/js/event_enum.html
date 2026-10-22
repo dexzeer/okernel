@@ -1,0 +1,26 @@
+<!doctype html>
+<html><head><title>event_enum</title></head>
+<body><div id="t"></div>
+<script>
+// Event's WebIDL members are enumerable, as in browsers. video.js copies every native event with for-in (fixEvent) and
+// looks the handlers up by the copy's .type: with a non-enumerable 'type' no media event reached the player.
+let fails = 0;
+function check(name, ok) { if (!ok) fails++; console.log((ok ? 'PASS ' : 'FAIL ') + name); }
+const keys = e => { const k = []; for (const x in e) k.push(x); return k; };
+const ek = keys(new Event('play'));
+for (const m of ['type', 'target', 'currentTarget', 'bubbles', 'timeStamp', 'srcElement', 'preventDefault', 'stopPropagation'])
+    check('for-in over an Event lists ' + m, ek.indexOf(m) >= 0);
+check('for-in over a MouseEvent lists type', keys(new MouseEvent('click')).indexOf('type') >= 0);
+check('the getter stays on the prototype', !Object.prototype.hasOwnProperty.call(new Event('x'), 'type') &&
+      Object.getOwnPropertyDescriptor(Event.prototype, 'type').enumerable === true);
+// the library pattern
+const handlers = { play: [() => { got++; }] };
+let got = 0;
+function fixEvent(old) { const ev = {}; for (const k in old) ev[k] = old[k]; return ev; }
+const t = document.getElementById('t');
+t.addEventListener('play', e => { const ev = fixEvent(e); (handlers[ev.type] || []).forEach(h => h(ev)); });
+t.dispatchEvent(new Event('play'));
+check('a for-in copied event finds its handlers by type', got === 1);
+console.log('RESULT ' + (fails ? 'FAIL ' + fails : 'ALLPASS'));
+</script>
+</body></html>
