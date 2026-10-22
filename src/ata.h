@@ -28,4 +28,10 @@ uint32_t ata_sectors(void);
 int ata_read(uint32_t lba, uint8_t *buf);
 int ata_write(uint32_t lba, const uint8_t *buf);
 
+// Write protection (part.h): writes into a protected range fail with -1, except in an allowed hole (the grubenv
+// sectors inside the boot partition). Up to 4 ranges and 4 holes.
+void ata_protect(uint32_t start, uint32_t count);
+void ata_allow(uint32_t start, uint32_t count);
+int ata_write_protected(uint32_t lba);
+
 #endif

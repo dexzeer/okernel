@@ -129,6 +129,7 @@ void window_set_pixels(int id, const uint32_t* px, int x, int y, int w, int h, i
 // Repaint only a sub-rect of the pixel surface (surface coordinates).
 void window_dirty_pixels(int id, int x, int y, int w, int h);
 int window_check_close_click(int id, int mx, int my);
+void window_close_btn_rect(int id, int r[4]);    // title-bar close button (x, y, w, h)
 int window_check_minimize_click(int id, int mx, int my);
 int window_check_maximize_click(int id, int mx, int my);
 // Caption button rect (WIN_CTRL_*) of a no-titlebar window, screen coords in

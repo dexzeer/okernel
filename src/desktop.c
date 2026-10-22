@@ -41,6 +41,8 @@
 #include "xhci.h"
 #include "i2chid.h"
 #include "klog.h"
+#include "recovery.h"
+#include "textview.h"
 #include "devlog.h"
 #include "rtw/rtw.h"
 #include "rtw/rtw_pci.h"
@@ -108,9 +110,14 @@ static int term_lens[MAX_TERMINALS];
 
 // System info window
 static int info_win = -1;
+static int crash_win = -1;    // recovery: the last boot's crash
 
 uint32_t tick_count = 0;
 int needs_redraw = 1; // Global flag: wallpaper + windows need full redraw
+// Booted with `recovery` on the command line (GRUB's recovery entry: the known-good kernel from the read-only partition,
+// part.h): a reduced desktop with one recovery terminal (recovery.c). The data partition is not mounted and the log of
+// the crashed boot is not overwritten.
+int recovery_mode;
 
 // FPS tracking
 static uint32_t frame_count = 0;
@@ -374,7 +381,7 @@ static const char* icon_basename(const char* name) {
 }
 
 static int icon_file_hidden(const char* name) {
-    if (!name || !name[0]) return 1;
+    if (!name || !name[0] || recovery_mode) return 1;     // the recovery desktop has no icons
     if (icon_basename(name)[0] == '.') return 1; // dotfiles
     // Seeded system files live in /bin and /sbin (shell, init, test ELFs)
     // and /readme.txt: needed on disk, but an eyesore as desktop icons.
@@ -782,7 +789,7 @@ static int create_terminal(void) {
 
 static void shell_prompt(int win_id) {
     window_set_text_color(win_id, 12, 0); // Anarchy red on black
-    window_puts(win_id, "kanarchy> ");
+    window_puts(win_id, recovery_mode ? "recovery# " : "kanarchy> ");
     window_set_text_color(win_id, 15, 0); // Back to white on black
 }
 
@@ -830,6 +837,23 @@ static void shell_execute(int win_id, const char* input) {
 
     const char* args = input + cmd_len;
     while (*args == ' ') args++;
+
+    if (recovery_mode) {
+        if (recovery_command(win_id, cmd_buf, *args ? args : 0)) return;
+        if (str_eq(cmd_buf, "help")) {
+            recovery_help(win_id);
+            window_puts(win_id, "clear  mem  run  reboot  shutdown\n");
+            return;
+        }
+        // only what `help` lists: okai, sysinfo, games etc. do not exist here
+        if (!str_eq(cmd_buf, "clear") && !str_eq(cmd_buf, "mem") && !str_eq(cmd_buf, "run") &&
+            !str_eq(cmd_buf, "reboot") && !str_eq(cmd_buf, "shutdown")) {
+            window_puts(win_id, cmd_buf);
+            window_puts(win_id, ": not found\n");
+            serial_puts("[recovery] not found\n");
+            return;
+        }
+    }
 
     if (str_eq(cmd_buf, "help")) {
         // Everyday commands only; networking utils and half-done tools
@@ -1533,6 +1557,8 @@ static void on_keypress(char c, int alt) {
     if (win_id >= 0 && win_id == wifigui_win()) { wifigui_key(c); return; }
     if (win_id >= 0 && win_id == gamewin_win()) { gamewin_key(c); return; }
 
+    if (textview_owns(win_id)) { textview_key(win_id, c); return; }
+
     // Check if this is an editor window
     int ed_id = editor_find_by_win(win_id);
     if (ed_id >= 0) {
@@ -1733,7 +1759,7 @@ void desktop_bg_poll(void) {
     xhci_poll();
     rtw_poll();
     i2chid_poll();
-    klog_poll();
+    if (!recovery_mode) klog_poll();     // recovery keeps the crashed boot's log
     net_poll();
     fetch_poll();
 }
@@ -1751,6 +1777,14 @@ void kernel_main(uint32_t mboot_phys) {
     // TS=0. Preemptive switches FNSAVE/FRSTOR per thread (process.c).
     fpu_init_cpu();   // also CR4.OSFXSR/OSXMMEXCPT when the CPU has SSE2 (see fpu.c)
     memory_init(mboot_phys);
+    if (*(volatile uint32_t*)(mboot_phys + 0) & (1u << 2)) {        // the command line: "/known/kanarchy.bin recovery"
+        const volatile char* cl = (const volatile char*)*(volatile uint32_t*)(mboot_phys + 16);
+        for (int i = 0; i < 240 && cl[i]; i++)
+            if ((i == 0 || cl[i - 1] == ' ') && cl[i] == 'r' && cl[i + 1] == 'e' && cl[i + 2] == 'c' && cl[i + 3] == 'o' &&
+                cl[i + 4] == 'v' && cl[i + 5] == 'e' && cl[i + 6] == 'r' && cl[i + 7] == 'y' && (!cl[i + 8] || cl[i + 8] == ' '))
+                recovery_mode = 1;
+        if (recovery_mode) serial_puts("[boot] recovery mode\n");
+    }
 
     // mboot_info.framebuffer_addr is the uint64 at offset 88 (NOT 44: count
     // the packed struct above — 4+4+4*9+2*4 = 88). A wrong offset reads
@@ -1795,7 +1829,8 @@ void kernel_main(uint32_t mboot_phys) {
     graphics_init(mboot_phys);
     window_init();
     fs_init();
-    pfs_init(); // ATA disk + mount-or-format (diskless = VFS-only, safe)
+    if (recovery_mode) pfs_init_recovery();
+    else pfs_init(); // ATA disk + mount-or-format (diskless = VFS-only, safe)
     userland_seed(); // /bin/* + /sbin/init from embedded ELFs (skips present)
     // TOFU pin persistence (P2): reload last boot's verified leaf pins so
     // a reboot doesn't re-open the first-visit window to a network-only
@@ -1874,6 +1909,15 @@ void kernel_main(uint32_t mboot_phys) {
         }
     }
 
+    // The recovery desktop: the same wallpaper, dark and red
+    if (recovery_mode && graphics_wallpaper()) {
+        uint32_t* px = (uint32_t*)graphics_wallpaper();
+        for (int i = 0; i < SCREEN_W * SCREEN_H; i++) {
+            uint32_t c = px[i], l = (((c >> 16) & 0xFF) * 3 + ((c >> 8) & 0xFF) * 5 + (c & 0xFF) * 2) / 10;
+            px[i] = ((l * 5 / 8 + 0x18) << 16) | ((l / 6 + 0x04) << 8) | (l / 5 + 0x08);
+        }
+    }
+
     // Draw initial wallpaper
     graphics_blit_wallpaper();
 
@@ -1911,7 +1955,9 @@ void kernel_main(uint32_t mboot_phys) {
     window_set_focus(term_wins[0]);
 
     window_set_text_color(term_wins[0], 15, 0);
+    if (recovery_mode) window_set_title(term_wins[0], "recovery");
     shell_prompt(term_wins[0]);
+    if (recovery_mode && (crash_win = recovery_crash_window()) >= 0) window_set_focus(crash_win);
 
     // PID 1 is spawned on FIRST `run` (lazy): the boot-time spawn raced
     // init's fork/exec children against the entry drain (bisected 2026-09-08:
@@ -2025,6 +2071,7 @@ void kernel_main(uint32_t mboot_phys) {
         if (prof_on) stall_report();
         stall_beat = tick_count;
         { PROF_BEGIN(PZ_KEYS); keys_dispatch(); PROF_END(PZ_KEYS); }
+        textview_redraw_if_resized();
         // Ring-3 entry drain: the shell (and fork) stage pid+eip+esp+window
         // into the entry run queue; here is plain ring-0 thread context, so
         // prepare (CR3+ESP0) + IRET below is safe. sys_exit resumes right
@@ -2447,7 +2494,7 @@ void kernel_main(uint32_t mboot_phys) {
         wifigui_poll();   // the Wi-Fi window
         gamewin_poll();   // the game window (held keys, physics, picture)
         { PROF_BEGIN(PZ_I2C); i2chid_poll(); PROF_END(PZ_I2C); }     // I2C-HID touchpad reports (polled, 100 Hz)
-        { PROF_BEGIN(PZ_KLOG); klog_poll(); PROF_END(PZ_KLOG); }     // the log on the boot stick (only when the flash tool marked it)
+        if (!recovery_mode) { PROF_BEGIN(PZ_KLOG); klog_poll(); PROF_END(PZ_KLOG); }     // the log on the boot stick (only when the flash tool marked it)
         { PROF_BEGIN(PZ_NET); net_poll(); PROF_END(PZ_NET); }
         { PROF_BEGIN(PZ_FETCH); fetch_poll(); PROF_END(PZ_FETCH); }  // drive the HTTP/HTTPS fetch engine (parallel, keep-alive)
         // Persist TOFU pins on change (write-through VFS, same as editor).
@@ -2502,6 +2549,7 @@ void kernel_main(uint32_t mboot_phys) {
                 int br_id = okai_find_by_win(wid);
                 if (br_id >= 0) okai_handle_wheel_at(br_id, wheel, mx, my);
                 else if (wid == wifigui_win()) wifigui_wheel(wheel);
+                else if (textview_owns(wid)) textview_wheel(wid, wheel);
                 else if (find_term_idx(wid) >= 0) window_scroll_view(wid, wheel);
             }
         }
@@ -2570,10 +2618,17 @@ void kernel_main(uint32_t mboot_phys) {
                             }
                         } else if (i == info_win) {
                             close_sysinfo();
+                        } else if (i == crash_win) {
+                            window_destroy(crash_win);
+                            crash_win = -1;
+                            serial_puts("[recovery] crash window closed\n");
+                            if (term_wins[0] >= 0) { active_term_idx = 0; window_set_focus(term_wins[0]); }
                         } else if (i == wifigui_win()) {
                             wifigui_close();
                         } else if (i == gamewin_win()) {
                             gamewin_close();
+                        } else if (textview_owns(i)) {
+                            textview_close(i);
                         } else {
                             int ed_id = editor_find_by_win(i);
                             if (ed_id >= 0) {

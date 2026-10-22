@@ -6,7 +6,8 @@
 // A log that survives the machine: when the boot USB stick carries the marker the flash tool puts in its last 2 MB
 // (see tools/stick/), every devlog line, a status snapshot every 5 s (`usb`, `touchpad`) and the raw ACPI tables are
 // written there, and tools/stick/readlog.ps1 reads them back on the PC. No photos, no serial port needed.
-// A stick without the marker is never written to.
+// A stick without the marker is never written to. On an installed disk (part.h) the same region is the start of the
+// log partition (the image builder writes the marker), and the recovery system reads it back (`log`).
 //
 // Layout of the last 4096 sectors (512 B each) of the stick, start S = capacity - 4096:
 //   S+0         header (see struct klog_hdr)
@@ -40,5 +41,7 @@ void klog_poll(void);                          // main loop: finds the stick, fl
 void klog_flush(void);                         // write what is pending now (the touchpad hunt does this before each memory window)
 int klog_active(void);
 void klog_set_scan_window(uint32_t w);         // persistent: which window is being read (cleared with 0)
+uint32_t klog_boot(void);                      // this boot's number in the log (0 = no log)
+void klog_panic_flush(void);                   // the panic screen: write everything pending to the disk's log partition
 
 #endif

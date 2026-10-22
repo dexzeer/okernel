@@ -105,7 +105,7 @@ src/gamewin.o: src/gamewin.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
 src/game/levels.o: src/game/levels.asm games/level1.dmccl games/level2.dmccl games/level3.dmccl games/level4.dmccl
 	$(AS) $(ASFLAGS) $< -o $@
-DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/ac97.o src/audio_rate.o src/pcix.o src/acpi_pm.o src/xhci.o src/wifigui.o src/rtw/rtw_hw.o src/rtw/rtw_pci.o src/rtw/rtw_wifi.o src/rtw/wsta.o src/rtw/wcrypto.o src/rtw/rtw_tables.o src/rtw/rtwfw.o src/hid.o src/devlog.o src/dwi2c.o src/hidi2c.o src/ptp.o src/i2caml.o src/i2chid.o src/klog.o src/virtio.o src/vgpu.o src/i915.o src/cpufreq.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/pfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
+DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/ac97.o src/audio_rate.o src/pcix.o src/acpi_pm.o src/xhci.o src/wifigui.o src/rtw/rtw_hw.o src/rtw/rtw_pci.o src/rtw/rtw_wifi.o src/rtw/wsta.o src/rtw/wcrypto.o src/rtw/rtw_tables.o src/rtw/rtwfw.o src/hid.o src/devlog.o src/dwi2c.o src/hidi2c.o src/ptp.o src/i2caml.o src/i2chid.o src/klog.o src/virtio.o src/vgpu.o src/i915.o src/cpufreq.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/part.o src/pfs.o src/panic.o src/recovery.o src/textview.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
               src/font_data.o $(WEB_OBJ) $(OJS_OBJ) \
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/aes.o src/crypto/chacha20.o src/crypto/poly1305.o \
@@ -116,7 +116,7 @@ DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/ac97.o src/audi
              src/crypto/certverify.o src/rtc.o \
              src/net/fcache.o src/net/hpack.o src/net/hpack_tables.o src/net/h2.o src/net/fetch.o
 
-.PHONY: laptop all text desktop clean run debug host-tests host-tests-asan media-tests diff-oracle diff-test tls-interop web-tests
+.PHONY: laptop disk all text desktop clean run debug host-tests host-tests-asan media-tests diff-oracle diff-test tls-interop web-tests
 
 # ---- Web engine host tests (src/web) ----
 # Offline must-pass: CSS cascade unit tests, font engine. With the corpus
@@ -308,8 +308,15 @@ kanarchy-text.iso: kanarchy-text.bin
 # ---- Desktop mode build ----
 desktop: kanarchy-desktop.iso
 
-kanarchy-desktop.bin: $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o linker-high.ld
-	$(LD) $(LDFLAGS_HIGH) -o $@ $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o
+# Two links: the first without symbols, then tools/ksyms.py turns its code symbols into the panic screen's table
+# (boot/ksyms.asm, section .ksyms after .data: the code does not move) and the second link adds it; --check proves it.
+kanarchy-desktop.bin: $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o linker-high.ld tools/ksyms.py boot/ksyms.asm
+	mkdir -p build-ksyms
+	$(LD) $(LDFLAGS_HIGH) -o build-ksyms/pass1.bin $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o
+	nm -n build-ksyms/pass1.bin | python3 tools/ksyms.py build-ksyms/ksyms.bin
+	$(AS) $(ASFLAGS) boot/ksyms.asm -o build-ksyms/ksyms.o
+	$(LD) $(LDFLAGS_HIGH) -o $@ $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o build-ksyms/ksyms.o
+	nm -n $@ | python3 tools/ksyms.py --check build-ksyms/ksyms.bin
 
 kanarchy-desktop.iso: kanarchy-desktop.bin
 	rm -rf isodir
@@ -365,8 +372,8 @@ ALL_C_OBJ = $(COMMON_OBJ) $(TEXT_OBJ) $(DESKTOP_OBJ) src/kernel.o src/desktop.o
 
 clean:
 	rm -f $(ASM_OBJ) boot/start_text.o $(ALL_C_OBJ) $(ALL_C_OBJ:.o=.d)
-	rm -f kanarchy-text.bin kanarchy-text.iso kanarchy-desktop.bin kanarchy-desktop.iso
-	rm -rf isodir
+	rm -f kanarchy-text.bin kanarchy-text.iso kanarchy-desktop.bin kanarchy-desktop.iso kanarchy-disk.img
+	rm -rf isodir build-ksyms build-disk
 
 -include $(wildcard $(ALL_C_OBJ:.o=.d))
 
@@ -443,6 +450,11 @@ build-fbtext/%.o: src/%.c $(HEADERS)
 	$(CC) $(CFLAGS) -DFBTEXT -c $< -o $@
 kanarchy-fbtext.bin: build-fbtext/start.o boot/isr.o $(COMMON_OBJ) build-fbtext/vga.o build-fbtext/terminal.o build-fbtext/kernel.o build-fbtext/fbtext.o src/shell.o src/hwinfo.o src/i915.o src/pcix.o src/acpi_pm.o src/text_stubs.o src/font_data.o
 	$(LD) $(LDFLAGS) -o $@ $^
+
+# ---- Installed disk: MBR + GRUB (BIOS and UEFI), boot / recovery / log / data partitions (src/part.h) ----
+disk: kanarchy-disk.img
+kanarchy-disk.img: kanarchy-desktop.bin tools/disk/mkdisk.py tools/disk/grub.cfg
+	python3 tools/disk/mkdisk.py $@ kanarchy-desktop.bin
 
 laptop: kanarchy-laptop.iso
 kanarchy-laptop.iso: kanarchy-text.bin kanarchy-fbtext.bin build-laptop/kanarchy-1366x768.bin build-laptop/kanarchy-1280x800.bin build-laptop/kanarchy-1024x768.bin build-laptop/kanarchy-auto.bin boot/laptop-grub.cfg

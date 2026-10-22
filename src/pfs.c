@@ -2,35 +2,15 @@
 #include "ata.h"
 #include "filesystem.h"
 #include "serial.h"
+#include "part.h"
 #include <stdint.h>
 
-#define PFS_MAGIC0 'O'
-#define PFS_MAGIC1 'K'
-#define PFS_MAGIC2 'P'
-#define PFS_MAGIC3 'F'
-#define PFS_MAGIC4 'S'
-#define PFS_MAGIC5 '1'
-#define PFS_VERSION 1
-
-#define PFS_SB_SECTOR 0
-#define PFS_TABLE_START 1
-#define PFS_TABLE_SECTORS 16
-#define PFS_FIRST_DATA 17
-
-struct pfs_super {
-    uint8_t magic[8];
-    uint32_t version;
-    uint32_t nfiles;
-    uint8_t bitmap[476]; // bit i = data sector FIRST_DATA+i in use
-};
-
-struct pfs_entry {
-    uint8_t name[32];
-    uint32_t size;
-    uint32_t start;  // first data sector (absolute LBA)
-    uint32_t flags;
-    uint8_t reserved[512 - 32 - 12];
-};
+// OKPFS1 lives in the data partition of an installed disk (part.h), or on the whole disk (older layout): every sector
+// number below is relative to pfs_base.
+static uint32_t pfs_base, pfs_len;
+static int dsk_read(uint32_t lba, uint8_t* buf) { return lba < pfs_len ? ata_read(pfs_base + lba, buf) : -1; }
+static int dsk_write(uint32_t lba, const uint8_t* buf) { return lba < pfs_len ? ata_write(pfs_base + lba, buf) : -1; }
+static uint32_t dsk_sectors(void) { return pfs_len; }
 
 static int mounted = 0;
 
@@ -50,7 +30,7 @@ static void sb_bitmap_set(struct pfs_super *sb, uint32_t sector, int used) {
 
 static int sb_read(struct pfs_super *sb) {
     uint8_t buf[512];
-    if (ata_read(PFS_SB_SECTOR, buf)) return -1;
+    if (dsk_read(PFS_SB_SECTOR, buf)) return -1;
     for (uint32_t i = 0; i < sizeof(*sb); i++)
         ((uint8_t*)sb)[i] = buf[i];
     return 0;
@@ -61,12 +41,12 @@ static int sb_write(const struct pfs_super *sb) {
     for (int i = 0; i < 512; i++) buf[i] = 0;
     for (uint32_t i = 0; i < sizeof(*sb); i++)
         buf[i] = ((const uint8_t*)sb)[i];
-    return ata_write(PFS_SB_SECTOR, buf);
+    return dsk_write(PFS_SB_SECTOR, buf);
 }
 
 static int entry_read(int idx, struct pfs_entry *e) {
     uint8_t buf[512];
-    if (ata_read(PFS_TABLE_START + idx, buf)) return -1;
+    if (dsk_read(PFS_TABLE_START + idx, buf)) return -1;
     for (uint32_t i = 0; i < sizeof(*e); i++)
         ((uint8_t*)e)[i] = buf[i];
     return 0;
@@ -77,7 +57,7 @@ static int entry_write(int idx, const struct pfs_entry *e) {
     for (uint32_t i = 0; i < sizeof(*e); i++)
         buf[i] = ((const uint8_t*)e)[i];
     for (uint32_t i = sizeof(*e); i < 512; i++) buf[i] = 0;
-    return ata_write(PFS_TABLE_START + idx, buf);
+    return dsk_write(PFS_TABLE_START + idx, buf);
 }
 
 static int sb_valid(const struct pfs_super *sb) {
@@ -101,11 +81,36 @@ static void sb_format(struct pfs_super *sb) {
     sb_write(sb);
 }
 
+// The recovery desktop: the partitions and their protection, but OKPFS1 is not mounted (the recovery tools read and
+// repair it directly, and nothing of the user's is hydrated or written back).
+void pfs_init_recovery(void) {
+    if (!ata_init() || part_scan() <= 0) return;
+    const struct part* r = part_role(PART_RECOVERY);
+    if (r) ata_protect(r->start, r->count);
+    grubenv_init();
+}
+
 void pfs_init(void) {
     fs_install_persist(pfs_sync_file, pfs_delete_file);
     if (!ata_init()) {
         serial_puts("[pfs] no disk — VFS only (files lost on reboot)\n");
         return;
+    }
+    pfs_base = 0;
+    pfs_len = ata_sectors();
+    if (part_scan() > 0) {
+        // An installed disk: the boot and recovery partitions are never written (except the grubenv block GRUB reads
+        // after a panic), and OKPFS1 only gets its own partition. Never format sector 0 here: it is the MBR.
+        const struct part* b = part_role(PART_BOOT), *r = part_role(PART_RECOVERY), *d = part_role(PART_DATA);
+        if (b) ata_protect(b->start, b->count);
+        if (r) ata_protect(r->start, r->count);
+        if (grubenv_init() == 0) serial_puts("[pfs] grubenv found: a panic boots the recovery system next\n");
+        if (!d) {
+            serial_puts("[pfs] partitioned disk without an OKPFS1 partition — VFS only\n");
+            return;
+        }
+        pfs_base = d->start;
+        pfs_len = d->count;
     }
     struct pfs_super sb;
     if (sb_read(&sb) || !sb_valid(&sb)) {
@@ -132,7 +137,7 @@ void pfs_init(void) {
         uint32_t sectors = (e.size + 511) / 512;
         for (uint32_t s = 0; s < sectors; s++) {
             uint8_t sec[512];
-            if (ata_read(e.start + s, sec)) break;
+            if (dsk_read(e.start + s, sec)) break;
             uint32_t n = e.size - got;
             if (n > 512) n = 512;
             for (uint32_t b = 0; b < n; b++) file_buf[got + b] = sec[b];
@@ -181,7 +186,7 @@ int pfs_sync_file(const char *name) {
     uint32_t start = 0;
     if (need > 0) {
         // First-fit contiguous run in the data area.
-        uint32_t max_sec = ata_sectors();
+        uint32_t max_sec = dsk_sectors();
         for (uint32_t s = PFS_FIRST_DATA; s + need <= max_sec; s++) {
             int free = 1;
             for (uint32_t k = 0; k < need; k++) {
@@ -205,7 +210,7 @@ int pfs_sync_file(const char *name) {
         if ((int32_t)n > 0) {
             for (uint32_t b = 0; b < n; b++) sec[b] = wbuf[s * 512 + b];
         }
-        if (ata_write(start + s, sec)) return -1;
+        if (dsk_write(start + s, sec)) return -1;
     }
     struct pfs_entry e;
     for (uint32_t i = 0; i < sizeof(e); i++) ((uint8_t*)&e)[i] = 0;
@@ -242,7 +247,7 @@ int pfs_load_file(const char *name) {
         uint32_t sectors = (e.size + 511) / 512;
         for (uint32_t s = 0; s < sectors; s++) {
             uint8_t sec[512];
-            if (ata_read(e.start + s, sec)) return -1;
+            if (dsk_read(e.start + s, sec)) return -1;
             uint32_t n = e.size - got;
             if (n > 512) n = 512;
             for (uint32_t b = 0; b < n; b++) file_buf[got + b] = sec[b];
@@ -294,7 +299,7 @@ void pfs_status(void) {
         serial_puts("[pfs] superblock unreadable\n");
         return;
     }
-    serial_printf("[pfs] files=%d disk_sectors=%d\n", sb.nfiles, ata_sectors());
+    serial_printf("[pfs] files=%d disk_sectors=%d\n", sb.nfiles, dsk_sectors());
     for (int i = 0; i < PFS_TABLE_SECTORS; i++) {
         struct pfs_entry e;
         if (entry_read(i, &e)) continue;

@@ -7,6 +7,10 @@
 #include "atoms.h"
 #include "builtins.h"
 #include "parse.h"
+#if !defined(KERNEL) || !KERNEL
+#include <stdlib.h>
+#include <stdio.h>
+#endif
 
 struct ftempl* compile_eval(ojs* J, struct parser* P, struct scope* envscope, int in_function, int sloppy_vars_to_caller);
 struct upval* frame_upval(ojs* J, struct ojs_frame* f, int slot);
@@ -271,6 +275,19 @@ static struct scope* build_env(struct parser* P, struct obj* desc, int* in_funct
 static jv run_eval(ojs* J, jv src, struct ojs_frame* caller, struct obj* desc, int strict_caller) {
     struct str* s = str_flat(J, src);
     if (!s) return JV_EXC;
+#if !defined(KERNEL) || !KERNEL
+    // host debugging: OJS_EVAL_DUMP=file appends every eval()'d source before it is parsed
+    {
+        const char* d = getenv("OJS_EVAL_DUMP");
+        FILE* f = d ? fopen(d, "a") : 0;
+        if (f) {
+            static int n;
+            fprintf(f, "\n/* --- eval %d len %u --- */\n", ++n, str_len(s));
+            if (!str_wide(s)) fwrite(s->u.c8, 1, str_len(s), f);
+            fclose(f);
+        }
+    }
+#endif
     struct ojs_eval_env env = { desc };
     struct parser P;
     struct parse_opts o;

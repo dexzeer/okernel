@@ -48,6 +48,7 @@ static int ata_wait_drq(void) {
 }
 
 int ata_init(void) {
+    if (present) return 1;
     // Select master, LBA mode. A floating bus reads 0xFF — treat as absent.
     outb(ATA_DRIVE, 0xE0);
     for (volatile int i = 0; i < 1000; i++) { (void)inb(ATA_STATUS); }
@@ -99,16 +100,36 @@ int ata_read(uint32_t lba, uint8_t *buf) {
     outb(ATA_LBA_HI, (lba >> 16) & 0xFF);
     outb(ATA_COMMAND, ATA_CMD_READ);
     if (ata_wait_drq()) return -1;
-    for (int i = 0; i < 256; i++) {
-        uint16_t w = inw(ATA_DATA);
-        buf[i * 2] = w & 0xFF;
-        buf[i * 2 + 1] = (w >> 8) & 0xFF;
-    }
+    // one string instruction per sector: a VM exit per word cost seconds per boot under WHPX
+    uint32_t n = 256;
+    __asm__ volatile("rep insw" : "+D"(buf), "+c"(n) : "d"((uint16_t)ATA_DATA) : "memory");
+    return 0;
+}
+
+static uint32_t prot[4][2], hole[4][2];
+static int nprot, nhole;
+
+void ata_protect(uint32_t start, uint32_t count) {
+    if (nprot < 4) { prot[nprot][0] = start; prot[nprot][1] = count; nprot++; }
+}
+
+void ata_allow(uint32_t start, uint32_t count) {
+    if (nhole < 4) { hole[nhole][0] = start; hole[nhole][1] = count; nhole++; }
+}
+
+int ata_write_protected(uint32_t lba) {
+    for (int i = 0; i < nhole; i++) if (lba - hole[i][0] < hole[i][1]) return 0;
+    for (int i = 0; i < nprot; i++) if (lba - prot[i][0] < prot[i][1]) return 1;
     return 0;
 }
 
 int ata_write(uint32_t lba, const uint8_t *buf) {
     if (!present || !buf || lba >= total_sectors) return -1;
+    if (ata_write_protected(lba)) {
+        static int warned;
+        if (!warned++) serial_printf("[ata] refused a write to protected sector %u\n", lba);
+        return -1;
+    }
     if (ata_wait_ready()) return -1;
     outb(ATA_DRIVE, 0xE0 | ((lba >> 24) & 0x0F));
     outb(ATA_SECTORS, 1);
@@ -117,10 +138,9 @@ int ata_write(uint32_t lba, const uint8_t *buf) {
     outb(ATA_LBA_HI, (lba >> 16) & 0xFF);
     outb(ATA_COMMAND, ATA_CMD_WRITE);
     if (ata_wait_drq()) return -1;
-    for (int i = 0; i < 256; i++) {
-        uint16_t w = (uint16_t)buf[i * 2] | ((uint16_t)buf[i * 2 + 1] << 8);
-        outw(ATA_DATA, w);
-    }
+    const uint8_t* src = buf;
+    uint32_t n = 256;
+    __asm__ volatile("rep outsw" : "+S"(src), "+c"(n) : "d"((uint16_t)ATA_DATA) : "memory");
     // Write cache flush is implicit on QEMU; on real hardware the device
     // completes before clearing BSY — wait for it.
     if (ata_wait_ready()) return -1;

@@ -36,7 +36,9 @@ BOOT_WAIT = 14          # seconds; kernel boots in ~8s, 14 is safe
 
 
 class OkVM:
-    def __init__(self, tag="vm", extra_net=True, disk=None):
+    def __init__(self, tag="vm", extra_net=True, disk=None, boot_disk=None):
+        # boot_disk: an installed-disk image (make disk) booted by its own GRUB instead of the ISO (QEMU runs with
+        # -no-reboot: a reboot ends it, the next boot is a new OkVM on the same image).
         os.makedirs(OUTDIR, exist_ok=True)
         self.LOG  = os.path.join(OUTDIR, f"{tag}_serial.log")
         self.SOCK = os.path.join(OUTDIR, f"{tag}_mon.sock")
@@ -46,7 +48,8 @@ class OkVM:
             try: os.unlink(f)
             except FileNotFoundError: pass
 
-        cmd = ["qemu-system-i386", "-m", os.environ.get("OKVM_MEM", "512"), "-cdrom", ISO, "-boot", "d", "-vga", os.environ.get("OKVM_VGA", "std"),
+        media = ["-drive", f"file={boot_disk},format=raw,if=ide,index=0", "-boot", "c"] if boot_disk else ["-cdrom", ISO, "-boot", "d"]
+        cmd = ["qemu-system-i386", "-m", os.environ.get("OKVM_MEM", "512"), *media, "-vga", os.environ.get("OKVM_VGA", "std"),
                "-serial", f"file:{self.LOG}", "-display", "none",
                "-monitor", f"unix:{self.SOCK},server,nowait", "-no-reboot"]
         if extra_net:  # e1000 + SLIRP user networking (10.0.2.x)

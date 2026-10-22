@@ -37,12 +37,22 @@ SECTIONS {
 
     /* Read-only data */
     .rodata : AT(0x100000 + (ADDR(.rodata) - 0xC0100000)) {
+        _rodata_start = .;              /* the end of the code (panic.c: what a return address may point into) */
         *(.rodata)
     }
 
     /* Initialized data */
     .data : AT(0x100000 + (ADDR(.data) - 0xC0100000)) {
         *(.data)
+    }
+
+    /* Symbol table of the panic screen (tools/ksyms.py). Last of the loaded sections before .bss: the first link
+       has it empty, the second fills it in, and nothing above moves between the two. */
+    . = ALIGN(4);
+    .ksyms : AT(0x100000 + (ADDR(.ksyms) - 0xC0100000)) {
+        _ksyms_start = .;
+        KEEP(*(.ksyms))
+        _ksyms_end = .;
     }
 
     /* Uninitialized data (BSS) */

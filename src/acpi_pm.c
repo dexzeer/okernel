@@ -89,6 +89,8 @@ void acpi_pm_poweroff(const struct acpi_pm* pm) {
 
 void acpi_pm_reboot(const struct acpi_pm* pm) {
     __asm__ volatile("cli");
+    extern void smp_stop_others(void) __attribute__((weak));   // smp.c (desktop only)
+    if (smp_stop_others) smp_stop_others();
     if (pm && pm->reset_ok) { outb((uint16_t)pm->reset_port, pm->reset_value); io_delay_us(200000); }
     for (int i = 0; i < 100000 && (inb(0x64) & 2); i++) io_delay_us(1);
     outb(0x64, 0xFE);                                            // pulse the CPU reset line of the keyboard controller

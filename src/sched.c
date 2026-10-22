@@ -294,7 +294,7 @@ int sched_spawn_elf(const char *path, char *const argv[], char *const envp[],
             used += sl;
         }
         // Tables: (argc+1 + envc+1 + 3 header words) * 4 bytes.
-        uint32_t need = used + 4 * (argc + 1) + 4 * (envc + 1) + 12;
+        uint32_t need = used + 4 * (argc + 1) + 4 * (envc + 1) + 12 + 15;   // + 15: the string area's alignment pad
         need = (need + 15) & ~15u;
         if (need > 4096) { process_destroy((uint32_t)pid); return -1; }
         uint32_t base = 4096 - need; // page offset of final_esp
@@ -302,7 +302,9 @@ int sched_spawn_elf(const char *path, char *const argv[], char *const envp[],
         uint32_t a_tab = final_esp + 12;
         uint32_t e_tab = a_tab + 4 * (argc + 1);
         uint32_t s_base = e_tab + 4 * (envc + 1);
-        s_base &= ~15u; // string area stays 16B-aligned (pad between)
+        // String area 16B-aligned, rounded UP past the tables. (It used to round down, onto the argv table: the
+        // table's NULL entries then zeroed the start of the strings, so `run prog arg` delivered argv[1] == "".)
+        s_base = (s_base + 15) & ~15u;
         // Header
         uint32_t h = base;
         sp0[h] = argc & 0xFF; sp0[h+1] = (argc >> 8) & 0xFF;

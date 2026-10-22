@@ -718,14 +718,14 @@ int sys_proc_exec(const char *path) {
         uint32_t path_len = 0;
         while (path[path_len] && path_len < 255) path_len++;
         path_len++; // NUL
-        uint32_t need = path_len + 4 * 2 + 4 * 1 + 12;
+        uint32_t need = path_len + 4 * 2 + 4 * 1 + 12 + 15;     // + 15: the string area's alignment pad
         need = (need + 15) & ~15u;
         if (need > 4096) return -1;
         uint32_t base = 4096 - need;
         uint32_t final_esp = (u_stack_top - 4096) + base;
         uint32_t a_tab = final_esp + 12;
         uint32_t e_tab = a_tab + 8;
-        uint32_t s_base = (e_tab + 4) & ~15u;
+        uint32_t s_base = (e_tab + 4 + 15) & ~15u;             // rounded UP: down landed on argv[1]/envp[0], zeroing the path's first bytes
         uint32_t h = base;
         sp0[h] = 1; sp0[h+1] = 0; sp0[h+2] = 0; sp0[h+3] = 0; // argc = 1
         sp0[h+4] = a_tab & 0xFF; sp0[h+5] = (a_tab >> 8) & 0xFF;
@@ -738,7 +738,8 @@ int sys_proc_exec(const char *path) {
         for (uint32_t b = 0; b < path_len; b++) sp0[s + b] = (uint8_t)path[b];
         sp0[w] = v & 0xFF; sp0[w+1] = (v >> 8) & 0xFF;
         sp0[w+2] = (v >> 16) & 0xFF; sp0[w+3] = (v >> 24) & 0xFF;
-        sp0[w+4] = sp0[w+5] = sp0[w+6] = sp0[w+7] = 0; // argv[1] + envp[0]
+        sp0[w+4] = sp0[w+5] = sp0[w+6] = sp0[w+7] = 0; // argv[1]
+        sp0[w+8] = sp0[w+9] = sp0[w+10] = sp0[w+11] = 0; // envp[0] (e_tab)
         cur->user_eip = entry;
         cur->user_esp = final_esp;
     }

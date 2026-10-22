@@ -45,3 +45,7 @@ kanarchy-i915test.*
 wifi_secret.txt
 wifi_usb_test.log
 wifigui_shots/
+build-ksyms/
+build-recovery/
+build-disk/
+kanarchy-disk.img

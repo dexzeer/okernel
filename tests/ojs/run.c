@@ -346,6 +346,17 @@ int main(int argc, char** argv) {
         }
         rc |= run_file(J, argv[i], module, strict);
     }
+    // OJS_TICK=1: a host event loop for scripts that keep their own timer queue. __tick() runs one macrotask and
+    // returns true while more are pending; the job queue is drained after each, as a browser does between tasks.
+    if (getenv("OJS_TICK")) {
+        static const char tick[] = "typeof __tick === 'function' && __tick()";
+        for (;;) {
+            ojsv r = ojs_eval(J, tick, sizeof tick - 1, "<tick>", OJS_EVAL_SCRIPT);
+            if (ojs_is_exception(r)) { rc |= report(J, "Uncaught (tick)"); continue; }
+            if (drain_jobs(J) < 0) rc |= report(J, "Uncaught (job)");
+            if (!ojs_to_bool(J, r)) break;
+        }
+    }
     if (getenv("OJS_GCSTATS")) {
         struct ojs_stats st;
         ojs_get_stats(J, &st);

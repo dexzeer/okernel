@@ -40,6 +40,10 @@ extern void isr11(void);
 extern void isr12(void);
 extern void isr13(void);
 extern void isr14(void);
+extern void isr16(void);
+extern void isr17(void);
+extern void isr18(void);
+extern void isr19(void);
 
 // INT 0x80 syscall stub (defined in isr.asm)
 extern void isr80(void);
@@ -111,7 +115,7 @@ void idt_init(void) {
         idt_set_gate(i, 0, 0, 0);
     }
 
-    // CPU exception handlers (ISRs 0-14)
+    // CPU exception handlers (ISRs 0-14, 16-19)
     idt_set_gate(0,  (uint32_t)isr0,  0x08, 0x8E);
     idt_set_gate(1,  (uint32_t)isr1,  0x08, 0x8E);
     idt_set_gate(2,  (uint32_t)isr2,  0x08, 0x8E);
@@ -127,6 +131,10 @@ void idt_init(void) {
     idt_set_gate(12, (uint32_t)isr12, 0x08, 0x8E);
     idt_set_gate(13, (uint32_t)isr13, 0x08, 0x8E);
     idt_set_gate(14, (uint32_t)isr14, 0x08, 0x8E);
+    idt_set_gate(16, (uint32_t)isr16, 0x08, 0x8E);
+    idt_set_gate(17, (uint32_t)isr17, 0x08, 0x8E);
+    idt_set_gate(18, (uint32_t)isr18, 0x08, 0x8E);
+    idt_set_gate(19, (uint32_t)isr19, 0x08, 0x8E);
 
     // IRQ handlers (IRQ 0-15 -> INT 32-47)
     idt_set_gate(32, (uint32_t)irq0,  0x08, 0x8E);
@@ -395,6 +403,12 @@ void isr_handler(int int_num) {
         }
     }
 
+    {
+        // The desktop kernel shows the panic screen, saves a crash record and reboots into the recovery system
+        // (panic.c); weak: the text builds have none and just stop here.
+        extern void panic_exception(int vec, uint32_t* frame) __attribute__((weak, noreturn));
+        if (panic_exception) panic_exception(int_num, (uint32_t*)(__builtin_frame_address(0) + 16));
+    }
     cli();
     while (1) { __asm__ volatile("hlt"); }
 }

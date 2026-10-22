@@ -59,6 +59,14 @@ static inline void mb(void) { __sync_synchronize(); }
 static inline void relax(void) { __asm__ volatile("pause" ::: "memory"); }
 
 int smp_ncpu(void) { return ncpu_total; }
+
+// Before a reset (acpi_pm_reboot): an INIT to every AP parks it in wait-for-SIPI, like Linux stopping the other CPUs.
+// QEMU under WHPX with -smp > 1 hung on the reset while the APs were still running their job loop.
+void smp_stop_others(void) {
+    if (!lapic_ready()) return;
+    for (int i = 1; i < ncpu_total && i < SMP_MAX_CPUS; i++)
+        if (cpus[i].apic_id != lapic_id()) lapic_ipi_init(cpus[i].apic_id);
+}
 uint32_t smp_cpu_apic_id(int cpu) { return (cpu >= 0 && cpu < SMP_MAX_CPUS) ? cpus[cpu].apic_id : 0; }
 
 static int cpu_of_stack(uint32_t esp) {

@@ -17,6 +17,7 @@
 #include "../userland/gen_forkexec.h"
 #include "../userland/gen_dbg2.h"
 #include "../userland/gen_dbg3.h"
+#include "../userland/gen_panic.h"
 
 static void seed_one(const char *name, const unsigned char *img,
                      unsigned int len) {
@@ -65,4 +66,5 @@ void userland_seed(void) {
     seed_one("/bin/forkexec", forkexec, forkexec_len);
     seed_one("/bin/dbg2", dbg2, dbg2_len);
     seed_one("/bin/dbg3", dbg3, dbg3_len);
+    seed_one("/bin/panic", panic, panic_len);
 }
