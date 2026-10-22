@@ -360,6 +360,7 @@ static int op_fx(const uint8_t* ip, uint32_t pc, struct fx* x) {
     case OP_HOLE_LOC: case OP_CLOSE: break;
     case OP_PUT_LOC: case OP_PUT_UPV: FX(1, -1); break;
     case OP_GET_FIELD: case OP_DELETE_FIELD: case OP_TO_PROPKEY: FX(1, 0); break;
+    case OP_TO_PROPKEY_REF: FX(2, 0); break;
     case OP_GET_FIELD_KEEP: FX(1, 1); break;
     case OP_PUT_FIELD: case OP_GET_ELEM: case OP_DELETE_ELEM: case OP_GET_PRIVATE: case OP_PRIVATE_IN: FX(2, -1); break;
     case OP_GET_ELEM_KEEP: FX(2, 0); break;

@@ -87,6 +87,7 @@ struct cfunc {
     int failed;
     int is_global_code;         // script top level: var/function go to the global object
     int is_eval;
+    int eval_dyn_vars;          // sloppy direct eval in a function: var names live in the caller's eval var object
     int in_params;              // compiling parameter initializers (direct eval restrictions)
     int is_module;
     int nparam_slots;
@@ -389,6 +390,10 @@ static void resolve(struct cfunc* c, struct str* name, struct scope* s, struct r
         // module import bindings are module cells (upvalues of the module function)
         r->d = d;
         r->tdz = is_tdz_kind(d->kind) || d->kind == D_IMPORT;
+        // parameters of a non-simple list are in their TDZ until bound (`function f(a = b, b)` throws): checked in the
+        // initializers themselves and in closures (which may run during them); the body only runs after binding
+        if (d->kind == D_PARAM && d->scope->fn && !(d->scope->fn->flags & FI_SIMPLE_PARAMS) && (c->in_params || d->scope->fn != c->fi))
+            r->tdz = 1;
         r->is_const = d->kind == D_CONST || d->kind == D_CLASSNAME || d->kind == D_FUNCNAME || d->kind == D_IMPORT;
         r->with_count = withs;
         if (s->kind == SC_SCRIPT || (s->kind == SC_EVAL && d->slot < 0 && !(d->flags & 0x40))) {
@@ -772,7 +777,11 @@ struct lval {
 };
 
 // evaluate the parts of an assignment target onto the stack
-static void lval_prepare(struct cfunc* c, struct node* n, struct lval* lv) {
+// defer_key: a plain `base[key] = v` converts the key only when it stores, after the right-hand side ran
+// (PutValue); compound and update forms read the target first, so the base is checked and the key converted up front
+static void lval_prepare_ex(struct cfunc* c, struct node* n, struct lval* lv, int defer_key);
+static void lval_prepare(struct cfunc* c, struct node* n, struct lval* lv) { lval_prepare_ex(c, n, lv, 0); }
+static void lval_prepare_ex(struct cfunc* c, struct node* n, struct lval* lv, int defer_key) {
     memset(lv, 0, sizeof *lv);
     lv->n = n;
     if (n->type == N_IDENT) { lv->kind = LV_NAME; return; }
@@ -797,7 +806,7 @@ static void lval_prepare(struct cfunc* c, struct node* n, struct lval* lv) {
     if (n->flags & NF_COMPUTED) {
         lv->kind = LV_ELEM;
         comp_expr(c, n->b);
-        op(c, OP_TO_PROPKEY, 0);
+        if (!defer_key) op(c, OP_TO_PROPKEY_REF, 0);
         return;
     }
     lv->kind = LV_FIELD;
@@ -1084,7 +1093,7 @@ static void comp_assign(struct cfunc* c, struct node* n) {
             return;
         }
         struct lval lv;
-        lval_prepare(c, t, &lv);
+        lval_prepare_ex(c, t, &lv, 1);
         comp_expr(c, n->b);
         lval_put(c, &lv);
         return;

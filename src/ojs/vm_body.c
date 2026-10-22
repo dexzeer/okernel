@@ -108,7 +108,7 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         [OP_GET_FIELD_KEEP] = &&L_OP_GET_FIELD_KEEP, [OP_PUT_FIELD] = &&L_OP_PUT_FIELD,
         [OP_GET_ELEM] = &&L_OP_GET_ELEM, [OP_GET_ELEM_KEEP] = &&L_OP_GET_ELEM_KEEP, [OP_PUT_ELEM] = &&L_OP_PUT_ELEM,
         [OP_DELETE_FIELD] = &&L_OP_DELETE_FIELD, [OP_DELETE_ELEM] = &&L_OP_DELETE_ELEM,
-        [OP_TO_PROPKEY] = &&L_OP_TO_PROPKEY, [OP_GET_SUPER] = &&L_OP_GET_SUPER,
+        [OP_TO_PROPKEY] = &&L_OP_TO_PROPKEY, [OP_TO_PROPKEY_REF] = &&L_OP_TO_PROPKEY_REF, [OP_GET_SUPER] = &&L_OP_GET_SUPER,
         [OP_GET_SUPER_KEEP] = &&L_OP_GET_SUPER_KEEP, [OP_PUT_SUPER] = &&L_OP_PUT_SUPER,
         [OP_SUPER_CTOR] = &&L_OP_SUPER_CTOR, [OP_GET_PRIVATE] = &&L_OP_GET_PRIVATE,
         [OP_PUT_PRIVATE] = &&L_OP_PUT_PRIVATE, [OP_DEFINE_PRIVATE] = &&L_OP_DEFINE_PRIVATE,
@@ -452,6 +452,13 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             TOP = v;
             break;
         }
+        case OP_TO_PROPKEY_REF: L_OP_TO_PROPKEY_REF:   // [obj, key]: an assignment target's base is checked before its key is converted
+            if (jv_is_nullish(sp[-2])) {
+                SYNC();
+                throw_type(J, "Cannot set properties of %s", jv_is_null(sp[-2]) ? "null" : "undefined");
+                goto exception;
+            }
+            /* fall through */
         case OP_TO_PROPKEY: L_OP_TO_PROPKEY: {
             SYNC();
             a = TOP;

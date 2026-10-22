@@ -218,7 +218,7 @@ static void declare_var(struct parser* P, struct str* name, uint32_t pos, struct
     for (struct scope* s = P->S; s; s = s->parent) {
         struct decl* d = scope_find(s, name);
         if (d && (is_lexical(d->kind) || (d->kind == D_FUNC && (d->flags & DF_LEX_FUNC)) ||
-                  (d->kind == D_CATCH && d->node && d->node->type != N_IDENT))) {
+                  (d->kind == D_CATCH && (d->xflags & DX_CATCH_PAT)))) {
             perr(P, pos, "Identifier '%S' has already been declared", name);
             return;
         }
@@ -646,8 +646,11 @@ static struct node* parse_primary(struct parser* P) {
                 if (!(f->flags & FI_ARROW)) { ok = 1; break; }
             }
             if (!ok) { perr(P, pos, "new.target expression is not allowed here"); return 0; }
-            for (struct funcinfo* f = P->F; f && (f->flags & FI_ARROW); f = f->parent) f->flags |= FI_USES_THIS;
-            P->F->flags |= FI_USES_THIS | FI_USES_NEW_TARGET;
+            // an arrow's new.target is its enclosing function's: that one needs the binding as well
+            for (struct funcinfo* f = P->F; f; f = f->parent) {
+                f->flags |= FI_USES_THIS | FI_USES_NEW_TARGET;
+                if (!(f->flags & FI_ARROW)) break;
+            }
             next(P);
             return mk(P, N_NEW_TARGET, pos);
         }

@@ -354,6 +354,20 @@ static void pop_block(struct cfunc* c) { if (c->blocks) c->blocks = c->blocks->p
 // The protected ranges closed for inlined finally blocks are reopened by
 // unwind_reopen after the jump.
 static void comp_stmts_in(struct cfunc* c, struct node* list);
+// a finally block: its own statements do not change the completion value unless it ends abruptly (break /
+// continue inside it), so the value is saved, the block starts from undefined, and a normal end restores it
+static void comp_finally(struct cfunc* c, struct node* fin) {
+    if (c->completion_slot < 0) { comp_stmt(c, fin); return; }
+    int tmp = new_local(c);
+    op16(c, OP_GET_LOC, (uint32_t)c->completion_slot, 1);
+    op16(c, OP_PUT_LOC, (uint32_t)tmp, -1);
+    op(c, OP_UNDEF, 1);
+    op16(c, OP_PUT_LOC, (uint32_t)c->completion_slot, -1);
+    comp_stmt(c, fin);
+    op16(c, OP_GET_LOC, (uint32_t)tmp, 1);
+    op16(c, OP_PUT_LOC, (uint32_t)c->completion_slot, -1);
+}
+
 static void unwind(struct cfunc* c, struct cblock* target, int keep_top) {
     for (struct cblock* b = c->blocks; b && b != target; b = b->prev) {
         switch (b->kind) {
@@ -380,7 +394,7 @@ static void unwind(struct cfunc* c, struct cblock* target, int keep_top) {
             struct cblock* saved = c->blocks;
             c->blocks = b->prev;   // the finally body is outside this try
             int saved_sp = c->sp;
-            comp_stmt(c, b->finally_node);   // a block: enters its scope
+            comp_finally(c, b->finally_node);   // a block: enters its scope
             c->sp = saved_sp;
             c->blocks = saved;
             break;
@@ -730,7 +744,7 @@ static void comp_try(struct cfunc* c, struct node* n) {
         pop_block(c);   // the finally block itself is not protected by this try
         exc_close(c, fexc);
         // normal completion: run finally inline
-        comp_stmt(c, fin);
+        comp_finally(c, fin);
         uint32_t done = jump(c, OP_JMP, 0);
         // abrupt completion (throw / generator return): save, run finally, rethrow
         fexc->handler = here(c);
@@ -811,7 +825,9 @@ static void comp_stmt(struct cfunc* c, struct node* n) {
             struct funcinfo* fi = n->u.fn;
             struct scope* vs = c->fi->body_scope;
             struct decl* vd = scope_find(vs, fi->name);
-            if (vd && vd->kind == D_VAR && (vd->flags & 0x80)) {
+            // (in a sloppy direct eval inside a function the var was moved to the caller's dynamic scope)
+            // a top-level function of the same name is updated too (B.3.3: the var binding exists either way)
+            if (vd ? (vd->kind == D_VAR && (vd->flags & 0x80)) || (vd->kind == D_FUNC && !(vd->flags & DF_LEX_FUNC)) : c->eval_dyn_vars) {
                 load_name(c, fi->name, n->scope, n->pos, 0);
                 store_name(c, fi->name, vs, n->pos, 0, 0);
             }
@@ -908,7 +924,7 @@ static int annexb_ok(struct funcinfo* fi, struct node* fn) {
     for (struct scope* x = s->parent; x; x = x->parent) {
         struct decl* d = scope_find(x, name);
         if (d && (d->kind == D_LET || d->kind == D_CONST || d->kind == D_CLASS ||
-                  (d->kind == D_FUNC && (d->flags & DF_LEX_FUNC)) || (d->kind == D_CATCH && d->node && d->node->type != N_IDENT)))
+                  (d->kind == D_FUNC && (d->flags & DF_LEX_FUNC)) || (d->kind == D_CATCH && (d->xflags & DX_CATCH_PAT))))
             return 0;
         if (x == fi->body_scope) break;
     }

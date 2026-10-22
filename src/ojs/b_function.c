@@ -80,7 +80,7 @@ static jv fn_bind(ojs* J, jv this_v, int argc, jv* argv, int magic) {
                 double t = d < 0 ? -(double)(int64_t)-d : (double)(int64_t)d;
                 if (d > 9007199254740992.0 || d < -9007199254740992.0) t = d;
                 len = t - (double)b->nargs;
-                if (len < 0) len = 0;
+                if (!(len > 0)) len = 0;     // also -0 (a target length in (-1, 0))
             }
         }
     }

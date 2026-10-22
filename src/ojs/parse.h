@@ -53,6 +53,7 @@ enum { D_VAR = 1, D_LET, D_CONST, D_FUNC, D_CLASS, D_PARAM, D_CATCH, D_IMPORT, D
 #define DF_IMPORT_NS  0x08      // import * as x
 #define DF_ASSIGNED   0x10      // written after initialization
 #define DF_PARAM_DUP  0x20
+#define DX_CATCH_PAT  0x01      // D_CATCH bound by a destructuring pattern (no Annex B.3.4 var redeclaration)
 
 struct scope;
 struct funcinfo;
@@ -61,7 +62,7 @@ struct decl {
     struct str* name;
     uint8_t kind;
     uint8_t flags;
-    uint16_t pad;
+    uint16_t xflags;            // DX_*
     struct node* node;          // declaring node (function/class node for D_FUNC/D_CLASS)
     struct decl* next;          // scope order
     struct scope* scope;
