@@ -32,6 +32,8 @@ struct wres {
     int blen;
     uint8_t lazy, near_;    // RES_IMG: only <img loading=lazy> uses it; set once its box came within reach of the viewport
     uint8_t stream;         // RES_REQ: fetch() wants the body in pieces (see wdoc_fetch_head)
+    uint8_t nocors;         // RES_REQ: a media element's own load (no crossorigin attribute): no CORS check, like a no-cors fetch
+    uint8_t cancelled;      // RES_REQ: the page aborted it (XHR abort / AbortController): okai drops the transfer, nothing is delivered
 };
 
 struct wdimg {
@@ -790,12 +792,13 @@ static int cors_ok(struct wdoc* d, const char* url, const char* headers) {
 int wdoc_fetch_head(struct wdoc* d, int id, int status, const char* headers, const char* final_url) {
     if (id < 0 || id >= d->nres || d->res[id].kind != RES_REQ || !d->js) return -1;
     struct wres* r = &d->res[id];
-    if (!cors_ok(d, final_url && final_url[0] ? final_url : r->url, headers)) return -1;
+    if (r->cancelled) return -1;
+    if (!r->nocors && !cors_ok(d, final_url && final_url[0] ? final_url : r->url, headers)) return -1;
     return wjs_fetch_head(d->js, id, status, headers, final_url ? final_url : r->url);
 }
 
 int wdoc_fetch_chunk(struct wdoc* d, int id, const char* bytes, int len) {
-    if (id < 0 || id >= d->nres || d->res[id].kind != RES_REQ || !d->js) return 0;
+    if (id < 0 || id >= d->nres || d->res[id].kind != RES_REQ || !d->js || d->res[id].cancelled) return 0;
     return wjs_fetch_chunk(d->js, id, bytes, len);
 }
 
@@ -806,9 +809,15 @@ void wdoc_fetch_done2(struct wdoc* d, int id, const char* bytes, int len, const 
     int streamed = len == WDOC_STREAM_END && r->kind == RES_REQ;       // the body was delivered piece by piece
     int failed = !streamed && (len < 0 || !bytes);
     (void)ctype;
+    if (r->kind == RES_REQ && r->cancelled) {        // the page gave up on it: finished, nobody is told
+        r->state = RS_FAILED;
+        w_free(r->headers); r->headers = 0;
+        w_free(r->body); r->body = 0;
+        return;
+    }
     if (r->kind == RES_SCRIPT || r->kind == RES_REQ) {
         r->state = failed ? RS_FAILED : RS_DONE;
-        if (r->kind == RES_REQ && !failed && !streamed && !cors_ok(d, final_url && final_url[0] ? final_url : r->url, headers)) {
+        if (r->kind == RES_REQ && !failed && !streamed && !r->nocors && !cors_ok(d, final_url && final_url[0] ? final_url : r->url, headers)) {
             w_log("[js] CORS: blocked cross-origin response from %s\n", r->url);
             status = 0;
             failed = 1;
@@ -1115,6 +1124,19 @@ int wdoc_res_script(struct wdoc* d, const char* url) {
 int wdoc_res_stream(struct wdoc* d, int id) { return id >= 0 && id < d->nres && d->res[id].kind == RES_REQ && d->res[id].stream; }
 
 int wdoc_res_request_stream(struct wdoc* d, int id) { if (id >= 0 && id < d->nres) d->res[id].stream = 1; return id; }
+int wdoc_res_request_nocors(struct wdoc* d, int id) { if (id >= 0 && id < d->nres) d->res[id].nocors = 1; return id; }
+int wdoc_res_cancel(struct wdoc* d, int id) {
+    if (id < 0 || id >= d->nres || d->res[id].kind != RES_REQ || d->res[id].state >= RS_DONE) return -1;
+    struct wres* r = &d->res[id];
+    r->cancelled = 1;
+    if (r->state == RS_PENDING) {                   // not sent yet: it never will be
+        r->state = RS_FAILED;
+        w_free(r->headers); r->headers = 0;
+        w_free(r->body); r->body = 0;
+    }
+    return 0;
+}
+int wdoc_res_cancelled(struct wdoc* d, int id) { return id >= 0 && id < d->nres && d->res[id].kind == RES_REQ && d->res[id].cancelled; }
 
 int wdoc_res_request(struct wdoc* d, const char* url, const char* method, const char* headers,
                      const char* body, int blen) {

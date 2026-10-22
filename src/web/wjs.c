@@ -296,6 +296,13 @@ NATIVE(n_log) {
     ojs_free_cstring(ctx, (char*)s);
     return OJS_UNDEFINED;
 }
+NATIVE(n_fetch_cancel) {        // the page aborted request `id`: stop the transfer, deliver nothing more
+    (void)this_val;
+    struct wjs* js = JSX(ctx);
+    int32_t id = -1;
+    if (argc > 0) ojs_to_int32(ctx, &id, argv[0]);
+    return ojs_int(wdoc_res_cancel(js->doc, id));
+}
 NATIVE(n_now) {
     (void)this_val; (void)argc; (void)argv;
     struct wjs* js = JSX(ctx);
@@ -390,6 +397,7 @@ NATIVE(n_fetch) {
     if (url && method && headers) id = wdoc_res_request(js->doc, url, method, headers, body, (int)bl);
     if (id >= 0) js->flags |= WJS_FETCH;
     if (id >= 0 && argc > 4 && ojs_to_bool(ctx, argv[4])) wdoc_res_request_stream(js->doc, id);
+    if (id >= 0 && argc > 5 && ojs_to_bool(ctx, argv[5])) wdoc_res_request_nocors(js->doc, id);
     if (url) ojs_free_cstring(ctx, (char*)url);
     if (method) ojs_free_cstring(ctx, (char*)method);
     if (headers) ojs_free_cstring(ctx, (char*)headers);
@@ -484,7 +492,8 @@ static const struct ojs_func_entry env_funcs[] = {
     { "userAgent", n_user_agent, 0 },
     { "pushURL", n_push_url, 2 },
     { "historyGo", n_history_go, 1 },
-    { "fetch", n_fetch, 5 },
+    { "fetch", n_fetch, 6 },
+    { "fetchCancel", n_fetch_cancel, 1 },
     { "store", n_store, 4 },
     { "cookie", n_cookie, 1 },
     { "random", n_random, 1 },
@@ -1390,7 +1399,7 @@ struct wjs* wjs_new(struct wdoc* doc) {
     ojsv* hv[] = { &js->hooks, &js->h_msg, &js->h_fhead, &js->h_fdata, &js->h_dispatch, &js->h_ui, &js->h_fetch, &js->h_nextdue, &js->h_rundue, &js->h_frame,
                    &js->h_dcl, &js->h_load, &js->h_script, &js->h_image, &js->h_proto, &js->h_report,
                    &js->h_mo, &js->h_click, &js->h_ready, &js->h_obs, &js->proto_svg, &js->proto_svgroot,
-                   &js->proto_math, &js->proto_text, &js->proto_comment, &js->proto_doc, &js->proto_frag };
+                   &js->proto_math, &js->proto_text, &js->proto_comment, &js->proto_doc, &js->proto_frag, &js->proto_xml };
     for (unsigned i = 0; i < sizeof hv / sizeof hv[0]; i++) *hv[i] = OJS_UNDEFINED;
     if (!wjs_grow_nodes(js)) { w_free(js); return 0; }
 #if defined(__i386__)

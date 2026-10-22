@@ -16,6 +16,7 @@ check() {  # page pattern...
 check media.html 'EV loadedmetadata' 'EV playing' 'play() resolved' 'EV ended' 'RESULT dur=3.01 size=320x180 frames=90 ' 'probably'
 check mediamp4.html 'EV loadedmetadata' 'EV playing' 'play() resolved' 'EV ended' 'RESULT dur=3.0[0-9] size=320x180 frames=90 ' 'mp4/avc: \[probably\]'
 check streams.html 'RESULT ALLPASS'
+check media_autoplay.html 'RESULT ALLPASS'
 check mse.html 'SB video buffered=1 end=3.0 audio buffered=0 element buffered=1' 'sourceopen readyState=open' 'EV loadedmetadata' 'EV seeked' 'EV ended' 'RESULT dur=3.00 size=320x180 frames=1[0-9][0-9] seeked=true'
 check msemp4.html 'sourceopen readyState=open' 'EV loadedmetadata' 'EV seeked' 'EV ended' 'RESULT dur=3.00 size=320x180 frames=1[0-9][0-9] seeked=true'
 check mse_offset.html 'first: video 0.0-3.0 audio' 'second: video 0.0-6.0 audio -0.0-6.0 element 0.0-6.0' 'after audio remove: video 0.0-6.0 audio 1.5-6.0' 'window: video 0.0-6.0,9.0-10.0' 'reopened: open video 0.0-9.0' 'RESULT t=9.00 dur=9.00 frames=2[0-9][0-9]'

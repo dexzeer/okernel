@@ -416,6 +416,56 @@ static void test_mp4_video(const char* mp4, const char* yuvname, long chunk, int
     free(yuv);
 }
 
+// A player switching quality appends another init segment (ftyp+moov) to the same SourceBuffer while frames of the current
+// level are still queued. Those frames must decode with the decoder state they belong to: the engine once replaced the
+// H.264 decoder the moment the init segment arrived, and every queued P/B frame then decoded without its references.
+// Here the "other level" is the same stream, so the frames are checked bit-exactly against the reference.
+static void test_mp4_requality(void) {
+    printf("mp4 video: an init segment appended mid-play (quality switch)\n");
+    long n, yn;
+    uint8_t* file = slurp("meng_h264_frag.mp4", &n);
+    uint8_t* yuv = slurp("meng_h264.yuv", &yn);
+    const int W = 320, H = 180, FS = W * H * 3 / 2;
+    long box[16], nb = 0;                                       // top-level box offsets
+    for (long o = 0; o + 8 <= n && nb < 15; ) {
+        box[nb++] = o;
+        long len = (long)file[o] << 24 | (long)file[o + 1] << 16 | (long)file[o + 2] << 8 | file[o + 3];
+        if (len < 8) break;
+        o += len;
+    }
+    box[nb] = n;
+    CHECK(nb >= 8, "unexpected layout of meng_h264_frag.mp4 (%ld boxes)", nb);   // ftyp moov (moof mdat) x3 ...
+    long init_end = box[2], frag3 = box[6], frag3_end = box[8];
+    reset_card();
+    struct meng* m = meng_new(&env);
+    int sb = meng_sb_add(m, 3);
+    CHECK(meng_sb_append(m, sb, file, (size_t)frag3) == 0, "append init + fragments 1-2");
+    meng_seek(m, 0.1);                                          // the stream starts two frames in: players seek into the buffered range
+    for (int i = 0; i < 5; i++) step(m);
+    meng_play(m);
+    for (int i = 0; i < 20; i++) step(m);                       // 0.2 s: some of fragment 1 is decoded, the rest is queued
+    CHECK(meng_sb_append(m, sb, file, (size_t)init_end) == 0, "append the init segment again");
+    CHECK(meng_sb_append(m, sb, file + frag3, (size_t)(frag3_end - frag3)) == 0, "append fragment 3");
+    meng_end_of_stream(m);
+    for (int i = 0; i < 3000 && meng_current_time(m) < 0.7; i++) step(m);
+    CHECK(meng_current_time(m) >= 0.7, "playback stalled at %.2f s after the re-append (decoded %u)", meng_current_time(m), meng_frames_decoded(m));
+    meng_pause(m);
+    for (int i = 0; i < 5; i++) step(m);
+    double tp = meng_current_time(m);
+    int idx = (int)(tp * 30 + 0.001) - 2;                        // the fragmented stream starts two frames in (see test_mp4_video)
+    if (idx < 1) idx = 1;
+    if (idx > 85) idx = 85;
+    int bad = frame_matches(meng_get_frame(m), yuv + (long)idx * FS, W, H);
+    int bad1 = frame_matches(meng_get_frame(m), yuv + (long)(idx - 1) * FS, W, H);
+    CHECK(bad == 0 || bad1 == 0, "frame at %.2f s after the re-append is neither %d nor %d (%d / %d wrong pixels)", tp, idx, idx - 1, bad, bad1);
+    meng_play(m);
+    for (int i = 0; i < 6000 && !meng_ended(m); i++) step(m);
+    CHECK(meng_ended(m), "video did not end (t=%.2f)", meng_current_time(m));
+    meng_free(m);
+    free(file);
+    free(yuv);
+}
+
 // cubic interpolation of the reference at a fractional frame position
 static double interp_ref(const int16_t* ref, long frames, double pos, int ch) {
     long i = (long)floor(pos);
@@ -546,6 +596,7 @@ int main(int argc, char** argv) {
     test_buffered_and_remove();
     test_mp4_video("meng_h264.mp4", "meng_h264.yuv", 6000, 0);
     test_mp4_video("meng_h264_frag.mp4", "meng_h264.yuv", 3333, 2);
+    test_mp4_requality();
     test_mp4_audio("meng_aac44.mp4", "meng_aac44.ref", 44100);
     test_mp4_audio("meng_aac24_mono.mp4", "meng_aac24_mono.ref", 24000);
     test_mp4_av();

@@ -1674,7 +1674,12 @@ static int apply_prop(struct dctx* c, const struct propdef* pd, const char* v, i
             int k = kw_lookup(KW_VALIGN, v, vl);
             if (k >= 0) emit_kw(c, P_VERTICAL_ALIGN, k);
             else emit_len(c, P_VERTICAL_ALIGN, v, vl, 4);
-        } else emit_len(c, pd->prop, v, vl, pd->flags);
+        } else {
+            const char* s = v; int l = vl; cv_trim(&s, &l);
+            if ((pd->prop == P_LETTER_SPACING || pd->prop == P_WORD_SPACING) && w_ieq(s, l, "normal"))
+                emit_kw(c, pd->prop, 0);   // = 0 (css_style): resets an inherited value (Pure's .pure-g -0.31em -> .pure-u normal)
+            else emit_len(c, pd->prop, v, vl, pd->flags);
+        }
         break;
     case H_COLOR: emit_color(c, pd->prop, v, vl); break;
     case H_BGCOLOR: emit_color(c, P_BG_COLOR, v, vl); break;

@@ -1,0 +1,65 @@
+<!doctype html>
+<html><head><title>xml / offsetParent / xhr</title></head>
+<body>
+<div id="p" style="position:absolute;left:30px;top:40px;border:5px solid red"><div id="c" style="margin-top:7px">c</div></div>
+<div id="s"><span id="b">x</span></div>
+<script>
+// DOMParser XML documents keep names exactly (a DASH manifest's indexRange), offsetParent chains end at null (video.js
+// findPosition loops until it does), and XMLHttpRequest honours overrideMimeType x-user-defined, reports progress and
+// can be aborted (players sniff a container from the first bytes of a whole-file request, then abort it).
+var fails = [], pending = 2;
+function ok(c, m) { if (!c) fails.push(m); }
+function finish() { if (--pending) return; console.log(fails.length ? 'RESULT FAIL ' + fails.join(' | ') : 'RESULT ALLPASS'); }
+
+var x = new DOMParser().parseFromString('<?xml version="1.0"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period><!-- c --><SegmentBase indexRange="740-2247"><Initialization range="0-739"/></SegmentBase><BaseURL>/a?b=1&amp;c=2</BaseURL></Period></MPD>', 'application/xml');
+ok(x.documentElement.nodeName === 'MPD', 'root ' + x.documentElement.nodeName);
+ok(x.documentElement.namespaceURI === 'urn:mpeg:dash:schema:mpd:2011', 'ns ' + x.documentElement.namespaceURI);
+var sb = x.getElementsByTagName('SegmentBase')[0];
+ok(sb && sb.getAttribute('indexRange') === '740-2247', 'indexRange');
+ok(sb && Array.prototype.map.call(sb.attributes, function (a) { return a.name; }).join() === 'indexRange', 'attr names');
+ok(sb && sb.firstChild && sb.firstChild.tagName === 'Initialization', 'child tag');
+ok(x.getElementsByTagName('segmentbase').length === 0, 'case-sensitive lookup');
+ok(x.getElementsByTagName('BaseURL')[0].textContent === '/a?b=1&c=2', 'entities');
+ok(new DOMParser().parseFromString('<a><b></a>', 'text/xml').documentElement.nodeName === 'parsererror', 'parsererror');
+ok(new DOMParser().parseFromString('<p>hi</p>', 'text/html').body.firstChild.tagName === 'P', 'html still html');
+
+ok(document.body.offsetParent === null, 'body.offsetParent');
+ok(document.documentElement.offsetParent === null, 'html.offsetParent');
+ok(document.getElementById('b').offsetParent === document.body, 'static chain');
+var c = document.getElementById('c');
+ok(c.offsetParent === document.getElementById('p'), 'positioned parent');
+ok(c.offsetTop === 7 && c.offsetLeft === 0, 'offsetTop/Left relative ' + c.offsetTop + ',' + c.offsetLeft);
+ok(document.getElementById('p').offsetTop === 40, 'abs offsetTop ' + document.getElementById('p').offsetTop);
+var f = document.createElement('div'); f.style.position = 'fixed'; document.body.appendChild(f);
+ok(f.offsetParent === null, 'fixed');
+ok(document.createElement('div').offsetParent === null, 'detached');
+
+// XHR over a blob: URL with bytes 0..255
+var bytes = new Uint8Array(256); for (var i = 0; i < 256; i++) bytes[i] = i;
+var url = URL.createObjectURL(new Blob([bytes]));
+var r = new XMLHttpRequest(), states = [], progress = 0;
+r.open('GET', url);
+r.overrideMimeType('text/plain; charset=x-user-defined');
+r.onreadystatechange = function () { if (states[states.length - 1] !== r.readyState) states.push(r.readyState); };
+r.onprogress = function (e) { progress++; ok(e.loaded > 0, 'progress loaded'); };
+r.onload = function () {
+    var t = r.responseText, good = t.length === 256;
+    for (var i = 0; good && i < 256; i++) if ((t.charCodeAt(i) & 0xFF) !== i) good = false;
+    ok(good, 'x-user-defined bytes');
+    ok(states.join() === '2,3,4', 'readyStates ' + states.join());
+    ok(progress >= 1, 'progress events');
+    finish();
+};
+r.send();
+
+var a = new XMLHttpRequest(), ev = [];
+a.open('GET', url);
+a.onabort = function () { ev.push('abort'); };
+a.onloadend = function () { ev.push('loadend'); };
+a.onload = function () { ev.push('load'); };
+a.send();
+a.abort();
+ok(a.readyState === 0 && a.status === 0, 'state after abort ' + a.readyState);
+setTimeout(function () { ok(ev.join() === 'abort,loadend', 'abort events ' + ev.join()); finish(); }, 50);
+</script>
+</body></html>

@@ -36,6 +36,7 @@ class DOMException extends Error {
 const LISTENERS = new WeakMap();   // target -> Map(type -> [{cb, capture, once, passive}])
 const HANDLERS = new WeakMap();    // target -> Map(type -> fn)  (onclick = ...)
 const INLINE = new WeakMap();      // element -> Map(type -> {src, fn})
+const XMLNS = new WeakMap();       // element of an XML document -> its namespace URI
 
 class Event {
     constructor(type, init) {
@@ -70,6 +71,14 @@ class Event {
     }
 }
 Event.NONE = 0; Event.CAPTURING_PHASE = 1; Event.AT_TARGET = 2; Event.BUBBLING_PHASE = 3;
+// WebIDL members are enumerable (class syntax makes them non-enumerable): libraries copy events with for-in. video.js's
+// fixEvent() builds its event that way; without 'type' every media event reached no handler and the player stayed paused.
+for (const k of Object.getOwnPropertyNames(Event.prototype)) {
+    if (k === 'constructor') continue;
+    const d = Object.getOwnPropertyDescriptor(Event.prototype, k);
+    d.enumerable = true;
+    Object.defineProperty(Event.prototype, k, d);
+}
 
 class CustomEvent extends Event {
     constructor(type, init) { super(type, init); this.detail = init && init.detail !== undefined ? init.detail : null; }
@@ -431,6 +440,7 @@ function protoFor(name, ns, type) {
     if (type === 1) {
         if (ns === 1) return name === 'svg' ? SVGSVGElement.prototype : SVGGraphicsElement.prototype;
         if (ns === 2) return MathMLElement.prototype;
+        if (ns === 3) return Element.prototype;          // an element of an XML document
         const p = PROTO_BY_TAG[name];
         if (p) return p;
         // custom elements start as HTMLElement: the upgrade runs the
@@ -592,7 +602,9 @@ const ParentNode = {
     querySelectorAll(sel) { return nodeList(W.query(this, String(sel), true)); },
     getElementsByTagName(tag) {
         tag = String(tag);
-        return htmlCollection(tag === '*' ? W.query(this, '*', true) : W.byTag(this, tag.toLowerCase()));
+        // HTML elements match the lowercased name; elements of an XML document match exactly
+        if (tag === '*') return htmlCollection(W.query(this, '*', true));
+        return htmlCollection(W.byTag(this, W.ns(this) === 3 ? tag : tag.toLowerCase()));
     },
     getElementsByClassName(cls) {
         const parts = String(cls).trim().split(/\s+/).filter(Boolean);
@@ -771,10 +783,12 @@ function rectOf(el) {
     return new DOMRect(r[0], r[1] - W.view()[2], r[2], r[3]);
 }
 accessor(Element.prototype, 'tagName', function () { return this.nodeName; });
-accessor(Element.prototype, 'localName', function () { return W.name(this); });
-accessor(Element.prototype, 'prefix', function () { return null; });
+accessor(Element.prototype, 'localName', function () { const n = W.name(this), i = W.ns(this) === 3 ? n.indexOf(':') : -1; return i >= 0 ? n.slice(i + 1) : n; });
+accessor(Element.prototype, 'prefix', function () { const n = W.name(this), i = W.ns(this) === 3 ? n.indexOf(':') : -1; return i >= 0 ? n.slice(0, i) : null; });
 accessor(Element.prototype, 'namespaceURI', function () {
-    return ['http://www.w3.org/1999/xhtml', 'http://www.w3.org/2000/svg', 'http://www.w3.org/1998/Math/MathML'][W.ns(this)];
+    const ns = W.ns(this);
+    if (ns === 3) { const u = XMLNS.get(this); return u === undefined ? null : u; }
+    return ['http://www.w3.org/1999/xhtml', 'http://www.w3.org/2000/svg', 'http://www.w3.org/1998/Math/MathML'][ns];
 });
 const reflect = (P, prop, attr) => accessor(P, prop,
     function () { const v = W.getAttr(this, attr); return v === null ? '' : v; },
@@ -833,9 +847,35 @@ for (const [p, i] of [['clientWidth', 2], ['clientHeight', 3], ['offsetWidth', 2
     });
 accessor(Element.prototype, 'clientTop', function () { return 0; });
 accessor(Element.prototype, 'clientLeft', function () { return 0; });
-accessor(Element.prototype, 'offsetTop', function () { const r = W.rect(this); return r ? Math.round(r[1]) : 0; });
-accessor(Element.prototype, 'offsetLeft', function () { const r = W.rect(this); return r ? Math.round(r[0]) : 0; });
-accessor(Element.prototype, 'offsetParent', function () { return W.rect(this) ? document.body : null; });
+// CSSOM View: offsetParent is null for <body>, <html>, a fixed box and an element without a box; otherwise the nearest positioned
+// ancestor, a td/th/table ancestor of a static element, or <body>. Loops like `while (el.offsetParent) el = el.offsetParent`
+// (video.js findPosition, jQuery offset) end at null - a constant <body> made them spin until the script budget killed them.
+function offsetParentOf(el) {
+    if (el === document.body || el === document.documentElement || !W.rect(el)) return null;
+    const b = W.cbox(el);
+    if (!b || b[0] === 3) return null;
+    for (let p = W.parent(el); p && W.ntype(p) === 1; p = W.parent(p)) {
+        if (p === document.body) return p;
+        const pb = W.cbox(p);
+        if (!pb) return null;
+        if (pb[0] !== 0) return p;
+        if (b[0] === 0 && W.ns(p) === 0) { const t = W.name(p); if (t === 'td' || t === 'th' || t === 'table') return p; }
+    }
+    return document.body;
+}
+// offsetLeft / offsetTop: the border edge relative to the offsetParent's padding edge (document coordinates under <body>)
+function offsetXY(el, i) {
+    if (el === document.body) return 0;
+    const r = W.rect(el);
+    if (!r) return 0;
+    const p = offsetParentOf(el);
+    if (!p || p === document.body) return Math.round(r[i]);
+    const pr = W.rect(p), pb = W.cbox(p);
+    return Math.round(r[i] - (pr ? pr[i] : 0) - (pb ? pb[i ? 1 : 2] : 0));
+}
+accessor(Element.prototype, 'offsetTop', function () { return offsetXY(this, 1); });
+accessor(Element.prototype, 'offsetLeft', function () { return offsetXY(this, 0); });
+accessor(Element.prototype, 'offsetParent', function () { return offsetParentOf(this); });
 accessor(Element.prototype, 'scrollTop', function () {
     return (this === document.documentElement || this === document.body) ? W.view()[2] : 0;
 }, function (v) { if (this === document.documentElement || this === document.body) W.scroll(Math.max(0, +v | 0)); });
@@ -1003,7 +1043,7 @@ function innerTextOf(el) {
 }
 accessor(HE, 'innerText', function () { return innerTextOf(this); }, function (v) { W.setText(this, v === null ? '' : String(v)); });
 accessor(HE, 'outerText', function () { return innerTextOf(this); });
-accessor(HE, 'offsetParent', function () { return W.rect(this) ? document.body : null; });
+accessor(HE, 'offsetParent', function () { return offsetParentOf(this); });
 methods(HE, {
     showPopover() {}, hidePopover() {}, togglePopover() { return false; },
     attachInternals() { return { setFormValue() {}, setValidity() {}, states: new Set(), form: null, labels: [] }; }
@@ -1371,6 +1411,17 @@ function mediaDecorative(el) {
 // only asked for while less than MEDIA_AHEAD_S seconds are buffered ahead of the playhead. A server that ignores Range sends
 // the whole file in the first answer, which is then the one and only chunk.
 const MEDIA_CHUNK = 2 * 1024 * 1024, MEDIA_AHEAD_S = 45;
+// One range of the element's own load. Without a crossorigin attribute this is a no-cors request in a browser: a cross-origin
+// server that sends no Access-Control-Allow-Origin (googlevideo behind an Invidious redirect) still plays.
+function mediaGet(el, src, range) {
+    const nocors = W.getAttr(el, 'crossorigin') === null;
+    return new Promise((resolve, reject) => {
+        startRequest('GET', src, new Headers({ Range: range }), null, (status, statusText, raw, body, url) => {
+            if (!status) { reject(new TypeError('Failed to fetch')); return; }
+            resolve(new Response(body, { status, statusText, headers: parseHeaders(raw), url: url || src }));
+        }, null, nocors);
+    });
+}
 function mediaStream(el, s, gen, src, sb) {
     const chunk = typeof G.__mediaChunk === 'number' && G.__mediaChunk > 0 ? G.__mediaChunk : MEDIA_CHUNK;   // (tests make it small)
     let pos = 0, total = -1;
@@ -1383,7 +1434,7 @@ function mediaStream(el, s, gen, src, sb) {
             if ((b.length ? b[b.length - 1] : 0) - t > MEDIA_AHEAD_S) { s.netState = 1; setTimeout(step, 500); return; }
         }
         s.netState = 2;
-        fetch(src, { headers: { Range: 'bytes=' + pos + '-' + (pos + chunk - 1) } }).then(r => {
+        mediaGet(el, src, 'bytes=' + pos + '-' + (pos + chunk - 1)).then(r => {
             if (r.status === 416 && pos > 0) return { end: true };
             if (!r.ok) throw new Error('HTTP ' + r.status);
             const cr = /\/(\d+)\s*$/.exec(r.headers.get('content-range') || '');
@@ -1409,8 +1460,13 @@ function mediaLoad(el) {
     mlog('load ' + (W.getAttr(el, 'src') || '(sources)'));
     const hadSession = s.id !== 0 || s.currentSrc !== '';
     mediaTeardown(el, s);
+    const gen = s.gen;
+    // emptied/loadstart are queued tasks (HTML "queue a media element task"), dropped if another load starts first: never
+    // dispatched inside the src setter. video.js 7 sets el.src and only then clears changingSrc_; a synchronous loadstart
+    // reached its parked play() while the flag was still set, so play() parked itself again and the poster stayed up.
+    const queue = type => setTimeout(() => { if (s.gen === gen) fire(el, type); }, 0);
     for (const p of s.promises.splice(0)) p.reject(new DOMException('The play() request was interrupted by a new load request.', 'AbortError'));
-    if (hadSession) fire(el, 'emptied');
+    if (hadSession) queue('emptied');
     Object.assign(s, { rs: 0, ended: false, seeking: false, error: null, dur: NaN, ct: 0, vw: 0, vh: 0, fMeta: false, fData: false,
         fCan: false, fThrough: false, playing: false, waiting: false, lastTU: 0, lastProg: 0, lastBuf: 0, started: false, eosSent: false,
         currentSrc: '', netState: 0 });
@@ -1428,13 +1484,12 @@ function mediaLoad(el) {
     if (src === null || src === '') { s.netState = 3; return; }
     s.currentSrc = src;
     s.netState = 2;
-    fire(el, 'loadstart');
-    const gen = s.gen;
+    queue('loadstart');
     if (/^blob:/i.test(src) && OBJURLS.get(src) instanceof Blob) {
         // a Blob behind the URL is an ordinary progressive file: startRequest() serves blob: URLs (with Range)
         if (!mediaSession(el, s)) { mediaFail(el, s, 4, 'no media session available'); return; }
         mediaStream(el, s, gen, src, W.mediaAddSb(s.id, 3));
-        if (W.getAttr(el, 'autoplay') !== null) setTimeout(() => { if (s.gen === gen && s.paused) el.play().catch(() => {}); }, 0);
+        if (W.getAttr(el, 'autoplay') !== null) s.autoplay = gen;
         return;
     }
     if (/^blob:/i.test(src)) {
@@ -1448,7 +1503,9 @@ function mediaLoad(el) {
     if (!mediaSession(el, s)) { mediaFail(el, s, 4, 'no media session available'); return; }
     const sb = W.mediaAddSb(s.id, 3);
     mediaStream(el, s, gen, src, sb);
-    if (W.getAttr(el, 'autoplay') !== null) setTimeout(() => { if (s.gen === gen && s.paused) el.play().catch(() => {}); }, 0);
+    // autoplay starts when the data is there (HAVE_ENOUGH_DATA, mediaApplyState), not right after the load: a player library
+    // that arrives later (video.js on Invidious) must still see play/playing, or it shows its poster over a playing video
+    if (W.getAttr(el, 'autoplay') !== null) s.autoplay = gen;
 }
 // engine state -> events
 function mediaApplyState(el, s) {
@@ -1475,6 +1532,7 @@ function mediaApplyState(el, s) {
     if (rs >= 3 && !s.fCan) { s.fCan = true; fire(el, 'canplay'); }
     else if (rs >= 3 && prev < 3 && hadCan && s.waiting) { s.waiting = false; fire(el, 'canplay'); }
     if (rs >= 4 && !s.fThrough) { s.fThrough = true; fire(el, 'canplaythrough'); }
+    if (rs >= 4 && s.autoplay && s.autoplay === s.gen && s.paused) { s.autoplay = 0; el.play().catch(() => {}); }
     if (!s.paused && !s.ended && !st[4]) {
         if (rs >= 3 && !s.playing) {
             s.playing = true;
@@ -1640,6 +1698,7 @@ methods(HM, {
         const wasPaused = s.paused;
         s.paused = false;
         s.started = true;
+        s.autoplay = 0;                 // the autoplaying flag: an explicit play() (or pause()) takes over
         if (s.ended) { s.ended = false; mediaSeek(this, s, 0); }
         if (s.id) W.mediaPlay(s.id);
         mediaKick();
@@ -1653,6 +1712,7 @@ methods(HM, {
     },
     pause() {
         const s = mst(this);
+        s.autoplay = 0;
         if (s.paused) return;
         s.paused = true;
         s.playing = false;
@@ -1677,11 +1737,18 @@ function mediaScan() {
 }
 
 // ---- MediaSource
+// sourceBuffers[i] are real indexed properties (WebIDL indexed getter): players test membership with
+// Array.prototype.indexOf.call(mediaSource.sourceBuffers, sb), and video.js skips every append when that fails
 class SourceBufferList extends EventTarget {
-    constructor() { super(); hidden(this, '_a', []); }
+    constructor() { super(); hidden(this, '_a', []); hidden(this, '_n', 0); }
     get length() { return this._a.length; }
     item(i) { return this._a[i] || null; }
     [Symbol.iterator]() { return this._a[Symbol.iterator](); }
+    _sync() {
+        for (let i = this._a.length; i < this._n; i++) delete this[i];
+        for (let i = 0; i < this._a.length; i++) Object.defineProperty(this, i, { value: this._a[i], enumerable: true, configurable: true, writable: false });
+        this._n = this._a.length;
+    }
 }
 class SourceBuffer extends EventTarget {
     constructor(ms, idx, mime) {
@@ -1797,6 +1864,7 @@ class MediaSource extends EventTarget {
         for (const sb of this.sourceBuffers._a) sb._removed = true;
         this.sourceBuffers._a.length = 0;
         this.activeSourceBuffers._a.length = 0;
+        this.sourceBuffers._sync(); this.activeSourceBuffers._sync();
         if (was !== 'closed') fire(this, 'sourceclose');
     }
     get duration() { return this._dur; }
@@ -1821,6 +1889,7 @@ class MediaSource extends EventTarget {
         const sb = new SourceBuffer(this, idx, String(mime));
         this.sourceBuffers._a.push(sb);
         this.activeSourceBuffers._a.push(sb);
+        this.sourceBuffers._sync(); this.activeSourceBuffers._sync();
         fire(this.sourceBuffers, 'addsourcebuffer');
         return sb;
     }
@@ -1831,6 +1900,7 @@ class MediaSource extends EventTarget {
         this.sourceBuffers._a.splice(i, 1);
         const j = this.activeSourceBuffers._a.indexOf(sb);
         if (j >= 0) this.activeSourceBuffers._a.splice(j, 1);
+        this.sourceBuffers._sync(); this.activeSourceBuffers._sync();
         fire(this.sourceBuffers, 'removesourcebuffer');
     }
     endOfStream(err) {
@@ -3195,7 +3265,7 @@ function runFrame(now) {
 const PENDING = new Map();    // request id -> handler(status, statusText, headersRaw, body:ArrayBuffer, url)
 const HEADS = new Map();      // request id -> head handler of a streaming fetch(): (status, statusText, headersRaw, stream, url, id)
 const STREAMS = new Map();    // request id -> controller of the Response body stream being filled
-function startRequest(method, url, headers, body, handler, headHandler) {
+function startRequest(method, url, headers, body, handler, headHandler, nocors) {
     let bodyStr = null, ctype = null;      // bodyStr: a string, or the bytes of an ArrayBuffer / view
     if (body !== null && body !== undefined) {
         if (typeof body === 'string') { bodyStr = body; ctype = 'text/plain;charset=UTF-8'; }
@@ -3209,12 +3279,13 @@ function startRequest(method, url, headers, body, handler, headHandler) {
     let hasType = false;
     for (const [k, v] of headers) { hs.push(k + ': ' + v); if (k.toLowerCase() === 'content-type') hasType = true; }
     if (ctype && !hasType) hs.push('Content-Type: ' + ctype);
-    if (/^blob:/i.test(String(url))) { serveBlobURL(String(url), headers, handler); return; }
-    const id = W.fetch(String(url), String(method).toUpperCase(), hs.join('\r\n'), bodyStr, !!headHandler);
-    if (id < 0) { setTimeout(() => handler(0, '', '', null, url), 0); return; }
+    if (/^blob:/i.test(String(url))) { serveBlobURL(String(url), headers, handler); return -1; }
+    const id = W.fetch(String(url), String(method).toUpperCase(), hs.join('\r\n'), bodyStr, !!headHandler, !!nocors);
+    if (id < 0) { setTimeout(() => handler(0, '', '', null, url), 0); return -1; }
     PENDING.set(id, handler);
     if (headHandler) HEADS.set(id, headHandler);
-    if (/\/videoplayback/.test(url)) { PTIME.set(id, W.now()); mlog('request ' + id + ' ' + method + ' videoplayback' + (bodyStr && bodyStr.byteLength !== undefined ? ' body=' + bodyStr.byteLength : '')); }
+    if (/\/videoplayback/.test(url)) { PTIME.set(id, W.now()); mlog('request ' + id + ' ' + method + ' videoplayback' + (bodyStr && bodyStr.byteLength !== undefined ? ' body=' + bodyStr.byteLength : '') + (hs.find(h => /^range:/i.test(h)) ? ' ' + hs.find(h => /^range:/i.test(h)) : ' (no range)')); }
+    return id;
 }
 // fetch()/XHR of a blob: URL made by URL.createObjectURL(blob): answered here, with Range support
 function serveBlobURL(url, headers, handler) {
@@ -3629,6 +3700,19 @@ function fetch(input, init) {
         });
     });
 }
+// XMLHttpRequest over the streaming fetch path: the body arrives in pieces, so readyState goes 2 -> 3 -> 4 with a readystatechange
+// and a progress event per piece, responseText grows while loading (decoded with the response charset, or the one overrideMimeType
+// names - including x-user-defined, the byte-preserving decoding players use to sniff a container from the first bytes), and
+// abort() / timeout cancel the network transfer itself (the host drops it) instead of letting the whole body download.
+function xudDecode(u8) {            // x-user-defined: 0x00-0x7F as is, 0x80-0xFF -> U+F780-U+F7FF
+    let s = '';
+    for (let i = 0; i < u8.length; i += 8192) {
+        const part = u8.subarray(i, i + 8192), a = new Array(part.length);
+        for (let j = 0; j < part.length; j++) a[j] = part[j] < 0x80 ? part[j] : 0xF700 + part[j];
+        s += String.fromCharCode.apply(null, a);
+    }
+    return s;
+}
 class XMLHttpRequest extends EventTarget {
     constructor() {
         super();
@@ -3636,56 +3720,145 @@ class XMLHttpRequest extends EventTarget {
         this.responseURL = ''; this.responseType = ''; this.timeout = 0; this.withCredentials = false; this.responseXML = null;
         this.upload = new EventTarget();
         hidden(this, '_h', new Headers()); hidden(this, '_rh', new Headers()); hidden(this, '_raw', '');
-        hidden(this, '_aborted', false); hidden(this, '_gen', 0);
+        hidden(this, '_aborted', false); hidden(this, '_gen', 0); hidden(this, '_rid', -1); hidden(this, '_mime', null);
+        hidden(this, '_loaded', 0); hidden(this, '_total', 0); hidden(this, '_sent', false);
         for (const n of ['onreadystatechange', 'onload', 'onerror', 'onabort', 'onloadend', 'onloadstart', 'onprogress', 'ontimeout']) this[n] = null;
     }
     _fire(type) {
-        const ev = type === 'readystatechange' ? new Event(type) : new ProgressEvent(type, { loaded: this._loaded || this.responseText.length, total: this._loaded || this.responseText.length });
+        const ev = type === 'readystatechange' ? new Event(type)
+            : new ProgressEvent(type, { loaded: this._loaded, total: this._total, lengthComputable: this._total > 0 });
         const h = this['on' + type];
         if (typeof h === 'function') try { h.call(this, ev); } catch (e) { report(e, 'XHR on' + type); }
         dispatch(this, ev);
     }
     _state(s) { this.readyState = s; this._fire('readystatechange'); }
+    _cancel() {                     // stop the transfer and forget the request
+        const id = this._rid;
+        this._rid = -1;
+        this._gen++;
+        if (id >= 0) { PENDING.delete(id); HEADS.delete(id); STREAMS.delete(id); W.fetchCancel(id); }
+    }
+    _fail(type) {                   // network error / abort / timeout while sent: DONE, the event, loadend
+        this._sent = false;
+        this.status = 0; this.statusText = ''; this.response = null; this.responseText = '';
+        this.readyState = 4;
+        this._fire('readystatechange');
+        this._fire(type);
+        this._fire('loadend');
+    }
     open(method, url, async) {
+        if (this._sent) this._cancel();
         this._method = String(method).toUpperCase();
         this._url = W.resolve(String(url));
         if (this._url === null) throw new DOMException('Invalid URL', 'SyntaxError');
         this._async = async !== false;
         this._h = new Headers();
         this._aborted = false;
+        this._sent = false;
         this._gen++;
-        this.status = 0; this.responseText = ''; this.response = null;
+        this.status = 0; this.statusText = ''; this.responseText = ''; this.response = null; this.responseURL = '';
+        this._loaded = 0; this._total = 0;
         this._state(1);
     }
-    setRequestHeader(k, v) { this._h.append(k, v); }
-    getResponseHeader(k) { return this._rh.get(k); }
-    getAllResponseHeaders() { let s = ''; for (const [k, v] of this._rh) s += k + ': ' + v + '\r\n'; return s; }
-    overrideMimeType() {}
-    abort() { this._aborted = true; if (this.readyState > 0 && this.readyState < 4) { this.readyState = 4; this._fire('readystatechange'); this._fire('abort'); this._fire('loadend'); } this.readyState = 0; }
+    setRequestHeader(k, v) {
+        if (this.readyState !== 1 || this._sent) throw new DOMException("Failed to execute 'setRequestHeader' on 'XMLHttpRequest': The object's state must be OPENED.", 'InvalidStateError');
+        this._h.append(k, v);
+    }
+    getResponseHeader(k) { return this.readyState >= 2 ? this._rh.get(k) : null; }
+    getAllResponseHeaders() { if (this.readyState < 2) return ''; let s = ''; for (const [k, v] of this._rh) s += k + ': ' + v + '\r\n'; return s; }
+    overrideMimeType(m) {
+        if (this.readyState >= 3) throw new DOMException("Failed to execute 'overrideMimeType' on 'XMLHttpRequest': MimeType cannot be overridden when the state is LOADING or DONE.", 'InvalidStateError');
+        this._mime = String(m);
+    }
+    abort() {
+        const active = this._sent && this.readyState > 0 && this.readyState < 4;
+        this._aborted = true;
+        this._cancel();
+        if (active) this._fail('abort');
+        if (this.readyState === 4) { this.readyState = 0; this.status = 0; this.response = null; }
+    }
     send(body) {
+        if (this.readyState !== 1 || this._sent) throw new DOMException("Failed to execute 'send' on 'XMLHttpRequest': The object's state must be OPENED.", 'InvalidStateError');
         if (!this._async) W.log(2, 'synchronous XMLHttpRequest is not supported (' + this._url + ')');
         const gen = this._gen;
+        const live = () => gen === this._gen && !this._aborted;
+        const rt = () => this.responseType;
+        let chunks = [], dec = null, xud = false;
+        this._sent = true;
         this._fire('loadstart');
-        startRequest(this._method, this._url, this._h, body === undefined ? null : body, (status, statusText, raw, buf, url) => {
-            if (this._aborted || gen !== this._gen) return;
-            if (!status) { this.readyState = 4; this._fire('readystatechange'); this._fire('error'); this._fire('loadend'); return; }
+        const head = (status, statusText, raw, url) => {
             this.status = status; this.statusText = statusText; this.responseURL = url || this._url;
             this._rh = parseHeaders(raw);
+            const cl = +this._rh.get('content-length');
+            this._total = cl > 0 && !this._rh.get('content-encoding') ? cl : 0;
+            const ct = (this._mime !== null ? this._mime : this._rh.get('content-type') || '').toLowerCase();
+            const cs = /charset\s*=\s*"?([^";\s]+)/.exec(ct);
+            xud = !!cs && cs[1] === 'x-user-defined';
+            if (!xud) { try { dec = new TextDecoder(cs ? cs[1] : 'utf-8'); } catch (e) { dec = new TextDecoder('utf-8'); } }
             this._state(2);
-            this._state(3);
-            const rt = this.responseType;
-            const text = buf === null || rt === 'arraybuffer' || rt === 'blob' ? '' : new TextDecoder().decode(buf);
-            this._loaded = buf === null ? 0 : buf.byteLength;
-            if (rt === '' || rt === 'text') this.responseText = text;
-            if (rt === 'json') { try { this.response = JSON.parse(text); } catch (e) { this.response = null; } }
-            else if (rt === 'arraybuffer') this.response = buf || new ArrayBuffer(0);
-            else if (rt === 'blob') this.response = new Blob(buf === null ? [] : [buf], { type: this._rh.get('content-type') || '' });
-            else if (rt === 'document') this.response = null;
-            else this.response = text;
+        };
+        const piece = u8 => {
+            if (!u8 || !u8.length) return;
+            chunks.push(u8);
+            this._loaded += u8.length;
+            const t = rt();
+            if (t === '' || t === 'text') this.responseText += xud ? xudDecode(u8) : dec.decode(u8, { stream: true });
+            if (this.readyState === 2) this.readyState = 3;
+            this._fire('readystatechange');
+            if (live()) this._fire('progress');
+        };
+        const done = () => {
+            this._rid = -1;
+            this._sent = false;
+            if (this.readyState === 2) this._state(3);
+            if (!live()) return;
+            const t = rt();
+            if ((t === '' || t === 'text') && dec) this.responseText += dec.decode();
+            let buf = null;
+            if (t !== '' && t !== 'text') {
+                const all = new Uint8Array(this._loaded);
+                let o = 0;
+                for (const c of chunks) { all.set(c, o); o += c.length; }
+                buf = all.buffer;
+            }
+            chunks = [];
+            if (t === 'json') { try { this.response = JSON.parse(new TextDecoder().decode(buf)); } catch (e) { this.response = null; } }
+            else if (t === 'arraybuffer') this.response = buf;
+            else if (t === 'blob') this.response = new Blob([buf], { type: this._rh.get('content-type') || '' });
+            else if (t === 'document') this.response = null;
+            else this.response = this.responseText;
+            if (!this._total) this._total = this._loaded;
             this._state(4);
             this._fire('load');
             this._fire('loadend');
+        };
+        const neterr = () => { this._rid = -1; if (live()) this._fail('error'); };
+        this._rid = startRequest(this._method, this._url, this._h, body === undefined ? null : body, (status, statusText, raw, buf, url) => {
+            // the whole answer at once (blob:/data: URLs, a host that did not stream it, failures)
+            if (!live()) return;
+            if (!status) { neterr(); return; }
+            head(status, statusText, raw, url);
+            if (!live()) return;
+            if (buf) piece(new Uint8Array(buf));
+            done();
+        }, (status, statusText, raw, stream, url, id) => {
+            this._rid = id;
+            if (!live()) return;
+            head(status, statusText, raw, url);
+            const rd = stream.getReader();
+            const pump = () => rd.read().then(r => {
+                if (!live()) return;
+                if (r.done) { done(); return; }
+                piece(r.value);
+                pump();
+            }, () => neterr());
+            pump();
         });
+        if (this.timeout > 0) setTimeout(() => {
+            if (!live() || this.readyState === 4) return;
+            this._cancel();
+            this._fail('timeout');
+        }, this.timeout);
     }
 }
 XMLHttpRequest.UNSENT = 0; XMLHttpRequest.OPENED = 1; XMLHttpRequest.HEADERS_RECEIVED = 2; XMLHttpRequest.LOADING = 3; XMLHttpRequest.DONE = 4;
@@ -3955,8 +4128,149 @@ const NodeFilter = { FILTER_ACCEPT: 1, FILTER_REJECT: 2, FILTER_SKIP: 3, SHOW_AL
     SHOW_ATTRIBUTE: 2, SHOW_TEXT: 4, SHOW_CDATA_SECTION: 8, SHOW_PROCESSING_INSTRUCTION: 64, SHOW_COMMENT: 128,
     SHOW_DOCUMENT: 256, SHOW_DOCUMENT_TYPE: 512, SHOW_DOCUMENT_FRAGMENT: 1024 };
 
+// XML documents for DOMParser (application/xml, text/xml, image/svg+xml, application/xhtml+xml): element and attribute
+// names keep their case (XML is case-sensitive; a DASH manifest's indexRange must not become indexrange). Elements of the
+// XHTML / SVG / MathML namespaces are made in those namespaces, everything else is an XML element (W.create ns 3). Not
+// validating: no DTD, only the predefined and numeric entities. A well-formedness error gives a <parsererror> document.
+const NS_URI = { 'http://www.w3.org/1999/xhtml': 0, 'http://www.w3.org/2000/svg': 1, 'http://www.w3.org/1998/Math/MathML': 2 };
+function xmlDecode(s) {
+    if (s.indexOf('&') < 0) return s;
+    return s.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|lt|gt|amp|quot|apos);/g, (m, e) =>
+        e === 'lt' ? '<' : e === 'gt' ? '>' : e === 'amp' ? '&' : e === 'quot' ? '"' : e === 'apos' ? "'" :
+        String.fromCodePoint(e[1] === 'x' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10)));
+}
+function parseXML(s) {
+    const NAME = /[A-Za-z_:À-￿][-A-Za-z0-9_:.·À-￿]*/y;
+    let i = 0, root = null;
+    const stack = [], nsStack = [{ '': null }];
+    const fail = msg => { throw new SyntaxError(msg); };
+    const name = () => { NAME.lastIndex = i; const m = NAME.exec(s); if (!m) fail('name expected at ' + i); i += m[0].length; return m[0]; };
+    const ws = () => { while (i < s.length && ' \t\r\n'.indexOf(s[i]) >= 0) i++; };
+    const append = n => W.insert(stack[stack.length - 1], n, null);
+    while (i < s.length) {
+        const lt = s.indexOf('<', i);
+        const text = s.slice(i, lt < 0 ? s.length : lt);
+        if (text) {
+            if (stack.length) append(W.createText(xmlDecode(text)));
+            else if (text.trim()) fail('text outside the root element');
+        }
+        if (lt < 0) break;
+        i = lt;
+        if (s.startsWith('<!--', i)) {
+            const e = s.indexOf('-->', i + 4);
+            if (e < 0) fail('unclosed comment');
+            if (stack.length) append(W.createComment(s.slice(i + 4, e)));
+            i = e + 3;
+            continue;
+        }
+        if (s.startsWith('<![CDATA[', i)) {
+            const e = s.indexOf(']]>', i);
+            if (e < 0 || !stack.length) fail('bad CDATA section');
+            append(W.createText(s.slice(i + 9, e)));
+            i = e + 3;
+            continue;
+        }
+        if (s.startsWith('<?', i)) { const e = s.indexOf('?>', i); if (e < 0) fail('unclosed processing instruction'); i = e + 2; continue; }
+        if (s.startsWith('<!DOCTYPE', i)) {
+            let d = 0, j = i + 9;
+            for (; j < s.length; j++) { if (s[j] === '[') d++; else if (s[j] === ']') d--; else if (s[j] === '>' && d <= 0) break; }
+            i = j + 1;
+            continue;
+        }
+        if (s[i + 1] === '/') {
+            i += 2;
+            const n = name();
+            ws();
+            if (s[i] !== '>') fail('> expected');
+            i++;
+            const top = stack.pop();
+            nsStack.pop();
+            if (!top || W.name(top) !== n && W.name(top) !== n.slice(n.indexOf(':') + 1)) fail('mismatched end tag </' + n + '>');
+            continue;
+        }
+        i++;
+        const tag = name();
+        const attrs = [];
+        for (;;) {
+            ws();
+            if (s[i] === '>' || s.startsWith('/>', i)) break;
+            if (i >= s.length) fail('unclosed tag');
+            const an = name();
+            ws();
+            if (s[i] !== '=') fail('= expected');
+            i++;
+            ws();
+            const q = s[i];
+            if (q !== '"' && q !== "'") fail('quoted value expected');
+            const e = s.indexOf(q, i + 1);
+            if (e < 0) fail('unclosed attribute value');
+            attrs.push([an, xmlDecode(s.slice(i + 1, e).replace(/[\t\n\r]/g, ' '))]);
+            i = e + 1;
+        }
+        const scope = Object.assign({}, nsStack[nsStack.length - 1]);
+        for (const [an, av] of attrs) {
+            if (an === 'xmlns') scope[''] = av || null;
+            else if (an.startsWith('xmlns:')) scope[an.slice(6)] = av;
+        }
+        const ci = tag.indexOf(':');
+        const uri = scope[ci >= 0 ? tag.slice(0, ci) : ''];
+        if (ci >= 0 && uri === undefined) fail('unbound prefix ' + tag.slice(0, ci));
+        const nsk = uri in NS_URI ? NS_URI[uri] : 3;
+        const el = W.create(nsk === 3 ? tag : (ci >= 0 ? tag.slice(ci + 1) : tag), nsk);
+        if (nsk === 3) XMLNS.set(el, uri === undefined ? null : uri);
+        for (const [an, av] of attrs) W.setAttr(el, an, av);
+        if (stack.length) append(el);
+        else if (root) fail('more than one root element');
+        else root = el;
+        if (s.startsWith('/>', i)) { i += 2; continue; }
+        i++;
+        stack.push(el);
+        nsStack.push(scope);
+    }
+    if (stack.length) fail('unclosed element <' + W.name(stack[stack.length - 1]) + '>');
+    if (!root) fail('no root element');
+    return root;
+}
+function xmlDocument(root) {
+    const doc = Object.create(Document.prototype);
+    const byTag = t => { t = String(t); return t === '*' ? [root].concat(W.query(root, '*', true)) : (W.name(root) === t ? [root] : []).concat(W.byTag(root, t)); };
+    Object.defineProperties(doc, {
+        nodeType: { value: 9 }, nodeName: { value: '#document' }, contentType: { value: 'application/xml' },
+        documentElement: { value: root }, body: { value: null }, head: { value: null }, title: { value: '' },
+        URL: { value: 'about:blank' }, location: { value: null }, readyState: { value: 'complete' },
+        childNodes: { get: () => nodeList([root]) }, firstChild: { get: () => root }, lastChild: { get: () => root },
+        children: { get: () => htmlCollection([root]) }, firstElementChild: { get: () => root },
+        querySelector: { value: sel => W.query(root, String(sel), false) },
+        querySelectorAll: { value: sel => nodeList(W.query(root, String(sel), true)) },
+        getElementById: { value: id => W.query(root, '#' + cssEscape(String(id)), false) },
+        getElementsByTagName: { value: t => htmlCollection(byTag(t)) },
+        getElementsByTagNameNS: { value: (ns, t) => htmlCollection(byTag(t)) },
+        createElement: { value: n => { const e = W.create(String(n), 3); XMLNS.set(e, null); return e; } },
+        createElementNS: { value: (ns, n) => document.createElementNS(ns, n) },
+        createTextNode: { value: t => document.createTextNode(t) },
+        createComment: { value: t => document.createComment(t) },
+        createDocumentFragment: { value: () => document.createDocumentFragment() },
+        importNode: { value: (n, d) => importNodeImpl(n, d) },
+        adoptNode: { value: n => n },
+        implementation: { value: IMPL },
+        defaultView: { value: null }
+    });
+    return doc;
+}
+
 class DOMParser {
     parseFromString(s, type) {
+        const t = String(type).toLowerCase();
+        if (t === 'application/xml' || t === 'text/xml' || t === 'image/svg+xml' || t === 'application/xhtml+xml') {
+            let root;
+            try { root = parseXML(String(s)); }
+            catch (e) {
+                root = W.create('parsererror', 3);
+                XMLNS.set(root, 'http://www.mozilla.org/newlayout/xml/parsererror.xml');
+                W.insert(root, W.createText('XML Parsing Error: ' + e.message), null);
+            }
+            return xmlDocument(root);
+        }
         // A detached <html> subtree standing in for a separate document
         // (shares the page's node store; ownerDocument stays the page).
         s = String(s);

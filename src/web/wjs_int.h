@@ -81,7 +81,7 @@ struct wjs {
     int node_cap;
     ojsv* proto_html;        // cached prototype per HTML tag atom (root range)
     int proto_cap;
-    ojsv proto_svg, proto_svgroot, proto_math, proto_text, proto_comment, proto_doc, proto_frag;
+    ojsv proto_svg, proto_svgroot, proto_math, proto_text, proto_comment, proto_doc, proto_frag, proto_xml;
     int frag_atom;           // atom naming fragment pseudo-elements (unused: WN_FRAG)
     // scripts
     struct wjs_script* sc;
