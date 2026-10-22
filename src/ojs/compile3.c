@@ -218,7 +218,7 @@ static void global_decls(struct cfunc* c, struct scope* s, int is_eval) {
     for (struct decl* d = s->decls; d; d = d->next)
         if (d->kind == D_VAR) op32(c, OP_DECL_GLOBAL_VAR, atom_const(c, d->name), 0);
     for (struct decl* d = s->decls; d; d = d->next)
-        if (d->kind == D_LET || d->kind == D_CONST || d->kind == D_CLASS) {
+        if (!is_eval && (d->kind == D_LET || d->kind == D_CONST || d->kind == D_CLASS)) {   // eval keeps them local
             op(c, OP_DECL_GLOBAL_LEX, 0);
             put32(c, atom_const(c, d->name));
             put16(c, d->kind == D_CONST ? 1 : 0);
@@ -278,6 +278,7 @@ struct ftempl* compile_eval(ojs* J, struct parser* P, struct scope* envscope, in
         for (struct scope* x = envscope; x && vix < 0; x = x->parent)
             for (struct decl* d = x->decls; d; d = d->next) if (d->kind == D_EVALVARS || (d->kind == D_WITH && (d->flags & 0x20))) { vix = d->slot; break; }
         if (vix < 0) { cerr(c, 0, "internal: eval var scope missing"); return 0; }
+        c->eval_dyn_vars = 1;
         for (struct decl* d = es->decls; d; d = d->next) {
             if (d->kind == D_VAR) { op32(c, OP_EVAL_VAR_DECL, atom_const(c, d->name), 0); put16(c, (uint32_t)vix); }
         }

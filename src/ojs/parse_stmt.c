@@ -501,6 +501,8 @@ static struct node* parse_try(struct parser* P) {
             h->b = parse_binding_target(P, D_CATCH);
             if (!h->b) return 0;
             declare_pattern(P, h->b, D_CATCH);
+            if (h->b->type != N_IDENT)
+                for (struct decl* d = h->scope->decls; d; d = d->next) if (d->kind == D_CATCH) d->xflags |= DX_CATCH_PAT;
             if (!expect(P, T_RPAREN)) return 0;
         }
         // the block shares the catch scope's conflict rules (marked via owner->op)
@@ -1178,12 +1180,14 @@ static struct node* parse_class(struct parser* P, int is_decl) {
         struct node* m = mk(P, N_MEMBER_DEF, mpos);
         if (!m) return 0;
         int is_static = 0, async = 0, gen = 0, kind = PK_METHOD;
+        uint32_t fpos = mpos;       // the method's source text starts after `static` (Function.prototype.toString)
         if (IS_CTX_RAW(static_)) {
             struct token t;
             int nt = peek(P, &t);
             if (nt != T_LPAREN && nt != T_ASSIGN && nt != T_SEMI && nt != T_RBRACE) {
                 is_static = 1;
                 next(P);
+                fpos = TPOS;
             }
         }
         if (is_static && TOK == T_LBRACE) {
@@ -1266,7 +1270,7 @@ static struct node* parse_class(struct parser* P, int is_decl) {
                 ff |= FI_CLASS_CTOR | (cls->b ? FI_DERIVED : 0);
             }
             if (is_static && kname == P->J->A->prototype && !is_private) { perr(P, mpos, "Classes may not have a static property named 'prototype'"); return 0; }
-            m->b = method_def(P, mpos, ff, m->a, kind);
+            m->b = method_def(P, fpos, ff, m->a, kind);
             if (!m->b) return 0;
             m->b->u.fn->class_node = cls;
             if (is_ctor) { holder->c = m->b; m->op = PK_METHOD; m->flags |= NF_SHORTHAND; }   // NF_SHORTHAND marks the constructor
