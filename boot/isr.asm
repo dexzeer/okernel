@@ -42,6 +42,10 @@ ISR_ERRCODE   11
 ISR_ERRCODE   12
 ISR_ERRCODE   13
 ISR_ERRCODE   14
+ISR_NOERRCODE 16      ; x87 floating-point error
+ISR_ERRCODE   17      ; alignment check
+ISR_NOERRCODE 18      ; machine check
+ISR_NOERRCODE 19      ; SIMD floating-point exception
 
 ; IRQ stubs (mapped to INT 32-47)
 IRQ 0, 32

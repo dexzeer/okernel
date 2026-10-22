@@ -20,11 +20,41 @@
 // copy changes). Mount at boot: if the superblock magic matches, VFS files
 // are hydrated from disk; otherwise the disk is formatted fresh.
 
+// The on-disk structures (the recovery system checks and repairs them too: src/recovery.c).
+#define PFS_MAGIC0 'O'
+#define PFS_MAGIC1 'K'
+#define PFS_MAGIC2 'P'
+#define PFS_MAGIC3 'F'
+#define PFS_MAGIC4 'S'
+#define PFS_MAGIC5 '1'
+#define PFS_VERSION 1
+
+#define PFS_SB_SECTOR 0
+#define PFS_TABLE_START 1
+#define PFS_TABLE_SECTORS 16
+#define PFS_FIRST_DATA 17
+
+struct pfs_super {
+    uint8_t magic[8];
+    uint32_t version;
+    uint32_t nfiles;
+    uint8_t bitmap[476]; // bit i = data sector FIRST_DATA+i in use
+};
+
+struct pfs_entry {
+    uint8_t name[32];
+    uint32_t size;
+    uint32_t start;  // first data sector (relative to the start of the partition or disk)
+    uint32_t flags;
+    uint8_t reserved[512 - 32 - 12];
+};
+
 #define PFS_MAX_FILE_SECTORS 64
 #define PFS_FILE_MAX (PFS_MAX_FILE_SECTORS * 512)
 
 // Init: ata_init + mount-or-format. Always succeeds (diskless = VFS-only).
 void pfs_init(void);
+void pfs_init_recovery(void);   // recovery desktop: partitions + protection only, nothing mounted
 
 // 1 when a disk with a valid superblock is mounted.
 int pfs_mounted(void);

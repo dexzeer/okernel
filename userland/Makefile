@@ -8,7 +8,7 @@ CFLAGS = -m32 -nostdlib -static -Os -fno-builtin -fno-stack-protector \
          -mno-red-zone -fno-pic -fno-pie -Wall
 LDFLAGS = -e _start
 
-PROGS = hello forktest pipetest exectest sh init forkexec dbg2 dbg3
+PROGS = hello forktest pipetest exectest sh init forkexec dbg2 dbg3 panic
 
 # Ring-3 ABI library: every userland program links usys.o, so the INT 0x80
 # trap site lives in exactly one translation unit (usys.c).

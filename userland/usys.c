@@ -125,3 +125,10 @@ void usys_munmap(unsigned virt) {
     __asm__ volatile("int $0x80" : : "a"(USYS_MUNMAP), "b"(virt)
                      : "memory", "ecx", "edx");
 }
+
+int usys_panic(int mode) {
+    int r;
+    __asm__ volatile("int $0x80" : "=a"(r) : "a"(USYS_PANIC), "b"(mode)
+                     : "memory", "ecx", "edx");
+    return r;
+}

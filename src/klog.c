@@ -9,6 +9,9 @@
 #include "devlog.h"
 #include "serial.h"
 #include "cpufreq.h"
+#include "ata.h"
+#include "part.h"
+#include "crash.h"
 
 extern uint32_t tick_count;
 
@@ -25,6 +28,7 @@ static uint32_t last_flush, last_snap;
 static int in_flush;
 static char snap[KLOG_SNAP_SECTORS * 512];
 static uint8_t chunk[64 * 512];
+static int on_ata;                           // the region is the log partition of the installed disk, not the stick
 
 static void put(const char* s) {
     while (*s && len < sizeof L - 1024) L[len++] = *s++;
@@ -54,7 +58,12 @@ void klog_write(char tag, const char* line) {
     put("\n");
 }
 
-static int wr(uint32_t sect, const void* data, uint32_t n) { return xhci_storage_rw(1, sect, (void*)data, n); }
+static int wr(uint32_t sect, const void* data, uint32_t n) {
+    if (!on_ata) return xhci_storage_rw(1, sect, (void*)data, n);
+    for (uint32_t i = 0; i < n; i++)
+        if (ata_write(sect + i, (const uint8_t*)data + i * 512)) return 0;
+    return 1;
+}
 
 static uint32_t ser_flushed;                                 // serial_total up to which the stick has it
 
@@ -132,6 +141,19 @@ static void dump_tables(void) {
     }
 }
 
+static void init_region(void) {
+    H.boot++;
+    log_sect = S0 + 1 + (H.boot & 1) * KLOG_LOG_SECTORS;
+    uint32_t prev_scan = H.scan_window;
+    state = 1;
+    if (on_ata) devlog('k', "log on the disk's log partition: boot %u", H.boot);
+    if (prev_scan) devlog('k', "the last boot died while reading window %x", prev_scan);
+    write_header();
+    dump_tables();
+    write_header();
+    klog_flush();
+}
+
 static void init_stick(uint32_t sectors) {
     if (sectors < KLOG_REGION_SECTORS + 4096) { state = 2; devlog('k', "stick too small for the log"); return; }
     S0 = sectors - KLOG_REGION_SECTORS;
@@ -141,21 +163,38 @@ static void init_stick(uint32_t sectors) {
         devlog('k', "USB stick without the log marker: not touched");
         return;
     }
-    H.boot++;
-    log_sect = S0 + 1 + (H.boot & 1) * KLOG_LOG_SECTORS;
-    uint32_t prev_scan = H.scan_window;
-    state = 1;
-    devlog('k', "log on the USB stick: boot %u, stick %u MB", H.boot, sectors >> 11);
-    if (prev_scan) devlog('k', "the last boot died while reading window %x", prev_scan);
-    write_header();
-    dump_tables();
-    write_header();
+    devlog('k', "log on the USB stick, stick %u MB", sectors >> 11);
+    init_region();
+}
+
+// The log partition of an installed disk (part.h) carries the same region at its start (the image builder marks it).
+static int init_disk(void) {
+    const struct part* p = part_role(PART_LOG);
+    if (!p || p->count < CRASH_PART_SECTORS || ata_read(p->start, (uint8_t*)&H) || memcmp(H.magic, KLOG_MAGIC, 16)) return 0;
+    on_ata = 1;
+    S0 = p->start;
+    init_region();
+    return 1;
+}
+
+uint32_t klog_boot(void) { return state == 1 ? H.boot : 0; }
+
+// From the panic screen: everything logged so far goes to the disk now (interrupts are off; nothing else runs).
+void klog_panic_flush(void) {
+    if (state != 1 || !on_ata) return;
+    in_flush = 0;
     klog_flush();
+    if (state == 1) ser_flush();
 }
 
 void klog_poll(void) {
     if (state == 2) return;
     if (state == 0) {
+        static int disk_tried;                                 // once pfs_init has read the partition table
+        if (!disk_tried && part_count() > 0) {
+            disk_tried = 1;
+            if (init_disk()) { last_flush = last_snap = tick_count; return; }
+        }
         static uint32_t next;
         if ((int)(tick_count - next) < 0) return;
         next = tick_count + 50;
@@ -166,7 +205,7 @@ void klog_poll(void) {
         return;
     }
     uint32_t sectors;
-    if (!xhci_storage_ready(&sectors)) { state = 2; return; }
+    if (!on_ata && !xhci_storage_ready(&sectors)) { state = 2; return; }
     if ((int)(tick_count - last_flush) >= 100) { last_flush = tick_count; klog_flush(); if (state == 1) ser_flush(); }
     if (state == 1 && (int)(tick_count - last_snap) >= 500) {
         last_snap = tick_count;

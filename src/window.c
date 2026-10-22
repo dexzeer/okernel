@@ -272,6 +272,8 @@ static void title_btn_rect(const struct window* w, int minimize, int r[4]) {
     r[2] = WIN_BTN_W; r[3] = WIN_BTN_H;
 }
 
+void window_close_btn_rect(int id, int r[4]) { title_btn_rect(&windows[id], 0, r); }
+
 static int title_btn_hit(const struct window* w, int minimize, int mx, int my) {
     int r[4];
     title_btn_rect(w, minimize, r);

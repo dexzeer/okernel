@@ -25,6 +25,7 @@ typedef void (*smp_fn)(void* ctx, uint32_t item, uint32_t cpu);
 // ACPI; returns the number of CPUs running (>= 1).
 int smp_init(void);
 int smp_ncpu(void);                  // CPUs running jobs, including the boot CPU
+void smp_stop_others(void);          // INIT every other CPU (before a reset)
 int smp_cpu_index(void);             // 0 = boot CPU; -1 if unknown
 uint32_t smp_cpu_apic_id(int cpu);
 int smp_on_ap(void);                 // the caller runs on an AP stack

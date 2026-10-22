@@ -1,7 +1,7 @@
 // usys.h — ring-3 user ABI for okernel userland.
 //
 // Everything in userland talks to the kernel ONLY through these wrappers
-// (INT 0x80, syscall numbers 0-17). Raw `int $0x80` asm lives here and
+// (INT 0x80, syscall numbers 0-18). Raw `int $0x80` asm lives here and
 // nowhere else, so the ring-0/ring-3 boundary is one file, not scattered
 //statics in every program.
 //
@@ -27,6 +27,7 @@
 #define USYS_KILL   15  // int pid, int signo
 #define USYS_MMAP   16  // unsigned virt (0 = auto; returns addr, 0 on failure)
 #define USYS_MUNMAP 17  // unsigned virt
+#define USYS_PANIC  18  // int mode (0 kernel panic, 1 CPU exception in the kernel); returns -1 where unsupported
 
 int usys_print(const char *msg);
 void usys_exit(int code) __attribute__((noreturn));
@@ -45,5 +46,6 @@ int usys_wait(int pid);
 int usys_kill(int pid, int signo);
 unsigned usys_mmap(unsigned virt);
 void usys_munmap(unsigned virt);
+int usys_panic(int mode);
 
 #endif

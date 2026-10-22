@@ -304,6 +304,7 @@ uint32_t syscall_park_esp(void) { return park_esp[trap_slot_self()]; }
 #define SYS_KILL        15  // ebx = pid, ecx = signo (0=TERM default); deliver signal
 #define SYS_MMAP        16  // ebx = user virt page (0 = auto); map fresh zero page
 #define SYS_MUNMAP      17  // ebx = user virt page; unmap one page
+#define SYS_PANIC       18  // ebx = 0: kernel panic, 1: a CPU exception in the kernel (/bin/panic tests the panic screen)
 
 // Simple syscall handler for int 0x80
 // Called from isr_handler when int_num == 0x80
@@ -859,6 +860,14 @@ void syscall_handler(uint32_t eax, uint32_t ebx, uint32_t ecx, uint32_t edx) {
             sys_munmap_hook(ebx);
             UTRACE("[user] munmap %x\n", ebx);
             break;
+        }
+        case SYS_PANIC: { // sys_panic(mode): crash the kernel on purpose (like Linux's sysrq-trigger 'c')
+            // panic.c is desktop-only: weak, so the text build links and answers -1
+            extern void kpanic(const char* fmt, ...) __attribute__((weak, noreturn));
+            if (!kpanic) { syscall_set_ret((uint32_t)-1); break; }
+            serial_printf("[user] sys_panic mode %d\n", ebx);
+            if (ebx == 1) __asm__ volatile("ud2");             // an invalid opcode in ring 0: the real exception path
+            kpanic("crash requested by /bin/panic");
         }
         default:
             serial_printf("[user] unknown syscall %d\n", eax);
