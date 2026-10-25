@@ -24,7 +24,8 @@ done
 if [ -n "$HOSTBINS" ]; then
     mkdir -p $OUT/lib64 $OUT/lib/x86_64-linux-gnu
     for b in bash ls cat echo true sh; do cp /bin/$b $OUT/bin/ 2>/dev/null || true; done
-    for b in $OUT/bin/bash $OUT/bin/ls $OUT/bin/cat; do
+    for f in lx/test/x_*.c; do gcc -O2 -w -o $OUT/bin/xl_$(basename $f .c | sed "s/^x_//") $f /usr/lib/x86_64-linux-gnu/libX11.so.6; done
+    for b in $OUT/bin/bash $OUT/bin/ls $OUT/bin/cat $OUT/bin/xl_*; do
         for l in $(ldd $b 2>/dev/null | grep -o "/[^ ]*\.so[^ ]*"); do
             mkdir -p $OUT$(dirname $l); cp -L $l $OUT$l
         done
