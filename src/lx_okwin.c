@@ -69,6 +69,7 @@ void *lx_okwin_open(struct lx_task *t) {
     struct okconn *c = (struct okconn*)kcalloc(1, sizeof *c);
     if (!c) return 0;
     c->refs = 1; c->pid = t->tgid;
+    { int a, b, d; while (keyboard_next_transition(&a, &b, &d)) {} }          // keys typed before the program started (its own command line) are not for it
     if (!inited) { memset(wins, 0, sizeof wins); inited = 1; }
     return c;
 }
@@ -132,8 +133,9 @@ static int64_t do_create(struct lx_task *t, struct okconn *c, uint64_t uarg) {
     if (noframe) window_set_popup(w->wid);                       // menus, tooltips: no title bar, no animation
     else { window_set_close_button(w->wid, 1); window_set_minimize_button(w->wid, 1); }
     window_set_hide_cursor(w->wid, 1);
-    window_set_focus(w->wid);
-    w->used = 1; w->conn = c; w->last_focus = 1; w->last_w = a.w; w->last_h = a.h;
+    if (a.flags & OKW_F_HIDDEN) window_set_hidden(w->wid);
+    else window_set_focus(w->wid);
+    w->used = 1; w->conn = c; w->last_focus = (a.flags & OKW_F_HIDDEN) ? 0 : 1; w->last_w = a.w; w->last_h = a.h;
     window_set_pixels(w->wid, w->pix, 0, 0, a.w, a.h, a.w);
     a.out_wid = w->wid; a.out_stride = a.w * 4;
     if (lx_copy_out(t, uarg, &a, sizeof a)) return -LX_EFAULT;
@@ -311,7 +313,7 @@ static int pending_wheel;
 void lx_okwin_wheel(int notches) { pending_wheel += notches; }
 
 void lx_okwin_poll(void) {
-    if (!inited) return;
+    if (!inited) { int a, b, c; while (keyboard_next_transition(&a, &b, &c)) {} return; }
     int any = 0;
     for (int i = 0; i < OKW_MAX; i++) if (wins[i].used) { any = 1; break; }
     if (!any) {

@@ -405,8 +405,6 @@ EXPORT BOOL PeekMessageW(MSG *m, HWND f, UINT lo, UINT hi, UINT flags) { return 
 EXPORT BOOL WaitMessage(void) { MSG m; get_msg(&m, 0, 0, 0, 0, 1); return TRUE; }
 EXPORT DWORD GetQueueStatus(UINT f) { (void)f; U_pump(0); lock(); int n = qn; unlock(); return n ? 0x00040004u : 0; }
 EXPORT BOOL TranslateMessage(const MSG *m) { (void)m; return TRUE; }
-EXPORT BOOL IsDialogMessageA(HWND h, MSG *m) { (void)h; (void)m; return FALSE; }
-EXPORT BOOL IsDialogMessageW(HWND h, MSG *m) { (void)h; (void)m; return FALSE; }
 EXPORT LRESULT DispatchMessageA(const MSG *m) {
     if (m->message == WM_TIMER && m->lParam) { ((void (*)(HWND, UINT, ULONG_PTR, DWORD))m->lParam)(m->hwnd, WM_TIMER, m->wParam, m->time); return 0; }
     struct wnd *w = U_wnd(m->hwnd);
@@ -500,7 +498,5 @@ LRESULT U_def_proc(struct wnd *w, UINT m, WPARAM wp, LPARAM lp, int unicode) {
 }
 EXPORT LRESULT DefWindowProcA(HWND h, UINT m, WPARAM wp, LPARAM lp) { struct wnd *w = U_wnd(h); return w ? U_def_proc(w, m, wp, lp, 0) : 0; }
 EXPORT LRESULT DefWindowProcW(HWND h, UINT m, WPARAM wp, LPARAM lp) { struct wnd *w = U_wnd(h); return w ? U_def_proc(w, m, wp, lp, 1) : 0; }
-EXPORT LRESULT DefDlgProcA(HWND h, UINT m, WPARAM wp, LPARAM lp) { return DefWindowProcA(h, m, wp, lp); }
-EXPORT LRESULT DefDlgProcW(HWND h, UINT m, WPARAM wp, LPARAM lp) { return DefWindowProcW(h, m, wp, lp); }
 EXPORT LRESULT DefFrameProcA(HWND h, HWND c, UINT m, WPARAM wp, LPARAM lp) { (void)c; return DefWindowProcA(h, m, wp, lp); }
 EXPORT LRESULT DefMDIChildProcA(HWND h, UINT m, WPARAM wp, LPARAM lp) { return DefWindowProcA(h, m, wp, lp); }
