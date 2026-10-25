@@ -221,7 +221,8 @@ struct edit {
     int readonly, maxlen, modified, drag;
     char pwchar;
 };
-static char clip[4096]; static int cliplen;
+extern void U_clip_set_text(const char *s, int n);
+extern int U_clip_text(char *out, int cap);
 
 static int utf8_prev(const char *s, int i) { if (i > 0) i--; while (i > 0 && (s[i] & 0xC0) == 0x80) i--; return i; }
 static int utf8_next(const char *s, int len, int i) { if (i < len) i++; while (i < len && (s[i] & 0xC0) == 0x80) i++; return i; }
@@ -353,8 +354,7 @@ static void ed_move(struct wnd *w, struct edit *e, int to, int extend) { (void)w
 static void ed_copy(struct edit *e) {
     int lo = ed_sel_lo(e), hi = ed_sel_hi(e);
     if (lo == hi) return;
-    cliplen = hi - lo > 4095 ? 4095 : hi - lo;
-    memcpy(clip, e->buf + lo, (SIZE_T)cliplen); clip[cliplen] = 0;
+    U_clip_set_text(e->buf + lo, hi - lo > 4095 ? 4095 : hi - lo);
 }
 
 LRESULT U_edit_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
@@ -408,7 +408,7 @@ LRESULT U_edit_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         else if (c == 1) { e->a = 0; e->b = e->len; U_invalidate(w, 0, 1); }
         else if (c == 3) ed_copy(e);
         else if (c == 24) { ed_copy(e); ed_insert(w, e, "", 0); }
-        else if (c == 22) { if (cliplen) ed_insert(w, e, clip, cliplen); }
+        else if (c == 22) { char t[4096]; int n = U_clip_text(t, sizeof t); if (n) ed_insert(w, e, t, n); }
         else if (c >= 32) {
             if ((w->style & ES_NUMBER) && (c < '0' || c > '9')) return 0;
             if (w->style & ES_UPPERCASE && c >= 'a' && c <= 'z') c -= 32;
@@ -448,7 +448,7 @@ LRESULT U_edit_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case 0xCC: e->pwchar = (char)wp; return 0;
     case WM_CUT: ed_copy(e); ed_insert(w, e, "", 0); return 0;
     case WM_COPY: ed_copy(e); return 0;
-    case WM_PASTE: if (cliplen) ed_insert(w, e, clip, cliplen); return 0;
+    case WM_PASTE: { char t[4096]; int n = U_clip_text(t, sizeof t); if (n) ed_insert(w, e, t, n); return 0; }
     case WM_CLEAR: ed_insert(w, e, "", 0); return 0;
     default: return U_def_proc(w, m, wp, lp, w->unicode);
     }
@@ -556,4 +556,6 @@ void U_register_builtin(void) {
     U_add_class("STATIC", U_static_proc, 0, 0, 0, face, 0, 0, 1);
     U_add_class("EDIT", U_edit_proc, CS_DBLCLKS, 0, 0, win, 0, 0, 1);
     U_add_class("LISTBOX", U_listbox_proc, CS_DBLCLKS, 0, 0, win, 0, 0, 1);
+    U_add_class("SCROLLBAR", U_scrollbar_proc, CS_DBLCLKS, 0, 0, face, 0, 0, 1);
+    U_add_class("COMBOBOX", U_combobox_proc, CS_DBLCLKS, 0, 0, win, 0, 0, 1);
 }

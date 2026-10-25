@@ -42,6 +42,8 @@ struct cls {
     HICON icon;
 };
 
+struct sbi { int min, max, page, pos, trackpos; };
+
 struct wnd {
     int used, magic;
     struct wnd *parent, *owner, *first, *last, *prev, *next;      // children in z order, last = top
@@ -64,6 +66,7 @@ struct wnd {
     int in_destroy, bd, activated;
     struct menu *menu; int mh, noframe;        // top level: its menu bar and the bar height inside the buffer
     void *font;
+    struct sbi sb[2];                          // scroll bars of the window itself: [0] horizontal, [1] vertical (style WS_HSCROLL / WS_VSCROLL)
     int dlg_result, dlg_done, dlg_defid;
 };
 
@@ -113,6 +116,8 @@ int U_menubar_event(struct wnd *T, const struct okw_event *e);
 void U_menubar_leave(struct wnd *T);
 int U_pump(int ms);
 extern int (*U_event_hook)(const struct okw_event *);
+HDC BeginPaint(HWND h, PAINTSTRUCT *ps);
+BOOL EndPaint(HWND h, const PAINTSTRUCT *ps);
 BOOL IsWindowEnabled(HWND h);
 BOOL IsDialogMessageA(HWND h, MSG *m);
 HWND GetDlgItem(HWND h, int id);
@@ -146,6 +151,15 @@ LRESULT U_button_proc(HWND, UINT, WPARAM, LPARAM);
 LRESULT U_static_proc(HWND, UINT, WPARAM, LPARAM);
 LRESULT U_edit_proc(HWND, UINT, WPARAM, LPARAM);
 LRESULT U_listbox_proc(HWND, UINT, WPARAM, LPARAM);
+LRESULT U_scrollbar_proc(HWND, UINT, WPARAM, LPARAM);
+LRESULT U_combobox_proc(HWND, UINT, WPARAM, LPARAM);
+int U_sbv(struct wnd *w);
+int U_sbh(struct wnd *w);
+void U_nc_paint(struct wnd *w);
+int U_nc_event(struct wnd *w, int lx, int ly, int type, int down);
+int U_nc_active(struct wnd *w);
+void U_sb_timer(struct wnd *w);
+void U_recalc_client(struct wnd *w);
 
 LRESULT DefWindowProcA(HWND, UINT, WPARAM, LPARAM);
 LRESULT DefWindowProcW(HWND, UINT, WPARAM, LPARAM);
@@ -154,6 +168,10 @@ static inline void *umalloc(SIZE_T n) { return HeapAlloc(GetProcessHeap(), 8, n 
 static inline void ufree(void *p) { if (p) HeapFree(GetProcessHeap(), 0, p); }
 static inline int ustrlen(const char *s) { int n = 0; while (s[n]) n++; return n; }
 static inline void ustrcpy(char *d, const char *s, int cap) { int i = 0; for (; s && s[i] && i < cap - 1; i++) d[i] = s[i]; d[i] = 0; }
+static inline int ustricmp_n(const char *a, const char *b, int n) {
+    for (int i = 0; i < n; i++) { int x = a[i], y = b[i]; if (x >= 'A' && x <= 'Z') x += 32; if (y >= 'A' && y <= 'Z') y += 32; if (x != y) return x - y; if (!x) return 0; }
+    return 0;
+}
 static inline int ustricmp(const char *a, const char *b) {
     for (;; a++, b++) { int x = *a, y = *b; if (x >= 'A' && x <= 'Z') x += 32; if (y >= 'A' && y <= 'Z') y += 32; if (x != y) return x - y; if (!x) return 0; }
 }
@@ -235,6 +253,10 @@ static inline int ustricmp(const char *a, const char *b) {
 #define LBN_DBLCLK 2
 
 #define WS_TABSTOP 0x00010000
+#ifndef WS_VSCROLL
+#define WS_VSCROLL 0x00200000
+#define WS_HSCROLL 0x00100000
+#endif
 #define WS_GROUP 0x00020000
 #define WS_DISABLED 0x08000000
 #define WS_CLIPCHILDREN 0x02000000

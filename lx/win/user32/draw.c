@@ -163,6 +163,7 @@ EXPORT HDC BeginPaint(HWND h, PAINTSTRUCT *ps) {
     ps->hdc = dc;
     if (erase) {
         draw_border(w);
+        U_nc_paint(w);
         if (U_send(w, WM_ERASEBKGND, (WPARAM)dc, 0)) ps->fErase = FALSE; else ps->fErase = TRUE;
     }
     for (struct wnd *c = w->first; c; c = c->next) {             // children that overlap are painted afterwards, over what the parent just drew
@@ -326,8 +327,6 @@ EXPORT int DrawTextW(HDC dc, LPCWSTR s, int n, RECT *rc, UINT fl) {
 EXPORT int DrawTextExA(HDC dc, LPSTR s, int n, RECT *rc, UINT fl, void *p) { (void)p; return draw_text(dc, s, n, rc, fl); }
 EXPORT int DrawTextExW(HDC dc, LPWSTR s, int n, RECT *rc, UINT fl, void *p) { (void)p; return DrawTextW(dc, s, n, rc, fl); }
 EXPORT LONG TabbedTextOutA(HDC dc, int x, int y, LPCSTR s, int n, int nt, const INT *tabs, int org) { (void)nt; (void)tabs; (void)org; TextOutA(dc, x, y, s, n); return U_text_width(dc, s, n); }
-EXPORT BOOL DrawIcon(HDC dc, int x, int y, HICON i) { (void)dc; (void)x; (void)y; (void)i; return TRUE; }
-EXPORT BOOL DrawIconEx(HDC dc, int x, int y, HICON i, int w, int h, UINT s, HBRUSH b, UINT f) { (void)dc; (void)x; (void)y; (void)i; (void)w; (void)h; (void)s; (void)b; (void)f; return TRUE; }
 
 // ---- metrics ------------------------------------------------------------------------------------------------------------------------------
 
@@ -381,11 +380,6 @@ EXPORT UINT GetDpiForSystem(void) { return 96; }
 
 EXPORT HCURSOR LoadCursorA(HINSTANCE h, LPCSTR n) { (void)h; return (HCURSOR)((ULONG_PTR)n < 0x10000 ? 0x1000 + (ULONG_PTR)n : 0x2000); }
 EXPORT HCURSOR LoadCursorW(HINSTANCE h, LPCWSTR n) { return LoadCursorA(h, (LPCSTR)n); }
-EXPORT HICON LoadIconA(HINSTANCE h, LPCSTR n) { (void)h; return (HICON)((ULONG_PTR)n < 0x10000 ? 0x3000 + (ULONG_PTR)n : 0x4000); }
-EXPORT HICON LoadIconW(HINSTANCE h, LPCWSTR n) { return LoadIconA(h, (LPCSTR)n); }
-EXPORT HANDLE LoadImageA(HINSTANCE h, LPCSTR n, UINT t, int w, int hh, UINT f) { (void)h; (void)n; (void)t; (void)w; (void)hh; (void)f; return (HANDLE)0x5000; }
-EXPORT HANDLE LoadImageW(HINSTANCE h, LPCWSTR n, UINT t, int w, int hh, UINT f) { return LoadImageA(h, (LPCSTR)n, t, w, hh, f); }
-EXPORT HBITMAP LoadBitmapA(HINSTANCE h, LPCSTR n) { (void)h; (void)n; return 0; }
 extern HRSRC FindResourceExW(HMODULE m, LPCWSTR type, LPCWSTR name, WORD lang);
 extern HGLOBAL LoadResource(HMODULE m, HRSRC r);
 static const WCHAR *find_string(HINSTANCE h, UINT id, int *len) {
@@ -415,21 +409,6 @@ EXPORT int LoadStringA(HINSTANCE h, UINT id, LPSTR buf, int cap) {
     buf[r] = 0;
     return r;
 }
-EXPORT BOOL DestroyIcon(HICON i) { (void)i; return TRUE; }
-EXPORT BOOL DestroyCursor(HCURSOR c) { (void)c; return TRUE; }
-EXPORT BOOL OpenClipboard(HWND h) { (void)h; return FALSE; }
-EXPORT BOOL CloseClipboard(void) { return TRUE; }
-EXPORT BOOL EmptyClipboard(void) { return TRUE; }
-EXPORT HANDLE GetClipboardData(UINT f) { (void)f; return 0; }
-EXPORT HANDLE SetClipboardData(UINT f, HANDLE h) { (void)f; (void)h; return 0; }
-EXPORT BOOL IsClipboardFormatAvailable(UINT f) { (void)f; return FALSE; }
-EXPORT BOOL SetScrollInfo(HWND h, int b, const void *i, BOOL r) { (void)h; (void)b; (void)i; (void)r; return TRUE; }
-EXPORT BOOL GetScrollInfo(HWND h, int b, void *i) { (void)h; (void)b; (void)i; return FALSE; }
-EXPORT int SetScrollPos(HWND h, int b, int p, BOOL r) { (void)h; (void)b; (void)r; return p; }
-EXPORT int GetScrollPos(HWND h, int b) { (void)h; (void)b; return 0; }
-EXPORT BOOL SetScrollRange(HWND h, int b, int lo, int hi, BOOL r) { (void)h; (void)b; (void)lo; (void)hi; (void)r; return TRUE; }
-EXPORT BOOL ShowScrollBar(HWND h, int b, BOOL s) { (void)h; (void)b; (void)s; return TRUE; }
-EXPORT BOOL EnableScrollBar(HWND h, UINT b, UINT a) { (void)h; (void)b; (void)a; return TRUE; }
 EXPORT int SetWindowRgn(HWND h, void *r, BOOL red) { (void)h; (void)r; (void)red; return 1; }
 EXPORT BOOL SetLayeredWindowAttributes(HWND h, COLORREF c, BYTE a, DWORD f) { (void)h; (void)c; (void)a; (void)f; return TRUE; }
 EXPORT BOOL DragDetect(HWND h, POINT p) { (void)h; (void)p; return FALSE; }

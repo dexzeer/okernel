@@ -18,7 +18,7 @@
 #define OKW_INFO     0x4F09
 #define OKW_FOCUS    0x4F0A
 #define OKW_TEXT     0x4F0B     /* render text with the system font into a window buffer */
-#define OKW_CLIPBOARD 0x4F0C
+#define OKW_CLIPBOARD 0x4F0C    /* the clipboard text (UTF-8) shared by every program: struct okw_clip */
 #define OKW_QUERY    0x4F0D     /* window position / pointer state */
 
 struct okw_create  { int x, y, w, h; unsigned flags; char title[64]; int out_wid; int out_stride; };
@@ -30,6 +30,8 @@ struct okw_move    { int wid; int x, y; };
 struct okw_show    { int wid; int show; };
 struct okw_info    { int screen_w, screen_h; int title_h, border; };
 struct okw_text    { unsigned long long str; int len, size, flags, family; unsigned long long mask; int cap_w, cap_h, out_w, out_asc, out_desc, pad; };   /* flags: 1 bold 2 italic 4 measure only; family 0 sans 1 serif 2 mono; mask = cap_w x cap_h coverage bytes */
+
+struct okw_clip    { int op; int len; unsigned long long buf; unsigned long long seq; };   /* op 0 = set (len bytes at buf), 1 = get (up to len bytes into buf; the new len is returned in len); seq = changes so far */
 
 struct okw_query   { int wid; int x, y, w, h; int mx, my, mb, focused; };   /* in: wid (or -1);  out: outer position and client size of the window, pointer, focus */
 

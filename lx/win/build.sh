@@ -26,7 +26,7 @@ fi
 
 if [ -d lx/win/gdi32 ]; then
     exports lx/win/gdi32/*.c > $T/gdi.exp
-    cat lx/win/gdi32/extra.exp >> $T/gdi.exp
+    tr -d '\r' < lx/win/gdi32/extra.exp >> $T/gdi.exp
     sort -u $T/gdi.exp -o $T/gdi.exp
     $PEB $SYS/gdi32.dll dll 0x6F000000 lx/win/gdi32/imports.txt $T/gdi.exp lx/win/gdi32/*.c
 fi
@@ -41,7 +41,9 @@ fi
 grep -vx -e memcpy -e memmove -e memset -e memcmp -e strlen $T/k32.exp > $T/k32_imp.exp
 for d in lx/win/tests/*/; do
     n=$(basename $d)
+    [ -f $d/gen.py ] && (cd $d && python3 gen.py)
     kind=exe; [ -f $d/gui ] && kind=gui
-    $PEB $OUT/win/$n.exe $kind 0x00400000 $d/imports.txt - $d/*.c
+    rs=""; [ -f $d/rsrc.txt ] && rs=$d/rsrc.txt
+    RSRC=$rs $PEB $OUT/win/$n.exe $kind 0x00400000 $d/imports.txt - $d/*.c
 done
 echo built $OUT

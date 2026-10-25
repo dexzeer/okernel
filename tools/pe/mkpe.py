@@ -10,6 +10,7 @@ come from the symbols __iat_<n>_<i> (n = index of the DLL in the file, i = index
 import struct, sys, argparse, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import unwind
+import rsrc
 
 def read_elf(path):
     d = open(path, "rb").read()
@@ -84,7 +85,7 @@ def main():
     ap.add_argument("--dll", action="store_true"); ap.add_argument("--gui", action="store_true")
     ap.add_argument("--base", default="0x10000000"); ap.add_argument("--imports"); ap.add_argument("--export", default="")
     ap.add_argument("--entry", default=None); ap.add_argument("--stack", type=int, default=1 << 20)
-    ap.add_argument("--name", default=None)
+    ap.add_argument("--name", default=None); ap.add_argument("--rsrc", default=None)
     a = ap.parse_args()
     base = int(a.base, 0)
     d, secs, syms, elf_entry, relocs = read_elf(a.elf)
@@ -187,6 +188,13 @@ def main():
         pdata = b"".join(struct.pack("<III", *t) for t in table)
         pd_rva, pd_size = nxt, len(pdata)
         pes.append(dict(name=".pdata", rva=pd_rva, vsize=len(pdata), data=pdata, flags=0x40000040))
+    # resources
+    rs_rva = rs_size = 0
+    if a.rsrc:
+        nxt = max(p["rva"] + align(p["vsize"], 0x1000) for p in pes)
+        rdata = rsrc.build(rsrc.parse(a.rsrc), nxt)
+        pes.append(dict(name=".rsrc", rva=nxt, vsize=len(rdata), data=rdata, flags=0x40000040))
+        rs_rva, rs_size = nxt, len(rdata)
     # headers
     entry_sym = a.entry or ("DllMain" if a.dll else None)
     entry_rva = (syms[entry_sym][0] - base) if entry_sym and entry_sym in syms else max(0, elf_entry - base)
@@ -219,6 +227,7 @@ def main():
     dd = o + 112
     if exp_rva: struct.pack_into("<II", out, dd, exp_rva, exp_size)
     if imports: struct.pack_into("<II", out, dd + 8, idata_rva, 20 * (len(imports) + 1))
+    if rs_rva: struct.pack_into("<II", out, dd + 16, rs_rva, rs_size)
     if pd_rva: struct.pack_into("<II", out, dd + 24, pd_rva, pd_size)               # exception directory
     so = o + 240
     for i, p in enumerate(pes):

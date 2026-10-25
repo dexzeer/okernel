@@ -8,6 +8,7 @@
 // __except that accepts the exception makes RtlUnwindEx run the termination handlers of the frames in between and continue in
 // the __except block with the stack of its function. Software exceptions (RaiseException) take the same way.
 #include "k32.h"
+extern void ExitProcess(DWORD code);
 
 typedef unsigned long long DWORD64;
 typedef struct { DWORD64 Low; LONGLONG High; } __attribute__((aligned(16))) M128A;
@@ -503,6 +504,16 @@ EXPORT long UnhandledExceptionFilter(EXCEPTION_POINTERS *ep) {
     put_hex(b, &n, (DWORD64)ep->ExceptionRecord->ExceptionAddress);
     b[n++] = 10;
     SC3(LX_write, 2, b, n);
+    {                                                              // a short call trace, innermost first
+        CONTEXT uc = *ep->ContextRecord;
+        for (int depth = 0; depth < 10 && uc.Rip && stack_ok(uc.gp[4]); depth++) {
+            DWORD64 base = 0, frame = 0; void *hd = 0;
+            RUNTIME_FUNCTION *fe = RtlLookupFunctionEntry(uc.Rip, &base, 0);
+            n = 0; b[n++] = ' '; b[n++] = ' '; put_hex(b, &n, uc.Rip); b[n++] = 10;
+            SC3(LX_write, 2, b, n);
+            RtlVirtualUnwind(0, base, uc.Rip, fe, &uc, &hd, &frame, 0);
+        }
+    }
     return 1;                                                      // EXCEPTION_EXECUTE_HANDLER: the process ends
 }
 

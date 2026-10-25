@@ -526,6 +526,7 @@ static void pop_paint(struct pop *p) {
     SC3(LX_ioctl, U_fd(), OKW_PRESENT, &pr);
 }
 
+static int g_minw, g_sel = -1;
 static struct pop *pop_open(struct menu *m, int sx, int sy) {
     if (npop >= MAXPOP) return 0;
     int title, border, sw, sh; U_info(&title, &border, &sw, &sh);
@@ -535,6 +536,10 @@ static struct pop *pop_open(struct menu *m, int sx, int sy) {
     pop_measure(p);
     if (R.owner) U_send(R.owner, WM_INITMENUPOPUP, (WPARAM)m, MAKELPARAM(0, 0));
     pop_measure(p);                                                       // the owner may have changed the items
+    if (g_minw > p->w) p->w = g_minw;
+    g_minw = 0;
+    if (g_sel >= 0 && g_sel < m->n) p->hot = g_sel;
+    g_sel = -1;
     int ow = p->w + 2 * border, oh = p->h + 2 * border;
     if (sx + ow > sw) sx = sw - ow;
     if (sy + oh > sh - 40) sy = sh - 40 - oh;
@@ -722,6 +727,14 @@ EXPORT BOOL TrackPopupMenu(HMENU hm, UINT flags, int x, int y, int res, HWND hw,
     int r = menu_run(w, -1, hm, x, y, (flags & TPM_RETURNCMD) != 0);
     return (flags & TPM_RETURNCMD) ? r : r != 0;
 }
+// a list of choices (combo box drop-down): returns the id (1-based index) of the chosen item or 0
+int U_list_popup(struct wnd *owner, struct menu *m, int sx, int sy, int minw, int sel) {
+    g_minw = minw; g_sel = sel;
+    int r = menu_run(owner, -1, m, sx, sy, 1);
+    g_minw = 0; g_sel = -1;
+    return r;
+}
+
 EXPORT BOOL TrackPopupMenuEx(HMENU hm, UINT flags, int x, int y, HWND hw, void *tpm) { (void)tpm; return TrackPopupMenu(hm, flags, x, y, 0, hw, 0); }
 
 // ---- accelerators -------------------------------------------------------------------------------------------------------------------

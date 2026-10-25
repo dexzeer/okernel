@@ -51,6 +51,7 @@ static inline char *strcpy_(char *d, const char *s) { char *r = d; while ((*d++ 
 static inline char *strncpy_(char *d, const char *s, SIZE_T n) { SIZE_T i = 0; for (; i + 1 < n && s[i]; i++) d[i] = s[i]; if (n) d[i] = 0; return d; }
 void *memcpy(void *d, const void *s, SIZE_T n);
 void *memset(void *d, int c, SIZE_T n);
+void *memmove(void *d, const void *s, SIZE_T n);
 SIZE_T strlen(const char *s);
 
 #define ARRAY_COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))

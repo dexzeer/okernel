@@ -1,0 +1,2 @@
+kernel32.dll: GetStdHandle WriteFile
+user32.dll: RegisterClassExA CreateWindowExA ShowWindow UpdateWindow GetMessageA TranslateMessage DispatchMessageA DefWindowProcA PostQuitMessage DestroyWindow wsprintfA SendMessageA GetWindowRect GetClientRect ClientToScreen LoadCursorA SetScrollInfo GetScrollPos SetScrollPos

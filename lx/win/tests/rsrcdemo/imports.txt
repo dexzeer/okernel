@@ -1,0 +1,3 @@
+kernel32.dll: GetStdHandle WriteFile GetModuleHandleA GlobalAlloc GlobalLock FindResourceA LoadResource SizeofResource
+user32.dll: LoadStringA LoadBitmapA LoadIconA DrawIconEx GetIconInfo LoadMenuA GetMenuItemCount GetSubMenu GetMenuStringA LoadAcceleratorsA DialogBoxParamA EndDialog GetDlgItemTextA SendDlgItemMessageA OpenClipboard EmptyClipboard SetClipboardData GetClipboardData CloseClipboard wsprintfA FillRect
+gdi32.dll: GetObjectA CreateCompatibleDC SelectObject GetPixel CreateCompatibleBitmap DeleteDC CreateSolidBrush

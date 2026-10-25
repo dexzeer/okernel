@@ -1,0 +1,7 @@
+BITMAP 100 test.bmp
+ICON 1 test.ico
+MENU 300 menu.bin
+DIALOG 400 dialog.bin
+ACCELERATOR 500 accel.bin
+RCDATA 10 data.bin
+STRINGS strings.txt

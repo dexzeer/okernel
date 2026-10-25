@@ -7,3 +7,4 @@ __gdi_FrameRect
 __gdi_dc_setup
 __gdi_reset_dc
 __gdi_is_dc
+__gdi_blend_argb
