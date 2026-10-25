@@ -1,5 +1,7 @@
 // kernel32: file mappings, FormatMessage, and the many small entry points real programs import (stubs where our system has no equivalent)
 #include "k32.h"
+extern HMODULE LoadLibraryA(LPCSTR name);
+extern FARPROC GetProcAddress(HMODULE m, LPCSTR name);
 
 #define PROT_READ_ 1
 #define PROT_WRITE_ 2
@@ -208,7 +210,24 @@ EXPORT WORD GetUserDefaultUILanguage(void) { return 0x409; }
 EXPORT void SetFileApisToOEM(void) {}
 EXPORT void SetFileApisToANSI(void) {}
 EXPORT NTSTATUS ApiSetQueryApiSetPresence(void *name, BYTE *present) { (void)name; if (present) *present = 0; return 0; }
-EXPORT void *ResolveDelayLoadedAPI(void *base, void *desc, void *fail, void *hook, void *thunk, DWORD flags) { (void)base; (void)desc; (void)fail; (void)hook; (void)thunk; (void)flags; return 0; }
+// Delay-loaded imports: the stub in the program's delay-load table calls this with the address of its IAT slot; the DLL is loaded
+// on the first call, the function looked up (by name or ordinal) and its address stored in the slot.
+struct delay_descr { DWORD attrs, rvaDll, rvaHmod, rvaIat, rvaInt, rvaBound, rvaUnload, timestamp; };
+EXPORT void *ResolveDelayLoadedAPI(void *base, void *desc, void *fail, void *hook, void *thunk, DWORD flags) {
+    (void)fail; (void)hook; (void)flags;
+    struct delay_descr *d = (struct delay_descr*)desc;
+    BYTE *b = (BYTE*)base;
+    HMODULE *hm = (HMODULE*)(b + d->rvaHmod);
+    if (!*hm) *hm = LoadLibraryA((LPCSTR)(b + d->rvaDll));
+    if (!*hm) return 0;
+    ULONGLONG *iat = (ULONGLONG*)(b + d->rvaIat), *nt = (ULONGLONG*)(b + d->rvaInt);
+    SIZE_T idx = (SIZE_T)((ULONGLONG*)thunk - iat);
+    ULONGLONG ent = nt[idx];
+    FARPROC p = (ent >> 63) ? GetProcAddress(*hm, (LPCSTR)(ent & 0xFFFF)) : GetProcAddress(*hm, (LPCSTR)(b + (ent & 0x7FFFFFFF) + 2));
+    if (p) *(FARPROC*)thunk = p;
+    return (void*)p;
+}
+
 EXPORT void *DelayLoadFailureHook(LPCSTR dll, LPCSTR proc) { (void)dll; (void)proc; return 0; }
 EXPORT BOOL GetOverlappedResult(HANDLE h, void *ov, LPDWORD n, BOOL wait) { (void)h; (void)ov; (void)wait; if (n) *n = 0; return FALSE; }
 EXPORT BOOL GetDiskFreeSpaceA(LPCSTR root, LPDWORD spc, LPDWORD bps, LPDWORD free_, LPDWORD total) { (void)root; if (spc) *spc = 8; if (bps) *bps = 512; if (free_) *free_ = 1000000; if (total) *total = 2000000; return TRUE; }

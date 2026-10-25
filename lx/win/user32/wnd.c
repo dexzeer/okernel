@@ -102,6 +102,10 @@ EXPORT ATOM RegisterClassExA(const WNDCLASSEXA *c) {
     struct cls *k = U_add_class(nm, c->lpfnWndProc, c->style, c->cbClsExtra, c->cbWndExtra, c->hbrBackground, c->hInstance, 0, 0);
     if (!k) return 0;
     k->cursor = c->hCursor; k->icon = c->hIcon;
+    if (c->lpszMenuName) {
+        if ((ULONG_PTR)c->lpszMenuName < 0x10000) k->menu_id = (ULONG_PTR)c->lpszMenuName;
+        else { WCHAR w[64]; u2w(c->lpszMenuName, w, 64); k->menu_name = (LPWSTR)umalloc(130); memcpy(k->menu_name, w, 130); }
+    }
     return (ATOM)k->atom;
 }
 EXPORT ATOM RegisterClassExW(const WNDCLASSEXW *c) {
@@ -112,6 +116,10 @@ EXPORT ATOM RegisterClassExW(const WNDCLASSEXW *c) {
     struct cls *k = U_add_class(nm, c->lpfnWndProc, c->style, c->cbClsExtra, c->cbWndExtra, c->hbrBackground, c->hInstance, 1, 0);
     if (!k) return 0;
     k->cursor = c->hCursor; k->icon = c->hIcon;
+    if (c->lpszMenuName) {
+        if ((ULONG_PTR)c->lpszMenuName < 0x10000) k->menu_id = (ULONG_PTR)c->lpszMenuName;
+        else { int n = 0; while (n < 63 && c->lpszMenuName[n]) n++; k->menu_name = (LPWSTR)umalloc(130); memcpy(k->menu_name, c->lpszMenuName, (SIZE_T)n * 2); k->menu_name[n] = 0; }
+    }
     return (ATOM)k->atom;
 }
 EXPORT ATOM RegisterClassA(const WNDCLASSA *c) {
@@ -233,6 +241,7 @@ HWND U_create_window(DWORD ex, const void *cls, const void *name, DWORD style, i
         int noframe = (style & WS_POPUP) && (style & WS_CAPTION) != WS_CAPTION;     // no title bar (the desktop still draws a thin frame)
         if (w == CW_USEDEFAULT) w = 640;
         if (h == CW_USEDEFAULT) h = 480;
+        if (!menu && (k->menu_id || k->menu_name)) menu = LoadMenuW(k->inst ? k->inst : inst, k->menu_name ? k->menu_name : (LPCWSTR)k->menu_id);   // the class menu
         struct menu *mn = menu ? U_menu(menu) : 0;                                   // hMenu of a top-level window is its menu
         int mh = mn ? U_menubar_height() : 0;
         int cw = w - 2 * t_border, ch = h - (noframe ? 0 : t_title) - 2 * t_border;  // = the size of the pixel buffer
