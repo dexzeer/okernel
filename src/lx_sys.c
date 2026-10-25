@@ -42,6 +42,7 @@ void lx_file_put(struct lx_file *f) {
     if (f->node) lxfs_unref(f->node);
     if (f->sock) lx_sock_close(f->sock);
     if (f->ev) lx_event_free(f->ev);
+    if (f->priv) { extern void lx_okwin_close(void*); lx_okwin_close(f->priv); }
     if (f->pipe) {
         if (f->kind == LXF_PIPE_R) f->pipe->readers--;
         else if (f->kind == LXF_PIPE_W) f->pipe->writers--;
@@ -168,6 +169,16 @@ static int64_t file_read(struct lx_task *t, struct lx_file *f, uint64_t uaddr, u
                     uaddr += k; len -= k; done += k;
                 }
                 return done;
+            }
+            if (dev == LXDEV_OKWIN) {
+                extern int lx_okwin_ready(void*); extern int64_t lx_okwin_read(struct lx_task*, void*, uint64_t, uint64_t);
+                extern int lx_okwin_wake(struct lx_task*);
+                if (!lx_okwin_ready(f->priv)) {
+                    if (f->flags & LX_O_NONBLOCK) return -LX_EAGAIN;
+                    lx_block(t, lx_okwin_wake, (uint64_t)fd_of(t, f));
+                    return 0;
+                }
+                return lx_okwin_read(t, f->priv, uaddr, len);
             }
             if (dev == LXDEV_EVENT0) {
                 extern int lx_input_ready(void); extern int lx_input_read(struct lx_task*, uint64_t, uint64_t); extern int lx_input_wake(struct lx_task*);
@@ -384,6 +395,11 @@ static int64_t do_openat(struct lx_task *t, int64_t dirfd, uint64_t upath, uint3
     }
     f = lx_file_new(LXF_NODE, (int)flags, n);
     if (!f) return -LX_ENOMEM;
+    if (n->type == LXN_CHR && n->dev == LXDEV_OKWIN) {
+        extern void *lx_okwin_open(struct lx_task*);
+        f->priv = lx_okwin_open(t);
+        if (!f->priv) { lx_file_put(f); return -LX_ENOMEM; }
+    }
     int fd = lx_fd_alloc(t, f, 0, (flags & LX_O_CLOEXEC) != 0);
     if (fd < 0) lx_file_put(f);
     return fd;
@@ -636,6 +652,7 @@ static int fd_events(struct lx_task *t, struct lx_file *f, int want) {
     case LXF_PIPE_W: if (f->pipe->count < LX_PIPE_SIZE) r |= POLLOUT; if (f->pipe->readers <= 0) r |= POLLERR; break;
     case LXF_NODE:
         if (f->node && f->node->type == LXN_CHR && f->node->dev == LXDEV_EVENT0) { extern int lx_input_ready(void); if (lx_input_ready()) r |= POLLIN; break; }
+        if (f->node && f->node->type == LXN_CHR && f->node->dev == LXDEV_OKWIN) { extern int lx_okwin_ready(void*); if (lx_okwin_ready(f->priv)) r |= POLLIN; r |= POLLOUT; break; }
         r |= POLLIN | POLLOUT; break;
     default: r |= POLLIN | POLLOUT; break;
     }
@@ -868,6 +885,10 @@ int64_t lx_syscall_dispatch(struct lx_task *t) {
         if (f->node && f->node->type == LXN_CHR && f->node->dev == LXDEV_FB0) {
             extern int lx_fb_ioctl(struct lx_task*, uint64_t, uint64_t);
             return lx_fb_ioctl(t, a1, a2);
+        }
+        if (f->node && f->node->type == LXN_CHR && f->node->dev == LXDEV_OKWIN) {
+            extern int64_t lx_okwin_ioctl(struct lx_task*, void*, uint64_t, uint64_t);
+            return lx_okwin_ioctl(t, f->priv, a1, a2);
         }
         return -LX_ENOTTY;
     }

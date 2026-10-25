@@ -330,6 +330,7 @@ void mouse_get_position(int* x, int* y) {
 int mouse_get_x(void) { return mouse_x; }
 int mouse_get_y(void) { return mouse_y; }
 int mouse_get_left_button(void) { return mouse_buttons & 0x01; }
+int mouse_get_buttons(void) { return mouse_buttons & 0x07; }
 
 int mouse_get_scroll(void) {
     uint32_t f = irq_save();

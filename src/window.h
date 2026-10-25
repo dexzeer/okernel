@@ -11,7 +11,7 @@ extern const uint32_t vga_to_rgb[16];
 // Default content background (VGA index 0) as exact RGB.
 #define WIN_BG_RGB 0x00000000
 
-#define MAX_WINDOWS 8
+#define MAX_WINDOWS 16
 // Layout constants derived from glyph size — never hardcode pixels;
 // these track FONT_SCALE automatically
 #define WIN_TITLE_H (CHAR_H + 8)
