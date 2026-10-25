@@ -245,7 +245,7 @@ HWND U_create_window(DWORD ex, const void *cls, const void *name, DWORD style, i
         if (y == CW_USEDEFAULT) y = -1;
         struct okw_create c;
         memset(&c, 0, sizeof c);
-        c.x = x; c.y = y; c.w = cw; c.h = ch; c.flags = noframe ? OKW_F_NOFRAME : 0;
+        c.x = x; c.y = y; c.w = cw; c.h = ch; c.flags = (noframe ? OKW_F_NOFRAME : 0) | ((style & WS_VISIBLE) ? 0 : OKW_F_HIDDEN);
         ustrcpy(c.title, me->text, sizeof c.title);
         if (SC3(LX_ioctl, U_fd(), OKW_CREATE, &c) < 0) { me->used = 0; ufree(me->extra); set_error(ERROR_NOT_ENOUGH_MEMORY); return 0; }
         struct okw_map m; memset(&m, 0, sizeof m); m.wid = c.out_wid;
@@ -254,7 +254,6 @@ HWND U_create_window(DWORD ex, const void *cls, const void *name, DWORD style, i
         me->x = x; me->y = y; me->cw = cw; me->ch = ch - mh;
         me->w = cw + 2 * t_border; me->h = ch + (noframe ? 0 : t_title) + 2 * t_border;
         U_menubar_paint(me);
-        if (!(style & WS_VISIBLE)) { struct okw_show s = { me->wid, 0 }; SC3(LX_ioctl, U_fd(), OKW_SHOW, &s); }
     }
 
     CREATESTRUCTA cs;
@@ -550,21 +549,21 @@ EXPORT BOOL BringWindowToTop(HWND h) {
     else if (k->parent && k->parent->last != k) { struct wnd *p = k->parent; unlink_child(k); link_child(p, k); U_invalidate(k, 0, 1); }
     return TRUE;
 }
+BOOL UpdateWindow(HWND h);
 EXPORT BOOL ShowWindow(HWND h, int cmd) {
     struct wnd *w = U_wnd(h);
     if (!w) return FALSE;
     int was = w->visible, show = cmd != SW_HIDE && cmd != SW_MINIMIZE;
     w->visible = show;
+    if (was != show) U_send(w, WM_SHOWWINDOW, show, 0);
+    if (show && !was && !w->parent) { U_invalidate(w, 0, 1); UpdateWindow(w); }      // the first picture is in the buffer when the desktop shows the window (its opening animation)
     if (!w->parent && w->wid >= 0) {
         struct okw_show s = { w->wid, show };
         SC3(LX_ioctl, U_fd(), OKW_SHOW, &s);
     }
-    if (was != show) {
-        U_send(w, WM_SHOWWINDOW, show, 0);
-        if (w->parent) {
-            RECT r = { w->x, w->y, w->x + w->w, w->y + w->h };
-            U_invalidate(w->parent, &r, 1);
-        }
+    if (was != show && w->parent) {
+        RECT r = { w->x, w->y, w->x + w->w, w->y + w->h };
+        U_invalidate(w->parent, &r, 1);
     }
     if (show) {
         U_invalidate(w, 0, 1);

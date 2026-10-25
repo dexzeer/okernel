@@ -218,6 +218,12 @@ void window_set_popup(int id) {
     window_set_no_titlebar(id, 1);
 }
 
+void window_set_hidden(int id) {
+    if (id < 0 || id >= MAX_WINDOWS) return;
+    winfx_cancel(id);
+    windows[id].minimized = 1; windows[id].focused = 0;
+}
+
 void window_set_pixels(int id, const uint32_t* px, int x, int y, int w, int h, int stride) {
     if (id < 0 || id >= MAX_WINDOWS) return;
     struct window* win = &windows[id];

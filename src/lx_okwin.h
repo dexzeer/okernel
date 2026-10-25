@@ -34,6 +34,7 @@ struct okw_text    { unsigned long long str; int len, size, flags, family; unsig
 struct okw_query   { int wid; int x, y, w, h; int mx, my, mb, focused; };   /* in: wid (or -1);  out: outer position and client size of the window, pointer, focus */
 
 #define OKW_F_NOFRAME 1          /* undecorated window (menus, tooltips) */
+#define OKW_F_HIDDEN 2           /* created hidden: OKW_SHOW 1 shows it (with the opening animation) */
 
 /* input events, read() from the connection */
 #define OKE_MOUSE_MOVE 1         /* a,b = x,y in the window            */

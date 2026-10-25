@@ -1,0 +1,2 @@
+kernel32.dll: GetStdHandle WriteFile
+user32.dll: DialogBoxIndirectParamA EndDialog wsprintfA GetDlgItemTextA SetDlgItemTextA IsDlgButtonChecked CheckRadioButton GetDialogBaseUnits

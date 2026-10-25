@@ -34,7 +34,7 @@ static int msgbox(HWND owner, const char *text, const char *caption, UINT type) 
     if (!reg) {
         reg = 1;
         WNDCLASSEXA c; memset(&c, 0, sizeof c);
-        c.cbSize = sizeof c; c.lpfnWndProc = msgbox_proc; c.lpszClassName = "#32770"; c.hbrBackground = (HBRUSH)(ULONG_PTR)(COLOR_BTNFACE + 1);
+        c.cbSize = sizeof c; c.lpfnWndProc = msgbox_proc; c.lpszClassName = "OKMsgBox"; c.hbrBackground = (HBRUSH)(ULONG_PTR)(COLOR_BTNFACE + 1);
         RegisterClassExA(&c);
     }
     static const char *names[8] = { "", "OK", "Cancel", "Abort", "Retry", "Ignore", "Yes", "No" };
@@ -57,7 +57,7 @@ static int msgbox(HWND owner, const char *text, const char *caption, UINT type) 
     int ch = th + 40 + bh + 20;
     int title, border, sw, sh; U_info(&title, &border, &sw, &sh);
     int ow = cw + 2 * border, oh = ch + title + 2 * border;
-    HWND d = CreateWindowExA(0, "#32770", caption ? caption : "", WS_POPUP | WS_CAPTION | WS_SYSMENU, (sw - ow) / 2, (sh - oh) / 3, ow, oh, owner, 0, 0, 0);
+    HWND d = CreateWindowExA(0, "OKMsgBox", caption ? caption : "", WS_POPUP | WS_CAPTION | WS_SYSMENU, (sw - ow) / 2, (sh - oh) / 3, ow, oh, owner, 0, 0, 0);
     if (!d) return 0;
     struct wnd *dw = d;
     CreateWindowExA(0, "STATIC", text, WS_CHILD | WS_VISIBLE | SS_LEFT, 20, 20, tw + 2, th + 2, d, (HMENU)(LONG_PTR)-1, 0, 0);
@@ -85,37 +85,5 @@ EXPORT int MessageBoxW(HWND owner, LPCWSTR text, LPCWSTR cap, UINT type) {
 }
 EXPORT int MessageBoxExA(HWND owner, LPCSTR text, LPCSTR cap, UINT type, WORD lang) { (void)lang; return MessageBoxA(owner, text, cap, type); }
 EXPORT int MessageBoxExW(HWND owner, LPCWSTR text, LPCWSTR cap, UINT type, WORD lang) { (void)lang; return MessageBoxW(owner, text, cap, type); }
-
-EXPORT INT_PTR DialogBoxParamA(HINSTANCE h, LPCSTR t, HWND p, void *proc, LPARAM lp) { (void)h; (void)t; (void)p; (void)proc; (void)lp; return -1; }
-EXPORT INT_PTR DialogBoxParamW(HINSTANCE h, LPCWSTR t, HWND p, void *proc, LPARAM lp) { (void)h; (void)t; (void)p; (void)proc; (void)lp; return -1; }
-EXPORT HWND CreateDialogParamA(HINSTANCE h, LPCSTR t, HWND p, void *proc, LPARAM lp) { (void)h; (void)t; (void)p; (void)proc; (void)lp; return 0; }
-EXPORT HWND CreateDialogParamW(HINSTANCE h, LPCWSTR t, HWND p, void *proc, LPARAM lp) { (void)h; (void)t; (void)p; (void)proc; (void)lp; return 0; }
-EXPORT BOOL EndDialog(HWND h, INT_PTR r) { struct wnd *w = U_wnd(h); if (!w) return FALSE; w->dlg_result = (int)r; w->dlg_done = 1; return TRUE; }
-EXPORT UINT GetDlgItemInt(HWND h, int id, BOOL *ok, BOOL sgn) {
-    char b[32]; GetWindowTextA(GetDlgItem(h, id), b, sizeof b);
-    long v = 0; int i = 0, neg = 0; if (sgn && b[0] == '-') { neg = 1; i++; }
-    for (; b[i] >= '0' && b[i] <= '9'; i++) v = v * 10 + (b[i] - '0');
-    if (ok) *ok = i > 0;
-    return (UINT)(neg ? -v : v);
-}
-EXPORT BOOL SetDlgItemInt(HWND h, int id, UINT v, BOOL sgn) {
-    char b[32]; int n = 0; long long x = sgn ? (long long)(int)v : (long long)v; int neg = x < 0; if (neg) x = -x;
-    char r[24]; int k = 0; do { r[k++] = (char)('0' + x % 10); x /= 10; } while (x);
-    if (neg) b[n++] = '-';
-    while (k) b[n++] = r[--k];
-    b[n] = 0;
-    return SetDlgItemTextA(h, id, b);
-}
-EXPORT BOOL CheckDlgButton(HWND h, int id, UINT c) { HWND b = GetDlgItem(h, id); if (!b) return FALSE; SendMessageA(b, BM_SETCHECK, c, 0); return TRUE; }
-EXPORT UINT IsDlgButtonChecked(HWND h, int id) { HWND b = GetDlgItem(h, id); return b ? (UINT)SendMessageA(b, BM_GETCHECK, 0, 0) : 0; }
-EXPORT BOOL CheckRadioButton(HWND h, int first, int last, int check) {
-    for (int i = first; i <= last; i++) CheckDlgButton(h, i, i == check);
-    return TRUE;
-}
-EXPORT LRESULT SendDlgItemMessageA(HWND h, int id, UINT m, WPARAM wp, LPARAM lp) { HWND c = GetDlgItem(h, id); return c ? SendMessageA(c, m, wp, lp) : 0; }
-EXPORT LRESULT SendDlgItemMessageW(HWND h, int id, UINT m, WPARAM wp, LPARAM lp) { HWND c = GetDlgItem(h, id); return c ? SendMessageW(c, m, wp, lp) : 0; }
-EXPORT HWND GetNextDlgTabItem(HWND d, HWND c, BOOL prev) { (void)d; (void)c; (void)prev; return 0; }
-EXPORT BOOL MapDialogRect(HWND h, RECT *r) { (void)h; (void)r; return TRUE; }
-EXPORT LONG GetDialogBaseUnits(void) { return (LONG)((13 << 16) | 7); }
 
 BOOL DllMain(HMODULE m, DWORD reason, LPVOID res) { (void)m; (void)reason; (void)res; return TRUE; }

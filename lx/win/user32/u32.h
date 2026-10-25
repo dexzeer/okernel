@@ -64,7 +64,7 @@ struct wnd {
     int in_destroy, bd, activated;
     struct menu *menu; int mh, noframe;        // top level: its menu bar and the bar height inside the buffer
     void *font;
-    int dlg_result, dlg_done;
+    int dlg_result, dlg_done, dlg_defid;
 };
 
 void *memset(void *d, int c, SIZE_T n);
@@ -113,6 +113,15 @@ int U_menubar_event(struct wnd *T, const struct okw_event *e);
 void U_menubar_leave(struct wnd *T);
 int U_pump(int ms);
 extern int (*U_event_hook)(const struct okw_event *);
+BOOL IsWindowEnabled(HWND h);
+BOOL IsDialogMessageA(HWND h, MSG *m);
+HWND GetDlgItem(HWND h, int id);
+BOOL SetWindowTextW(HWND h, LPCWSTR s);
+int GetWindowTextW(HWND h, LPWSTR out, int cap);
+LONG_PTR GetWindowLongPtrA(HWND h, int i);
+LONG_PTR SetWindowLongPtrA(HWND h, int i, LONG_PTR v);
+BOOL SetDlgItemTextA(HWND h, int id, LPCSTR s);
+LRESULT DefWindowProcW(HWND h, UINT m, WPARAM wp, LPARAM lp);
 struct wnd *U_wnd(HWND h);
 struct wnd *U_top(struct wnd *w);
 void U_origin(struct wnd *w, int *ox, int *oy);                  // client origin of w inside its top level's buffer
