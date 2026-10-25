@@ -44,6 +44,7 @@
 #include "recovery.h"
 #include "lx.h"
 extern int lx_fb_win(void);
+extern int lx_okwin_is(int wid);
 #include "textview.h"
 #include "devlog.h"
 #include "rtw/rtw.h"
@@ -1604,6 +1605,7 @@ static void on_keypress(char c, int alt) {
 
     if (win_id >= 0 && win_id == wifigui_win()) { wifigui_key(c); return; }
     if (win_id >= 0 && win_id == gamewin_win()) { gamewin_key(c); return; }
+    { extern int lx_okwin_char(int wid, int c); if (win_id >= 0 && lx_okwin_char(win_id, (unsigned char)c)) return; }   // a window of a Linux/Windows program
 
     if (textview_owns(win_id)) { textview_key(win_id, c); return; }
 
@@ -2123,7 +2125,7 @@ void kernel_main(uint32_t mboot_phys) {
         { PROF_BEGIN(PZ_KEYS); keys_dispatch(); PROF_END(PZ_KEYS); }
         {   // Linux subsystem: every runnable program gets a slice; the shell prompt returns when the foreground one exits
             lx_poll();
-            { extern void lx_fb_poll(void); lx_fb_poll(); }
+            { extern void lx_fb_poll(void); lx_fb_poll(); extern void lx_okwin_poll(void); lx_okwin_poll(); }
             if (lx_fg_pid > 0 && !lx_pid_alive(lx_fg_pid)) { lx_fg_pid = 0; shell_prompt(lx_fg_win); }
         }
         textview_redraw_if_resized();
@@ -2598,6 +2600,7 @@ void kernel_main(uint32_t mboot_phys) {
         // Mouse wheel → scroll the okai window under the cursor, or the
         // terminal's scrollback (same wheel model as the browser).
         int wheel = mouse_get_scroll();
+        { extern void lx_okwin_wheel(int); if (wheel) lx_okwin_wheel(wheel); }
         if (wheel != 0) {
             int wid = window_from_point(mx, my);
             if (wid >= 0) {
@@ -2682,6 +2685,9 @@ void kernel_main(uint32_t mboot_phys) {
                             wifigui_close();
                         } else if (i == gamewin_win()) {
                             gamewin_close();
+                        } else if (lx_okwin_is(i)) {
+                            extern void lx_okwin_close_request(int);
+                            lx_okwin_close_request(i);
                         } else if (i == lx_fb_win()) {
                             extern void lx_fb_close(void);
                             lx_fb_close();

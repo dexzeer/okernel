@@ -24,6 +24,19 @@ if [ -d lx/win/msvcrt ]; then
     $PEB $SYS/msvcrt.dll dll 0x6D000000 lx/win/msvcrt/imports.txt $T/crt.exp lx/win/msvcrt/*.c
 fi
 
+if [ -d lx/win/gdi32 ]; then
+    exports lx/win/gdi32/*.c > $T/gdi.exp
+    cat lx/win/gdi32/extra.exp >> $T/gdi.exp
+    sort -u $T/gdi.exp -o $T/gdi.exp
+    $PEB $SYS/gdi32.dll dll 0x6F000000 lx/win/gdi32/imports.txt $T/gdi.exp lx/win/gdi32/*.c
+fi
+
+if [ -d lx/win/user32 ]; then
+    exports lx/win/user32/*.c > $T/user.exp
+    sort -u $T/user.exp -o $T/user.exp
+    $PEB $SYS/user32.dll dll 0x6E000000 lx/win/user32/imports.txt $T/user.exp lx/win/user32/*.c
+fi
+
 # the import list of the test programs: everything our two DLLs export (memcpy & co. come from msvcrt)
 grep -vx -e memcpy -e memmove -e memset -e memcmp -e strlen $T/k32.exp > $T/k32_imp.exp
 for d in lx/win/tests/*/; do

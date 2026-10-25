@@ -183,6 +183,16 @@ int lx_protect_region(struct lx_task *t, uint32_t start, uint32_t len, uint32_t 
 static void mm_free_user(struct lx_mm *m);
 void lx_free_user(struct lx_task *t) { mm_free_user(t->mm); }
 
+// helpers for devices that keep a mapping in some address space (src/lx_okwin.c)
+static void mm_put(struct lx_mm *m);
+void lx_mm_hold(struct lx_mm *m) { m->refs++; }
+void lx_mm_release(struct lx_mm *m) { mm_put(m); }
+void lx_mm_unmap(struct lx_mm *m, uint32_t va, uint32_t len) {
+    static struct lx_task stand;                   // lx_unmap_region only looks at ->mm
+    stand.mm = m;
+    lx_unmap_region(&stand, va, len);
+}
+
 // Bring the page at `addr` in. Returns the physical address of the page, or 0 if the access is not allowed.
 static uint32_t page_in(struct lx_task *t, uint32_t addr, int write) {
     uint32_t page = addr & ~0xFFFu;
@@ -750,6 +760,7 @@ void lx_init(void) {
     mk_node("/dev/console", LXN_CHR, 0600, LXDEV_CONSOLE);
     mk_node("/dev/fb0", LXN_CHR, 0666, LXDEV_FB0);
     mk_node("/dev/input/event0", LXN_CHR, 0666, LXDEV_EVENT0);
+    mk_node("/dev/okwin", LXN_CHR, 0666, LXDEV_OKWIN);
     mk_text("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
     mk_text("/etc/group", "root:x:0:\n");
     mk_text("/etc/hostname", "kanarchy\n");

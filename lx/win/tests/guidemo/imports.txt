@@ -1,0 +1,3 @@
+kernel32.dll: GetStdHandle WriteFile
+user32.dll: RegisterClassExA CreateWindowExA ShowWindow UpdateWindow GetMessageA TranslateMessage DispatchMessageA DefWindowProcA PostQuitMessage BeginPaint EndPaint GetClientRect InvalidateRect SetTimer DestroyWindow GetWindowTextA wsprintfA LoadCursorA FillRect MessageBoxA
+gdi32.dll: CreateSolidBrush SelectObject CreatePen Rectangle Ellipse MoveToEx LineTo TextOutA SetTextColor SetBkMode Polygon GetStockObject CreateCompatibleDC CreateCompatibleBitmap BitBlt DeleteDC DeleteObject

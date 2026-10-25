@@ -24,6 +24,7 @@ void mouse_get_position(int* x, int* y);
 int  mouse_get_x(void);
 int  mouse_get_y(void);
 int  mouse_get_left_button(void);
+int  mouse_get_buttons(void);        // bit 0 left, 1 right, 2 middle
 int  mouse_get_scroll(void);         // wheel delta since the last call
 
 #endif

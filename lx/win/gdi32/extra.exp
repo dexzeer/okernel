@@ -1,0 +1,9 @@
+__gdi_make_dc
+__gdi_dc_set_surface
+__gdi_free_dc
+__gdi_rect_fill_color
+__gdi_FillRect
+__gdi_FrameRect
+__gdi_dc_setup
+__gdi_reset_dc
+__gdi_is_dc

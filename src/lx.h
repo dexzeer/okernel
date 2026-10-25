@@ -113,6 +113,7 @@ struct lx_file {
     struct lx_pipe *pipe;
     struct lx_sock *sock;
     struct lx_event *ev;                     // epoll / eventfd / timerfd objects (lx_ev.c)
+    void *priv;                              // device state (a /dev/okwin connection)
 };
 
 // ---- tasks ------------------------------------------------------------------------------------------------------
