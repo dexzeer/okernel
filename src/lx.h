@@ -145,6 +145,7 @@ struct lx_mm {
     uint32_t brk_start, brk;
     uint32_t mmap_hint;
     uint32_t rss;                            // pages
+    void *win;                               // Windows process data (lx_pe.c), or 0
 };
 
 struct lx_files {
@@ -169,7 +170,8 @@ struct lx_task {
     struct lx_mm *mm;
     struct lx_files *files;
     struct lx_sighand *sh;
-    uint64_t fs_base;
+    uint64_t fs_base, gs_base;               // gs_base: the TEB of a Windows thread
+    int      is_win;                         // a Windows (PE) program: paths are case-insensitive
     struct lx_node *cwd;
     char     comm[16];
     int      term_win;                       // terminal window of its standard files (-1: serial only)
@@ -210,6 +212,13 @@ int lx_busy(void);                           // a task is runnable: the main loo
 // Is the task `pid` still running? (the foreground wait of the shell)
 int lx_pid_alive(int pid);
 void lx_report(char *out, int cap);
+
+// lx_pe.c
+int lx_pe_load(struct lx_task *t, struct lx_node *exe, const char *path, const char *const *argv, const char *const *envp);
+int lx_pe_missing_import(struct lx_task *t, uint64_t rip);
+int64_t lx_pe_loadlibrary(struct lx_task *t, uint64_t uname);
+int64_t lx_pe_getproc(struct lx_task *t, uint64_t base, uint64_t uname, uint64_t ordinal);
+extern int lxfs_case_insensitive;
 
 // lx_elf.c
 int lx_exec_load(struct lx_task *t, const char *path, const char *const *argv, const char *const *envp);

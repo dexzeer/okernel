@@ -143,6 +143,15 @@ int lx_exec_load(struct lx_task *t, const char *path, const char *const *argv, c
     int err = 0;
     struct lx_node *n = lxfs_resolve(t->cwd, path, 1, &err);
     if (!n) return err;
+    if (n->type == LXN_REG && n->size > 0x40 && n->data[0] == 'M' && n->data[1] == 'Z') {
+        lx_free_user(t);
+        t->mm->brk_start = t->mm->brk = 0; t->mm->mmap_hint = 0; t->fs_base = 0;
+        int pr = lx_pe_load(t, n, path, argv, envp);
+        if (pr) return pr;
+        set_comm(t, path);
+        { int i = 0; for (; path[i] && i < 127; i++) t->exe[i] = path[i]; t->exe[i] = 0; }
+        return 0;
+    }
     const struct elf64_hdr *h = check(n, &err);
     if (!h) return err;
     struct lx_node *interp = 0;

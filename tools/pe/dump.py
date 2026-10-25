@@ -57,7 +57,7 @@ if __name__ == "__main__":
     p = parse(sys.argv[1])
     print("machine %#x  base %#x  entry rva %#x  subsystem %d  image %#x  dllchars %#x" % (p["machine"], p["base"], p["entry"], p["subsystem"], p["size_image"], p["dllchars"]))
     for s in p["secs"]: print("  section %-8s rva %#8x vsize %#8x file %#8x+%#x flags %#x" % s)
-    names = {1: "export", 2: "import", 3: "resource", 5: "reloc", 9: "tls", 10: "loadcfg", 12: "iat", 13: "delay", 14: "clr"}
+    names = {0: "export", 1: "import", 2: "resource", 5: "reloc", 9: "tls", 10: "loadcfg", 12: "iat", 13: "delay", 14: "clr"}
     for i, (rva, size) in enumerate(p["dirs"]):
         if rva: print("  dir %-8s rva %#x size %#x" % (names.get(i, i), rva, size))
     total = 0

@@ -309,6 +309,12 @@ int64_t lx_syscall_more(struct lx_task *t, uint64_t nr, uint64_t a0, uint64_t a1
     case 157: return 0;                                                             // prctl: PR_SET_NAME and friends
     case 100: { uint64_t tms[4] = { 0, 0, 0, 0 }; if (a0 && lx_copy_out(t, a0, tms, 32)) return -LX_EFAULT; return (int64_t)(lx_now_ms() / 10); }   // times
     case 139: return -LX_ENOSYS;                                                    // sysfs
+    case 0x1000: return lx_pe_loadlibrary(t, a0);                                   // LoadLibrary: map a DLL, return its base
+    case 0x1001: return lx_pe_getproc(t, a0, a1, a2);                               // GetProcAddress(base, name, ordinal)
+    case 0x1002: { // GetModuleHandle(name or 0): base of a mapped module
+        extern int64_t lx_pe_modulebase(struct lx_task *t, uint64_t uname);
+        return lx_pe_modulebase(t, a0);
+    }
     default:
         serial_printf("[lx] pid %d (%s): unimplemented syscall %d\n", t->tgid, t->comm, (int)nr);
         return -LX_ENOSYS;

@@ -25,6 +25,8 @@ if [ -n "$HOSTBINS" ]; then
         done
     done
 fi
+# the Windows side (kernel32/msvcrt/... and test programs), built by lx/win/build.sh
+if [ -f lx/win/build.sh ]; then sh lx/win/build.sh > /dev/null; cp -a build-host/winroot/. $OUT/; fi
 if [ -n "$1" ]; then cp -a "$1"/. $OUT/; fi
 tar --format=ustar -cf build-host/lxtest.tar -C $OUT .
 rm -rf build-host/lxiso; mkdir -p build-host/lxiso/boot/grub
