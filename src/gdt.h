@@ -8,13 +8,31 @@
 #define GDT_KERNEL_DATA 0x10
 #define GDT_USER_CODE   0x18
 #define GDT_USER_DATA   0x20
+#ifdef LONGMODE
+// The desktop kernel runs the CPU in long mode (kernel code in compatibility mode); the text kernel stays in
+// 32-bit protected mode (src/gdt32.c, src/idt.c without LONGMODE).
+#define GDT_USER_CODE64 0x28
+#define GDT_KERNEL_CODE64 0x30
+#define GDT_KERNEL_DATA2 0x38
+#define GDT_TSS         0x40
+
+// Task State Segment, 64-bit format (104 bytes). LAYOUT WARNING: the CPU reads rsp0 (offset 4) on every ring-3 ->
+// ring-0 interrupt; a reordered or resized struct silently breaks every trap.
+struct tss {
+    uint32_t reserved0;
+    uint64_t rsp0, rsp1, rsp2;
+    uint64_t reserved1;
+    uint64_t ist[7];
+    uint64_t reserved2;
+    uint16_t reserved3;
+    uint16_t iomap_base;
+} __attribute__((packed));
+#else
 #define GDT_TSS         0x28
 
 // Task State Segment (104 bytes + I/O map base, x86 32-bit).
-// LAYOUT WARNING: every field order/size below is ABI — the CPU reads
-// esp0/ss0 at offsets 4/8 on every ring-3 -> ring-0 trap. A reordered or
-// resized struct silently breaks all syscalls (trap frame lands on a garbage
-// stack; faults as #DE/#PF at LOW EIP like 0x2d). Verified 2026-09-07.
+// LAYOUT WARNING: every field order/size below is ABI - the CPU reads
+// esp0/ss0 at offsets 4/8 on every ring-3 -> ring-0 trap.
 struct tss {
     uint32_t prev_tss;
     uint32_t esp0;
@@ -28,6 +46,7 @@ struct tss {
     uint16_t trap;
     uint16_t iomap_base;
 } __attribute__((packed));
+#endif
 
 void gdt_init(void);
 // Load the already-built GDT on an application processor. No TSS: an AP never

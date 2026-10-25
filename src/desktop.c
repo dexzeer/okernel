@@ -42,6 +42,8 @@
 #include "i2chid.h"
 #include "klog.h"
 #include "recovery.h"
+#include "lx.h"
+extern int lx_fb_win(void);
 #include "textview.h"
 #include "devlog.h"
 #include "rtw/rtw.h"
@@ -469,6 +471,49 @@ static const char *binpath_of(const char *name) {
     while (name[ni] && bi < 63) { out[bi] = name[ni]; bi++; ni++; }
     out[bi] = 0;
     return fs_exists(out) ? out : 0;
+}
+
+// Linux subsystem: `lx <path> [args...] [&]` starts an x86-64 Linux program from the Linux file system. The terminal
+// belongs to it (keys go to its tty) until it exits; the prompt comes back then.
+static int lx_fg_pid = 0, lx_fg_win = -1;
+static void shell_execute_lx(int win_id, const char *rest) {
+    char argbuf[512];
+    uint32_t alen = 0;
+    while (rest[alen] && alen < 511) { argbuf[alen] = rest[alen]; alen++; }
+    argbuf[alen] = 0;
+    const char *av[33];
+    int ac = 0, bg = 0;
+    // words split at spaces; '...' and "..." group (the quotes are dropped), a backslash takes the next character
+    uint32_t i = 0, o = 0;
+    while (i < alen && ac < 32) {
+        while (i < alen && argbuf[i] == ' ') i++;
+        if (i >= alen) break;
+        uint32_t s = o;
+        int quoted = 0;
+        char q = 0;
+        while (i < alen && (q || argbuf[i] != ' ')) {
+            char ch = argbuf[i];
+            if (q) { if (ch == q) q = 0; else argbuf[o++] = ch; i++; }
+            else if (ch == '\'' || ch == '"') { q = ch; quoted = 1; i++; }
+            else if (ch == '\\' && i + 1 < alen) { argbuf[o++] = argbuf[i + 1]; i += 2; }
+            else { argbuf[o++] = ch; i++; }
+        }
+        int last = (i >= alen);
+        if (last && !quoted && o - s == 1 && argbuf[s] == '&') { bg = 1; break; }
+        if (i < alen) i++;                  // the delimiter is consumed before the terminator may overwrite it
+        argbuf[o++] = 0;
+        av[ac++] = &argbuf[s];
+    }
+    av[ac] = 0;
+    if (ac == 0) { window_puts(win_id, "usage: lx <path> [args]\n"); return; }
+    static const char *const env[] = { "PATH=/bin:/usr/bin:/sbin:/usr/sbin", "HOME=/root", "TERM=xterm", "USER=root", "SHELL=/bin/sh", "LANG=C", 0 };
+    int pid = lx_spawn(av[0], av, env, win_id);
+    if (pid < 0) {
+        window_puts(win_id, av[0]);
+        window_puts(win_id, pid == -LX_ENOENT ? ": not found\n" : pid == -LX_ENOEXEC ? ": not an x86-64 program\n" : ": cannot start\n");
+        return;
+    }
+    if (!bg) { lx_fg_pid = pid; lx_fg_win = win_id; }
 }
 
 // Shared `run` implementation (used by the `run` builtin AND the Unknown:
@@ -1408,6 +1453,9 @@ static void shell_execute(int win_id, const char* input) {
         // covered by tests/headless/test_sh_hello.py).
         window_puts(win_id, "usermode retired; use run /bin/hello\n");
     }
+    else if (str_eq(cmd_buf, "lx")) {
+        shell_execute_lx(win_id, args);
+    }
     else if (str_eq(cmd_buf, "run")) {
         // run <path> [args...] [&]: spawn an ELF program from the VFS and
         // enter it through the main-loop drain (same path as usermode, but
@@ -1576,6 +1624,7 @@ static void on_keypress(char c, int alt) {
 
     int tidx = find_term_idx(win_id);
     if (tidx < 0) return; // Not a terminal window
+    { extern int lx_tty_key(int win, int c); if (lx_tty_key(win_id, (unsigned char)c)) return; }   // a Linux program owns this terminal
 
     // Control codes (Ctrl+letter from the keyboard driver) are not terminal
     // input — ignore them here (the editor handles its own Ctrl+S/Ctrl+X;
@@ -1641,7 +1690,7 @@ static void on_keypress(char c, int alt) {
             if (!fg_live) shell_execute(win_id, term_bufs[tidx]);
         }
         term_lens[tidx] = 0;
-        shell_prompt(win_id);
+        if (!(lx_fg_pid > 0 && lx_fg_win == win_id)) shell_prompt(win_id);
     } else {
         if (term_lens[tidx] < 255) {
             term_bufs[tidx][term_lens[tidx]++] = c;
@@ -1832,6 +1881,7 @@ void kernel_main(uint32_t mboot_phys) {
     if (recovery_mode) pfs_init_recovery();
     else pfs_init(); // ATA disk + mount-or-format (diskless = VFS-only, safe)
     userland_seed(); // /bin/* + /sbin/init from embedded ELFs (skips present)
+    lx_init();       // Linux subsystem: root file system (boot module tar), SYSCALL setup
     // TOFU pin persistence (P2): reload last boot's verified leaf pins so
     // a reboot doesn't re-open the first-visit window to a network-only
     // attacker. Malformed files are ignored (fail-open to empty store =
@@ -2071,6 +2121,11 @@ void kernel_main(uint32_t mboot_phys) {
         if (prof_on) stall_report();
         stall_beat = tick_count;
         { PROF_BEGIN(PZ_KEYS); keys_dispatch(); PROF_END(PZ_KEYS); }
+        {   // Linux subsystem: every runnable program gets a slice; the shell prompt returns when the foreground one exits
+            lx_poll();
+            { extern void lx_fb_poll(void); lx_fb_poll(); }
+            if (lx_fg_pid > 0 && !lx_pid_alive(lx_fg_pid)) { lx_fg_pid = 0; shell_prompt(lx_fg_win); }
+        }
         textview_redraw_if_resized();
         // Ring-3 entry drain: the shell (and fork) stage pid+eip+esp+window
         // into the entry run queue; here is plain ring-0 thread context, so
@@ -2627,6 +2682,9 @@ void kernel_main(uint32_t mboot_phys) {
                             wifigui_close();
                         } else if (i == gamewin_win()) {
                             gamewin_close();
+                        } else if (i == lx_fb_win()) {
+                            extern void lx_fb_close(void);
+                            lx_fb_close();
                         } else if (textview_owns(i)) {
                             textview_close(i);
                         } else {
@@ -3084,7 +3142,7 @@ void kernel_main(uint32_t mboot_phys) {
         int net_wait = fetch_free_slots() != FETCH_MAX || ow_now == 2;
         int timed_wait = ow_now == 3;
         if (!composed && !cursor_moved && !mb && !wheel && drag_win < 0 && resize_win < 0 &&
-            ow_now != 1 && !mplay_wants_cpu() && ((!net_wait && !timed_wait) || lapic_timer_available())) {
+            ow_now != 1 && !mplay_wants_cpu() && !lx_busy() && ((!net_wait && !timed_wait) || lapic_timer_available())) {
             if (net_wait) lapic_timer_oneshot_us(500);
             else if (timed_wait) lapic_timer_oneshot_us(3000);
             {   // idle: pay the hypervisor's first-touch cost of heap pages now instead of in the middle of a page load (memory.c)

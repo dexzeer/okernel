@@ -5,6 +5,8 @@
 
 // Initialize memory manager with multiboot info
 void memory_init(uint32_t mboot_addr);
+// Boot module `idx` (GRUB `module` line) through the high alias; len and cmdline are optional. 0 = none.
+const uint8_t* memory_boot_module(int idx, uint32_t* len, const char** cmdline);
 
 // Physical memory manager
 uint32_t pmm_alloc_page(void);

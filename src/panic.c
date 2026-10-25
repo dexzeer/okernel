@@ -16,6 +16,7 @@
 #include "devlog.h"
 #include "graphics.h"
 #include "io.h"
+#include "paging.h"
 #include "klog.h"
 #include "part.h"
 #include "serial.h"
@@ -94,20 +95,8 @@ static int after_call(uint32_t r) {
     return 0;
 }
 
-// Whether a kernel address can be read without faulting (walks the current page directory).
-static int mapped(uint32_t va) {
-    uint32_t cr3;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-    cr3 &= ~0xFFFu;
-    if (cr3 >= 0x30000000u) return 0;                          // outside the kernel's direct map: cannot look
-    const uint32_t* pd = (const uint32_t*)(cr3 + 0xC0000000u);
-    uint32_t pde = pd[va >> 22];
-    if (!(pde & 1)) return 0;
-    if (pde & 0x80) return 1;
-    uint32_t pt = pde & ~0xFFFu;
-    if (pt >= 0x30000000u) return 0;
-    return ((const uint32_t*)(pt + 0xC0000000u))[(va >> 12) & 1023] & 1;
-}
+// Whether a kernel address can be read without faulting (walks the current page tables).
+static int mapped(uint32_t va) { return paging_va_mapped(va); }
 
 
 // Return addresses on the stack, starting at esp (the frame pointer is omitted at -O2: this is a scan, like Linux's,

@@ -56,7 +56,23 @@ static int bitmap_test(uint32_t page) {
     return bitmap[page / 8] & (1 << (page % 8));
 }
 
+static uint32_t boot_info_phys;
+
+// Boot module `idx` (multiboot `module` lines): its bytes through the high alias. 0 when there is no such module.
+const uint8_t* memory_boot_module(int idx, uint32_t* len, const char** cmdline) {
+    if (!boot_info_phys) return 0;
+    uint32_t flags = *(volatile uint32_t*)(boot_info_phys + 0);
+    if (!(flags & (1u << 3))) return 0;
+    uint32_t mcount = *(volatile uint32_t*)(boot_info_phys + 20), maddr = *(volatile uint32_t*)(boot_info_phys + 24);
+    if (idx < 0 || (uint32_t)idx >= mcount) return 0;
+    volatile uint32_t* me = (volatile uint32_t*)P2V_U32(maddr + (uint32_t)idx * 16);
+    if (len) *len = me[1] - me[0];
+    if (cmdline) *cmdline = me[2] ? (const char*)P2V_U32(me[2]) : "";
+    return (const uint8_t*)P2V_U32(me[0]);
+}
+
 void memory_init(uint32_t mboot_phys) {
+    boot_info_phys = mboot_phys;
     // mboot_phys is PHYS (GRUB structs live low). Plain phys derefs through
     // the boot PD's 0-4M LOW identity window. (An earlier pushed-args mixup
     // in start.asm once delivered the magic number in this slot — diagnosed
@@ -116,6 +132,18 @@ void memory_init(uint32_t mboot_phys) {
         // keep the bootloader's own structures (info block, map) out of the allocator
         for (uint32_t a = mp & ~(PAGE_SIZE - 1); a < mp + 128; a += PAGE_SIZE) if (a / PAGE_SIZE < total_pages) bitmap_set(a / PAGE_SIZE);
         for (uint32_t a = map_addr & ~(PAGE_SIZE - 1); a < map_addr + map_len; a += PAGE_SIZE) if (a / PAGE_SIZE < total_pages) bitmap_set(a / PAGE_SIZE);
+        // boot modules (multiboot flag bit 3): the table, the strings and the module images stay out of the allocator
+        if (mboot_flags & (1u << 3)) {
+            uint32_t mcount = *(volatile uint32_t*)(mp + 20), maddr = *(volatile uint32_t*)(mp + 24);
+            for (uint32_t a = maddr & ~(PAGE_SIZE - 1); a < maddr + mcount * 16 + 16; a += PAGE_SIZE) if (a / PAGE_SIZE < total_pages) bitmap_set(a / PAGE_SIZE);
+            for (uint32_t m = 0; m < mcount && m < 8; m++) {
+                volatile uint32_t* me = (volatile uint32_t*)(maddr + m * 16);
+                uint32_t ms = me[0], mend = me[1], mstr = me[2];
+                for (uint32_t a = ms & ~(PAGE_SIZE - 1); a < mend; a += PAGE_SIZE) if (a / PAGE_SIZE < total_pages) bitmap_set(a / PAGE_SIZE);
+                if (mstr) { uint32_t pg = mstr / PAGE_SIZE; if (pg < total_pages) bitmap_set(pg); }
+                serial_printf("[mem] module %u: %x-%x\n", m, ms, mend);
+            }
+        }
     } else {
         uint32_t mem_upper_kb = mboot_upper;
         if (!(mboot_flags & MULTIBOOT_FLAG_MEM)) {

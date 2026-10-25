@@ -5,39 +5,183 @@
 #include "lapic.h"
 #include <stdint.h>
 
-// High-half kernel page tables. The kernel links at 0xC0100000 (phys 1MB),
-// so every stored PD/PT value is PHYS (V2P) and every deref goes through P2V.
-// PD 768..799 mirror phys 0-128M as the kernel high map; PD 0 keeps a 0-1M
-// supervisor window for e1000 DMA (0x80000-0x9FFFF) + VGA (0xB8000); FB/MMIO
-// live high and supervisor-only. User space 0..767 stays private per process.
-static uint32_t page_directory[1024] __attribute__((aligned(4096)));
-// 32 tables for high kernel map (0–128M phys), 1 for low 0-1M window,
-// up to 4 for framebuffer+MMIO, spares for paging_map/paging_map_user
-static uint32_t page_tables[112][1024] __attribute__((aligned(4096)));
-static int pt_count = 0;
+// x86-64 page tables (4 levels, 64-bit entries). The kernel is still 32-bit code: it runs in compatibility mode with
+// the CPU in long mode (boot/start.asm), so every address it handles is below 4 GB. That makes the tree small:
+//   PML4[0] -> one PDPT; PDPT[0..2] -> private page directories (user space 0..3 GB), PDPT[3] -> `kpd[3]`, the
+//   kernel half 0xC0000000..0xFFFFFFFF built from 2 MB pages and SHARED by every address space (no copy at creation,
+//   so a kernel mapping made later is seen everywhere).
+// Entries hold PHYSICAL addresses (< 4 GB), tables are reached through the high alias (P2V). Because the high
+// dword of every entry is always zero, an entry is written with one 32-bit store (atomic for the other CPUs).
+typedef uint64_t pte_t;
 
-extern uint32_t boot_pd[1024];
+#define P_PRESENT 0x01u
+#define P_RW      0x02u
+#define P_US      0x04u
+#define P_PS      0x80u
+#define P_TABLE   (P_PRESENT | P_RW | P_US)
 
-// Map one 4MB phys window at an explicit PD index (high kernel map)
-static void map_4mb_at(uint32_t phys_base, uint32_t pd_index, uint32_t flags) {
-    if (page_directory[pd_index] & 0x01) return;
-    if (pt_count >= 112) return;
+static inline void pte_set(volatile pte_t* p, uint32_t lo) { ((volatile uint32_t*)p)[0] = lo; }
+static inline pte_t* tbl(uint32_t phys) { return (pte_t*)P2V_U32(phys); }
+static inline void invlpg(uint32_t va) { __asm__ volatile("invlpg (%0)" :: "r"(va) : "memory"); }
+static inline void tlb_flush(void) { uint32_t t; __asm__ volatile("mov %%cr3, %0; mov %0, %%cr3" : "=r"(t) :: "memory"); }
 
-    uint32_t* pt = page_tables[pt_count];
-    uint32_t pt_phys = V2P((uint32_t)pt);
-    for (int i = 0; i < 1024; i++) {
-        pt[i] = ((phys_base & 0xFFC00000) + i * 0x1000) | flags;
+// The kernel's own tree (pid 0, boot, APs): kpd[0] maps 0-128 MB identity (supervisor), kpd[1..2] are empty until a
+// device above 1 GB asks for a window, kpd[3] is the kernel half.
+static pte_t kpml4[512] __attribute__((aligned(4096)));
+static pte_t kpdpt[512] __attribute__((aligned(4096)));
+static pte_t kpd[4][512] __attribute__((aligned(4096)));
+// The kernel half is also reachable at 0xFFFFFFFFC0000000 (PML4[511] -> PDPT[511] -> kpd[3]): 64-bit code addresses
+// kernel data with a sign-extended 32-bit displacement, and 0xC0xxxxxx sign-extends to exactly this alias.
+static pte_t kpdpt_hi[512] __attribute__((aligned(4096)));
+
+static uint32_t alloc_table(void) {
+    uint32_t ph = pmm_alloc_page();
+    if (!ph) return 0;
+    uint32_t* z = (uint32_t*)P2V_U32(ph);
+    for (int i = 0; i < 1024; i++) z[i] = 0;
+    return ph;
+}
+
+// Next level below table `t` at `idx`; creates it when `alloc`. A table on the way to a user page gets U/S set (the CPU
+// checks every level). Returns 0 when absent, when it cannot be allocated, or when a 2 MB page is in the way.
+static pte_t* walk_next(pte_t* t, unsigned idx, int alloc, uint32_t flags) {
+    uint32_t e = (uint32_t)t[idx];
+    if (!(e & P_PRESENT)) {
+        if (!alloc) return 0;
+        uint32_t ph = alloc_table();
+        if (!ph) return 0;
+        pte_set(&t[idx], ph | flags);
+        return tbl(ph);
     }
-    page_directory[pd_index] = pt_phys | flags;
-    pt_count++;
+    if (e & P_PS) return 0;
+    if (alloc && (flags & P_US) && !(e & P_US)) pte_set(&t[idx], e | P_US);
+    return tbl(e & 0xFFFFF000u);
+}
+
+// The 4 KB entry for `va` (< 4 GB) in the address space whose PML4 is at phys `cr3`.
+pte_t* aspace_pte(uint32_t cr3, uint32_t va, int alloc) {
+    if (va >= KERNEL_VBASE) return 0;                  // the shared kernel half is not edited through here
+    pte_t* pdpt = walk_next(tbl(cr3), 0, alloc, P_TABLE);
+    if (!pdpt) return 0;
+    pte_t* pd = walk_next(pdpt, va >> 30, alloc, P_TABLE);
+    if (!pd) return 0;
+    pte_t* pt = walk_next(pd, (va >> 21) & 511, alloc, P_TABLE);
+    if (!pt) return 0;
+    return &pt[(va >> 12) & 511];
+}
+
+// New address space: an empty user half and the shared kernel half. Returns the PML4's phys address (the CR3 value).
+uint32_t aspace_create(void) {
+    uint32_t pml4 = alloc_table();
+    if (!pml4) return 0;
+    uint32_t pdpt = alloc_table();
+    if (!pdpt) { pmm_free_page(pml4); return 0; }
+    pte_set(&tbl(pml4)[0], pdpt | P_TABLE);
+    pte_set(&tbl(pdpt)[3], (uint32_t)kpdpt[3]);        // the kernel half, the same entry for everyone
+    pte_set(&tbl(pml4)[511], (uint32_t)kpml4[511]);    // and its high alias (see kpdpt_hi)
+    return pml4;
+}
+
+// Map a 4 KB user page; `writable` 0 makes it read-only. Returns 0 on success, -1 when a table could not be allocated.
+int aspace_map(uint32_t cr3, uint32_t va, uint32_t phys, int writable) {
+    pte_t* e = aspace_pte(cr3, va, 1);
+    if (!e) return -1;
+    pte_set(e, (phys & 0xFFFFF000u) | P_PRESENT | P_US | (writable ? P_RW : 0));
+    return 0;
+}
+
+// Change the permission of a mapped page (flushes it when this space is loaded); 0 = was not mapped.
+int aspace_set_writable(uint32_t cr3, uint32_t va, int writable) {
+    pte_t* e = aspace_pte(cr3, va, 0);
+    if (!e || !(*e & P_PRESENT)) return 0;
+    uint32_t v = (uint32_t)*e;
+    pte_set(e, writable ? (v | P_RW) : (v & ~(uint32_t)P_RW));
+    invlpg(va);
+    return 1;
+}
+
+int aspace_present(uint32_t cr3, uint32_t va) {
+    pte_t* e = aspace_pte(cr3, va, 0);
+    return e && (*e & P_PRESENT);
+}
+
+// Unmap one user page; returns its phys address (0 if it was not mapped). The caller frees it.
+uint32_t aspace_unmap(uint32_t cr3, uint32_t va) {
+    pte_t* e = aspace_pte(cr3, va, 0);
+    if (!e || !(*e & P_PRESENT)) return 0;
+    uint32_t ph = (uint32_t)*e & 0xFFFFF000u;
+    pte_set(e, 0);
+    return ph;
+}
+
+// Calls fn(va, phys) for every present 4 KB user page, in address order; stops at the first non-zero answer.
+int aspace_walk_user(uint32_t cr3, int (*fn)(uint32_t va, uint32_t phys, void* ctx), void* ctx) {
+    pte_t* pml4 = tbl(cr3);
+    if (!(pml4[0] & P_PRESENT)) return 0;
+    pte_t* pdpt = tbl((uint32_t)pml4[0] & 0xFFFFF000u);
+    for (unsigned g = 0; g < 3; g++) {
+        if (!(pdpt[g] & P_PRESENT)) continue;
+        pte_t* pd = tbl((uint32_t)pdpt[g] & 0xFFFFF000u);
+        for (unsigned d = 0; d < 512; d++) {
+            uint32_t de = (uint32_t)pd[d];
+            if (!(de & P_PRESENT) || (de & P_PS)) continue;
+            pte_t* pt = tbl(de & 0xFFFFF000u);
+            for (unsigned k = 0; k < 512; k++) {
+                uint32_t e = (uint32_t)pt[k];
+                if (!(e & P_PRESENT)) continue;
+                int r = fn((g << 30) | (d << 21) | (k << 12), e & 0xFFFFF000u, ctx);
+                if (r) return r;
+            }
+        }
+    }
+    return 0;
+}
+
+// Free every user page and every user-side table of the address space; the PML4 and the PDPT stay (empty user half).
+// The caller reloads CR3 if this is the running space.
+void aspace_free_user(uint32_t cr3) {
+    pte_t* pml4 = tbl(cr3);
+    if (!(pml4[0] & P_PRESENT)) return;
+    pte_t* pdpt = tbl((uint32_t)pml4[0] & 0xFFFFF000u);
+    for (unsigned g = 0; g < 3; g++) {
+        if (!(pdpt[g] & P_PRESENT)) continue;
+        uint32_t pd_ph = (uint32_t)pdpt[g] & 0xFFFFF000u;
+        pte_t* pd = tbl(pd_ph);
+        for (unsigned d = 0; d < 512; d++) {
+            uint32_t de = (uint32_t)pd[d];
+            if (!(de & P_PRESENT) || (de & P_PS)) continue;
+            pte_t* pt = tbl(de & 0xFFFFF000u);
+            for (unsigned k = 0; k < 512; k++)
+                if (pt[k] & P_PRESENT) pmm_free_page((uint32_t)pt[k] & 0xFFFFF000u);
+            pmm_free_page(de & 0xFFFFF000u);
+            pte_set(&pd[d], 0);
+        }
+        pte_set(&pdpt[g], 0);
+        pmm_free_page(pd_ph);
+    }
+}
+
+// Release a whole address space: user pages, user tables, the PDPT and the PML4.
+void aspace_destroy(uint32_t cr3) {
+    aspace_free_user(cr3);
+    pte_t* pml4 = tbl(cr3);
+    if (pml4[0] & P_PRESENT) pmm_free_page((uint32_t)pml4[0] & 0xFFFFF000u);
+    pmm_free_page(cr3);
+}
+
+// Map one 4 MB window as two 2 MB pages at kernel virtual `va` (4 MB aligned, in the kernel half or the low 3 GB of
+// the kernel's own tree). Returns 0 if something is already mapped there.
+static int map_4mb(uint32_t va, uint32_t phys, uint32_t flags) {
+    pte_t* pd = kpd[va >> 30];
+    unsigned i = (va >> 21) & 511;
+    if ((pd[i] & P_PRESENT) || (pd[i + 1] & P_PRESENT)) return 0;
+    pte_set(&pd[i], (phys & 0xFFC00000u) | flags | P_PS);
+    pte_set(&pd[i + 1], ((phys & 0xFFC00000u) + 0x200000u) | flags | P_PS);
+    return 1;
 }
 
 // Kernel MMIO window (paging_map): 16 x 4MB above the RAM alias.
 #define MMIO_VBASE_HI 0xF8000000u
-
-static void map_4mb_high(uint32_t phys_base) {
-    map_4mb_at(phys_base, PD_KERNEL_BASE + ((phys_base >> 22) & 0x3F), 0x03);
-}
 
 // Page attribute table: entries 0-7 are indexed by (PAT<<2 | PCD<<1 | PWT).
 // Power-on default is WB, WT, UC-, UC, WB, WT, UC-, UC; entry 1 (PWT alone,
@@ -55,29 +199,21 @@ int pat_init(void) {
 int pat_enabled(void) { return pat_ok; }
 
 void paging_init(uint32_t framebuffer_addr, uint32_t fb_bytes) {
-    for (int i = 0; i < 1024; i++) page_directory[i] = 0;
+    for (int i = 0; i < 512; i++) { kpml4[i] = 0; kpdpt[i] = 0; for (int g = 0; g < 4; g++) kpd[g][i] = 0; }
+    pte_set(&kpml4[0], V2P((uint32_t)kpdpt) | P_TABLE);
+    for (int g = 0; g < 3; g++) pte_set(&kpdpt[g], V2P((uint32_t)kpd[g]) | P_TABLE);
+    pte_set(&kpdpt[3], V2P((uint32_t)kpd[3]) | P_PRESENT | P_RW);          // supervisor only
+    for (int i = 0; i < 512; i++) kpdpt_hi[i] = 0;
+    pte_set(&kpdpt_hi[511], V2P((uint32_t)kpd[3]) | P_PRESENT | P_RW);
+    pte_set(&kpml4[511], V2P((uint32_t)kpdpt_hi) | P_PRESENT | P_RW);
 
-    // Full low identity 0-128M (supervisor) + high kernel alias of the same.
-    // The low half is transitional: it keeps every pre-high-half phys
-    // deref working (DMA, VGA, PMM) while call sites convert to V2P/P2V.
-    // Per-process user isolation (clearing low PD 1-767) is Priority 3.
-    for (uint32_t addr = 0; addr < 0x08000000; addr += 0x00400000) {
-        uint32_t pd = addr >> 22;
-        if (pt_count < 112) {
-            uint32_t* pt = page_tables[pt_count];
-            uint32_t pt_phys = V2P((uint32_t)pt);
-            for (int i = 0; i < 1024; i++)
-                pt[i] = ((addr & 0xFFC00000) + i * 0x1000) | 0x03;
-            page_directory[pd] = pt_phys | 0x03;
-            pt_count++;
-        }
-        map_4mb_high(addr);
-    }
+    // Low identity 0-128M (supervisor). The low half is transitional: it keeps every pre-high-half phys deref working
+    // (DMA, VGA, PMM) while call sites convert to V2P/P2V; user processes never see it.
+    for (uint32_t addr = 0; addr < 0x08000000; addr += 0x00200000)
+        pte_set(&kpd[0][addr >> 21], addr | P_PRESENT | P_RW | P_PS);
 
-    // RAM above 128M: high alias only, as 4MB PSE pages (no page tables —
-    // these PDEs are never walked by the 4K-PT helpers, which only touch the
-    // user half). The alias ends below the MMIO window (0xF8000000) and below
-    // an identity-mapped framebuffer that might sit in the high range.
+    // The kernel half: RAM as a high alias of phys 0.., ending below the MMIO window (0xF8000000) and below an
+    // identity-mapped framebuffer that might sit in the high range.
     {
         uint32_t ram = pmm_get_total_pages() * 4096u;
         uint32_t lim = MMIO_VBASE_HI - KERNEL_VBASE;
@@ -85,17 +221,13 @@ void paging_init(uint32_t framebuffer_addr, uint32_t fb_bytes) {
             (framebuffer_addr & 0xFFC00000) - KERNEL_VBASE < lim)
             lim = (framebuffer_addr & 0xFFC00000) - KERNEL_VBASE;
         if (ram > lim) ram = lim;
-        uint32_t cr4;
-        __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
-        cr4 |= 0x10; // PSE
-        __asm__ volatile("mov %0, %%cr4" :: "r"(cr4));
-        for (uint32_t addr = 0x08000000; addr + 0x00400000 <= ram; addr += 0x00400000)
-            page_directory[PD_KERNEL_BASE + (addr >> 22)] = addr | 0x83; // P|RW|PS
+        for (uint32_t addr = 0; addr + 0x00200000 <= ram; addr += 0x00200000)
+            pte_set(&kpd[3][addr >> 21], addr | P_PRESENT | P_RW | P_PS);
         serial_printf("[paging] high alias covers %u MB\n", ram >> 20);
     }
 
     // Map framebuffer (typically 0xFD000000, ~8.3MB for 1920x1080x32).
-    // Identity PD index (phys>>22): FB stays at its phys address, supervisor.
+    // Identity (virt == phys), supervisor.
     if (framebuffer_addr) {
         // Write-combining (PAT entry 1 = PWT) when the CPU has a PAT. On real
         // hardware the video aperture lives in the PCI hole, which firmware
@@ -110,41 +242,33 @@ void paging_init(uint32_t framebuffer_addr, uint32_t fb_bytes) {
         if (nwin > 12) nwin = 12;
         for (uint32_t i = 0; i < nwin; i++) {
             uint32_t base = fb_base + i * 0x00400000;
-            if (!(page_directory[base >> 22] & 0x01))
-                map_4mb_at(base, base >> 22, fbf);
+            map_4mb(base, base, fbf);
         }
     }
 
-    // Map e1000 MMIO (typically 0xFEB80000 -> PD 1018), supervisor
-    {
-        uint32_t base = 0xFEB80000 & 0xFFC00000;
-        if (!(page_directory[base >> 22] & 0x01))
-            map_4mb_at(base, base >> 22, 0x03);
-    }
+    // Map e1000 MMIO (typically 0xFEB80000), supervisor
+    map_4mb(0xFEB80000 & 0xFFC00000, 0xFEB80000 & 0xFFC00000, 0x03);
 
     // Local APIC + I/O APIC + HPET live in 0xFEC00000-0xFEFFFFFF. Uncached
-    // (PCD|PWT) and identity-mapped; done here, before any process exists, so
-    // every address space copies the entry. A relocated APIC base gets its own
-    // window.
+    // (PCD|PWT) and identity-mapped. A relocated APIC base gets its own window.
     {
         uint32_t wins[2] = { 0xFEC00000u, lapic_phys_base() };
         for (int i = 0; i < 2; i++) {
             if (!wins[i]) continue;
             uint32_t base = wins[i] & 0xFFC00000;
-            if (!(page_directory[base >> 22] & 0x01))
-                map_4mb_at(base, base >> 22, 0x1B);
+            map_4mb(base, base, 0x1B);
         }
     }
 
-    // Switch from the boot PD (0-4M low+high) to the full map
-    __asm__ volatile("mov %0, %%cr3" : : "r"(V2P((uint32_t)page_directory)));
+    // Switch from the boot tables (0-64M low+high) to the full map
+    __asm__ volatile("mov %0, %%cr3" : : "r"(V2P((uint32_t)kpml4)) : "memory");
     serial_printf("[paging] high-half map on: cr3=%x kernel_end=%x\n",
-                  V2P((uint32_t)page_directory), 0u);
+                  V2P((uint32_t)kpml4), 0u);
 }
 
 // Kernel MMIO windows (0xF8000000+, 16 x 4MB): the pool paging_map and
-// paging_map_mmio draw from. Windows must be created before the first process
-// (page directories copy the kernel half at creation), i.e. during boot.
+// paging_map_mmio draw from. The kernel half is shared by all address spaces, so a window made at any time is seen
+// everywhere.
 #define MMIO_VBASE MMIO_VBASE_HI
 #define MMIO_WINDOWS 16          // the last one is the probe window (paging_probe_window), not part of the pool
 #define MMIO_POOL (MMIO_WINDOWS - 1)
@@ -164,13 +288,12 @@ static void* map_windows(uint32_t phys_addr, uint32_t len, uint32_t flags) {
     if (mmio_next + n * 0x00400000 > MMIO_VBASE + MMIO_POOL * 0x00400000) return 0;
     uint32_t vbase = mmio_next;
     for (uint32_t k = 0; k < n; k++) {
-        map_4mb_at(base + k * 0x00400000, (vbase >> 22) + k, flags);
+        if (!map_4mb(vbase + k * 0x00400000, base + k * 0x00400000, flags)) return 0;
         mmio_win[((vbase - MMIO_VBASE) >> 22) + k].base = base + k * 0x00400000;
         mmio_win[((vbase - MMIO_VBASE) >> 22) + k].flags = flags;
-        if (!(page_directory[(vbase >> 22) + k] & 0x01)) return 0;      // out of page tables
     }
     mmio_next += n * 0x00400000;
-    __asm__ volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax", "memory");
+    tlb_flush();
     return (void*)(vbase + off);
 }
 
@@ -179,25 +302,23 @@ static void* map_windows(uint32_t phys_addr, uint32_t len, uint32_t flags) {
 void* paging_map(uint32_t phys_addr) { return map_windows(phys_addr, 1, 0x03); }
 
 // A scratch 4MB window (the last MMIO slot) that can be re-pointed at any 4MB-aligned physical block, to read device
-// registers in address space nobody has mapped (hunting for an ACPI-mode controller). The entry goes into the kernel
-// page directory and into the page directory that is current now (address spaces made earlier hold a copy of the kernel
-// half from their creation, so only the caller's own space sees a later change: use it from one thread).
+// registers in address space nobody has mapped (hunting for an ACPI-mode controller). The entries live in the shared
+// kernel half, so every address space sees a change at once.
 // paging_probe_window(0) unmaps it again.
 void* paging_probe_window(uint32_t phys4mb) {
-    uint32_t idx = (MMIO_VBASE >> 22) + MMIO_WINDOWS - 1;
+    uint32_t va = MMIO_VBASE + (MMIO_WINDOWS - 1) * 0x00400000u;
+    unsigned idx = (va - KERNEL_VBASE) >> 21;
     static int ours;                                       // 1 once we have put our own entry there
     if (!ours) {
-        if (page_directory[idx] & 1) return 0;             // something else (an identity-mapped framebuffer) lives there
+        if (kpd[3][idx] & P_PRESENT) return 0;             // something else (an identity-mapped framebuffer) lives there
         ours = 1;
     }
-    uint32_t ent = phys4mb ? ((phys4mb & 0xFFC00000) | 0x9B) : 0;            // P | RW | PWT | PCD | PS
-    uint32_t cr3;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
-    uint32_t* cur = (uint32_t*)P2V_U32(cr3 & 0xFFFFF000u);
-    if (cur != page_directory) cur[idx] = ent;
-    page_directory[idx] = ent;
-    __asm__ volatile("invlpg (%0)" :: "r"(idx << 22) : "memory");
-    return phys4mb ? (void*)(idx << 22) : 0;
+    uint32_t base = phys4mb & 0xFFC00000;
+    pte_set(&kpd[3][idx], phys4mb ? (base | 0x9B) : 0);                       // P | RW | PWT | PCD | PS
+    pte_set(&kpd[3][idx + 1], phys4mb ? ((base + 0x200000u) | 0x9B) : 0);
+    invlpg(va);
+    invlpg(va + 0x200000u);
+    return phys4mb ? (void*)va : 0;
 }
 
 // Uncached (PCD|PWT) mapping of `len` bytes of device registers at phys_addr,
@@ -210,83 +331,26 @@ void* paging_map_low(uint32_t phys_addr) {
     return (void*)phys_addr;
 }
 
-// Kernel PD phys, for process.c to share the high map (PD 768-1023)
+// The kernel's PML4 (CR3 value): pid 0, boot, application processors
 uint32_t paging_kernel_pd_phys(void) {
-    return V2P((uint32_t)page_directory);
+    return V2P((uint32_t)kpml4);
 }
 
-// Map one user page into the PD at pd_phys (PHYS address), with TLB flush.
-// Used when the target is the RUNNING address space (current CR3).
-static void paging_map_user_internal(uint32_t pd_phys, uint32_t virt_addr,
-                                     uint32_t phys_addr) {
-    uint32_t *pd = (uint32_t*)P2V_U32(pd_phys);
-    uint32_t pd_index = virt_addr >> 22;
-    uint32_t pt_index = (virt_addr >> 12) & 0x3FF;
-
-    // Ensure page directory entry exists (page-granular PT via PMM:
-    // kmalloc is only 4B-aligned, and masking its low 12 bits corrupts).
-    // PMM pages are PHYS: deref through the HIGH alias (P2V) — the full map
-    // covers all phys, and the stored PD value stays phys for CR3 walks.
-    if (!(pd[pd_index] & 0x01)) {
-        uint32_t pt_phys = pmm_alloc_page();
-        if (!pt_phys) return;
-        uint32_t *pt = (uint32_t*)P2V_U32(pt_phys);
-        for (int i = 0; i < 1024; i++) pt[i] = 0;
-        pd[pd_index] = pt_phys | 0x07; // present + rw + user
-    } else {
-        // Pre-existing table: flip the PD entry to user so ring 3 can walk
-        // through it. (Kernel-high PDEs never reach this branch: guarded above.)
-        pd[pd_index] |= 0x04;
-    }
-
-    uint32_t *pt = (uint32_t*)P2V_U32(pd[pd_index] & 0xFFFFF000);
-    pt[pt_index] = (phys_addr & 0xFFFFF000) | 0x07; // present + rw + user
-
-    // The mapping changed underfoot — flush the TLB entry so the CPU walks
-    // the new tables instead of the cached supervisor translation.
-    __asm__ volatile("invlpg (%0)" : : "r"(virt_addr) : "memory");
-}
-
-// Same, but no TLB flush: the target address space is NOT running (the CR3
-// switch flushes the whole TLB anyway). Shares the body via the flush flag.
-static void paging_map_user_internal_noflush(uint32_t pd_phys, uint32_t virt_addr,
-                                             uint32_t phys_addr) {
-    uint32_t *pd = (uint32_t*)P2V_U32(pd_phys);
-    uint32_t pd_index = virt_addr >> 22;
-    uint32_t pt_index = (virt_addr >> 12) & 0x3FF;
-
-    if (!(pd[pd_index] & 0x01)) {
-        uint32_t pt_phys = pmm_alloc_page();
-        if (!pt_phys) return;
-        uint32_t *pt = (uint32_t*)P2V_U32(pt_phys);
-        for (int i = 0; i < 1024; i++) pt[i] = 0;
-        pd[pd_index] = pt_phys | 0x07; // present + rw + user
-    } else {
-        pd[pd_index] |= 0x04;
-    }
-
-    uint32_t *pt = (uint32_t*)P2V_U32(pd[pd_index] & 0xFFFFF000);
-    pt[pt_index] = (phys_addr & 0xFFFFF000) | 0x07; // present + rw + user
-}
-
-// Map a page as user-accessible (ring 3 can read/write it)
-// Used for user-mode stacks and code. Marks BOTH the page-table entry AND
-// the page-directory entry User (U/S=1): the CPU checks every level, so a
-// supervisor PD entry faults ring 3 even when the PT entry says user.
-// phys_addr is PHYSICAL; virt_addr is the user-low virtual address.
-void paging_map_user(uint32_t virt_addr, uint32_t phys_addr) {
-    // Low user space only: never allow remapping the kernel high half
-    if (virt_addr >= KERNEL_VBASE) return;
-    paging_map_user_internal(V2P((uint32_t)page_directory),
-                             virt_addr, phys_addr);
-}
-
-// Same mapping into an explicit page directory (PHYS PD address).
-// No TLB flush: the target address space is not running (flush on switch).
+// Map one user page into the address space at `cr3` (PHYS PML4 address). No TLB flush: a page that was not mapped
+// before has no TLB entry, and a space that is not running is flushed by the CR3 switch.
 void paging_map_user_pd(uint32_t pd_phys, uint32_t virt_addr, uint32_t phys_addr) {
     if (virt_addr >= KERNEL_VBASE) return;
     if (!pd_phys) return;
-    paging_map_user_internal_noflush(pd_phys, virt_addr, phys_addr);
+    pte_t* e = aspace_pte(pd_phys, virt_addr, 1);
+    if (e) pte_set(e, (phys_addr & 0xFFFFF000u) | P_TABLE);
+}
+
+// Map a page as user-accessible (ring 3 can read/write it) in the kernel's own tree, with a TLB flush.
+// phys_addr is PHYSICAL; virt_addr is the user-low virtual address.
+void paging_map_user(uint32_t virt_addr, uint32_t phys_addr) {
+    if (virt_addr >= KERNEL_VBASE) return;
+    paging_map_user_pd(V2P((uint32_t)kpml4), virt_addr, phys_addr);
+    invlpg(virt_addr);
 }
 
 // Check a user buffer range is fully mapped user-accessible in the CURRENT
@@ -299,17 +363,38 @@ int paging_user_range_valid(uint32_t virt_addr, uint32_t len) {
     if (virt_addr + len > KERNEL_VBASE) return 0; // kernel half off-limits
     uint32_t cr3_phys;
     __asm__ volatile("mov %%cr3, %0" : "=r"(cr3_phys));
-    uint32_t *pd = (uint32_t*)P2V_U32(cr3_phys);
+    cr3_phys &= 0xFFFFF000u;
     uint32_t start = virt_addr & 0xFFFFF000;
     uint32_t end = (virt_addr + len - 1) & 0xFFFFF000;
     for (uint32_t page = start; ; page += 0x1000) {
-        uint32_t pde = pd[page >> 22];
-        // Present + user-accessible at BOTH levels (U/S=1 is bit 2 = 0x04)
-        if (!(pde & 0x01) || !(pde & 0x04)) return 0;
-        uint32_t *pt = (uint32_t*)P2V_U32(pde & 0xFFFFF000);
-        uint32_t pte = pt[(page >> 12) & 0x3FF];
-        if (!(pte & 0x01) || !(pte & 0x04)) return 0;
+        // Present + user-accessible at every level (U/S=1 is bit 2)
+        pte_t* e = aspace_pte(cr3_phys, page, 0);
+        if (!e || (*e & (P_PRESENT | P_US)) != (P_PRESENT | P_US)) return 0;
         if (page == end) break;
     }
     return 1;
+}
+
+// Whether a kernel/user address below 4 GB can be read without faulting, in the address space that is loaded now
+// (the panic screen scans the stack with it: no allocation, no locks).
+int paging_va_mapped(uint32_t va) {
+    uint32_t cr3;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3));
+    cr3 &= ~0xFFFu;
+    if (cr3 >= 0x30000000u) return 0;                          // outside the kernel's direct map: cannot look
+    const pte_t* pml4 = (const pte_t*)P2V_U32(cr3);
+    uint32_t e = (uint32_t)pml4[0];
+    if (!(e & P_PRESENT)) return 0;
+    if ((e & ~0xFFFu) >= 0x30000000u) return 0;
+    const pte_t* t = (const pte_t*)P2V_U32(e & ~0xFFFu);       // PDPT
+    e = (uint32_t)t[va >> 30];
+    if (!(e & P_PRESENT)) return 0;
+    if ((e & ~0xFFFu) >= 0x30000000u) return 0;
+    t = (const pte_t*)P2V_U32(e & ~0xFFFu);                    // PD
+    e = (uint32_t)t[(va >> 21) & 511];
+    if (!(e & P_PRESENT)) return 0;
+    if (e & P_PS) return 1;
+    if ((e & ~0xFFFu) >= 0x30000000u) return 0;
+    t = (const pte_t*)P2V_U32(e & ~0xFFFu);                    // PT
+    return (uint32_t)t[(va >> 12) & 511] & P_PRESENT;
 }

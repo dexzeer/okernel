@@ -79,33 +79,10 @@ void process_capture_idle_esp(void) {
     __asm__ volatile("mov %%ebp, %0" : "=r"(processes[0].ebp));
 }
 
-// Create a new page directory sharing the kernel high map (PD 768-1023).
-// User low space (PD 0-767) stays zero/private. CR3 values are PHYS; tables
-// are dereferenced through P2V (high kernel map covers all phys).
+// New address space: empty user half (0..3 GB) plus the kernel half every space shares (aspace_create).
+// CR3 values are PHYS; tables are dereferenced through P2V (high kernel map covers all phys).
 static uint32_t create_page_directory(void) {
-    // Allocate a new page for the page directory
-    uint32_t pd_phys = pmm_alloc_page();
-    if (!pd_phys) return 0;
-
-    uint32_t *new_pd = (uint32_t *)P2V_U32(pd_phys);
-    // Clear the new page directory
-    for (int i = 0; i < 1024; i++) new_pd[i] = 0;
-
-    // Get the current page directory (CR3 is phys)
-    uint32_t cr3_phys;
-    __asm__ volatile("mov %%cr3, %0" : "=r"(cr3_phys));
-    uint32_t *cur_pd = (uint32_t *)P2V_U32(cr3_phys);
-
-    // Share kernel high map + FB/MMIO supervisor entries (PD 768-1023).
-    // Never copy low entries: kernel-low no longer exists, and user-low
-    // must start private (the old code copied PD 0-255, leaking kernel).
-    for (int i = PD_KERNEL_BASE; i < 1024; i++) {
-        if (cur_pd[i] & 0x01) {
-            new_pd[i] = cur_pd[i];
-        }
-    }
-
-    return pd_phys;
+    return aspace_create();
 }
 
 int process_create(void) {
@@ -211,22 +188,7 @@ void process_destroy(uint32_t pid) {
             // (worst case: switches into a dead address space for one slice,
             // then the zombie-target guard refuses it next tick). Poison + park
             // drop below still run (slot hygiene unchanged).
-            if (0 && processes[i].page_dir) {
-                uint32_t *pd = (uint32_t *)P2V_U32(processes[i].page_dir);
-                for (int j = 0; j < PD_KERNEL_BASE; j++) {
-                    if (pd[j] & 0x01) {
-                        uint32_t *pt = (uint32_t *)P2V_U32(pd[j] & 0xFFFFF000);
-                        // Free user page table pages
-                        for (int k = 0; k < 1024; k++) {
-                            if (pt[k] & 0x01) {
-                                pmm_free_page(pt[k] & 0xFFFFF000);
-                            }
-                        }
-                        pmm_free_page(pd[j] & 0xFFFFF000);
-                    }
-                }
-                pmm_free_page(processes[i].page_dir);
-            }
+            // (the freeing itself would be aspace_free_user(page_dir) + pmm_free_page of the PML4/PDPT: not done, see above)
             // Free kernel stack
             if (processes[i].kernel_stack) {
                 kfree((void *)processes[i].kernel_stack);
