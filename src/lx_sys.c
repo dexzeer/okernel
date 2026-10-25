@@ -962,7 +962,7 @@ int64_t lx_syscall_dispatch(struct lx_task *t) {
     case 102: case 104: case 107: case 108: return 0;               // uid gid euid egid
     case 111: return t->pid;                                        // getpgrp
     case 121: return t->pid;                                        // getpgid
-    case 112: return t->pid;                                        // setsid
+    case 112: t->term_win = -1; return t->pid;                         // setsid: a daemon leaves its terminal (the shell prompt comes back, output goes to the serial log)
     case 109: case 105: case 106: return 0;                         // setpgid setuid setgid
     case 218: t->clear_child_tid = a0; return t->pid;               // set_tid_address
     case 273: return 0;                                             // set_robust_list
