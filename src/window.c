@@ -120,6 +120,7 @@ int window_create(const char* title, int x, int y, int w, int h) {
             windows[i].no_titlebar = 0;
             windows[i].is_term = 0; // reset: slot reuse must not leak themes
             windows[i].has_restore = 0;
+            windows[i].is_popup = 0;
             windows[i].text_fg = 15; windows[i].text_bg = 0;
             windows[i].text_fg_rgb = vga_to_rgb[15]; windows[i].text_bg_rgb = vga_to_rgb[0];
             windows[i].content_bg = WIN_BG;
@@ -208,6 +209,13 @@ void window_set_no_titlebar(int id, int flag) {
     if (w->no_titlebar == flag) return;
     w->no_titlebar = flag;
     window_apply_metrics(w);
+}
+
+void window_set_popup(int id) {
+    if (id < 0 || id >= MAX_WINDOWS) return;
+    windows[id].is_popup = 1;
+    winfx_cancel(id);
+    window_set_no_titlebar(id, 1);
 }
 
 void window_set_pixels(int id, const uint32_t* px, int x, int y, int w, int h, int stride) {
@@ -599,7 +607,7 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
     }
 
     // ---- Resize grip (skip if clip rect is far from bottom-right) ----
-    if (rx + rw > w->x + w->w - WIN_GRIP_SIZE - WIN_BORDER &&
+    if (!w->is_popup && rx + rw > w->x + w->w - WIN_GRIP_SIZE - WIN_BORDER &&
         ry + rh > w->y + w->h - WIN_GRIP_SIZE - WIN_BORDER) {
         for (int i = 0; i < WIN_GRIP_SIZE; i++)
             hline(w->x + w->w - WIN_BORDER - 1 - i,

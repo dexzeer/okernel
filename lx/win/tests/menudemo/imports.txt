@@ -1,0 +1,3 @@
+kernel32.dll: GetStdHandle WriteFile
+user32.dll: RegisterClassExA CreateWindowExA ShowWindow UpdateWindow GetMessageA TranslateMessage DispatchMessageA DefWindowProcA PostQuitMessage BeginPaint EndPaint GetClientRect InvalidateRect DestroyWindow wsprintfA LoadCursorA CreateMenu CreatePopupMenu AppendMenuA SetMenu CheckMenuItem EnableMenuItem TrackPopupMenu GetMenuItemRect ClientToScreen GetMenuItemCount CreateAcceleratorTableA TranslateAcceleratorA
+gdi32.dll: TextOutA SetBkMode
