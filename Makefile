@@ -327,16 +327,23 @@ kanarchy-desktop.bin: $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o link
 	$(LD) $(LDFLAGS_HIGH) -o $@ $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o build-ksyms/ksyms.o
 	nm -n $@ | python3 tools/ksyms.py --check build-ksyms/ksyms.bin
 
-kanarchy-desktop.iso: kanarchy-desktop.bin
+# The Linux/Windows subsystem root (lx/, tools/pe, tools/lx): our own programs and DLLs; GRUB hands it to the kernel as a module
+LX_SRC := $(shell find lx tools/pe tools/lx -type f \( -name '*.c' -o -name '*.h' -o -name '*.py' -o -name '*.sh' -o -name '*.txt' -o -name '*.ld' -o -name '*.exp' \) 2>/dev/null)
+build-host/lxsys.tar: $(LX_SRC)
+	sh tools/lx/build_root.sh build-host/lxsys
+
+kanarchy-desktop.iso: kanarchy-desktop.bin build-host/lxsys.tar
 	rm -rf isodir
 	mkdir -p isodir/boot/grub
 	cp kanarchy-desktop.bin isodir/boot/kanarchy.bin
+	cp build-host/lxsys.tar isodir/boot/lxroot.tar
 	echo 'set timeout=0' > isodir/boot/grub/grub.cfg
 	echo 'set default=0' >> isodir/boot/grub/grub.cfg
 	echo '' >> isodir/boot/grub/grub.cfg
 	echo 'menuentry "KAnarchy OS" {' >> isodir/boot/grub/grub.cfg
 	echo '    set gfxpayload=1920x1080x32' >> isodir/boot/grub/grub.cfg
 	echo '    multiboot /boot/kanarchy.bin' >> isodir/boot/grub/grub.cfg
+	echo '    module /boot/lxroot.tar' >> isodir/boot/grub/grub.cfg
 	echo '    boot' >> isodir/boot/grub/grub.cfg
 	echo '}' >> isodir/boot/grub/grub.cfg
 	grub-mkrescue -o $@ isodir 2>/dev/null
@@ -462,8 +469,8 @@ kanarchy-fbtext.bin: build-fbtext/start.o boot/isr.o $(COMMON_OBJ) build-fbtext/
 
 # ---- Installed disk: MBR + GRUB (BIOS and UEFI), boot / recovery / log / data partitions (src/part.h) ----
 disk: kanarchy-disk.img
-kanarchy-disk.img: kanarchy-desktop.bin tools/disk/mkdisk.py tools/disk/grub.cfg
-	python3 tools/disk/mkdisk.py $@ kanarchy-desktop.bin
+kanarchy-disk.img: kanarchy-desktop.bin build-host/lxsys.tar tools/disk/mkdisk.py tools/disk/grub.cfg
+	python3 tools/disk/mkdisk.py $@ kanarchy-desktop.bin build-host/lxsys.tar
 
 laptop: kanarchy-laptop.iso
 kanarchy-laptop.iso: kanarchy-text.bin kanarchy-fbtext.bin build-laptop/kanarchy-1366x768.bin build-laptop/kanarchy-1280x800.bin build-laptop/kanarchy-1024x768.bin build-laptop/kanarchy-auto.bin boot/laptop-grub.cfg

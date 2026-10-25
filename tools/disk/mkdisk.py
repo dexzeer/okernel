@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Builds the installed-disk image (layout: src/part.h) from the desktop and recovery kernels, without root: GRUB's
 # images come from grub-mkimage, the FAT file systems from mtools, the rest is written here.
-#   python3 tools/disk/mkdisk.py OUT.img kanarchy-desktop.bin
+#   python3 tools/disk/mkdisk.py OUT.img kanarchy-desktop.bin lxroot.tar
+# lxroot.tar (the Linux/Windows subsystem root, tools/lx/build_root.sh) is loaded by GRUB as a multiboot module.
 # BIOS: GRUB's boot.img in the MBR, its core image in the gap before the first partition.
 # UEFI: /EFI/BOOT/BOOTX64.EFI and BOOTIA32.EFI on the boot partition (type 0xEF, so firmware takes it as the ESP).
 # Run in QEMU:  qemu-system-i386 -m 1024 -hda kanarchy-disk.img -vga std
@@ -33,7 +34,7 @@ def fat(path, part, files, dirs):
         run('mcopy', '-i', path, src, '::' + dst)
 
 def main():
-    out, desktop = sys.argv[1:3]
+    out, desktop, lxroot = sys.argv[1:4]
     work = 'build-disk'
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
@@ -53,10 +54,10 @@ def main():
     assert os.path.getsize(env) == 1024
     here = os.path.dirname(os.path.abspath(__file__))
     bootfat = os.path.join(work, 'boot.fat')
-    fat(bootfat, P1, [(desktop, '/boot/kanarchy.bin'), (os.path.join(here, 'grub.cfg'), '/boot/grub/grub.cfg'), (env, '/boot/grub/grubenv')] + efis,
+    fat(bootfat, P1, [(desktop, '/boot/kanarchy.bin'), (lxroot, '/boot/lxroot.tar'), (os.path.join(here, 'grub.cfg'), '/boot/grub/grub.cfg'), (env, '/boot/grub/grubenv')] + efis,
         ['/boot', '/boot/grub', '/EFI', '/EFI/BOOT'])
     recfat = os.path.join(work, 'recovery.fat')
-    fat(recfat, P2, [(desktop, '/known/kanarchy.bin')], ['/known'])   # booted with `recovery` = the recovery desktop
+    fat(recfat, P2, [(desktop, '/known/kanarchy.bin'), (lxroot, '/known/lxroot.tar')], ['/known'])   # booted with `recovery` = the recovery desktop
 
     corebytes = open(core, 'rb').read()
     ncore = (len(corebytes) + 511) // 512
