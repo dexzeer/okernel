@@ -3,6 +3,8 @@
 #include "theme.h"
 #include "ui_draw.h"
 #include "cjk.h"
+#include "winfx.h"
+#include "taskbar.h"
 #include "memory.h"
 #include "idt.h"
 #include "io.h"
@@ -132,6 +134,7 @@ int window_create(const char* title, int x, int y, int w, int h) {
             windows[i].cell_bg = (uint32_t*)kmalloc(CONTENT_CELLS_MAX * sizeof(uint32_t));
             windows[i].cell_attr = (uint8_t*)kmalloc(CONTENT_CELLS_MAX * sizeof(uint8_t));
             window_apply_metrics(&windows[i]); // sets content_w/h and blanks the buffer
+            winfx_open(i);                      // opening animation (starts at the next main-loop pass)
             return i;
         }
     }
@@ -147,6 +150,7 @@ void window_set_font_scale(int id, int scale) {
 
 void window_destroy(int id) {
     if (id < 0 || id >= MAX_WINDOWS) return;
+    winfx_cancel(id);
     if (windows[id].content) { kfree(windows[id].content); windows[id].content = 0; }
     if (windows[id].cell_fg) { kfree(windows[id].cell_fg); windows[id].cell_fg = 0; }
     if (windows[id].cell_bg) { kfree(windows[id].cell_bg); windows[id].cell_bg = 0; }
@@ -334,13 +338,19 @@ void window_toggle_maximize(int id) {
 
 void window_minimize(int id) {
     if (id >= 0 && id < MAX_WINDOWS) {
+        // the animation takes its snapshot while the window is still on screen
+        int animated = windows[id].visible && !windows[id].minimized && winfx_minimize(id);
         windows[id].minimized = 1; windows[id].focused = 0;
-        desktop_paint_rect_pub(windows[id].x, windows[id].y, windows[id].w, windows[id].h);
+        if (!animated) desktop_paint_rect_pub(windows[id].x, windows[id].y, windows[id].w, windows[id].h);
     }
 }
 
 void window_restore(int id) {
-    if (id >= 0 && id < MAX_WINDOWS) { windows[id].minimized = 0; windows[id].dirty = 1; window_mark_all(&windows[id]); needs_redraw = 1; }
+    if (id >= 0 && id < MAX_WINDOWS) {
+        int was_min = windows[id].minimized;
+        windows[id].minimized = 0; windows[id].dirty = 1; window_mark_all(&windows[id]); needs_redraw = 1;
+        if (was_min) winfx_restore(id);
+    }
 }
 
 void window_resize(int id, int new_w, int new_h) {
@@ -428,18 +438,21 @@ static int window_blink_on(void) {
     return (tick_count / 100) % 2 == 0;
 }
 
+uint32_t window_border_color(const struct window* w) {
+    return w->no_titlebar ? (w->focused ? FX_FRAME_BORDER : FX_FRAME_BORDER_U) :
+                            (w->focused ? HDR_BORDER : HDR_BORDER_U);
+}
+
 void window_paint_region(int id, int rx, int ry, int rw, int rh) {
     struct window* w = &windows[id];
-    if (!w->visible || w->minimized) return;
+    if (!w->visible || w->minimized || winfx_hides(id)) return;
 
     // ---- Border + (optional) title bar ----
     int title_off = w->no_titlebar ? 0 : WIN_TITLE_H;
     int title_bottom = w->y + WIN_BORDER + title_off;
     // Border frame — drawn whenever the clip rect overlaps the window at all.
     if (rx < w->x + w->w && rx + rw > w->x && ry < w->y + w->h && ry + rh > w->y) {
-        uint32_t bc = w->no_titlebar ? (w->focused ? FX_FRAME_BORDER : FX_FRAME_BORDER_U) :
-                      (w->focused ? HDR_BORDER : HDR_BORDER_U);
-        rect_outline(w->x, w->y, w->w, w->h, bc, WIN_BORDER);
+        rect_outline(w->x, w->y, w->w, w->h, window_border_color(w), WIN_BORDER);
     }
     // Title bar (skipped for title-bar-less windows; the client draws its own
     // top): a dark GNOME-style header bar, centered Noto title, round buttons.
@@ -457,11 +470,12 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
         ws_push_clip(&s, tx, ty, tx + tw, ty + WIN_TITLE_H - 1, old2);
         int btns_w = (w->has_close_button ? WIN_BTN_W + 14 : 0) +
                      (w->has_minimize_button ? WIN_BTN_W + 6 : 0);
-        int room = tw - 2 * (btns_w + 8);
+        // app icon, then the name, both from the left edge
+        int ix = tx + 14, nx = ix + 20 + 10;
+        taskbar_draw_window_icon(&s, id, ix, ty + (WIN_TITLE_H - 20) / 2);
+        int room = tx + tw - btns_w - 10 - nx;
         if (room > 0) {
-            int tl = ui_text_w(15, 1, w->title, -1);
-            if (tl > room) tl = room;
-            ui_text_draw(&s, tx + (tw - tl) / 2, ty + WIN_TITLE_H / 2, 15, 1,
+            ui_text_draw(&s, nx, ty + WIN_TITLE_H / 2, 15, 1,
                          w->focused ? HDR_TEXT : HDR_TEXT_U, w->title, -1, room, hbg);
         }
         for (int m = 0; m < 2; m++) {
@@ -612,6 +626,8 @@ void window_paint_region(int id, int rx, int ry, int rw, int rh) {
             }
         }
     }
+
+    winfx_round_corners(id, rx, ry, rx + rw, ry + rh);
 }
 
 // Paint (px,py,pw,ph) of window id clipped to the parts NOT covered by
@@ -627,7 +643,7 @@ static void window_paint_uncovered(int id, int px, int py, int pw, int ph) {
     rects[0][0] = px; rects[0][1] = py; rects[0][2] = pw; rects[0][3] = ph;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         struct window* hw = &windows[i];
-        if (i == id || !hw->visible || hw->minimized || hw->z < w->z) continue;
+        if (i == id || !hw->visible || hw->minimized || hw->z < w->z || winfx_hides(i)) continue;
         if (hw->z == w->z) continue; // unique in practice; paint order covers ties
         int hx0 = hw->x, hy0 = hw->y,
             hx1 = hw->x + hw->w, hy1 = hw->y + hw->h;
@@ -683,7 +699,7 @@ fallback:
 
 int window_draw(int id) {
     struct window* w = &windows[id];
-    if (!w->visible || w->minimized) return 0;
+    if (!w->visible || w->minimized || winfx_hides(id)) return 0;
     int blink = window_blink_on();
     int cursor_live = (w->focused && w->content && !w->hide_cursor);
     int blink_changed = (cursor_live && blink != w->last_cursor_visible);

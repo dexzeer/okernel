@@ -59,6 +59,14 @@ static void tb_layout(struct tb_lay* L) {
     for (int k = 0; k < L->n; k++) L->bx[k] = x0 + k * (bw + TB_GAP);
 }
 
+int taskbar_button_rect(int id, int r[4]) {
+    struct tb_lay L;
+    tb_layout(&L);
+    for (int k = 0; k < L.n; k++)
+        if (L.id[k] == id) { r[0] = L.bx[k]; r[1] = L.by; r[2] = L.bw; r[3] = TB_BTN_H; return 1; }
+    return 0;
+}
+
 int taskbar_hit(int mx, int my) {
     struct tb_lay L;
     tb_layout(&L);
@@ -110,6 +118,9 @@ static void icon_app(struct wsurf* s, int app, int x, int y) {
             ui_rrect(s, x + 6, y + 5 + k * 3, k == 3 ? 5 : 8, 1, 0, 0x00808090);
     }
 }
+
+// The icon of a window's app (also used in the window's own title bar).
+void taskbar_draw_window_icon(struct wsurf* s, int id, int x, int y) { icon_app(s, app_of(id), x, y); }
 
 // ---- state + rendering ------------------------------------------------------
 
