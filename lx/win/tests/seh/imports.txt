@@ -1,0 +1,2 @@
+kernel32.dll: GetStdHandle WriteFile RaiseException AddVectoredExceptionHandler SetUnhandledExceptionFilter GetCommandLineA
+msvcrt.dll: qsort __C_specific_handler

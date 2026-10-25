@@ -14,7 +14,7 @@ T=build-host/winobj; rm -rf $T; mkdir -p $T
 exports() { grep -h '^EXPORT ' "$@" | sed -E 's/^EXPORT [^(]*[ *]([A-Za-z_0-9]+)\(.*/\1/' | grep -E '^[A-Za-z_][A-Za-z0-9_]*$' | sort -u; }
 
 exports lx/win/kernel32/*.c > $T/k32.exp
-printf '%s\n' memcpy memmove memset memcmp strlen >> $T/k32.exp
+printf '%s\n' memcpy memmove memset memcmp strlen RtlCaptureContext RtlRestoreContext >> $T/k32.exp
 $PEB $SYS/kernel32.dll dll 0x6C000000 - $T/k32.exp lx/win/kernel32/*.c
 
 if [ -d lx/win/msvcrt ]; then

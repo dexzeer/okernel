@@ -500,6 +500,14 @@ int64_t lx_pe_getproc(struct lx_task *t, uint64_t base, uint64_t uname, uint64_t
     return 0;
 }
 
+int64_t lx_pe_module_of(struct lx_task *t, uint64_t addr) {
+    struct lx_win *w = t->mm->win;
+    if (!w) return 0;
+    for (int i = 0; i < w->nmod; i++)
+        if (addr >= w->mod[i].base && addr < (uint64_t)w->mod[i].base + w->mod[i].size) return w->mod[i].base;
+    return 0;
+}
+
 int64_t lx_pe_modulebase(struct lx_task *t, uint64_t uname) {
     struct lx_win *w = t->mm->win;
     if (!w) return 0;

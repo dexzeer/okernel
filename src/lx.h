@@ -197,6 +197,7 @@ struct lx_task {
     uint64_t futex_addr;
     int      futex_state;                    // 0 none, 1 waiting, 2 woken, 3 timed out
     char     exe[128];                       // path of the running program (/proc/self/exe)
+    uint64_t win_exc_entry;                  // Windows: user-mode exception entry (ntdll's KiUserExceptionDispatcher equivalent), 0 = none
 };
 
 // lx_sig.c

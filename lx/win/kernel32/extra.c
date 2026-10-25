@@ -229,7 +229,6 @@ EXPORT NTSTATUS RtlMultiByteToUnicodeN(WCHAR *out, ULONG cap, ULONG *written, co
 }
 EXPORT NTSTATUS RtlUnicodeToMultiByteN(char *out, ULONG cap, ULONG *written, const WCHAR *w, ULONG bytes) { return RtlUnicodeToOemN(out, cap, written, w, bytes); }
 EXPORT ULONG DbgPrint(const char *fmt, ...) { (void)fmt; return 0; }
-EXPORT void *RtlVirtualUnwind(DWORD type, ULONG_PTR base, ULONG_PTR pc, void *fe, void *ctx, void **data, ULONG_PTR *frame, void *ctxptrs) { (void)type; (void)base; (void)pc; (void)fe; (void)ctx; (void)data; (void)frame; (void)ctxptrs; return 0; }
 EXPORT void OutputDebugStringW(LPCWSTR s) { (void)s; }
 EXPORT BOOL InitializeSListHeadStub_(void) { return TRUE; }
 EXPORT BOOL OpenProcessToken(HANDLE p, DWORD acc, HANDLE *t) { (void)p; (void)acc; if (t) *t = 0; set_error(ERROR_ACCESS_DENIED); return FALSE; }

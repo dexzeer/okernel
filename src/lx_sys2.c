@@ -311,6 +311,10 @@ int64_t lx_syscall_more(struct lx_task *t, uint64_t nr, uint64_t a0, uint64_t a1
     case 139: return -LX_ENOSYS;                                                    // sysfs
     case 0x1000: return lx_pe_loadlibrary(t, a0);                                   // LoadLibrary: map a DLL, return its base
     case 0x1001: return lx_pe_getproc(t, a0, a1, a2);                               // GetProcAddress(base, name, ordinal)
+    case 0x1003: { // base of the mapped module that contains an address (0 = none)
+        extern int64_t lx_pe_module_of(struct lx_task *t, uint64_t addr);
+        return lx_pe_module_of(t, a0);
+    }
     case 0x1002: { // GetModuleHandle(name or 0): base of a mapped module
         extern int64_t lx_pe_modulebase(struct lx_task *t, uint64_t uname);
         return lx_pe_modulebase(t, a0);

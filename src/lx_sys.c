@@ -1106,6 +1106,7 @@ int64_t lx_syscall_dispatch(struct lx_task *t) {
     case 158: { // arch_prctl
         if (a0 == 0x1002) { t->fs_base = a1; __asm__ volatile("wrmsr" :: "c"(0xC0000100), "a"((uint32_t)a1), "d"((uint32_t)(a1 >> 32))); return 0; }
         if (a0 == 0x1003) return lx_copy_out(t, a1, &t->fs_base, 8);
+        if (a0 == 0x1005) { t->win_exc_entry = a1; return 0; }                       // the Windows exception entry
         if (a0 == 0x1001) { t->gs_base = a1; __asm__ volatile("wrmsr" :: "c"(0xC0000101), "a"((uint32_t)a1), "d"((uint32_t)(a1 >> 32))); return 0; }
         if (a0 == 0x1004) return lx_copy_out(t, a1, &t->gs_base, 8);
         return -LX_EINVAL;

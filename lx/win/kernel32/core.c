@@ -199,6 +199,7 @@ EXPORT HANDLE CreateThread(SECURITY_ATTRIBUTES *sa, SIZE_T stack, DWORD (*fn)(vo
     char *me = (char*)teb();
     memcpy(tebp, me, 0x2000);                                           // start from the creator's TEB
     *(void**)(tebp + 0x30) = tebp;
+    *(void**)(tebp + 0x28) = 0;                                         // the exception dispatcher's per-thread state
     *(void**)(tebp + 0x08) = top;
     *(void**)(tebp + 0x10) = mem + 0x4000;
     *(DWORD*)(tebp + 0x68) = 0;
@@ -452,6 +453,7 @@ EXPORT DWORD GetTimeZoneInformation(void *tz) { memset(tz, 0, 172); return 0; }
 BOOL DllMain(HMODULE m, DWORD reason, LPVOID res) {
     (void)m; (void)res;
     if (reason != 1) return TRUE;
+    { extern void KiFaultEntry(void); SC2(LX_arch_prctl, 0x1005, KiFaultEntry); }          // faults of this program go to the SEH dispatcher (seh.c)
     struct obj *o;
     for (int i = 0; i < 3; i++) { HANDLE h = k32_new_obj(OB_STDCON, &o); o->fd = i; (void)h; }
     char *peb = *(char**)((char*)teb() + 0x60);

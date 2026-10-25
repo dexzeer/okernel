@@ -309,22 +309,10 @@ EXPORT void GetStartupInfoA(STARTUPINFOA *si) { memset(si, 0, sizeof *si); si->c
 EXPORT void GetStartupInfoW(STARTUPINFOW *si) { memset(si, 0, sizeof *si); si->cb = sizeof *si; si->hStdInput = GetStdHandle(STD_INPUT_HANDLE); si->hStdOutput = GetStdHandle(STD_OUTPUT_HANDLE); si->hStdError = GetStdHandle(STD_ERROR_HANDLE); }
 EXPORT HANDLE OpenProcess(DWORD access, BOOL inh, DWORD pid) { (void)access; (void)inh; struct obj *o; HANDLE h = k32_new_obj(OB_PROCESS, &o); if (h) o->pid = (int)pid; return h; }
 
-// ---- exceptions (no structured exception handling yet: unhandled means the process ends) -----------------------------------------
+// ---- exceptions: seh.c ----------------------------------------------------------------------------------------------------
 
-typedef long (*TOPLEVEL)(void *ep);
-static TOPLEVEL toplevel;
-EXPORT TOPLEVEL SetUnhandledExceptionFilter(TOPLEVEL f) { TOPLEVEL o = toplevel; toplevel = f; return o; }
-EXPORT long UnhandledExceptionFilter(void *ep) { (void)ep; return 1; }
-EXPORT void RaiseException(DWORD code, DWORD flags, DWORD n, const ULONG_PTR *args) {
-    (void)flags; (void)n; (void)args;
-    const char *m = "unhandled exception\n";
-    SC3(LX_write, 2, m, 20);
-    ExitProcess(code);
-}
 EXPORT UINT SetErrorMode(UINT m) { (void)m; return 0; }
 EXPORT UINT GetErrorMode(void) { return 0; }
-EXPORT void RtlCaptureContext(void *ctx) { memset(ctx, 0, 1232); }
-EXPORT void *RtlLookupFunctionEntry(ULONG_PTR pc, ULONG_PTR *base, void *hist) { (void)pc; (void)hist; if (base) *base = 0; return 0; }
 EXPORT void RtlMoveMemory(void *d, const void *s, SIZE_T n) { memmove(d, s, n); }
 EXPORT void RtlCopyMemory(void *d, const void *s, SIZE_T n) { memmove(d, s, n); }
 EXPORT void RtlFillMemory(void *d, SIZE_T n, BYTE c) { memset(d, c, n); }

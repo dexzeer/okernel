@@ -12,7 +12,7 @@ T=$(mktemp -d)
 OBJS=""
 for f in "$@"; do
     o=$T/$(basename $f).o
-    gcc -c -O2 -ffreestanding -fno-stack-protector -fno-pic -fno-pie -mabi=ms -mno-red-zone -fno-asynchronous-unwind-tables \
+    gcc -c -O2 -ffreestanding -fno-stack-protector -fno-pic -fno-pie -mabi=ms -mno-red-zone -fasynchronous-unwind-tables -fno-shrink-wrap \
         -fno-ident -fno-builtin -Wall -Wno-unused-function -I"$HERE" -I"$(dirname $f)" -Ilx/win -Ilx/win/msvcrt -o $o $f
     OBJS="$OBJS $o"
 done
@@ -28,7 +28,7 @@ case $KIND in
     exe|gui) ENTRY="-e entry"; FLAGS="" ; [ "$KIND" = gui ] && FLAGS="--gui";;
     dll) ENTRY="-e DllMain"; FLAGS="--dll";;
 esac
-ld -m elf_x86_64 -static -T $HERE/pe.ld --defsym=__base=$BASE $ENTRY -o $T/out.elf $OBJS
+ld -m elf_x86_64 -static -q -T $HERE/pe.ld --defsym=__base=$BASE $ENTRY -o $T/out.elf $OBJS
 EXP=""
 if [ "$EXPORTS" != "-" ]; then EXP="--export $(tr '\n' ',' < $EXPORTS | sed 's/,$//')"; fi
 python3 $HERE/mkpe.py $T/out.elf $OUT $FLAGS --base $BASE $EXTRA $EXP --name $(basename $OUT)
