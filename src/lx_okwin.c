@@ -123,13 +123,14 @@ static int64_t do_create(struct lx_task *t, struct okconn *c, uint64_t uarg) {
     int r = alloc_buffer(w, a.w, a.h);
     if (r) return r;
     a.title[63] = 0;
-    int ww = a.w + 2 * WIN_BORDER, wh = a.h + WIN_TITLE_H + 2 * WIN_BORDER;
+    int noframe = (a.flags & OKW_F_NOFRAME) != 0;
+    int ww = a.w + 2 * WIN_BORDER, wh = a.h + (noframe ? 0 : WIN_TITLE_H) + 2 * WIN_BORDER;
     int x = a.x, y = a.y;
     if (x < 0 || y < 0 || x > SCREEN_W - 40 || y > SCREEN_H - 40) { x = 60 + 30 * slot; y = 40 + 30 * slot; }
     w->wid = window_create(a.title[0] ? a.title : "window", x, y, ww, wh);
     if (w->wid < 0) { kfree(w->raw); memset(w, 0, sizeof *w); return -LX_ENOMEM; }
-    window_set_close_button(w->wid, 1);
-    window_set_minimize_button(w->wid, 1);
+    if (noframe) window_set_popup(w->wid);                       // menus, tooltips: no title bar, no animation
+    else { window_set_close_button(w->wid, 1); window_set_minimize_button(w->wid, 1); }
     window_set_hide_cursor(w->wid, 1);
     window_set_focus(w->wid);
     w->used = 1; w->conn = c; w->last_focus = 1; w->last_w = a.w; w->last_h = a.h;
@@ -173,7 +174,7 @@ static int64_t do_resize(struct lx_task *t, struct okconn *c, uint64_t uarg) {
     if (old_mm) { lx_mm_unmap(old_mm, old_va, old_len); lx_mm_release(old_mm); }
     kfree(old_raw);
     struct window *win = window_get(w->wid);
-    if (win) window_resize(w->wid, a.w + 2 * WIN_BORDER, a.h + WIN_TITLE_H + 2 * WIN_BORDER);
+    if (win) window_resize(w->wid, a.w + 2 * WIN_BORDER, a.h + (win->no_titlebar ? 0 : WIN_TITLE_H) + 2 * WIN_BORDER);
     window_set_pixels(w->wid, w->pix, 0, 0, a.w, a.h, a.w);
     w->last_w = a.w; w->last_h = a.h;
     {   // map the new buffer
@@ -278,7 +279,7 @@ int64_t lx_okwin_ioctl(struct lx_task *t, void *conn, uint64_t req, uint64_t arg
         struct okwin *w = by_wid(q.wid);
         struct window *win = w ? window_get(w->wid) : 0;
         q.x = q.y = q.w = q.h = 0; q.focused = 0;
-        if (win) { q.x = win->x; q.y = win->y; q.w = win->w - 2 * WIN_BORDER; q.h = win->h - WIN_TITLE_H - 2 * WIN_BORDER; q.focused = window_get_focused() == w->wid; }
+        if (win) { q.x = win->x; q.y = win->y; q.w = win->w - 2 * WIN_BORDER; q.h = win->h - (win->no_titlebar ? 0 : WIN_TITLE_H) - 2 * WIN_BORDER; q.focused = window_get_focused() == w->wid; }
         q.mx = mouse_get_x(); q.my = mouse_get_y(); q.mb = mouse_get_buttons();
         return lx_copy_out(t, arg, &q, sizeof q);
     }
@@ -313,7 +314,12 @@ void lx_okwin_poll(void) {
     if (!inited) return;
     int any = 0;
     for (int i = 0; i < OKW_MAX; i++) if (wins[i].used) { any = 1; break; }
-    if (!any) { pending_wheel = 0; return; }
+    if (!any) {
+        pending_wheel = 0;
+        int a, b, c;
+        while (keyboard_next_transition(&a, &b, &c)) {}              // nobody listens: keys typed now must not reach a window opened later
+        return;
+    }
     int focus = window_get_focused();
     for (int i = 0; i < OKW_MAX; i++) {
         struct okwin *w = &wins[i];
@@ -322,22 +328,18 @@ void lx_okwin_poll(void) {
         if (!win) { evq(w->conn, OKE_CLOSE, w->wid, 0, 0, 0, 0); w->used = 0; continue; }
         int f = focus == w->wid;
         if (f != w->last_focus) { evq(w->conn, OKE_FOCUS, w->wid, f, 0, 0, 0); w->last_focus = f; }
-        int cw = win->w - 2 * WIN_BORDER, ch = win->h - WIN_TITLE_H - 2 * WIN_BORDER;
+        int cw = win->w - 2 * WIN_BORDER, ch = win->h - (win->no_titlebar ? 0 : WIN_TITLE_H) - 2 * WIN_BORDER;
         if ((cw != w->last_w || ch != w->last_h) && cw >= 16 && ch >= 16) { evq(w->conn, OKE_RESIZE, w->wid, cw, ch, 0, 0); w->last_w = cw; w->last_h = ch; }
     }
-    // keys go to the focused window of this kind
+    // keys go to the focused window of this kind: every press and release, in order
     struct okwin *fw = by_wid(focus);
-    if (fw) {
-        int mods = mods_now();
-        for (int sc = 1; sc < 0x59; sc++) {
-            int d = keyboard_scancode_held(sc, 0);
-            if (d != keyheld[sc]) { keyheld[sc] = (uint8_t)d; evq(fw->conn, OKE_KEY, fw->wid, sc, d, 0, mods); }
-        }
-        for (int sc = 0; sc < 0x54; sc++) {
-            int code = ext_code(sc);
-            if (!code) continue;
-            int d = keyboard_scancode_held(sc, 1);
-            if (d != extheld[sc]) { extheld[sc] = (uint8_t)d; evq(fw->conn, OKE_KEY, fw->wid, code, d, 0, mods); }
+    {
+        int sc, ext, down;
+        while (keyboard_next_transition(&sc, &ext, &down)) {
+            if (!fw) continue;
+            int code = ext ? ext_code(sc) : sc;
+            if (!code || (!ext && sc >= 0x59)) continue;
+            evq(fw->conn, OKE_KEY, fw->wid, code, down, 0, mods_now());
         }
     }
     // the pointer
@@ -352,7 +354,7 @@ void lx_okwin_poll(void) {
     if (target >= 0) {
         struct okwin *w = &wins[target];
         struct window *win = window_get(w->wid);
-        int cx = win ? win->x + WIN_BORDER : 0, cy = win ? win->y + WIN_TITLE_H + WIN_BORDER : 0;
+        int cx = win ? win->x + WIN_BORDER : 0, cy = win ? win->y + (win->no_titlebar ? 0 : WIN_TITLE_H) + WIN_BORDER : 0;
         int px = mx - cx, py = my - cy;
         int inside = px >= 0 && py >= 0 && px < w->w && py < w->h;
         if (inside || grab == target) {

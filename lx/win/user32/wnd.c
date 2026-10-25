@@ -45,6 +45,7 @@ struct wnd *U_top(struct wnd *w) { while (w && w->parent) w = w->parent; return 
 void U_origin(struct wnd *w, int *ox, int *oy) {
     int x = 0, y = 0;
     for (; w && w->parent; w = w->parent) { x += w->x + w->bd; y += w->y + w->bd; }
+    if (w) y += w->mh;                                              // the top level: its menu bar is above the client area
     *ox = x; *oy = y;
 }
 // client rectangle of w clipped by its ancestors, in buffer coordinates
@@ -182,10 +183,12 @@ static void unlink_child(struct wnd *w) {
     w->prev = w->next = 0;
 }
 
-int U_okw_resize(struct wnd *w, int cw, int ch) {
-    struct okw_resize r; r.wid = w->wid; r.w = cw; r.h = ch; r.pad = 0; r.out_addr = 0;
+// the buffer of a top-level window gets the size cw x bh (the client area is below the menu bar)
+int U_okw_resize(struct wnd *w, int cw, int bh) {
+    struct okw_resize r; r.wid = w->wid; r.w = cw; r.h = bh; r.pad = 0; r.out_addr = 0;
     if (SC3(LX_ioctl, U_fd(), OKW_RESIZE, &r) < 0) return -1;
-    w->px = (unsigned*)r.out_addr; w->stride = cw; w->bw = cw; w->bh = ch; w->cw = cw; w->ch = ch;
+    w->px = (unsigned*)r.out_addr; w->stride = cw; w->bw = cw; w->bh = bh; w->cw = cw; w->ch = bh - w->mh;
+    U_menubar_paint(w);
     return 0;
 }
 
@@ -227,14 +230,17 @@ HWND U_create_window(DWORD ex, const void *cls, const void *name, DWORD style, i
         if (me->ch < 0) me->ch = 0;
     } else {
         me->owner = par;
-        int noframe = (style & WS_POPUP) && (style & WS_CAPTION) != WS_CAPTION;
+        int noframe = (style & WS_POPUP) && (style & WS_CAPTION) != WS_CAPTION;     // no title bar (the desktop still draws a thin frame)
         if (w == CW_USEDEFAULT) w = 640;
         if (h == CW_USEDEFAULT) h = 480;
-        int cw = noframe ? w : w - 2 * t_border, ch = noframe ? h : h - t_title - 2 * t_border;
+        struct menu *mn = menu ? U_menu(menu) : 0;                                   // hMenu of a top-level window is its menu
+        int mh = mn ? U_menubar_height() : 0;
+        int cw = w - 2 * t_border, ch = h - (noframe ? 0 : t_title) - 2 * t_border;  // = the size of the pixel buffer
         if (cw < 16) cw = 16;
         if (ch < 16) ch = 16;
         if (cw > 2048) cw = 2048;
         if (ch > 1200) ch = 1200;
+        me->menu = mn; me->mh = mh; me->noframe = noframe; if (mn) me->id = 0;
         if (x == CW_USEDEFAULT) x = -1;
         if (y == CW_USEDEFAULT) y = -1;
         struct okw_create c;
@@ -245,8 +251,9 @@ HWND U_create_window(DWORD ex, const void *cls, const void *name, DWORD style, i
         struct okw_map m; memset(&m, 0, sizeof m); m.wid = c.out_wid;
         if (SC3(LX_ioctl, U_fd(), OKW_MAP, &m) < 0) { SC3(LX_ioctl, U_fd(), OKW_DESTROY, c.out_wid); me->used = 0; ufree(me->extra); return 0; }
         me->wid = c.out_wid; me->px = (unsigned*)m.out_addr; me->stride = cw; me->bw = cw; me->bh = ch;
-        me->x = x; me->y = y; me->cw = cw; me->ch = ch;
-        me->w = noframe ? cw : cw + 2 * t_border; me->h = noframe ? ch : ch + t_title + 2 * t_border;
+        me->x = x; me->y = y; me->cw = cw; me->ch = ch - mh;
+        me->w = cw + 2 * t_border; me->h = ch + (noframe ? 0 : t_title) + 2 * t_border;
+        U_menubar_paint(me);
         if (!(style & WS_VISIBLE)) { struct okw_show s = { me->wid, 0 }; SC3(LX_ioctl, U_fd(), OKW_SHOW, &s); }
     }
 
@@ -450,9 +457,8 @@ void U_screen_origin(struct wnd *w, int *sx, int *sy) {             // screen po
     struct wnd *t = U_top(w);
     int ox, oy; U_origin(w, &ox, &oy);
     sync_top(t);
-    int noframe = t->w == t->cw;
-    *sx = t->x + (noframe ? 0 : t_border) + ox;
-    *sy = t->y + (noframe ? 0 : t_title + t_border) + oy;
+    *sx = t->x + t_border + ox;
+    *sy = t->y + (t->noframe ? 0 : t_title) + t_border + oy;
 }
 EXPORT BOOL GetClientRect(HWND h, RECT *r) { struct wnd *w = U_wnd(h); if (!w) return FALSE; r->left = r->top = 0; r->right = w->cw; r->bottom = w->ch; return TRUE; }
 EXPORT BOOL GetWindowRect(HWND h, RECT *r) {
@@ -474,10 +480,11 @@ EXPORT int MapWindowPoints(HWND from, HWND to, POINT *p, UINT n) {
     return MAKELPARAM(fx - tx, fy - ty);
 }
 EXPORT BOOL AdjustWindowRectEx(RECT *r, DWORD style, BOOL menu, DWORD ex) {
-    (void)menu; (void)ex;
+    (void)ex;
     init();
     int noframe = (style & WS_POPUP) && (style & WS_CAPTION) != WS_CAPTION;
-    if (!noframe) { r->left -= t_border; r->right += t_border; r->top -= t_title + t_border; r->bottom += t_border; }
+    r->left -= t_border; r->right += t_border; r->top -= (noframe ? 0 : t_title) + t_border; r->bottom += t_border;
+    if (menu) r->top -= U_menubar_height();
     return TRUE;
 }
 EXPORT BOOL AdjustWindowRect(RECT *r, DWORD style, BOOL menu) { return AdjustWindowRectEx(r, style, menu, 0); }
@@ -489,9 +496,8 @@ static void apply_size(struct wnd *w, int cw, int ch, int notify) {
         if (ch < 16) ch = 16;
         if (cw > 2048) cw = 2048;
         if (ch > 1200) ch = 1200;
-        if (U_okw_resize(w, cw, ch)) return;
-        int noframe = w->w == w->cw;
-        w->w = noframe ? cw : cw + 2 * t_border; w->h = noframe ? ch : ch + t_title + 2 * t_border;
+        if (U_okw_resize(w, cw, ch + w->mh)) return;
+        w->w = cw + 2 * t_border; w->h = ch + w->mh + (w->noframe ? 0 : t_title) + 2 * t_border;
     } else { w->cw = cw; w->ch = ch; w->w = cw + 2 * w->bd; w->h = ch + 2 * w->bd; }
     if (notify) U_send(w, WM_SIZE, SIZE_RESTORED, MAKELPARAM(w->cw, w->ch));
     U_invalidate(w, 0, 1);
@@ -500,11 +506,10 @@ EXPORT BOOL MoveWindow(HWND h, int x, int y, int w, int hh, BOOL repaint) {
     struct wnd *k = U_wnd(h);
     if (!k) return FALSE;
     if (!k->parent) {
-        int noframe = k->w == k->cw;
         struct okw_move m = { k->wid, x, y };
         SC3(LX_ioctl, U_fd(), OKW_MOVE, &m);
         k->x = x; k->y = y;
-        apply_size(k, noframe ? w : w - 2 * t_border, noframe ? hh : hh - t_title - 2 * t_border, 1);
+        apply_size(k, w - 2 * t_border, hh - (k->noframe ? 0 : t_title) - 2 * t_border - k->mh, 1);
         U_send(k, WM_MOVE, 0, MAKELPARAM(0, 0));
     } else {
         RECT old = { k->x, k->y, k->x + k->w, k->y + k->h };

@@ -336,7 +336,7 @@ static void draw_frame(int nx, int ny, int nw, int nh, int alpha) {
 
 void winfx_open(int id) {
     if (id < 0 || id >= MAX_WINDOWS) return;
-    pending[id] = 1;
+    pending[id] = 1;                           // (a popup: window_set_popup clears it, see winfx_step)
 }
 
 int winfx_minimize(int id) {
@@ -367,7 +367,7 @@ void winfx_step(void) {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (!pending[i]) continue;
         struct window* w = window_get(i);
-        if (!w || !w->visible || w->minimized) { pending[i] = 0; continue; }
+        if (!w || !w->visible || w->minimized || w->is_popup) { pending[i] = 0; continue; }
         pending[i] = 0;
         if (!begin(i, FX_OPEN)) { w->dirty = 1; w->pr_valid = 0; }
     }

@@ -56,6 +56,23 @@ int keyboard_scancode_held(int scancode, int extended_key) {
     return held_keys[(extended_key ? 0x80 : 0) + (scancode & 0x7F)];
 }
 
+#define KTR_N 64
+static volatile uint16_t ktr[KTR_N];                  // bit 8: extended, bit 7: down, bits 0-6: scancode
+static volatile uint32_t ktr_head, ktr_tail;
+static void ktr_push(int scancode, int extended, int down) {
+    uint32_t n = (ktr_tail + 1) % KTR_N;
+    if (n == ktr_head) return;
+    ktr[ktr_tail] = (uint16_t)((extended ? 0x100 : 0) | (down ? 0x80 : 0) | (scancode & 0x7F));
+    ktr_tail = n;
+}
+int keyboard_next_transition(int* scancode, int* extended_key, int* down) {
+    if (ktr_head == ktr_tail) return 0;
+    uint16_t v = ktr[ktr_head];
+    ktr_head = (ktr_head + 1) % KTR_N;
+    *scancode = v & 0x7F; *extended_key = (v & 0x100) != 0; *down = (v & 0x80) != 0;
+    return 1;
+}
+
 static void keyboard_irq(void) {
     // Only take a byte that is there and is the keyboard's (status bit 5 =
     // it came from the mouse port: IRQ12's handler owns it).
@@ -89,6 +106,7 @@ static void keyboard_irq(void) {
     if (extended) {
         extended = 0;
         held_keys[0x80 + (scancode & 0x7F)] = !(scancode & 0x80);
+        ktr_push(scancode, 1, !(scancode & 0x80));
         if (scancode == 0x38) { alt_pressed = 1; return; }  // right Alt press
         if (scancode == 0xB8) { alt_pressed = 0; return; }  // right Alt release
         if (scancode & 0x80) return; // key release, ignore
@@ -105,6 +123,7 @@ static void keyboard_irq(void) {
     }
 
     held_keys[scancode & 0x7F] = !(scancode & 0x80);
+    ktr_push(scancode, 0, !(scancode & 0x80));
 
     // Key release
     if (scancode & 0x80) {

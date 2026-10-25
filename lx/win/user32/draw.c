@@ -417,26 +417,6 @@ EXPORT int LoadStringA(HINSTANCE h, UINT id, LPSTR buf, int cap) {
 }
 EXPORT BOOL DestroyIcon(HICON i) { (void)i; return TRUE; }
 EXPORT BOOL DestroyCursor(HCURSOR c) { (void)c; return TRUE; }
-EXPORT HANDLE LoadAcceleratorsA(HINSTANCE h, LPCSTR n) { (void)h; (void)n; return (HANDLE)1; }
-EXPORT HANDLE LoadAcceleratorsW(HINSTANCE h, LPCWSTR n) { (void)h; (void)n; return (HANDLE)1; }
-EXPORT HMENU CreateMenu(void) { return (HMENU)1; }
-EXPORT HMENU CreatePopupMenu(void) { return (HMENU)1; }
-EXPORT HMENU LoadMenuA(HINSTANCE h, LPCSTR n) { (void)h; (void)n; return (HMENU)1; }
-EXPORT HMENU LoadMenuW(HINSTANCE h, LPCWSTR n) { (void)h; (void)n; return (HMENU)1; }
-EXPORT BOOL SetMenu(HWND h, HMENU m) { (void)h; (void)m; return TRUE; }
-EXPORT HMENU GetMenu(HWND h) { (void)h; return 0; }
-EXPORT HMENU GetSystemMenu(HWND h, BOOL r) { (void)h; (void)r; return 0; }
-EXPORT HMENU GetSubMenu(HMENU m, int i) { (void)m; (void)i; return 0; }
-EXPORT BOOL DestroyMenu(HMENU m) { (void)m; return TRUE; }
-EXPORT BOOL DrawMenuBar(HWND h) { (void)h; return TRUE; }
-EXPORT BOOL AppendMenuA(HMENU m, UINT f, ULONG_PTR id, LPCSTR s) { (void)m; (void)f; (void)id; (void)s; return TRUE; }
-EXPORT BOOL AppendMenuW(HMENU m, UINT f, ULONG_PTR id, LPCWSTR s) { (void)m; (void)f; (void)id; (void)s; return TRUE; }
-EXPORT BOOL InsertMenuA(HMENU m, UINT p, UINT f, ULONG_PTR id, LPCSTR s) { (void)m; (void)p; (void)f; (void)id; (void)s; return TRUE; }
-EXPORT BOOL RemoveMenu(HMENU m, UINT p, UINT f) { (void)m; (void)p; (void)f; return TRUE; }
-EXPORT BOOL DeleteMenu(HMENU m, UINT p, UINT f) { (void)m; (void)p; (void)f; return TRUE; }
-EXPORT DWORD CheckMenuItem(HMENU m, UINT i, UINT f) { (void)m; (void)i; (void)f; return 0; }
-EXPORT BOOL EnableMenuItem(HMENU m, UINT i, UINT f) { (void)m; (void)i; (void)f; return 0; }
-EXPORT BOOL TrackPopupMenu(HMENU m, UINT f, int x, int y, int r, HWND h, const RECT *rc) { (void)m; (void)f; (void)x; (void)y; (void)r; (void)h; (void)rc; return 0; }
 EXPORT BOOL OpenClipboard(HWND h) { (void)h; return FALSE; }
 EXPORT BOOL CloseClipboard(void) { return TRUE; }
 EXPORT BOOL EmptyClipboard(void) { return TRUE; }

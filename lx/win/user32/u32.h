@@ -62,6 +62,7 @@ struct wnd {
     void *ctl;                         // control state (built-in classes)
     struct wnd *focus_child;           // top level: the child that has the keyboard
     int in_destroy, bd, activated;
+    struct menu *menu; int mh, noframe;        // top level: its menu bar and the bar height inside the buffer
     void *font;
     int dlg_result, dlg_done;
 };
@@ -105,6 +106,13 @@ int mods_cache(void);
 HWND GetDlgItem(HWND h, int id);
 int GetWindowTextA(HWND h, LPSTR out, int cap);
 BOOL SetDlgItemTextA(HWND h, int id, LPCSTR s);
+struct menu *U_menu(HMENU h);
+int U_menubar_height(void);
+void U_menubar_paint(struct wnd *w);
+int U_menubar_event(struct wnd *T, const struct okw_event *e);
+void U_menubar_leave(struct wnd *T);
+int U_pump(int ms);
+extern int (*U_event_hook)(const struct okw_event *);
 struct wnd *U_wnd(HWND h);
 struct wnd *U_top(struct wnd *w);
 void U_origin(struct wnd *w, int *ox, int *oy);                  // client origin of w inside its top level's buffer

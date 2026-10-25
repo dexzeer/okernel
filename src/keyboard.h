@@ -17,5 +17,8 @@ int keyboard_alt_held(void);
 
 // 1 while a key is physically down: set-1 scancode (0x39 = space), extended_key = 1 for the 0xE0 keys (0x48 up arrow ...).
 int keyboard_scancode_held(int scancode, int extended_key);
+// Every key press and release since the last call, in order (the IRQ queues them; polling held state loses a tap shorter than a
+// main-loop pass). 1 = an event was returned. Only one consumer: the /dev/okwin input (src/lx_okwin.c).
+int keyboard_next_transition(int* scancode, int* extended_key, int* down);
 
 #endif

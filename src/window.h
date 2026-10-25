@@ -91,6 +91,7 @@ struct window {
     int pxd_valid, pxd_x0, pxd_y0, pxd_x1, pxd_y1;
     // Maximize/restore: the rect to return to when un-maximizing.
     int has_restore, restore_x, restore_y, restore_w, restore_h;
+    int is_popup;    // menus and tooltips of the Linux/Windows subsystem: no title bar, no opening animation
 };
 
 void window_init(void);
@@ -123,6 +124,7 @@ void window_set_close_button(int id, int has_close);
 void window_set_minimize_button(int id, int has_min);
 void window_set_terminal(int id, int flag); // mark as a terminal (taskbar icon)
 void window_set_no_titlebar(int id, int flag);
+void window_set_popup(int id);   // no title bar, not animated
 void window_set_hide_cursor(int id, int flag);
 // Attach (px != NULL) or detach a client pixel surface; marks the window dirty.
 void window_set_pixels(int id, const uint32_t* px, int x, int y, int w, int h, int stride);

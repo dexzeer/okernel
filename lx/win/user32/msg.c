@@ -201,7 +201,7 @@ static struct wnd *mouse_target(struct wnd *T, int x, int y, int *lx, int *ly) {
         int sx, sy, cx, cy; U_screen_origin(T, &sx, &sy); U_screen_origin(c, &cx, &cy);
         *lx = x + sx - cx; *ly = y + sy - cy; return c;
     }
-    struct wnd *h = U_child_from_point(T, x, y);
+    struct wnd *h = U_child_from_point(T, x, y - T->mh);            // (x, y) are buffer coordinates, the client area starts below the menu bar
     int ox, oy; U_origin(h, &ox, &oy);
     *lx = x - ox; *ly = y - oy;
     return h;
@@ -227,18 +227,22 @@ void U_activate(struct wnd *T, int on) {
     }
 }
 
+int (*U_event_hook)(const struct okw_event *);
 static void handle_event(const struct okw_event *e) {
+    if (U_event_hook && U_event_hook(e)) return;                      // a menu is open: it takes the events of the connection
     int i = U_find_wid(e->wid);
     if (i < 0) return;
     struct wnd *T = U_pool(i);
     int mods = e->d;
     switch (e->type) {
     case OKE_MOUSE_MOVE: {
+        if (T->menu && !U_capture()) { if (e->b < T->mh) { if (U_menubar_event(T, e)) break; } else U_menubar_leave(T); }
         int lx, ly; struct wnd *t = mouse_target(T, e->a, e->b, &lx, &ly);
         U_post(t, WM_MOUSEMOVE, key_flags(mods_cache()), MAKELPARAM(lx, ly));
         break;
     }
     case OKE_MOUSE_BUTTON: {
+        if (T->menu && e->b < T->mh && !U_capture() && U_menubar_event(T, e)) break;
         int lx, ly; struct wnd *t = mouse_target(T, e->a, e->b, &lx, &ly);
         int btn = e->c, down = e->d;
         if (down) mouse_down_mask |= 1 << (btn - 1); else mouse_down_mask &= ~(1 << (btn - 1));
@@ -264,7 +268,7 @@ static void handle_event(const struct okw_event *e) {
         if (f && f->used && U_top(f) == T) t = f;
         int sx, sy; U_screen_origin(T, &sx, &sy);
         int delta = e->c * 120;
-        U_post(t, WM_MOUSEWHEEL, (WPARAM)(((unsigned)(delta & 0xFFFF) << 16) | (key_flags(mods_cache()) & 0xFFFF)), MAKELPARAM(sx + e->a, sy + e->b));
+        U_post(t, WM_MOUSEWHEEL, (WPARAM)(((unsigned)(delta & 0xFFFF) << 16) | (key_flags(mods_cache()) & 0xFFFF)), MAKELPARAM(sx + e->a, sy - T->mh + e->b));
         break;
     }
     case OKE_KEY: {
@@ -290,10 +294,9 @@ static void handle_event(const struct okw_event *e) {
     case OKE_FOCUS: U_activate(T, e->a != 0); if (!e->a) { rep_vk = 0; for (int k = 0; k < 256; k++) keys[k] &= ~0x80; mouse_down_mask = 0; } break;
     case OKE_CLOSE: U_post(T, WM_CLOSE, 0, 0); break;
     case OKE_RESIZE: {
-        if (e->a != T->cw || e->b != T->ch) {
+        if (e->a != T->bw || e->b != T->bh) {
             if (U_okw_resize(T, e->a, e->b) == 0) {
-                int noframe = T->w == T->cw;
-                (void)noframe;
+                { int title, border, sw, sh; U_info(&title, &border, &sw, &sh); T->w = T->bw + 2 * border; T->h = T->bh + (T->noframe ? 0 : title) + 2 * border; }
                 U_post(T, WM_SIZE, SIZE_RESTORED, MAKELPARAM(T->cw, T->ch));
                 U_invalidate(T, 0, 1);
             }
@@ -312,7 +315,7 @@ int mods_cache(void) {
 
 struct pollfd_ { int fd; short events, revents; };
 // read pending events; wait up to ms (-1 = forever, 0 = do not wait). Returns 1 if anything was read.
-static int pump(int ms) {
+int U_pump(int ms) {
     int fd = U_fd();
     if (fd < 0) { if (ms > 0) { struct { long long s, n; } ts = { ms / 1000, (long long)(ms % 1000) * 1000000 }; SC2(LX_nanosleep, &ts, 0); } return 0; }
     struct pollfd_ p = { fd, 1, 0 };
@@ -358,7 +361,7 @@ static void fill_pt(MSG *m) {
 static int get_msg(MSG *m, HWND f, UINT lo, UINT hi, int remove, int block) {
     U_init();
     for (;;) {
-        if (pump(0)) continue;
+        if (U_pump(0)) continue;
         DWORD now = GetTickCount();
         if (rep_vk && now - rep_next < 0x80000000u) {
             struct wnd *t = key_target(rep_wnd && rep_wnd->used ? rep_wnd : 0);
@@ -387,7 +390,7 @@ static int get_msg(MSG *m, HWND f, UINT lo, UINT hi, int remove, int block) {
         if (!block) return -1;
         int ms = wait == 0xFFFFFFFFu ? -1 : (int)wait;
         if (rep_vk) { int d = (int)(rep_next - now); if (d < 1) d = 1; if (ms < 0 || d < ms) ms = d; }
-        pump(ms < 0 ? -1 : ms < 1 ? 1 : ms);
+        U_pump(ms < 0 ? -1 : ms < 1 ? 1 : ms);
     }
 }
 EXPORT BOOL GetMessageA(MSG *m, HWND f, UINT lo, UINT hi) { int r = get_msg(m, f, lo, hi, 1, 1); return r < 0 ? -1 : r; }
@@ -400,10 +403,8 @@ EXPORT BOOL PeekMessageA(MSG *m, HWND f, UINT lo, UINT hi, UINT flags) {
 }
 EXPORT BOOL PeekMessageW(MSG *m, HWND f, UINT lo, UINT hi, UINT flags) { return PeekMessageA(m, f, lo, hi, flags); }
 EXPORT BOOL WaitMessage(void) { MSG m; get_msg(&m, 0, 0, 0, 0, 1); return TRUE; }
-EXPORT DWORD GetQueueStatus(UINT f) { (void)f; pump(0); lock(); int n = qn; unlock(); return n ? 0x00040004u : 0; }
+EXPORT DWORD GetQueueStatus(UINT f) { (void)f; U_pump(0); lock(); int n = qn; unlock(); return n ? 0x00040004u : 0; }
 EXPORT BOOL TranslateMessage(const MSG *m) { (void)m; return TRUE; }
-EXPORT BOOL TranslateAcceleratorA(HWND h, HANDLE a, MSG *m) { (void)h; (void)a; (void)m; return 0; }
-EXPORT BOOL TranslateAcceleratorW(HWND h, HANDLE a, MSG *m) { (void)h; (void)a; (void)m; return 0; }
 EXPORT BOOL IsDialogMessageA(HWND h, MSG *m) { (void)h; (void)m; return FALSE; }
 EXPORT BOOL IsDialogMessageW(HWND h, MSG *m) { (void)h; (void)m; return FALSE; }
 EXPORT LRESULT DispatchMessageA(const MSG *m) {
@@ -423,12 +424,12 @@ EXPORT DWORD MsgWaitForMultipleObjects(DWORD n, const HANDLE *hs, BOOL all, DWOR
     (void)mask;
     DWORD start = GetTickCount();
     for (;;) {
-        if (pump(0)) return n;
+        if (U_pump(0)) return n;
         lock(); int have = qn; unlock();
         if (have || U_next_invalid(0)) return n;
         if (n) { DWORD r = WaitForMultipleObjects(n, hs, all, 0); if (r != 0x102) return r; }
         if (ms != INFINITE && GetTickCount() - start >= ms) return 0x102;
-        pump(n ? 2 : (ms == INFINITE ? -1 : (int)(ms - (GetTickCount() - start))));
+        U_pump(n ? 2 : (ms == INFINITE ? -1 : (int)(ms - (GetTickCount() - start))));
     }
 }
 EXPORT DWORD MsgWaitForMultipleObjectsEx(DWORD n, const HANDLE *hs, DWORD ms, DWORD mask, DWORD fl) { (void)fl; return MsgWaitForMultipleObjects(n, hs, FALSE, ms, mask); }
