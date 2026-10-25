@@ -12,6 +12,11 @@ for f in lx/src/*.c; do
     n=$(basename $f .c)
     gcc -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -O2 -Wall -o $OUT/bin/$n $f
 done
+# the X11 server (several files, one binary) and its test clients
+gcc -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -O2 -Wall -Wno-unused-function -o $OUT/bin/xokai lx/xsrv/*.c
+for f in lx/xsrv/clients/*.c; do
+    gcc -static -nostdlib -ffreestanding -fno-stack-protector -fno-pic -no-pie -O2 -Wall -o $OUT/bin/$(basename $f .c) $f
+done
 for f in lx/test/gl_*.c; do
     n=$(basename $f .c | sed 's/^gl_/gl/')
     gcc -static -O2 -pthread -w -o $OUT/bin/$n $f
