@@ -151,7 +151,9 @@ void window_set_font_scale(int id, int scale) {
 
 void window_destroy(int id) {
     if (id < 0 || id >= MAX_WINDOWS) return;
+    int animating = winfx_hides(id);                                // (not yet shown, or opening/minimizing: no closing animation)
     winfx_cancel(id);
+    int closing = !animating && winfx_close_prepare(id);            // the snapshot needs the window as it is
     if (windows[id].content) { kfree(windows[id].content); windows[id].content = 0; }
     if (windows[id].cell_fg) { kfree(windows[id].cell_fg); windows[id].cell_fg = 0; }
     if (windows[id].cell_bg) { kfree(windows[id].cell_bg); windows[id].cell_bg = 0; }
@@ -160,7 +162,12 @@ void window_destroy(int id) {
     windows[id].pix = 0; windows[id].pxd_valid = 0;
     // Backbuffer is persistent now: repair the freed region (wallpaper + icons +
     // any window behind) instead of relying on a full per-frame repaint.
-    desktop_paint_rect_pub(windows[id].x, windows[id].y, windows[id].w, windows[id].h);
+    if (closing) winfx_close_commit();                              // repairs the area itself, then fades the window out
+    else {
+        int bx, by, bw, bh;
+        winfx_shadow_bounds(id, &bx, &by, &bw, &bh);                // the window and its shadow
+        desktop_paint_rect_pub(bx, by, bw, bh);
+    }
     sb_count[id] = 0; sb_next[id] = 0; windows[id].scroll_off = 0;
 }
 
@@ -169,7 +176,14 @@ static int g_z_top = 0;   // monotonically increasing top of the z-stack
 void window_raise(int id) {
     if (id < 0 || id >= MAX_WINDOWS) return;
     if (!windows[id].visible) return;
+    int was_top = windows[id].z == g_z_top;
     windows[id].z = ++g_z_top;
+    if (!was_top && !windows[id].minimized && !winfx_hides(id)) {
+        // its shadow now falls on the windows it rose above: recomposite the window and its shadow
+        int bx, by, bw, bh;
+        winfx_shadow_bounds(id, &bx, &by, &bw, &bh);
+        desktop_paint_rect_pub(bx, by, bw, bh);
+    }
 }
 
 void window_set_focus(int id) {
@@ -346,7 +360,8 @@ void window_toggle_maximize(int id) {
         window_resize(id, SCREEN_W, wa_h);
     }
     w->dirty = 1; w->pr_valid = 0; w->pxd_valid = 0; needs_redraw = 1;
-    // the old footprint: wallpaper + whatever sits behind (z-order repair)
+    // the old footprint: wallpaper + whatever sits behind (z-order repair), with the shadow the window cast
+    winfx_grow_rect(&ox, &oy, &ow, &oh);
     desktop_paint_rect_pub(ox, oy, ow, oh);
 }
 
@@ -355,7 +370,11 @@ void window_minimize(int id) {
         // the animation takes its snapshot while the window is still on screen
         int animated = windows[id].visible && !windows[id].minimized && winfx_minimize(id);
         windows[id].minimized = 1; windows[id].focused = 0;
-        if (!animated) desktop_paint_rect_pub(windows[id].x, windows[id].y, windows[id].w, windows[id].h);
+        if (!animated) {
+            int bx, by, bw, bh;
+            winfx_shadow_bounds(id, &bx, &by, &bw, &bh);
+            desktop_paint_rect_pub(bx, by, bw, bh);
+        }
     }
 }
 
@@ -703,12 +722,14 @@ static void window_paint_uncovered(int id, int px, int py, int pw, int ph) {
         if (rects[k][2] <= 0 || rects[k][3] <= 0) continue;
         graphics_set_clip(rects[k][0], rects[k][1], rects[k][2], rects[k][3]);
         window_paint_region(id, rects[k][0], rects[k][1], rects[k][2], rects[k][3]);
+        winfx_shadows_above(w->z, rects[k][0], rects[k][1], rects[k][2], rects[k][3]);   // the repaint erased the shadows that fall here
     }
     graphics_clip_reset();
     return;
 fallback:
     graphics_clip_reset();
     window_paint_region(id, px, py, pw, ph);
+    winfx_shadows_above(w->z, px, py, pw, ph);
 }
 
 int window_draw(int id) {

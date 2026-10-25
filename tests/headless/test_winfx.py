@@ -72,6 +72,17 @@ try:
     w, h, px = ppm(shot)
     check(px(WX + 400, WY + 300) == (0, 0, 0), "the window is back after restoring")
     check(not near(px(WX, WY), BORDER, 14), "corners are still rounded after restoring")
+
+    # close: the window fades out (the snapshot is taken while it exists, the animation runs after it is gone)
+    cx = WX + WW - 2 - 8 - 30 + 15
+    vm.click_screen(cx, my, r"\[winfx\] close win=0")
+    check(vm.wait_for(r"[winfx] close win=0 frames=", timeout=10), "closing ran an animation")
+    n = int(re.findall(r"\[winfx\] close win=0 frames=(\d+)", vm.serial())[0])
+    check(n >= 2, f"the close animation drew frames ({n})")
+    time.sleep(0.5)
+    vm.mon(f"screendump {shot}", 1.0)
+    w, h, px = ppm(shot)
+    check(px(WX + 400, WY + 300) != (0, 0, 0), "the window is gone after closing")
 finally:
     vm.kill()
 print("RESULT", "ALLPASS" if not fails else "FAIL: " + "; ".join(fails))
