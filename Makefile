@@ -12,7 +12,7 @@ LD = ld
 CFLAGS = -m32 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
          -nostartfiles -nodefaultlibs -fno-pic -fno-pie -mno-red-zone \
          -O2 -fno-strict-aliasing -MMD -MP \
-         -Wall -Wextra -DKERNEL -Isrc
+         -Wall -Wextra -DKERNEL -DLONGMODE -Isrc
 
 # Assembler flags
 ASFLAGS = -f elf32
@@ -24,7 +24,7 @@ LDFLAGS_HIGH = -m elf_i386 -T linker-high.ld
 # Common objects (no kernel.c, no desktop.c). ORDER: start.o FIRST — its
 # .text must land at 0xC0100030 (right after .multiboot) so _start's LOW
 # alias (phys 0x100030+0x30) is where GRUB jumps. isr.o second.
-ASM_OBJ = boot/start.o boot/isr.o boot/smp_stubs.o boot/ap_tramp.o
+ASM_OBJ = boot/start.o boot/isr.o boot/lm.o boot/smp_stubs.o boot/ap_tramp.o
 COMMON_OBJ = src/gdt.o src/idt.o src/memory.o src/serial.o src/keyboard.o src/mouse.o src/string.o src/syscall.o
 
 # Text mode objects
@@ -105,7 +105,7 @@ src/gamewin.o: src/gamewin.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
 src/game/levels.o: src/game/levels.asm games/level1.dmccl games/level2.dmccl games/level3.dmccl games/level4.dmccl
 	$(AS) $(ASFLAGS) $< -o $@
-DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/ac97.o src/audio_rate.o src/pcix.o src/acpi_pm.o src/xhci.o src/wifigui.o src/rtw/rtw_hw.o src/rtw/rtw_pci.o src/rtw/rtw_wifi.o src/rtw/wsta.o src/rtw/wcrypto.o src/rtw/rtw_tables.o src/rtw/rtwfw.o src/hid.o src/devlog.o src/dwi2c.o src/hidi2c.o src/ptp.o src/i2caml.o src/i2chid.o src/klog.o src/virtio.o src/vgpu.o src/i915.o src/cpufreq.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/part.o src/pfs.o src/panic.o src/recovery.o src/textview.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
+DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/ac97.o src/audio_rate.o src/pcix.o src/acpi_pm.o src/xhci.o src/wifigui.o src/rtw/rtw_hw.o src/rtw/rtw_pci.o src/rtw/rtw_wifi.o src/rtw/wsta.o src/rtw/wcrypto.o src/rtw/rtw_tables.o src/rtw/rtwfw.o src/hid.o src/devlog.o src/dwi2c.o src/hidi2c.o src/ptp.o src/i2caml.o src/i2chid.o src/klog.o src/virtio.o src/vgpu.o src/i915.o src/cpufreq.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/part.o src/pfs.o src/panic.o src/recovery.o src/textview.o src/lx.o src/lx_elf.o src/lx_sys.o src/lx_tty.o src/lx_fb.o src/lx_sig.o src/lx_sys2.o src/lx_net.o src/lx_ev.o src/lxfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
               src/font_data.o $(WEB_OBJ) $(OJS_OBJ) \
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/aes.o src/crypto/chacha20.o src/crypto/poly1305.o \
@@ -289,7 +289,16 @@ all: text
 # ---- Text mode build ----
 text: kanarchy-text.iso
 
-kanarchy-text.bin: $(TEXT_ASM_OBJ) $(COMMON_OBJ) $(TEXT_OBJ) src/kernel.o
+# The text kernel stays in 32-bit protected mode: its own gdt/idt objects, built without LONGMODE.
+TEXT_COMMON_OBJ = build-text/gdt.o build-text/idt.o $(filter-out src/gdt.o src/idt.o,$(COMMON_OBJ))
+build-text/gdt.o: src/gdt32.c $(HEADERS)
+	mkdir -p build-text
+	$(CC) $(CFLAGS) -ULONGMODE -c $< -o $@
+build-text/idt.o: src/idt.c $(HEADERS)
+	mkdir -p build-text
+	$(CC) $(CFLAGS) -ULONGMODE -c $< -o $@
+
+kanarchy-text.bin: $(TEXT_ASM_OBJ) $(TEXT_COMMON_OBJ) $(TEXT_OBJ) src/kernel.o
 	$(LD) $(LDFLAGS) -o $@ $^
 
 kanarchy-text.iso: kanarchy-text.bin
@@ -373,7 +382,7 @@ ALL_C_OBJ = $(COMMON_OBJ) $(TEXT_OBJ) $(DESKTOP_OBJ) src/kernel.o src/desktop.o
 clean:
 	rm -f $(ASM_OBJ) boot/start_text.o $(ALL_C_OBJ) $(ALL_C_OBJ:.o=.d)
 	rm -f kanarchy-text.bin kanarchy-text.iso kanarchy-desktop.bin kanarchy-desktop.iso kanarchy-disk.img
-	rm -rf isodir build-ksyms build-disk
+	rm -rf isodir build-ksyms build-disk build-text
 
 -include $(wildcard $(ALL_C_OBJ:.o=.d))
 

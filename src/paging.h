@@ -25,14 +25,26 @@ void* paging_probe_window(uint32_t phys4mb);   // scratch 4MB uncached window fo
 // Low 0-1M DMA/VGA window: identity supervisor, virt == phys
 void* paging_map_low(uint32_t phys_addr);
 
-// Kernel page-directory PHYS address (CR3 value), for sharing PD 768-1023
+// The kernel's PML4 PHYS address (CR3 value): pid 0, boot, application processors
 uint32_t paging_kernel_pd_phys(void);
+
+// Address spaces (4-level tables; user half 0..3 GB private, kernel half shared). `cr3` is the PML4's PHYS address.
+uint32_t aspace_create(void);
+uint64_t* aspace_pte(uint32_t cr3, uint32_t va, int alloc);   // the 4 KB entry for va (0: absent / not allocatable)
+int aspace_map(uint32_t cr3, uint32_t va, uint32_t phys, int writable);   // 0 ok, -1 out of memory
+int aspace_set_writable(uint32_t cr3, uint32_t va, int writable);
+int aspace_present(uint32_t cr3, uint32_t va);
+uint32_t aspace_unmap(uint32_t cr3, uint32_t va);               // phys of the page that was mapped (0: none); caller frees it
+int aspace_walk_user(uint32_t cr3, int (*fn)(uint32_t va, uint32_t phys, void* ctx), void* ctx);
+void aspace_free_user(uint32_t cr3);                            // frees user pages + user tables; reload CR3 if running
+void aspace_destroy(uint32_t cr3);                              // everything, including the PML4
+int paging_va_mapped(uint32_t va);                              // readable now? (panic screen: no allocation)
 
 // Map a PHYS page at a user-low virtual address (ring 3 read/write).
 // virt must be < 0xC0000000; phys is the physical page address.
 void paging_map_user(uint32_t virt_addr, uint32_t phys_addr);
 
-// Same, but into an explicit page directory (PHYS address of PD).
+// Same, but into an explicit address space (PHYS address of its PML4).
 // Used to build a process address space before switching to it.
 void paging_map_user_pd(uint32_t pd_phys, uint32_t virt_addr, uint32_t phys_addr);
 

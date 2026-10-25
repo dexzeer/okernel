@@ -40,6 +40,18 @@ static uint8_t arp_cache_ip[ARP_CACHE_SIZE][4];
 static uint8_t arp_cache_mac[ARP_CACHE_SIZE][6];
 static int arp_cache_count = 0;
 
+// UDP ports bound by sockets of the Linux subsystem (udp_bind_port)
+#define UDP_BOUND_MAX 16
+static struct { uint16_t port; udp_rx_fn fn; void* ctx; } udp_bound[UDP_BOUND_MAX];
+int udp_bind_port(uint16_t port, udp_rx_fn fn, void* ctx) {
+    for (int i = 0; i < UDP_BOUND_MAX; i++) if (udp_bound[i].fn && udp_bound[i].port == port) return -1;
+    for (int i = 0; i < UDP_BOUND_MAX; i++) if (!udp_bound[i].fn) { udp_bound[i].port = port; udp_bound[i].fn = fn; udp_bound[i].ctx = ctx; return 0; }
+    return -1;
+}
+void udp_unbind_port(uint16_t port) {
+    for (int i = 0; i < UDP_BOUND_MAX; i++) if (udp_bound[i].fn && udp_bound[i].port == port) udp_bound[i].fn = 0;
+}
+
 // UDP callback
 typedef void (*udp_callback_t)(uint8_t* data, uint32_t len, uint16_t src_port, uint16_t dst_port);
 static udp_callback_t udp_callback = 0;
@@ -1812,6 +1824,13 @@ static void handle_ip(uint8_t* data, uint32_t len) {
         uint16_t src_port = ((udp->src_port >> 8) & 0xFF) | ((udp->src_port & 0xFF) << 8);
         uint16_t udp_len = ((udp->length >> 8) & 0xFF) | ((udp->length & 0xFF) << 8);
 
+        for (int ui = 0; ui < UDP_BOUND_MAX; ui++)                              // sockets of the Linux subsystem
+            if (udp_bound[ui].fn && udp_bound[ui].port == dst_port && udp_len >= 8) {
+                struct ip_header* uip = (struct ip_header*)(data + sizeof(struct eth_header));
+                uint32_t sip = ((uint32_t)uip->src_ip[0] << 24) | ((uint32_t)uip->src_ip[1] << 16) | ((uint32_t)uip->src_ip[2] << 8) | uip->src_ip[3];
+                udp_bound[ui].fn(udp_bound[ui].ctx, sip, src_port, data + sizeof(struct eth_header) + sizeof(struct ip_header) + sizeof(struct udp_header), (uint32_t)udp_len - 8);
+                return;
+            }
         if (dst_port == 68 && src_port == 67 && udp_len > 8) {                  // DHCP reply
             dhcp_input(data + sizeof(struct eth_header) + sizeof(struct ip_header) + sizeof(struct udp_header), (int)udp_len - 8);
         }

@@ -97,7 +97,7 @@ void acpi_pm_reboot(const struct acpi_pm* pm) {
     io_delay_us(200000);
     outb(0xCF9, 0x02); io_delay_us(50); outb(0xCF9, 0x06);       // PCI reset control: hard reset
     io_delay_us(200000);
-    struct { uint16_t limit; uint32_t base; } __attribute__((packed)) idt = { 0, 0 };
+    struct { uint16_t limit; uint32_t base; uint32_t base_hi; } __attribute__((packed)) idt = { 0, 0, 0 };   // 10 bytes: the long-mode form
     __asm__ volatile("lidt %0; int3" :: "m"(idt));               // no IDT: the breakpoint triple-faults
     for (;;) __asm__ volatile("hlt");
 }

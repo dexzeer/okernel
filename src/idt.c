@@ -7,6 +7,29 @@
                      // calls into process.o (desktop-only); all uses here go
                      // through weak aliases, so the text build still links.
 
+#ifdef LONGMODE
+// Long mode: 16-byte gates, and every gate points at a 64-bit entry thunk (boot/lm.asm) that rebuilds the 32-bit
+// interrupt frame the handlers below were written for and enters the handler registered here (lm_legacy[]) in
+// compatibility mode. idt_set_gate keeps its old meaning: `base` is the 32-bit handler.
+struct idt_entry {
+    uint16_t base_low;
+    uint16_t selector;
+    uint8_t  ist;
+    uint8_t  flags;
+    uint16_t base_mid;
+    uint32_t base_high;
+    uint32_t zero;
+} __attribute__((packed));
+
+struct idt_ptr {                // 10 bytes: read as the 6-byte form it is the same limit + low base
+    uint16_t limit;
+    uint32_t base;
+    uint32_t base_hi;
+} __attribute__((packed));
+
+extern uint32_t lm_vec_table[256];      // the 64-bit thunk of each vector
+extern uint32_t lm_legacy[256];         // the 32-bit handler of each vector
+#else
 // IDT entry structure
 struct idt_entry {
     uint16_t base_low;
@@ -20,6 +43,7 @@ struct idt_ptr {
     uint16_t limit;
     uint32_t base;
 } __attribute__((packed));
+#endif
 
 static struct idt_entry idt[256];
 static struct idt_ptr idtp;
@@ -77,6 +101,20 @@ void irq_register_handler(int irq, irq_handler_t handler) {
     irq_handlers[irq] = handler;
 }
 
+#ifdef LONGMODE
+static void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags) {
+    (void)sel;                                  // long mode gates name the 64-bit code segment (0x30), set below
+    lm_legacy[num] = base;
+    uint32_t t = base ? lm_vec_table[num] : 0;
+    idt[num].base_low  = t & 0xFFFF;
+    idt[num].selector  = base ? 0x30 : 0;
+    idt[num].ist       = 0;
+    idt[num].flags     = base ? flags : 0;
+    idt[num].base_mid  = t >> 16;
+    idt[num].base_high = 0;
+    idt[num].zero      = 0;
+}
+#else
 static void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags) {
     idt[num].base_low  = base & 0xFFFF;
     idt[num].base_high = (base >> 16) & 0xFFFF;
@@ -84,6 +122,7 @@ static void idt_set_gate(uint8_t num, uint32_t base, uint16_t sel, uint8_t flags
     idt[num].zero      = 0;
     idt[num].flags     = flags;
 }
+#endif
 
 // Remap the PIC so IRQs 0-15 don't conflict with CPU exceptions 0-15
 static void pic_remap(void) {
@@ -110,6 +149,9 @@ void idt_load_ap(void) {
 void idt_init(void) {
     idtp.limit = sizeof(idt) - 1;
     idtp.base  = (uint32_t)&idt;
+#ifdef LONGMODE
+    idtp.base_hi = 0;
+#endif
 
     for (int i = 0; i < 256; i++) {
         idt_set_gate(i, 0, 0, 0);

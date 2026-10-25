@@ -432,13 +432,7 @@ uint32_t sys_proc_mmap_anon(uint32_t virt) {
         page = 0;
         for (uint32_t cand = (cur->mmap_next - 0x1000) & 0xFFFFF000;
              cand >= USER_MMAP_BASE; cand -= 0x1000) {
-            uint32_t *pd = (uint32_t*)P2V_U32(cur->page_dir);
-            uint32_t pde = pd[cand >> 22];
-            int present = 0;
-            if (pde & 0x01) {
-                uint32_t *pt = (uint32_t*)P2V_U32(pde & 0xFFFFF000);
-                present = (pt[(cand >> 12) & 0x3FF] & 0x01) != 0;
-            }
+            int present = aspace_present(cur->page_dir, cand);
             if (!present) { page = cand; break; }
             if (cand == USER_MMAP_BASE) break;
         }
@@ -458,18 +452,26 @@ uint32_t sys_proc_mmap_anon(uint32_t virt) {
 void sys_proc_munmap(uint32_t virt) {
     struct process *cur = process_current();
     if (!cur || !cur->page_dir) return;
-    uint32_t *pd = (uint32_t*)P2V_U32(cur->page_dir);
-    uint32_t pde = pd[virt >> 22];
-    if (!(pde & 0x01)) return;
-    uint32_t *pt = (uint32_t*)P2V_U32(pde & 0xFFFFF000);
-    uint32_t pte = pt[(virt >> 12) & 0x3FF];
-    if (!(pte & 0x01)) return;
-    pmm_free_page(pte & 0xFFFFF000);
-    pt[(virt >> 12) & 0x3FF] = 0;
+    uint32_t phys = aspace_unmap(cur->page_dir, virt);
+    if (!phys) return;
+    pmm_free_page(phys);
     __asm__ volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax", "memory");
 }
 
 // ---- fork: copy the calling process's user-low address space ----
+// One user page of the parent: a fresh PMM page for the child with the same contents (through the HIGH alias).
+struct fork_copy { uint32_t child_cr3; };
+static int fork_copy_page(uint32_t virt, uint32_t src_phys, void *ctx) {
+    struct fork_copy *fc = (struct fork_copy*)ctx;
+    uint32_t phys = pmm_alloc_page();
+    if (!phys) return -1;
+    paging_map_user_pd(fc->child_cr3, virt, phys);
+    uint8_t *dst = (uint8_t*)P2V_U32(phys);
+    uint8_t *src = (uint8_t*)P2V_U32(src_phys);
+    for (int b = 0; b < 4096; b++) dst[b] = src[b];
+    return 0;
+}
+
 int sys_proc_fork(void) {
     struct process *parent = process_current();
     if (!parent || parent->pid == 0 || !parent->page_dir) return -1;
@@ -480,21 +482,8 @@ int sys_proc_fork(void) {
     // Copy user-low pages (PD 0-767, present entries): fresh PMM page per
     // page, memcpy through the HIGH alias. Kernel-high is shared by design
     // (create_page_directory already shares it — never copy it).
-    uint32_t *ppd = (uint32_t*)P2V_U32(parent->page_dir);
-    for (int j = 0; j < PD_KERNEL_BASE; j++) {
-        if (!(ppd[j] & 0x01)) continue;
-        uint32_t *ppt = (uint32_t*)P2V_U32(ppd[j] & 0xFFFFF000);
-        for (int k = 0; k < 1024; k++) {
-            if (!(ppt[k] & 0x01)) continue;
-            uint32_t phys = pmm_alloc_page();
-            if (!phys) { process_destroy((uint32_t)child_pid); return -1; }
-            uint32_t virt = ((uint32_t)j << 22) | ((uint32_t)k << 12);
-            paging_map_user_pd(child->page_dir, virt, phys);
-            uint8_t *dst = (uint8_t*)P2V_U32(phys);
-            uint8_t *src = (uint8_t*)P2V_U32(ppt[k] & 0xFFFFF000);
-            for (int b = 0; b < 4096; b++) dst[b] = src[b];
-        }
-    }
+    struct fork_copy fc = { child->page_dir };
+    if (aspace_walk_user(parent->page_dir, fork_copy_page, &fc)) { process_destroy((uint32_t)child_pid); return -1; }
     // Child resumes AFTER the fork trap (same ESP the parent trapped with;
     // EIP = return address: the word the trap pushed... precisely, the
     // INT 0x80 trap pushed NOTHING on the user stack (ring-3 int pushes
@@ -549,12 +538,9 @@ int sys_proc_fork(void) {
                 process_destroy((uint32_t)child_pid);
                 return -1;
             }
-            // Locate the child's stack page phys (walk ITS PD: PD 0-767 PD
-            // 767 covers 0xBFC00000-0xBFFFFFFF; stack page = last PTE).
-            uint32_t *cpd = (uint32_t*)P2V_U32(child->page_dir);
-            uint32_t pde = cpd[tesp >> 22];
-            uint32_t *cpt = (uint32_t*)P2V_U32(pde & 0xFFFFF000);
-            uint32_t sph = cpt[(tesp >> 12) & 0x3FF] & 0xFFFFF000;
+            // Locate the child's stack page phys (walk ITS address space; the stack page is the last user page).
+            uint64_t *spte = aspace_pte(child->page_dir, tesp, 0);
+            uint32_t sph = spte ? ((uint32_t)*spte & 0xFFFFF000) : 0;
             uint8_t *spage = (uint8_t*)P2V_U32(sph);
             // Stub bytes at page base (5B; .text-adjacent low page is mapped
             // user — reuse the stack page base, never executed otherwise).
@@ -677,16 +663,7 @@ int sys_proc_exec(const char *path) {
     if (len <= 0) return -1;
     // Wipe user-low (fresh address space, keep kernel-high shared tables).
     // Free pages first (avoid leaking the old image), then clear PDEs.
-    uint32_t *pd = (uint32_t*)P2V_U32(cur->page_dir);
-    for (int j = 0; j < PD_KERNEL_BASE; j++) {
-        if (!(pd[j] & 0x01)) continue;
-        uint32_t *pt = (uint32_t*)P2V_U32(pd[j] & 0xFFFFF000);
-        for (int k = 0; k < 1024; k++) {
-            if (pt[k] & 0x01) pmm_free_page(pt[k] & 0xFFFFF000);
-        }
-        pmm_free_page(pd[j] & 0xFFFFF000);
-        pd[j] = 0;
-    }
+    aspace_free_user(cur->page_dir);
     // TLB flush (bisected 2026-09-08: exec #PF exc 14 at the new entry —
     // the wipe above only cleared PDEs/PTEs in MEMORY, but the TLB still
     // holds the OLD translations... actually worse: it holds NOTHING valid

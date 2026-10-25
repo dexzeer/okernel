@@ -49,7 +49,7 @@ class OkVM:
             except FileNotFoundError: pass
 
         media = ["-drive", f"file={boot_disk},format=raw,if=ide,index=0", "-boot", "c"] if boot_disk else ["-cdrom", ISO, "-boot", "d"]
-        cmd = ["qemu-system-i386", "-m", os.environ.get("OKVM_MEM", "512"), *media, "-vga", os.environ.get("OKVM_VGA", "std"),
+        cmd = [os.environ.get("OKVM_QEMU", "qemu-system-x86_64"), "-m", os.environ.get("OKVM_MEM", "512"), *media, "-vga", os.environ.get("OKVM_VGA", "std"),
                "-serial", f"file:{self.LOG}", "-display", "none",
                "-monitor", f"unix:{self.SOCK},server,nowait", "-no-reboot"]
         if extra_net:  # e1000 + SLIRP user networking (10.0.2.x)
@@ -119,7 +119,11 @@ class OkVM:
         km = {' ': 'spc', '/': 'slash', '.': 'dot', ':': 'shift-semicolon',
               '-': 'minus', '\n': 'ret', '=': 'equal', '_': 'shift-minus',
               '?': 'shift-slash', '\t': 'tab', '\b': 'backspace',
-              '\x1b': 'esc'}
+              '\x1b': 'esc', '"': 'shift-apostrophe', "'": 'apostrophe', ';': 'semicolon',
+              '|': 'shift-backslash', '\\': 'backslash', ',': 'comma', '>': 'shift-dot', '<': 'shift-comma',
+              '&': 'shift-7', '*': 'shift-8', '(': 'shift-9', ')': 'shift-0', '!': 'shift-1', '$': 'shift-4',
+              '#': 'shift-3', '%': 'shift-5', '@': 'shift-2', '^': 'shift-6', '+': 'shift-equal',
+              '[': 'bracket_left', ']': 'bracket_right', '`': 'grave_accent', '~': 'shift-grave_accent'}
         for ch in s:
             k = km.get(ch, ch.lower() if ch.isalpha() else ch)
             if ch.isupper(): k = f"shift-{ch.lower()}"

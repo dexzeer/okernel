@@ -69,6 +69,10 @@ void icmp_send_ping(uint8_t* target_ip, uint16_t id, uint16_t seq);
 
 // Send a UDP packet
 void udp_send(uint8_t* dst_ip, uint16_t src_port, uint16_t dst_port, uint8_t* data, uint16_t len);
+// Datagrams for a bound local port are handed to fn (src ip in host order, payload valid only during the call).
+typedef void (*udp_rx_fn)(void* ctx, uint32_t src_ip, uint16_t src_port, const uint8_t* data, uint32_t len);
+int udp_bind_port(uint16_t port, udp_rx_fn fn, void* ctx);   // 0 ok, -1 in use / table full
+void udp_unbind_port(uint16_t port);
 
 // Ask the router for an address (DHCP); automatic on the Wi-Fi link. net_status: the interface settings as text.
 void net_dhcp(void);

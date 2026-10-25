@@ -6,7 +6,7 @@
 ; data slots below, then wakes the AP. The code takes the CPU real mode ->
 ; flat 32-bit protected mode -> paging on with the kernel's page directory
 ; (which identity-maps low memory, so the instruction stream keeps running
-; across the switch) -> the AP's own stack -> the C entry point, a high
+; across the switch; it is a PML4, and the CPU enters long mode) -> the AP's own stack -> the C entry point, a high
 ; address reached through the same page directory.
 ;
 ; Everything here is position dependent on TRAMP_PHYS: label arithmetic is
@@ -45,8 +45,12 @@ ap_pm32:
     mov gs, ax
     mov ss, ax
     mov eax, cr4
-    or eax, 0x10                ; CR4.PSE: the kernel map has 4MB pages
+    or eax, 0x20                ; CR4.PAE: the kernel map is x86-64 page tables
     mov cr4, eax
+    mov ecx, 0xC0000080         ; IA32_EFER
+    rdmsr
+    or eax, 0x100               ; LME: paging below puts the CPU in long mode, running this 32-bit code as compatibility mode
+    wrmsr
     mov eax, [ABS(ap_tramp_cr3)]
     mov cr3, eax
     mov eax, cr0

@@ -18,8 +18,5 @@
 #define P2V(p) ((void*)(P2V_U32(p)))
 #define IS_HIGH(v) ((uint32_t)(v) >= KERNEL_VBASE)
 
-// PD indices
-#define PD_KERNEL_BASE 768   // 0xC0000000 >> 22
-#define PD_LOW_IDENT 0       // 0x00000000: 0-1M DMA/VGA window
 
 #endif
