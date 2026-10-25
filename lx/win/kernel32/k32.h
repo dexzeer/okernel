@@ -3,7 +3,7 @@
 #define K32_H
 #include "winbase.h"
 
-enum { OB_FREE = 0, OB_FILE, OB_EVENT, OB_MUTEX, OB_SEM, OB_THREAD, OB_PROCESS, OB_FIND, OB_PIPE, OB_STDCON };
+enum { OB_FREE = 0, OB_FILE, OB_EVENT, OB_MUTEX, OB_SEM, OB_THREAD, OB_PROCESS, OB_FIND, OB_PIPE, OB_STDCON, OB_MAP };
 
 struct obj {
     int type;
@@ -19,6 +19,7 @@ struct obj {
     char *pattern;                // OB_FIND: directory listing
     int dirfd; char dirpath[272]; int dirpos; char wild[272];
     int is_console;
+    ULONGLONG mapsize;            // OB_MAP
 };
 
 HANDLE k32_new_obj(int type, struct obj **out);
