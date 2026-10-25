@@ -187,7 +187,7 @@ static void unlink_child(struct wnd *w) {
 int U_okw_resize(struct wnd *w, int cw, int bh) {
     struct okw_resize r; r.wid = w->wid; r.w = cw; r.h = bh; r.pad = 0; r.out_addr = 0;
     if (SC3(LX_ioctl, U_fd(), OKW_RESIZE, &r) < 0) return -1;
-    w->px = (unsigned*)r.out_addr; w->stride = cw; w->bw = cw; w->bh = bh; w->cw = cw; w->ch = bh - w->mh;
+    w->px = (unsigned*)r.out_addr; w->stride = cw; w->bw = cw; w->bh = bh; w->cw = cw - U_sbv(w); w->ch = bh - w->mh - U_sbh(w);
     U_menubar_paint(w);
     return 0;
 }
@@ -225,7 +225,7 @@ HWND U_create_window(DWORD ex, const void *cls, const void *name, DWORD style, i
         if (w == CW_USEDEFAULT) w = 0;
         if (h == CW_USEDEFAULT) h = 0;
         me->x = x; me->y = y; me->w = w; me->h = h;
-        me->cw = w - 2 * me->bd; me->ch = h - 2 * me->bd;
+        me->cw = w - 2 * me->bd - U_sbv(me); me->ch = h - 2 * me->bd - U_sbh(me);
         if (me->cw < 0) me->cw = 0;
         if (me->ch < 0) me->ch = 0;
     } else {
@@ -251,7 +251,7 @@ HWND U_create_window(DWORD ex, const void *cls, const void *name, DWORD style, i
         struct okw_map m; memset(&m, 0, sizeof m); m.wid = c.out_wid;
         if (SC3(LX_ioctl, U_fd(), OKW_MAP, &m) < 0) { SC3(LX_ioctl, U_fd(), OKW_DESTROY, c.out_wid); me->used = 0; ufree(me->extra); return 0; }
         me->wid = c.out_wid; me->px = (unsigned*)m.out_addr; me->stride = cw; me->bw = cw; me->bh = ch;
-        me->x = x; me->y = y; me->cw = cw; me->ch = ch - mh;
+        me->x = x; me->y = y; me->cw = cw - U_sbv(me); me->ch = ch - mh - U_sbh(me);
         me->w = cw + 2 * t_border; me->h = ch + (noframe ? 0 : t_title) + 2 * t_border;
         U_menubar_paint(me);
     }
@@ -495,9 +495,9 @@ static void apply_size(struct wnd *w, int cw, int ch, int notify) {
         if (ch < 16) ch = 16;
         if (cw > 2048) cw = 2048;
         if (ch > 1200) ch = 1200;
-        if (U_okw_resize(w, cw, ch + w->mh)) return;
-        w->w = cw + 2 * t_border; w->h = ch + w->mh + (w->noframe ? 0 : t_title) + 2 * t_border;
-    } else { w->cw = cw; w->ch = ch; w->w = cw + 2 * w->bd; w->h = ch + 2 * w->bd; }
+        if (U_okw_resize(w, cw + U_sbv(w), ch + w->mh + U_sbh(w))) return;
+        w->w = cw + U_sbv(w) + 2 * t_border; w->h = ch + U_sbh(w) + w->mh + (w->noframe ? 0 : t_title) + 2 * t_border;
+    } else { w->cw = cw; w->ch = ch; w->w = cw + U_sbv(w) + 2 * w->bd; w->h = ch + U_sbh(w) + 2 * w->bd; }
     if (notify) U_send(w, WM_SIZE, SIZE_RESTORED, MAKELPARAM(w->cw, w->ch));
     U_invalidate(w, 0, 1);
 }
@@ -508,14 +508,14 @@ EXPORT BOOL MoveWindow(HWND h, int x, int y, int w, int hh, BOOL repaint) {
         struct okw_move m = { k->wid, x, y };
         SC3(LX_ioctl, U_fd(), OKW_MOVE, &m);
         k->x = x; k->y = y;
-        apply_size(k, w - 2 * t_border, hh - (k->noframe ? 0 : t_title) - 2 * t_border - k->mh, 1);
+        apply_size(k, w - 2 * t_border - U_sbv(k), hh - (k->noframe ? 0 : t_title) - 2 * t_border - k->mh - U_sbh(k), 1);
         U_send(k, WM_MOVE, 0, MAKELPARAM(0, 0));
     } else {
         RECT old = { k->x, k->y, k->x + k->w, k->y + k->h };
         U_invalidate(k->parent, &old, 1);
         k->x = x; k->y = y;
         int ow = k->cw, oh = k->ch;
-        apply_size(k, w - 2 * k->bd, hh - 2 * k->bd, 0);
+        apply_size(k, w - 2 * k->bd - U_sbv(k), hh - 2 * k->bd - U_sbh(k), 0);
         if (ow != k->cw || oh != k->ch) U_send(k, WM_SIZE, SIZE_RESTORED, MAKELPARAM(k->cw, k->ch));
         U_send(k, WM_MOVE, 0, MAKELPARAM(x, y));
         U_invalidate(k, 0, 1);

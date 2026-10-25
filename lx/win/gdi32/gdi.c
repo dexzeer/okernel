@@ -442,6 +442,22 @@ EXPORT int GetDIBits(HDC hdc, HBITMAP hb, UINT start, UINT n, LPVOID bits, BITMA
     return 0;
 }
 
+
+// an ARGB (non-premultiplied) image scaled to dw x dh and blended at (x, y): icons
+BOOL __gdi_blend_argb(HDC hdc, int x, int y, int dw, int dh, const unsigned *argb, int sw, int sh) {
+    struct dc *d = hdc;
+    if (!d || dw <= 0 || dh <= 0 || sw <= 0 || sh <= 0) return FALSE;
+    for (int j = 0; j < dh; j++) {
+        int sy = sh == dh ? j : j * sh / dh;
+        for (int i = 0; i < dw; i++) {
+            int sx = sw == dw ? i : i * sw / dw;
+            unsigned p = argb[sy * sw + sx], a = p >> 24;
+            if (a) blend(d, x + i, y + j, p & 0xFFFFFF, a);
+        }
+    }
+    return TRUE;
+}
+
 // ---- text ---------------------------------------------------------------------------------------------------------------------------------
 
 static int okw_fd = -2;

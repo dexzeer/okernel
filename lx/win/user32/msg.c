@@ -2,6 +2,8 @@
 #include "u32.h"
 
 
+static WPARAM rep_vk;                       // key repeat: the key and the window it goes to
+static struct wnd *rep_wnd;
 static MSG q[MSGQ];
 static int qn;
 static volatile int qlock;
@@ -21,6 +23,7 @@ void U_post(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     unlock();
 }
 void U_drop_messages(struct wnd *w) {
+    if (rep_wnd == w) rep_vk = 0;
     lock();
     int j = 0;
     for (int i = 0; i < qn; i++) if (q[i].hwnd != (HWND)w) q[j++] = q[i];
@@ -175,7 +178,7 @@ EXPORT int ToAscii(UINT vk, UINT sc, const BYTE *st, WORD *out, UINT f) { (void)
 // ---- translating /dev/okwin events ------------------------------------------------------------------------------------------------
 
 static int mouse_down_mask;
-static DWORD rep_next; static WPARAM rep_vk; static LPARAM rep_lp; static struct wnd *rep_wnd;
+static DWORD rep_next; static LPARAM rep_lp;
 static DWORD last_click_time; static int last_click_x, last_click_y, last_click_btn; static struct wnd *last_click_wnd;
 
 static WPARAM key_flags(int mods) {
@@ -230,6 +233,10 @@ void U_activate(struct wnd *T, int on) {
 int (*U_event_hook)(const struct okw_event *);
 static void handle_event(const struct okw_event *e) {
     if (U_event_hook && U_event_hook(e)) return;                      // a menu is open: it takes the events of the connection
+    if (e->type == OKE_KEY && !e->b) {                                // a release counts even when its window is gone (key repeat, key state)
+        int vk = vk_of_linux(e->a);
+        if (vk) { set_key(vk, 0); if (rep_vk == (WPARAM)vk) rep_vk = 0; }
+    }
     int i = U_find_wid(e->wid);
     if (i < 0) return;
     struct wnd *T = U_pool(i);
@@ -238,6 +245,7 @@ static void handle_event(const struct okw_event *e) {
     case OKE_MOUSE_MOVE: {
         if (T->menu && !U_capture()) { if (e->b < T->mh) { if (U_menubar_event(T, e)) break; } else U_menubar_leave(T); }
         int lx, ly; struct wnd *t = mouse_target(T, e->a, e->b, &lx, &ly);
+        if (U_nc_active(t) && U_nc_event(t, lx, ly, OKE_MOUSE_MOVE, 0)) break;                                   // dragging a scroll bar thumb
         U_post(t, WM_MOUSEMOVE, key_flags(mods_cache()), MAKELPARAM(lx, ly));
         break;
     }
@@ -245,6 +253,10 @@ static void handle_event(const struct okw_event *e) {
         if (T->menu && e->b < T->mh && !U_capture() && U_menubar_event(T, e)) break;
         int lx, ly; struct wnd *t = mouse_target(T, e->a, e->b, &lx, &ly);
         int btn = e->c, down = e->d;
+        if (btn == 1 && (U_sbv(t) || U_sbh(t) || U_nc_active(t)) && U_nc_event(t, lx, ly, OKE_MOUSE_BUTTON, down)) {
+            if (down) { struct wnd *f = t; while (f->parent && !f->parent->used) f = f->parent; }
+            break;
+        }
         if (down) mouse_down_mask |= 1 << (btn - 1); else mouse_down_mask &= ~(1 << (btn - 1));
         UINT m;
         if (btn == 1) m = down ? WM_LBUTTONDOWN : WM_LBUTTONUP; else if (btn == 2) m = down ? WM_RBUTTONDOWN : WM_RBUTTONUP; else m = down ? WM_MBUTTONDOWN : WM_MBUTTONUP;
@@ -492,6 +504,7 @@ LRESULT U_def_proc(struct wnd *w, UINT m, WPARAM wp, LPARAM lp, int unicode) {
     case WM_NCHITTEST: return HTCLIENT;
     case WM_MOUSEACTIVATE: return 1;
     case WM_SETCURSOR: return 0;
+    case WM_TIMER: if (wp == 0x7F01) U_sb_timer(w); return 0;
     case WM_SHOWWINDOW: return 0;
     default: return 0;
     }

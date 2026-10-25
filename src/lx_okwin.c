@@ -285,6 +285,24 @@ int64_t lx_okwin_ioctl(struct lx_task *t, void *conn, uint64_t req, uint64_t arg
         q.mx = mouse_get_x(); q.my = mouse_get_y(); q.mb = mouse_get_buttons();
         return lx_copy_out(t, arg, &q, sizeof q);
     }
+    case OKW_CLIPBOARD: {
+        static char clip[65536];
+        static int cliplen;
+        static uint64_t clipseq;
+        struct okw_clip a;
+        if (lx_copy_in(t, &a, arg, sizeof a)) return -LX_EFAULT;
+        if (a.op == 0) {
+            if (a.len < 0 || a.len > (int)sizeof clip) return -LX_EINVAL;
+            if (a.len && lx_copy_in(t, clip, a.buf, (uint64_t)a.len)) return -LX_EFAULT;
+            cliplen = a.len; clipseq++;
+        } else {
+            int n = cliplen < a.len ? cliplen : a.len;
+            if (n > 0 && lx_copy_out(t, a.buf, clip, (uint64_t)n)) return -LX_EFAULT;
+            a.len = cliplen;
+        }
+        a.seq = clipseq;
+        return lx_copy_out(t, arg, &a, sizeof a);
+    }
     case OKW_TEXT: return do_text(t, arg);
     default: return -LX_ENOTTY;
     }

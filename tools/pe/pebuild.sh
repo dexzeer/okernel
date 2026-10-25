@@ -13,15 +13,16 @@ OBJS=""
 for f in "$@"; do
     o=$T/$(basename $f).o
     gcc -c -O2 -ffreestanding -fno-stack-protector -fno-pic -fno-pie -mabi=ms -mno-red-zone -fasynchronous-unwind-tables -fno-shrink-wrap \
-        -fno-ident -fno-builtin -Wall -Wno-unused-function -I"$HERE" -I"$(dirname $f)" -Ilx/win -Ilx/win/msvcrt -o $o $f
+        -fno-ident -fno-builtin -Werror=implicit-function-declaration -Wall -Wno-unused-function -I"$HERE" -I"$(dirname $f)" -Ilx/win -Ilx/win/msvcrt -o $o $f
     OBJS="$OBJS $o"
 done
 EXTRA=""
+[ -n "$RSRC" ] && EXTRA="$EXTRA --rsrc $RSRC"
 if [ "$IMPORTS" != "-" ]; then
     python3 $HERE/mkpe.py gen-imports $IMPORTS $T/imports.S
     gcc -c -o $T/imports.o $T/imports.S
     OBJS="$OBJS $T/imports.o"
-    EXTRA="--imports $IMPORTS"
+    EXTRA="$EXTRA --imports $IMPORTS"
 fi
 ENTRY=""
 case $KIND in
@@ -31,5 +32,6 @@ esac
 ld -m elf_x86_64 -static -q -T $HERE/pe.ld --defsym=__base=$BASE $ENTRY -o $T/out.elf $OBJS
 EXP=""
 if [ "$EXPORTS" != "-" ]; then EXP="--export $(tr '\n' ',' < $EXPORTS | sed 's/,$//')"; fi
-python3 $HERE/mkpe.py $T/out.elf $OUT $FLAGS --base $BASE $EXTRA $EXP --name $(basename $OUT)
+[ -n "$KEEP_ELF" ] && cp $T/out.elf "$OUT.elf"; python3 $HERE/mkpe.py $T/out.elf $OUT $FLAGS --base $BASE $EXTRA $EXP --name $(basename $OUT)
+[ -n "$KEEP_ELF" ] && cp $T/out.elf "$OUT.elf"
 rm -rf $T

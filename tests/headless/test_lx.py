@@ -52,6 +52,7 @@ try:
     run("lx /bin/glsock", "SOCKTEST PASS")
     run("lx /win/hello.exe", "hello from a Windows program", status=7 << 8)
     run("lx /win/crtdemo.exe", "CRTDEMO PASS", timeout=120)
+    run("lx /win/rsrcdemo.exe", "RSRC PASS", timeout=60)
     run("lx /win/seh.exe", "SEH PASS", timeout=60)
     run("lx /win/seh.exe unhandled", "unhandled exception 0xc0000005", status=1280)
     run("lx /win/seh.exe top", "custom top-level filter", status=1280)

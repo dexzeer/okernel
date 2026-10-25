@@ -96,4 +96,9 @@ extern FILE *__acrt_iob_func(unsigned i);
 #define stdin (__acrt_iob_func(0))
 #define stdout (__acrt_iob_func(1))
 #define stderr (__acrt_iob_func(2))
+int wcscmp(const WCHAR *a, const WCHAR *b);
+int wcsncmp(const WCHAR *a, const WCHAR *b, size_t n);
+int _wcsicmp(const WCHAR *a, const WCHAR *b);
+int _wcsnicmp(const WCHAR *a, const WCHAR *b, size_t n);
+int vswprintf(WCHAR *buf, size_t n, const WCHAR *wfmt, va_list ap);
 #endif
