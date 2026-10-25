@@ -55,8 +55,8 @@ static void map_dll(const char *imported, char *out, int cap) {
     const char *r = n;
     if (has_prefix(n, "api-ms-win-crt-") || has_prefix(n, "ucrtbase") || has_prefix(n, "msvcr") || has_prefix(n, "vcruntime") || has_prefix(n, "libgcc") || has_prefix(n, "libstdc")) r = "msvcrt.dll";
     else if (has_prefix(n, "api-ms-") || has_prefix(n, "ext-ms-") || has_prefix(n, "kernelbase") || has_prefix(n, "ntdll") || has_prefix(n, "advapi32") ||
-             has_prefix(n, "kernel32") || has_prefix(n, "sechost") || has_prefix(n, "rpcrt4") || has_prefix(n, "bcrypt") || has_prefix(n, "version")) r = "kernel32.dll";
-    else if (has_prefix(n, "user32") || has_prefix(n, "win32u") || has_prefix(n, "comctl32") || has_prefix(n, "shell32")) r = "user32.dll";
+             has_prefix(n, "kernel32") || has_prefix(n, "sechost") || has_prefix(n, "rpcrt4") || has_prefix(n, "bcrypt") || has_prefix(n, "version") || has_prefix(n, "ole32") || has_prefix(n, "oleaut32") || has_prefix(n, "shlwapi") || has_prefix(n, "shcore") || has_prefix(n, "combase") || has_prefix(n, "propsys") || has_prefix(n, "ws2_32") || has_prefix(n, "psapi") || has_prefix(n, "wtsapi32") || has_prefix(n, "userenv") || has_prefix(n, "crypt32") || has_prefix(n, "winspool") || has_prefix(n, "urlmon")) r = "kernel32.dll";
+    else if (has_prefix(n, "user32") || has_prefix(n, "win32u") || has_prefix(n, "comctl32") || has_prefix(n, "shell32") || has_prefix(n, "comdlg32") || has_prefix(n, "uxtheme") || has_prefix(n, "dwmapi")) r = "user32.dll";
     else if (has_prefix(n, "gdi32")) r = "gdi32.dll";
     int i = 0;
     for (; r[i] && i < cap - 1; i++) out[i] = r[i];
@@ -244,6 +244,10 @@ static int bind_imports(struct lx_task *t, struct lx_win *w, int mi, int depth) 
             uint64_t addr;
             const char *fname = 0; uint32_t ord = 0;
             if (v >> 63) ord = (uint32_t)(v & 0xFFFF); else fname = rva_str(&p, (uint32_t)v + 2);
+            if (ord && has_prefix(dn, "COMCTL32")) {                      // the few comctl32 functions programs import by number
+                static const struct { uint32_t o; const char *n; } cc[] = { {345, "TaskDialogIndirect"}, {381, "LoadIconWithScaleDown"}, {410, "SetWindowSubclass"}, {411, "GetWindowSubclass"}, {412, "RemoveWindowSubclass"}, {413, "DefSubclassProc"} };
+                for (int k = 0; k < 6; k++) if (cc[k].o == ord) { fname = cc[k].n; ord = 0; break; }
+            }
             addr = export_lookup(t, w, &w->mod[di], fname, ord, 0);
             if (!addr) {
                 if (w->nmissing < MAX_MISSING) {
@@ -494,8 +498,16 @@ int64_t lx_pe_getproc(struct lx_task *t, uint64_t base, uint64_t uname, uint64_t
     for (int i = 0; i < w->nmod; i++) {
         if (w->mod[i].base != base) continue;
         char nm[96];
-        if (uname) { if (lx_copy_str(t, nm, uname, sizeof nm) < 0) return 0; return (int64_t)export_lookup(t, w, &w->mod[i], nm, 0, 0); }
-        return (int64_t)export_lookup(t, w, &w->mod[i], 0, (uint32_t)ordinal, 0);
+        extern int lx_trace;
+        if (uname) {
+            if (lx_copy_str(t, nm, uname, sizeof nm) < 0) return 0;
+            int64_t r = (int64_t)export_lookup(t, w, &w->mod[i], nm, 0, 0);
+            if (!r && lx_trace) serial_printf("[lxt] GetProcAddress(%s): not found\n", nm);
+            return r;
+        }
+        int64_t r = (int64_t)export_lookup(t, w, &w->mod[i], 0, (uint32_t)ordinal, 0);
+        if (!r && lx_trace) serial_printf("[lxt] GetProcAddress(#%u): not found\n", (unsigned)ordinal);
+        return r;
     }
     return 0;
 }

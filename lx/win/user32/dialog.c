@@ -13,7 +13,7 @@ static LRESULT msgbox_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     struct wnd *w = h;
     if (m == WM_COMMAND) {
         int id = (int)(wp & 0xFFFF);
-        if (id >= 1 && id <= 7) { w->dlg_result = id; w->dlg_done = 1; }
+        if (id >= 1) { w->dlg_result = id; w->dlg_done = 1; }
         return 0;
     }
     if (m == WM_CLOSE) { w->dlg_result = w->dlg_result ? w->dlg_result : IDCANCEL; w->dlg_done = 1; return 0; }
@@ -28,16 +28,11 @@ void U_run_modal(struct wnd *dlg) {
     }
 }
 
+static int taskbox(HWND owner, const char *text, const char *caption, int nb, const int *ids, const char *const *names, int def);
+
 static int msgbox(HWND owner, const char *text, const char *caption, UINT type) {
-    static int reg;
     U_init();
-    if (!reg) {
-        reg = 1;
-        WNDCLASSEXA c; memset(&c, 0, sizeof c);
-        c.cbSize = sizeof c; c.lpfnWndProc = msgbox_proc; c.lpszClassName = "OKMsgBox"; c.hbrBackground = (HBRUSH)(ULONG_PTR)(COLOR_BTNFACE + 1);
-        RegisterClassExA(&c);
-    }
-    static const char *names[8] = { "", "OK", "Cancel", "Abort", "Retry", "Ignore", "Yes", "No" };
+    static const char *const names[8] = { "", "OK", "Cancel", "Abort", "Retry", "Ignore", "Yes", "No" };
     int ids[3] = { IDOK, 0, 0 }, nb = 1;
     switch (type & 0xF) {
     case 1: ids[0] = IDOK; ids[1] = IDCANCEL; nb = 2; break;
@@ -46,12 +41,26 @@ static int msgbox(HWND owner, const char *text, const char *caption, UINT type) 
     case 4: ids[0] = IDYES; ids[1] = IDNO; nb = 2; break;
     case 5: ids[0] = 4; ids[1] = IDCANCEL; nb = 2; break;
     }
+    const char *lab[3];
+    for (int i = 0; i < nb; i++) lab[i] = names[ids[i]];
+    return taskbox(owner, text, caption, nb, ids, lab, 0);
+}
+
+static int taskbox(HWND owner, const char *text, const char *caption, int nb, const int *ids, const char *const *names, int def) {
+    static int reg;
+    if (!reg) {
+        reg = 1;
+        WNDCLASSEXA c; memset(&c, 0, sizeof c);
+        c.cbSize = sizeof c; c.lpfnWndProc = msgbox_proc; c.lpszClassName = "OKMsgBox"; c.hbrBackground = (HBRUSH)(ULONG_PTR)(COLOR_BTNFACE + 1);
+        RegisterClassExA(&c);
+    }
     HDC mdc = GetDC(0);
     RECT tr = { 0, 0, 360, 0 };
     DrawTextA(mdc, text, -1, &tr, DT_CALCRECT | DT_WORDBREAK);
     __gdi_free_dc(mdc);
     int tw = tr.right - tr.left, th = tr.bottom - tr.top;
     int bw = 80, bh = 26, gap = 8;
+    for (int i = 0; i < nb; i++) { int need_w = (int)ustrlen(names[i]) * 8 + 24; if (need_w > bw) bw = need_w; }
     int cw = tw + 40, need = nb * bw + (nb - 1) * gap + 40;
     if (cw < need) cw = need;
     int ch = th + 40 + bh + 20;
@@ -64,8 +73,8 @@ static int msgbox(HWND owner, const char *text, const char *caption, UINT type) 
     int x = (cw - (nb * bw + (nb - 1) * gap)) / 2;
     HWND first = 0;
     for (int i = 0; i < nb; i++) {
-        HWND b = CreateWindowExA(0, "BUTTON", names[ids[i]], WS_CHILD | WS_VISIBLE | WS_TABSTOP | (i == 0 ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON), x + i * (bw + gap), ch - bh - 16, bw, bh, d, (HMENU)(LONG_PTR)ids[i], 0, 0);
-        if (!first) first = b;
+        HWND b = CreateWindowExA(0, "BUTTON", names[ids[i]], WS_CHILD | WS_VISIBLE | WS_TABSTOP | (i == def ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON), x + i * (bw + gap), ch - bh - 16, bw, bh, d, (HMENU)(LONG_PTR)ids[i], 0, 0);
+        if (i == def) first = b;
     }
     ShowWindow(d, SW_SHOW);
     if (first) SetFocus(first);
@@ -87,3 +96,5 @@ EXPORT int MessageBoxExA(HWND owner, LPCSTR text, LPCSTR cap, UINT type, WORD la
 EXPORT int MessageBoxExW(HWND owner, LPCWSTR text, LPCWSTR cap, UINT type, WORD lang) { (void)lang; return MessageBoxW(owner, text, cap, type); }
 
 BOOL DllMain(HMODULE m, DWORD reason, LPVOID res) { (void)m; (void)reason; (void)res; return TRUE; }
+
+int U_taskbox(HWND owner, const char *text, const char *caption, int nb, const int *ids, const char *const *names, int def) { U_init(); return taskbox(owner, text, caption, nb, ids, names, def); }

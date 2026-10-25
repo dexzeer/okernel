@@ -566,3 +566,23 @@ EXPORT HGDIOBJ CreateRectRgn(int a, int b, int c, int d) { (void)a; (void)b; (vo
 EXPORT int CombineRgn(HGDIOBJ d, HGDIOBJ a, HGDIOBJ b, int m) { (void)d; (void)a; (void)b; (void)m; return 2; }
 
 BOOL DllMain(HMODULE m, DWORD reason, LPVOID res) { (void)m; (void)reason; (void)res; return TRUE; }
+
+// ---- printing, mapping modes, font enumeration: accepted without effect --------------------------------------------------------------------------
+EXPORT BOOL SetViewportExtEx(HDC dc, int x, int y, SIZE *old) { (void)dc; (void)x; (void)y; if (old) { old->cx = 1; old->cy = 1; } return 1; }
+EXPORT BOOL SetWindowExtEx(HDC dc, int x, int y, SIZE *old) { (void)dc; (void)x; (void)y; if (old) { old->cx = 1; old->cy = 1; } return 1; }
+EXPORT BOOL LPtoDP(HDC dc, POINT *p, int n) { (void)dc; (void)p; (void)n; return 1; }
+EXPORT int AbortDoc(HDC dc) { (void)dc; return -1; }
+EXPORT int EndDoc(HDC dc) { (void)dc; return -1; }
+EXPORT int EndPage(HDC dc) { (void)dc; return -1; }
+EXPORT int StartPage(HDC dc) { (void)dc; return -1; }
+EXPORT int StartDocW(HDC dc, const void *di) { (void)dc; (void)di; return -1; }
+EXPORT int SetAbortProc(HDC dc, void *p) { (void)dc; (void)p; return -1; }
+EXPORT HDC CreateDCW(LPCWSTR drv, LPCWSTR dev, LPCWSTR port, const void *dm) { (void)drv; (void)dev; (void)port; (void)dm; return 0; }
+EXPORT int EnumFontsW(HDC dc, LPCWSTR face, void *proc, LPARAM p) { (void)dc; (void)face; (void)proc; (void)p; return 0; }
+EXPORT int GetTextFaceW(HDC dc, int n, LPWSTR out) {
+    static const WCHAR f[] = { 'S', 'e', 'g', 'o', 'e', ' ', 'U', 'I', 0 };
+    int l = 8;
+    if (out && n > 0) { int i = 0; for (; i < l && i < n - 1; i++) out[i] = f[i]; out[i] = 0; return i + 1; }
+    (void)dc;
+    return l + 1;
+}

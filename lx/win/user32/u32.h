@@ -40,6 +40,7 @@ struct cls {
     int unicode, builtin, atom;
     HCURSOR cursor;
     HICON icon;
+    ULONG_PTR menu_id; LPWSTR menu_name;               // the class menu (lpszMenuName): a resource id or name
 };
 
 struct sbi { int min, max, page, pos, trackpos; };
@@ -147,6 +148,8 @@ struct wnd *U_child_from_point(struct wnd *top, int x, int y);   // x,y in top-l
 
 // built-in controls (controls.c)
 void U_register_builtin(void);
+HMENU LoadMenuW(HINSTANCE h, LPCWSTR name);
+void U_register_comctl(void);
 LRESULT U_button_proc(HWND, UINT, WPARAM, LPARAM);
 LRESULT U_static_proc(HWND, UINT, WPARAM, LPARAM);
 LRESULT U_edit_proc(HWND, UINT, WPARAM, LPARAM);

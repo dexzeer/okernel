@@ -558,4 +558,5 @@ void U_register_builtin(void) {
     U_add_class("LISTBOX", U_listbox_proc, CS_DBLCLKS, 0, 0, win, 0, 0, 1);
     U_add_class("SCROLLBAR", U_scrollbar_proc, CS_DBLCLKS, 0, 0, face, 0, 0, 1);
     U_add_class("COMBOBOX", U_combobox_proc, CS_DBLCLKS, 0, 0, win, 0, 0, 1);
+    U_register_comctl();
 }
