@@ -238,7 +238,7 @@ static void gc_apply(struct gc *g, u32 mask, const u8 *v) {
 #define NEED(n) do { if (len < (u32)(n)) { send_error(c, ER_Length, 0, op, 0); return; } } while (0)
 #define BADWIN(id) do { send_error(c, ER_Window, (id), op, 0); return; } while (0)
 
-static int id_ok(struct client *c, u32 id) { return (id & ~0x1FFFFFu) == c->base && (id & 0x1FFFFF) != 0 && res_free_id(id); }
+static int id_ok(struct client *c, u32 id) { return (id & ~0x1FFFFFu) == c->base && res_free_id(id); }
 
 static u8 *reply(struct client *c, int data, u32 extra, u32 **unused) {
     (void)unused;
