@@ -574,7 +574,7 @@ struct lx_task *lx_clone(struct lx_task *p, uint64_t flags, uint64_t stack, uint
     if (stack) c->regs.rsp = stack;
     memcpy(c->fx, p->fx, 512);
     c->fs_base = (flags & CL_SETTLS) ? tls : p->fs_base;
-    c->gs_base = p->gs_base; c->is_win = p->is_win;
+    c->gs_base = p->gs_base; c->is_win = p->is_win; c->win_exc_entry = p->win_exc_entry;
     memcpy(c->comm, p->comm, 16);
     memcpy(c->exe, p->exe, sizeof c->exe);
     c->cwd = p->cwd;
@@ -633,6 +633,21 @@ extern int lx_sig_wake_blocked(struct lx_task *t);
 extern void lx_sig_timers(void);
 extern void lx_signal_group(int tgid, int sig);
 
+// A Windows program that registered an exception entry gets its faults there (structured exception handling is done in user
+// mode): the registers are copied to its stack as {struct lx_regs, cr2} and it continues at the entry with rcx = that frame.
+static int win_exception(struct lx_task *t, uint64_t vec) {
+    (void)vec;
+    uint64_t rip = t->regs.rip;
+    if (rip >= t->win_exc_entry && rip < t->win_exc_entry + 0x1000) return 0;        // a fault inside the entry stub itself: fatal
+    uint64_t F = (t->regs.rsp - 0x400) & ~15ull;
+    struct { struct lx_regs r; uint64_t cr2; uint64_t pad; } fr;
+    fr.r = t->regs; fr.cr2 = lx_fault_cr2; fr.pad = 0;
+    uint64_t ret = 0;
+    if (lx_copy_out(t, F, &fr, sizeof fr) || lx_copy_out(t, F - 40, &ret, 8)) return 0;
+    t->regs.rcx = F; t->regs.rsp = F - 40; t->regs.rip = t->win_exc_entry; t->regs.rflags = 0x202;
+    return 1;
+}
+
 // A hardware fault the kernel cannot repair: the matching signal, caught or fatal.
 static void fault_signal(struct lx_task *t, uint64_t vec) {
     int sig = 11;                                   // SIGSEGV
@@ -641,6 +656,7 @@ static void fault_signal(struct lx_task *t, uint64_t vec) {
     else if (vec == 17) sig = 7;                    // #AC  SIGBUS
     else if (vec == 3 || vec == 1) sig = 5;         // SIGTRAP
     if (vec == 14 && t->is_win && lx_pe_missing_import(t, t->regs.rip)) { lx_task_exit(t, 3 << 8); return; }
+    if (t->is_win && t->win_exc_entry && win_exception(t, vec)) return;
     uint64_t h = t->sh->act[sig].handler;
     if (h <= 1 || (t->sig_blocked & (1ull << (sig - 1)))) {
         serial_printf("[lx] pid %d (%s): fault vec=%d err=%x rip=%x addr=%x -> signal %d\n", t->tgid, t->comm, (int)vec,

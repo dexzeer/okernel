@@ -7,7 +7,9 @@
 imports.txt: lines "DLLNAME.dll: func func func ..."; gen-imports (below) makes the assembler stubs for them. The IAT slots
 come from the symbols __iat_<n>_<i> (n = index of the DLL in the file, i = index of the function).
 """
-import struct, sys, argparse
+import struct, sys, argparse, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import unwind
 
 def read_elf(path):
     d = open(path, "rb").read()
@@ -17,7 +19,7 @@ def read_elf(path):
     secs = []
     for i in range(shnum):
         name, typ, flags, addr, off, size, link, info, align, entsize = struct.unpack_from("<IIQQQQIIQQ", d, shoff + i * shentsize)
-        secs.append(dict(name=name, type=typ, flags=flags, addr=addr, off=off, size=size, link=link, entsize=entsize))
+        secs.append(dict(name=name, type=typ, flags=flags, addr=addr, off=off, size=size, link=link, info=info, entsize=entsize))
     stroff = secs[shstrndx]["off"]
     for s in secs:
         e = d.index(b"\0", stroff + s["name"])
@@ -31,7 +33,17 @@ def read_elf(path):
                 e = d.index(b"\0", strtab["off"] + nm)
                 syms[d[strtab["off"] + nm:e].decode()] = (val, shndx, info)
     entry, = struct.unpack_from("<Q", d, 0x18)
-    return d, secs, syms, entry
+    # relocations kept by `ld -q`: (target section name, offset in it, type) for the sections whose 32-bit fields are RVAs
+    for i, s in enumerate(secs):
+        s["idx"] = i
+    relocs = {}
+    for s in secs:
+        if s["type"] == 4:                                                   # SHT_RELA
+            tgt = secs[s["info"]]
+            for k in range(s["size"] // 24):
+                off, info, addend = struct.unpack_from("<QQq", d, s["off"] + k * 24)
+                relocs.setdefault(tgt["name"], []).append((off, info & 0xFFFFFFFF))
+    return d, secs, syms, entry, relocs
 
 def align(v, a): return (v + a - 1) // a * a
 
@@ -75,18 +87,24 @@ def main():
     ap.add_argument("--name", default=None)
     a = ap.parse_args()
     base = int(a.base, 0)
-    d, secs, syms, elf_entry = read_elf(a.elf)
+    d, secs, syms, elf_entry, relocs = read_elf(a.elf)
     # allocated sections become PE sections (names kept, at most 8 characters)
     pes = []
     for s in secs:
         if not (s["flags"] & 2) or s["size"] == 0: continue            # SHF_ALLOC
+        if s["name"] in (".eh_frame", ".sehfunc"): continue             # input of the unwind tables below, not shipped
         flags = 0x40000000                                              # readable
         if s["flags"] & 4: flags |= 0x20000000 | 0x20                   # executable code
         elif s["type"] == 8: flags |= 0xC0000000 | 0x80                 # .bss: read+write, uninitialised data
         else:
             flags |= 0x40 if True else 0
             if s["flags"] & 1: flags |= 0x80000000                      # writable
-        pes.append(dict(name=s["name"][:8], rva=s["addr"] - base, vsize=s["size"], data=None if s["type"] == 8 else d[s["off"]:s["off"] + s["size"]], flags=flags))
+        data = None if s["type"] == 8 else bytearray(d[s["off"]:s["off"] + s["size"]])
+        if s["name"] == ".sehdata" and data is not None:                # 32-bit relocations in hand written unwind data are RVAs
+            for off, typ in relocs.get(".sehdata", []):
+                o = off - s["addr"]
+                struct.pack_into("<I", data, o, (struct.unpack_from("<I", data, o)[0] - base) & 0xFFFFFFFF)
+        pes.append(dict(name=s["name"][:8], rva=s["addr"] - base, vsize=s["size"], data=None if data is None else bytes(data), flags=flags))
     # imports
     idata = bytearray()
     imports = parse_imports(a.imports) if a.imports else []
@@ -142,6 +160,33 @@ def main():
             struct.pack_into("<H", blob, ords_o + 2 * i, i)
         pes.append(dict(name=".edata", rva=nxt, vsize=len(blob), data=bytes(blob), flags=0x40000040))
         exp_rva, exp_size = nxt, len(blob)
+    # unwind tables: .pdata (RUNTIME_FUNCTION) and .xdata (UNWIND_INFO), from the compiler's CFI plus hand written entries
+    pd_rva = pd_size = 0
+    eh = next((x for x in secs if x["name"] == ".eh_frame" and x["size"]), None)
+    rt = []
+    xd = b""
+    if eh is not None:
+        ents, xd, bad = unwind.build(d[eh["off"]:eh["off"] + eh["size"]], eh["addr"], base)
+        if bad and os.environ.get("MKPE_UNWIND_VERBOSE"):
+            names = {v[0]: k for k, v in syms.items() if v[2] & 0xF in (1, 2)}
+            for b, why in bad: sys.stderr.write("unwind: no table for %s: %s\n" % (names.get(b, hex(b)), why))
+        rt = [(b, e, u) for b, e, u in ents]
+    user = next((x for x in secs if x["name"] == ".sehfunc" and x["size"]), None)
+    user_rt = []
+    if user is not None:
+        raw = bytearray(d[user["off"]:user["off"] + user["size"]])
+        for off, typ in relocs.get(".sehfunc", []):
+            o = off - user["addr"]
+            struct.pack_into("<I", raw, o, (struct.unpack_from("<I", raw, o)[0] - base) & 0xFFFFFFFF)
+        for k in range(len(raw) // 12): user_rt.append(struct.unpack_from("<III", raw, 12 * k))
+    if rt or user_rt:
+        nxt = max(p["rva"] + align(p["vsize"], 0x1000) for p in pes)
+        xd_rva = nxt
+        if xd: pes.append(dict(name=".xdata", rva=xd_rva, vsize=len(xd), data=xd, flags=0x40000040)); nxt += align(len(xd), 0x1000)
+        table = sorted([(b, e, xd_rva + u) for b, e, u in rt] + user_rt)
+        pdata = b"".join(struct.pack("<III", *t) for t in table)
+        pd_rva, pd_size = nxt, len(pdata)
+        pes.append(dict(name=".pdata", rva=pd_rva, vsize=len(pdata), data=pdata, flags=0x40000040))
     # headers
     entry_sym = a.entry or ("DllMain" if a.dll else None)
     entry_rva = (syms[entry_sym][0] - base) if entry_sym and entry_sym in syms else max(0, elf_entry - base)
@@ -174,6 +219,7 @@ def main():
     dd = o + 112
     if exp_rva: struct.pack_into("<II", out, dd, exp_rva, exp_size)
     if imports: struct.pack_into("<II", out, dd + 8, idata_rva, 20 * (len(imports) + 1))
+    if pd_rva: struct.pack_into("<II", out, dd + 24, pd_rva, pd_size)               # exception directory
     so = o + 240
     for i, p in enumerate(pes):
         nm = p["name"].encode()[:8].ljust(8, b"\0")

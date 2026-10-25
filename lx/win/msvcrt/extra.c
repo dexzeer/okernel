@@ -8,7 +8,8 @@ int _fmode;
 
 // ---- SEH / C++ runtime: nothing is unwound yet ------------------------------------------------------------------------------------------
 
-EXPORT int __C_specific_handler(void *rec, void *frame, void *ctx, void *disp) { (void)rec; (void)frame; (void)ctx; (void)disp; return 1; }   // ExceptionContinueSearch
+extern int __k32_c_specific_handler(void *rec, void *frame, void *ctx, void *disp);
+EXPORT int __C_specific_handler(void *rec, void *frame, void *ctx, void *disp) { return __k32_c_specific_handler(rec, frame, ctx, disp); }
 EXPORT int __setusermatherr(void *f) { (void)f; return 0; }
 void terminate_stub(void) { for (;;) SC1(LX_exit_group, 3); }
 
