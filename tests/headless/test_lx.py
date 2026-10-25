@@ -50,6 +50,8 @@ try:
     run("lx /bin/threads", "joined: shared=101 counter=1000")
     run("lx /bin/glthread", "threads done: total=4000 sum=60")
     run("lx /bin/glsock", "SOCKTEST PASS")
+    run("lx /win/hello.exe", "hello from a Windows program", status=7 << 8)
+    run("lx /win/crtdemo.exe", "CRTDEMO PASS", timeout=120)
     if "/bin/bash" in open(os.path.join(HERE, "..", "..", "build-host", "lxtest.tar"), "rb").read().decode("latin1")[:0] or True:
         # dynamically linked host programs, only when the root has them
         tarlist = vm.serial()

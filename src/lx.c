@@ -300,6 +300,7 @@ static struct lx_mm *mm_new(void) {
 static void mm_put(struct lx_mm *m) {
     if (--m->refs > 0) return;
     mm_free_user(m);
+    if (m->win) kfree(m->win);
     aspace_destroy(m->cr3);
     kfree(m->vma);
     kfree(m);
@@ -563,6 +564,7 @@ struct lx_task *lx_clone(struct lx_task *p, uint64_t flags, uint64_t stack, uint
     if (stack) c->regs.rsp = stack;
     memcpy(c->fx, p->fx, 512);
     c->fs_base = (flags & CL_SETTLS) ? tls : p->fs_base;
+    c->gs_base = p->gs_base; c->is_win = p->is_win;
     memcpy(c->comm, p->comm, 16);
     memcpy(c->exe, p->exe, sizeof c->exe);
     c->cwd = p->cwd;
@@ -628,6 +630,7 @@ static void fault_signal(struct lx_task *t, uint64_t vec) {
     else if (vec == 0 || vec == 16 || vec == 19) sig = 8;   // #DE, x87, SSE  SIGFPE
     else if (vec == 17) sig = 7;                    // #AC  SIGBUS
     else if (vec == 3 || vec == 1) sig = 5;         // SIGTRAP
+    if (vec == 14 && t->is_win && lx_pe_missing_import(t, t->regs.rip)) { lx_task_exit(t, 3 << 8); return; }
     uint64_t h = t->sh->act[sig].handler;
     if (h <= 1 || (t->sig_blocked & (1ull << (sig - 1)))) {
         serial_printf("[lx] pid %d (%s): fault vec=%d err=%x rip=%x addr=%x -> signal %d\n", t->tgid, t->comm, (int)vec,
@@ -641,6 +644,7 @@ static void fault_signal(struct lx_task *t, uint64_t vec) {
 static inline void load_user_state(struct lx_task *t) {
     __asm__ volatile("mov %0, %%cr3" :: "r"(t->mm->cr3) : "memory");
     wrmsr(0xC0000100, t->fs_base);                  // IA32_FS_BASE
+    if (t->is_win) wrmsr(0xC0000101, t->gs_base);   // IA32_GS_BASE: the TEB
 }
 
 static inline void load_kernel_state(void) {
@@ -664,7 +668,9 @@ static void run_slice(struct lx_task *t) {
         if (reason == LX_ENTER_SYSCALL) {
             t->sysnr = t->regs.rax;
             load_kernel_state();
+            lxfs_case_insensitive = t->is_win;
             int64_t r = lx_syscall_dispatch(t);
+            lxfs_case_insensitive = 0;
             if (t->state == LXT_FREE || t->state == LXT_ZOMBIE) break;
             if (t->state == LXT_BLOCK) {
                 if (t->block_complete) { t->block_complete = 0; t->blocked_rewound = 0; t->regs.rax = (uint64_t)r; }       // done; only the waiting remains

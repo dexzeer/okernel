@@ -40,9 +40,18 @@ void lxfs_init(void) {
 
 struct lx_node *lxfs_root(void) { return root; }
 
+int lxfs_case_insensitive;                                   // set while serving a Windows program
+
 static struct lx_node *find_child(struct lx_node *dir, const char *name, uint32_t len) {
     for (struct lx_node *c = dir->child; c; c = c->next)
         if (strlen(c->name) == len && memcmp(c->name, name, len) == 0) return c;
+    if (lxfs_case_insensitive)
+        for (struct lx_node *c = dir->child; c; c = c->next) {
+            if (strlen(c->name) != len) continue;
+            uint32_t i = 0;
+            while (i < len && (c->name[i] | 0x20) == (name[i] | 0x20) && ((c->name[i] | 0x20) < 'a' || (c->name[i] | 0x20) > 'z' ? c->name[i] == name[i] : 1)) i++;
+            if (i == len) return c;
+        }
     return 0;
 }
 

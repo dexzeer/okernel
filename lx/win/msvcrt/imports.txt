@@ -1,0 +1,1 @@
+kernel32.dll: HeapAlloc HeapReAlloc HeapFree HeapSize GetProcessHeap ExitProcess GetCommandLineA GetEnvironmentStringsA GetEnvironmentVariableA GetSystemTimeAsFileTime WideCharToMultiByte MultiByteToWideChar

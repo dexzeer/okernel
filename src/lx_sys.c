@@ -1085,7 +1085,8 @@ int64_t lx_syscall_dispatch(struct lx_task *t) {
     case 158: { // arch_prctl
         if (a0 == 0x1002) { t->fs_base = a1; __asm__ volatile("wrmsr" :: "c"(0xC0000100), "a"((uint32_t)a1), "d"((uint32_t)(a1 >> 32))); return 0; }
         if (a0 == 0x1003) return lx_copy_out(t, a1, &t->fs_base, 8);
-        if (a0 == 0x1001 || a0 == 0x1004) return a0 == 0x1001 ? 0 : lx_copy_out(t, a1, (uint64_t[]){0}, 8);
+        if (a0 == 0x1001) { t->gs_base = a1; __asm__ volatile("wrmsr" :: "c"(0xC0000101), "a"((uint32_t)a1), "d"((uint32_t)(a1 >> 32))); return 0; }
+        if (a0 == 0x1004) return lx_copy_out(t, a1, &t->gs_base, 8);
         return -LX_EINVAL;
     }
     case 202: { // futex
