@@ -507,6 +507,7 @@ static void shell_execute_lx(int win_id, const char *rest) {
     }
     av[ac] = 0;
     if (ac == 0) { window_puts(win_id, "usage: lx <path> [args]\n"); return; }
+    if (str_eq(av[0], "trace")) { extern int lx_trace; lx_trace = ac > 1 ? str_eq(av[1], "on") : !lx_trace; window_puts(win_id, lx_trace ? "trace on\n" : "trace off\n"); return; }
     static const char *const env[] = { "PATH=/bin:/usr/bin:/sbin:/usr/sbin", "HOME=/root", "TERM=xterm", "USER=root", "SHELL=/bin/sh", "LANG=C", 0 };
     int pid = lx_spawn(av[0], av, env, win_id);
     if (pid < 0) {

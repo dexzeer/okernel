@@ -386,8 +386,35 @@ EXPORT HICON LoadIconW(HINSTANCE h, LPCWSTR n) { return LoadIconA(h, (LPCSTR)n);
 EXPORT HANDLE LoadImageA(HINSTANCE h, LPCSTR n, UINT t, int w, int hh, UINT f) { (void)h; (void)n; (void)t; (void)w; (void)hh; (void)f; return (HANDLE)0x5000; }
 EXPORT HANDLE LoadImageW(HINSTANCE h, LPCWSTR n, UINT t, int w, int hh, UINT f) { return LoadImageA(h, (LPCSTR)n, t, w, hh, f); }
 EXPORT HBITMAP LoadBitmapA(HINSTANCE h, LPCSTR n) { (void)h; (void)n; return 0; }
-EXPORT int LoadStringA(HINSTANCE h, UINT id, LPSTR buf, int cap) { (void)h; (void)id; if (cap > 0) buf[0] = 0; return 0; }
-EXPORT int LoadStringW(HINSTANCE h, UINT id, LPWSTR buf, int cap) { (void)h; (void)id; if (cap > 0) buf[0] = 0; return 0; }
+extern HRSRC FindResourceExW(HMODULE m, LPCWSTR type, LPCWSTR name, WORD lang);
+extern HGLOBAL LoadResource(HMODULE m, HRSRC r);
+static const WCHAR *find_string(HINSTANCE h, UINT id, int *len) {
+    HRSRC r = FindResourceExW(h, (LPCWSTR)(ULONG_PTR)6, (LPCWSTR)(ULONG_PTR)((id >> 4) + 1), 0);          // RT_STRING: blocks of 16
+    if (!r) return 0;
+    const WCHAR *p = LoadResource(h, r);
+    for (UINT i = 0; i < (id & 15); i++) p += 1 + p[0];
+    *len = p[0];
+    return p + 1;
+}
+EXPORT int LoadStringW(HINSTANCE h, UINT id, LPWSTR buf, int cap) {
+    int n;
+    const WCHAR *s = find_string(h, id, &n);
+    if (!s) { if (cap > 0) buf[0] = 0; return 0; }
+    if (cap == 0) { *(const WCHAR**)buf = s; return n; }                                                    // the caller wants a pointer into the resource
+    if (n > cap - 1) n = cap - 1;
+    for (int i = 0; i < n; i++) buf[i] = s[i];
+    buf[n] = 0;
+    return n;
+}
+EXPORT int LoadStringA(HINSTANCE h, UINT id, LPSTR buf, int cap) {
+    int n;
+    const WCHAR *s = find_string(h, id, &n);
+    if (!s || cap <= 0) { if (cap > 0) buf[0] = 0; return 0; }
+    int r = WideCharToMultiByte(65001, 0, s, n, buf, cap - 1, 0, 0);
+    if (r < 0) r = 0;
+    buf[r] = 0;
+    return r;
+}
 EXPORT BOOL DestroyIcon(HICON i) { (void)i; return TRUE; }
 EXPORT BOOL DestroyCursor(HCURSOR c) { (void)c; return TRUE; }
 EXPORT HANDLE LoadAcceleratorsA(HINSTANCE h, LPCSTR n) { (void)h; (void)n; return (HANDLE)1; }

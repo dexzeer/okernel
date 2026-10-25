@@ -55,7 +55,7 @@ def gen_stubs(imports_path, out_path):
     slots = []
     for n, (dll, funcs) in enumerate(parse_imports(imports_path)):
         for i, f in enumerate(funcs):
-            lines.append(f"    .globl {f}\n{f}:\n    jmp *__iat_{n}_{i}(%rip)")
+            lines.append(f'    .globl "{f}"\n"{f}":\n    jmp *__iat_{n}_{i}(%rip)')
         slots.append((n, len(funcs)))
     lines.append('    .section .iat,"aw"\n    .balign 8')
     for n, cnt in slots:

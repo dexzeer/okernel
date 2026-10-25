@@ -661,6 +661,22 @@ static inline void load_kernel_state(void) {
     __asm__ volatile("mov %0, %%cr3" :: "r"(paging_kernel_pd_phys()) : "memory");
 }
 
+int lx_trace;
+// `lx trace on`: every system call with its arguments, the path for the calls that take one, and the result (serial)
+static void lx_trace_call(struct lx_task *t, int64_t r) {
+    uint64_t nr = t->sysnr, pa = 0;
+    char path[72];
+    path[0] = 0;
+    if (nr == 2 || nr == 4 || nr == 6 || nr == 21 || nr == 59 || nr == 80 || nr == 82 || nr == 83 || nr == 84 || nr == 87 || nr == 89) pa = t->regs.rdi;
+    else if (nr == 257 || nr == 262) pa = t->regs.rsi;
+    if (pa) {
+        int n = 0;
+        for (; n < 70; n++) { char c; if (lx_copy_in(t, &c, pa + (uint64_t)n, 1)) break; path[n] = c; if (!c) break; }
+        path[n] = 0;
+    }
+    serial_printf("[lxt] %d nr=%d (%x,%x,%x) %s -> %d\n", t->tgid, (int)nr, (uint32_t)t->regs.rdi, (uint32_t)t->regs.rsi, (uint32_t)t->regs.rdx, path, (int)r);
+}
+
 static void run_slice(struct lx_task *t) {
     cur = t;
     uint32_t ktop = (uint32_t)&t->regs + sizeof t->regs;
@@ -681,6 +697,7 @@ static void run_slice(struct lx_task *t) {
             lxfs_case_insensitive = t->is_win;
             int64_t r = lx_syscall_dispatch(t);
             lxfs_case_insensitive = 0;
+            if (lx_trace) lx_trace_call(t, r);
             if (t->state == LXT_FREE || t->state == LXT_ZOMBIE) break;
             if (t->state == LXT_BLOCK) {
                 if (t->block_complete) { t->block_complete = 0; t->blocked_rewound = 0; t->regs.rax = (uint64_t)r; }       // done; only the waiting remains

@@ -160,6 +160,7 @@ struct lx_sighand {
     struct lx_sigaction act[LX_NSIG];
 };
 
+extern int lx_trace;
 struct lx_task {
     struct lx_regs regs;                     // FIRST: TSS.rsp0 points just past it (16-byte aligned page start + 0)
     uint8_t  fx[512] __attribute__((aligned(16)));   // x87/SSE state

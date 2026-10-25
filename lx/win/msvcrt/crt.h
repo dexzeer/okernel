@@ -17,6 +17,7 @@ typedef struct _FILE {
     int rpos, rlen, wlen, cap;
     int unget;
     int owned_buf;
+    long long pad_;             // sizeof(FILE) = 48 like the Microsoft one: compiled programs index __iob_func() with that stride
 } FILE;
 
 #define _IOREAD 1
