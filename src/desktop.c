@@ -5,6 +5,7 @@
 #include "net/e1000.h"
 #include "crypto/tls_client.h"  // TLS_FAIL_* reason codes for the no-downgrade gate
 #include "rtc.h"
+#include "winfx.h"
 #include "taskbar.h"
 #include "graphics.h"
 #include "web/image.h"
@@ -309,7 +310,7 @@ static void draw_desktop_icons_in(int rx, int ry, int rw, int rh) {
 // sprite and any other region whose pixels must return to model truth.
 // skip_win: window id to leave out of the recomposite (-1 = none) — used
 // by the drag path when the dragged window's pixels were already blitted.
-static void desktop_paint_rect_skip(int skip_win, int x, int y, int w, int h) {
+static void desktop_paint_rect_z(int skip_win, int zlimit, int x, int y, int w, int h) {
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > SCREEN_W) w = SCREEN_W - x;
@@ -318,6 +319,8 @@ static void desktop_paint_rect_skip(int skip_win, int x, int y, int w, int h) {
 
     // All repair drawing is clip-limited so only the damaged rows/columns
     // get marked dirty (keeps flush volume proportional to repair size)
+    int oc0, oc1, oc2, oc3;
+    graphics_get_clip(&oc0, &oc1, &oc2, &oc3);       // nested use (rounded corners recomposite what is below a window)
     graphics_set_clip(x, y, w, h);
 
     graphics_blit_wallpaper_rect(x, y, w, h);
@@ -329,7 +332,7 @@ static void desktop_paint_rect_skip(int skip_win, int x, int y, int w, int h) {
     int vis[MAX_WINDOWS], nv = 0;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         struct window* win = window_get(i);
-        if (!win || !win->visible || win->minimized || i == skip_win) continue;
+        if (!win || !win->visible || win->minimized || i == skip_win || win->z >= zlimit || winfx_hides(i)) continue;
         if (win->x < x + w && win->x + win->w > x &&
             win->y < y + h && win->y + win->h > y)
             vis[nv++] = i;
@@ -343,18 +346,42 @@ static void desktop_paint_rect_skip(int skip_win, int x, int y, int w, int h) {
         int id = vis[a];
         window_paint_region(id, x, y, w, h);
         int ob = okai_find_by_win(id);
-        if (ob >= 0) okai_paint_overlays(ob);
+        if (ob >= 0) { okai_paint_overlays(ob); winfx_round_corners(id, x, y, x + w, y + h); }
     }
 
     if (y + h > SCREEN_H - TASKBAR_H) {
         taskbar_paint();
     }
 
-    graphics_clip_reset();
+    graphics_set_clip(oc0, oc1, oc2 - oc0, oc3 - oc1);
+}
+
+static void desktop_paint_rect_skip(int skip_win, int x, int y, int w, int h) {
+    desktop_paint_rect_z(skip_win, 0x7fffffff, x, y, w, h);
 }
 
 static void desktop_paint_rect(int x, int y, int w, int h) {
     desktop_paint_rect_skip(-1, x, y, w, h);
+}
+
+// The scene below a window (wallpaper, icons, windows with a lower z, taskbar) into a region: what shows through its
+// rounded corners.
+void desktop_paint_below(int zlimit, int x, int y, int w, int h) {
+    desktop_paint_rect_z(-1, zlimit, x, y, w, h);
+}
+
+// Window `id` drawn alone over the scene below it (the animations take their snapshot from this).
+void desktop_paint_window_alone(int id) {
+    struct window* w = window_get(id);
+    if (!w) return;
+    desktop_paint_rect_z(-1, w->z, w->x, w->y, w->w, w->h);
+    int oc0, oc1, oc2, oc3;
+    graphics_get_clip(&oc0, &oc1, &oc2, &oc3);
+    graphics_set_clip(w->x, w->y, w->w, w->h);
+    window_paint_region(id, w->x, w->y, w->w, w->h);
+    int ob = okai_find_by_win(id);
+    if (ob >= 0) { okai_paint_overlays(ob); winfx_round_corners(id, w->x, w->y, w->x + w->w, w->y + w->h); }
+    graphics_set_clip(oc0, oc1, oc2 - oc0, oc3 - oc1);
 }
 
 // Public wrapper so other modules (e.g. window.c on close/minimize) can repair
@@ -2915,6 +2942,8 @@ void kernel_main(uint32_t mboot_phys) {
                             desktop_paint_rect_skip(drag_win, ox, oy, ow, ny - oy);
                         if (ny + oh < oy + oh)
                             desktop_paint_rect_skip(drag_win, ox, ny + oh, ow, (oy + oh) - (ny + oh));
+                        // the blit carried the old corner squares (and what was behind them) along
+                        winfx_round_corners(drag_win, nx, ny, nx + ow, ny + oh);
                     }
                 }
             }
@@ -3007,12 +3036,13 @@ void kernel_main(uint32_t mboot_phys) {
         // overlay never bleeds over a covering window, and that covering window
         // does NOT need a forced full repaint every frame (which tanked FPS when
         // a window sat over okai).
+        winfx_step();
         PROF_BEGIN(PZ_WINDOWS);
         {
             int vis[MAX_WINDOWS], nv = 0;
             for (int i = 0; i < MAX_WINDOWS; i++) {
                 struct window* w = window_get(i);
-                if (w && w->visible && !w->minimized) vis[nv++] = i;
+                if (w && w->visible && !w->minimized && !winfx_hides(i)) vis[nv++] = i;
             }
             // insertion sort by z ascending (back to front)
             for (int a = 1; a < nv; a++) {
@@ -3078,6 +3108,7 @@ void kernel_main(uint32_t mboot_phys) {
                             }
                         }
                         okai_paint_overlays_rects(ob, rects, nr);
+                        for (int k = 0; k < nr; k++) winfx_round_corners(id, rects[k][0], rects[k][1], rects[k][0] + rects[k][2], rects[k][1] + rects[k][3]);
                         // Clear chrome-dirty only once the paint was visible:
                         // a fully-covered window (nr==0) keeps it until the
                         // repair path repaints the overlay on uncover.
@@ -3147,7 +3178,7 @@ void kernel_main(uint32_t mboot_phys) {
         // Waiting for the network only (a fetch in flight, nothing else to run): packets are polled, so sleep in
         // half-millisecond steps (local APIC timer) instead of spinning; with nothing at all to do, sleep to the next tick.
         int net_wait = fetch_free_slots() != FETCH_MAX || ow_now == 2;
-        int timed_wait = ow_now == 3;
+        int timed_wait = ow_now == 3 || winfx_active();
         if (!composed && !cursor_moved && !mb && !wheel && drag_win < 0 && resize_win < 0 &&
             ow_now != 1 && !mplay_wants_cpu() && !lx_busy() && ((!net_wait && !timed_wait) || lapic_timer_available())) {
             if (net_wait) lapic_timer_oneshot_us(500);
