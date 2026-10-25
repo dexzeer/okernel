@@ -333,8 +333,9 @@ static void desktop_paint_rect_z(int skip_win, int zlimit, int x, int y, int w, 
     for (int i = 0; i < MAX_WINDOWS; i++) {
         struct window* win = window_get(i);
         if (!win || !win->visible || win->minimized || i == skip_win || win->z >= zlimit || winfx_hides(i)) continue;
-        if (win->x < x + w && win->x + win->w > x &&
-            win->y < y + h && win->y + win->h > y)
+        int bx, by, bw, bh;
+        winfx_shadow_bounds(i, &bx, &by, &bw, &bh);                  // a window whose shadow reaches into the region counts too
+        if (bx < x + w && bx + bw > x && by < y + h && by + bh > y)
             vis[nv++] = i;
     }
     for (int a = 1; a < nv; a++) {
@@ -344,6 +345,9 @@ static void desktop_paint_rect_z(int skip_win, int zlimit, int x, int y, int w, 
     }
     for (int a = 0; a < nv; a++) {
         int id = vis[a];
+        struct window* vw = window_get(id);
+        winfx_shadow(id, x, y, w, h, 0);                              // its shadow on everything painted so far
+        if (!(vw->x < x + w && vw->x + vw->w > x && vw->y < y + h && vw->y + vw->h > y)) continue;   // only the shadow reaches here
         window_paint_region(id, x, y, w, h);
         int ob = okai_find_by_win(id);
         if (ob >= 0) { okai_paint_overlays(ob); winfx_round_corners(id, x, y, x + w, y + h); }
@@ -2933,15 +2937,25 @@ void kernel_main(uint32_t mboot_phys) {
                         w->x = nx; w->y = ny;
                         graphics_blit_rect(ox, oy, ow, oh, nx - ox, ny - oy);
 
-                        // exposed L-strips: old footprint minus new
-                        if (nx > ox)
-                            desktop_paint_rect_skip(drag_win, ox, oy, nx - ox, oh);
-                        if (nx + ow < ox + ow)
-                            desktop_paint_rect_skip(drag_win, nx + ow, oy, (ox + ow) - (nx + ow), oh);
-                        if (ny > oy)
-                            desktop_paint_rect_skip(drag_win, ox, oy, ow, ny - oy);
-                        if (ny + oh < oy + oh)
-                            desktop_paint_rect_skip(drag_win, ox, ny + oh, ow, (oy + oh) - (ny + oh));
+                        // The shadow moves with the window: recomposite (without it) the union of the old and the new
+                        // footprint including shadows, except the window's new rectangle, then cast its shadow there again.
+                        int ux, uy, uw, uh, gx = ox, gy = oy, gw = ow, gh = oh;
+                        winfx_grow_rect(&gx, &gy, &gw, &gh);
+                        winfx_shadow_bounds(drag_win, &ux, &uy, &uw, &uh);
+                        { int x1 = gx + gw > ux + uw ? gx + gw : ux + uw, y1 = gy + gh > uy + uh ? gy + gh : uy + uh;
+                          if (gx < ux) ux = gx;
+                          if (gy < uy) uy = gy;
+                          uw = x1 - ux; uh = y1 - uy; }
+                        int strip[4][4] = {
+                            { ux, uy, uw, ny - uy },                                   // above the new rectangle
+                            { ux, ny + oh, uw, uy + uh - (ny + oh) },                  // below
+                            { ux, ny, nx - ux, oh },                                   // left
+                            { nx + ow, ny, ux + uw - (nx + ow), oh } };                // right
+                        for (int s = 0; s < 4; s++) {
+                            if (strip[s][2] <= 0 || strip[s][3] <= 0) continue;
+                            desktop_paint_rect_skip(drag_win, strip[s][0], strip[s][1], strip[s][2], strip[s][3]);
+                            winfx_shadow(drag_win, strip[s][0], strip[s][1], strip[s][2], strip[s][3], 0);
+                        }
                         // the blit carried the old corner squares (and what was behind them) along
                         winfx_round_corners(drag_win, nx, ny, nx + ow, ny + oh);
                     }
@@ -2969,12 +2983,12 @@ void kernel_main(uint32_t mboot_phys) {
                     if (w->w != ow) {
                         int bx0 = w->x + (ow < w->w ? ow : w->w) - band;
                         int hmax = oh > w->h ? oh : w->h;
-                        desktop_paint_rect(bx0, w->y, dw + band, hmax);
+                        desktop_paint_rect(bx0, w->y - 10, dw + band + 16, hmax + 32);       // (and the shadow beside and below)
                     }
                     if (w->h != oh) {
                         int by0 = w->y + (oh < w->h ? oh : w->h) - band;
                         int wmax = ow > w->w ? ow : w->w;
-                        desktop_paint_rect(w->x, by0, wmax, dh + band);
+                        desktop_paint_rect(w->x - 16, by0, wmax + 32, dh + band + 22);
                     }
                     needs_redraw = 0; // bands above already repaired
                 }
@@ -3108,6 +3122,7 @@ void kernel_main(uint32_t mboot_phys) {
                             }
                         }
                         okai_paint_overlays_rects(ob, rects, nr);
+                        for (int k = 0; k < nr; k++) winfx_shadows_above(w->z, rects[k][0], rects[k][1], rects[k][2], rects[k][3]);   // the overlay repaint erased shadows of windows above
                         for (int k = 0; k < nr; k++) winfx_round_corners(id, rects[k][0], rects[k][1], rects[k][0] + rects[k][2], rects[k][1] + rects[k][3]);
                         // Clear chrome-dirty only once the paint was visible:
                         // a fully-covered window (nr==0) keeps it until the

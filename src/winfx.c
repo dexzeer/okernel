@@ -65,6 +65,84 @@ static uint32_t blend(uint32_t bg, uint32_t fg, uint32_t a) {   // a: 0..255 wei
     return rb | g;
 }
 
+// ---- drop shadows ----------------------------------------------------------------------------------------------------------
+// A window casts a soft shadow on everything below it (wallpaper, icons, lower windows): black, peak opacity SH_A, falling off
+// over SH_R pixels beyond a core rectangle that is the window shifted down by SH_DY. Only pixels outside the window are
+// touched (except its corner squares, whose outside-the-arc pixels show the scene below plus the shadow). Whoever repaints a
+// region from the scene model draws the shadows in z order; whoever repaints part of a window over an existing shadow
+// re-applies the shadows of the windows above it (winfx_shadows_above).
+#define SH_R 16
+#define SH_DY 6
+#define SH_A 112
+static uint8_t sh_g[SH_R + 1];
+static int sh_ready;
+
+static int has_shadow(const struct window* w, int id) {
+    return w && !window_is_maximized(id) && w->w >= 4 * R && w->h >= 4 * R;
+}
+
+void winfx_shadow_bounds(int id, int* x, int* y, int* w, int* h) {
+    struct window* win = window_get(id);
+    if (!win) { *x = *y = *w = *h = 0; return; }
+    if (!has_shadow(win, id)) { *x = win->x; *y = win->y; *w = win->w; *h = win->h; return; }
+    *x = win->x - SH_R; *y = win->y + SH_DY - SH_R; *w = win->w + 2 * SH_R; *h = win->h + 2 * SH_R;
+}
+
+void winfx_grow_rect(int* x, int* y, int* w, int* h) {
+    *x -= SH_R; *y += SH_DY - SH_R; *w += 2 * SH_R; *h += 2 * SH_R;
+}
+
+void winfx_shadow(int id, int rx, int ry, int rw, int rh, int inside) {
+    struct window* win = window_get(id);
+    if (!win || !win->visible || win->minimized || winfx_hides(id) || !has_shadow(win, id)) return;
+    if (!sh_ready) { for (int d = 0; d <= SH_R; d++) sh_g[d] = (uint8_t)(255 * (SH_R - d) * (SH_R - d) / (SH_R * SH_R)); sh_ready = 1; }
+    int bx, by, bw, bh;
+    winfx_shadow_bounds(id, &bx, &by, &bw, &bh);
+    int x0 = rx > bx ? rx : bx, y0 = ry > by ? ry : by;
+    int x1 = rx + rw < bx + bw ? rx + rw : bx + bw, y1 = ry + rh < by + bh ? ry + rh : by + bh;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > SCREEN_W) x1 = SCREEN_W;
+    if (y1 > SCREEN_H - TASKBAR_H) y1 = SCREEN_H - TASKBAR_H;
+    if (x0 >= x1 || y0 >= y1) return;
+    uint32_t* bb = graphics_get_buffer();
+    int cx0 = win->x, cx1 = win->x + win->w, cy0 = win->y + SH_DY, cy1 = win->y + win->h + SH_DY;
+    for (int y = y0; y < y1; y++) {
+        int dy = y < cy0 ? cy0 - y : y >= cy1 ? y - cy1 + 1 : 0;
+        if (dy > SH_R) continue;
+        uint32_t gy = sh_g[dy];
+        int sk0 = 0, sk1 = 0;                                        // x range that is the window itself: not touched
+        if (!inside && y >= win->y && y < win->y + win->h) {
+            int corner_row = y < win->y + R || y >= win->y + win->h - R;
+            sk0 = corner_row ? win->x + R : win->x; sk1 = corner_row ? win->x + win->w - R : win->x + win->w;
+        }
+        uint32_t* row = bb + y * SCREEN_W;
+        for (int x = x0; x < x1; x++) {
+            if (x >= sk0 && x < sk1) { x = sk1 - 1; continue; }
+            int dx = x < cx0 ? cx0 - x : x >= cx1 ? x - cx1 + 1 : 0;
+            if (dx > SH_R) continue;
+            uint32_t a = (uint32_t)SH_A * sh_g[dx] / 255 * gy / 255;
+            if (a) row[x] = blend(row[x], 0, a);
+        }
+    }
+    graphics_mark_rect(x0, y0, x1 - x0, y1 - y0);
+}
+
+// The shadows of the windows above z over a region that a lower window just repainted.
+void winfx_shadows_above(int z, int x, int y, int w, int h) {
+    int ids[MAX_WINDOWS], n = 0;
+    for (int i = 0; i < MAX_WINDOWS; i++) {
+        struct window* o = window_get(i);
+        if (o && o->visible && !o->minimized && o->z > z) ids[n++] = i;
+    }
+    for (int a = 1; a < n; a++) {
+        int id = ids[a], zz = window_get(id)->z, b = a - 1;
+        while (b >= 0 && window_get(ids[b])->z > zz) { ids[b + 1] = ids[b]; b--; }
+        ids[b + 1] = id;
+    }
+    for (int a = 0; a < n; a++) winfx_shadow(ids[a], x, y, w, h, 0);
+}
+
 int winfx_radius(int id) {
     struct window* w = window_get(id);
     if (!w || !w->visible) return 0;
@@ -92,6 +170,7 @@ void winfx_round_corners(int id, int cx0, int cy0, int cx1, int cy1) {
         for (int y = y0; y < y1; y++)
             for (int x = x0; x < x1; x++) save[(y - sy) * R + (x - sx)] = bb[y * SCREEN_W + x];
         desktop_paint_below(w->z, x0, y0, x1 - x0, y1 - y0);           // what is behind the window
+        winfx_shadow(id, x0, y0, x1 - x0, y1 - y0, 1);                  // ... including this window's own shadow
         for (int y = y0; y < y1; y++)
             for (int x = x0; x < x1; x++) {
                 int qi = (c & 1) ? R - 1 - (x - sx) : x - sx, qj = (c & 2) ? R - 1 - (y - sy) : y - sy;
@@ -106,9 +185,10 @@ void winfx_round_corners(int id, int cx0, int cy0, int cx1, int cy1) {
 
 // ---- animations -------------------------------------------------------------------------------------------------------------
 
-enum { FX_OPEN = 1, FX_MIN = 2, FX_RESTORE = 3 };
+enum { FX_OPEN = 1, FX_MIN = 2, FX_RESTORE = 3, FX_CLOSE = 4 };
 #define DUR_OPEN_TICKS    20      // 100 Hz ticks
 #define DUR_MIN_TICKS     25
+#define DUR_CLOSE_TICKS   14
 
 struct anim {
     int active, id, kind;
@@ -131,7 +211,7 @@ static int work_bottom(void) { return SCREEN_H - TASKBAR_H; }
 int winfx_hides(int id) {
     if (snapshotting) return 0;
     if (id < 0 || id >= MAX_WINDOWS) return 0;
-    return pending[id] || (A.active && A.id == id);
+    return pending[id] || (A.active && A.kind != FX_CLOSE && A.id == id);
 }
 int winfx_active(void) {
     if (A.active) return 1;
@@ -147,17 +227,18 @@ static void free_buffers(void) {
 // Leave the current animation at once (the end state is applied).
 static void finish(void) {
     if (!A.active) return;
-    struct window* w = window_get(A.id);
     int id = A.id, kind = A.kind, frames = A.frames;
+    struct window* w = kind == FX_CLOSE ? 0 : window_get(id);     // (a closed window is gone; its id may belong to a new one)
     uint32_t ms = (tick_count - A.t0) * 10;
     int ux = A.ux, uy = A.uy, uw = A.uw, uh = A.uh;
     A.active = 0;
     free_buffers();
-    if (w && w->visible) {
+    if (kind == FX_CLOSE) desktop_paint_rect_pub(ux, uy, uw, uh);
+    else if (w && w->visible) {
         desktop_paint_rect_pub(ux, uy, uw, uh);                     // the area the frames touched, from the scene model
         if (kind != FX_MIN) { w->dirty = 1; w->pr_valid = 0; w->pxd_valid = 0; }
     }
-    serial_printf("[winfx] %s win=%d frames=%d ms=%u\n", kind == FX_OPEN ? "open" : kind == FX_MIN ? "minimize" : "restore", id, frames, (unsigned)ms);
+    serial_printf("[winfx] %s win=%d frames=%d ms=%u\n", kind == FX_OPEN ? "open" : kind == FX_MIN ? "minimize" : kind == FX_CLOSE ? "close" : "restore", id, frames, (unsigned)ms);
 }
 
 static int rect_union(int* x, int* y, int* w, int* h, int ax, int ay, int aw, int ah) {
@@ -219,7 +300,8 @@ static int begin(int id, int kind) {
     A.dur = kind == FX_OPEN ? DUR_OPEN_TICKS : DUR_MIN_TICKS;
     A.active = 1;                                   // hides the window from now on
     // the scene without the window
-    int ux = w->x, uy = w->y, uw = w->w, uh = w->h;
+    int ux, uy, uw, uh;
+    winfx_shadow_bounds(id, &ux, &uy, &uw, &uh);                    // the window and its shadow: the shadow is gone while it animates
     if (kind != FX_OPEN) {
         target_center(id, &A.tcx, &A.tcy);
         rect_union(&ux, &uy, &uw, &uh, A.tcx - 4, A.tcy - 4, 8, 8);
@@ -232,7 +314,7 @@ static int begin(int id, int kind) {
     if (uy + uh > work_bottom()) uh = work_bottom() - uy;
     if (uw <= 0 || uh <= 0) { A.active = 0; free_buffers(); return 0; }
     A.ux = ux; A.uy = uy; A.uw = uw; A.uh = uh;
-    desktop_paint_rect_pub(w->x, w->y, w->w, w->h);   // window hidden now: the scene as it is without it
+    desktop_paint_rect_pub(ux, uy, uw, uh);           // window hidden now: the scene as it is without it (and without its shadow)
     A.bg = (uint32_t*)kmalloc((uint32_t)uw * (uint32_t)uh * 4);
     if (!A.bg) { A.active = 0; free_buffers(); return 0; }
     uint32_t* bb = graphics_get_buffer();
@@ -252,6 +334,14 @@ static void geometry(int t1024, int* nx, int* ny, int* nw, int* nh, int* alpha) 
         *nw = sw * s / 1024; *nh = sh * s / 1024;
         *nx = cx - *nw / 2; *ny = cy - *nh / 2 + 24 * (1024 - e) / 1024;
         *alpha = 255 * e / 1024;
+        return;
+    }
+    if (A.kind == FX_CLOSE) {                                       // shrinks a little, sinks and fades out; slow start
+        int e2 = (int)((int64_t)t1024 * t1024 >> 10);
+        int s2 = 1024 - 70 * e2 / 1024;
+        *nw = sw * s2 / 1024; *nh = sh * s2 / 1024;
+        *nx = cx - *nw / 2; *ny = cy - *nh / 2 + 12 * e2 / 1024;
+        *alpha = 255 - 255 * e2 / 1024;
         return;
     }
     int e;                                                          // 0 = the window, 1024 = collapsed into the button
@@ -351,10 +441,44 @@ int winfx_restore(int id) {
     return begin(id, FX_RESTORE);
 }
 
+// Closing: the snapshot is taken while the window still exists (prepare), the animation starts once it is gone (commit).
+static int close_ready;
+
+int winfx_close_prepare(int id) {
+    struct window* w = window_get(id);
+    if (!w || !w->visible || w->minimized || w->is_popup || w->w < 64 || w->h < 64 || winfx_hides(id)) return 0;
+    finish();
+    if (!take_snapshot(w, id)) return 0;
+    A.id = id; A.kind = FX_CLOSE; A.dur = DUR_CLOSE_TICKS;
+    winfx_shadow_bounds(id, &A.ux, &A.uy, &A.uw, &A.uh);
+    close_ready = 1;
+    return 1;
+}
+
+void winfx_close_commit(void) {
+    if (!close_ready) return;
+    close_ready = 0;
+    int ux = A.ux, uy = A.uy, uw = A.uw, uh = A.uh;
+    if (ux < 0) { uw += ux; ux = 0; }
+    if (uy < 0) { uh += uy; uy = 0; }
+    if (ux + uw > SCREEN_W) uw = SCREEN_W - ux;
+    if (uy + uh > work_bottom()) uh = work_bottom() - uy;
+    if (uw <= 0 || uh <= 0) { free_buffers(); return; }
+    A.ux = ux; A.uy = uy; A.uw = uw; A.uh = uh;
+    desktop_paint_rect_pub(ux, uy, uw, uh);           // the scene without the window
+    A.bg = (uint32_t*)kmalloc((uint32_t)uw * (uint32_t)uh * 4);
+    if (!A.bg) { free_buffers(); return; }
+    uint32_t* bb = graphics_get_buffer();
+    for (int y = 0; y < uh; y++)
+        for (int x = 0; x < uw; x++) A.bg[y * uw + x] = bb[(uy + y) * SCREEN_W + ux + x];
+    A.t0 = tick_count; A.last_tick = tick_count - 1; A.have_prev = 0; A.frames = 0;
+    A.active = 1;
+}
+
 void winfx_cancel(int id) {
     if (id < 0 || id >= MAX_WINDOWS) return;
     pending[id] = 0;
-    if (A.active && A.id == id) {
+    if (A.active && A.kind != FX_CLOSE && A.id == id) {
         int ux = A.ux, uy = A.uy, uw = A.uw, uh = A.uh;
         A.active = 0;
         free_buffers();
@@ -367,7 +491,14 @@ void winfx_step(void) {
     for (int i = 0; i < MAX_WINDOWS; i++) {
         if (!pending[i]) continue;
         struct window* w = window_get(i);
-        if (!w || !w->visible || w->minimized || w->is_popup) { pending[i] = 0; continue; }
+        if (w && w->visible && w->is_popup) {                      // a popup does not animate, but it casts a shadow
+            int bx, by, bw, bh;
+            winfx_shadow_bounds(i, &bx, &by, &bw, &bh);
+            pending[i] = 0;
+            desktop_paint_rect_pub(bx, by, bw, bh);
+            continue;
+        }
+        if (!w || !w->visible || w->minimized) { pending[i] = 0; continue; }
         pending[i] = 0;
         if (!begin(i, FX_OPEN)) { w->dirty = 1; w->pr_valid = 0; }
     }

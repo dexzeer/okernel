@@ -11,6 +11,16 @@
 void winfx_round_corners(int id, int x0, int y0, int x1, int y1);
 int  winfx_radius(int id);
 
+// Drop shadows. winfx_shadow_bounds: the window rectangle grown by its shadow. winfx_shadow darkens the part of [x,y,w,h] that
+// the shadow of window `id` covers (outside the window; `inside` = also its corner squares). winfx_shadows_above: the shadows of
+// every window above z, bottom to top.
+void winfx_shadow_bounds(int id, int* x, int* y, int* w, int* h);
+void winfx_shadow(int id, int x, int y, int w, int h, int inside);
+void winfx_shadows_above(int z, int x, int y, int w, int h);
+void winfx_grow_rect(int* x, int* y, int* w, int* h);   // a rectangle grown by the shadow margins of a window of that size
+int  winfx_close_prepare(int id);        // before destroying a window: 1 = a closing animation will run (call winfx_close_commit after)
+void winfx_close_commit(void);           // the window is gone: start the closing animation
+
 // The animations. open: a new window grows and fades in. minimize: the window shrinks into its taskbar button.
 // restore: the reverse. During an animation the window is not painted by the compositor (winfx_hides); the animation
 // draws it. All three fall back to "no animation" when memory is short.
