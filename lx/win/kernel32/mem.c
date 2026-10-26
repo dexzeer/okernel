@@ -183,6 +183,7 @@ int k32_utf8_to_wide(const char *s, int slen, WCHAR *out, int cap) {
 
 int k32_wide_to_utf8(const WCHAR *w, int wlen, char *out, int cap) {
     int n = 0;
+    if (!w) { if (cap > 0) out[0] = 0; return 1; }                  // a NULL path is an empty one (the API then fails with an error, it does not fault)
     int len = wlen;
     if (len < 0) { len = 0; while (w[len]) len++; len++; }
     for (int i = 0; i < len; i++) {

@@ -49,7 +49,7 @@ static void tb_layout(struct tb_lay* L) {
     L->n = 0;
     for (int i = 0; i < MAX_WINDOWS; i++) {
         struct window* w = window_get(i);
-        if (w && w->visible) L->id[L->n++] = i;
+        if (w && w->visible && !w->is_popup) L->id[L->n++] = i;
     }
     int x0 = 6, right = SCREEN_W - TB_TRAY_W;
     int bw = L->n ? (right - x0) / L->n - TB_GAP : TB_BTN_MAX;

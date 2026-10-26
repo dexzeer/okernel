@@ -564,6 +564,10 @@ EXPORT BOOL ShowWindow(HWND h, int cmd) {
     if (!w) return FALSE;
     int was = w->visible, show = cmd != SW_HIDE && cmd != SW_MINIMIZE;
     w->visible = show;
+    if (show && !was && !w->parent && !w->activated) {                 // the first show of a top-level window: it learns its final size now (the children exist by then)
+        U_send(w, WM_SIZE, SIZE_RESTORED, MAKELPARAM(w->cw, w->ch));
+        U_send(w, WM_MOVE, 0, MAKELPARAM(w->x, w->y));
+    }
     if (was != show) U_send(w, WM_SHOWWINDOW, show, 0);
     if (show && !was && !w->parent) { U_invalidate(w, 0, 1); UpdateWindow(w); }      // the first picture is in the buffer when the desktop shows the window (its opening animation)
     if (!w->parent && w->wid >= 0) {

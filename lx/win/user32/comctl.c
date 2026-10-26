@@ -246,19 +246,30 @@ extern int U_taskbox(HWND owner, const char *text, const char *caption, int nb, 
 static unsigned long long rd8(const BYTE *p) { unsigned long long v = 0; for (int i = 7; i >= 0; i--) v = (v << 8) | p[i]; return v; }
 static DWORD rd4(const BYTE *p) { return (DWORD)p[0] | ((DWORD)p[1] << 8) | ((DWORD)p[2] << 16) | ((DWORD)p[3] << 24); }
 
+extern int LoadStringW(HINSTANCE h, UINT id, LPWSTR buf, int cap);
+// a string of the config: a pointer, or MAKEINTRESOURCE(id) of the program's string table
+static void td_str(HINSTANCE h, ULONG_PTR p, char *out, int cap) {
+    out[0] = 0;
+    if (!p) return;
+    WCHAR w[512];
+    if (p < 0x10000) { if (LoadStringW(h, (UINT)p, w, 512) <= 0) return; WideCharToMultiByte(65001, 0, w, -1, out, cap, 0, 0); }
+    else WideCharToMultiByte(65001, 0, (LPCWSTR)p, -1, out, cap, 0, 0);
+}
+
 EXPORT LONG TaskDialogIndirect(const BYTE *cfg, int *button, int *radio, BOOL *verified) {      // TASKDIALOGCONFIG is packed (1)
     if (!cfg) return (LONG)0x80070057;
     HWND owner = (HWND)rd8(cfg + 4);
     DWORD common = rd4(cfg + 24);
-    LPCWSTR title = (LPCWSTR)rd8(cfg + 28), instr = (LPCWSTR)rd8(cfg + 44), content = (LPCWSTR)rd8(cfg + 52);
+    HINSTANCE inst = (HINSTANCE)rd8(cfg + 12);
+    ULONG_PTR title = (ULONG_PTR)rd8(cfg + 28), instr = (ULONG_PTR)rd8(cfg + 44), content = (ULONG_PTR)rd8(cfg + 52);
     DWORD nb = rd4(cfg + 60);
     const BYTE *btns = (const BYTE*)rd8(cfg + 64);
     int defb = (int)rd4(cfg + 72);
     char cap[128] = "", text[1024] = "", tmp[512];
-    if (title) WideCharToMultiByte(65001, 0, title, -1, cap, sizeof cap, 0, 0);
-    if (instr) { WideCharToMultiByte(65001, 0, instr, -1, text, sizeof text, 0, 0); }
+    td_str(inst, title, cap, sizeof cap);
+    td_str(inst, instr, text, sizeof text);
     if (content) {
-        WideCharToMultiByte(65001, 0, content, -1, tmp, sizeof tmp, 0, 0);
+        td_str(inst, content, tmp, sizeof tmp);
         int l = ustrlen(text);
         if (l && l < (int)sizeof text - 4) { text[l++] = 10; text[l++] = 10; text[l] = 0; }
         ustrcpy(text + l, tmp, (int)sizeof text - l);
@@ -266,8 +277,7 @@ EXPORT LONG TaskDialogIndirect(const BYTE *cfg, int *button, int *radio, BOOL *v
     int ids[16]; char labels[16][64]; const char *names[16]; int n = 0;
     for (DWORD i = 0; i < nb && n < 16; i++) {
         ids[n] = (int)rd4(btns + 12 * i);
-        LPCWSTR lw = (LPCWSTR)rd8(btns + 12 * i + 4);
-        if ((ULONG_PTR)lw < 0x10000) labels[n][0] = 0; else WideCharToMultiByte(65001, 0, lw, -1, labels[n], sizeof labels[n], 0, 0);
+        td_str(inst, (ULONG_PTR)rd8(btns + 12 * i + 4), labels[n], sizeof labels[n]);
         for (char *p = labels[n]; *p; p++) if (*p == 38) { char *q = p; while (*q) { *q = q[1]; q++; } break; }     // drop the & accelerator mark
         names[n] = labels[n]; n++;
     }

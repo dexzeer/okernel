@@ -24,6 +24,7 @@ void U_run_modal(struct wnd *dlg) {
     MSG msg;
     while (dlg->used && !dlg->dlg_done) {
         if (!GetMessageA(&msg, 0, 0, 0)) { PostQuitMessage((int)msg.wParam); break; }
+        if (IsDialogMessageA(dlg, &msg)) continue;                                  // Tab, Enter (the default button), Escape
         DispatchMessageA(&msg);
     }
 }
@@ -73,7 +74,7 @@ static int taskbox(HWND owner, const char *text, const char *caption, int nb, co
     int x = (cw - (nb * bw + (nb - 1) * gap)) / 2;
     HWND first = 0;
     for (int i = 0; i < nb; i++) {
-        HWND b = CreateWindowExA(0, "BUTTON", names[ids[i]], WS_CHILD | WS_VISIBLE | WS_TABSTOP | (i == def ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON), x + i * (bw + gap), ch - bh - 16, bw, bh, d, (HMENU)(LONG_PTR)ids[i], 0, 0);
+        HWND b = CreateWindowExA(0, "BUTTON", names[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | (i == def ? BS_DEFPUSHBUTTON : BS_PUSHBUTTON), x + i * (bw + gap), ch - bh - 16, bw, bh, d, (HMENU)(LONG_PTR)ids[i], 0, 0);
         if (i == def) first = b;
     }
     ShowWindow(d, SW_SHOW);

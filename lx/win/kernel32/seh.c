@@ -502,6 +502,12 @@ EXPORT long UnhandledExceptionFilter(EXCEPTION_POINTERS *ep) {
     put_hex(b, &n, ep->ExceptionRecord->ExceptionCode);
     const char *a = " at "; while (*a) b[n++] = *a++;
     put_hex(b, &n, (DWORD64)ep->ExceptionRecord->ExceptionAddress);
+    if (ep->ExceptionRecord->ExceptionCode == 0xC0000005 && ep->ExceptionRecord->NumberParameters >= 2) {      // what it touched
+        const char *w = ep->ExceptionRecord->ExceptionInformation[0] == 8 ? " (fetch " : ep->ExceptionRecord->ExceptionInformation[0] ? " (write " : " (read ";
+        while (*w) b[n++] = *w++;
+        put_hex(b, &n, ep->ExceptionRecord->ExceptionInformation[1]);
+        b[n++] = ')';
+    }
     b[n++] = 10;
     SC3(LX_write, 2, b, n);
     {                                                              // a short call trace, innermost first

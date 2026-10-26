@@ -350,6 +350,8 @@ static void wide_out(struct out *o, const WCHAR *w, int n, int prec) {
     }
 }
 
+static int printf_wide;                                  // the format is a wide one (wprintf family): %s and %c take wide arguments
+
 static void do_printf(struct out *o, const char *fmt, va_list ap) {
     for (const char *f = fmt; *f; f++) {
         if (*f != '%') { emit(o, *f); continue; }
@@ -359,7 +361,7 @@ static void do_printf(struct out *o, const char *fmt, va_list ap) {
         if (*f == '*') { width = va_arg(ap, int); if (width < 0) { flags |= 1; width = -width; } f++; } else while (isdigit(*f)) width = width * 10 + (*f++ - '0');
         if (*f == '.') { f++; prec = 0; if (*f == '*') { prec = va_arg(ap, int); f++; } else while (isdigit(*f)) prec = prec * 10 + (*f++ - '0'); }
         for (;; f++) {
-            if (*f == 'l') lng++; else if (*f == 'h') lng--; else if (*f == 'z' || *f == 'j' || *f == 't') lng = 2; else if (*f == 'L') lng = 2;
+            if (*f == 'l') lng++; else if (*f == 'w') lng = 1; else if (*f == 'h') lng--; else if (*f == 'z' || *f == 'j' || *f == 't') lng = 2; else if (*f == 'L') lng = 2;
             else if (*f == 'I' && f[1] == '6' && f[2] == '4') { lng = 2; f += 2; } else if (*f == 'I' && f[1] == '3' && f[2] == '2') { lng = 0; f += 2; } else if (*f == 'I') lng = 2;
             else break;
         }
@@ -367,9 +369,16 @@ static void do_printf(struct out *o, const char *fmt, va_list ap) {
         char tmp[80];
         switch (conv) {
         case '%': emit(o, '%'); break;
-        case 'c': { int c = va_arg(ap, int); if (!(flags & 1)) pad(o, width - 1, ' '); emit(o, (char)c); if (flags & 1) pad(o, width - 1, ' '); break; }
+        case 'c': case 'C': {
+            int c = va_arg(ap, int);
+            int wide_arg = lng == 1 ? 1 : lng == -1 ? 0 : (conv == 'c' ? printf_wide : !printf_wide);
+            if (!(flags & 1)) pad(o, width - 1, ' ');
+            if (wide_arg) { WCHAR wc = (WCHAR)c; if (!wc && printf_wide) emit(o, (char)0xFF); else wide_out(o, &wc, 1, -1); } else emit(o, (char)c);      // (a wide NUL is carried as 0xFF until the result is widened)
+            if (flags & 1) pad(o, width - 1, ' ');
+            break;
+        }
         case 's': case 'S': {
-            if ((conv == 's' && lng == 1) || (conv == 'S' && lng != -1 && lng != 2 && 0) || conv == 'S') {
+            if (lng == 1 ? 1 : lng == -1 ? 0 : (conv == 's' ? printf_wide : !printf_wide)) {
                 const WCHAR *w = va_arg(ap, const WCHAR*);
                 if (!w) { emits(o, "(null)", 6); break; }
                 int len = 0; while (w[len] && (prec < 0 || len < prec)) len++;
@@ -451,17 +460,31 @@ EXPORT int __stdio_common_vsnprintf_s(unsigned long long opts, char *buf, size_t
 EXPORT int vswprintf(WCHAR *buf, size_t n, const WCHAR *wfmt, va_list ap) {
     char fmt[1024], tmp[4096];
     WideCharToMultiByte_(wfmt, fmt, sizeof fmt);
+    printf_wide = 1;
     int r = vsnprintf(tmp, sizeof tmp, fmt, ap);
+    printf_wide = 0;
     if (r < 0) return r;
-    int w = MultiByteToWideChar_(tmp, buf, (int)n);
-    return w > 0 ? w - 1 : 0;
+    if (r > (int)sizeof tmp - 1) r = (int)sizeof tmp - 1;
+    size_t o = 0;                                                      // UTF-8 -> UTF-16 over r bytes (0xFF = an embedded NUL)
+    for (int i = 0; i < r && o + 1 < n; ) {
+        unsigned char c = (unsigned char)tmp[i];
+        unsigned cp;
+        if (c == 0xFF) { cp = 0; i++; }
+        else if (c < 0x80) { cp = c; i++; }
+        else if ((c & 0xE0) == 0xC0 && i + 1 < r) { cp = ((unsigned)(c & 0x1F) << 6) | ((unsigned char)tmp[i + 1] & 0x3F); i += 2; }
+        else if ((c & 0xF0) == 0xE0 && i + 2 < r) { cp = ((unsigned)(c & 0x0F) << 12) | (((unsigned char)tmp[i + 1] & 0x3F) << 6) | ((unsigned char)tmp[i + 2] & 0x3F); i += 3; }
+        else { cp = '?'; i++; }
+        buf[o++] = (WCHAR)cp;
+    }
+    if (n) buf[o] = 0;
+    return (int)o;
 }
 EXPORT int _vsnwprintf(WCHAR *buf, size_t n, const WCHAR *f, va_list ap) { return vswprintf(buf, n, f, ap); }
 EXPORT int swprintf(WCHAR *buf, size_t n, const WCHAR *f, ...) { va_list ap; va_start(ap, f); int r = vswprintf(buf, n, f, ap); va_end(ap); return r; }
 EXPORT int _snwprintf(WCHAR *buf, size_t n, const WCHAR *f, ...) { va_list ap; va_start(ap, f); int r = vswprintf(buf, n, f, ap); va_end(ap); return r; }
 EXPORT int wprintf(const WCHAR *wfmt, ...) {
     char fmt[1024]; WideCharToMultiByte_(wfmt, fmt, sizeof fmt);
-    va_list ap; va_start(ap, wfmt); int r = vfprintf(&iob[1], fmt, ap); va_end(ap); return r;
+    va_list ap; va_start(ap, wfmt); printf_wide = 1; int r = vfprintf(&iob[1], fmt, ap); printf_wide = 0; va_end(ap); return r;
 }
 
 // ---- scanf ---------------------------------------------------------------------------------------------------------------------

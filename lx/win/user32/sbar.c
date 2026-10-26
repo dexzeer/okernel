@@ -39,8 +39,13 @@ extern BOOL KillTimer(HWND h, ULONG_PTR id);
 
 typedef struct { UINT cbSize, fMask; int nMin, nMax; UINT nPage; int nPos, nTrackPos; } SCROLLINFO;
 
-int U_sbv(struct wnd *w) { return (w->style & WS_VSCROLL) ? SBT : 0; }
-int U_sbh(struct wnd *w) { return (w->style & WS_HSCROLL) ? SBT : 0; }
+int U_sbv(struct wnd *w) { return (w->style & WS_VSCROLL) && !(w->sb_off & 2) ? SBT : 0; }
+int U_sbh(struct wnd *w) { return (w->style & WS_HSCROLL) && !(w->sb_off & 1) ? SBT : 0; }
+void U_sb_visible(struct wnd *w, int bar, int show) {
+    int bit = bar == SB_VERT ? 2 : 1, old = w->sb_off;
+    if (show) w->sb_off &= ~bit; else w->sb_off |= bit;
+    if (old != w->sb_off) U_recalc_client(w);
+}
 
 // geometry of one bar of length len: parts 1 (arrow before), 2 (track before the thumb), 3 (thumb), 4 (track after), 5 (arrow after)
 struct sbgeo { int a1, t0, th0, th1, t1, a2; };
