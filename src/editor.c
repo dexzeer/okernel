@@ -297,8 +297,8 @@ void editor_draw(int ed_id) {
     } else if (ed->modified) {
         window_puts(ed->win_id, " *");
     }
-    if (ed->read_only) window_puts(ed->win_id, "  Ctrl+X:Close");
-    else window_puts(ed->win_id, "  Ctrl+S:Save  Ctrl+X:Close");
+    if (ed->read_only) window_puts(ed->win_id, "  ctrl+x:close");
+    else window_puts(ed->win_id, "  ctrl+s:save  ctrl+x:close");
     // Fill rest of status bar
     int status_len = 3 + 1 + 1 + 30 + 1; // approximate
     for (int i = status_len; i < w->content_w; i++) {

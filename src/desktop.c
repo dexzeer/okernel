@@ -581,7 +581,7 @@ static void shell_execute_run(int win_id, const char *rest) {
     }
     rargv[rargc] = 0;
     if (rargc == 0) {
-        window_puts(win_id, "Usage: run <path> [args...] [&]\n");
+        window_puts(win_id, "usage: run <path> [args...] [&]\n");
         return;
     }
     // Resolve the path: exact VFS name first, then /bin/<name>.
@@ -643,7 +643,7 @@ static void shell_execute_run(int win_id, const char *rest) {
     struct process *rp = process_get((uint32_t)pid);
     serial_printf("[run] pid=%d '%s' argc=%d bg=%d\n",
                   pid, path, rargc, background);
-    window_puts(win_id, "Starting ");
+    window_puts(win_id, "starting ");
     window_puts(win_id, path);
     window_put_char(win_id, '\n');
     syscall_can_exit = 1;
@@ -746,9 +746,9 @@ static void put_uint(char* buf, uint32_t val) {
 // One text block built from live facts (CPU, memory, display backend, network, audio, uptime), shown in both places.
 
 struct sxb { char* p; int n, cap; };
-static void sx_s(struct sxb* b, const char* s) { while (*s && b->n < b->cap - 1) b->p[b->n++] = *s++; b->p[b->n] = 0; }
+static void sx_s(struct sxb* b, const char* s) { for (; *s && b->n < b->cap - 1; s++) b->p[b->n++] = (*s >= 'A' && *s <= 'Z') ? (char)(*s + 32) : *s; b->p[b->n] = 0; }
 static void sx_u(struct sxb* b, uint32_t v) { char t[16]; put_uint(t, v); sx_s(b, t); }
-static void sx_pad(struct sxb* b, const char* label) {         // "Label    " (9 columns)
+static void sx_pad(struct sxb* b, const char* label) {         // "label    " (9 columns)
     int l = 0;
     while (label[l]) l++;
     sx_s(b, label);
@@ -776,42 +776,42 @@ static void sx_cpu_brand(char* out, int cap) {
 static void sysinfo_text(char* out, int cap) {
     struct sxb b = { out, 0, cap };
     out[0] = 0;
-    sx_s(&b, "KAnarchy OS - Okapi desktop\n");
+    sx_s(&b, "kanarchy os - okapi desktop\n");
     sx_s(&b, "---------------------------\n");
-    sx_pad(&b, "OS");      sx_s(&b, "KAnarchy OS, build " __DATE__ " " __TIME__ "\n");
-    sx_pad(&b, "Kernel");  sx_s(&b, "okernel (32-bit x86, high-half, preemptive, SMP)\n");
+    sx_pad(&b, "os");      sx_s(&b, "kanarchy os, build " __DATE__ " " __TIME__ "\n");
+    sx_pad(&b, "kernel");  sx_s(&b, "okernel (32-bit x86, high-half, preemptive, smp)\n");
     char brand[56];
     sx_cpu_brand(brand, sizeof brand);
-    sx_pad(&b, "CPU");
-    sx_s(&b, brand[0] ? brand : "unknown x86 CPU");
+    sx_pad(&b, "cpu");
+    sx_s(&b, brand[0] ? brand : "unknown x86 cpu");
     sx_s(&b, "\n");
     sx_pad(&b, "");
     uint32_t mhz = cpufreq_mhz();
-    if (mhz) { sx_u(&b, mhz); sx_s(&b, " MHz, "); }
+    if (mhz) { sx_u(&b, mhz); sx_s(&b, " mhz, "); }
     sx_u(&b, (uint32_t)smp_ncpu());
-    sx_s(&b, smp_ncpu() == 1 ? " CPU, speed x" : " CPUs, speed x");
+    sx_s(&b, smp_ncpu() == 1 ? " cpu, speed x" : " cpus, speed x");
     sx_u(&b, (uint32_t)cpufreq_slow_factor());
     sx_s(&b, "\n");
-    sx_pad(&b, "Memory");
+    sx_pad(&b, "memory");
     {
         uint32_t ht, hu, hp, hl;
         heap_stats(&ht, &hu, &hp, &hl);
         sx_u(&b, pmm_get_total_pages() * 4 / 1024);
-        sx_s(&b, " MB RAM, heap ");
+        sx_s(&b, " mb ram, heap ");
         sx_u(&b, hu / (1024 * 1024));
         sx_s(&b, " / ");
         sx_u(&b, ht / (1024 * 1024));
-        sx_s(&b, " MB used (peak ");
+        sx_s(&b, " mb used (peak ");
         sx_u(&b, hp / (1024 * 1024));
         sx_s(&b, ")\n");
     }
-    sx_pad(&b, "Display");
+    sx_pad(&b, "display");
     sx_u(&b, (uint32_t)gfx_w); sx_s(&b, "x"); sx_u(&b, (uint32_t)gfx_h);
     sx_s(&b, ", "); sx_s(&b, graphics_display_name());
     sx_s(&b, "\n");
-    sx_pad(&b, "Network");
-    if (rtw_net_up()) sx_s(&b, "Wi-Fi (Realtek RTL8821C)");
-    else if (e1000_present()) sx_s(&b, "Intel e1000 Ethernet");
+    sx_pad(&b, "network");
+    if (rtw_net_up()) sx_s(&b, "wi-fi (realtek rtl8821c)");
+    else if (e1000_present()) sx_s(&b, "intel e1000 ethernet");
     else sx_s(&b, "none");
     {
         uint8_t* ip = net_get_ip();
@@ -821,21 +821,21 @@ static void sysinfo_text(char* out, int cap) {
         }
     }
     sx_s(&b, "\n");
-    sx_pad(&b, "Audio");   sx_s(&b, audio_ready() ? "Intel HD Audio, running\n" : "none\n");
-    sx_pad(&b, "Browser"); sx_s(&b, "okai (own HTML/CSS/ojs JavaScript engine, TLS 1.3, HTTP/2)\n");
-    sx_pad(&b, "Uptime");
+    sx_pad(&b, "audio");   sx_s(&b, audio_ready() ? "intel hd audio, running\n" : "none\n");
+    sx_pad(&b, "browser"); sx_s(&b, "okai (own html/css/ojs javascript engine, tls 1.3, http/2)\n");
+    sx_pad(&b, "uptime");
     {
         uint32_t sec = tick_count / 100;
         sx_u(&b, sec / 3600); sx_s(&b, "h ");
         sx_u(&b, (sec % 3600) / 60); sx_s(&b, "m ");
         sx_u(&b, sec % 60); sx_s(&b, "s\n");
     }
-    sx_pad(&b, "Shell");   sx_s(&b, "Okapi terminal - type help for the commands\n");
+    sx_pad(&b, "shell");   sx_s(&b, "okapi terminal - type help for the commands\n");
 }
 
 static void open_sysinfo(void) {
     if (info_win >= 0) return; // Already open
-    info_win = window_create("System Info", 520, 80, 940, 410);
+    info_win = window_create("system info", 520, 80, 940, 410);
     window_set_close_button(info_win, 1);
     window_set_minimize_button(info_win, 1);
     static char text[1024];
@@ -854,7 +854,7 @@ static int create_terminal(void) {
     if (term_count >= MAX_TERMINALS) return -1;
     int x = 80 + (term_count % 4) * 80;
     int y = 60 + (term_count % 4) * 60;
-    int win_id = window_create("Terminal", x, y, 900, 650);
+    int win_id = window_create("terminal", x, y, 900, 650);
     window_set_close_button(win_id, 1);
     window_set_minimize_button(win_id, 1);
     window_set_terminal(win_id, 1);
@@ -937,45 +937,45 @@ static void shell_execute(int win_id, const char* input) {
         // Everyday commands only; networking utils and half-done tools
         // live behind `help --a` so a casual user isn't offered them.
         int adv = str_eq(args, "--a") || str_eq(args, "-a");
-        window_puts(win_id, adv ? "Commands (advanced):\n" : "Commands:\n");
+        window_puts(win_id, adv ? "commands (advanced):\n" : "commands:\n");
         window_puts(win_id, "  help      - show this\n");
         window_puts(win_id, "  clear     - clear terminal\n");
         window_puts(win_id, "  echo      - print text\n");
         window_puts(win_id, "  mem       - memory info\n");
         window_puts(win_id, "  uptime    - system uptime\n");
-        window_puts(win_id, "  about     - about KAnarchy\n");
+        window_puts(win_id, "  about     - about kanarchy\n");
         window_puts(win_id, "  neofetch  - system info\n");
         window_puts(win_id, "  sysinfo   - open info window\n");
         window_puts(win_id, "  terminal  - open new terminal\n");
         window_puts(win_id, "  exit      - close this terminal\n");
         window_puts(win_id, "  okai   - open web okai\n");
         window_puts(win_id, "  vidfps - toggle the video frame-rate counter\n");
-        window_puts(win_id, "  wifigui   - Wi-Fi window (scan, connect)\n");
-        window_puts(win_id, "  game      - KAnarchy Wheels, a ragdoll obstacle course (game | game 1 | game FILE)\n");
+        window_puts(win_id, "  wifigui   - wi-fi window (scan, connect)\n");
+        window_puts(win_id, "  game      - kanarchy wheels, a ragdoll obstacle course (game | game 1 | game file)\n");
         window_puts(win_id, "  ls        - list files\n");
         window_puts(win_id, "  save      - force one file to disk\n");
         window_puts(win_id, "  ps        - list processes\n");
-        window_puts(win_id, "  run       - run ELF program (/bin/*) [&]\n");
+        window_puts(win_id, "  run       - run elf program (/bin/*) [&]\n");
         window_puts(win_id, "  reboot    - reboot system\n");
         window_puts(win_id, "  shutdown  - power off\n");
         if (adv) {
-            window_puts(win_id, "  wifi      - Wi-Fi adapter: start | scan | list |\n");
-            window_puts(win_id, "              connect NAME [PASS] | disconnect |\n");
-            window_puts(win_id, "              status | log | ch N\n");
-            window_puts(win_id, "  wifigui demo - Wi-Fi window, simulated adapter\n");
+            window_puts(win_id, "  wifi      - wi-fi adapter: start | scan | list |\n");
+            window_puts(win_id, "              connect name [pass] | disconnect |\n");
+            window_puts(win_id, "              status | log | ch n\n");
+            window_puts(win_id, "  wifigui demo - wi-fi window, simulated adapter\n");
             window_puts(win_id, "  dhcp      - ask the router for an address\n");
-            window_puts(win_id, "  ipconfig  - address, mask, gateway, DNS\n");
-            window_puts(win_id, "  usb       - USB controller and devices\n");
-            window_puts(win_id, "  touchpad  - I2C touchpad status\n");
-            window_puts(win_id, "  cpu       - core clock, speed factor; cpu slow N|auto\n");
+            window_puts(win_id, "  ipconfig  - address, mask, gateway, dns\n");
+            window_puts(win_id, "  usb       - usb controller and devices\n");
+            window_puts(win_id, "  touchpad  - i2c touchpad status\n");
+            window_puts(win_id, "  cpu       - core clock, speed factor; cpu slow n|auto\n");
             window_puts(win_id, "  prof      - on|off: per-second cycle profile\n");
             window_puts(win_id, "  ping      - ping gateway\n");
-            window_puts(win_id, "  ip        - show IP address\n");
-            window_puts(win_id, "  netdrop N - drop 1-in-N TCP pkts (test)\n");
-            window_puts(win_id, "  resolve   - DNS lookup\n");
+            window_puts(win_id, "  ip        - show ip address\n");
+            window_puts(win_id, "  netdrop n - drop 1-in-n tcp pkts (test)\n");
+            window_puts(win_id, "  resolve   - dns lookup\n");
             window_puts(win_id, "  edit      - open text editor\n");
             window_puts(win_id, "  open      - open file in editor\n");
-            window_puts(win_id, "  disk      - disk + persistent FS status\n");
+            window_puts(win_id, "  disk      - disk + persistent fs status\n");
             window_puts(win_id, "  locktest  - spinlock/mutex selftest\n");
         } else {
             window_puts(win_id, "  help --a  - show advanced commands\n");
@@ -983,7 +983,7 @@ static void shell_execute(int win_id, const char* input) {
     }
     else if (str_eq(cmd_buf, "ping")) {
         uint8_t* gw = net_get_gateway();
-        window_puts(win_id, "Pinging gateway ");
+        window_puts(win_id, "pinging gateway ");
         char ip_buf[16];
         int idx = 0;
         for (int i = 0; i < 4; i++) {
@@ -1000,7 +1000,7 @@ static void shell_execute(int win_id, const char* input) {
     }
     else if (str_eq(cmd_buf, "ip")) {
         uint8_t* ip = net_get_ip();
-        window_puts(win_id, "IP: ");
+        window_puts(win_id, "ip: ");
         char ip_buf[16];
         int idx = 0;
         for (int i = 0; i < 4; i++) {
@@ -1018,17 +1018,17 @@ static void shell_execute(int win_id, const char* input) {
         // VP9 tile columns and loop filter on several CPUs (needs -smp 3 or more); `vp9par off` / `vp9par on`
         if (str_eq(args, "off")) meng_set_parallel(0);
         else if (str_eq(args, "on")) meng_set_parallel(1);
-        window_puts(win_id, meng_get_parallel() ? "VP9 multi-CPU decode: on\n" : "VP9 multi-CPU decode: off\n");
+        window_puts(win_id, meng_get_parallel() ? "vp9 multi-cpu decode: on\n" : "vp9 multi-cpu decode: off\n");
     }
     else if (str_eq(cmd_buf, "vidfps")) {
         // Frame-rate counter on video corners (dec = frames the decoder handed over, scr = frames that reached the screen); also logged as [vidfps]
         okai_vidfps_set(!okai_vidfps_get());
-        window_puts(win_id, okai_vidfps_get() ? "Video fps counter on.\n" : "Video fps counter off.\n");
+        window_puts(win_id, okai_vidfps_get() ? "video fps counter on.\n" : "video fps counter off.\n");
     }
     else if (str_eq(cmd_buf, "nettrace")) {
         // Per-packet serial tracing (frames, TCP segments) on/off
         net_trace = !net_trace;
-        window_puts(win_id, net_trace ? "Packet tracing on (serial).\n" : "Packet tracing off.\n");
+        window_puts(win_id, net_trace ? "packet tracing on (serial).\n" : "packet tracing off.\n");
     }
     else if (str_eq(cmd_buf, "netdrop")) {
         // Test hook: drop every Nth received TCP packet (netdrop 0 = off)
@@ -1038,20 +1038,20 @@ static void shell_execute(int win_id, const char* input) {
         }
         net_set_drop_rate(n);
         if (n > 0) {
-            window_puts(win_id, "Dropping 1 in ");
+            window_puts(win_id, "dropping 1 in ");
             char buf[8];
             put_uint(buf, (uint32_t)n);
             window_puts(win_id, buf);
             window_puts(win_id, " packets.\n");
         } else {
-            window_puts(win_id, "Packet drop disabled.\n");
+            window_puts(win_id, "packet drop disabled.\n");
         }
     }
     else if (str_eq(cmd_buf, "resolve")) {
         if (args[0] == 0) {
-            window_puts(win_id, "Usage: resolve <hostname>\n");
+            window_puts(win_id, "usage: resolve <hostname>\n");
         } else {
-            window_puts(win_id, "Resolving ");
+            window_puts(win_id, "resolving ");
             window_puts(win_id, args);
             window_puts(win_id, "...\n");
             dns_resolve(args);
@@ -1161,32 +1161,32 @@ static void shell_execute(int win_id, const char* input) {
         if (okai_window_count() > 0) {
             okai_new_tab(0, target);
             window_set_focus(okai_get(0)->win_id);
-            window_puts(win_id, "New tab: ");
+            window_puts(win_id, "new tab: ");
             window_puts(win_id, target);
             window_put_char(win_id, '\n');
         } else {
             int ok = okai_open(target);
             if (ok >= 0) {
-                window_puts(win_id, "Opened: ");
+                window_puts(win_id, "opened: ");
                 window_puts(win_id, target);
                 window_put_char(win_id, '\n');
             } else {
-                window_puts(win_id, "Cannot open okai.\n");
+                window_puts(win_id, "cannot open okai.\n");
             }
         }
     }
     else if (str_eq(cmd_buf, "edit")) {
         if (args[0] == 0) {
-            window_puts(win_id, "Usage: edit <filename>\n");
-            window_puts(win_id, "Example: edit readme.txt\n");
+            window_puts(win_id, "usage: edit <filename>\n");
+            window_puts(win_id, "example: edit readme.txt\n");
         } else {
             int ed = editor_open(args);
             if (ed >= 0) {
-                window_puts(win_id, "Opened editor: ");
+                window_puts(win_id, "opened editor: ");
                 window_puts(win_id, args);
                 window_put_char(win_id, '\n');
             } else {
-                window_puts(win_id, "Cannot open editor.\n");
+                window_puts(win_id, "cannot open editor.\n");
             }
         }
     }
@@ -1218,19 +1218,19 @@ static void shell_execute(int win_id, const char* input) {
     }
     else if (str_eq(cmd_buf, "open")) {
         if (args[0] == 0) {
-            window_puts(win_id, "Usage: open <filename>\n");
+            window_puts(win_id, "usage: open <filename>\n");
         } else if (!fs_exists(args)) {
-            window_puts(win_id, "File not found: ");
+            window_puts(win_id, "file not found: ");
             window_puts(win_id, args);
             window_put_char(win_id, '\n');
         } else {
             int ed = editor_open(args);
             if (ed >= 0) {
-                window_puts(win_id, "Opened: ");
+                window_puts(win_id, "opened: ");
                 window_puts(win_id, args);
                 window_put_char(win_id, '\n');
             } else {
-                window_puts(win_id, "Cannot open editor.\n");
+                window_puts(win_id, "cannot open editor.\n");
             }
         }
     }
@@ -1238,28 +1238,28 @@ static void shell_execute(int win_id, const char* input) {
         // Disk + persistent-FS diagnostics: presence, mount, table.
         serial_puts("[sh] disk status\n");
         if (!ata_present()) {
-            window_puts(win_id, "disk: no ATA disk (VFS only)\n");
+            window_puts(win_id, "disk: no ata disk (vfs only)\n");
         } else {
-            window_puts(win_id, "disk: ATA present, ");
-            window_puts(win_id, pfs_mounted() ? "PFS mounted\n" : "PFS NOT mounted\n");
+            window_puts(win_id, "disk: ata present, ");
+            window_puts(win_id, pfs_mounted() ? "pfs mounted\n" : "pfs not mounted\n");
         }
         pfs_status(); // serial table dump (names/sizes/sectors)
-        window_puts(win_id, "(see serial for PFS table)\n");
+        window_puts(win_id, "(see serial for pfs table)\n");
     }
     else if (str_eq(cmd_buf, "save")) {
         // save <file>: force one VFS file through to disk now (normally
         // write-through is automatic — this is the manual override + proof).
         if (args[0] == 0) {
-            window_puts(win_id, "Usage: save <filename>\n");
+            window_puts(win_id, "usage: save <filename>\n");
         } else if (!fs_exists(args)) {
-            window_puts(win_id, "File not found: ");
+            window_puts(win_id, "file not found: ");
             window_puts(win_id, args);
             window_put_char(win_id, '\n');
         } else if (!ata_present()) {
-            window_puts(win_id, "save: no disk (VFS only)\n");
+            window_puts(win_id, "save: no disk (vfs only)\n");
         } else {
             int rc = pfs_sync_file(args);
-            window_puts(win_id, rc == 0 ? "saved to disk\n" : "save FAILED\n");
+            window_puts(win_id, rc == 0 ? "saved to disk\n" : "save failed\n");
         }
     }
     else if (str_eq(cmd_buf, "simd")) {
@@ -1303,7 +1303,7 @@ static void shell_execute(int win_id, const char* input) {
         int fx, fy;
         int bad = graphics_verify(&fx, &fy);
         serial_printf("[gfx] verify: %d mismatching pixels (first at %d,%d)\n", bad, fx, fy);
-        window_puts(win_id, bad ? "gfxcheck: MISMATCH (see serial)\n" : "gfxcheck: framebuffer matches\n");
+        window_puts(win_id, bad ? "gfxcheck: mismatch (see serial)\n" : "gfxcheck: framebuffer matches\n");
     }
     else if (str_eq(cmd_buf, "gfxsum")) {
         // Hash every 16-row band of the backbuffer (and, for "gfxsum Y0 Y1", the
@@ -1326,7 +1326,7 @@ static void shell_execute(int win_id, const char* input) {
     }
     else if (str_eq(cmd_buf, "cpu") && str_eq(args, "msrtest")) {
         int msr_ok = cpufreq_msr_selftest();
-        window_puts(win_id, msr_ok ? "msr fault-safety: PASS\n" : "msr fault-safety: FAIL\n");
+        window_puts(win_id, msr_ok ? "msr fault-safety: pass\n" : "msr fault-safety: fail\n");
         serial_puts(msr_ok ? "[cpu] msrtest PASS\n" : "[cpu] msrtest FAIL\n");
     }
     else if (str_eq(cmd_buf, "cpu")) {
@@ -1378,17 +1378,17 @@ static void shell_execute(int win_id, const char* input) {
         uint32_t free = pmm_get_free_pages() * 4 / 1024;
         char buf[16];
 
-        window_puts(win_id, "Memory:\n");
-        put_uint(buf, total); window_puts(win_id, "  Total: "); window_puts(win_id, buf); window_puts(win_id, " MB\n");
-        put_uint(buf, used);  window_puts(win_id, "  Used:  "); window_puts(win_id, buf); window_puts(win_id, " MB\n");
-        put_uint(buf, free);  window_puts(win_id, "  Free:  "); window_puts(win_id, buf); window_puts(win_id, " MB\n");
+        window_puts(win_id, "memory:\n");
+        put_uint(buf, total); window_puts(win_id, "  total: "); window_puts(win_id, buf); window_puts(win_id, " mb\n");
+        put_uint(buf, used);  window_puts(win_id, "  used:  "); window_puts(win_id, buf); window_puts(win_id, " mb\n");
+        put_uint(buf, free);  window_puts(win_id, "  free:  "); window_puts(win_id, buf); window_puts(win_id, " mb\n");
         uint32_t ht, hu, hp, hl;
         heap_stats(&ht, &hu, &hp, &hl);
-        window_puts(win_id, "Kernel heap:\n");
-        put_uint(buf, ht >> 20); window_puts(win_id, "  Size:  "); window_puts(win_id, buf); window_puts(win_id, " MB\n");
-        put_uint(buf, hu >> 10); window_puts(win_id, "  Used:  "); window_puts(win_id, buf); window_puts(win_id, " KB\n");
-        put_uint(buf, hp >> 10); window_puts(win_id, "  Peak:  "); window_puts(win_id, buf); window_puts(win_id, " KB\n");
-        put_uint(buf, hl >> 10); window_puts(win_id, "  Largest free: "); window_puts(win_id, buf); window_puts(win_id, " KB\n");
+        window_puts(win_id, "kernel heap:\n");
+        put_uint(buf, ht >> 20); window_puts(win_id, "  size:  "); window_puts(win_id, buf); window_puts(win_id, " mb\n");
+        put_uint(buf, hu >> 10); window_puts(win_id, "  used:  "); window_puts(win_id, buf); window_puts(win_id, " kb\n");
+        put_uint(buf, hp >> 10); window_puts(win_id, "  peak:  "); window_puts(win_id, buf); window_puts(win_id, " kb\n");
+        put_uint(buf, hl >> 10); window_puts(win_id, "  largest free: "); window_puts(win_id, buf); window_puts(win_id, " kb\n");
     }
     else if (str_eq(cmd_buf, "uptime")) {
         uint32_t seconds = tick_count / 100;
@@ -1415,8 +1415,8 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, " |_|\\_\\  /_/   \\_\\ |_| |_|  \\__,_|  |_|     \\___|  |_| |_|   \\__, |\n");
         window_puts(win_id, "                            |___/                            |___/\n\n");
         window_set_text_color(win_id, 15, 0); // White
-        window_puts(win_id, "KAnarchy OS - Okapi desktop\n");
-        window_puts(win_id, "Built from scratch in C and x86 assembly\n");
+        window_puts(win_id, "kanarchy os - okapi desktop\n");
+        window_puts(win_id, "built from scratch in c and x86 assembly\n");
     }
     else if (str_eq(cmd_buf, "neofetch") || str_eq(cmd_buf, "sysinfo")) {
         static char text[1024];
@@ -1431,9 +1431,9 @@ static void shell_execute(int win_id, const char* input) {
             active_term_idx = term_count - 1;
             window_set_focus(new_win);
             shell_prompt(new_win);
-            window_puts(win_id, "Terminal opened.\n");
+            window_puts(win_id, "terminal opened.\n");
         } else {
-            window_puts(win_id, "Max terminals reached.\n");
+            window_puts(win_id, "max terminals reached.\n");
         }
     }
     else if (str_eq(cmd_buf, "exit")) {
@@ -1449,11 +1449,11 @@ static void shell_execute(int win_id, const char* input) {
         }
     }
     else if (str_eq(cmd_buf, "reboot")) {
-        window_puts(win_id, "Rebooting...\n");
+        window_puts(win_id, "rebooting...\n");
         acpi_pm_reboot(acpi_get_pm());               // ACPI reset register, keyboard controller, PCI reset, triple fault
     }
     else if (str_eq(cmd_buf, "ps")) {
-        window_puts(win_id, "PID  STATE\n");
+        window_puts(win_id, "pid  state\n");
         // use process_get_by_slot
         for (int i = 0; i < 16; i++) {
             struct process *p = process_get_by_slot(i);
@@ -1522,11 +1522,11 @@ static void shell_execute(int win_id, const char* input) {
     }
     else if (str_eq(cmd_buf, "game")) {
         const char* gm = gamewin_open(args);       // a level number or a script in the file system; no argument lists the levels
-        window_puts(win_id, gm ? gm : "Game started.\n");
+        window_puts(win_id, gm ? gm : "game started.\n");
     }
     else if (str_eq(cmd_buf, "wifigui")) {
         wifigui_open(args[0] && str_eq(args, "demo"));
-        window_puts(win_id, "Wi-Fi window opened.\n");
+        window_puts(win_id, "wi-fi window opened.\n");
     }
     else if (str_eq(cmd_buf, "wifi")) {
         static char wb[2048];
@@ -1543,9 +1543,9 @@ static void shell_execute(int win_id, const char* input) {
         else { xhci_status(ub, sizeof ub); window_puts(win_id, ub); }
     }
     else if (str_eq(cmd_buf, "shutdown")) {
-        window_puts(win_id, "Shutting down...\n");
+        window_puts(win_id, "shutting down...\n");
         acpi_pm_poweroff(acpi_get_pm());             // ACPI S5; the emulator ports are its fallback
-        window_puts(win_id, "Power-off did not work: hold the power button.\n");
+        window_puts(win_id, "power-off did not work: hold the power button.\n");
         while (1) { __asm__ volatile("hlt"); }
     }
     else {
@@ -1563,7 +1563,7 @@ static void shell_execute(int win_id, const char* input) {
         } else if (fs_exists(cmd_buf) || fs_exists(binpath_of(cmd_buf))) {
             shell_execute_run(win_id, input);
         } else {
-            window_puts(win_id, "Unknown: ");
+            window_puts(win_id, "unknown: ");
             window_puts(win_id, cmd_buf);
             window_put_char(win_id, '\n');
         }
@@ -2029,7 +2029,7 @@ void kernel_main(uint32_t mboot_phys) {
     int term_rows = (SCREEN_H - TASKBAR_H - 128 - WIN_TITLE_H - 2 * WIN_BORDER - 8) / CONTENT_GH;
     if (term_rows > 24) term_rows = 24;
     if (term_rows < 8) term_rows = 8;
-    term_wins[0] = window_create("Terminal", 16, 128, 72 * CONTENT_GW + 2 * WIN_BORDER,
+    term_wins[0] = window_create("terminal", 16, 128, 72 * CONTENT_GW + 2 * WIN_BORDER,
                                  term_rows * CONTENT_GH + WIN_TITLE_H + 2 * WIN_BORDER);
     window_set_close_button(term_wins[0], 1);
     window_set_minimize_button(term_wins[0], 1);
@@ -2451,7 +2451,7 @@ void kernel_main(uint32_t mboot_phys) {
             {
                 int fw = window_get_focused();
                 if (fw >= 0) {
-                    window_puts(fw, "Back from user mode.\n");
+                    window_puts(fw, "back from user mode.\n");
                     shell_prompt(fw);
                 }
             }

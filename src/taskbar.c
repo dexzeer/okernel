@@ -84,7 +84,7 @@ static int app_of(int id) {
     struct window* w = window_get(id);
     if (okai_find_by_win(id) >= 0) return APP_WEB;
     if (w && w->is_term) return APP_TERM;
-    if (w && w->title[0] == 'S' && w->title[1] == 'y') return APP_INFO; // "System Info"
+    if (w && w->title[0] == 's' && w->title[1] == 'y') return APP_INFO; // "system info"
     return APP_DOC;
 }
 
@@ -233,7 +233,7 @@ static void render(const struct tb_lay* L, int hover) {
     char num[8]; int ni = 0; unsigned v = tb_fps;
     do { num[ni++] = (char)('0' + v % 10); v /= 10; } while (v && ni < 7);
     while (ni) fb[fi++] = num[--ni];
-    fb[fi++] = ' '; fb[fi++] = 'F'; fb[fi++] = 'P'; fb[fi++] = 'S'; fb[fi] = 0;
+    fb[fi++] = ' '; fb[fi++] = 'f'; fb[fi++] = 'p'; fb[fi++] = 's'; fb[fi] = 0;
     int fw = ui_text_w(12, 1, fb, -1) + 20;
     int fx = rx - cw - 18 - fw, fy = (TASKBAR_H - 24) / 2;
     ui_rrect(&s, fx, fy, fw, 24, 12, 0x1EFFFFFFu);

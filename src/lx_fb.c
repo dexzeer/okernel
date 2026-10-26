@@ -81,7 +81,7 @@ int lx_fb_open_hook(struct lx_task *t) {
     }
     F.w = w; F.h = h;
     int ww = (int)w + 2 * WIN_BORDER, wh = (int)h + WIN_TITLE_H + 2 * WIN_BORDER;
-    F.win = window_create("Linux", (SCREEN_W - ww) / 2, (SCREEN_H - TASKBAR_H - wh) / 2 > 4 ? (SCREEN_H - TASKBAR_H - wh) / 2 : 4, ww, wh);
+    F.win = window_create("linux", (SCREEN_W - ww) / 2, (SCREEN_H - TASKBAR_H - wh) / 2 > 4 ? (SCREEN_H - TASKBAR_H - wh) / 2 : 4, ww, wh);
     if (F.win < 0) return -LX_ENOMEM;
     window_set_close_button(F.win, 1);
     window_set_minimize_button(F.win, 1);

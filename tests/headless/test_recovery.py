@@ -100,7 +100,7 @@ try:
     command(vm, "ls recovery /known", "KANARCHY.BIN")
     command(vm, "hexdump 0", "55 aa")
     command(vm, "restore", "restored, verified")
-    command(vm, "memtest 8", "8 MB ok")
+    command(vm, "memtest 8", "8 mb ok")
     vm.type_string("knowngood\n")
     check(wait_exit(vm), "knowngood reboots")
     check("next_entry=knowngood" in grubenv(), "grubenv says knowngood")

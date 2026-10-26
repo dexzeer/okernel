@@ -1327,20 +1327,20 @@ static const char OKAI_HOME_HTML[] =
 "<p class=tag>the okernel web browser</p></div>"
 "<div class=grid>"
 "<a class=card href=\"http://example.com/\"><b><i class=dot style=\"background:#7db4f5\"></i>example.com</b>"
-"<span>The classic test page</span></a>"
-"<a class=card href=\"https://en.wikipedia.org/wiki/Operating_system\"><b><i class=dot style=\"background:#f5f5f5\"></i>Wikipedia</b>"
-"<span>Operating system &mdash; the free encyclopedia</span></a>"
-"<a class=card href=\"https://news.ycombinator.com/\"><b><i class=dot style=\"background:#ff6600\"></i>Hacker News</b>"
+"<span>the classic test page</span></a>"
+"<a class=card href=\"https://en.wikipedia.org/wiki/Operating_system\"><b><i class=dot style=\"background:#f5f5f5\"></i>wikipedia</b>"
+"<span>operating system &mdash; the free encyclopedia</span></a>"
+"<a class=card href=\"https://news.ycombinator.com/\"><b><i class=dot style=\"background:#ff6600\"></i>hacker news</b>"
 "<span>news.ycombinator.com</span></a>"
 "<a class=card href=\"http://info.cern.ch/\"><b><i class=dot style=\"background:#5fd38d\"></i>info.cern.ch</b>"
-"<span>The first website</span></a>"
+"<span>the first website</span></a>"
 "<a class=card href=\"https://notdexy.ru/\"><b><i class=dot style=\"background:#c792ea\"></i>notdexy.ru</b>"
-"<span>Home of KAnarchy</span></a>"
+"<span>home of kanarchy</span></a>"
 "<a class=card href=\"https://www.python.org/\"><b><i class=dot style=\"background:#ffd43b\"></i>python.org</b>"
-"<span>Python programming language</span></a>"
+"<span>python programming language</span></a>"
 "</div>"
-"<p class=foot>Press <kbd>g</kbd> to type an address &nbsp;&middot;&nbsp; <kbd>j</kbd> <kbd>k</kbd> or the wheel to scroll"
-" &nbsp;&middot;&nbsp; <kbd>Tab</kbd> cycles form fields</p>"
+"<p class=foot>press <kbd>g</kbd> to type an address &nbsp;&middot;&nbsp; <kbd>j</kbd> <kbd>k</kbd> or the wheel to scroll"
+" &nbsp;&middot;&nbsp; <kbd>tab</kbd> cycles form fields</p>"
 "</body></html>";
 
 // HTML-escape src into out (returns new length).
@@ -1411,11 +1411,11 @@ static void show_error(int id, int tab) {
     struct okai_tab* T = &okais[id].tabs[tab];
     static char h[8192];
     int n = 0;
-    const char* title = "Unable to load page";
+    const char* title = "unable to load page";
     const char* accent = "#ffb454";
-    if (T->truncated) { title = "Response truncated"; accent = "#ff6b6b"; }
-    else if (T->cert_failed) { title = "Security warning"; accent = "#ff6b6b"; }
-    else if (T->conn_failed) title = T->conn_kind == OKAI_CONN_TOOLARGE ? "Page too large" : "Connection error";
+    if (T->truncated) { title = "response truncated"; accent = "#ff6b6b"; }
+    else if (T->cert_failed) { title = "security warning"; accent = "#ff6b6b"; }
+    else if (T->conn_failed) title = T->conn_kind == OKAI_CONN_TOOLARGE ? "page too large" : "connection error";
     n = html_put(h, n, sizeof h, "<!DOCTYPE html><html><head><meta charset=utf-8><title>");
     n = html_put(h, n, sizeof h, title);
     n = html_put(h, n, sizeof h, "</title><style>"
@@ -1432,12 +1432,12 @@ static void show_error(int id, int tab) {
     n = html_put(h, n, sizeof h, title);
     n = html_put(h, n, sizeof h, "</h1>");
     if (T->truncated) {
-        n = html_put(h, n, sizeof h, "<p>The secure connection to</p><span class=u>");
+        n = html_put(h, n, sizeof h, "<p>the secure connection to</p><span class=u>");
         n = html_esc(h, n, sizeof h, T->url);
-        n = html_put(h, n, sizeof h, "</span><p>ended mid-response. The page may have been cut by an attacker.</p>"
-            "<p class=dim>Nothing was rendered and no HTTP fallback was attempted.</p>");
+        n = html_put(h, n, sizeof h, "</span><p>ended mid-response. the page may have been cut by an attacker.</p>"
+            "<p class=dim>nothing was rendered and no http fallback was attempted.</p>");
     } else if (T->cert_failed) {
-        n = html_put(h, n, sizeof h, "<p>The certificate for</p><span class=u>");
+        n = html_put(h, n, sizeof h, "<p>the certificate for</p><span class=u>");
         n = html_esc(h, n, sizeof h, T->url);
         n = html_put(h, n, sizeof h, "</span><p>failed verification.</p>");
         const char* why = 0;
@@ -1452,32 +1452,32 @@ static void show_error(int id, int tab) {
         case CV_ERR_PRELOAD: why = "site key differs from pinned key"; break;
         }
         if (why) {
-            n = html_put(h, n, sizeof h, "<p class=why>Reason: ");
+            n = html_put(h, n, sizeof h, "<p class=why>reason: ");
             n = html_put(h, n, sizeof h, why);
             n = html_put(h, n, sizeof h, ".</p>");
         }
-        n = html_put(h, n, sizeof h, "<p>The connection may be intercepted, the site's certificate expired, "
-            "or the identity does not match.</p><p class=dim>Nothing was loaded and no HTTP fallback was "
-            "attempted. Revocation: stapled OCSP is enforced when sent; absent staples are not fetched "
+        n = html_put(h, n, sizeof h, "<p>the connection may be intercepted, the site's certificate expired, "
+            "or the identity does not match.</p><p class=dim>nothing was loaded and no http fallback was "
+            "attempted. revocation: stapled ocsp is enforced when sent; absent staples are not fetched "
             "(soft-fail).</p>");
     } else if (T->conn_failed) {
-        n = html_put(h, n, sizeof h, "<p>Could not load</p><span class=u>");
+        n = html_put(h, n, sizeof h, "<p>could not load</p><span class=u>");
         n = html_esc(h, n, sizeof h, T->url);
         n = html_put(h, n, sizeof h, "</span>");
         if (T->conn_kind == OKAI_CONN_TOOLARGE)
-            n = html_put(h, n, sizeof h, "<p>The page is larger than the fetch buffer and was not loaded.</p>");
+            n = html_put(h, n, sizeof h, "<p>the page is larger than the fetch buffer and was not loaded.</p>");
         else
-            n = html_put(h, n, sizeof h, "<p>The secure connection broke before the page arrived. This is "
+            n = html_put(h, n, sizeof h, "<p>the secure connection broke before the page arrived. this is "
                 "<b>not</b> a certificate problem &mdash; try reloading.</p>");
-        n = html_put(h, n, sizeof h, "<p class=dim>Nothing was loaded and no HTTP fallback was attempted.</p>");
+        n = html_put(h, n, sizeof h, "<p class=dim>nothing was loaded and no http fallback was attempted.</p>");
     } else {
         n = html_put(h, n, sizeof h, "<p>okai could not fetch</p><span class=u>");
         n = html_esc(h, n, sizeof h, T->url);
-        n = html_put(h, n, sizeof h, "</span><p>Check the address, or the site may be unreachable.</p>");
+        n = html_put(h, n, sizeof h, "</span><p>check the address, or the site may be unreachable.</p>");
     }
     n = html_put(h, n, sizeof h, "<p class=dim><a href=\"");
     n = html_esc(h, n, sizeof h, T->url);
-    n = html_put(h, n, sizeof h, "\">Try again</a> &nbsp;&middot;&nbsp; <a href=\"okai:home\">Home</a></p></div></body></html>");
+    n = html_put(h, n, sizeof h, "\">try again</a> &nbsp;&middot;&nbsp; <a href=\"okai:home\">home</a></p></div></body></html>");
     serial_printf("[okai] error page: %s for %s\n", title, T->url);
     tab_load_html(id, tab, h, n, "utf-8", 0);
     T->load_state = -1;
