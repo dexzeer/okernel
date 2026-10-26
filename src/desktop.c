@@ -742,6 +742,32 @@ static void put_uint(char* buf, uint32_t val) {
     buf[i] = 0;
 }
 
+// `ls [path]`: the kanarchy files and the Linux/Windows subsystem root, or one subsystem directory
+static void ls_lx(int win_id, const char *path) {
+    int err = 0;
+    struct lx_node *d = lxfs_resolve(lxfs_root(), path, 1, &err);
+    if (!d) { window_puts(win_id, path); window_puts(win_id, ": not found\n"); return; }
+    if (d->type != LXN_DIR) {
+        char b[24];
+        window_puts(win_id, "  "); window_puts(win_id, path); window_puts(win_id, "  (");
+        put_uint(b, (uint32_t)d->size); window_puts(win_id, b); window_puts(win_id, " bytes)\n");
+        return;
+    }
+    const char *name;
+    for (uint64_t i = 2; lxfs_dir_entry(d, i, &name); i++) {
+        struct lx_node *n = lxfs_dir_entry(d, i, &name);
+        window_puts(win_id, "  "); window_puts(win_id, name);
+        if (n->type == LXN_DIR) window_puts(win_id, "/");
+        else if (n->type == LXN_LNK) { window_puts(win_id, " -> "); window_puts(win_id, n->target ? n->target : "?"); }
+        else if (n->type == LXN_REG) {
+            char b[24];
+            window_puts(win_id, "  (");
+            put_uint(b, (uint32_t)n->size); window_puts(win_id, b); window_puts(win_id, " bytes)");
+        }
+        window_puts(win_id, "\n");
+    }
+}
+
 // ---- system information (shell `sysinfo` / `neofetch` and the System Info window) -------------------------------------
 // One text block built from live facts (CPU, memory, display backend, network, audio, uptime), shown in both places.
 
@@ -951,7 +977,7 @@ static void shell_execute(int win_id, const char* input) {
         window_puts(win_id, "  wifigui   - wi-fi window (scan, connect)\n");
         window_puts(win_id, "  game      - kanarchy wheels (game | game 1 | game file)\n");
         window_puts(win_id, "  play      - play a webm url; stopplay stops it\n");
-        window_puts(win_id, "  ls        - list files\n");
+        window_puts(win_id, "  ls        - list files; ls /path lists a subsystem directory\n");
         window_puts(win_id, "  edit      - text editor: edit file\n");
         window_puts(win_id, "  open      - open a file in the editor\n");
         window_puts(win_id, "  save      - force one file to disk\n");
@@ -1208,6 +1234,9 @@ static void shell_execute(int win_id, const char* input) {
             }
         }
     }
+    else if (str_eq(cmd_buf, "ls") && args[0]) {
+        ls_lx(win_id, args);
+    }
     else if (str_eq(cmd_buf, "ls")) {
         int count = fs_get_count();
         if (count == 0) {
@@ -1233,6 +1262,7 @@ static void shell_execute(int win_id, const char* input) {
                 window_puts(win_id, " bytes)\n");
             }
         }
+        ls_lx(win_id, "/");
     }
     else if (str_eq(cmd_buf, "open")) {
         if (args[0] == 0) {
