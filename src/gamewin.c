@@ -14,10 +14,10 @@ extern uint32_t tick_count;
 extern const char lvl_1[], lvl_1_end[], lvl_2[], lvl_2_end[], lvl_3[], lvl_3_end[], lvl_4[], lvl_4_end[];
 
 static const struct { const char* name; const char* start; const char* end; } LEVELS[] = {
-    { "Rolling Start (hold UP and roll)", lvl_1, lvl_1_end },
-    { "Wrecking Yard (wrecker, barrels, a pit)", lvl_2, lvl_2_end },
-    { "Moon Walk (low gravity, trampolines)", lvl_3, lvl_3_end },
-    { "Chain Reaction (barrels do not like each other)", lvl_4, lvl_4_end },
+    { "rolling start (hold up and roll)", lvl_1, lvl_1_end },
+    { "wrecking yard (wrecker, barrels, a pit)", lvl_2, lvl_2_end },
+    { "moon walk (low gravity, trampolines)", lvl_3, lvl_3_end },
+    { "chain reaction (barrels do not like each other)", lvl_4, lvl_4_end },
 };
 #define N_LEVELS ((int)(sizeof LEVELS / sizeof LEVELS[0]))
 
@@ -76,7 +76,7 @@ const char* gamewin_open(const char* what) {
     W.msg[0] = 0;
     while (*what == ' ') what++;
     if (!*what) {                                         // no argument: the list
-        cat(W.msg, sizeof W.msg, "KAnarchy Wheels - a ragdoll obstacle course, scripted in dmccl.\n");
+        cat(W.msg, sizeof W.msg, "kanarchy wheels - a ragdoll obstacle course, scripted in dmccl.\n");
         for (int i = 0; i < N_LEVELS; i++) {
             char line[96] = "  game ";
             line[7] = (char)('1' + i);
@@ -86,8 +86,8 @@ const char* gamewin_open(const char* what) {
             cat(line, sizeof line, "\n");
             cat(W.msg, sizeof W.msg, line);
         }
-        cat(W.msg, sizeof W.msg, "  game FILE   run a level script from the file system (write one with `edit FILE`)\n");
-        cat(W.msg, sizeof W.msg, "keys: arrows/WASD drive and lean, space eject, R restart, N next level, Esc close\n");
+        cat(W.msg, sizeof W.msg, "  game file   run a level script from the file system (write one with `edit file`)\n");
+        cat(W.msg, sizeof W.msg, "keys: arrows/wasd drive and lean, space eject, r restart, n next level, esc close\n");
         return W.msg;
     }
     static char file_src[FS_MAX_SIZE + 1];
@@ -123,7 +123,7 @@ const char* gamewin_open(const char* what) {
         ww = cw + 2 * WIN_BORDER;
         wh = ch + WIN_TITLE_H + 2 * WIN_BORDER;
     }
-    W.win = window_create("KAnarchy Wheels", (SCREEN_W - ww) / 2, (SCREEN_H - TASKBAR_H - wh) / 2 > 4 ? (SCREEN_H - TASKBAR_H - wh) / 2 : 4, ww, wh);
+    W.win = window_create("kanarchy wheels", (SCREEN_W - ww) / 2, (SCREEN_H - TASKBAR_H - wh) / 2 > 4 ? (SCREEN_H - TASKBAR_H - wh) / 2 : 4, ww, wh);
     if (W.win < 0) { game_free(W.g); W.g = 0; cat(W.msg, sizeof W.msg, "cannot create the window\n"); return W.msg; }
     window_set_close_button(W.win, 1);
     window_set_minimize_button(W.win, 1);

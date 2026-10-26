@@ -172,7 +172,7 @@ static void icon_spinner(int x, int y, int phase) {
     ui_path_fill(&S, C_ACCENT);
 }
 
-static const char* sec_name(int sec) { return sec == 0 ? "Open" : sec == 1 ? "WEP" : sec == 2 ? "WPA" : sec == 3 ? "WPA2" : "WPA3 / enterprise"; }
+static const char* sec_name(int sec) { return sec == 0 ? "open" : sec == 1 ? "wep" : sec == 2 ? "wpa" : sec == 3 ? "wpa2" : "wpa3 / enterprise"; }
 
 static int band_5g(int ch) { return ch > 14; }
 
@@ -195,28 +195,28 @@ static void draw(void) {
     int phase = (int)((tick_count / 6) & 15);
 
     // header
-    text(M, 38, 26, 1, C_TEXT, "Wi-Fi", 300, C_BG);
+    text(M, 38, 26, 1, C_TEXT, "wi-fi", 300, C_BG);
     char name[80];
     rtw_ui_adapter_name(name, sizeof name);
     text(M, 66, 13, 0, C_SUB, name, W - 2 * M - 140, C_BG);
 
     if (G.adapter == 0) {
-        text(M, 230, 17, 1, C_TEXT, "No Wi-Fi adapter found", W - 2 * M, C_BG);
-        text(M, 262, 14, 0, C_SUB, "Plug in a USB Wi-Fi adapter (Realtek RTL8811CU / 8821CU).", W - 2 * M, C_BG);
-        text(M, 284, 14, 0, C_SUB, "It is detected automatically.", W - 2 * M, C_BG);
+        text(M, 230, 17, 1, C_TEXT, "no wi-fi adapter found", W - 2 * M, C_BG);
+        text(M, 262, 14, 0, C_SUB, "plug in a usb wi-fi adapter (realtek rtl8811cu / 8821cu).", W - 2 * M, C_BG);
+        text(M, 284, 14, 0, C_SUB, "it is detected automatically.", W - 2 * M, C_BG);
         return;
     }
     if (G.adapter == 1) {
-        text(M, 200, 17, 1, C_TEXT, G.starting ? "Starting the adapter..." : "Wi-Fi adapter found", W - 2 * M, C_BG);
-        text(M, 232, 14, 0, C_SUB, G.starting ? "This takes a few seconds." : "Turn it on to look for networks.", W - 2 * M, C_BG);
-        if (!G.starting) button(&G.power, "Turn on", 1, 1, G.hover == H_POWER);
-        if (G.start_result) text(M, 330, 14, 0, C_RED, "The adapter did not start (see `wifi log`).", W - 2 * M, C_BG);
+        text(M, 200, 17, 1, C_TEXT, G.starting ? "starting the adapter..." : "wi-fi adapter found", W - 2 * M, C_BG);
+        text(M, 232, 14, 0, C_SUB, G.starting ? "this takes a few seconds." : "turn it on to look for networks.", W - 2 * M, C_BG);
+        if (!G.starting) button(&G.power, "turn on", 1, 1, G.hover == H_POWER);
+        if (G.start_result) text(M, 330, 14, 0, C_RED, "the adapter did not start (see `wifi log`).", W - 2 * M, C_BG);
         return;
     }
 
     int scanning = rtw_ui_scanning();
     int can_scan = !scanning && G.link.state != RTW_LINK_BUSY && G.link.state != RTW_LINK_UP;
-    button(&G.scan, scanning ? "Scanning..." : "Scan", 1, can_scan, G.hover == H_SCAN && can_scan);
+    button(&G.scan, scanning ? "scanning..." : "scan", 1, can_scan, G.hover == H_SCAN && can_scan);
 
     // connection card
     if (G.card.h) {
@@ -224,25 +224,25 @@ static void draw(void) {
         rr(c->x, c->y, c->w, c->h, 12, C_LINE);
         rr(c->x + 1, c->y + 1, c->w - 2, c->h - 2, 11, C_CARD);
         char line[96] = "";
-        const char* act = "Disconnect";
+        const char* act = "disconnect";
         if (G.link.state == RTW_LINK_UP) {
             rr(c->x + 18, c->y + 30, 18, 18, 9, C_GREEN);
-            cat(line, "Connected to ", sizeof line); cat(line, G.link.ssid, sizeof line);
+            cat(line, "connected to ", sizeof line); cat(line, G.link.ssid, sizeof line);
             text(c->x + 52, c->y + 28, 17, 1, C_TEXT, line, c->w - 52 - 150, C_CARD);
-            char d[100] = "Address "; cat(d, G.link.ip, sizeof d); cat(d, "   Gateway ", sizeof d); cat(d, G.link.gateway, sizeof d);
+            char d[100] = "address "; cat(d, G.link.ip, sizeof d); cat(d, "   gateway ", sizeof d); cat(d, G.link.gateway, sizeof d);
             text(c->x + 52, c->y + 56, 13, 0, C_SUB, d, c->w - 52 - 150, C_CARD);
         } else if (G.link.state == RTW_LINK_BUSY) {
             icon_spinner(c->x + 14, c->y + 26, phase);
-            cat(line, "Connecting to ", sizeof line); cat(line, G.link.ssid, sizeof line);
+            cat(line, "connecting to ", sizeof line); cat(line, G.link.ssid, sizeof line);
             text(c->x + 52, c->y + 28, 17, 1, C_TEXT, line, c->w - 52 - 150, C_CARD);
             text(c->x + 52, c->y + 56, 13, 0, C_SUB, G.link.msg, c->w - 52 - 150, C_CARD);
-            act = "Cancel";
+            act = "cancel";
         } else {
             rr(c->x + 18, c->y + 30, 18, 18, 9, C_RED);
-            cat(line, "Could not connect to ", sizeof line); cat(line, G.link.ssid, sizeof line);
+            cat(line, "could not connect to ", sizeof line); cat(line, G.link.ssid, sizeof line);
             text(c->x + 52, c->y + 28, 17, 1, C_TEXT, line, c->w - 52 - 150, C_CARD);
             text(c->x + 52, c->y + 56, 13, 0, C_RED, G.link.msg, c->w - 52 - 150, C_CARD);
-            act = "Dismiss";
+            act = "dismiss";
         }
         button(&G.disc, act, 0, 1, G.hover == H_DISC);
     }
@@ -250,8 +250,8 @@ static void draw(void) {
     // network list
     struct rect lv = G.listv;
     if (G.n == 0) {
-        text(M, lv.y + 40, 16, 1, C_TEXT, scanning ? "Looking for networks..." : "No networks yet", W - 2 * M, C_BG);
-        text(M, lv.y + 68, 13, 0, C_SUB, scanning ? "This takes a few seconds." : "Press Scan to look again.", W - 2 * M, C_BG);
+        text(M, lv.y + 40, 16, 1, C_TEXT, scanning ? "looking for networks..." : "no networks yet", W - 2 * M, C_BG);
+        text(M, lv.y + 68, 13, 0, C_SUB, scanning ? "this takes a few seconds." : "press scan to look again.", W - 2 * M, C_BG);
         if (scanning) icon_spinner(W - M - 40, lv.y + 28, phase);
     }
     int old[4];
@@ -269,11 +269,11 @@ static void draw(void) {
         char sub[96] = "";
         cat(sub, sec_name(b->sec), sizeof sub); cat(sub, ", channel ", sizeof sub);
         char t[12]; itoa_(t, b->ch); cat(sub, t, sizeof sub);
-        cat(sub, band_5g(b->ch) ? " (5 GHz), " : " (2.4 GHz), ", sizeof sub);
-        itoa_(t, b->rssi); cat(sub, t, sizeof sub); cat(sub, " dBm", sizeof sub);
+        cat(sub, band_5g(b->ch) ? " (5 ghz), " : " (2.4 ghz), ", sizeof sub);
+        itoa_(t, b->rssi); cat(sub, t, sizeof sub); cat(sub, " dbm", sizeof sub);
         if (b->sec == 4) cat(sub, " - not supported", sizeof sub);
         text(r->x + 60, r->y + 44, 12, 0, C_SUB, sub, r->w - 60 - 20, bg);
-        if (connected) text(r->x + r->w - 110, r->y + 30, 13, 1, C_GREEN, "Connected", 100, bg);
+        if (connected) text(r->x + r->w - 110, r->y + 30, 13, 1, C_GREEN, "connected", 100, bg);
         else if (b->sec != 0) icon_lock(r->x + r->w - 36, r->y + 22, 0x8A909C);
         if (i == G.sel) {
             int by = r->y + ROW_H;
@@ -281,19 +281,19 @@ static void draw(void) {
                 rr(G.field.x, G.field.y, G.field.w, G.field.h, 8, C_ACCENT);
                 rr(G.field.x + 2, G.field.y + 2, G.field.w - 4, G.field.h - 4, 6, 0xFFFFFF);
                 int tx = G.field.x + 14, cy = G.field.y + G.field.h / 2;
-                if (G.pwlen == 0) text(tx, cy, 14, 0, 0x9AA0AB, "Password", G.field.w - 28, 0xFFFFFF);
+                if (G.pwlen == 0) text(tx, cy, 14, 0, 0x9AA0AB, "password", G.field.w - 28, 0xFFFFFF);
                 else if (G.show) tx += text(tx, cy, 15, 0, C_TEXT, G.pw, G.field.w - 40, 0xFFFFFF);
                 else for (int k = 0; k < G.pwlen && tx < G.field.x + G.field.w - 24; k++, tx += 12) rr(tx, cy - 4, 9, 9, 4, C_TEXT);
                 if (((tick_count / 50) & 1) == 0) fill(tx + 1, cy - 11, 2, 22, C_ACCENT);
-                button(&G.showb, G.show ? "Hide" : "Show", 0, 1, G.hover == H_SHOW);
-                if (G.short_pw) text(M + 60 + 220, G.connect.y + G.connect.h / 2, 12, 0, C_RED, "Use 8 to 63 characters", 200, C_SEL);
+                button(&G.showb, G.show ? "hide" : "show", 0, 1, G.hover == H_SHOW);
+                if (G.short_pw) text(M + 60 + 220, G.connect.y + G.connect.h / 2, 12, 0, C_RED, "use 8 to 63 characters", 200, C_SEL);
             }
             if (b->sec == 3 || b->sec == 0) {
                 int ok = b->sec == 0 || G.pwlen >= 8;
-                button(&G.connect, "Connect", 1, ok, G.hover == H_CONNECT && ok);
-                button(&G.cancel, "Cancel", 0, 1, G.hover == H_CANCEL);
+                button(&G.connect, "connect", 1, ok, G.hover == H_CONNECT && ok);
+                button(&G.cancel, "cancel", 0, 1, G.hover == H_CANCEL);
             } else {
-                text(M + 60, by + 20, 13, 0, C_SUB, "This kind of network can't be joined from here yet.", r->w - 80, C_SEL);
+                text(M + 60, by + 20, 13, 0, C_SUB, "this kind of network can't be joined from here yet.", r->w - 80, C_SEL);
             }
         }
     }
@@ -310,7 +310,7 @@ static void draw(void) {
 
     // footer
     fill(0, H - FOOT_H, W, FOOT_H, C_BG);
-    text(M, H - FOOT_H / 2, 12, 0, C_SUB, "Click a network, type its password, press Enter.   Esc cancels.", W - 2 * M, C_BG);
+    text(M, H - FOOT_H / 2, 12, 0, C_SUB, "click a network, type its password, press enter.   esc cancels.", W - 2 * M, C_BG);
 }
 
 // ---- keeping the picture current ---------------------------------------------------------------------------------------------------
@@ -405,7 +405,7 @@ void wifigui_open(int demo) {
     int x = (SCREEN_W - WIN_W) / 2, y = (SCREEN_H - WIN_H - TASKBAR_H) / 2;
     if (y < 8) y = 8;
     if (x < 0) x = 0;
-    G.win = window_create("Wi-Fi", x, y, WIN_W, WIN_H);
+    G.win = window_create("wi-fi", x, y, WIN_W, WIN_H);
     if (G.win < 0) return;
     window_set_close_button(G.win, 1);
     window_set_minimize_button(G.win, 1);

@@ -142,14 +142,14 @@ static int arg_is(const char* a, const char* w) {
 
 static void cmd_part(void) {
     if (!ata_present()) { bad("no disk\n"); return; }
-    pf("disk %u MB\n", ata_sectors() / 2048);
+    pf("disk %u mb\n", ata_sectors() / 2048);
     if (!part_count()) { out("no partition table\n"); return; }
     for (int i = 0; i < 4; i++) {
         const struct part* p = part_at(i);
         if (!p->count) continue;
         const char* role = "";
         for (int r = 0; r < PART_ROLES; r++) if (part_role(r) == p) role = part_role_name(r);
-        pf("p%d  %8u  %4u MB  %02x  %-9s %s%s%s\n", i + 1, p->start, p->count / 2048, p->type, role,
+        pf("p%d  %8u  %4u mb  %02x  %-9s %s%s%s\n", i + 1, p->start, p->count / 2048, p->type, role,
            p->fat ? (p->fat == 32 ? "fat32 " : "fat16 ") : "", p->label, part_role(PART_RECOVERY) == p ? "  ro" : "");
     }
 }
@@ -243,7 +243,7 @@ static struct pfs_entry E[PFS_TABLE_SECTORS];
 
 static int pfs_load(const struct part* d) {
     if (ata_read(d->start + PFS_SB_SECTOR, (uint8_t*)&SB)) { bad("read error\n"); return -1; }
-    if (memcmp(SB.magic, "OKPFS1", 6) || SB.version != PFS_VERSION) { bad("no OKPFS1 superblock\n"); return -1; }
+    if (memcmp(SB.magic, "OKPFS1", 6) || SB.version != PFS_VERSION) { bad("no okpfs1 superblock\n"); return -1; }
     for (int i = 0; i < PFS_TABLE_SECTORS; i++)
         if (ata_read(d->start + PFS_TABLE_START + i, (uint8_t*)&E[i])) { bad("read error\n"); return -1; }
     return 0;
@@ -278,11 +278,11 @@ static void ls_fat_cb(const char* name, const struct fat_file* e, void* ud) {
 static void cmd_ls(const char* args) {
     if (!args) { cmd_ls_pfs(); return; }
     int role = arg_is(args, "boot") ? PART_BOOT : arg_is(args, "recovery") ? PART_RECOVERY : -1;
-    if (role < 0) { out("ls [boot|recovery [DIR]]\n"); return; }
+    if (role < 0) { out("ls [boot|recovery [dir]]\n"); return; }
     const struct part* p = need_role(role);
     struct fat f;
     if (!p) return;
-    if (fat_open(&f, p->start)) { bad("not FAT\n"); return; }
+    if (fat_open(&f, p->start)) { bad("not fat\n"); return; }
     const char* dir = next_arg(args);
     if (fat_list(&f, dir ? dir : "/", ls_fat_cb, 0) < 0) bad("no such directory\n");
 }
@@ -352,7 +352,7 @@ static void cmd_fsck(const char* args) {
 }
 
 static void cmd_rm(const char* args) {
-    if (!args) { out("rm NAME\n"); return; }
+    if (!args) { out("rm name\n"); return; }
     const struct part* d = need_role(PART_DATA);
     if (!d || pfs_load(d)) return;
     for (int i = 0; i < PFS_TABLE_SECTORS; i++) {
@@ -376,7 +376,7 @@ static void cmd_rm(const char* args) {
 static void cmd_hexdump(const char* args) {
     int ok;
     uint32_t lba = parse_num(args, &ok);
-    if (!ok) { out("hexdump LBA [N]\n"); return; }
+    if (!ok) { out("hexdump lba [n]\n"); return; }
     uint32_t n = parse_num(next_arg(args), &ok);
     if (!ok || !n) n = 1;
     if (n > 64) n = 64;
@@ -413,7 +413,7 @@ static void cmd_restore(void) {
     if (!b || !r) return;
     struct fat fb, fr;
     struct fat_file src, dst;
-    if (fat_open(&fb, b->start) || fat_open(&fr, r->start)) { bad("not FAT\n"); return; }
+    if (fat_open(&fb, b->start) || fat_open(&fr, r->start)) { bad("not fat\n"); return; }
     if (fat_find(&fr, "/known/kanarchy.bin", &src)) { bad("recovery:/known/kanarchy.bin missing\n"); return; }
     if (fat_find(&fb, "/boot/kanarchy.bin", &dst)) { bad("boot:/boot/kanarchy.bin missing\n"); return; }
     pf("recovery:/known/kanarchy.bin -> boot:/boot/kanarchy.bin (%u bytes)\n", src.size);
@@ -442,7 +442,7 @@ static void cmd_memtest(const char* args) {
         if (!p) break;
         blk[nb++] = p;
     }
-    pf("%u MB\n", nb);
+    pf("%u mb\n", nb);
     static const uint32_t pat[4] = { 0x00000000u, 0xFFFFFFFFu, 0x55555555u, 0xAAAAAAAAu };
     for (int pass = 0; pass < 5; pass++) {
         for (uint32_t i = 0; i < nb; i++) {
@@ -462,7 +462,7 @@ static void cmd_memtest(const char* args) {
     }
     for (uint32_t i = 0; i < nb; i++) kfree(blk[i]);
     if (errors) { color(12); pf("%u errors\n", errors); color(15); }
-    else pf("%u MB ok\n", nb);
+    else pf("%u mb ok\n", nb);
 }
 
 // ---- entry points ----
@@ -501,7 +501,7 @@ static int last_crash(char* cause, int ccap, char* where, int wcap) {
 int recovery_crash_window(void) {
     static char cause[64], where[64];
     if (!last_crash(cause, sizeof cause, where, sizeof where)) return -1;
-    static const char msg[] = "Kernel panic! You're on your own now.";
+    static const char msg[] = "kernel panic! you're on your own now.";
     int cols = (int)sizeof msg - 1;
     if ((int)strlen(cause) > cols) cols = (int)strlen(cause);
     if ((int)strlen(where) > cols) cols = (int)strlen(where);
@@ -525,8 +525,8 @@ int recovery_crash_window(void) {
 
 void recovery_help(int win) {
     W = win;
-    out("crash [N|list]  log [prev] [dev]  part  ls [boot|recovery [DIR]]\n"
-        "fsck [fix]  rm NAME  hexdump LBA [N]  restore  knowngood  memtest [MB]\n");
+    out("crash [n|list]  log [prev] [dev]  part  ls [boot|recovery [dir]]\n"
+        "fsck [fix]  rm name  hexdump lba [n]  restore  knowngood  memtest [mb]\n");
 }
 
 int recovery_command(int win, const char* cmd, const char* args) {

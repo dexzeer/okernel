@@ -659,7 +659,7 @@ static void draw_url_text(struct wsurf* s, struct okai* b, const struct ui_lay* 
         const char* t = b->addr_input;
         int n = b->addr_input_len;
         if (n == 0) {
-            text_draw(s, x, cy, px, 0, FX_TEXT_2, "Search or enter address", -1, maxw, bg);
+            text_draw(s, x, cy, px, 0, FX_TEXT_2, "search or enter address", -1, maxw, bg);
             ws_fill_rect(s, x, cy - 11, 2, 22, 0xFF000000u | FX_TEXT);
             return;
         }
@@ -672,7 +672,7 @@ static void draw_url_text(struct wsurf* s, struct okai* b, const struct ui_lay* 
     }
     const char* u = T->url;
     if (!u[0] || has_prefix(u, "okai:")) {
-        text_draw(s, x, cy, px, 0, FX_TEXT_2, "Search or enter address", -1, maxw, bg);
+        text_draw(s, x, cy, px, 0, FX_TEXT_2, "search or enter address", -1, maxw, bg);
         return;
     }
     int n = slen(u);
@@ -726,7 +726,7 @@ static void render_chrome(int id, struct okai* b, const struct ui_lay* L, struct
         else if (has_prefix(TT->url, "okai:")) icon_search(s, icx, icy, FX_TEXT_2);
         else icon_globe(s, icx, icy, FX_TEXT_2);
         const char* t = TT->title[0] ? TT->title : TT->url;
-        if (has_prefix(TT->url, "okai:home")) t = "New Tab";
+        if (has_prefix(TT->url, "okai:home")) t = "new tab";
         int show_x = tw >= TAB_MIN_W && (sel || tw >= 110 || hover == HV_TAB + i || hover == HV_TABX + i);
         int text_x = tx + 36;
         int text_max = tx + tw - (show_x ? 6 + TABX_SZ + 4 : 10) - text_x;
@@ -830,7 +830,7 @@ static void draw_security_panel(struct okai* b, const struct ui_lay* L) {
     int internal = !T->url[0] || has_prefix(T->url, "okai:");
     if (internal) {
         icon_search(&s, x, py + 72, FX_TEXT_2);
-        text_draw(&s, x + 28, py + 80, 15, 1, FX_TEXT, "This is a built-in okai page", -1, pw - 60, 0xFFFFFF);
+        text_draw(&s, x + 28, py + 80, 15, 1, FX_TEXT, "this is a built-in okai page", -1, pw - 60, 0xFFFFFF);
         text_draw(&s, x + 28, py + 108, 14, 0, FX_TEXT_2, "It is generated locally \xE2\x80\x94 nothing", -1, pw - 60, 0xFFFFFF);
         text_draw(&s, x + 28, py + 136, 14, 0, FX_TEXT_2, "was loaded from the network.", -1, pw - 60, 0xFFFFFF);
         mark_rows(py - 4, ph + 10);
@@ -838,12 +838,12 @@ static void draw_security_panel(struct okai* b, const struct ui_lay* L) {
     }
     icon_lock(&s, x, py + 72, T->is_https ? FX_SECURE : FX_TEXT_2, !T->is_https);
     if (T->is_https) {
-        text_draw(&s, x + 28, py + 80, 15, 1, FX_TEXT, "Connection is secure", -1, pw - 60, 0xFFFFFF);
+        text_draw(&s, x + 28, py + 80, 15, 1, FX_TEXT, "connection is secure", -1, pw - 60, 0xFFFFFF);
         text_draw(&s, x + 28, py + 108, 14, 0, FX_TEXT_2, "TLS 1.3 \xE2\x80\x94 certificate verified", -1, pw - 60, 0xFFFFFF);
-        text_draw(&s, x + 28, py + 136, 14, 0, FX_TEXT_2, "Information you send is encrypted.", -1, pw - 60, 0xFFFFFF);
+        text_draw(&s, x + 28, py + 136, 14, 0, FX_TEXT_2, "information you send is encrypted.", -1, pw - 60, 0xFFFFFF);
     } else {
-        text_draw(&s, x + 28, py + 80, 15, 1, FX_TEXT, "Connection is not secure", -1, pw - 60, 0xFFFFFF);
-        text_draw(&s, x + 28, py + 108, 14, 0, FX_TEXT_2, "Information you send to this site", -1, pw - 60, 0xFFFFFF);
+        text_draw(&s, x + 28, py + 80, 15, 1, FX_TEXT, "connection is not secure", -1, pw - 60, 0xFFFFFF);
+        text_draw(&s, x + 28, py + 108, 14, 0, FX_TEXT_2, "information you send to this site", -1, pw - 60, 0xFFFFFF);
         text_draw(&s, x + 28, py + 136, 14, 0, FX_TEXT_2, "could be seen by others.", -1, pw - 60, 0xFFFFFF);
     }
     mark_rows(py - 4, ph + 10);
