@@ -248,7 +248,8 @@ static int bind_imports(struct lx_task *t, struct lx_win *w, int mi, int depth) 
                 static const struct { uint32_t o; const char *n; } cc[] = { {345, "TaskDialogIndirect"}, {381, "LoadIconWithScaleDown"}, {410, "SetWindowSubclass"}, {411, "GetWindowSubclass"}, {412, "RemoveWindowSubclass"}, {413, "DefSubclassProc"} };
                 for (int k = 0; k < 6; k++) if (cc[k].o == ord) { fname = cc[k].n; ord = 0; break; }
             }
-            addr = export_lookup(t, w, &w->mod[di], fname, ord, 0);
+            if (ord && has_prefix(dn, "api-ms-win-shcore-path") && ord == 170) { fname = "__shcore_170"; ord = 0; }      // an unnamed shcore export (adds a path to the recent documents)
+            addr = ord ? 0 : export_lookup(t, w, &w->mod[di], fname, ord, 0);                                           // our DLLs have no ordinals: a number alone is an unknown function
             if (!addr) {
                 if (w->nmissing < MAX_MISSING) {
                     {

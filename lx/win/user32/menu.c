@@ -582,6 +582,7 @@ static void choose(struct pop *p, int idx) {
     R.result = (int)t->id; R.done = 1;
 }
 
+static int kbd_open;                                                         // the bar menu was opened with the keyboard: the first item is hot
 static void bar_open(struct wnd *T, int idx);
 static int bar_item_at(struct wnd *T, int x) {
     for (int i = 0; i < T->menu->n; i++) if (x >= T->menu->it[i].x && x < T->menu->it[i].x + T->menu->it[i].w) return i;
@@ -671,7 +672,11 @@ static void bar_open(struct wnd *T, int idx) {
     int sx, sy; U_screen_origin(T, &sx, &sy);
     int title, border, sw, sh; U_info(&title, &border, &sw, &sh);
     pop_open(t->sub, sx + t->x - border, sy - T->mh + T->mh - border);       // under the bar item
-    if (npop) set_hot(&pops[0], -1);
+    if (npop) {
+        int first = -1;
+        if (kbd_open) for (int i = 0; i < pops[0].m->n; i++) if (selectable(&pops[0].m->it[i])) { first = i; break; }
+        set_hot(&pops[0], first);
+    }
 }
 
 static int menu_run(struct wnd *owner, int bar_idx, HMENU popup, int sx, int sy, int returncmd) {
@@ -695,6 +700,26 @@ static int menu_run(struct wnd *owner, int bar_idx, HMENU popup, int sx, int sy,
         if (result && !returncmd) PostMessageA(ow, WM_COMMAND, (WPARAM)(result & 0xFFFF), 0);
     }
     return result;
+}
+
+// Alt+letter (ch != 0) opens the bar menu with that mnemonic, F10 / a lone Alt (ch == 0) the first one: 1 = handled
+int U_menubar_key(struct wnd *T, int ch) {
+    if (!T->menu || R.owner || T->menu->n <= 0) return 0;
+    int idx = -1;
+    if (!ch) idx = 0;
+    else {
+        int c = ch; if (c >= 'A' && c <= 'Z') c += 32;
+        for (int i = 0; i < T->menu->n && idx < 0; i++) {
+            char plain[96]; int mn;
+            split_text(T->menu->it[i].text, plain, sizeof plain, 0, 0, &mn);
+            if (mn >= 0) { int m = plain[mn]; if (m >= 'A' && m <= 'Z') m += 32; if (m == c) idx = i; }
+        }
+    }
+    if (idx < 0) return 0;
+    kbd_open = 1;
+    menu_run(T, idx, 0, 0, 0, 0);
+    kbd_open = 0;
+    return 1;
 }
 
 // the owner's events on its own menu bar (msg.c calls this for mouse events with y < mh)

@@ -287,6 +287,9 @@ static void handle_event(const struct okw_event *e) {
         int vk = vk_of_linux(e->a), down = e->b;
         if (!vk) break;
         set_key(vk, down);
+        { static int alt_alone; int is_alt = vk == 0xA4 || vk == 0xA5 || vk == 18;
+          if (is_alt) { if (down) alt_alone = 1; else if (alt_alone) { alt_alone = 0; if (U_menubar_key(T, 0)) break; } }
+          else { alt_alone = 0; if (down && vk == 0x79 && U_menubar_key(T, 0)) break; } }                        // F10
         struct wnd *t = key_target(T);
         int alt = (keys[18] & 0x80) != 0;
         UINT m = down ? (alt && vk != 0xA4 && vk != 0xA5 ? WM_SYSKEYDOWN : WM_KEYDOWN) : (alt ? WM_SYSKEYUP : WM_KEYUP);
@@ -300,6 +303,7 @@ static void handle_event(const struct okw_event *e) {
         int c = e->a;
         if (c == 10) c = 13;
         if (c == 127 || c == 0) break;
+        if (mods & 4) { if (U_menubar_key(T, c)) break; U_post(key_target(T), 0x106, (WPARAM)c, 1 << 29); break; }       // Alt+letter: a menu mnemonic (WM_SYSCHAR otherwise)
         U_post(key_target(T), WM_CHAR, (WPARAM)c, 1);
         break;
     }

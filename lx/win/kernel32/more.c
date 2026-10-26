@@ -266,3 +266,4 @@ EXPORT LONG PSGetPropertyDescriptionListFromString(LPCWSTR s, const void *iid, v
 EXPORT LONG PropVariantToStringVectorAlloc(const void *pv, LPWSTR **out, ULONG *n) { (void)pv; if (out) *out = 0; if (n) *n = 0; return E_NOTIMPL; }
 EXPORT BOOL DecryptFileW(LPCWSTR f, DWORD r) { (void)f; (void)r; return 0; }
 EXPORT DWORD DuplicateEncryptionInfoFile(LPCWSTR a, LPCWSTR b, DWORD c, DWORD d, void *sa) { (void)a; (void)b; (void)c; (void)d; (void)sa; return 1; }
+EXPORT LONG __shcore_170(LPCWSTR path) { (void)path; return 0; }

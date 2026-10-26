@@ -69,6 +69,7 @@ struct wnd {
     void *font;
     struct sbi sb[2];                          // scroll bars of the window itself: [0] horizontal, [1] vertical (style WS_HSCROLL / WS_VSCROLL)
     int dlg_result, dlg_done, dlg_defid;
+    int sb_off;                                // scroll bars of the window that are hidden although the style has them (1 horizontal, 2 vertical): an EDIT control hides what it does not need
 };
 
 void *memset(void *d, int c, SIZE_T n);
@@ -115,6 +116,7 @@ int U_menubar_height(void);
 void U_menubar_paint(struct wnd *w);
 int U_menubar_event(struct wnd *T, const struct okw_event *e);
 void U_menubar_leave(struct wnd *T);
+int U_menubar_key(struct wnd *T, int ch);
 int U_pump(int ms);
 extern int (*U_event_hook)(const struct okw_event *);
 HDC BeginPaint(HWND h, PAINTSTRUCT *ps);
@@ -157,6 +159,7 @@ LRESULT U_listbox_proc(HWND, UINT, WPARAM, LPARAM);
 LRESULT U_scrollbar_proc(HWND, UINT, WPARAM, LPARAM);
 LRESULT U_combobox_proc(HWND, UINT, WPARAM, LPARAM);
 int U_sbv(struct wnd *w);
+void U_sb_visible(struct wnd *w, int bar, int show);          // bar 0 horizontal, 1 vertical
 int U_sbh(struct wnd *w);
 void U_nc_paint(struct wnd *w);
 int U_nc_event(struct wnd *w, int lx, int ly, int type, int down);
