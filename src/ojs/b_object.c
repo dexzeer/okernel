@@ -195,10 +195,13 @@ static jv object_keys(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     return enumerable_own(J, o, magic);
 }
 
+int ta_integrity_blocked(struct obj* o);   // b_typed.c: length-tracking TA on a resizable buffer
+
 static jv object_freeze(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     // magic: 0 freeze, 1 seal, 2 preventExtensions
     if (!jv_is_obj(argv[0])) return argv[0];
     struct obj* o = jv_obj(argv[0]);
+    if (magic != 2 && ta_integrity_blocked(o)) return throw_type(J, "Cannot freeze a length-tracking typed array on a resizable buffer");
     int r = magic == 2 ? obj_prevent_extensions(J, o) : set_integrity(J, o, magic == 0);
     if (r < 0) return JV_EXC;
     if (!r) return throw_type(J, magic == 2 ? "Cannot prevent extensions" : magic == 0 ? "Cannot freeze" : "Cannot seal");
@@ -218,7 +221,7 @@ static jv object_from_entries(ojs* J, jv this_v, int argc, jv* argv, int magic) 
     if (jv_is_nullish(argv[0])) return throw_type(J, "Object.fromEntries requires an iterable");
     struct obj* o = obj_new_plain(J);
     if (!o) return JV_EXC;
-    jv rv = iter_get(J, argv[0], 0);
+    jv rv = iter_get_ex(J, argv[0], 0, 1);
     if (rv == JV_EXC) return JV_EXC;
     struct iterrec* r = (struct iterrec*)jv_obj(rv);
     for (;;) {

@@ -14,9 +14,10 @@ extern const uint8_t wfd_serif_i[], wfd_serif_i_end[];
 extern const uint8_t wfd_mono_r[], wfd_mono_r_end[];
 extern const uint8_t wfd_mono_b[], wfd_mono_b_end[];
 extern const uint8_t wfd_sym[], wfd_sym_end[];
+extern const uint8_t wfd_cjk[], wfd_cjk_end[];
 
 enum { F_SANS_R, F_SANS_B, F_SANS_I, F_SANS_BI, F_SERIF_R, F_SERIF_B, F_SERIF_I,
-       F_MONO_R, F_MONO_B, F_SYM, F_COUNT };
+       F_MONO_R, F_MONO_B, F_SYM, F_CJK, F_COUNT };
 
 struct face {
     const uint8_t* d;
@@ -111,6 +112,7 @@ void wfont_init(void) {
     face_load(&faces[F_MONO_R], wfd_mono_r, wfd_mono_r_end);
     face_load(&faces[F_MONO_B], wfd_mono_b, wfd_mono_b_end);
     face_load(&faces[F_SYM], wfd_sym, wfd_sym_end);
+    face_load(&faces[F_CJK], wfd_cjk, wfd_cjk_end);
     fonts_ready = 1;
 }
 
@@ -196,7 +198,9 @@ static inline int32_t fu_lu(const struct face* f, int32_t v, int px) {
     return w_muldiv(v, px * LU, f->upem);
 }
 
-// Resolve cp to (face, gid). Fallback chain: chosen face -> symbols face.
+// Resolve cp to (face, gid). Fallback chain: chosen face -> symbols face ->
+// sans -> CJK face (the sans subsets stop before the CJK blocks; the CJK face
+// carries Latin too but must stay last so western text keeps Noto Sans).
 // Returns face index or -1 (no outline anywhere).
 static int resolve(int fi, uint32_t cp, uint32_t* gid) {
     uint32_t g = face_gid(&faces[fi], cp);
@@ -207,6 +211,10 @@ static int resolve(int fi, uint32_t cp, uint32_t* gid) {
     if (fi != F_SANS_R) {
         g = face_gid(&faces[F_SANS_R], cp);
         if (g) { *gid = g; return F_SANS_R; }
+    }
+    if (fi != F_CJK) {
+        g = face_gid(&faces[F_CJK], cp);
+        if (g) { *gid = g; return F_CJK; }
     }
     *gid = 0;
     return -1;

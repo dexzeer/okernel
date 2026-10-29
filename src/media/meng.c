@@ -10,7 +10,7 @@
 #include "h264.h"
 #include "vcvt.h"
 #include "msys.h"
-#ifdef KERNEL
+#if defined(KERNEL) || defined(OKAI_PORT)
 #include "../smp.h"
 #elif defined(MENG_PTHREAD)
 #include <pthread.h>
@@ -102,7 +102,7 @@ static void vw_run(void* ctx, uint32_t item, uint32_t cpu);
 static void vc_run(void* ctx, uint32_t item, uint32_t cpu);
 typedef void (*vjob_fn)(void* ctx, uint32_t item, uint32_t cpu);
 
-#ifdef KERNEL
+#if defined(KERNEL) || defined(OKAI_PORT)
 struct vhandle { struct smp_async a; };
 static int vh_can(void) { return smp_ncpu() > 1 && !smp_on_ap(); }
 static int vh_start(struct vhandle* h, vjob_fn fn, void* ctx) { return smp_async_start(fn, ctx, &h->a); }
@@ -133,7 +133,7 @@ static int vh_done(struct vhandle* h) { (void)h; return 1; }
 // (next = all ones) as soon as a frame's tasks are all claimed, so a helper that only starts running later - after the frame is over and
 // the fields below have been rewritten - finds nothing to do, and a claimed task can never belong to another frame (the owner does not
 // return before every claimed task is done).
-#ifdef KERNEL
+#if defined(KERNEL) || defined(OKAI_PORT)
 #define VTP_HELPERS 3
 struct vth { struct vtp* p; volatile uint32_t gen; struct smp_async h; };
 struct vtp {
@@ -196,7 +196,7 @@ struct vconv {
 };
 
 struct vwork {
-#ifdef KERNEL
+#if defined(KERNEL) || defined(OKAI_PORT)
     struct vtp tp;
 #endif
     struct vjob job;
@@ -1391,7 +1391,7 @@ static void vc_run(void* ctx, uint32_t item, uint32_t cpu) {
 static void vw_run(void* ctx, uint32_t item, uint32_t cpu) {
     (void)item; (void)cpu;
     struct vjob* j = (struct vjob*)ctx;
-#ifdef KERNEL
+#if defined(KERNEL) || defined(OKAI_PORT)
     if (j->tp && g_vp9_par && smp_ncpu() >= 3) vp9_dec_set_parallel(j->vd, vw_par_run, j->tp);
 #endif
     for (j->cur = 0; j->cur < j->n; j->cur++) {
@@ -1400,7 +1400,7 @@ static void vw_run(void* ctx, uint32_t item, uint32_t cpu) {
         j->dec_ticks += j->ticks() - t0;
         if (rc < 0) j->error = 1;
     }
-#ifdef KERNEL
+#if defined(KERNEL) || defined(OKAI_PORT)
     if (j->tp) vp9_dec_set_parallel(j->vd, 0, 0);       // (the engine decodes inline after a seek)
 #endif
 }
@@ -1505,7 +1505,7 @@ static void vw_submit(struct meng* m, int64_t now) {
         int cap = slot_bytes ? (int)(frame_budget / slot_bytes) : VW_RING;
         if (cap < 6) cap = 6;
         if (cap > VW_RING) cap = VW_RING;
-#if defined(KERNEL) && KERNEL
+#if (defined(KERNEL) && KERNEL) || defined(OKAI_PORT)
         { static int last_cap = VW_RING; extern void serial_printf(const char*, ...);       // say when the ring is limited by memory
           if (cap != last_cap) { last_cap = cap; serial_printf("[media] frame ring limited to %d slots (%u KB per picture, budget %u MB)\n", cap, (unsigned)(slot_bytes >> 10), (unsigned)(frame_budget >> 20)); } }
 #endif
@@ -1551,7 +1551,7 @@ static void vw_submit(struct meng* m, int64_t now) {
         off += pk->len;
     }
     j->vd = m->vd;
-#ifdef KERNEL
+#if defined(KERNEL) || defined(OKAI_PORT)
     j->tp = &w->tp;
 #else
     j->tp = 0;
@@ -1874,7 +1874,7 @@ double meng_buffered_ahead(const struct meng* m) {
 }
 
 void meng_take_tile_stats(struct meng* m, uint32_t* by_owner, uint32_t* by_helper) {   // tile tasks since the last call
-#ifdef KERNEL
+#if defined(KERNEL) || defined(OKAI_PORT)
     *by_owner = m->vw.tp.by_owner; *by_helper = m->vw.tp.by_helper;
     m->vw.tp.by_owner = m->vw.tp.by_helper = 0;
 #else

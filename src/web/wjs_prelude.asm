@@ -1,7 +1,11 @@
 ; The okai Web API prelude (src/web/wjs_prelude.js), embedded NUL-terminated
 ; for wjs.c. Path is relative to the repository root (make runs there).
 
+%ifidn __OUTPUT_FORMAT__,win32
+section .rdata
+%else
 section .rodata
+%endif
 align 4
 
 global wjs_prelude_src, wjs_prelude_len
@@ -13,4 +17,6 @@ align 4
 wjs_prelude_len:
 dd wjs_prelude_end - wjs_prelude_src
 
+%ifnidn __OUTPUT_FORMAT__,win32
 section .note.GNU-stack noalloc noexec nowrite progbits
+%endif

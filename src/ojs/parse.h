@@ -144,6 +144,7 @@ struct funcinfo {
 #define FI_EVAL         0x100000
 #define FI_USES_SUPER_CALL 0x200000
 #define FI_USES_SUPER_PROP 0x400000
+#define FI_IN_FIELD_INIT 0x800000   // lexically inside a class field initializer or static block
 #define FI_HAS_YIELD    0x800000
 #define FI_CLASS_FIELDS 0x1000000  // constructor must run field initializers
 #define FI_NEW_FUNCTION 0x2000000  // body of new Function(...)

@@ -36,6 +36,9 @@ enum {
     P_CURSOR, P_OUTLINE_WIDTH, P_OUTLINE_STYLE, P_OUTLINE_COLOR,
     P_FILL, P_STROKE, P_STROKE_WIDTH,
     P_MASK,
+    // animations / transitions (raw text, decoded at compute time)
+    P_ANIM, P_ANIM_NAME, P_ANIM_DUR, P_ANIM_DELAY, P_ANIM_ITER, P_ANIM_DIR, P_ANIM_FILL, P_ANIM_TF,
+    P_TRANS, P_TRANS_PROP, P_TRANS_DUR, P_TRANS_DELAY, P_TRANS_TF,
     P_COUNT,
     P_CUSTOM = 0xFFF0   // --custom-property (name in raw text)
 };
@@ -123,6 +126,14 @@ struct cmq {             // media query list (stored raw, evaluated per layout p
     uint32_t raw, rawlen;
 };
 
+// @keyframes: one stop (0%..100%) with its declarations in the sheet's decls[].
+struct ckf {
+    uint16_t atom;       // animation name (atom)
+    uint16_t offset;     // 0..1000 per mille ("from" = 0, "to" = 1000)
+    uint32_t order;      // source order (later stops win at the same offset)
+    int32_t decl, ndecl; // range in decls[]
+};
+
 struct wsheet {
     struct wbuf pool;        // copies of value/selector text
     struct cdecl* decls; int ndecl, capdecl;
@@ -131,6 +142,7 @@ struct wsheet {
     struct cpart* parts; int npart, cappart;
     struct ccalc* calcs; int ncalc, capcalc;
     struct cmq* mqs; int nmq, capmq;
+    struct ckf* kfs; int nkf, capkf;     // @keyframes stops
     char base[256];
     int origin;
     // @import URLs (absolute), NUL separated

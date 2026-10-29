@@ -22,6 +22,11 @@
 #define WL_FIT     5   // fit-content
 #define WL_CONTENT 6   // flex-basis: content
 
+// ---- animation / transition keywords (struct wstyle tail) -------------------
+enum { ANIM_DIR_NORMAL, ANIM_DIR_REVERSE, ANIM_DIR_ALT, ANIM_DIR_ALT_REV };
+enum { ANIM_FILL_NONE, ANIM_FILL_FORWARDS, ANIM_FILL_BACKWARDS, ANIM_FILL_BOTH };
+enum { TF_LINEAR, TF_EASE, TF_EASE_IN, TF_EASE_OUT, TF_EASE_IN_OUT };   // others -> TF_EASE
+
 struct wlen {
     int32_t px;     // LU
     int32_t pct;    // 1/100 percent
@@ -166,6 +171,15 @@ struct wstyle {
     uint32_t deco_inh_color;
     // custom properties (inherited)
     struct wcvars* vars;
+    // animations / transitions, resolved at compute time (see css_anim.c).
+    // Durations/delays are milliseconds (capped at 65 s); anim_iter 0 = infinite.
+    uint16_t anim_name;        // @keyframes name atom (0 = none)
+    uint16_t anim_dur, anim_delay;
+    uint16_t anim_iter;
+    uint8_t anim_dir, anim_fill, anim_tf;   // ANIM_DIR_*, ANIM_FILL_*, TF_*
+    uint8_t trans_prop;        // P_* animated, 0xFF = all, 0 = none
+    uint16_t trans_dur, trans_delay;
+    uint8_t trans_tf;
 };
 
 // ---- stylesheets -----------------------------------------------------------------

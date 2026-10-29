@@ -76,6 +76,9 @@ for sub in DIRS:
         if SKIP_FEATURES & set(feats) or "atomicsHelper.js" in incs:   # multi-agent tests need threads
             skipped += 1
             continue
+        if "CanBlockIsTrue" in flags or "$262.createRealm(" in src:   # one agent, one realm
+            skipped += 1
+            continue
         fl = ""
         if "raw" in flags: fl += "r"
         if "async" in flags: fl += "a"

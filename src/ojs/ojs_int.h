@@ -381,6 +381,7 @@ struct intrinsics {
         *match_tmpl,                     // ... and of RegExp match arrays (index, input, groups)
         *regexp_proto_snap;              // RegExp.prototype's slot values at realm start (see regexp_pristine)
     struct obj *native_error_proto[8], *native_error_ctor[8];
+    int aproto_indexed;             // an own index property was ever defined on Array.prototype: push/unshift must take the generic path (inherited setters)
     struct shape *empty_shape, *array_shape, *func_shape, *arrow_shape, *method_shape, *ctor_shape,
         *gen_shape, *regexp_shape, *error_shape, *regexp_proto_shape0;
 };
@@ -483,7 +484,8 @@ struct ojs {
 jv  ojs_throw(ojs* J, jv v);                           // always returns JV_EXC
 jv  throw_error(ojs* J, int ne, const char* fmt, ...); // NE_* (Error constructor family)
 jv  throw_type(ojs* J, const char* fmt, ...);
-jv  throw_not_callable(ojs* J, jv v, int ctor);   // "a.b is not a function" (callee text from the source)
+jv  throw_not_callable(ojs* J, jv v, int ctor);
+void ojs_frame_site(ojs* J, struct ojs_frame* f, char* out, int cap);   // eval-origin site of a frame   // "a.b is not a function" (callee text from the source)
 jv  throw_range(ojs* J, const char* fmt, ...);
 jv  throw_ref(ojs* J, const char* fmt, ...);
 jv  throw_syntax(ojs* J, const char* fmt, ...);
@@ -577,6 +579,13 @@ int  obj_elems_reserve(ojs* J, struct obj* o, uint32_t n);
 int  obj_append_raw(ojs* J, struct obj* o, pkey k, uint32_t attrs, jv v);
 int  shape_find(const struct shape* s, pkey k);
 jv   obj_get(ojs* J, struct obj* o, pkey k, jv receiver);
+#if !defined(KERNEL) || !KERNEL
+extern int ojs_trace_miss_on;                         // host debugging: OJS_TRACE_MISS (see util.c)
+void ojs_trace_miss(ojs* J, struct obj* o, pkey k, const char* what);
+#define OJS_MISS(J, o, k, what) do { if (ojs_trace_miss_on) ojs_trace_miss((J), (o), (k), (what)); } while (0)
+#else
+#define OJS_MISS(J, o, k, what) ((void)0)
+#endif
 jv   obj_get_v(ojs* J, jv target, pkey k);            // GetV (primitives use their prototype)
 int  obj_set(ojs* J, struct obj* o, pkey k, jv v, jv receiver, int throw_on_fail);   // 1 ok, 0 refused, -1 exc
 int  obj_has(ojs* J, struct obj* o, pkey k);            // 0/1/-1
@@ -601,6 +610,7 @@ int  length_of_array_like(ojs* J, struct obj* o, int64_t* out);
 jv   species_constructor(ojs* J, struct obj* o, jv def);
 jv   ordinary_create_from_ctor(ojs* J, jv new_target, struct obj* default_proto_intr, int cls, size_t size);
 struct obj* get_proto_from_ctor(ojs* J, jv new_target, struct obj* fallback);
+int  revoked_proxy(ojs* J, jv v);
 
 #define OWNKEYS_STRINGS 1
 #define OWNKEYS_SYMBOLS 2

@@ -31,6 +31,10 @@ tests/test_html_google
 build-host/
 __pycache__/
 
+# okai Windows port: objects, the exe's log
+build-win32/
+okai.log
+
 # web engine test corpus (tools/fetch_corpus.py) + outputs
 tests/web/corpus/
 tests/web/out/

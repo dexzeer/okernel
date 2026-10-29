@@ -998,6 +998,7 @@ static void shell_execute(int win_id, const char* input) {
             window_puts(win_id, "  resolve   - dns lookup\n");
             window_puts(win_id, "  doh       - dns over https on|off\n");
             window_puts(win_id, "  nettrace  - per-packet serial trace on|off\n");
+            window_puts(win_id, "  fetchdump - dump youtubei/jnn/googlevideo request bodies to serial on|off\n");
             window_puts(win_id, "  netdrop n - drop 1-in-n tcp pkts (test)\n");
             window_puts(win_id, "  usb       - usb controller and devices\n");
             window_puts(win_id, "  touchpad  - i2c touchpad status\n");
@@ -1073,6 +1074,12 @@ static void shell_execute(int win_id, const char* input) {
         // Per-packet serial tracing (frames, TCP segments) on/off
         net_trace = !net_trace;
         window_puts(win_id, net_trace ? "packet tracing on (serial).\n" : "packet tracing off.\n");
+    }
+    else if (str_eq(cmd_buf, "fetchdump")) {
+        // Dump bodies of youtubei/jnn/googlevideo requests+responses to serial (attestation debugging)
+        extern int okai_fdbg;
+        okai_fdbg = !okai_fdbg;
+        window_puts(win_id, okai_fdbg ? "fetchdump on.\n" : "fetchdump off.\n");
     }
     else if (str_eq(cmd_buf, "netdrop")) {
         // Test hook: drop every Nth received TCP packet (netdrop 0 = off)

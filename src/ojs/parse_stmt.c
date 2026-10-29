@@ -818,6 +818,7 @@ static struct funcinfo* new_funcinfo(struct parser* P, uint32_t flags, uint32_t 
     if (P->F) {
         fi->depth = P->F->depth + 1;
         if (P->F->flags & FI_STRICT) fi->flags |= FI_STRICT;
+        if (P->F->flags & (FI_FIELD_INIT | FI_STATIC_BLOCK | FI_IN_FIELD_INIT)) fi->flags |= FI_IN_FIELD_INIT;
         // link as a child (compile order)
         if (P->F->last_child) P->F->last_child->next_sibling = fi;
         else P->F->children = fi;
@@ -996,10 +997,15 @@ static struct node* parse_function(struct parser* P, uint32_t pos, uint32_t flag
             if (d && (is_lexical(d->kind))) { perr(P, name_pos, "Identifier '%S' has already been declared", name); return 0; }
             for (struct scope* x = P->S; x; x = x->parent) { add_varname(P, x, name); if (x == var_scope(P)) break; }
             if (!d) d = add_decl(P, s, name, D_FUNC, fn);
-            else if (d->kind == D_VAR || d->kind == D_FUNC || d->kind == D_PARAM) {
-                // a later declaration wins: record it
-                struct decl* nd = add_decl(P, s, name, D_FUNC, fn);
-                (void)nd;
+            else if (d->kind == D_VAR || d->kind == D_FUNC) {
+                // one binding: a var and the function declaration share it, the
+                // last function wins (its node is the one instantiated on entry)
+                d->kind = D_FUNC;
+                d->node = fn;
+                d->flags &= ~DF_TDZ;
+            } else {
+                // a parameter keeps its own decl: the body function shares its slot
+                add_decl(P, s, name, D_FUNC, fn);
             }
         } else {
             uint32_t fl = flags & (FI_ASYNC | FI_GENERATOR);

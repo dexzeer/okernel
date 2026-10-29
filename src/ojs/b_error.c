@@ -84,8 +84,7 @@ static int name_char(uint32_t c) {
     return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '$';
 }
 
-// "x is not a function": the callee of the call the current frame is executing, as
-// written in the source, when it is a plain dotted name (a, a.b.c, this.f, a?.b);
+// "x is not a function": the callee of the call the current frame is executing, as// written in the source, when it is a plain dotted name (a, a.b.c, this.f, a?.b);
 // calls mark their own position right before the call instruction
 static int callee_text(ojs* J, int ctor, char* out, int cap) {
     struct ojs_frame* f = J->frame;
@@ -93,7 +92,8 @@ static int callee_text(ojs* J, int ctor, char* out, int cap) {
     struct ftempl* t = f->t;
     uint32_t p0 = pos_raw(t, (uint32_t)(f->pc - t->code));
     if (!(p0 & POS_CALLEE)) return 0;
-    p0 &= ~POS_CALLEE;
+    int callret = (p0 & POS_CALLRET) != 0;
+    p0 &= ~(POS_CALLEE | POS_CALLRET);
     // the source from the call's position on (a window is all the name can span)
     uint32_t w[256], n = 0;
     if (t->source) {
@@ -110,15 +110,66 @@ static int callee_text(ojs* J, int ctor, char* out, int cap) {
         while (p < n && (w[p] == ' ' || w[p] == '\t')) p++;
     }
     int k = 0;
-    while (p < n && k < cap - 1) {
-        uint32_t c = w[p];
-        if (name_char(c) || c == '#') out[k++] = (char)c;
-        else if (c == '.' && k && out[k - 1] != '.') out[k++] = '.';
-        else if (c == '?' && p + 1 < n && w[p + 1] == '.' && k) { out[k++] = '?'; out[k++] = '.'; p++; if (k >= cap - 1) return 0; }
-        else break;
+    // The callee expression, as V8 renders it in "not a function/constructor"
+    // messages: a literal base with its .props as written ("o.p.q", "5",
+    // "\"a\".b"); anything computed collapses to "(intermediate value)" and
+    // keeps the property chain ("(intermediate value).x is not a function").
+    // A call inside the chain is invisible except that it forces the collapse.
+    // A '(' followed by something but '.' is the failing call itself: stop.
+    enum { B_NAME, B_STR, B_INTER } base = B_NAME;
+    if (p < n && (w[p] == '"' || w[p] == '\'')) {
+        uint32_t q = w[p];
         p++;
+        base = B_STR;
+        out[k++] = '"';   // V8 renders string callees with double quotes
+        while (p < n && k < cap - 2) {
+            if (w[p] == '\\' && p + 1 < n) { out[k++] = (char)w[p]; out[k++] = (char)w[p + 1]; p += 2; continue; }
+            if (w[p] == q) { out[k++] = '"'; p++; break; }
+            out[k++] = (char)w[p];
+            p++;
+        }
+    } else if (p < n && !(name_char(w[p]) || w[p] == '#' || w[p] == '.')) {
+        base = B_INTER;
+    } else {
+        while (p < n && k < cap - 1) {
+            uint32_t c = w[p];
+            if (name_char(c) || c == '#') out[k++] = (char)c;
+            else if (c == '.' && k && out[k - 1] != '.') out[k++] = '.';
+            else break;
+            p++;
+        }
     }
-    if (!k || out[k - 1] == '.' || (out[0] >= '0' && out[0] <= '9')) return 0;
+    if (base == B_INTER || callret) {
+        k = 0;
+        for (const char* s = "(intermediate value)"; *s && k < cap - 1; s++) out[k++] = *s;
+        base = B_INTER;
+    }
+    int calls = 0;
+    for (;;) {
+        if (p < n && (w[p] == '.' || (w[p] == '?' && p + 1 < n && w[p + 1] == '.'))) {
+            p += w[p] == '?' ? 2 : 1;
+            if (k && k < cap - 1 && out[k - 1] != '.') out[k++] = '.';
+            if (base == B_INTER && k + 2 >= cap) return 0;
+            while (p < n && k < cap - 1 && (name_char(w[p]) || w[p] == '#')) { out[k++] = (char)w[p]; p++; }
+        } else if (p < n && w[p] == '(') {
+            int q = p, depth = 0;
+            while (q < n) {
+                uint32_t c = w[q];
+                if (c == '(') depth++;
+                else if (c == ')' && --depth == 0) { q++; break; }
+                else if (c == '"' || c == '\'') { uint32_t qc = c; q++; while (q < n && w[q] != qc) { if (w[q] == '\\' && q + 1 < n) q++; q++; } }
+                q++;
+            }
+            if (q < n && (w[q] == '.' || (w[q] == '?' && q + 1 < n && w[q + 1] == '.'))) {
+                calls = 1;
+                if (base != B_INTER) { k = 0; for (const char* s = "(intermediate value)"; *s && k < cap - 1; s++) out[k++] = *s; base = B_INTER; }
+                p = q;
+            } else break;       // the failing call itself
+        } else break;
+    }
+    if (callret && k == 20 && 20 + 6 < cap) for (const char* s = "(...)"; *s; s++) out[k++] = *s;
+    (void)calls;
+    if (!k || out[k - 1] == '.') return 0;
     while (p < n && (w[p] == ' ' || w[p] == '\t')) p++;
     uint32_t next = p < n ? w[p] : 0;
     if (!(next == '(' || next == '`' || (ctor && (next == 0 || next == ';' || next == ')' || next == ',' || next == '\n')))) return 0;
@@ -131,6 +182,32 @@ static void t_line_col(ojs* J, struct ftempl* t, uint32_t pos, int* line, int* c
 static int t_has_source(struct ftempl* t) { return t->source || t->srct; }
 
 // the innermost running function as "name file:line:col" (host profiling aid)
+// the caller's location for an eval origin: an eval-compiled caller hands down
+// its own "eval at ..." chain with no position of its own (V8 nesting), any
+// other caller renders as "file:line:col" at the eval() call site
+void ojs_frame_site(ojs* J, struct ojs_frame* f, char* out, int cap) {
+    struct ftempl* t = f ? f->t : 0;
+    if (!t || cap < 8) { ojs_snprintf(out, cap, "<anonymous>"); return; }
+    struct str* fns = t->filename && str_len(t->filename) ? t->filename : 0;
+    int is_eval = fns && str_len(fns) > 8 && str_at(fns, 0) == 'e' && str_at(fns, 1) == 'v' && str_at(fns, 2) == 'a' && str_at(fns, 3) == 'l' && str_at(fns, 4) == ' ';
+    int k = 0;
+    if (fns) {
+        uint32_t n = str_len(fns);
+        for (uint32_t i = 0; i < n && k < cap - 1; i++) {
+            uint32_t c = str_at(fns, i);
+            out[k++] = c < 128 ? (char)c : '?';
+        }
+    }
+    if (!is_eval && t_has_source(t) && f->pc >= t->code) {
+        int line = 0, col = 0;
+        t_line_col(J, t, pos_of(t, (uint32_t)(f->pc - t->code)), &line, &col);
+        char lc[24];
+        ojs_snprintf(lc, sizeof lc, ":%d:%d", line, col);
+        for (const char* q = lc; *q && k < cap - 1; q++) out[k++] = *q;
+    }
+    out[k] = 0;
+}
+
 int ojs_where(ojs* J, char* out, int cap) {
     struct ojs_frame* f = J->frame;
     while (f && !f->t) f = f->prev;
@@ -257,13 +334,17 @@ static jv format_stack(ojs* J, struct errobj* e) {
         struct ftempl* t = (struct ftempl*)JV_PTR(v[i * 2]);
         uint32_t off = (uint32_t)jv_int(v[i * 2 + 1]);
         sb_puts(&b, "\n    at ");
-        int named = t->name && str_len(t->name) > 0;
-        if (named) { sb_put_str(&b, t->name); sb_puts(&b, " ("); }
-        if (t->filename && str_len(t->filename)) sb_put_str(&b, t->filename);
+        struct str* fns = t->filename && str_len(t->filename) ? t->filename : 0;
+        int is_eval = fns && str_len(fns) > 8 && str_at(fns, 0) == 'e' && str_at(fns, 1) == 'v' && str_at(fns, 2) == 'a' && str_at(fns, 3) == 'l' && str_at(fns, 4) == ' ';
+        // frames of eval() code are named "eval" in V8, even anonymous ones
+        int named = (t->name && str_len(t->name) > 0) || is_eval;
+        if (named) { if (t->name && str_len(t->name) > 0) sb_put_str(&b, t->name); else sb_puts(&b, "eval"); sb_puts(&b, " ("); }
+        if (fns) sb_put_str(&b, fns);
         else sb_puts(&b, "<anonymous>");
         if (t_has_source(t)) {
             int line, col;
             t_line_col(J, t, pos_of(t, off), &line, &col);
+            if (is_eval) sb_puts(&b, ", <anonymous>");
             char buf[32];
             ojs_snprintf(buf, sizeof buf, ":%d:%d", line, col);
             sb_puts(&b, buf);
@@ -289,7 +370,7 @@ static jv error_stack_get(ojs* J, jv this_v, int argc, jv* argv, int magic) {
 // SetterThatIgnoresPrototypeProperties(this, %Error.prototype%, "stack", v)
 static jv error_stack_set(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     if (!jv_is_obj(this_v)) return throw_type(J, "Error.prototype.stack setter called on non-object");
-    if (argc < 1) return throw_type(J, "Error.prototype.stack setter requires an argument");
+    if (argc < 1 || !jv_is_str(argv[0])) return throw_type(J, "Error stack value must be a string");
     struct obj* o = jv_obj(this_v);
     if (o == J->I.error_proto) return throw_type(J, "Cannot assign to read only property 'stack' of Error.prototype");
     int h = obj_get_own(J, o, A(stack), 0);

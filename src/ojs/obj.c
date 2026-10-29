@@ -436,6 +436,7 @@ void complete_property_descriptor(struct pdesc* d) {
 // no validation. Fast elements are used when possible.
 static int put_prop(ojs* J, struct obj* o, pkey k, uint32_t attrs, jv value, jv get, jv set, struct ploc* L) {
     int accessor = (attrs & PA_ACCESSOR) != 0;
+    if (o == J->I.array_proto && PK_IS_INDEX(k)) J->I.aproto_indexed = 1;
     if (L->kind == 3) {   // array length: only writability changes here (value via array_set_length)
         if (!(attrs & PA_WRITABLE)) o->flags |= OF_LEN_RO;
         return 0;
@@ -456,7 +457,7 @@ static int put_prop(ojs* J, struct obj* o, pkey k, uint32_t attrs, jv value, jv 
         if (i >= o->elen) o->elen = i + 1;
         return 0;
     }
-    if (L->kind == 0 && PK_IS_INDEX(k) && (o->flags & OF_ARRAY_FAST) && elems_to_slow(J, o) < 0) return -1;
+    if (L->kind == 0 && (o->flags & OF_ARRAY_FAST) && (PK_IS_INDEX(k) || key_array_index(k) >= 0) && elems_to_slow(J, o) < 0) return -1;
     jv slotv = value;
     if (accessor) {
         struct accessor* a = accessor_new(J, get, set);
@@ -683,6 +684,7 @@ static int array_set_length(ojs* J, struct obj* a, const struct pdesc* d) {
 // ---------------------------------------------------------------- get / has / set / delete
 
 int ord_has(ojs* J, struct obj* o, pkey k) {
+    struct obj* start = o;
     for (;;) {
         int r;
         if ((o->flags & OF_EXOTIC) && class_ops[obj_class(o)].has) return class_ops[obj_class(o)].has(J, o, k);
@@ -697,7 +699,7 @@ int ord_has(ojs* J, struct obj* o, pkey k) {
         int err = 0;
         struct obj* p = obj_get_proto(J, o, &err);
         if (err) return -1;
-        if (!p) return 0;
+        if (!p) { OJS_MISS(J, start, k, "has"); return 0; }
         o = p;
     }
 }
@@ -710,6 +712,7 @@ static jv call_getter(ojs* J, jv getter, jv receiver) {
 }
 
 jv ord_get(ojs* J, struct obj* o, pkey k, jv receiver) {
+    struct obj* start = o;
     for (;;) {
         if (o->flags & OF_EXOTIC) {
             const struct class_ops* ops = &class_ops[obj_class(o)];
@@ -729,7 +732,7 @@ jv ord_get(ojs* J, struct obj* o, pkey k, jv receiver) {
         int err = 0;
         struct obj* p = obj_get_proto(J, o, &err);
         if (err) return JV_EXC;
-        if (!p) return JV_UNDEFINED;
+        if (!p) { OJS_MISS(J, start, k, "get"); return JV_UNDEFINED; }
         o = p;
     }
 }
@@ -1197,6 +1200,8 @@ struct obj* get_proto_from_ctor(ojs* J, jv new_target, struct obj* fallback) {
     if (!jv_is_obj(new_target)) return fallback;
     jv p = obj_get(J, jv_obj(new_target), A(prototype), new_target);
     if (p == JV_EXC) return 0;
+    // GetFunctionRealm(newTarget): a revoked proxy as the new target is a TypeError
+    if (revoked_proxy(J, new_target) < 0) return 0;
     if (jv_is_obj(p)) return jv_obj(p);
     // cross-realm: the intrinsic of the constructor's realm (one realm here)
     return fallback;

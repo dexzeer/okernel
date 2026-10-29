@@ -56,6 +56,7 @@ void userland_seed(void) {
         "Try:\n"
         "  open /readme.txt   (editable)\n"
         "  open /bin/hello    (read-only)\n");
+    seed_text("/iknowwhatyoudid.txt", "I know what you did.\n");
     seed_one("/bin/hello", hello, hello_len);
     seed_one("/bin/forktest", forktest, forktest_len);
     seed_one("/bin/pipetest", pipetest, pipetest_len);

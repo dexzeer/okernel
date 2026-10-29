@@ -159,6 +159,13 @@ static int build_tables(ojs* J, struct module_rec* m, struct parser* P) {
                     continue;
                 }
                 struct decl* d = scope_find(ms, sp->u.str);
+                if (d && d->kind == D_IMPORT && d->import_name == J->A->ns_star) {
+                    // re-export of an imported module namespace object: indirect, ImportName = all
+                    int rq = request_index(J, reqs, d->import_from);
+                    if (arr_push(J, ind, jv_from_str(sp->str2)) < 0 || arr_push(J, ind, jv_from_int(rq)) < 0 ||
+                        arr_push(J, ind, JV_UNDEFINED) < 0) return -1;
+                    continue;
+                }
                 if (d && d->kind == D_IMPORT && d->import_name != J->A->ns_star) {
                     // re-export of an imported binding: an indirect export
                     int rq = request_index(J, reqs, d->import_from);
@@ -511,10 +518,10 @@ static jv get_namespace(ojs* J, struct module_rec* m) {
     n->m = m;
     n->names = jv_from_obj(keep);
     n->cells = jv_from_obj(cells);
-    n->base.flags &= ~OF_EXTENSIBLE;
     if (ord_define_own(J, &n->base, pk_from_sym(J->wk[WK_TO_STRING_TAG]),
-                       &(struct pdesc){ PD_VALUE | PD_WRITABLE | PD_ENUMERABLE | PD_CONFIGURABLE, 0, str_value(J, "Module"), JV_UNDEFINED, JV_UNDEFINED }) < 0)
+                       &(struct pdesc){ PD_VALUE, 0, str_value(J, "Module"), JV_UNDEFINED, JV_UNDEFINED }) < 0)
         return JV_EXC;
+    n->base.flags &= ~OF_EXTENSIBLE;
     m->ns = jv_from_obj(&n->base);
     return m->ns;
 }
@@ -838,7 +845,9 @@ jv module_dynamic_import(ojs* J, struct ojs_frame* f, jv spec, jv options) {
     struct str* referrer = 0;
     if (cur) referrer = cur->name;
     else {
-        for (struct ojs_frame* x = f; x && !referrer; x = x->prev) if (x->t && x->t->filename) referrer = x->t->filename;
+        // GetActiveScriptOrModule: eval frames are not it — the referencing script/module is
+        for (struct ojs_frame* x = f; x && !referrer; x = x->prev)
+            if (x->t && x->t->filename && !(x->t->flags & TF_EVAL)) referrer = x->t->filename;
         if (!referrer) referrer = J->A->empty;
     }
     struct ojs_module_hooks* H = J->modhooks;

@@ -45,7 +45,7 @@ jv global_get(ojs* J, struct str* name, int typeof_mode) {
     }
     int h = obj_has(J, g, k);
     if (h < 0) return JV_EXC;
-    if (!h) return typeof_mode ? JV_UNDEFINED : not_defined(J, name);
+    if (!h) { OJS_MISS(J, g, k, typeof_mode ? "typeof" : "ident"); return typeof_mode ? JV_UNDEFINED : not_defined(J, name); }
     return obj_get(J, g, k, jv_from_obj(g));
 }
 
@@ -56,7 +56,7 @@ int global_put(ojs* J, struct str* name, jv v, int strict) {
     int i = shape_find(L->shape, k);
     if (i >= 0) {
         if (L->slots[i] == JV_HOLE) { tdz(J, name); return -1; }
-        if (!(L->shape->props[i].attrs & PA_WRITABLE)) { throw_type(J, "Assignment to constant variable '%S'", name); return -1; }
+        if (!(L->shape->props[i].attrs & PA_WRITABLE)) { throw_type(J, "Assignment to constant variable."); return -1; }
         L->slots[i] = v;
         return 0;
     }
@@ -294,12 +294,27 @@ static jv run_eval(ojs* J, jv src, struct ojs_frame* caller, struct obj* desc, i
     memset(&o, 0, sizeof o);
     o.kind = PARSE_EVAL;
     o.strict = strict_caller;
-    o.filename = "eval";
+    // V8 renders frames of eval() code as
+    // "at fn (eval at <anonymous> (SITE), <anonymous>:L:C)"; the site chain
+    // lives in the compiled filename so the stack builder gets it for free
+    char efn[320], site[280];
+    ojs_frame_site(J, caller, site, (int)sizeof site);
+    int en = 0;
+    for (const char* q = "eval at <anonymous> ("; *q && en < (int)sizeof efn - 1; q++) efn[en++] = *q;
+    for (const char* q = site; *q && en < (int)sizeof efn - 1; q++) efn[en++] = *q;
+    if (en < (int)sizeof efn - 1) efn[en++] = ')';
+    efn[en] = 0;
+    o.filename = efn;
     if (desc) {
-        o.allow_new_target = env_has_name(desc, "new.target");
+        // new.target in eval code resolves to the calling frame's; permitted when the direct
+        // eval sits in function code (the pseudo binding's presence covers used / nested cases)
+        int nt_ok = env_has_name(desc, "new.target");
+        if (!nt_ok && caller && caller->t && !(caller->t->flags & (TF_SCRIPT | TF_MODULE | TF_ARROW | TF_EVAL)))
+            nt_ok = 1;
+        o.allow_new_target = nt_ok;
         o.allow_super_prop = env_has_name(desc, "*home*");
         o.eval_env = &env;
-        if (caller && (caller->t->flags & (TF_FIELD_INIT | TF_STATIC_INIT))) o.in_class_field = 1;
+        if (caller && (caller->t->flags & (TF_FIELD_INIT | TF_STATIC_INIT | TF_IN_FIELD_INIT))) o.in_class_field = 1;
     }
     if (parse_program(J, s, &o, &P) < 0) { parse_free(&P); return JV_EXC; }
     // in parameter initializers a sloppy eval's vars must not clash with the parameters
@@ -313,6 +328,22 @@ static jv run_eval(ojs* J, jv src, struct ojs_frame* caller, struct obj* desc, i
             for (uint32_t i = 0; i < desc->alen; i++) {
                 int fl = jv_int(desc->elems[i * 3 + 1]);
                 if ((fl & EF_PARAM) && str_eq(jv_str(desc->elems[i * 3]), d->name)) {
+                    parse_free(&P);
+                    return throw_syntax(J, "Identifier '%S' has already been declared", d->name);
+                }
+            }
+        }
+    }
+    // a sloppy direct eval's var names must not hoist over a lexical binding between the
+    // eval's lexical environment and the function's variable environment; the *evalvars*
+    // entry marks the variable environment, so everything before it can conflict
+    if (desc && !(P.top->flags & FI_STRICT)) {
+        for (struct decl* d = P.top->body_scope->decls; d; d = d->next) {
+            if (!(d->kind == D_VAR || (d->kind == D_FUNC && !(d->flags & DF_LEX_FUNC)))) continue;
+            for (uint32_t i = 0; i < desc->alen; i++) {
+                int fl = jv_int(desc->elems[i * 3 + 1]);
+                if (fl & EF_VARSCOPE) break;   // reached the variable environment
+                if ((fl & EF_TDZ) && str_eq(jv_str(desc->elems[i * 3]), d->name)) {
                     parse_free(&P);
                     return throw_syntax(J, "Identifier '%S' has already been declared", d->name);
                 }

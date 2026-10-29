@@ -102,6 +102,7 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         [OP_BIND_THIS_UPV] = &&L_OP_BIND_THIS_UPV, [OP_GET_GLOBAL] = &&L_OP_GET_GLOBAL,
         [OP_TYPEOF_GLOBAL] = &&L_OP_TYPEOF_GLOBAL, [OP_PUT_GLOBAL] = &&L_OP_PUT_GLOBAL,
         [OP_PUT_GLOBAL_STRICT] = &&L_OP_PUT_GLOBAL_STRICT, [OP_INIT_GLOBAL_LEX] = &&L_OP_INIT_GLOBAL_LEX,
+        [OP_GLOBAL_REF_PROBE] = &&L_OP_GLOBAL_REF_PROBE, [OP_PUT_GLOBAL_PROBED] = &&L_OP_PUT_GLOBAL_PROBED,
         [OP_DECL_GLOBAL_VAR] = &&L_OP_DECL_GLOBAL_VAR, [OP_DECL_GLOBAL_FUNC] = &&L_OP_DECL_GLOBAL_FUNC,
         [OP_DECL_GLOBAL_LEX] = &&L_OP_DECL_GLOBAL_LEX, [OP_CHECK_GLOBAL_DECLS] = &&L_OP_CHECK_GLOBAL_DECLS,
         [OP_DELETE_GLOBAL] = &&L_OP_DELETE_GLOBAL, [OP_GET_FIELD] = &&L_OP_GET_FIELD,
@@ -129,6 +130,7 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         [OP_NEW] = &&L_OP_NEW, [OP_CALL_SPREAD] = &&L_OP_CALL_SPREAD,
         [OP_CALL_METHOD_SPREAD] = &&L_OP_CALL_METHOD_SPREAD, [OP_NEW_SPREAD] = &&L_OP_NEW_SPREAD,
         [OP_SUPER_CALL] = &&L_OP_SUPER_CALL, [OP_SUPER_CALL_SPREAD] = &&L_OP_SUPER_CALL_SPREAD,
+        [OP_SUPER_BASE] = &&L_OP_SUPER_BASE,
         [OP_EVAL] = &&L_OP_EVAL, [OP_EVAL_SPREAD] = &&L_OP_EVAL_SPREAD,
         [OP_CALL_IGNORED_REF_ERROR] = &&L_OP_CALL_IGNORED_REF_ERROR, [OP_RETURN] = &&L_OP_RETURN,
         [OP_RETURN_UNDEF] = &&L_OP_RETURN_UNDEF, [OP_THROW] = &&L_OP_THROW, [OP_THROW_ERR] = &&L_OP_THROW_ERR,
@@ -152,6 +154,7 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         [OP_WITH_GET] = &&L_OP_WITH_GET, [OP_WITH_TYPEOF] = &&L_OP_WITH_TYPEOF,
         [OP_WITH_CALL_THIS] = &&L_OP_WITH_CALL_THIS, [OP_WITH_DELETE] = &&L_OP_WITH_DELETE,
         [OP_WITH_PUT] = &&L_OP_WITH_PUT, [OP_EVAL_VAR_DECL] = &&L_OP_EVAL_VAR_DECL,
+        [OP_WITH_REF] = &&L_OP_WITH_REF, [OP_WITH_LOAD] = &&L_OP_WITH_LOAD, [OP_WITH_SET] = &&L_OP_WITH_SET,
         [OP_INITIAL_YIELD] = &&L_OP_INITIAL_YIELD, [OP_YIELD] = &&L_OP_YIELD,
         [OP_ASYNC_GEN_YIELD] = &&L_OP_ASYNC_GEN_YIELD, [OP_AWAIT] = &&L_OP_AWAIT,
         [OP_YIELD_STAR] = &&L_OP_YIELD_STAR,
@@ -291,6 +294,31 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             SYNC();
             CHECKI(global_put(J, jv_str(nm), TOP, opc == OP_PUT_GLOBAL_STRICT));
             ic_fill_global(J, t, ici, atom_key(J, nm), 1);
+            break;
+        }
+        case OP_GLOBAL_REF_PROBE: L_OP_GLOBAL_REF_PROBE: {   // [] -> [resolvable?]; ResolveBinding of a global name
+            jv nm = consts[rd32(pc)];
+            pc += 4;
+            SYNC();
+            struct obj* L = jv_obj(J->global_lex);
+            pkey k = atom_key(J, nm);
+            int found = shape_find(L->shape, k) >= 0;
+            if (!found) {
+                int h = obj_has(J, J->I.global, k);
+                if (h < 0) goto exception;
+                found = h;
+            }
+            PUSH(found ? JV_TRUE : JV_FALSE);
+            break;
+        }
+        case OP_PUT_GLOBAL_PROBED: L_OP_PUT_GLOBAL_PROBED: {   // [probe, value] -> [value]; PutValue of a probed reference
+            jv nm = consts[rd32(pc)];
+            pc += 6;   // + ic index, unused (this path is never cached)
+            SYNC();
+            if (sp[-2] == JV_FALSE) { throw_ref(J, "%S is not defined", jv_str(nm)); goto exception; }
+            CHECKI(global_put(J, jv_str(nm), TOP, 1));
+            sp[-2] = TOP;
+            sp--;
             break;
         }
         case OP_INIT_GLOBAL_LEX: L_OP_INIT_GLOBAL_LEX: {
@@ -498,14 +526,20 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             TOP = v;
             break;
         }
-        case OP_SUPER_CTOR: L_OP_SUPER_CTOR: {   // [func] -> [its prototype, which must be a constructor]
+        case OP_SUPER_CTOR: L_OP_SUPER_CTOR: {   // [func] -> [its prototype] (the constructor check happens in SUPER_CALL, after the arguments ran)
             SYNC();
             a = TOP;
             int err = 0;
             struct obj* p = jv_is_obj(a) ? obj_get_proto(J, jv_obj(a), &err) : 0;
             if (err) goto exception;
-            if (!p || !(p->flags & OF_CONSTRUCTOR)) { throw_type(J, "Super constructor is not a constructor"); goto exception; }
-            TOP = jv_from_obj(p);
+            TOP = p ? jv_from_obj(p) : JV_NULL;
+            break;
+        }
+        case OP_SUPER_BASE: L_OP_SUPER_BASE: {   // [home] -> [its [[Prototype]]]; captured before the property key is converted
+            SYNC();
+            v = super_base(J, TOP);
+            if (v == JV_EXC) goto exception;
+            TOP = v;
             break;
         }
 
@@ -694,7 +728,31 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         case OP_IN: L_OP_IN: {   // [key, obj] -> [bool]
             SYNC();
             a = sp[-2]; b = sp[-1];
-            if (!jv_is_obj(b)) { throw_type(J, "Cannot use 'in' operator to search for a key in a non-object"); goto exception; }
+            if (!jv_is_obj(b)) {
+                // V8: "Cannot use 'in' operator to search for 'a' in 1" —
+                // strings and symbol descriptions as written, else ToString
+                struct str* ks = 0;
+                int have_ks = 0;
+                if (jv_is_str(a)) { ks = str_flat(J, a); have_ks = 1; }
+                else if (jv_is_sym(a) && !jv_is_undef(jv_sym(a)->desc)) { ks = str_flat(J, jv_sym(a)->desc); have_ks = 1; }
+                if (!have_ks) {
+                    jv tv = to_string(J, a);
+                    if (tv == JV_EXC) goto exception;
+                    ks = str_flat(J, tv);
+                    if (!ks) goto exception;
+                }
+                if (!ks) goto exception;
+                char kb[96];
+                int kn = 0;
+                for (uint32_t i = 0; i < str_len(ks) && kn < (int)sizeof kb - 1; i++) kb[kn++] = (char)str_at(ks, i);
+                kb[kn] = 0;
+                jv tb = to_string(J, b);
+                if (tb == JV_EXC) goto exception;
+                struct str* bs = str_flat(J, tb);
+                if (!bs) goto exception;
+                throw_type(J, "Cannot use 'in' operator to search for '%s' in %S", kb, bs);
+                goto exception;
+            }
             pkey k = pkey_from_value(J, a);
             if (!k) goto exception;
             int r = obj_has(J, jv_obj(b), k);
@@ -825,6 +883,7 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             a = args[-2];
             b = args[-1];
             if (jv_is_undef(b)) { throw_ref(J, "'super' keyword unexpected here"); goto exception; }
+            if (!jv_is_obj(a) || !(jv_obj(a)->flags & OF_CONSTRUCTOR)) { throw_type(J, "Super constructor is not a constructor"); goto exception; }
             v = vm_call(J, a, JV_UNDEFINED, argc, args, b);
             CHECK(v);
             sp = args - 2;
@@ -834,6 +893,7 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         case OP_SUPER_CALL_SPREAD: L_OP_SUPER_CALL_SPREAD: {   // [parent, newtarget, array] -> [this]
             SYNC();
             c = sp[-1]; b = sp[-2]; a = sp[-3];
+            if (!jv_is_obj(a) || !(jv_obj(a)->flags & OF_CONSTRUCTOR)) { throw_type(J, "Super constructor is not a constructor"); goto exception; }
             struct obj* arr = jv_obj(c);
             for (uint32_t i = 0; i < arr->elen; i++) if (arr->elems[i] == JV_HOLE) arr->elems[i] = JV_UNDEFINED;
             v = vm_call(J, a, JV_UNDEFINED, (int)arr->elen, arr->elems, b);
@@ -893,10 +953,9 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
         }
         case OP_TDZ_ERROR: L_OP_TDZ_ERROR: { jv nm = consts[rd32(pc)]; pc += 4; SYNC(); tdz_error(J, nm); goto exception; }
         case OP_CONST_ERROR: L_OP_CONST_ERROR: {
-            jv nm = consts[rd32(pc)];
             pc += 4;
             SYNC();
-            throw_type(J, "Assignment to constant variable '%S'", str_flat(J, nm));
+            throw_type(J, "Assignment to constant variable.");
             goto exception;
         }
 
@@ -1124,16 +1183,32 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             break;
         }
         case OP_ASYNC_ITER_CLOSE: L_OP_ASYNC_ITER_CLOSE: {   // [rec] -> [return() result (to await)] or [undefined]
+            uint8_t in_flight = *pc++;
             SYNC();
             struct iterrec* r = (struct iterrec*)jv_obj(TOP);
             // nothing to close: JV_HOLE makes the following AWAIT / ITER_CHECK_OBJ no-ops
             if (r->done) { TOP = JV_HOLE; break; }
             r->done = 1;
+            // a close error never replaces the body exception already in flight
+            // (operand 1: the exception is parked on the stack below the record)
+            int had_exc = in_flight;
+            int oom0 = J->oom;
+            jv saved_exc = J->exc;
             jv m = get_method(J, r->iter, A(return_));
-            CHECK(m);
+            if (m == JV_EXC) {
+                if (!had_exc) goto exception;
+                J->exc = saved_exc; J->has_exc = had_exc; J->oom = oom0;
+                TOP = JV_HOLE;
+                break;
+            }
             if (jv_is_undef(m)) { TOP = JV_HOLE; break; }
             v = ojs_call_v(J, m, r->iter, 0, 0);
-            CHECK(v);
+            if (v == JV_EXC) {
+                if (!had_exc) goto exception;
+                J->exc = saved_exc; J->has_exc = had_exc; J->oom = oom0;
+                TOP = JV_HOLE;
+                break;
+            }
             TOP = v;
             break;
         }
@@ -1236,6 +1311,17 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
                 JUMP(off);
                 break;
             }
+            if (opc == OP_WITH_GET || opc == OP_WITH_CALL_THIS) {   // GetBindingValue re-checks HasProperty after HasBinding
+                int h2 = obj_has(J, jv_obj(a), k);
+                if (h2 < 0) goto exception;
+                if (!h2) {
+                    if (strict) { throw_error(J, NE_REFERENCE, "%S is not defined", jv_str(nm)); goto exception; }
+                    PUSH(JV_UNDEFINED);
+                    if (opc == OP_WITH_CALL_THIS) PUSH((jv_obj(a)->flags & OF_EVALVARS) ? JV_UNDEFINED : a);
+                    JUMP(off);
+                    break;
+                }
+            }
             v = obj_get(J, jv_obj(a), k, a);
             CHECK(v);
             PUSH(v);
@@ -1257,6 +1343,55 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             int r = obj_set(J, jv_obj(a), k, TOP, a, strict);
             if (r < 0) goto exception;
             JUMP(off);
+            break;
+        }
+        case OP_WITH_REF: L_OP_WITH_REF: {   // [obj] -> found: [obj] + jump; else popped, fall through
+            jv nm = consts[rd32(pc)];
+            int32_t off = (int32_t)rd32(pc + 4);
+            pc += 8;
+            SYNC();
+            a = POP();
+            if (!jv_is_obj(a)) break;   // eval var object not created yet
+            pkey k = atom_key(J, nm);
+            int h = with_has(J, jv_obj(a), k);
+            if (h < 0) goto exception;
+            if (!h) break;
+            PUSH(a);
+            JUMP(off);
+            break;
+        }
+        case OP_WITH_LOAD: L_OP_WITH_LOAD: {   // [obj] -> [obj, value]; GetBindingValue(N, strict)
+            jv nm = consts[rd32(pc)];
+            pc += 4;
+            SYNC();
+            a = POP();
+            pkey k = atom_key(J, nm);
+            int h = obj_has(J, jv_obj(a), k);
+            if (h < 0) goto exception;
+            if (!h) {
+                if (strict) { throw_error(J, NE_REFERENCE, "%S is not defined", jv_str(nm)); goto exception; }
+                PUSH(a);
+                PUSH(JV_UNDEFINED);
+                break;
+            }
+            v = obj_get(J, jv_obj(a), k, a);
+            CHECK(v);
+            PUSH(a);
+            PUSH(v);
+            break;
+        }
+        case OP_WITH_SET: L_OP_WITH_SET: {   // [obj, v] -> [v]; SetMutableBinding(N, v, strict)
+            jv nm = consts[rd32(pc)];
+            pc += 4;
+            SYNC();
+            a = sp[-2];
+            pkey k = atom_key(J, nm);
+            int h = obj_has(J, jv_obj(a), k);
+            if (h < 0) goto exception;
+            if (!h && strict) { throw_error(J, NE_REFERENCE, "%S is not defined", jv_str(nm)); goto exception; }
+            if (obj_set(J, jv_obj(a), k, TOP, a, strict) < 0) goto exception;
+            sp[-2] = TOP;
+            sp--;
             break;
         }
         case OP_EVAL_VAR_DECL: L_OP_EVAL_VAR_DECL: {   // create a var in the caller's eval var object

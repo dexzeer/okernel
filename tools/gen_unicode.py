@@ -102,14 +102,40 @@ def add_props(fname):
     for f in rd(fname):
         if len(f) < 2:
             continue
+        if " " in f[0]:          # a sequence of code points (emoji strings property)
+            strprops.setdefault(f[1], []).append([int(x, 16) for x in f[0].split()])
+            continue
         a, b = parse_range(f[0])
         binprops.setdefault(f[1], []).append([a, b])
 
+# property-of-strings data (UTS #51; the v-mode \p{...} sets):
+# emoji-sequences.txt / emoji-zwj.txt live next to emoji-data.txt in the UCD layout
+strprops = {}
+add_props("emoji/emoji-sequences.txt")
+add_props("emoji/emoji-zwj.txt")
+
 add_props("DerivedCoreProperties.txt")
 add_props("PropList.txt")
-add_props("emoji-data.txt")
-add_props("DerivedBinaryProperties.txt")
+add_props("emoji/emoji-data.txt")
+add_props("extracted/DerivedBinaryProperties.txt")
 add_props("DerivedNormalizationProps.txt")
+
+# RGI_Emoji = Basic_Emoji plus every other RGI sequence set.
+# Basic_Emoji also contains the single code points with Emoji_Presentation=Yes
+if strprops.get("Basic_Emoji"):
+    for a, b in binprops.get("Emoji_Presentation", []):
+        for cp in range(a, b + 1):
+            strprops["Basic_Emoji"].append([cp])
+    rgi = []
+    seen = set()
+    for p in ("Basic_Emoji", "Emoji_Keycap_Sequence", "RGI_Emoji_Flag_Sequence",
+              "RGI_Emoji_Modifier_Sequence", "RGI_Emoji_Tag_Sequence", "RGI_Emoji_ZWJ_Sequence"):
+        for s in strprops.get(p, []):
+            t = tuple(s)
+            if t not in seen:
+                seen.add(t)
+                rgi.append(list(t))
+    strprops["RGI_Emoji"] = rgi
 # CaseFolding-derived and others ECMAScript requires that UCD derives elsewhere
 binprops = {k: merge(v) for k, v in binprops.items()}
 
@@ -210,6 +236,12 @@ for k in list(scx.keys()):
         if k in [short_of.get(s, s) for s in f[1].split()]:
             ext.append([a, b])
     scx[k] = merge(base + ext)
+# Unknown (Zzzz) is not listed in Scripts.txt: the complement of every known script
+known = []
+for v in scripts.values():
+    known += v
+scripts["Unknown"] = subtract([[0, 0x10FFFF]], merge(known))
+scx["Unknown"] = subtract(scripts["Unknown"], listed_ranges)
 
 # ---------------------------------------------------------------- case data
 
@@ -317,6 +349,28 @@ for label, data in (("SC", scripts), ("SCX", scx)):
     w("    { 0, { 0, 0 } }")
     w("};")
     w()
+
+# property-of-strings (v-mode \p{...}): flat per property: n, cp..., n, cp..., 0
+str_ents = []
+for k in sorted(strprops.keys()):
+    seqs = sorted(set(map(tuple, strprops[k])), key=lambda s: (-len(s), s))
+    flat = []
+    for s in seqs:
+        flat += [len(s)] + list(s)
+    flat.append(0)
+    cname = "S_STR_" + cid(k)
+    w("static const uint32_t %s[] = {" % cname)
+    for i in range(0, len(flat), 10):
+        w("    " + ", ".join("0x%X" % v for v in flat[i:i + 10]) + ",")
+    w("};")
+    str_ents.append((k, cname))
+w()
+w("const struct uprop_str uni_strprops[] = {")
+for k, cname in str_ents:
+    w('    { "%s", %s },' % (k, cname))
+w("    { 0, 0 }")
+w("};")
+w()
 
 def emit_pairs(cname, d):
     items = sorted(d.items())

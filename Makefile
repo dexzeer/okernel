@@ -116,7 +116,13 @@ DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/ac97.o src/audi
              src/crypto/certverify.o src/rtc.o \
              src/net/fcache.o src/net/hpack.o src/net/hpack_tables.o src/net/h2.o src/net/fetch.o
 
-.PHONY: laptop disk all text desktop clean run debug host-tests host-tests-asan media-tests diff-oracle diff-test tls-interop web-tests
+.PHONY: laptop disk all text desktop clean run debug host-tests host-tests-asan media-tests diff-oracle diff-test tls-interop web-tests win
+
+# ---- okai for Windows (32-bit) ----
+# The browser shell + engine + ojs + TLS/HTTP on Winsock, in a Win32 window:
+# build-host/okai.exe. Needs MinGW-w64 i686 (sudo apt install gcc-mingw-w64-i686).
+win:
+	sh win32/build.sh
 
 # ---- Web engine host tests (src/web) ----
 # Offline must-pass: CSS cascade unit tests, font engine. With the corpus
@@ -389,7 +395,7 @@ ALL_C_OBJ = $(COMMON_OBJ) $(TEXT_OBJ) $(DESKTOP_OBJ) src/kernel.o src/desktop.o
 clean:
 	rm -f $(ASM_OBJ) boot/start_text.o $(ALL_C_OBJ) $(ALL_C_OBJ:.o=.d)
 	rm -f kanarchy-text.bin kanarchy-text.iso kanarchy-desktop.bin kanarchy-desktop.iso kanarchy-disk.img
-	rm -rf isodir build-ksyms build-disk build-text
+	rm -rf isodir build-ksyms build-disk build-text build-win32
 
 -include $(wildcard $(ALL_C_OBJ:.o=.d))
 

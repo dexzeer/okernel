@@ -126,6 +126,12 @@ const struct urange_set* uni_find_prop(int kind, const char* name, int* is_cn) {
     return 0;
 }
 
+const uint32_t* uni_find_strprop(const char* name) {
+    for (int i = 0; uni_strprops[i].names; i++)
+        if (name_match(uni_strprops[i].names, name)) return uni_strprops[i].seqs;
+    return 0;
+}
+
 // ---------------------------------------------------------------- normalization
 
 #define SBASE 0xAC00

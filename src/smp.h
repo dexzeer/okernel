@@ -2,7 +2,9 @@
 #define SMP_H
 
 #include <stdint.h>
+#if !(defined(__STDC_HOSTED__) && __STDC_HOSTED__)
 #include "acpi.h"
+#endif
 
 // Symmetric multiprocessing, deliberately small: every extra core (an AP)
 // runs a worker that executes jobs handed over by the boot CPU. The AP never

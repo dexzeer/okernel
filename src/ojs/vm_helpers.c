@@ -609,20 +609,16 @@ static jv super_base(ojs* J, jv home) {
     return p ? jv_from_obj(p) : JV_NULL;
 }
 
-static jv super_get(ojs* J, jv key, jv home, jv this_v) {
+static jv super_get(ojs* J, jv key, jv base, jv this_v) {
     if (this_v == JV_HOLE) return throw_ref(J, "Must call super constructor in derived class before accessing 'this'");
-    jv base = super_base(J, home);
-    if (base == JV_EXC) return JV_EXC;
     pkey k = pkey_from_value(J, key);
     if (!k) return JV_EXC;
     if (jv_is_null(base)) return throw_type(J, "Cannot read properties of null");
     return obj_get(J, jv_obj(base), k, this_v);
 }
 
-static int super_put(ojs* J, jv key, jv home, jv this_v, jv v, int strict) {
+static int super_put(ojs* J, jv key, jv base, jv this_v, jv v, int strict) {
     if (this_v == JV_HOLE) { throw_ref(J, "Must call super constructor in derived class before accessing 'this'"); return -1; }
-    jv base = super_base(J, home);
-    if (base == JV_EXC) return -1;
     pkey k = pkey_from_value(J, key);
     if (!k) return -1;
     if (jv_is_null(base)) { throw_type(J, "Cannot set properties of null"); return -1; }

@@ -21,7 +21,18 @@ static void proxy_trace(ojs* J, struct obj* o) {
 
 // the trap `name` of p's handler: undefined if absent; JV_EXC on revoked / errors
 static jv get_trap(ojs* J, struct proxy* p, pkey name) {
-    if (jv_is_null(p->handler)) return throw_type(J, "Cannot perform operation on a revoked proxy");
+    if (jv_is_null(p->handler)) {
+        // V8 names the operation: "Cannot perform 'get' on a proxy that has been revoked"
+        char op[40];
+        int n = 0;
+        if (pk_is_str(name)) {
+            struct str* s = pk_str(name);
+            for (uint32_t i = 0; i < str_len(s) && n < (int)sizeof op - 1; i++) op[n++] = (char)str_at(s, i);
+        }
+        if (!n) { op[0] = 'o'; op[1] = 'p'; op[2] = 0; }
+        op[n] = 0;
+        return throw_type(J, "Cannot perform '%s' on a proxy that has been revoked", op);
+    }
     return get_method(J, p->handler, name);
 }
 
@@ -401,6 +412,16 @@ int proxy_is_array(ojs* J, struct obj* o) {
     struct proxy* p = (struct proxy*)o;
     if (jv_is_null(p->handler)) { throw_type(J, "Cannot perform 'IsArray' on a proxy that has been revoked"); return -1; }
     return is_array(J, p->target);
+}
+
+// GetFunctionRealm on a proxy: a revoked one throws (GetPrototypeFromConstructor's
+// prototype get may itself have gone through and revoked it mid-flight)
+int revoked_proxy(ojs* J, jv v) {
+    if (!jv_is_obj(v) || obj_class(jv_obj(v)) != OC_PROXY) return 0;
+    struct proxy* p = (struct proxy*)jv_obj(v);
+    if (!jv_is_null(p->handler) && !jv_is_null(p->target)) return 0;
+    throw_type(J, "Cannot construct with a proxy that has been revoked");
+    return -1;
 }
 
 // ---------------------------------------------------------------- Proxy constructor

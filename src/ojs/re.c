@@ -67,7 +67,7 @@ static void* aalloc(struct rp* p, size_t n) {
 static void fail(struct rp* p, const char* msg) {
     if (p->failed) return;
     p->failed = 1;
-    ojs_snprintf(p->err, p->errcap, "Invalid regular expression: %s", msg);
+    ojs_snprintf(p->err, p->errcap, "%s", msg);
 }
 
 static int cs_add(struct rp* p, struct cset* c, uint32_t lo, uint32_t hi) {
@@ -387,6 +387,29 @@ static int class_escape(struct rp* p, int c, struct cset* set) {
             else {
                 u = uni_find_prop(0, name, &is_cn);
                 if (!u && !is_cn) u = uni_find_prop(1, name, &is_cn);
+                if (!u && !is_cn && p->vmode) {
+                    // property of strings (v mode only): add every sequence
+                    const uint32_t* q = uni_find_strprop(name);
+                    if (q) {
+                        if (neg) { fail(p, "negated character class may contain strings"); return -1; }
+                        for (; *q; q += *q + 1) {
+                            uint32_t n = *q;
+                            if (n == 1) { if (cs_add(p, &tmp, q[1], q[1]) < 0) return -1; }
+                            else {
+                                struct cstr* s = (struct cstr*)aalloc(p, sizeof *s);
+                                if (!s) return -1;
+                                s->cp = (uint32_t*)aalloc(p, (size_t)n * 4);
+                                if (!s->cp) return -1;
+                                memcpy(s->cp, q + 1, (size_t)n * 4);
+                                s->n = (int)n;
+                                s->next = tmp.strs;
+                                tmp.strs = s;
+                            }
+                        }
+                        if (cs_add_set(p, set, &tmp) < 0) return -1;
+                        return 1;
+                    }
+                }
                 if (!u && !is_cn) { fail(p, "invalid property name"); return -1; }
             }
         }
@@ -1404,7 +1427,7 @@ const char* re_group_name(const struct re_prog* p, uint32_t i) {
 
 int regexp_check_syntax(ojs* J, struct str* body, struct str* flags, char* err, int errcap) {
     int fl = re_parse_flags(flags);
-    if (fl < 0) { ojs_snprintf(err, errcap, "Invalid regular expression flags"); return -1; }
+    if (fl < 0) { ojs_snprintf(err, errcap, "Invalid flags supplied to RegExp constructor"); return -1; }
     int saved = J->gc_disabled;
     struct re_prog* p = re_compile(J, body, fl, err, errcap);
     J->gc_disabled = saved;

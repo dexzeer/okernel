@@ -18,6 +18,7 @@ struct iterrec {
     int done;
 };
 jv   iter_get(ojs* J, jv v, int async);                 // iterator record (object value)
+jv   iter_get_ex(ojs* J, jv v, int async, int longmsg);  // longmsg: the built-in "number 1 is not iterable (...)" form
 jv   iter_step_value(ojs* J, struct iterrec* r);        // value, JV_HOLE when done, JV_EXC
 int  iter_close(ojs* J, struct iterrec* r, int quiet);  // quiet: completion is a throw (ignore errors)
 jv   iter_to_list(ojs* J, jv iterable);                 // JS array of the iterated values

@@ -26,6 +26,9 @@
 // okai:home is an INTERNAL page (no network).
 #define OKAI_HOME_URL "okai:home"
 
+// The page that is not linked from anywhere.
+#define OKAI_SECRET_URL "okai:iknowwhatyoudid"
+
 struct wdoc;
 
 // One page: everything that a tab switch must preserve so switching back
