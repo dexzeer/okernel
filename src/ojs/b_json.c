@@ -17,7 +17,8 @@ struct jp {
     uint32_t i, n;
     int depth;
     int keep_source;        // record source text of primitives (reviver present)
-    struct obj* sources;    // value object -> source text (parallel arrays in an internal array)
+    struct obj* sources;    // per primitive: [value, start, end, holder, key]
+    int last_src;           // sources record of the value jp_value just returned
 };
 
 static inline uint32_t PC(struct jp* p) { return p->i < p->n ? str_at(p->s, p->i) : 0xFFFFFFFFu; }
@@ -30,11 +31,63 @@ static void skip_ws(struct jp* p) {
     }
 }
 
-static jv jp_error(struct jp* p, const char* what) {
-    if (p->i >= p->n) return throw_syntax(p->J, "Unexpected end of JSON input");
-    uint32_t c = str_at(p->s, p->i);
-    if (c >= 32 && c < 127) return throw_syntax(p->J, "Unexpected token '%c', %s in JSON at position %d", (int)c, what, (int)p->i);
-    return throw_syntax(p->J, "Unexpected character %s in JSON at position %d", what, (int)p->i);
+// V8's JSON.parse messages: a token where a value was expected quotes a
+// snippet of the source ("Unexpected token 'x', \"[1,1,x]\" is not valid
+// JSON", the window clipped with "..." on either side); everything else says
+// "... in JSON at position N (line L column C)". A digit where the parser
+// wanted a separator scans as a number token: "Unexpected number".
+enum {
+    JP_BAD_VALUE, JP_EXPECT_KEY, JP_EXPECT_DQ_KEY, JP_EXPECT_COLON,
+    JP_EXPECT_OBJ_SEP, JP_EXPECT_ARR_SEP, JP_UNTERMINATED_STR, JP_BAD_ESCAPE,
+    JP_BAD_UNICODE, JP_NO_NUM, JP_BAD_FRAC, JP_BAD_EXP, JP_TRAILING,
+    JP_UNEXPECTED_NUMBER
+};
+
+static void jp_line_col(const struct str* s, uint32_t n, uint32_t pos, int* line, int* col) {
+    int l = 1, c = 1;
+    for (uint32_t i = 0; i < n && i < pos; i++) {
+        if (str_at(s, i) == '\n') { l++; c = 1; } else c++;
+    }
+    *line = l;
+    *col = c;
+}
+
+static jv jp_error(struct jp* p, int kind) {
+    uint32_t i = p->i;
+    const char* what = 0;
+    switch (kind) {
+    case JP_EXPECT_KEY: what = "Expected property name or '}'"; break;
+    case JP_EXPECT_DQ_KEY: what = "Expected double-quoted property name"; break;
+    case JP_EXPECT_COLON: what = "Expected ':' after property name"; break;
+    case JP_EXPECT_OBJ_SEP: what = "Expected ',' or '}' after property value"; break;
+    case JP_EXPECT_ARR_SEP: what = "Expected ',' or ']' after array element"; break;
+    case JP_UNTERMINATED_STR: what = "Unterminated string"; break;
+    case JP_BAD_ESCAPE: what = "Bad escaped character"; break;
+    case JP_BAD_UNICODE: what = "Bad Unicode escape"; break;
+    case JP_NO_NUM: what = "No number after minus sign"; break;
+    case JP_BAD_FRAC: what = "Unterminated fractional number"; break;
+    case JP_BAD_EXP: what = "Exponent part is missing a number"; break;
+    case JP_TRAILING: what = ""; break;  // has its own format below
+    case JP_UNEXPECTED_NUMBER: what = "Unexpected number"; break;
+    default: {                   // a token where a value was expected
+        if (i >= p->n) return throw_syntax(p->J, "Unexpected end of JSON input");
+        uint32_t c = str_at(p->s, i);
+        uint32_t st = i >= 10 ? i - 10 : 0, en = p->n < i + 11 ? p->n : i + 11;
+        char snip[24];
+        int sn = 0;
+        for (uint32_t k = st; k < en && sn < (int)sizeof snip - 1; k++) {
+            uint32_t sc = str_at(p->s, k);
+            snip[sn++] = sc >= 32 && sc < 127 ? (char)sc : '?';
+        }
+        snip[sn] = 0;
+        return throw_syntax(p->J, "Unexpected token '%c', %s\"%s\"%s is not valid JSON", (int)(c & 0xFF), st > 0 ? "..." : "", snip, en < p->n ? "..." : "");
+    }
+    }
+    int line = 1, col = 1;
+    jp_line_col(p->s, p->n, i, &line, &col);
+    if (kind == JP_TRAILING)
+        return throw_syntax(p->J, "%s at position %d (line %d column %d)", "Unexpected non-whitespace character after JSON", (int)i, line, col);
+    return throw_syntax(p->J, "%s in JSON at position %d (line %d column %d)", what, (int)i, line, col);
 }
 
 static int hex4(struct jp* p, uint32_t* out) {
@@ -71,13 +124,13 @@ static jv jp_string(struct jp* p) {
     sb_init(p->J, &b);
     sb_put_sub(&b, p->s, start, p->i);
     for (;;) {
-        if (p->i >= p->n) { sb_free(&b); return jp_error(p, "unterminated string"); }
+        if (p->i >= p->n) { sb_free(&b); return jp_error(p, JP_UNTERMINATED_STR); }
         uint32_t c = str_at(p->s, p->i);
         if (c == '"') { p->i++; return sb_done(&b); }
-        if (c < 0x20) { sb_free(&b); return jp_error(p, "bad control character in string literal"); }
+        if (c < 0x20) { sb_free(&b); return jp_error(p, JP_BAD_VALUE); }
         if (c != '\\') { sb_putc(&b, c); p->i++; continue; }
         p->i++;
-        if (p->i >= p->n) { sb_free(&b); return jp_error(p, "bad escape"); }
+        if (p->i >= p->n) { sb_free(&b); return jp_error(p, JP_BAD_ESCAPE); }
         c = str_at(p->s, p->i++);
         switch (c) {
         case '"': sb_putc(&b, '"'); break;
@@ -90,14 +143,14 @@ static jv jp_string(struct jp* p) {
         case 't': sb_putc(&b, 9); break;
         case 'u': {
             uint32_t u;
-            if (hex4(p, &u) < 0) { sb_free(&b); return jp_error(p, "bad Unicode escape"); }
+            if (hex4(p, &u) < 0) { sb_free(&b); return jp_error(p, JP_BAD_UNICODE); }
             sb_putc(&b, u);
             break;
         }
         default:
             p->i--;
             sb_free(&b);
-            return jp_error(p, "bad escaped character");
+            return jp_error(p, JP_BAD_ESCAPE);
         }
     }
 }
@@ -116,13 +169,13 @@ static jv jp_number(struct jp* p) {
             if (nd < 780) dig[nd++] = (char)c; else { exp10++; if (c != '0') dropped = 1; }
             p->i++;
         }
-    } else return jp_error(p, "no number after minus sign");
+    } else return jp_error(p, JP_NO_NUM);
     int is_int = 1;
     if (PC(p) == '.') {
         is_int = 0;
         p->i++;
         c = PC(p);
-        if (!(c >= '0' && c <= '9')) return jp_error(p, "unterminated fractional number");
+        if (!(c >= '0' && c <= '9')) return jp_error(p, JP_BAD_FRAC);
         while ((c = PC(p)) >= '0' && c <= '9') {
             if (nd == 0 && c == '0') { exp10--; p->i++; continue; }
             if (nd < 780) { dig[nd++] = (char)c; exp10--; } else if (c != '0') dropped = 1;
@@ -137,7 +190,7 @@ static jv jp_number(struct jp* p) {
         c = PC(p);
         if (c == '+' || c == '-') { eneg = c == '-'; p->i++; }
         c = PC(p);
-        if (!(c >= '0' && c <= '9')) return jp_error(p, "exponent part is missing a number");
+        if (!(c >= '0' && c <= '9')) return jp_error(p, JP_BAD_EXP);
         int e = 0;
         while ((c = PC(p)) >= '0' && c <= '9') { if (e < 100000) e = e * 10 + (int)(c - '0'); p->i++; }
         exp10 += eneg ? -e : e;
@@ -162,16 +215,44 @@ static int match_word(struct jp* p, const char* w) {
     return 1;
 }
 
+// 1 matched, 0 mismatch, -1 the input ends inside the word (V8: end of input)
+static int match_word_eof(struct jp* p, const char* w) {
+    uint32_t k = 0;
+    for (; w[k]; k++) {
+        if (p->i + k >= p->n) return -1;
+        if (str_at(p->s, p->i + k) != (uint8_t)w[k]) return 0;
+    }
+    p->i += k;
+    return 1;
+}
+
 static jv jp_value(struct jp* p);
 
-// source text record: a parallel internal array [value, start, end] for primitives
+// source text record: per parsed primitive [value, start, end, holder, key];
+// holder/key are bound when the value is inserted into its container, so the
+// reviver's { source } is structural and immune to value coincidences
 static int note_source(struct jp* p, jv v, uint32_t start, uint32_t end) {
+    p->last_src = -1;
     if (!p->keep_source) return 0;
     struct obj* s = p->sources;
-    if (obj_elems_reserve(p->J, s, s->elen + 3) < 0) return -1;
+    if (obj_elems_reserve(p->J, s, s->elen + 5) < 0) return -1;
+    p->last_src = (int)(s->elen / 5);
     s->elems[s->elen++] = v;
     s->elems[s->elen++] = jv_from_int((int32_t)start);
     s->elems[s->elen++] = jv_from_int((int32_t)end);
+    s->elems[s->elen++] = JV_UNDEFINED;
+    s->elems[s->elen++] = JV_UNDEFINED;
+    return 0;
+}
+
+// bind the record of the primitive just inserted into holder under key
+static int src_bind(struct jp* p, jv val, jv holder, jv key) {
+    if (!p->keep_source || p->last_src < 0 || jv_is_obj(val)) return 0;
+    struct obj* s = p->sources;
+    int i = p->last_src * 5;
+    s->elems[i + 3] = holder;
+    s->elems[i + 4] = key;
+    p->last_src = -1;
     return 0;
 }
 
@@ -189,24 +270,28 @@ static jv jp_value(struct jp* p) {
         if (!o) return JV_EXC;
         skip_ws(p);
         if (PC(p) == '}') { p->i++; p->depth--; return jv_from_obj(o); }
+        int first_key = 1;
         for (;;) {
             skip_ws(p);
-            if (PC(p) != '"') return jp_error(p, "expected property name");
+            if (PC(p) != '"') return jp_error(p, first_key ? JP_EXPECT_KEY : JP_EXPECT_DQ_KEY);
             jv k = jp_string(p);
             if (k == JV_EXC) return JV_EXC;
             skip_ws(p);
-            if (PC(p) != ':') return jp_error(p, "expected ':' after property name");
+            if (PC(p) != ':') return jp_error(p, JP_EXPECT_COLON);
             p->i++;
             jv val = jp_value(p);
             if (val == JV_EXC) return JV_EXC;
             pkey pk = pkey_from_value(J, k);
             if (!pk) return JV_EXC;
             if (obj_define_value(J, o, pk, val, PA_DEFAULT) < 0) return JV_EXC;
+            jv kv = pkey_to_value(J, pk);
+            if (kv == JV_EXC) return JV_EXC;
+            if (src_bind(p, val, jv_from_obj(o), kv) < 0) return JV_EXC;
             skip_ws(p);
             c = PC(p);
-            if (c == ',') { p->i++; continue; }
+            if (c == ',') { p->i++; first_key = 0; continue; }
             if (c == '}') { p->i++; break; }
-            return jp_error(p, "expected ',' or '}' after property value");
+            return jp_error(p, ((PC(p) >= 48 && PC(p) <= 57) || PC(p) == 45) ? JP_UNEXPECTED_NUMBER : JP_EXPECT_OBJ_SEP);
         }
         p->depth--;
         return jv_from_obj(o);
@@ -224,22 +309,23 @@ static jv jp_value(struct jp* p) {
             if (a->elen == a->alen && obj_elems_reserve(J, a, a->elen + 1) < 0) return JV_EXC;
             a->elems[a->elen++] = val;
             a->alen = a->elen;
+            if (src_bind(p, val, jv_from_obj(a), pkey_to_value(J, PK_FROM_INDEX(a->elen - 1))) < 0) return JV_EXC;
             skip_ws(p);
             c = PC(p);
             if (c == ',') { p->i++; continue; }
             if (c == ']') { p->i++; break; }
-            return jp_error(p, "expected ',' or ']' after array element");
+            return jp_error(p, ((PC(p) >= 48 && PC(p) <= 57) || PC(p) == 45) ? JP_UNEXPECTED_NUMBER : JP_EXPECT_ARR_SEP);
         }
         p->depth--;
         return jv_from_obj(a);
     }
     case '"': v = jp_string(p); break;
-    case 't': if (!match_word(p, "true")) return jp_error(p, "is not valid JSON"); v = JV_TRUE; break;
-    case 'f': if (!match_word(p, "false")) return jp_error(p, "is not valid JSON"); v = JV_FALSE; break;
-    case 'n': if (!match_word(p, "null")) return jp_error(p, "is not valid JSON"); v = JV_NULL; break;
+    case 't': { int mw = match_word_eof(p, "true"); if (mw < 0) return throw_syntax(p->J, "Unexpected end of JSON input"); if (!mw) return jp_error(p, JP_BAD_VALUE); v = JV_TRUE; break; }
+    case 'f': { int mw = match_word_eof(p, "false"); if (mw < 0) return throw_syntax(p->J, "Unexpected end of JSON input"); if (!mw) return jp_error(p, JP_BAD_VALUE); v = JV_FALSE; break; }
+    case 'n': { int mw = match_word_eof(p, "null"); if (mw < 0) return throw_syntax(p->J, "Unexpected end of JSON input"); if (!mw) return jp_error(p, JP_BAD_VALUE); v = JV_NULL; break; }
     default:
         if (c == '-' || (c >= '0' && c <= '9')) { v = jp_number(p); break; }
-        return jp_error(p, "is not valid JSON");
+        return jp_error(p, JP_BAD_VALUE);
     }
     if (v == JV_EXC) return JV_EXC;
     if (note_source(p, v, start, p->i) < 0) return JV_EXC;
@@ -247,7 +333,7 @@ static jv jp_value(struct jp* p) {
 }
 
 // InternalizeJSONProperty(holder, name, reviver)
-static jv internalize(ojs* J, struct jp* p, jv holder, pkey name, jv reviver, uint32_t* srcpos) {
+static jv internalize(ojs* J, struct jp* p, jv holder, pkey name, jv reviver) {
     if (check_stack(J)) return JV_EXC;
     jv val = obj_get(J, jv_obj(holder), name, holder);
     if (val == JV_EXC) return JV_EXC;
@@ -259,7 +345,7 @@ static jv internalize(ojs* J, struct jp* p, jv holder, pkey name, jv reviver, ui
             if (length_of_array_like(J, jv_obj(val), &len) < 0) return JV_EXC;
             for (int64_t i = 0; i < len; i++) {
                 pkey k = PK_FROM_INDEX((uint32_t)i);
-                jv nv = internalize(J, p, val, k, reviver, srcpos);
+                jv nv = internalize(J, p, val, k, reviver);
                 if (nv == JV_EXC) return JV_EXC;
                 if (jv_is_undef(nv)) { if (obj_delete(J, jv_obj(val), k, 0) < 0) return JV_EXC; }
                 else if (create_data_property(J, jv_obj(val), k, nv) < 0) return JV_EXC;
@@ -271,7 +357,7 @@ static jv internalize(ojs* J, struct jp* p, jv holder, pkey name, jv reviver, ui
             for (uint32_t i = 0; i < ka->elen; i++) {
                 pkey k = pkey_from_value(J, ka->elems[i]);
                 if (!k) return JV_EXC;
-                jv nv = internalize(J, p, val, k, reviver, srcpos);
+                jv nv = internalize(J, p, val, k, reviver);
                 if (nv == JV_EXC) return JV_EXC;
                 if (jv_is_undef(nv)) { if (obj_delete(J, jv_obj(val), k, 0) < 0) return JV_EXC; }
                 else if (create_data_property(J, jv_obj(val), k, nv) < 0) return JV_EXC;
@@ -280,19 +366,19 @@ static jv internalize(ojs* J, struct jp* p, jv holder, pkey name, jv reviver, ui
     }
     jv kv = pkey_to_value(J, name);
     if (kv == JV_EXC) return JV_EXC;
-    // context: { source } for primitive values that are still the parsed ones
+    // context: { source } of the primitive that was parsed at this exact slot and
+    // is still there (the record is bound to holder + key at parse time)
     struct obj* ctx = obj_new_plain(J);
     if (!ctx) return JV_EXC;
     if (!jv_is_obj(val) && p->sources) {
         struct obj* s = p->sources;
-        for (uint32_t i = *srcpos; i < s->elen; i += 3) {
-            if (strict_equals(J, s->elems[i], val) || (s->elems[i] == val)) {
-                jv src = jstr_sub(J, jv_from_str((struct str*)p->s), (uint32_t)jv_int(s->elems[i + 1]), (uint32_t)jv_int(s->elems[i + 2]));
-                if (src == JV_EXC) return JV_EXC;
-                if (def_value(J, ctx, "source", src, PA_DEFAULT) < 0) return JV_EXC;
-                *srcpos = i + 3;
-                break;
-            }
+        for (uint32_t i = 0; i < s->elen; i += 5) {
+            if (s->elems[i + 3] != holder) continue;
+            if (!strict_equals(J, s->elems[i + 4], kv) || !strict_equals(J, s->elems[i], val)) continue;
+            jv src = jstr_sub(J, jv_from_str((struct str*)p->s), (uint32_t)jv_int(s->elems[i + 1]), (uint32_t)jv_int(s->elems[i + 2]));
+            if (src == JV_EXC) return JV_EXC;
+            if (def_value(J, ctx, "source", src, PA_DEFAULT) < 0) return JV_EXC;
+            break;
         }
     }
     jv args[3] = { kv, val, jv_from_obj(ctx) };
@@ -313,13 +399,15 @@ jv json_parse(ojs* J, struct str* s, jv reviver) {
     jv v = jp_value(&p);
     if (v == JV_EXC) return JV_EXC;
     skip_ws(&p);
-    if (p.i < p.n) return jp_error(&p, "unexpected non-whitespace character after JSON data");
+    if (p.i < p.n) return jp_error(&p, ((PC(&p) >= 48 && PC(&p) <= 57) || PC(&p) == 45) ? JP_UNEXPECTED_NUMBER : JP_TRAILING);
     if (!p.keep_source) return v;
     struct obj* root = obj_new_plain(J);
     if (!root) return JV_EXC;
     if (obj_define_value(J, root, A(empty), v, PA_DEFAULT) < 0) return JV_EXC;
-    uint32_t pos = 0;
-    return internalize(J, &p, jv_from_obj(root), A(empty), reviver, &pos);
+    jv rootkv = pkey_to_value(J, A(empty));
+    if (rootkv == JV_EXC) return JV_EXC;
+    if (src_bind(&p, v, jv_from_obj(root), rootkv) < 0) return JV_EXC;
+    return internalize(J, &p, jv_from_obj(root), A(empty), reviver);
 }
 
 static jv json_parse_fn(ojs* J, jv this_v, int argc, jv* argv, int magic) {

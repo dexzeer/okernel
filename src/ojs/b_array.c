@@ -251,7 +251,7 @@ static jv ap_push(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     struct obj* o = this_obj(J, this_v);
     if (!o) return JV_EXC;
     if (obj_class(o) == OC_ARRAY && is_fast(o) && o->elen == o->alen && !(o->flags & (OF_LEN_RO | OF_FROZEN_ELEMS | OF_SEALED_ELEMS)) &&
-        (o->flags & OF_EXTENSIBLE) && (uint64_t)o->alen + (uint64_t)argc <= 0x7FFFFFFFu) {
+        (o->flags & OF_EXTENSIBLE) && (uint64_t)o->alen + (uint64_t)argc <= 0x7FFFFFFFu && !J->I.aproto_indexed) {
         uint32_t n = o->alen;
         if (obj_elems_reserve(J, o, n + (uint32_t)argc) < 0) return JV_EXC;
         for (int i = 0; i < argc; i++) o->elems[n + (uint32_t)i] = argv[i];
@@ -334,7 +334,8 @@ static jv ap_unshift(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     if (argc > 0) {
         if (len + argc > MAX_SAFE) return throw_type(J, "Unshift would exceed the maximum array length");
         if (obj_class(o) == OC_ARRAY && is_fast(o) && o->elen == o->alen && len == o->alen &&
-            !(o->flags & (OF_LEN_RO | OF_FROZEN_ELEMS | OF_SEALED_ELEMS)) && (o->flags & OF_EXTENSIBLE) && len + argc <= 0x7FFFFFFF) {
+            !(o->flags & (OF_LEN_RO | OF_FROZEN_ELEMS | OF_SEALED_ELEMS)) && (o->flags & OF_EXTENSIBLE) && len + argc <= 0x7FFFFFFF &&
+            !J->I.aproto_indexed) {
             int holes = 0;
             for (uint32_t i = 0; i < o->elen; i++) if (o->elems[i] == JV_HOLE) { holes = 1; break; }
             if (!holes) {

@@ -637,6 +637,71 @@ static void add_request_meta(struct oreq* q, const char* top, const char* method
     }
 }
 
+// ---- request/response dump (shell `fetchdump`) -------------------------------------
+// Temporary investigation aid: prints method/URL and bodies of the requests and
+// responses that carry YouTube's attestation flow (youtubei / jnn / googlevideo)
+// to serial, so they can be diffed against a capture from a real browser.
+int okai_fdbg = 0;
+static int fdbg_has(const char* s, const char* sub) {
+    for (; *s; s++) {
+        const char* a = s;
+        const char* b = sub;
+        while (*b && *a == *b) { a++; b++; }
+        if (!*b) return 1;
+    }
+    return 0;
+}
+static int fdbg_match(const char* url) {
+    return fdbg_has(url, "youtubei") || fdbg_has(url, "/api/jnn/") ||
+           fdbg_has(url, "videoplayback") || fdbg_has(url, "googlevideo");
+}
+static void fdbg_body(const char* tag, const uint8_t* p, int n) {
+    if (!p || n <= 0) return;
+    int printable = 1;
+    for (int i = 0; i < n && i < 64; i++)
+        if (p[i] < 0x20 && p[i] != '\n' && p[i] != '\r' && p[i] != '\t') { printable = 0; break; }
+    if (printable) {
+        serial_printf("[fdbg] %s %d text: ", tag, n);
+        char chunk[81];
+        int shown = n > 8192 ? 8192 : n;
+        for (int i = 0; i < shown; i++) {
+            int w = 0;
+            uint8_t c = p[i];
+            if (c == '\n') { chunk[w++] = '\\'; chunk[w++] = 'n'; }
+            else if (c == '\r') { chunk[w++] = '\\'; chunk[w++] = 'r'; }
+            else if (c == '\t') { chunk[w++] = '\\'; chunk[w++] = 't'; }
+            else if (c == '\\') { chunk[w++] = '\\'; chunk[w++] = '\\'; }
+            else if (c >= 0x20 && c < 0x7f) chunk[w++] = (char)c;
+            else { w = 4; chunk[0] = '\\'; chunk[1] = 'x'; chunk[2] = "0123456789abcdef"[c >> 4]; chunk[3] = "0123456789abcdef"[c & 15]; }
+            chunk[w] = 0;
+            serial_puts(chunk);
+        }
+        serial_puts(n > shown ? "...\n" : "\n");
+    } else {
+        static const char* A = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        serial_printf("[fdbg] %s %d b64:\n", tag, n);
+        char line[101];
+        int shown = n > 8192 ? 8192 : n;
+        for (int i = 0; i < shown; i += 3) {
+            uint32_t v = (uint32_t)p[i] << 16;
+            int pad = 0;
+            if (i + 1 < shown) v |= (uint32_t)p[i + 1] << 8; else pad = 1;
+            if (i + 2 < shown) v |= (uint32_t)p[i + 2]; else pad = 2;
+            line[0] = A[(v >> 18) & 63]; line[1] = A[(v >> 12) & 63];
+            line[2] = pad > 1 ? '=' : A[(v >> 6) & 63];
+            line[3] = pad > 0 ? '=' : A[v & 63];
+            line[4] = 0;
+            serial_puts(line);
+        }
+        serial_puts("\n");
+    }
+}
+static void fdbg_req(struct oreq* q, const struct fetch_opts* o) {
+    if (!okai_fdbg || !fdbg_match(q->url)) return;
+    serial_printf("[fdbg] > %s %s\n", o->method ? o->method : "GET", q->url);
+    if (o->body && o->body_len) fdbg_body("req", o->body, (int)o->body_len);
+}
+
 static int req_fetch(struct oreq* q, const char* top) {
     char host[128];
     static char path[OKAI_URL_LEN];
@@ -725,6 +790,7 @@ static int req_fetch(struct oreq* q, const char* top) {
     if (n > 0) o.extra = cookie_hdr;
     o.cache = (q->speculative || (q->doc != 0 && q->sub_id >= 0)) && !o.method && !o.body;       // sub-resources, not documents
     q->https = url_is_https(q->url);
+    fdbg_req(q, &o);
     if (q->speculative) {
         int pr = fetch_prefetch(host, path, (uint16_t)port, q->https, &o);
         return pr < 0 ? -2 : 0;
@@ -913,6 +979,8 @@ static void req_stream_step(struct oreq* q, const char* r, int len, int final) {
         q->s_state = 1;
         q->s_hlen = bo;
         q->s_raw = 0;
+        if (okai_fdbg && fdbg_match(q->url))
+            serial_printf("[fdbg] < stream %s %d ct=%s clen=%d\n", q->url, ri.status, ri.ctype, q->s_clen);
         js_apply((int)(b - okais), q->tab, j.result);
     }
     if (q->s_state != 1) return;
@@ -1111,6 +1179,7 @@ static void okai_rewrite_scheme_http(char* url) {
 }
 
 int okai_is_home(const char* url) { return strcmp(url, OKAI_HOME_URL) == 0; }
+int okai_is_secret(const char* url) { return strcmp(url, OKAI_SECRET_URL) == 0; }
 
 // ---- init / tabs -----------------------------------------------------------------
 
@@ -1404,6 +1473,26 @@ static void load_home(int id, int tab) {
     request_render(T, 0);
     if (okais[id].active_tab == tab) okai_render_content(id);
     serial_puts("[br] home rendered\n");
+}
+
+static const char OKAI_SECRET_HTML[] =
+"<!DOCTYPE html><html><head><meta charset=utf-8><title>okai</title><style>"
+"html,body{height:100%;margin:0;background:#000;color:#e8eef5;"
+"font-family:'Noto Sans',sans-serif}"
+"body{display:flex;align-items:center;justify-content:center}"
+"p{font-size:42px;letter-spacing:1px;text-align:center;padding:0 32px}"
+"</style></head><body><p>I know what you did.</p></body></html>";
+
+static void load_secret(int id, int tab) {
+    struct okai_tab* T = &okais[id].tabs[tab];
+    scopy(T->url, OKAI_SECRET_URL, OKAI_URL_LEN);
+    tab_reset_load(T);
+    T->is_https = 0;
+    tab_load_html(id, tab, OKAI_SECRET_HTML, (int)sizeof(OKAI_SECRET_HTML) - 1, "utf-8", 0);
+    T->load_state = 1;
+    request_render(T, 0);
+    if (okais[id].active_tab == tab) okai_render_content(id);
+    serial_puts("[br] secret rendered\n");
 }
 
 // Error pages are ordinary documents (rendered by the engine like any page).
@@ -1957,6 +2046,7 @@ static int start_main_fetch(int id, int tab) {
     struct okai* b = &okais[id];
     struct okai_tab* T = &b->tabs[tab];
     if (okai_is_home(T->url)) { load_home(id, tab); return 1; }
+    if (okai_is_secret(T->url)) { load_secret(id, tab); return 1; }
     if (!url_is_http(T->url)) {
         serial_printf("[okai] unsupported scheme in '%s'\n", T->url);
         show_error(id, tab);
@@ -2184,12 +2274,14 @@ static int sub_done(struct okai_tab* T, struct oreq* q, int st, char* resp, int 
     j.final_url = q->url;
     int status = 0, blen = 0, heap = 0;
     char* body = 0;
+    const char* rct = "";
     static char hdrs[8192];
     hdrs[0] = 0;
     if (st == 1 && resp && len > 0) {
         struct resp_info ri;
         parse_resp(resp, len, &ri);
         status = ri.status;
+        rct = ri.ctype;
         store_cookies(q->url, resp, len);
         if (q->stream && q->s_state == 1) req_stream_step(q, resp, len, 1);       // the rest of the body
         else if (q->stream && q->s_state == 0) q->s_state = 2;
@@ -2244,6 +2336,10 @@ static int sub_done(struct okai_tab* T, struct oreq* q, int st, char* resp, int 
     if (heap) kfree(body);
     serial_printf("[okai] sub-res %s: status=%d %d bytes%s\n", kind_name(kind), status,
                   j.len, j.len < 0 ? " (failed)" : "");
+    if (okai_fdbg && fdbg_match(q->url)) {
+        serial_printf("[fdbg] < %s %d %d ct=%s\n", kind_name(kind), status, j.len, rct);
+        if (j.bytes && j.len > 0) fdbg_body("res", (const uint8_t*)j.bytes, j.len > 900 ? 900 : j.len);
+    }
     return 0;
 }
 
@@ -2922,6 +3018,7 @@ static void navigate_slot(int id, int slot, const char* url, int push) {
     b->chrome_dirty = 1;
     serial_printf("[okai] navigate %s%s\n", frame ? "(frame) " : "", T->url);
     if (okai_is_home(T->url)) load_home(id, slot);
+    else if (okai_is_secret(T->url)) load_secret(id, slot);
     // otherwise okai_poll starts the fetch; the old page stays visible
     // until the new one arrives.
 }

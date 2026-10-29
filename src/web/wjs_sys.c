@@ -57,7 +57,8 @@ int ojs_sys_tz_offset(double utc_ms, int is_local) { (void)utc_ms; (void)is_loca
 
 // Parallel garbage collection: the collector (src/ojs/gc.c) marks on every CPU the SMP job system offers. The workers run on the APs
 // (and one on the calling CPU) and only read the JS heap and set mark bits: no serial output, no page state, no JS.
-#if defined(KERNEL) && KERNEL
+// The Windows port offers the same job API over its thread pool (win32/win_sys.c), so it marks in parallel too.
+#if (defined(KERNEL) && KERNEL) || defined(OKAI_PORT)
 #include "../smp.h"
 struct kgc_job { void (*fn)(void* ctx, int item, int is_main); void* ctx; };
 static void kgc_adapter(void* ctx, uint32_t item, uint32_t cpu) {

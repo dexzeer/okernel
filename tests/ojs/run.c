@@ -210,9 +210,12 @@ static int test262(const char* harness) {
         // optional includes after the path: "flags path inc1,inc2"
         char* inc = strchr(file, ' ');
         if (inc) *inc++ = 0;
-        int strict = strchr(flags, 's') != 0, module = strchr(flags, 'm') != 0, raw = strchr(flags, 'r') != 0;
-        int async = strchr(flags, 'a') != 0;
         const char* neg = strchr(flags, 'n');
+        // the negative type (e.g. "Test262Error") follows the 'n' and may itself
+        // contain flag letters: only look for the real flags before it
+        int flen = neg ? (int)(neg - flags) : (int)strlen(flags);
+        int strict = memchr(flags, 's', flen) != 0, module = memchr(flags, 'm', flen) != 0, raw = memchr(flags, 'r', flen) != 0;
+        int async = memchr(flags, 'a', flen) != 0;
         ojs* J = ojs_new();
         if (!J) { printf("FAIL init\n"); fflush(stdout); continue; }
         ojs_enter(J);

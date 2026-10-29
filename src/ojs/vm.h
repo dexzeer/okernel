@@ -26,11 +26,12 @@
     X(GET_UPV, H) X(SET_UPV, H) X(PUT_UPV, H) X(GET_UPV_CHK, HA) X(PUT_UPV_CHK, HA) X(INIT_UPV, H) \
     X(CLOSE, H) X(HOLE_LOC, H) X(BIND_THIS_LOC, H) X(BIND_THIS_UPV, H) \
     X(GET_GLOBAL, AH) X(PUT_GLOBAL, AH) X(PUT_GLOBAL_STRICT, AH) X(TYPEOF_GLOBAL, AH) X(INIT_GLOBAL_LEX, A) \
+    X(GLOBAL_REF_PROBE, A) X(PUT_GLOBAL_PROBED, AH) \
     X(DECL_GLOBAL_VAR, A) X(DECL_GLOBAL_FUNC, A) X(DECL_GLOBAL_LEX, AH) X(CHECK_GLOBAL_DECLS, A) \
     X(DELETE_GLOBAL, A) X(HAS_GLOBAL, A) \
     X(GET_FIELD, AH) X(GET_FIELD_KEEP, AH) X(PUT_FIELD, AH) X(GET_ELEM, N) X(GET_ELEM_KEEP, N) \
     X(PUT_ELEM, N) X(GET_LENGTH, N) X(DELETE_FIELD, A) X(DELETE_ELEM, N) X(TO_PROPKEY, N) \
-    X(GET_SUPER, N) X(PUT_SUPER, N) X(GET_SUPER_KEEP, N) X(SUPER_CTOR, N) \
+    X(GET_SUPER, N) X(PUT_SUPER, N) X(GET_SUPER_KEEP, N) X(SUPER_CTOR, N) X(SUPER_BASE, N) \
     X(GET_PRIVATE, N) X(PUT_PRIVATE, N) X(DEFINE_PRIVATE, N) X(PRIVATE_IN, N) X(ADD_PRIVATE_METHOD, B) \
     X(ADD, N) X(SUB, N) X(MUL, N) X(DIV, N) X(MOD, N) X(POW, N) X(NEG, N) X(PLUS, N) X(BITNOT, N) \
     X(NOT, N) X(INC, N) X(DEC, N) X(TO_NUMERIC, N) X(SHL, N) X(SAR, N) X(SHR, N) X(BAND, N) X(BOR, N) \
@@ -54,9 +55,10 @@
     X(YIELD, N) X(YIELD_STAR, N) X(AWAIT, N) X(INITIAL_YIELD, N) X(ASYNC_GEN_YIELD, N) \
     X(GEN_RESUME_CHECK, N) X(GEN_RETURN, N) \
     X(WITH_GET, AW) X(WITH_PUT, AW) X(WITH_TYPEOF, AW) X(WITH_DELETE, AW) X(WITH_CALL_THIS, AW) \
+    X(WITH_REF, AW) X(WITH_LOAD, A) X(WITH_SET, A) \
     X(EVAL_VAR_GET, AH) X(EVAL_VAR_PUT, AH) X(EVAL_VAR_DECL, AH) X(DEBUGGER, N) X(LINE, W) X(FRAME_THIS, N) \
     X(PRIVATE_NAME, A) X(TDZ_ERROR, A) X(CONST_ERROR, A) X(GET_REF_GLOBAL, A) X(PUT_REF_GLOBAL, A) \
-    X(TO_PRIMITIVE, N) X(ITER_CLOSE_SYNC_RET, N) X(ASYNC_ITER_CLOSE, N) X(GET_PRIVATE_BRAND, N) \
+    X(TO_PRIMITIVE, N) X(ITER_CLOSE_SYNC_RET, N) X(ASYNC_ITER_CLOSE, B) X(GET_PRIVATE_BRAND, N) \
     X(CONST_W, A) X(TO_PROPKEY_REF, N) X(NOP_END, N)
 
 enum op {
@@ -97,6 +99,7 @@ struct upval_desc { uint16_t from_local; uint16_t index; };
 #define TF_NO_PROTOTYPE  0x10000
 #define TF_CONSTRUCTOR   0x20000    // [[Construct]] allowed
 #define TF_STATIC_INIT   0x40000
+#define TF_IN_FIELD_INIT 0x100000  // lexically inside a class field initializer or static block
 #define TF_DEFAULT_CTOR  0x80000    // class without an explicit constructor (VM does it)
 
 // an inline cache entry: where a property was found for objects of one shape.
@@ -110,6 +113,7 @@ struct ic { struct shape* shape; struct obj* holder; struct shape* hshape; struc
 #define IC_NONE 0xFFFF
 
 #define POS_CALLEE 0x80000000u   // line table: the call's callee is a plain name at this position
+#define POS_CALLRET 0x40000000u   // the callee is itself a call: V8 renders "(intermediate value)(...)"
 
 struct ftempl {
     struct gch h;

@@ -448,7 +448,7 @@ static jv collection_ctor(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     jv adder = obj_get(J, &m->base, is_set ? A(add) : A(set), ov);
     if (adder == JV_EXC) return JV_EXC;
     if (!is_callable(adder)) return throw_type(J, "'%s' returned for property '%s' of object is not a function", "adder", is_set ? "add" : "set");
-    jv rv = iter_get(J, iterable, 0);
+    jv rv = iter_get_ex(J, iterable, 0, 1);
     if (rv == JV_EXC) return JV_EXC;
     struct iterrec* r = (struct iterrec*)jv_obj(rv);
     for (;;) {
@@ -881,7 +881,7 @@ jv group_by(ojs* J, jv items, jv cb, int map_mode, jv* out) {
     struct obj* keys = obj_new_array(J, 0);
     struct obj* vals = obj_new_array(J, 0);
     if (!keys || !vals) return JV_EXC;
-    jv rv = iter_get(J, items, 0);
+    jv rv = iter_get_ex(J, items, 0, 1);
     if (rv == JV_EXC) return JV_EXC;
     struct iterrec* r = (struct iterrec*)jv_obj(rv);
     double k = 0;

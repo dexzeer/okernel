@@ -570,6 +570,25 @@ static void emit_layer(struct wlayout* L, int bi, int depth) {
     struct lbox* b = &L->b[bi];
     if (b->flags & BF_FIXED) L->fixed_ctx = 1;
     if (b->st && b->st->opacity < 255) L->alpha = (uint8_t)((L->alpha * b->st->opacity + 127) / 255);
+    // a positioned box is clipped by overflow != visible ancestors up to and including
+    // its containing block (the nearest positioned one): above that it escapes the clip.
+    // this paints the hoisted positioned descendants of an overflow-clipped layer inside it
+    int nclip = 0;
+    for (int a = b->parent; a >= 0 && nclip < 6; a = L->b[a].parent) {
+        struct lbox* ab = &L->b[a];
+        const struct wstyle* as = ab->st;
+        if (!as) break;
+        if ((as->overflow_x != OV_VISIBLE || as->overflow_y != OV_VISIBLE) && (ab->flags & BF_LAID)) {
+            int32_t cx = ab->ax + ab->b[3], cy = ab->ay + ab->b[0];
+            int32_t cw = ab->w - ab->b[1] - ab->b[3], ch = ab->h - ab->b[0] - ab->b[2];
+            int32_t big = PX(1000000);
+            if (as->overflow_x == OV_VISIBLE && as->overflow_y != OV_VISIBLE) { cx -= big / 2; cw += big; }
+            if (as->overflow_y == OV_VISIBLE && as->overflow_x != OV_VISIBLE) { cy -= big / 2; ch += big; }
+            di_add(L, DI_CLIP, cx, cy, cw, ch, 0);
+            nclip++;
+        }
+        if (as->position != POS_STATIC) break;   // the containing block is the last clipper
+    }
     // negative z
     for (int i = 0; i < ls.n; i++) if (z_of(L, ls.v[i]) < 0) emit_layer(L, ls.v[i], depth + 1);
     L->alpha = saved_alpha;
@@ -583,6 +602,7 @@ static void emit_layer(struct wlayout* L, int bi, int depth) {
     if (clip) di_add(L, DI_CLIP, b->ax + b->b[3], b->ay + b->b[0], b->w - b->b[1] - b->b[3], b->h - b->b[0] - b->b[2], 0);
     for (int i = 0; i < ls.n; i++) if (z_of(L, ls.v[i]) >= 0) emit_layer(L, ls.v[i], depth + 1);
     if (clip) di_add(L, DI_UNCLIP, 0, 0, 0, 0, 0);
+    for (int i = 0; i < nclip; i++) di_add(L, DI_UNCLIP, 0, 0, 0, 0, 0);
     L->alpha = saved_alpha;
     L->fixed_ctx = saved_fixed;
     w_free(ls.v);

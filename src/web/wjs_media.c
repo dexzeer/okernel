@@ -35,6 +35,16 @@ int mplay_active(void);
 static uint32_t env_ticks(void) { return tick_count; }
 static const struct meng_env ENV_AUDIO = {audio_ready, audio_queued, audio_write, audio_clock, audio_flush, env_ticks};
 #define AUDIO_AVAILABLE() (!mplay_active() && audio_ready())
+#elif defined(OKAI_PORT)
+// The Windows port has a real sound card (audio.h over waveOut) and the same
+// 100 Hz tick, so the A/V path is the kernel's.
+#include "../audio.h"
+#include "../memory.h"
+extern uint32_t tick_count;
+int mplay_active(void);
+static uint32_t env_ticks(void) { return tick_count; }
+static const struct meng_env ENV_AUDIO = {audio_ready, audio_queued, audio_write, audio_clock, audio_flush, env_ticks};
+#define AUDIO_AVAILABLE() audio_ready()
 #else
 static uint32_t env_ticks(void) { return (uint32_t)(wjs_now() / 10); }
 #define AUDIO_AVAILABLE() 0
@@ -45,7 +55,7 @@ static uint32_t mute_write(const int16_t* f, uint32_t n) { (void)f; return n; }
 static uint64_t mute_clock(void) { return 0; }
 static void mute_flush(void) {}
 static const struct meng_env ENV_MUTE = {mute_ready, mute_queued, mute_write, mute_clock, mute_flush, env_ticks};
-#if !(defined(KERNEL) && KERNEL)
+#if !(defined(KERNEL) && KERNEL) && !defined(OKAI_PORT)
 #define ENV_AUDIO ENV_MUTE
 #endif
 
@@ -248,7 +258,7 @@ void wjs_media_free(struct wjs* js) {
 // kernel heap decides. A fullscreen click on a 1915x1077 page asked for 8.2 MB per slot (a dozen slots) with 167 MB free: every allocation failed and the
 // video died (323 [diag] kmalloc FAIL lines).
 static int64_t out_budget_px(void) {
-#if defined(KERNEL) && KERNEL
+#if (defined(KERNEL) && KERNEL) || defined(OKAI_PORT)
     static uint32_t last_tick = 0xFFFFFFFFu;
     static int64_t last_px = MAX_OUT_PX;
     static int last_tick_logged;

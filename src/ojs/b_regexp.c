@@ -75,7 +75,10 @@ static struct re_prog* compile_cached(ojs* J, struct str* src, struct str* fl, i
     struct re_prog* p = re_compile(J, src, flags, err, sizeof err);
     if (!p) {
         if (J->has_exc) return 0;
-        throw_syntax(J, "%s: /%S/", err, src);
+        // V8: "Invalid regular expression: /(/: Unterminated group" — the
+        // pattern as written, then the reason with a capital first letter
+        if (err[0] >= 'a' && err[0] <= 'z') err[0] = (char)(err[0] - 32);
+        throw_syntax(J, "Invalid regular expression: /%S/: %s", src, err);
         return 0;
     }
     // the cache holds programs through tiny template objects
@@ -97,7 +100,7 @@ static jv regexp_init(ojs* J, struct regexp* r, jv pattern, jv flags) {
     struct str* F = jv_is_undef(flags) ? J->A->empty : to_str(J, flags);
     if (!F) return JV_EXC;
     int fl = re_parse_flags(F);
-    if (fl < 0) return throw_syntax(J, "Invalid regular expression flags '%S'", F);
+    if (fl < 0) return throw_syntax(J, "Invalid flags supplied to RegExp constructor '%S'", F);
     struct re_prog* p = compile_cached(J, P, F, fl);
     if (!p) return JV_EXC;
     r->source = jv_from_str(P);

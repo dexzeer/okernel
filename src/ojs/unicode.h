@@ -8,6 +8,7 @@
 
 struct urange_set { const uint32_t* r; int n; };          // n [start, end] pairs, sorted
 struct uprop { const char* names; struct urange_set set; };   // names: "Long|alias|alias"
+struct uprop_str { const char* names; const uint32_t* seqs; };  // strings: n, cp..., n, cp..., 0
 struct upairs { const uint32_t* p; int n; };              // n (key, value) pairs, sorted by key
 struct umulti { const uint32_t* p; int n; };              // n rows: cp, count, c1, c2, c3
 struct udecomp { const uint32_t* e; int n; const uint32_t* seq; };   // rows: cp, compat<<7|len, offset
@@ -15,6 +16,7 @@ struct ucompose { const uint32_t* p; int n; };            // rows: first, second
 
 extern const struct urange_set uni_id_start, uni_id_continue;
 extern const struct uprop uni_gc[], uni_binary[], uni_sc[], uni_scx[];
+extern const struct uprop_str uni_strprops[];
 extern const struct upairs uni_upper, uni_lower, uni_fold, uni_ccc;
 extern const struct umulti uni_special_upper, uni_special_lower;
 extern const struct udecomp uni_decomp;
@@ -35,6 +37,8 @@ int uni_ccc_of(uint32_t cp);
 // Returns the range set (complemented sets are built by the caller), or
 // NULL if unknown. *complement_assigned is set for Cn/C (unassigned).
 const struct urange_set* uni_find_prop(int kind, const char* name, int* is_cn);
+// property-of-strings for v-mode \p{...}: the sequence list (0-terminated) or NULL
+const uint32_t* uni_find_strprop(const char* name);
 int uni_is_white_space(uint32_t cp);
 
 #endif

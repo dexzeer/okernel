@@ -20,16 +20,20 @@
 #ifdef KERNEL
 #include "rand.h"
 #endif
+#if defined(OKAI_PORT)
+#include "rand.h"       // the Windows port links the kernel CPRNG (crypto/rand.c)
+#endif
 
 #ifndef KERNEL
+#include <stdio.h>
+#include <time.h>
+#if !defined(OKAI_PORT)
 // Host-test RNG (review 2026-09-10 #5/#8): /dev/urandom ONLY — the old
 // time/pid-xorshift fallback was predictable, and silently downgrading
 // cryptographic randomness is never acceptable. If urandom is unavailable
 // the handshake aborts (tls_fill_random returns 0 → TLS_FAIL_RNG), exactly
 // like the kernel's not-ready CPRNG. Host binaries stay test-only
 // (production = kernel CPRNG); this just refuses to run them broken.
-#include <stdio.h>
-#include <time.h>
 static int host_rng(uint8_t* out, uint32_t n) {
     FILE* f = fopen("/dev/urandom", "rb");
     if (!f) return 0;
@@ -38,12 +42,13 @@ static int host_rng(uint8_t* out, uint32_t n) {
     return got == n;
 }
 #endif
+#endif
 
 // Fills `out` with n random bytes. Returns 0 on failure — callers MUST abort
 // the handshake in that case. Never synthesize deterministic "random": these
 // bytes become the ECDHE private key and the ClientHello nonce.
 static int tls_fill_random(uint8_t* out, uint32_t n) {
-#ifdef KERNEL
+#if defined(KERNEL) || defined(OKAI_PORT)
     return rand_bytes(out, n) == 1;
 #else
     return host_rng(out, n);

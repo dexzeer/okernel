@@ -233,6 +233,14 @@ static jv cap_settle(ojs* J, struct promise_cap* cap, int rejected, jv v) {
     return ojs_call_v(J, fn, JV_UNDEFINED, 1, &v);
 }
 
+// IfAbruptRejectPromise: a resolve that threw rejects the capability with that error
+static jv cap_reject_thrown(ojs* J, struct promise_cap* cap) {
+    if (J->uncatchable) return JV_EXC;
+    jv e = take_exc(J);
+    if (cap_settle(J, cap, 1, e) == JV_EXC) return JV_EXC;
+    return JV_UNDEFINED;
+}
+
 // PromiseReactionJob(reaction, argument); argv: record, argument, rejected
 static jv reaction_job(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     struct irec* r = (struct irec*)jv_obj(argv[0]);
@@ -456,13 +464,19 @@ static jv promise_try(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     struct promise_cap cap;
     if (new_promise_capability(J, this_v, &cap) < 0) return JV_EXC;
     jv r = ojs_call_v(J, argv[0], JV_UNDEFINED, argc > 1 ? argc - 1 : 0, argv + 1);
-    int abrupt = 0;
     if (r == JV_EXC) {
         if (J->uncatchable) return JV_EXC;
         r = take_exc(J);
-        abrupt = 1;
+        if (cap_settle(J, &cap, 1, r) == JV_EXC) return JV_EXC;
+        return cap.promise;
     }
-    if (cap_settle(J, &cap, abrupt, r) == JV_EXC) return JV_EXC;
+    // PromiseResolve: a promise whose constructor is the receiver is returned unwrapped
+    if (is_promise(r)) {
+        jv ctor = obj_get(J, jv_obj(r), A(constructor), r);
+        if (ctor == JV_EXC) return JV_EXC;
+        if (ctor == this_v) return r;
+    }
+    if (cap_settle(J, &cap, 0, r) == JV_EXC) return JV_EXC;
     return cap.promise;
 }
 
@@ -496,9 +510,11 @@ static jv element_fn(ojs* J, jv this_v, int argc, jv* argv, int magic) {
             jv e = err_new(J, NE_AGGREGATE, str_value(J, "All promises were rejected"));
             if (e == JV_EXC) return JV_EXC;
             if (obj_define_value(J, jv_obj(e), A(errors), sh->v[0], PA_HIDDEN) < 0) return JV_EXC;
-            return cap_settle(J, &cap, 1, e);
+            if (cap_settle(J, &cap, 1, e) == JV_EXC) return JV_EXC;
+            return JV_UNDEFINED;
         }
-        return cap_settle(J, &cap, 0, sh->v[0]);
+        if (cap_settle(J, &cap, 0, sh->v[0]) == JV_EXC) return cap_reject_thrown(J, &cap);
+        return JV_UNDEFINED;
     }
     return JV_UNDEFINED;
 }
@@ -521,7 +537,7 @@ static jv settled_fn(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     sh->v[1] = jv_from_int(remaining);
     if (remaining == 0) {
         struct promise_cap cap = { sh->v[2], sh->v[3], sh->v[4] };
-        return cap_settle(J, &cap, 0, sh->v[0]);
+        if (cap_settle(J, &cap, 0, sh->v[0]) == JV_EXC) return cap_reject_thrown(J, &cap);
     }
     return JV_UNDEFINED;
 }
@@ -534,7 +550,7 @@ static jv promise_combinator(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     jv resolve = obj_get_v(J, C, A(resolve));
     if (resolve == JV_EXC) goto reject_abrupt;
     if (!is_callable(resolve)) { throw_type(J, "Promise resolve is not a function"); goto reject_abrupt; }
-    jv rv = iter_get(J, argv[0], 0);
+    jv rv = iter_get_ex(J, argv[0], 0, 1);
     if (rv == JV_EXC) goto reject_abrupt;
     struct iterrec* r = (struct iterrec*)jv_obj(rv);
     struct irec* sh = irec_new(J, 5);
@@ -606,13 +622,15 @@ static jv promise_combinator(ojs* J, jv this_v, int argc, jv* argv, int magic) {
                 if (e == JV_EXC) goto reject_abrupt;
                 if (obj_define_value(J, jv_obj(e), A(errors), jv_from_obj(values), PA_HIDDEN) < 0) goto reject_abrupt;
                 if (cap_settle(J, &cap, 1, e) == JV_EXC) return JV_EXC;
-            } else if (cap_settle(J, &cap, 0, jv_from_obj(values)) == JV_EXC) return JV_EXC;
+            } else if (cap_settle(J, &cap, 0, jv_from_obj(values)) == JV_EXC) {
+                if (cap_reject_thrown(J, &cap) == JV_EXC) return JV_EXC;
+            }
         }
     }
     return cap.promise;
 close_abrupt:
     if (J->uncatchable) return JV_EXC;
-    iter_close(J, r, 1);
+    if (!r->done) iter_close(J, r, 1);   // spec: close only while iteratorRecord.[[Done]] is false
 reject_abrupt:
     if (J->uncatchable) return JV_EXC;
     {

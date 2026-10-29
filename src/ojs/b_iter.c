@@ -40,32 +40,45 @@ static jv iter_from_method(ojs* J, jv v, jv m) {
     return rec_new(J, it, next);
 }
 
-static jv not_iterable(ojs* J, jv v) {
+// V8: JS-level iteration (spread, for-of) says "1 is not iterable"; a built-in
+// that asks for the iterator says "number 1 is not iterable (cannot read
+// property Symbol(Symbol.iterator))"
+static jv not_iterable(ojs* J, jv v, int longmsg) {
     if (jv_is_nullish(v)) return throw_type(J, "%s is not iterable", jv_is_null(v) ? "null" : "undefined");
-    jv t = typeof_value(J, v);
-    return throw_type(J, "%S is not iterable", jv_str(t));
+    if (longmsg) {
+        jv t = typeof_value(J, v);
+        if (t == JV_EXC) return JV_EXC;
+        jv s = to_string(J, v);
+        if (s == JV_EXC) return JV_EXC;
+        return throw_type(J, "%S %S is not iterable (cannot read property Symbol(Symbol.iterator))", jv_str(t), jv_str(s));
+    }
+    jv s = to_string(J, v);
+    if (s == JV_EXC) return JV_EXC;
+    return throw_type(J, "%S is not iterable", jv_str(s));
 }
 
-jv iter_get(ojs* J, jv v, int async) {
+jv iter_get_ex(ojs* J, jv v, int async, int longmsg) {
     if (async) {
         jv m = get_method(J, v, WK(WK_ASYNC_ITERATOR));
         if (m == JV_EXC) return JV_EXC;
         if (jv_is_undef(m)) {
             jv sm = get_method(J, v, WK(WK_ITERATOR));
             if (sm == JV_EXC) return JV_EXC;
-            if (jv_is_undef(sm)) return not_iterable(J, v);
+            if (jv_is_undef(sm)) return not_iterable(J, v, longmsg);
             jv sync = iter_from_method(J, v, sm);
             if (sync == JV_EXC) return JV_EXC;
             return async_from_sync_iter(J, sync);
         }
         return iter_from_method(J, v, m);
     }
-    if (jv_is_nullish(v)) return not_iterable(J, v);
+    if (jv_is_nullish(v)) return not_iterable(J, v, longmsg);
     jv m = get_method(J, v, WK(WK_ITERATOR));
     if (m == JV_EXC) return JV_EXC;
-    if (jv_is_undef(m)) return not_iterable(J, v);
+    if (jv_is_undef(m)) return not_iterable(J, v, longmsg);
     return iter_from_method(J, v, m);
 }
+
+jv iter_get(ojs* J, jv v, int async) { return iter_get_ex(J, v, async, 0); }
 
 jv create_iter_result(ojs* J, jv value, int done) {
     struct obj* o = obj_new_plain(J);

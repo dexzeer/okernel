@@ -582,6 +582,7 @@ static void leave_scope(struct cfunc* c, struct scope* s);
 static int  scope_has_captures(struct cfunc* c, struct scope* s);
 static void comp_optchain(struct cfunc* c, struct node* n, int as_callee);
 static void super_ref(struct cfunc* c, struct node* n);
+static void super_ref_ex(struct cfunc* c, struct node* n, int defer);
 static jv bigint_literal(ojs* J, struct str* text);
 static void throw_err(struct cfunc* c, int kind, const char* msg);
 static jv template_object(struct cfunc* c, struct node* n);
@@ -616,13 +617,19 @@ static void load_pseudo(struct cfunc* c, const char* which, uint32_t pos) {
     load_ref_static(c, &r, pos, 0);
 }
 
-// [key, home, this] for super property access
-static void super_ref(struct cfunc* c, struct node* n) {
-    if (n->flags & NF_COMPUTED) { comp_expr(c, n->b); op(c, OP_TO_PROPKEY, 0); }
-    else push_str(c, n->u.str);
+// [key, base, this] for super property access; the base is captured before the key is
+// evaluated (GetSuperBase), and defer keeps the key unconverted until the store (PutValue)
+static void super_ref_ex(struct cfunc* c, struct node* n, int defer) {
     load_pseudo(c, "*home*", n->pos);
-    comp_this(c, n->pos);
+    op(c, OP_SUPER_BASE, 0);   // [base]
+    comp_this(c, n->pos);      // [base, this]
+    if (n->flags & NF_COMPUTED) {
+        comp_expr(c, n->b);    // [base, this, keyval]
+        if (!defer) op(c, OP_TO_PROPKEY, 0);
+    } else push_str(c, n->u.str);
+    op(c, OP_ROT3R, 0);        // [key, base, this]
 }
+static void super_ref(struct cfunc* c, struct node* n) { super_ref_ex(c, n, 0); }
 
 static void comp_this(struct cfunc* c, uint32_t pos) {
     struct funcinfo* tf = this_func(c->fi);
@@ -768,33 +775,58 @@ static int binop_code(int tok) {
 
 // ---------------------------------------------------------------- references (assignment targets)
 
-enum { LV_NAME = 1, LV_FIELD, LV_ELEM, LV_SUPER, LV_PRIVATE, LV_CALL };
+enum { LV_NAME = 1, LV_FIELD, LV_ELEM, LV_SUPER, LV_PRIVATE, LV_CALL, LV_NAME_CAP };
 
 struct lval {
     int kind;
     struct node* n;
     struct str* atom;   // LV_FIELD
+    struct ref r;       // LV_NAME_CAP: the with/eval-var resolution, captured before the RHS runs
+    int probed;         // LV_NAME: strict assignment to an undeclared global (a resolvability probe sits below the value)
 };
 
 // evaluate the parts of an assignment target onto the stack
 // defer_key: a plain `base[key] = v` converts the key only when it stores, after the right-hand side ran
 // (PutValue); compound and update forms read the target first, so the base is checked and the key converted up front
-static void lval_prepare_ex(struct cfunc* c, struct node* n, struct lval* lv, int defer_key);
-static void lval_prepare(struct cfunc* c, struct node* n, struct lval* lv) { lval_prepare_ex(c, n, lv, 0); }
-static void lval_prepare_ex(struct cfunc* c, struct node* n, struct lval* lv, int defer_key) {
+static void lval_prepare_ex(struct cfunc* c, struct node* n, struct lval* lv, int defer_key, int allow_probe);
+static void lval_prepare(struct cfunc* c, struct node* n, struct lval* lv) { lval_prepare_ex(c, n, lv, 0, 0); }
+static void lval_prepare_ex(struct cfunc* c, struct node* n, struct lval* lv, int defer_key, int allow_probe) {
     memset(lv, 0, sizeof *lv);
     lv->n = n;
-    if (n->type == N_IDENT) { lv->kind = LV_NAME; return; }
+    if (n->type == N_IDENT) {
+        struct ref r;
+        resolve(c, n->u.str, n->scope, &r);
+        if (r.kind == R_WITH) {
+            // the Reference Record keeps the resolved base: run the with chain once, leaving the
+            // matched object (or undefined = fall back to the static binding) below the value
+            lv->kind = LV_NAME_CAP;
+            lv->r = r;
+            struct patch* found = with_chain(c, n->scope, &r, OP_WITH_REF);
+            op(c, OP_UNDEF, 1);
+            patch_list(c, found, here(c));
+            return;
+        }
+        lv->kind = LV_NAME;
+        // strict assignment to an undeclared global: ResolveBinding runs now (before the
+        // right-hand side) and PutValue throws when the reference did not resolve
+        if (allow_probe && (c->fi->flags & FI_STRICT) && r.kind == R_GLOBAL && !r.d) {
+            lv->probed = 1;
+            op32(c, OP_GLOBAL_REF_PROBE, atom_const(c, n->u.str), 1);
+        }
+        return;
+    }
     if (n->type == N_CALL) {
-        // Annex B: evaluate the call, then a ReferenceError
+        // web-compat: evaluate the call, then a ReferenceError before the right-hand
+        // side is evaluated (Runtime Errors for Function Call Assignment Targets)
         lv->kind = LV_CALL;
         comp_expr(c, n);
+        op(c, OP_CALL_IGNORED_REF_ERROR, -1);
         return;
     }
     // N_MEMBER
     if (n->a->type == N_SUPER) {
         lv->kind = LV_SUPER;
-        super_ref(c, n);   // [key, home, this]
+        super_ref_ex(c, n, defer_key);   // [key, base, this]
         return;
     }
     comp_expr(c, n->a);
@@ -816,7 +848,7 @@ static void lval_prepare_ex(struct cfunc* c, struct node* n, struct lval* lv, in
 // stack items a prepared target occupies
 static int lval_parts(const struct lval* lv) {
     switch (lv->kind) {
-    case LV_FIELD: case LV_CALL: return 1;
+    case LV_FIELD: case LV_CALL: case LV_NAME_CAP: return 1;
     case LV_ELEM: case LV_PRIVATE: return 2;
     case LV_SUPER: return 3;
     default: return 0;
@@ -827,6 +859,19 @@ static int lval_parts(const struct lval* lv) {
 static void lval_get(struct cfunc* c, struct lval* lv) {
     switch (lv->kind) {
     case LV_NAME: load_name(c, lv->n->u.str, lv->n->scope, lv->n->pos, 0); break;
+    case LV_NAME_CAP: {   // [captured] -> [captured, value]
+        op(c, OP_DUP, 1);
+        uint32_t st = jump(c, OP_JF, -1);
+        op32(c, OP_WITH_LOAD, atom_const(c, lv->r.name), 1);
+        uint32_t done = jump(c, OP_JMP, 0);
+        patch_here(c, st);
+        op(c, OP_POP, -1);
+        load_ref_static(c, &lv->r, lv->n->pos, 0);
+        op(c, OP_UNDEF, 1);
+        op(c, OP_SWAP, 0);
+        patch_here(c, done);
+        break;
+    }
     case LV_FIELD: op(c, OP_DUP, 1); get_field(c, lv->atom); break;
     case LV_ELEM: op(c, OP_DUP2, 2); op(c, OP_GET_ELEM, -1); break;
     case LV_SUPER: op8(c, OP_PICK, 2, 1); op8(c, OP_PICK, 2, 1); op8(c, OP_PICK, 2, 1); op(c, OP_GET_SUPER, -2); break;
@@ -839,12 +884,30 @@ static void lval_get(struct cfunc* c, struct lval* lv) {
 // consumed); the value stays on the stack
 static void lval_put(struct cfunc* c, struct lval* lv) {
     switch (lv->kind) {
-    case LV_NAME: store_name(c, lv->n->u.str, lv->n->scope, lv->n->pos, 1, 0); break;
+    case LV_NAME:
+        if (lv->probed) {   // [probe, value] -> [value]
+            op32(c, OP_PUT_GLOBAL_PROBED, atom_const(c, lv->n->u.str), 0);
+            put16(c, new_ic(c));
+            return;
+        }
+        store_name(c, lv->n->u.str, lv->n->scope, lv->n->pos, 1, 0);
+        break;
     case LV_FIELD: put_field(c, lv->atom); break;
     case LV_ELEM: op(c, OP_PUT_ELEM, -2); break;
     case LV_SUPER: op(c, OP_PUT_SUPER, -3); break;
     case LV_PRIVATE: op(c, OP_PUT_PRIVATE, -2); break;
     case LV_CALL: op(c, OP_CALL_IGNORED_REF_ERROR, -1); break;   // always throws ReferenceError
+    case LV_NAME_CAP: {   // [captured, value] -> [value]
+        op8(c, OP_PICK, 1, 1);
+        uint32_t st = jump(c, OP_JF, -1);
+        op32(c, OP_WITH_SET, atom_const(c, lv->r.name), -1);
+        uint32_t done = jump(c, OP_JMP, 0);
+        patch_here(c, st);
+        op(c, OP_NIP, -1);
+        store_ref_static(c, &lv->r, lv->n->pos, 1, 0);
+        patch_here(c, done);
+        break;
+    }
     }
 }
 
@@ -876,13 +939,15 @@ static int plain_callee(struct node* f) {
 }
 
 // the call instruction's own position (stack traces, callee names in errors):
-// a plain callee is marked at its first token
+// marked at the callee expression's first token so "5 is not a function"-
+// style messages can quote the source as written
 static void mark_call(struct cfunc* c, struct node* call, struct node* callee) {
-    if (!plain_callee(callee)) { mark_pos(c, call->pos); return; }
-    if (call->type == N_NEW) { mark_pos(c, call->pos | POS_CALLEE); return; }   // at `new`
     struct node* x = callee;
-    while (x->type == N_MEMBER) x = x->a;
-    mark_pos(c, x->pos | POS_CALLEE);
+    while (x && x->type == N_MEMBER && !(x->flags & NF_COMPUTED)) x = x->a;   // the chain base
+    if (call->type == N_NEW || !x) { mark_pos(c, call->pos | POS_CALLEE); return; }   // at `new`
+    uint32_t flags = POS_CALLEE;
+    if (x->type == N_CALL) flags |= POS_CALLRET;   // foo()()/foo().x(): "(intermediate value)"
+    mark_pos(c, x->pos | flags);
 }
 
 static void emit_call(struct cfunc* c, int argc, int spread) {
@@ -1088,12 +1153,16 @@ static void comp_assign(struct cfunc* c, struct node* n) {
             return;
         }
         if (t->type == N_IDENT) {
-            comp_expr_named(c, n->b, t->u.str);
-            store_name(c, t->u.str, t->scope, t->pos, 1, 0);
+            // via the lval machinery so a with/eval-var target captures its base before the RHS
+            struct lval lv;
+            lval_prepare_ex(c, t, &lv, 0, 1);
+            // a parenthesized identifier is no IdentifierRef: no NamedEvaluation, name stays ""
+            comp_expr_named(c, n->b, (t->flags & NF_PAREN) ? 0 : t->u.str);
+            lval_put(c, &lv);
             return;
         }
         struct lval lv;
-        lval_prepare_ex(c, t, &lv, 1);
+        lval_prepare_ex(c, t, &lv, 1, 0);
         comp_expr(c, n->b);
         lval_put(c, &lv);
         return;
@@ -1200,9 +1269,10 @@ static void comp_delete(struct cfunc* c, struct node* n) {
     }
     if (t->type == N_MEMBER) {
         if (t->a->type == N_SUPER) {
-            // delete super.x: ReferenceError (after evaluating the key and this)
-            if (t->flags & NF_COMPUTED) { comp_expr(c, t->b); op(c, OP_POP, -1); }
+            // delete super.x: GetThisBinding runs before the key is evaluated
+            // (delete super[super()] throws the this-binding ReferenceError first)
             comp_this(c, t->pos);
+            if (t->flags & NF_COMPUTED) { comp_expr(c, t->b); op(c, OP_POP, -1); }
             op(c, OP_POP, -1);
             throw_err(c, NE_REFERENCE, "Unsupported reference to 'super'");
             op(c, OP_TRUE_, 1);

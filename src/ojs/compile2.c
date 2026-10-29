@@ -65,11 +65,13 @@ static jv eval_env_descriptor(struct cfunc* c, struct scope* s) {
             if (d->slot < 0 && !(d->flags & 0x40) && d->scope->kind != SC_MODULE) continue;   // not materialized
             int loc;
             if (d->flags & 0x40) loc = -1 - upval_index(c, d);          // nested eval: a captured cell
-            else if (d->scope->kind == SC_MODULE) loc = -1 - upval_index(c, d);
             else if (d->scope->fn == c->fi && d->slot >= 0) {
+                // the module function's own bindings (SC_MODULE included) are locals
+                // of the top frame; upval_index has no enclosing function there
                 loc = d->slot;
-                d->flags |= DF_CAPTURED;   // eval code may close over it: per-iteration copies and scope exits close the cell
-            } else loc = -1 - upval_index(c, d);
+                if (d->scope->kind != SC_MODULE) d->flags |= DF_CAPTURED;   // eval code may close over it: per-iteration copies and scope exits close the cell
+            } else if (d->scope->kind == SC_MODULE) loc = -1 - upval_index(c, d);
+            else loc = -1 - upval_index(c, d);
             int fl = 0;
             if (is_tdz_kind(d->kind) || d->kind == D_IMPORT) fl |= EF_TDZ;
             if (d->kind == D_CONST || d->kind == D_CLASSNAME || d->kind == D_IMPORT) fl |= EF_CONST;
@@ -170,16 +172,26 @@ static void assign_element(struct cfunc* c, struct node* el, int kind, valfn get
     if (tgt->type == N_ASSIGN_PAT) { init = tgt->b; tgt = tgt->a; }
     if (tgt->type == N_MEMBER || tgt->type == N_CALL) {
         struct lval lv;
-        lval_prepare(c, tgt, &lv);
+        lval_prepare_ex(c, tgt, &lv, 1, 0);   // ToPropertyKey of a computed key runs at PutValue, after the value is produced
         get(c, ctx);
         if (init) default_value(c, init, 0);
         lval_put(c, &lv);
         op(c, OP_POP, -1);
         return;
     }
+    // ResolveBinding of a var target runs before the value is read: inside a
+    // with statement the HasBinding probes of the reference are observable
+    struct lval lv;
+    int cap = 0;
+    if (tgt->type == N_IDENT && kind == D_VAR) {
+        struct ref r;
+        resolve(c, tgt->u.str, tgt->scope, &r);
+        if (r.kind == R_WITH) { lval_prepare(c, tgt, &lv); cap = 1; }
+    }
     get(c, ctx);
     if (init) default_value(c, init, tgt);
-    comp_target_store(c, tgt, kind);
+    if (cap) { lval_put(c, &lv); op(c, OP_POP, -1); }
+    else comp_target_store(c, tgt, kind);
 }
 
 struct objget { int src; int key; struct str* atom; };
@@ -258,11 +270,14 @@ static void comp_pattern_assign(struct cfunc* c, struct node* pat, int kind) {
         }
         return;
     }
-    // array pattern: iterator protocol, closing the iterator on abrupt exits
+    // array pattern: iterator protocol, closing the iterator on abrupt exits.
+    // throws close quietly and rethrow; a generator return closes LOUDLY
+    // (errors from return() replace the return) and then continue the return
     op(c, OP_GET_ITER, 0);
     int rec = new_local(c);
     op16(c, OP_PUT_LOC, (uint32_t)rec, -1);
-    struct cexc* prot = exc_begin(c, 1);
+    struct cexc* protr = exc_begin(c, 1);
+    struct cexc* prot = exc_begin(c, 0);
     struct arrget g = { rec };
     for (struct node* e = pat->a; e; e = e->next) {
         if (e->type == N_HOLE) {
@@ -276,12 +291,18 @@ static void comp_pattern_assign(struct cfunc* c, struct node* pat, int kind) {
         assign_element(c, e, kind, arrget_fn, &g);
     }
     exc_close(c, prot);
+    exc_close(c, protr);
     uint32_t over = jump(c, OP_JMP, 0);
-    prot->handler = here(c);
+    prot->handler = here(c);                    // first in the table: throws
     c->sp = prot->sp + 1;                       // [exc]
     op16(c, OP_GET_LOC, (uint32_t)rec, 1);
     op(c, OP_ITER_CLOSE_QUIET, -1);             // errors from return() are ignored
     op(c, OP_THROW, -1);
+    protr->handler = here(c);                   // generator return
+    c->sp = protr->sp + 1;                      // [return sentinel]
+    op16(c, OP_GET_LOC, (uint32_t)rec, 1);
+    op(c, OP_ITER_CLOSE, -1);
+    op(c, OP_THROW, -1);                        // rethrow the sentinel past the table: the frame returns
     patch_here(c, over);
     c->sp = prot->sp;
     op16(c, OP_GET_LOC, (uint32_t)rec, 1);
@@ -301,7 +322,7 @@ static void enter_scope(struct cfunc* c, struct scope* s, int hoist_functions) {
     struct scope* saved = c->cur_scope;
     c->cur_scope = s;
     for (struct decl* d = s->decls; d; d = d->next) {
-        int lex = d->kind == D_LET || d->kind == D_CONST || d->kind == D_CLASS;
+        int lex = d->kind == D_LET || d->kind == D_CONST || d->kind == D_CLASS || d->kind == D_CLASSNAME;
         if (d->slot >= 0) {
             if (again && lex) op16(c, OP_HOLE_LOC, (uint32_t)d->slot, 0);
             continue;
@@ -374,7 +395,7 @@ static void unwind(struct cfunc* c, struct cblock* target, int keep_top) {
         case CB_FOR_OF:
             if (keep_top) { op(c, OP_SWAP, 0); }
             if (b->is_async_iter) {
-                op(c, OP_ASYNC_ITER_CLOSE, 0);   // [rec] -> [promise] (returns()'s result)
+                op8(c, OP_ASYNC_ITER_CLOSE, 0, 0);   // [rec] -> [promise] (return()'s result)
                 op(c, OP_AWAIT, 0);
                 op(c, OP_ITER_CHECK_OBJ, 0);
                 op(c, OP_POP, -1);
@@ -466,6 +487,21 @@ static void comp_var(struct cfunc* c, struct node* v) {
             continue;   // var x; does nothing
         }
         mark_pos(c, d->pos);
+        if (d->a->type == N_IDENT && v->op == D_VAR) {
+            // the Reference Record's base is resolved before the initializer runs:
+            // `with (o) { var x = rhs; }` assigns through o even when rhs removes the binding
+            struct ref r;
+            resolve(c, d->a->u.str, d->a->scope, &r);
+            int cap = r.kind == R_WITH;
+            if (cap) {
+                struct lval lv;
+                lval_prepare(c, d->a, &lv);
+                comp_expr_named(c, d->b, d->a->u.str);
+                lval_put(c, &lv);
+                op(c, OP_POP, -1);
+                continue;
+            }
+        }
         if (d->a->type == N_IDENT) comp_expr_named(c, d->b, d->a->u.str);
         else comp_expr(c, d->b);
         comp_target_store(c, d->a, v->op);
@@ -542,6 +578,11 @@ static void comp_for(struct cfunc* c, struct node* n) {
     apply_labels(c, b, &ls);
     uint32_t top = here(c);
     uint32_t exit = 0;
+    // CreatePerIterationEnvironment: the head init's closures (first entry) and the
+    // previous iteration's increment closures are frozen before this iteration's
+    // test and increment write the bindings; unconditional (the captures of the
+    // increment's closures are only known after this point)
+    if (per_iter) op16(c, OP_CLOSE, (uint32_t)hs->first_slot, 0);
     int has_test = n->b != 0;
     if (has_test) { comp_expr(c, n->b); exit = jump(c, OP_JF, -1); }
     comp_stmt(c, n->d);
@@ -592,6 +633,9 @@ static void comp_for_in_of(struct cfunc* c, struct node* n) {
     // the head bindings are fresh per iteration: reset TDZ for the body
     if (is_of) op(c, is_await ? OP_GET_ASYNC_ITER : OP_GET_ITER, 0);
     else op(c, OP_FOR_IN_START, 0);
+    // closures made while evaluating the iterable captured the head bindings:
+    // materialize them now (they keep the TDZ hole; the head env is never assigned)
+    if (scope_has_captures(c, hs)) op16(c, OP_CLOSE, (uint32_t)hs->first_slot, 0);
     struct cblock* it = push_block(c, is_of ? CB_FOR_OF : CB_FOR_IN);
     it->is_async_iter = is_await;
     struct cblock* b = push_block(c, CB_LOOP);
@@ -612,15 +656,19 @@ static void comp_for_in_of(struct cfunc* c, struct node* n) {
     // per-iteration bindings start uninitialized
     for (struct decl* d = hs->decls; d; d = d->next)
         if (d->kind == D_LET || d->kind == D_CONST) op16(c, OP_HOLE_LOC, (uint32_t)d->slot, 0);
-    // assignment / body under protection: abrupt completion closes the iterator
-    struct cexc* prot = is_of ? exc_begin(c, 1) : 0;
+    // assignment / body under protection: abrupt completion closes the iterator.
+    // throws close quietly; a generator return closes loudly (return() errors win) and continues the return
+    struct cexc* protr = is_of ? exc_begin(c, 1) : 0;
+    struct cexc* prot = is_of ? exc_begin(c, 0) : 0;
     if (prot) prot->sp = (uint16_t)(c->sp - 1);   // handler sees [rec, exc]
+    if (protr) protr->sp = prot->sp;
     struct cblock* pb = 0;
     if (prot) { pb = push_block(c, CB_CATCH_PROT); pb->prot = prot; }
     comp_for_head_store(c, n->a);
     comp_stmt(c, n->d);
     if (pb) pop_block(c);
     if (prot) exc_close(c, prot);
+    if (protr) exc_close(c, protr);
     patch_list(c, b->continues, here(c));
     if (scope_has_captures(c, hs)) op16(c, OP_CLOSE, (uint32_t)hs->first_slot, 0);
     jump_back(c, OP_JMP, top, 0);
@@ -635,11 +683,21 @@ static void comp_for_in_of(struct cfunc* c, struct node* n) {
         c->sp = prot->sp + 1;   // [rec, exc]
         op(c, OP_SWAP, 0);
         if (is_await) {
-            op(c, OP_ASYNC_ITER_CLOSE, 0);
+            op8(c, OP_ASYNC_ITER_CLOSE, 1, 0);   // 1: the body exception is parked below the record
             op(c, OP_AWAIT, 0);
             op(c, OP_POP, -1);
         } else op(c, OP_ITER_CLOSE_QUIET, -1);
         op(c, OP_THROW, -1);
+        // generator return from the body: close loudly, then continue the return
+        protr->handler = here(c);
+        c->sp = protr->sp + 1;  // [rec, return sentinel]
+        op(c, OP_SWAP, 0);
+        if (is_await) {
+            op8(c, OP_ASYNC_ITER_CLOSE, 0, 0);   // 0: a close error replaces the return sentinel
+            op(c, OP_AWAIT, 0);
+            op(c, OP_POP, -1);
+        } else op(c, OP_ITER_CLOSE, -1);
+        op(c, OP_THROW, -1);    // rethrow the sentinel past the table: the frame returns
     }
     // break targets: the iterator was already closed / popped by unwind()
     c->sp = it->stack_depth - 1;
@@ -944,7 +1002,9 @@ static void collect_annexb_stmt(struct cfunc* c, struct node* s, struct funcinfo
     if (!s) return;
     switch (s->type) {
     case N_FUNC:
-        if ((s->flags & NF_ANNEXB) && s->u.fn->name) {
+        // a block function named "arguments" is not var-hoisted: the arguments
+        // object of the function keeps the name (Annex B.3.3 skip)
+        if ((s->flags & NF_ANNEXB) && s->u.fn->name && s->u.fn->name != c->J->A->arguments) {
             if (annexb_ok(fi, s)) {
                 struct decl* d = scope_find(fi->body_scope, s->u.fn->name);
                 if (!d) {
@@ -1069,7 +1129,7 @@ static struct ftempl* compile_func(ojs* J, struct parser* P, struct funcinfo* fi
             struct decl* d = pseudo_decl(c, ps, "new.target", D_NEWTARGET);
             if (d) { d->slot = new_local(c); c->newtarget_slot = d->slot; }
         }
-        if (fi->flags & (FI_METHOD | FI_CLASS_CTOR)) {
+        if (fi->flags & (FI_METHOD | FI_CLASS_CTOR | FI_STATIC_BLOCK)) {
             struct decl* d = pseudo_decl(c, ps, "*home*", D_HOME);
             if (d) { d->slot = new_local(c); c->home_slot = d->slot; }
         }
@@ -1080,9 +1140,14 @@ static struct ftempl* compile_func(ojs* J, struct parser* P, struct funcinfo* fi
         !(fi->flags & (FI_FIELD_INIT | FI_STATIC_BLOCK))) {
         struct decl* shadow = scope_find(ps, J->A->arguments);
         int shadowed = shadow && shadow->kind == D_PARAM;
-        struct decl* bd = bs != ps ? scope_find(bs, J->A->arguments) : 0;
-        if (bd && (bd->kind == D_FUNC || bd->kind == D_LET || bd->kind == D_CONST || bd->kind == D_CLASS)) shadowed = 1;
-        if (!bd && shadow && shadow->kind == D_FUNC) shadowed = 1;
+        if (simple) {
+            // only a function WITHOUT parameter expressions suppresses the object for
+            // body-level bindings: with them, the body scope is invisible to the
+            // parameter initializer, which still sees the arguments object
+            struct decl* bd = bs != ps ? scope_find(bs, J->A->arguments) : 0;
+            if (bd && (bd->kind == D_FUNC || bd->kind == D_LET || bd->kind == D_CONST || bd->kind == D_CLASS)) shadowed = 1;
+            if (!bd && shadow && shadow->kind == D_FUNC) shadowed = 1;
+        }
         if (!shadowed) {
             argd = scope_find(ps, J->A->arguments);
             if (!argd) {
@@ -1252,6 +1317,7 @@ static struct ftempl* finish_template(struct cfunc* c) {
     if (fi->flags & FI_SIMPLE_PARAMS) fl |= TF_SIMPLE_PARAMS;
     if (fi->flags & FI_FIELD_INIT) fl |= TF_FIELD_INIT;
     if (fi->flags & FI_STATIC_BLOCK) fl |= TF_STATIC_INIT;
+    if (fi->flags & FI_IN_FIELD_INIT) fl |= TF_IN_FIELD_INIT;
     if (fi->flags & FI_EXPR) fl |= TF_EXPR_NAME;
     // constructors: ordinary functions (not methods / arrows / generators / async) and classes
     if (((fi->flags & (FI_ARROW | FI_METHOD | FI_GENERATOR | FI_ASYNC | FI_GETTER | FI_SETTER | FI_FIELD_INIT | FI_STATIC_BLOCK)) == 0 &&
@@ -1403,9 +1469,13 @@ static struct ftempl* compile_class_init(struct cfunc* parent, struct node* cls,
         int st = (m->flags & NF_STATIC) != 0;
         if (st != is_static) continue;
         if (m->type == N_CLASS_STATIC_BLOCK) {
-            // static { ... }: call the block function with this = the class
-            comp_function_node(c, m->b);
-            load_pseudo(c, "this", m->pos);
+            // static { ... }: call the block function with this = the class; its
+            // home object is the class (super.x reads the class's prototype)
+            comp_function_node(c, m->b);             // [fn]
+            load_pseudo(c, "this", m->pos);          // [fn, class]
+            op(c, OP_SWAP, 0);                       // [class, fn]
+            op(c, OP_SET_HOME, -1);                  // [fn] (home = the class)
+            load_pseudo(c, "this", m->pos);          // [fn, class]
             op16(c, OP_CALL, 0, -1);
             op(c, OP_POP, -1);
             continue;

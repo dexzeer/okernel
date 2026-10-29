@@ -37,4 +37,6 @@ section .bss
 engine_main_sp: resd 1
 
 ; Must be LAST (see AGENTS.md: code after it lands non-executable)
+%ifnidn __OUTPUT_FORMAT__,win32
 section .note.GNU-stack noalloc noexec nowrite progbits
+%endif

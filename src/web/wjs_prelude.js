@@ -837,7 +837,7 @@ accessor(Element.prototype, 'outerHTML', function () { return W.html(this, 1); }
 });
 accessor(Element.prototype, 'classList', function () { return tokenList(this, 'class'); });
 accessor(Element.prototype, 'part', function () { return tokenList(this, 'part'); });
-accessor(Element.prototype, 'shadowRoot', function () { return null; });
+accessor(Element.prototype, 'shadowRoot', function () { return this._shadow || null; });   // attachShadow's light-tree hack stores itself here: the getter must agree or the page's !shadowRoot guards re-stamp on every connect
 accessor(Element.prototype, 'assignedSlot', function () { return null; });
 for (const [p, i] of [['clientWidth', 2], ['clientHeight', 3], ['offsetWidth', 2], ['offsetHeight', 3], ['scrollWidth', 2], ['scrollHeight', 3]])
     accessor(Element.prototype, p, function () {
@@ -3349,6 +3349,52 @@ function parseHeaders(raw) {
     }
     return h;
 }
+// Trusted Types (https://w3c.github.io/webappsec-trusted-types/dist/spec/): policies wrap
+// the strings their rules return in opaque typed objects. There is no CSP enforcement
+// (we serve no require-trusted-types-for directive), so DOM sinks keep taking plain
+// strings and coerce these through toString.
+class TrustedHTML {
+    constructor(s) { hidden(this, '_s', String(s)); }
+    toString() { return this._s; }
+    toJSON() { return this._s; }
+}
+class TrustedScript extends TrustedHTML {}
+class TrustedScriptURL extends TrustedHTML {}
+const TT_POLICIES = new Map();
+class TrustedTypePolicy {
+    constructor(name, rules) {
+        // Chromium allows recreating a policy name (BotGuard creates 'ad' several
+        // times); the newest policy wins
+        hidden(this, '_name', name);
+        for (const [prop, Cls] of [['createHTML', TrustedHTML], ['createScript', TrustedScript], ['createScriptURL', TrustedScriptURL]]) {
+            const rule = rules && rules[prop];
+            this[prop] = typeof rule === 'function'
+                ? function (input) {
+                    const s = input === undefined || input === null ? '' : typeof input === 'string' ? input : String(input.valueOf());
+                    const out = rule(s);
+                    if (out === undefined || out === null) throw new TypeError("The " + prop + " policy's callback returned a falsy value.");
+                    return new Cls(out);
+                }
+                : function () { throw new TypeError("Failed to execute '" + prop + "' on 'TrustedTypePolicy': Policy '" + name + "' does not support " + prop + "."); };
+        }
+        TT_POLICIES.set(name, this);
+    }
+    get name() { return this._name; }
+}
+class TrustedTypePolicyFactory {
+    createPolicy(name, rules) {
+        if (arguments.length === 0) throw new TypeError("Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': 1 argument required, but only 0 present.");
+        return new TrustedTypePolicy(String(name), rules);
+    }
+    isHTML(v) { return v instanceof TrustedHTML; }
+    isScript(v) { return v instanceof TrustedScript; }
+    isScriptURL(v) { return v instanceof TrustedScriptURL; }
+    get defaultPolicy() { return null; }
+    getAttributeType(tag, attr) { return null; }
+    getPropertyType(tag, prop) { return null; }
+}
+const trustedTypes = new TrustedTypePolicyFactory();
+
 class Headers {
     constructor(init) {
         hidden(this, '_m', new Map());
@@ -6530,7 +6576,8 @@ const win = {
     document, location, history, navigator, screen, performance, console, crypto, localStorage, sessionStorage,
     customElements: new CustomElementRegistry(), length: 0, name: '', status: '', origin: location.origin,
     isSecureContext: /^https:/.test(W.docURL()), crossOriginIsolated: false, devicePixelRatio: 1,
-    visualViewport: null, speechSynthesis: undefined, trustedTypes: undefined,
+    visualViewport: null, speechSynthesis: undefined,
+    trustedTypes, TrustedTypePolicy, TrustedTypePolicyFactory, TrustedHTML, TrustedScript, TrustedScriptURL,
     setTimeout, setInterval, clearTimeout, clearInterval: clearTimeout, requestAnimationFrame, cancelAnimationFrame,
     requestIdleCallback, cancelIdleCallback: clearTimeout, queueMicrotask, structuredClone, matchMedia, getComputedStyle,
     getSelection, postMessage, fetch, atob, btoa,
@@ -6560,7 +6607,6 @@ const win = {
     ValidityState: function ValidityState() { illegal(); }, HTMLOptionsCollection: HTMLCollection,
     VisualViewport: function VisualViewport() { illegal(); }, CSSStyleRule: CSSRule, CSSMediaRule: CSSRule,
     CSS: { supports(a, b) { return W.supports(b === undefined ? String(a) : '(' + a + ': ' + b + ')'); }, escape: cssEscape },
-    Intl: G.Intl
 };
 for (const k of Object.keys(win)) {
     if (win[k] === undefined) continue;

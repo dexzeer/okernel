@@ -503,13 +503,13 @@ static jv afs_method(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     if (m == JV_EXC) return reject_now(J, p);
     if (jv_is_undef(m)) {
         if (magic == 1) {
+            // return with no return method: resolve done (no close — only throw closes)
             jv res = create_iter_result(J, argv[0], 1);
             if (res == JV_EXC) return JV_EXC;
             promise_settle(J, p, 0, res);
             return p;
         }
         // throw without a throw method: close the sync iterator, then reject with a TypeError
-        r->done = 1;
         if (iter_close(J, r, 0) < 0) return reject_now(J, p);
         throw_type(J, "The iterator does not provide a 'throw' method");
         return reject_now(J, p);

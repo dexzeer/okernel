@@ -147,13 +147,26 @@ static jv native_source(ojs* J, struct obj* f) {
     if (jv_is_str(nm)) {
         struct str* s = str_flat(J, nm);
         if (s) {
-            // a symbol-named or accessor name keeps only identifier-safe text
-            int ok = 1;
-            for (uint32_t i = 0; i < str_len(s); i++) {
-                uint32_t c = str_at(s, i);
-                if (c == '(' || c == ')' || c == '{' || c == '}' || c == '\n') { ok = 0; break; }
+            // the stored name of an accessor carries its "get "/"set " prefix
+            uint32_t n = str_len(s), from = 0;
+            if (n >= 4 && (str_at(s, 0) == 'g' || str_at(s, 0) == 's') && str_at(s, 1) == 'e' && str_at(s, 2) == 't' && str_at(s, 3) == ' ') {
+                from = 4;
+                sb_put_sub(&b, s, 0, 4);
             }
-            if (ok) sb_put_str(&b, s);
+            // PropertyName: [Symbol.x] is emitted as-is; otherwise the name only when it is
+            // a valid IdentifierName ("$&" is not — the grammar allows omitting it)
+            if (n - from >= 2 && str_at(s, from) == '[' && str_at(s, n - 1) == ']') {
+                sb_put_sub(&b, s, from, n);
+            } else {
+                int ok = n > from;
+                for (uint32_t i = from; i < n && ok; i++) {
+                    uint32_t c = str_at(s, i);
+                    int idc = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '$' || c == '_' ||
+                              (i > from && c >= '0' && c <= '9') || c >= 0x80;   // built-in names are ASCII in practice
+                    if (!idc) ok = 0;
+                }
+                if (ok) sb_put_sub(&b, s, from, n);
+            }
         }
     }
     sb_puts(&b, "() { [native code] }");

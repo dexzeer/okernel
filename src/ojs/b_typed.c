@@ -55,10 +55,13 @@ static struct abuf* abuf_new(ojs* J, struct obj* proto, uint32_t len, uint32_t m
 }
 
 static int to_byte_len(ojs* J, jv v, uint32_t* out) {
-    uint64_t n;
-    if (to_index(J, v, &n) < 0) return -1;
-    if (n > MAX_BYTES) { throw_range(J, "Array buffer allocation failed"); return -1; }
-    *out = (uint32_t)n;
+    // V8 validates the ArrayBuffer length before the index conversion:
+    // negatives and beyond-2^53 are "Invalid array buffer length"
+    double d;
+    if (to_integer_or_inf(J, v, &d) < 0) return -1;
+    if (d < 0 || d > 9007199254740991.0) { throw_range(J, "Invalid array buffer length"); return -1; }
+    if (d > (double)MAX_BYTES) { throw_range(J, "Array buffer allocation failed"); return -1; }
+    *out = (uint32_t)d;
     return 0;
 }
 
@@ -66,20 +69,29 @@ static int to_byte_len(ojs* J, jv v, uint32_t* out) {
 static jv abuf_ctor(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     jv nt = J->native_new_target;
     if (jv_is_undef(nt)) return throw_type(J, "Constructor %s requires 'new'", magic ? "SharedArrayBuffer" : "ArrayBuffer");
-    uint32_t len, max = 0;
-    if (to_byte_len(J, argv[0], &len) < 0) return JV_EXC;
+    // ToIndex(length) / ToIndex(maxByteLength): a huge but in-range length is fine
+    // here — its RangeError comes from the data block, after the object exists
+    double len_d;
+    if (to_integer_or_inf(J, argv[0], &len_d) < 0) return JV_EXC;
+    if (len_d < 0 || len_d > 9007199254740991.0) return throw_range(J, "Invalid array buffer length");
+    uint32_t len = len_d > (double)MAX_BYTES ? 0 : (uint32_t)len_d;
+    int oversized = len_d > (double)MAX_BYTES;
     int resizable = 0;
+    uint32_t max = 0;
     if (jv_is_obj(argv[1])) {
         jv m = obj_get(J, jv_obj(argv[1]), A(maxByteLength), argv[1]);
         if (m == JV_EXC) return JV_EXC;
         if (!jv_is_undef(m)) {
             if (to_byte_len(J, m, &max) < 0) return JV_EXC;
-            if (len > max) return throw_range(J, "byteLength exceeds maxByteLength");
+            if (len_d > (double)max) return throw_range(J, "byteLength exceeds maxByteLength");
             resizable = 1;
         }
     }
+    // AllocateArrayBuffer: OrdinaryCreateFromConstructor (the new.target prototype
+    // getter runs here) comes before CreateByteDataBlock (the allocation failure)
     struct obj* proto = get_proto_from_ctor(J, nt, magic ? J->I.sharedarraybuffer_proto : J->I.arraybuffer_proto);
     if (!proto) return JV_EXC;
+    if (oversized) return throw_range(J, "Array buffer allocation failed");
     struct abuf* b = abuf_new(J, proto, len, max, resizable, magic);
     return b ? jv_from_obj(&b->base) : JV_EXC;
 }
@@ -326,6 +338,14 @@ int typed_array_length(ojs* J, struct obj* o, uint32_t* len) {
     return 0;
 }
 
+// freeze/seal need a stable length: a view of a resizable buffer has a writable
+// "length" (resize can change it), so SetIntegrityLevel would throw — report it
+// before any change
+int ta_integrity_blocked(struct obj* o) {
+    if (obj_class(o) != OC_TYPEDARRAY) return 0;
+    return ((struct tarr*)o)->buf->resizable;
+}
+
 static uint8_t* ta_ptr(struct tarr* t, uint32_t i) { return t->buf->data + t->offset + (size_t)i * TSIZE[t->type]; }
 
 // CanonicalNumericIndexString: 1 numeric (value in *out), 0 not numeric
@@ -553,14 +573,18 @@ static jv ta_ctor(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     int type = magic;
     jv nt = J->native_new_target;
     if (jv_is_undef(nt)) return throw_type(J, "Constructor %s requires 'new'", TNAME[type]);
-    struct obj* proto = get_proto_from_ctor(J, nt, ta_proto_of(J, type));
-    if (!proto) return JV_EXC;
     jv a0 = argv[0];
     if (!jv_is_obj(a0)) {
+        // elementLength = ToIndex(firstArgument) runs before AllocateTypedArray
+        // reads newTarget.prototype
         uint64_t n;
         if (to_index(J, a0, &n) < 0) return JV_EXC;
+        struct obj* proto = get_proto_from_ctor(J, nt, ta_proto_of(J, type));
+        if (!proto) return JV_EXC;
         return ta_create_len(J, proto, type, (double)n);
     }
+    struct obj* proto = get_proto_from_ctor(J, nt, ta_proto_of(J, type));
+    if (!proto) return JV_EXC;
     struct obj* o = jv_obj(a0);
     int cls = obj_class(o);
     if (cls == OC_ARRAYBUFFER || cls == OC_SHAREDARRAYBUFFER) {
@@ -1168,6 +1192,14 @@ static jv tp_with(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     for (uint32_t i = 0; i < len; i++) {
         if (i == (uint32_t)idx) write_conv(a->type, ta_ptr(a, i), d, big);
         else if (i < cur) memcpy(ta_ptr(a, i), ta_ptr(t, i), TSIZE[t->type]);
+        else {
+            // the source shrank while the value was coerced: the missing element
+            // reads as undefined and is converted per element type (NaN / 0 / TypeError)
+            double ud = 0;
+            uint64_t ub = 0;
+            if (conv_value(J, a->type, JV_UNDEFINED, &ud, &ub) < 0) return JV_EXC;
+            write_conv(a->type, ta_ptr(a, i), ud, ub);
+        }
     }
     return r;
 }
@@ -1364,14 +1396,12 @@ static jv atomics_wait(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     if (idx >= len) return throw_range(J, "Invalid atomic access index");
     double d = 0;
     uint64_t big = 0;
-    if (conv_value(J, t->type, argv[2], &d, &big) < 0) return JV_EXC;
+    if (conv_value(J, t->type, argv[2], &d, &big) < 0) return JV_EXC;   // the value is coerced before the suspend check
+    (void)d; (void)big;
     double timeout;
     if (to_number_d(J, argv[3], &timeout) < 0) return JV_EXC;
-    uint8_t tmp[8];
-    write_conv(t->type, tmp, d, big);
-    if (memcmp(tmp, ta_ptr(t, (uint32_t)idx), TSIZE[t->type])) return str_value(J, "not-equal");
-    // a single agent: nobody can notify us
-    return str_value(J, "timed-out");
+    // the host runs a single agent: AgentCanSuspend() is false, wait always throws
+    return throw_type(J, "the calling agent cannot be suspended");
 }
 
 static jv atomics_notify(ojs* J, jv this_v, int argc, jv* argv, int magic) {
@@ -1380,11 +1410,11 @@ static jv atomics_notify(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     if (!t) return JV_EXC;
     uint64_t idx;
     if (to_index(J, argv[1], &idx) < 0) return JV_EXC;
+    if (idx >= len) return throw_range(J, "Invalid atomic access index");   // ValidateAtomicAccess, before the count is coerced
     if (!jv_is_undef(argv[2])) {
         double c;
         if (to_integer_or_inf(J, argv[2], &c) < 0) return JV_EXC;
     }
-    if (idx >= len) return throw_range(J, "Invalid atomic access index");
     return jv_from_int(0);
 }
 
