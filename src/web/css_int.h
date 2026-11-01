@@ -12,7 +12,7 @@ enum {
     P_DISPLAY, P_POSITION, P_FLOAT, P_CLEAR, P_BOX_SIZING, P_VISIBILITY, P_OVERFLOW_X,
     P_OVERFLOW_Y, P_Z_INDEX, P_OPACITY,
     P_WIDTH, P_HEIGHT, P_MIN_WIDTH, P_MIN_HEIGHT, P_MAX_WIDTH, P_MAX_HEIGHT,
-    P_MARGIN_TOP, P_MARGIN_RIGHT, P_MARGIN_BOTTOM, P_MARGIN_LEFT,
+    P_MARGIN_TOP, P_MARGIN_RIGHT, P_MARGIN_BOTTOM, P_MARGIN_LEFT, P_MARGIN_TRIM,
     P_PADDING_TOP, P_PADDING_RIGHT, P_PADDING_BOTTOM, P_PADDING_LEFT,
     P_TOP, P_RIGHT, P_BOTTOM, P_LEFT,
     P_BTW, P_BRW, P_BBW, P_BLW,           // border widths
@@ -39,6 +39,17 @@ enum {
     // animations / transitions (raw text, decoded at compute time)
     P_ANIM, P_ANIM_NAME, P_ANIM_DUR, P_ANIM_DELAY, P_ANIM_ITER, P_ANIM_DIR, P_ANIM_FILL, P_ANIM_TF,
     P_TRANS, P_TRANS_PROP, P_TRANS_DUR, P_TRANS_DELAY, P_TRANS_TF,
+    P_CTR_RESET, P_CTR_INC, P_CTR_SET, P_BG_ORIGIN, P_BG_CLIP, P_LINE_BREAK, P_LINE_CLAMP, P_WEBKIT_ORIENT, P_HYPHENS, P_OBJECT_POS, P_TEXT_ALIGN_LAST, P_CONTAIN, P_CIS_W, P_CIS_H, P_TAB_SIZE, P_MULTICOL, P_OCM, P_WST,
+    P_BG_ATTACH, P_TW, P_TWM, P_TWS,                       // text-wrap, text-wrap-mode, text-wrap-style
+    P_EMPH_STYLE, P_EMPH_POS, P_EMPH, P_RUBY_POS,          // text-emphasis-*; ruby-position
+    P_TFO, P_SCALE,                                        // transform-origin; standalone scale property
+    P_UBIDI,                                               // unicode-bidi
+
+    P_BI_SRC, P_BI_SLICE, P_BI_WIDTH, P_BI_OUTSET, P_BI_REPEAT,      // border-image longhands (raw text)
+    P_WM, P_TOR,                                   // writing-mode, text-orientation
+    // logical properties: resolved to the physical ones once the element's writing mode is known (css_style.c remap_logical)
+    P_L_ISIZE, P_L_BSIZE, P_L_MINI, P_L_MINB, P_L_MAXI, P_L_MAXB,
+    P_L_M_BS, P_L_M_BE, P_L_M_IS, P_L_M_IE, P_L_P_BS, P_L_P_BE, P_L_P_IS, P_L_P_IE, P_L_I_BS, P_L_I_BE, P_L_I_IS, P_L_I_IE,
     P_COUNT,
     P_CUSTOM = 0xFFF0   // --custom-property (name in raw text)
 };
@@ -98,7 +109,7 @@ struct cpart {
     uint8_t kind;        // SK_*
     uint8_t op;          // combinator / attr op / pseudo-class id
     uint8_t ci;          // attribute value case-insensitive
-    uint8_t _pad;
+    uint8_t cnt;         // :lang() comma-separated language-range count
     uint16_t atom;       // tag/id/class/attr-name atom
     uint16_t _pad2;
     int32_t a, b;        // attr value (pool off, len) | nth (a, b) | sublist index
@@ -148,6 +159,9 @@ struct wsheet {
     // @import URLs (absolute), NUL separated
     struct wbuf imports;
     int nimports;
+    // @font-face entries, "family\0url\0" (absolute), NUL separated
+    struct wbuf fontfaces;
+    int nfontfaces;
     // transient parse source: text being parsed (never the pool itself)
     // and the pool offset holding an identical copy of it
     const char* src;

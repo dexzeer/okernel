@@ -70,7 +70,9 @@ static int http_get(const char* url, const char* method, const char* req_headers
     }
     char key[64], bpath[700], hpath[700], mpath[700];
     char kin[8192];
-    snprintf(kin, sizeof kin, "o3 %s %s %s %s", method, url, cookie, g_top_url ? g_top_url : "");
+    int local = !strncmp(url, "http://127.0.0.1", 16) || !strncmp(url, "http://localhost", 16);
+    // a local test server is never cached: files are private to this process (parallel runs fetch the same url all the time)
+    snprintf(kin, sizeof kin, "o3 %s %s %s %s %d", method, url, cookie, g_top_url ? g_top_url : "", local ? (int)getpid() : 0);
     unsigned long long kh = fnv(kin);
     for (int bi = 0; body && bi < blen; bi++) { kh ^= (unsigned char)body[bi]; kh *= 1099511628211ULL; }
     for (const char* hp = req_headers; hp && *hp; hp++) { kh ^= (unsigned char)*hp; kh *= 1099511628211ULL; }   // Range etc. select a different answer
@@ -133,8 +135,10 @@ static int http_get(const char* url, const char* method, const char* req_headers
     snprintf(r->ctype, sizeof r->ctype, "%s", ct);
     r->body = slurp(bpath, &r->len);
     if (!r->body) { r->body = calloc(1, 1); r->len = 0; }
+    if (local) { unlink(bpath); unlink(mpath); }
     int hl;
     char* h = slurp(hpath, &hl);
+    if (local) unlink(hpath);
     // cookies from every header block (redirect hops included)
     if (h) {
         for (char* line = h; line && *line;) {
@@ -292,6 +296,25 @@ again:
             double tr = now_ms();
             int f = wjs_run(js, 500);
             js_ms += now_ms() - tr;
+            {   // script focus(): applied like the shell does (the focused node and its ancestors get the :focus / :focus-within flags)
+                int fnode;
+                if ((f & WJS_FOCUS) && wjs_take_focus(js, &fnode)) {
+                    struct wdom* dd = wdoc_dom(d);
+                    static int cur_focus = -1;
+                    if (cur_focus >= 0 && cur_focus < dd->nn) {
+                        dd->n[cur_focus].flags &= ~WNF_FOCUSED;
+                        for (int q = cur_focus; q >= 0; q = dd->n[q].parent) dd->n[q].flags &= ~WNF_FOCUS_WITHIN;
+                    }
+                    cur_focus = fnode >= 0 && fnode < dd->nn ? fnode : -1;
+                    if (cur_focus >= 0) {
+                        dd->n[cur_focus].flags |= WNF_FOCUSED;
+                        for (int q = cur_focus; q >= 0; q = dd->n[q].parent) dd->n[q].flags |= WNF_FOCUS_WITHIN;
+                    }
+                    wdoc_set_focus(d, cur_focus);
+                    wdoc_invalidate(d);
+                    f |= WJS_DIRTY;
+                }
+            }
             if (f & WJS_DIRTY) { double tu = now_ms(); wdoc_update(d); up_ms += now_ms() - tu; }        // the shell re-renders after script changes (observers measure the new layout)
             js_runs++;
             if (getenv("WB_TRACE") && now_ms() - tr > 50) printf("[trace] wjs_run %.0fms flags=%x\n", now_ms() - tr, f);
@@ -308,6 +331,7 @@ again:
             wjs_media_poll(js, rr, 8, &nn);
         }
         if (id >= 0) continue;
+        wdoc_height(d);                             // lays out: images only a layout finds (CSS backgrounds) are queued now, like the shell does while it renders
         int due = js ? wjs_next_due(js) : -1;
         if (js && wjs_media_active(js)) due = 5;
         if (now_ms() > deadline) break;
@@ -350,10 +374,7 @@ again:
     if (js) wjs_stats(js, jst, sizeof jst);
     printf("WB %s: %s doc_h=%d | %s | parse=%.0fms net+js=%.0fms (scripts %.0fms, updates %.0fms) paint=%.0fms fetched=%d failed=%d title=\"%s\"\n",
            argv[1], stats, dh, jst, t1 - t0, t2 - t1, js_ms, up_ms, t3 - t2, fetched, failed, wdoc_title(d));
-    if (getenv("WB_DUMP")) {
-        struct wbuf { char* p; int len, cap; } b = { 0, 0, 0 };
-        (void)b;
-    }
+    if (getenv("WB_DUMP")) { extern void wdoc_dump_layout(struct wdoc*); wdoc_dump_layout(d); }
     free(s.px);
     wdoc_free(d);
     if (html != page.body) free(html);

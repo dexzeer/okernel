@@ -1,0 +1,1856 @@
+[gdt] GDT + TSS initialized (user segments at 0x18/0x20)
+[mem] mboot phys=10000
+[mem] mboot phys=10000 flags=1a67
+[mem] memory map: 1 usable region(s), top 896 MB
+[mem] total pages: 229376, used: 3321
+[boot] mboot phys=10000 flags=1a67 fb=fd000000
+[paging] high alias covers 896 MB
+[paging] high-half map on: cr3=855000 kernel_end=0
+[mem] heap 735 MB at c0cf9000
+[acpi] power: PM1a 604 PM1b 0 smi 0/0 sleep_ctl 0 S5 found (0,0) reset none
+[acpi] RSDP f52d0 rev 0: 4 cpus (4 enabled), lapic fee00000, 1 ioapic, 5 override
+[proc] process table initialized
+[gfx] mboot fb=fd000000 pitch=7680 w=1920 h=1080 bpp=32 flags=1a67
+[gfx] using identity FB fd000000 pitch=7680
+[gfx] screen 1920x1080 pitch 7680
+[gfx] display backend: GRUB framebuffer
+[fs] initialized
+[ata] no disk (no IDENTIFY response)
+[pfs] no disk — VFS only (files lost on reboot)
+[fs] created: /readme.txt
+[seed] //readme.txt
+[fs] created: /bin/hello
+[seed] //bin/hello
+[fs] created: /bin/forktest
+[seed] //bin/forktest
+[fs] created: /bin/pipetest
+[seed] //bin/pipetest
+[fs] created: /bin/exectest
+[seed] //bin/exectest
+[fs] created: /bin/sh
+[seed] //bin/sh
+[fs] created: /sbin/init
+[seed] //sbin/init
+[fs] created: /bin/dbgchild
+[seed] //bin/dbgchild
+[fs] created: /bin/forkexec
+[seed] //bin/forkexec
+[fs] created: /bin/dbg2
+[seed] //bin/dbg2
+[fs] created: /bin/dbg3
+[seed] //bin/dbg3
+[cpu] family 15 model 0x6b: TSC 3609 MHz, core 4134 MHz, bench 1697 us (x1); clock control not used on this CPU
+[c] cpu: family 15 model 0x6b: TSC 3609 MHz, core 4134 MHz, bench 1697 us (x1); clock control not used on this CPU
+[smp] boot cpu apic id 0 (xAPIC)
+[smp] local APIC timer calibrated (idle wake-ups)
+[smp] 4 CPUs running (3 application processors started)
+[ac97] controller 8086:2415 at 0:4.0, mixer port c000, bus master port c400
+[hda] AC'97 audio output running (48 kHz, 16 bit, stereo)
+[net] net_init start
+[pci] found: 8086:1237
+[pci] found: 8086:7000
+[pci] found: 1234:1111
+[pci] found: 8086:100e
+[pci] found: 8086:2415
+[pci] found 5 devices
+[e1000] found
+[e1000] BAR0=febc0000
+[e1000] MMIO base OK
+[e1000] mapping MMIO...
+[e1000] MMIO mapped OK
+[e1000] CTRL=00140240
+[e1000] resetting...
+[e1000] reset OK
+[e1000] MAC OK
+[e1000] rx ring 256 x 2048 at phys 1635980
+[e1000] Status=80080783
+[e1000] Link UP!
+[e1000] IRQ registered on line ;
+[e1000] initialized OK
+[net] net_init done
+[net] IP: 10.00.02.15
+[arp] send request to 10.0.2.2
+[rand] CPRNG seeded (hw=0), ready=0 (TIMER class pending)
+[rtc] wall clock: 2026-10-20 12:25:57
+[mse] wheel detect id=0x03 4-byte mode ON
+[ps2] config was=0x71 now=0x53 reset=fa/aa/0 enable=fa
+[u] no xHCI controller
+[net] rx 0 KB (0 pkts) tx 0 KB (1 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 0 fetch 0 | nic max-batch 0 missed 0 nobuf 0 poll-gap 0ms
+[fps] 0 loops=1 busy=100% awake: composed=0 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[taskbar] layout n=1
+[taskbar] btn win=0 6,1040,220,36
+[arp] packet received, len=064
+[arp] opcode=2
+[arp] resolved: 52:55:0a:00:02:02
+[fs] created: /.rngseed
+[rand] seed file refreshed
+[mse] btn=1 x=1803 y=574 pkts=21
+[mse] btn=0 x=1803 y=574 pkts=22
+[net] rx 0 KB (1 pkts) tx 0 KB (0 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 0 fetch 0 | nic max-batch 1 missed 0 nobuf 0 poll-gap 49ms
+[fps] 17 loops=341284 busy=63% awake: composed=2 cursor=16 mouse=341188 fetch=0 okai=0 mplay=0
+[fps] 1 loops=99 busy=60% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[sh] exec: okai
+[okai] navigate okai:home
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 30ms (page origin 2,98) stack=13KB
+[okai] link[0] x=368 y=276 w=379 h=102 href=http://example.com/
+[okai] link[1] x=768 y=276 w=379 h=102 href=https://en.wikipedia.org/wiki/Operating_system
+[okai] link[2] x=1169 y=276 w=379 h=102 href=https://news.ycombinator.com/
+[okai] link[3] x=368 y=400 w=379 h=102 href=http://info.cern.ch/
+[okai] link[4] x=768 y=400 w=379 h=102 href=https://notdexy.ru/
+[okai] link[5] x=1169 y=400 w=379 h=102 href=https://www.python.org/
+[br] home rendered
+[taskbar] layout n=2
+[taskbar] btn win=0 6,1040,220,36
+[taskbar] btn win=1 230,1040,220,36
+[okai] ui back=10,54,36,36 fwd=48,54,36,36 reload=86,54,36,36 home=124,54,36,36 url=172,52,1736,40 ident=176,56,32,32 newtab=254,8,32,32 min=1780,2,46,44 max=1826,2,46,44 close=1872,2,46,44
+[okai] ui tabs n=1 tab0=10,6,240,36 tabx0=220,12,24,24
+[fps] 7 loops=131 busy=51% awake: composed=1 cursor=6 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 10 loops=100 busy=55% awake: composed=1 cursor=9 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=86 busy=52% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=90 busy=55% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[mem] heap pre-touched (735 MB)
+[fps] 1 loops=92 busy=19% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=102 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[time] 116 of 1000 ticks were not delivered (11%)
+[fps] 31 loops=145 busy=1% awake: composed=1 cursor=30 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 14 loops=121 busy=1% awake: composed=1 cursor=13 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=105 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=102 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=102 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=101 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 14 loops=121 busy=1% awake: composed=1 cursor=13 mouse=0 fetch=0 okai=0 mplay=0
+[mse] btn=1 x=1012 y=86 pkts=112
+[okai] address bar focused
+[mse] btn=0 x=1012 y=86 pkts=113
+[fps] 7 loops=164643 busy=11% awake: composed=2 cursor=5 mouse=164543 fetch=0 okai=0 mplay=0
+[okai] key 105 focus=-1 addr=1
+[okai] key 110 focus=-1 addr=1
+[okai] key 100 focus=-1 addr=1
+[fps] 1 loops=103 busy=5% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 118 focus=-1 addr=1
+[okai] key 8 focus=-1 addr=1
+[okai] key 105 focus=-1 addr=1
+[okai] key 118 focus=-1 addr=1
+[okai] key 105 focus=-1 addr=1
+[okai] key 100 focus=-1 addr=1
+[fps] 1 loops=107 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 105 focus=-1 addr=1
+[okai] key 111 focus=-1 addr=1
+[okai] key 117 focus=-1 addr=1
+[okai] key 115 focus=-1 addr=1
+[time] 114 of 2000 ticks were not delivered (5%)
+[okai] key 46 focus=-1 addr=1
+[fps] 1 loops=107 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 110 focus=-1 addr=1
+[fps] 1 loops=102 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 101 focus=-1 addr=1
+[okai] key 114 focus=-1 addr=1
+[okai] key 100 focus=-1 addr=1
+[okai] key 118 focus=-1 addr=1
+[okai] key 112 focus=-1 addr=1
+[okai] key 110 focus=-1 addr=1
+[fps] 1 loops=112 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 44 focus=-1 addr=1
+[okai] key 100 focus=-1 addr=1
+[okai] key 101 focus=-1 addr=1
+[fps] 1 loops=106 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 10 focus=-1 addr=1
+[okai] navigate https://individious.nerdvpn,de
+[tls-net] queued HTTPS individious.nerdvpn,de/
+[okai] fetch https://individious.nerdvpn,de
+[tls-net] queued HTTPS cloudflare-dns.com/dns-query?dns=EjUBAAABAAAAAAAAC2luZGl2aWRpb3VzCm5lcmR2cG4sZGUAAAEAAQ
+[dns] querying 'individious.nerdvpn,de' (DoH cloudflare-dns.com)...
+[tls-net] TCP established, handshake... (cloudflare-dns.com/dns-query?dns=EjUBAAABAAAAAAAAC2luZGl2aWRpb3VzCm5lcmR2cG4sZGUAAAEAAQ)
+[tls] leaf key_type=2 sig_alg=5 cv_alg=403 sig_len=72
+[tls] certificate chain verified, host matched
+[tls-net] HTTP/2 with cloudflare-dns.com
+[fs] created: /.pins
+[pins] pin store saved
+[tls] ticket stored for cloudflare-dns.com (192B, lifetime 64799s)
+[tls] ticket stored for cloudflare-dns.com (192B, lifetime 64799s)
+[tls-net] received 376 bytes (cloudflare-dns.com/dns-query?dns=EjUBAAABAAAAAAAAC2luZGl2aWRpb3VzCm5lcmR2cG4sZGUAAAEAAQ, 270ms) [h2]
+[dns] query error, rcode=3
+[dns] lookup failed for 'individious.nerdvpn,de'
+[dns] DoH works (cloudflare-dns.com)
+[tls-net] fetch failed: DNS failed (no A record) (individious.nerdvpn,de/)
+[okai] https failed, retrying http: http://individious.nerdvpn,de
+[okai] http fallback in flight for http://individious.nerdvpn,de
+[http] fetch failed: DNS failed (no A record) (individious.nerdvpn,de/)
+[okai] error page: Unable to load page for http://individious.nerdvpn,de
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=13KB
+[okai] link[0] x=662 y=304 w=43 h=20 href=okai:home
+[okai] link[1] x=578 y=304 w=65 h=20 href=http://individious.nerdvpn,de/
+[net] rx 4 KB (14 pkts) tx 1 KB (14 pkts) | tcp in 3 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 1 fetch 0 | nic max-batch 3 missed 0 nobuf 0 poll-gap 20ms
+[fps] 1 loops=469 busy=9% awake: composed=1 cursor=0 mouse=0 fetch=399 okai=0 mplay=0
+[fps] 23 loops=136 busy=1% awake: composed=1 cursor=22 mouse=0 fetch=0 okai=0 mplay=0
+[mse] btn=1 x=391 y=71 pkts=158
+[okai] address bar focused
+[mse] btn=0 x=391 y=71 pkts=159
+[fps] 31 loops=121530 busy=9% awake: composed=2 cursor=29 mouse=121394 fetch=0 okai=0 mplay=0
+[okai] key 105 focus=-1 addr=1
+[okai] key 100 focus=-1 addr=1
+[okai] key 110 focus=-1 addr=1
+[fps] 1 loops=104 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 8 focus=-1 addr=1
+[okai] key 8 focus=-1 addr=1
+[okai] key 110 focus=-1 addr=1
+[okai] key 100 focus=-1 addr=1
+[fps] 1 loops=108 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 105 focus=-1 addr=1
+[okai] key 118 focus=-1 addr=1
+[okai] key 105 focus=-1 addr=1
+[okai] key 100 focus=-1 addr=1
+[okai] key 105 focus=-1 addr=1
+[okai] key 111 focus=-1 addr=1
+[okai] key 117 focus=-1 addr=1
+[fps] 1 loops=111 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 115 focus=-1 addr=1
+[okai] key 46 focus=-1 addr=1
+[okai] key 110 focus=-1 addr=1
+[okai] key 101 focus=-1 addr=1
+[okai] key 114 focus=-1 addr=1
+[time] 109 of 3000 ticks were not delivered (3%)
+[okai] key 100 focus=-1 addr=1
+[fps] 1 loops=111 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 118 focus=-1 addr=1
+[okai] key 112 focus=-1 addr=1
+[okai] key 110 focus=-1 addr=1
+[okai] key 46 focus=-1 addr=1
+[okai] key 100 focus=-1 addr=1
+[fps] 1 loops=108 busy=4% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 101 focus=-1 addr=1
+[okai] key 10 focus=-1 addr=1
+[okai] navigate https://individious.nerdvpn.de
+[tls-net] queued HTTPS individious.nerdvpn.de/
+[okai] fetch https://individious.nerdvpn.de
+[tls-net] queued HTTPS cloudflare-dns.com/dns-query?dns=EjYBAAABAAAAAAAAC2luZGl2aWRpb3VzB25lcmR2cG4CZGUAAAEAAQ
+[dns] querying 'individious.nerdvpn.de' (DoH cloudflare-dns.com)...
+[tls-net] received 373 bytes (cloudflare-dns.com/dns-query?dns=EjYBAAABAAAAAAAAC2luZGl2aWRpb3VzB25lcmR2cG4CZGUAAAEAAQ, 100ms) [h2] [reused]
+[dns] query error, rcode=3
+[dns] lookup failed for 'individious.nerdvpn.de'
+[tls-net] fetch failed: DNS failed (no A record) (individious.nerdvpn.de/)
+[okai] https failed, retrying http: http://individious.nerdvpn.de
+[okai] http fallback in flight for http://individious.nerdvpn.de
+[http] fetch failed: DNS failed (no A record) (individious.nerdvpn.de/)
+[okai] error page: Unable to load page for http://individious.nerdvpn.de
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=13KB
+[okai] link[0] x=662 y=304 w=43 h=20 href=okai:home
+[okai] link[1] x=578 y=304 w=65 h=20 href=http://individious.nerdvpn.de/
+[net] rx 0 KB (3 pkts) tx 0 KB (3 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 1 fetch 0 | nic max-batch 2 missed 0 nobuf 0 poll-gap 14ms
+[fps] 1 loops=257 busy=6% awake: composed=1 cursor=0 mouse=0 fetch=166 okai=0 mplay=0
+[fps] 10 loops=114 busy=1% awake: composed=1 cursor=9 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=101 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=102 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[mse] btn=1 x=471 y=74 pkts=176
+[okai] address bar focused
+[mse] btn=0 x=471 y=74 pkts=177
+[fps] 1 loops=195162 busy=13% awake: composed=1 cursor=0 mouse=195073 fetch=0 okai=0 mplay=0
+[okai] key 105 focus=-1 addr=1
+[okai] key 110 focus=-1 addr=1
+[okai] key 118 focus=-1 addr=1
+[okai] key 105 focus=-1 addr=1
+[okai] key 100 focus=-1 addr=1
+[fps] 1 loops=106 busy=4% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 105 focus=-1 addr=1
+[fps] 1 loops=101 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 111 focus=-1 addr=1
+[okai] key 117 focus=-1 addr=1
+[okai] key 115 focus=-1 addr=1
+[okai] key 46 focus=-1 addr=1
+[fps] 1 loops=108 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 110 focus=-1 addr=1
+[okai] key 101 focus=-1 addr=1
+[okai] key 114 focus=-1 addr=1
+[okai] key 100 focus=-1 addr=1
+[time] 107 of 4000 ticks were not delivered (2%)
+[fps] 1 loops=109 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 118 focus=-1 addr=1
+[okai] key 112 focus=-1 addr=1
+[okai] key 110 focus=-1 addr=1
+[okai] key 46 focus=-1 addr=1
+[okai] key 100 focus=-1 addr=1
+[okai] key 101 focus=-1 addr=1
+[fps] 1 loops=107 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 10 focus=-1 addr=1
+[okai] navigate https://invidious.nerdvpn.de
+[tls-net] queued HTTPS invidious.nerdvpn.de/
+[okai] fetch https://invidious.nerdvpn.de
+[tls-net] queued HTTPS cloudflare-dns.com/dns-query?dns=EjcBAAABAAAAAAAACWludmlkaW91cwduZXJkdnBuAmRlAAABAAE
+[dns] querying 'invidious.nerdvpn.de' (DoH cloudflare-dns.com)...
+[tls-net] received 314 bytes (cloudflare-dns.com/dns-query?dns=EjcBAAABAAAAAAAACWludmlkaW91cwduZXJkdnBuAmRlAAABAAE, 60ms) [h2] [reused]
+[dns] resolved: invidious.nerdvpn.de -> 176.97.120.57
+[tls-net] TCP established, handshake... (invidious.nerdvpn.de/)
+[tls] OCSP staple present (279B, validating post-auth)
+[tls] leaf key_type=2 sig_alg=4 cv_alg=403 sig_len=71
+[tls] certificate chain verified, host matched
+[tls] OCSP staple verdict: good
+[tls-net] HTTP/2 with invidious.nerdvpn.de
+[pins] pin store saved
+[tls] ticket stored for invidious.nerdvpn.de (32B, lifetime 10800s)
+[tls] ticket stored for invidious.nerdvpn.de (32B, lifetime 10800s)
+[net] rx 4 KB (17 pkts) tx 1 KB (17 pkts) | tcp in 3 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 1 | nic max-batch 3 missed 0 nobuf 0 poll-gap 16ms
+[fps] 1 loops=1308 busy=7% awake: composed=1 cursor=0 mouse=0 fetch=1286 okai=0 mplay=0
+[tls-net] received 649 bytes (invidious.nerdvpn.de/, 980ms) [h2]
+[okai] redirect 1 -> https://invidious.nerdvpn.de/.gandalf/check?gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f275701&gandalf_redir=/
+[tls-net] queued HTTPS invidious.nerdvpn.de/.gandalf/check?gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f275701&gandalf_redir=/
+[tls-net] queued HTTPS invidious.nerdvpn.de/.gandalf/static/gandalf.css?v=a341a328
+[okai] preload https://invidious.nerdvpn.de/.gandalf/static/gandalf.css?v=a341a328
+[tls-net] received 29161 bytes (invidious.nerdvpn.de/.gandalf/check?gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f275701&gandalf_redir=/, 440ms) [h2] [reused]
+[br] https parse: count=136 len=65187 dom_nodes=136 status=200 gzip ctype=text/html js
+[okai] sub-res fetch: CSS https://invidious.nerdvpn.de/.gandalf/static/gandalf.css?v=a341a328
+[cache] adopted prefetch invidious.nerdvpn.de/.gandalf/static/gandalf.css?v=a341a328
+[tls-net] received 4965 bytes (invidious.nerdvpn.de/.gandalf/static/gandalf.css?v=a341a328, 230ms) [h2] [reused]
+[okai] js tab=0 ran 260ms (stack 13KB)
+[okai] sub-res CSS: status=200 12424 bytes
+[okai] sub-res fetch: XHR https://invidious.nerdvpn.de/.gandalf/submit
+[tls-net] queued HTTPS invidious.nerdvpn.de/.gandalf/submit
+[js] load event: scripts=2 ran=2 errors=0 modules=1 heap=12715KB live=2975KB gcs=5 [str=344 obj=552 shape=177 code=276 arr=525 bytes=920 ptrs=144 gcms=10]
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=15KB
+[okai] field[0] x=654 y=297 w=51 h=20 node=55 btn=1
+[okai] link[1] x=654 y=317 w=61 h=22 href=https://invidious.nerdvpn.de/.gandalf/confirm
+[okai] link[2] x=747 y=326 w=47 h=16 href=https://gandalf.nerdvpn.de/
+[okai] sub-res fetch: JS https://invidious.nerdvpn.de/.gandalf/static/botd.js?v=4.1.0-b181212
+[tls-net] queued HTTPS invidious.nerdvpn.de/.gandalf/static/botd.js?v=4.1.0-b181212
+[net] rx 35 KB (37 pkts) tx 2 KB (18 pkts) | tcp in 33 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 2 | nic max-batch 9 missed 0 nobuf 0 poll-gap 22ms
+[fps] 2 loops=1054 busy=40% awake: composed=1 cursor=1 mouse=0 fetch=1054 okai=2 mplay=0
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 0Kpx
+[tls-net] received 572 bytes (invidious.nerdvpn.de/.gandalf/submit, 230ms) [h2] [reused]
+[okai] sub-res XHR: status=200 23 bytes
+[tls-net] received 4984 bytes (invidious.nerdvpn.de/.gandalf/static/botd.js?v=4.1.0-b181212, 220ms) [h2] [reused]
+[okai] sub-res JS: status=200 12026 bytes
+[okai] sub-res done: 1 css, 0 img
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 0Kpx
+[net] rx 5 KB (5 pkts) tx 0 KB (3 pkts) | tcp in 5 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 0 | nic max-batch 3 missed 0 nobuf 0 poll-gap 17ms
+[okai] js tab=0 ran 2940ms (stack 15KB)
+[fps] 9 loops=278 busy=91% awake: composed=1 cursor=8 mouse=0 fetch=263 okai=0 mplay=0
+[okai] sub-res fetch: XHR https://invidious.nerdvpn.de/.gandalf/check
+[tls-net] queued HTTPS invidious.nerdvpn.de/.gandalf/check
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 0Kpx
+[tls-net] received 687 bytes (invidious.nerdvpn.de/.gandalf/check, 210ms) [h2] [reused]
+[okai] sub-res XHR: status=200 137 bytes
+[okai] sub-res done: 1 css, 0 img
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 1793Kpx
+[okai] field[0] x=654 y=264 w=51 h=20 node=55 btn=1
+[okai] link[1] x=654 y=284 w=61 h=22 href=https://invidious.nerdvpn.de/.gandalf/confirm
+[okai] link[2] x=747 y=293 w=47 h=16 href=https://gandalf.nerdvpn.de/
+[net] rx 0 KB (4 pkts) tx 0 KB (4 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 0 | nic max-batch 2 missed 0 nobuf 0 poll-gap 19ms
+[fps] 1 loops=429 busy=5% awake: composed=1 cursor=1 mouse=0 fetch=350 okai=1 mplay=0
+[okai] script navigation -> https://invidious.nerdvpn.de/.gandalf/check?gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f275701&gandalf_redir=%2F
+[okai] navigate https://invidious.nerdvpn.de/.gandalf/check?gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f275701&gandalf_redir=%2F
+[tls-net] queued HTTPS invidious.nerdvpn.de/.gandalf/check?gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f275701&gandalf_redir=%
+[okai] fetch https://invidious.nerdvpn.de/.gandalf/check?gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f275701&gandalf_redir=%2F
+[okai] preload https://invidious.nerdvpn.de/.gandalf/static/gandalf.css?v=a341a328
+[tls-net] received 34311 bytes (invidious.nerdvpn.de/.gandalf/check?gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f275701&gandalf_redir=%, 460ms) [h2] [reused]
+[net] rx 35 KB (30 pkts) tx 1 KB (13 pkts) | tcp in 33 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 1 | nic max-batch 11 missed 0 nobuf 0 poll-gap 17ms
+[br] https parse: count=136 len=77079 dom_nodes=136 status=200 gzip ctype=text/html js
+[okai] sub-res fetch: CSS https://invidious.nerdvpn.de/.gandalf/static/gandalf.css?v=a341a328
+[cache] hit invidious.nerdvpn.de/.gandalf/static/gandalf.css?v=a341a328 (4965 bytes)
+[okai] js tab=0 ran 300ms (stack 15KB)
+[fps] 1 loops=755 busy=39% awake: composed=1 cursor=0 mouse=0 fetch=729 okai=0 mplay=0
+[okai] sub-res CSS: status=200 12424 bytes
+[okai] sub-res fetch: XHR https://invidious.nerdvpn.de/.gandalf/submit
+[tls-net] queued HTTPS invidious.nerdvpn.de/.gandalf/submit
+[js] load event: scripts=2 ran=2 errors=0 modules=1 heap=12737KB live=3079KB gcs=6 [str=369 obj=561 shape=182 code=283 arr=540 bytes=959 ptrs=147 gcms=10]
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=15KB
+[okai] field[0] x=654 y=297 w=51 h=20 node=55 btn=1
+[okai] link[1] x=654 y=317 w=61 h=22 href=https://invidious.nerdvpn.de/.gandalf/confirm
+[okai] link[2] x=746 y=326 w=47 h=16 href=https://gandalf.nerdvpn.de/
+[okai] sub-res fetch: JS https://invidious.nerdvpn.de/.gandalf/static/botd.js?v=4.1.0-b181212
+[cache] hit invidious.nerdvpn.de/.gandalf/static/botd.js?v=4.1.0-b181212 (4984 bytes)
+[okai] sub-res JS: status=200 12026 bytes
+[js] error: RTCPeerConnection not available
+[okai] script navigation -> https://invidious.nerdvpn.de/.gandalf/check?gandalf_error=webrtc&gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f275701&gandalf_type=rhea&gandalf_redir=/
+[okai] navigate https://invidious.nerdvpn.de/.gandalf/check?gandalf_error=webrtc&gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f275701&gandalf_type=rhea&gandalf_redir=/
+[tls-net] queued HTTPS invidious.nerdvpn.de/.gandalf/check?gandalf_error=webrtc&gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f2
+[okai] fetch https://invidious.nerdvpn.de/.gandalf/check?gandalf_error=webrtc&gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f275701&gandalf_type=rhea&gandalf_redir=/
+[tls-net] received 2669 bytes (invidious.nerdvpn.de/.gandalf/check?gandalf_error=webrtc&gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f2, 220ms) [h2] [reused]
+[br] https parse: count=132 len=4481 dom_nodes=132 status=403 gzip ctype=text/html js
+[okai] sub-res fetch: CSS https://invidious.nerdvpn.de/.gandalf/static/gandalf.css?v=a341a328
+[cache] hit invidious.nerdvpn.de/.gandalf/static/gandalf.css?v=a341a328 (4965 bytes)
+[okai] sub-res fetch: IMG https://invidious.nerdvpn.de/.gandalf/static/gandalf.svg?v=4.1.0-b181212
+[tls-net] queued HTTPS invidious.nerdvpn.de/.gandalf/static/gandalf.svg?v=4.1.0-b181212
+[okai] sub-res CSS: status=200 12424 bytes
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=15KB
+[okai] link[0] x=746 y=497 w=47 h=16 href=https://gandalf.nerdvpn.de/
+[net] rx 3 KB (11 pkts) tx 2 KB (10 pkts) | tcp in 2 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 1 | nic max-batch 2 missed 0 nobuf 0 poll-gap 20ms
+[tls-net] received 7103 bytes (invidious.nerdvpn.de/.gandalf/static/gandalf.svg?v=4.1.0-b181212, 230ms) [h2] [reused]
+[okai] sub-res IMG: status=200 6517 bytes
+[okai] sub-res done: 1 css, 1 img
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 419Kpx
+[okai] link[0] x=746 y=686 w=47 h=16 href=https://gandalf.nerdvpn.de/
+[js] load event: scripts=1 ran=1 errors=0 modules=0 heap=6141KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[fps] 1 loops=94682 busy=23% awake: composed=1 cursor=0 mouse=0 fetch=933 okai=93684 mplay=0
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[time] 103 of 5000 ticks were not delivered (2%)
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 11Kpx
+[net] rx 7 KB (5 pkts) tx 0 KB (1 pkts) | tcp in 6 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 0 | nic max-batch 5 missed 0 nobuf 0 poll-gap 15ms
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[fps] 1 loops=270 busy=4% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 11Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[fps] 1 loops=270 busy=4% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 11Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[fps] 1 loops=266 busy=5% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 11Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[fps] 1 loops=270 busy=3% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 11Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[fps] 1 loops=274 busy=3% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 11Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[fps] 1 loops=283 busy=4% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 11Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[fps] 1 loops=280 busy=3% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 11Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[fps] 1 loops=275 busy=6% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=1 mplay=0
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 11Kpx
+[fps] 1 loops=294 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 10Kpx
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 11Kpx
+[okai] link[0] x=854 y=604 w=208 h=48 href=https://invidious.nerdvpn.de/.gandalf/check?gandalf_id=2ad7878d-2c0a-4fec-a2e9-bb495f275701&gandalf_redir=%2F
+[okai] link[1] x=746 y=686 w=47 h=16 href=https://gandalf.nerdvpn.de/
+[fps] 1 loops=203 busy=3% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[time] 189 of 6000 ticks were not delivered (3%)
+[fps] 1 loops=102 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=102 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=101 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=84 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 27 loops=145 busy=1% awake: composed=1 cursor=26 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 21 loops=131 busy=1% awake: composed=1 cursor=20 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 11 loops=119 busy=1% awake: composed=1 cursor=10 mouse=0 fetch=0 okai=0 mplay=0
+[mse] btn=1 x=870 y=73 pkts=280
+[okai] address bar focused
+[mse] btn=0 x=870 y=73 pkts=281
+[fps] 8 loops=202979 busy=16% awake: composed=2 cursor=6 mouse=202885 fetch=0 okai=0 mplay=0
+[okai] key 121 focus=-1 addr=1
+[okai] key 116 focus=-1 addr=1
+[fps] 1 loops=105 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[time] 278 of 7000 ticks were not delivered (3%)
+[fps] 1 loops=102 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=104 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[net] rx 0 KB (2 pkts) tx 0 KB (1 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 1 fetch 0 | nic max-batch 1 missed 0 nobuf 0 poll-gap 7637ms
+[fps] 1 loops=72 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[time] 1040 of 8000 ticks were not delivered (13%)
+[net] rx 0 KB (3 pkts) tx 0 KB (1 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 0 fetch 0 | nic max-batch 1 missed 0 nobuf 0 poll-gap 13ms
+[fps] 1 loops=101 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 46 focus=-1 addr=1
+[okai] key 99 focus=-1 addr=1
+[net] rx 0 KB (1 pkts) tx 0 KB (0 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 0 fetch 0 | nic max-batch 1 missed 0 nobuf 0 poll-gap 14ms
+[fps] 1 loops=104 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 104 focus=-1 addr=1
+[okai] key 111 focus=-1 addr=1
+[okai] key 99 focus=-1 addr=1
+[okai] key 111 focus=-1 addr=1
+[fps] 1 loops=109 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 108 focus=-1 addr=1
+[okai] key 97 focus=-1 addr=1
+[okai] key 116 focus=-1 addr=1
+[okai] key 101 focus=-1 addr=1
+[okai] key 109 focus=-1 addr=1
+[net] rx 0 KB (1 pkts) tx 0 KB (0 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 0 fetch 0 | nic max-batch 1 missed 0 nobuf 0 poll-gap 29ms
+[fps] 1 loops=104 busy=5% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 111 focus=-1 addr=1
+[okai] key 111 focus=-1 addr=1
+[okai] key 53 focus=-1 addr=1
+[net] rx 0 KB (1 pkts) tx 0 KB (0 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 0 fetch 0 | nic max-batch 1 missed 0 nobuf 0 poll-gap 13ms
+[fps] 1 loops=106 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 52 focus=-1 addr=1
+[okai] key 46 focus=-1 addr=1
+[okai] key 8 focus=-1 addr=1
+[okai] key 8 focus=-1 addr=1
+[okai] key 51 focus=-1 addr=1
+[okai] key 46 focus=-1 addr=1
+[fps] 1 loops=110 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 99 focus=-1 addr=1
+[okai] key 111 focus=-1 addr=1
+[okai] key 109 focus=-1 addr=1
+[okai] key 10 focus=-1 addr=1
+[okai] navigate https://yt.chocolatemoo53.com
+[tls-net] queued HTTPS yt.chocolatemoo53.com/
+[okai] fetch https://yt.chocolatemoo53.com
+[tls-net] queued HTTPS cloudflare-dns.com/dns-query?dns=EjgBAAABAAAAAAAAAnl0DmNob2NvbGF0ZW1vbzUzA2NvbQAAAQAB
+[dns] querying 'yt.chocolatemoo53.com' (DoH cloudflare-dns.com)...
+[tls-net] TCP established, handshake... (cloudflare-dns.com/dns-query?dns=EjgBAAABAAAAAAAAAnl0DmNob2NvbGF0ZW1vbzUzA2NvbQAAAQAB)
+[tls] offering PSK for cloudflare-dns.com (ticket 192B)
+[tls] resumption accepted by server
+[tls-net] HTTP/2 with cloudflare-dns.com
+[tls] ticket stored for cloudflare-dns.com (192B, lifetime 64800s)
+[tls] ticket stored for cloudflare-dns.com (192B, lifetime 64800s)
+[tls-net] received 315 bytes (cloudflare-dns.com/dns-query?dns=EjgBAAABAAAAAAAAAnl0DmNob2NvbGF0ZW1vbzUzA2NvbQAAAQAB, 200ms) [h2]
+[dns] resolved: yt.chocolatemoo53.com -> 207.241.173.117
+[net] rx 1 KB (13 pkts) tx 1 KB (15 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 1 | nic max-batch 3 missed 0 nobuf 0 poll-gap 13ms
+[fps] 1 loops=469 busy=5% awake: composed=1 cursor=0 mouse=0 fetch=388 okai=0 mplay=0
+[tls-net] TCP established, handshake... (yt.chocolatemoo53.com/)
+[tls] leaf key_type=2 sig_alg=5 cv_alg=403 sig_len=71
+[tls] certificate chain verified, host matched
+[tls-net] HTTP/2 with yt.chocolatemoo53.com
+[pins] pin store saved
+[tls] ticket stored for yt.chocolatemoo53.com (32B, lifetime 600s)
+[tls] ticket stored for yt.chocolatemoo53.com (32B, lifetime 600s)
+[tls-net] queued HTTPS yt.chocolatemoo53.com/css/empty.css?v=69622ea
+[okai] preload https://yt.chocolatemoo53.com/css/empty.css?v=69622ea
+[tls-net] queued HTTPS yt.chocolatemoo53.com/css/pure-min.css?v=69622ea
+[okai] preload https://yt.chocolatemoo53.com/css/pure-min.css?v=69622ea
+[tls-net] queued HTTPS yt.chocolatemoo53.com/css/grids-responsive-min.css?v=69622ea
+[okai] preload https://yt.chocolatemoo53.com/css/grids-responsive-min.css?v=69622ea
+[tls-net] queued HTTPS yt.chocolatemoo53.com/css/ionicons.min.css?v=69622ea
+[okai] preload https://yt.chocolatemoo53.com/css/ionicons.min.css?v=69622ea
+[tls-net] received 4933 bytes (yt.chocolatemoo53.com/, 850ms) [h2]
+[br] https parse: count=391 len=16540 dom_nodes=391 status=200 gzip ctype=text/html js
+[okai] sub-res fetch: CSS https://yt.chocolatemoo53.com/css/empty.css?v=69622ea
+[cache] adopted prefetch yt.chocolatemoo53.com/css/empty.css?v=69622ea
+[okai] sub-res fetch: CSS https://yt.chocolatemoo53.com/css/pure-min.css?v=69622ea
+[cache] adopted prefetch yt.chocolatemoo53.com/css/pure-min.css?v=69622ea
+[okai] sub-res fetch: CSS https://yt.chocolatemoo53.com/css/grids-responsive-min.css?v=69622ea
+[cache] adopted prefetch yt.chocolatemoo53.com/css/grids-responsive-min.css?v=69622ea
+[okai] sub-res fetch: CSS https://yt.chocolatemoo53.com/css/ionicons.min.css?v=69622ea
+[cache] adopted prefetch yt.chocolatemoo53.com/css/ionicons.min.css?v=69622ea
+[okai] sub-res fetch: CSS https://yt.chocolatemoo53.com/css/default.css?v=69622ea
+[tls-net] queued HTTPS yt.chocolatemoo53.com/css/default.css?v=69622ea
+[okai] sub-res fetch: CSS https://yt.chocolatemoo53.com/css/carousel.css?v=69622ea
+[tls-net] queued HTTPS yt.chocolatemoo53.com/css/carousel.css?v=69622ea
+[okai] key 6 focus=-1 addr=0
+[tls-net] received 681 bytes (yt.chocolatemoo53.com/css/empty.css?v=69622ea, 220ms) [h2] [reused]
+[okai] sub-res CSS: status=200 255 bytes
+[okai] sub-res fetch: JS https://yt.chocolatemoo53.com/js/_helpers.js?v=69622ea
+[tls-net] queued HTTPS yt.chocolatemoo53.com/js/_helpers.js?v=69622ea
+[tls-net] received 4089 bytes (yt.chocolatemoo53.com/css/pure-min.css?v=69622ea, 250ms) [h2] [reused]
+[tls-net] received 1817 bytes (yt.chocolatemoo53.com/css/grids-responsive-min.css?v=69622ea, 240ms) [h2] [reused]
+[okai] sub-res CSS: status=200 15722 bytes
+[okai] sub-res CSS: status=200 8035 bytes
+[okai] sub-res fetch: JS https://yt.chocolatemoo53.com/js/handlers.js?v=69622ea
+[tls-net] queued HTTPS yt.chocolatemoo53.com/js/handlers.js?v=69622ea
+[okai] sub-res fetch: JS https://yt.chocolatemoo53.com/js/themes.js?v=69622ea
+[tls-net] queued HTTPS yt.chocolatemoo53.com/js/themes.js?v=69622ea
+[tls-net] received 8536 bytes (yt.chocolatemoo53.com/css/ionicons.min.css?v=69622ea, 290ms) [h2] [reused]
+[tls-net] received 1752 bytes (yt.chocolatemoo53.com/css/carousel.css?v=69622ea, 220ms) [h2] [reused]
+[okai] sub-res CSS: status=200 45198 bytes
+[okai] sub-res CSS: status=200 2785 bytes
+[net] rx 40 KB (55 pkts) tx 11 KB (44 pkts) | tcp in 37 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 2 KB (max 2 KB) socks 2 fetch 4 | nic max-batch 5 missed 0 nobuf 0 poll-gap 39ms
+[fps] 1 loops=1434 busy=18% awake: composed=1 cursor=0 mouse=0 fetch=1434 okai=0 mplay=0
+[tls-net] received 47055 bytes (yt.chocolatemoo53.com/css/default.css?v=69622ea, 520ms) [h2] [reused]
+[okai] sub-res CSS: status=200 93701 bytes
+[tls-net] received 3251 bytes (yt.chocolatemoo53.com/js/_helpers.js?v=69622ea, 380ms) [h2] [reused]
+[okai] render tab=0 1916x936 doc_h=1318 scroll=0 in 0ms (page origin 2,98) stack=21KB
+[okai] link[0] x=1640 y=16 w=4 h=18 href=https://yt.chocolatemoo53.com/toggle_theme?referer=%2F
+[okai] link[1] x=1660 y=16 w=4 h=18 href=https://yt.chocolatemoo53.com/preferences?referer=%2F
+[okai] link[2] x=1680 y=16 w=58 h=18 href=https://yt.chocolatemoo53.com/login?referer=%2F
+[okai] link[3] x=311 y=50 w=95 h=18 href=https://yt.chocolatemoo53.com/switchbackend?companion_id=0&referer=%2F
+[okai] link[4] x=423 y=50 w=95 h=18 href=https://yt.chocolatemoo53.com/switchbackend?companion_id=1&referer=%2F
+[okai] link[5] x=535 y=50 w=95 h=18 href=https://yt.chocolatemoo53.com/switchbackend?companion_id=2&referer=%2F
+[okai] link[6] x=647 y=50 w=95 h=18 href=https://yt.chocolatemoo53.com/switchbackend?companion_id=3&referer=%2F
+[okai] link[7] x=760 y=50 w=95 h=18 href=https://yt.chocolatemoo53.com/switchbackend?companion_id=4&referer=%2F
+[okai] link[8] x=872 y=50 w=95 h=18 href=https://yt.chocolatemoo53.com/switchbackend?companion_id=5&referer=%2F
+[okai] link[9] x=848 y=152 w=121 h=34 href=https://yt.chocolatemoo53.com/feed/trending
+[okai] link[10] x=969 y=152 w=98 h=34 href=https://yt.chocolatemoo53.com/feed/search
+[okai] field[11] x=567 y=531 w=752 h=39 node=168 btn=0
+[okai] field[12] x=1320 y=531 w=28 h=39 node=171 btn=1
+[tls-net] received 1935 bytes (yt.chocolatemoo53.com/js/handlers.js?v=69622ea, 400ms) [h2] [reused]
+[tls-net] received 1178 bytes (yt.chocolatemoo53.com/js/themes.js?v=69622ea, 390ms) [h2] [reused]
+[okai] sub-res JS: status=200 9280 bytes
+[okai] sub-res JS: status=200 6008 bytes
+[okai] sub-res JS: status=200 1657 bytes
+[js] load event: scripts=3 ran=3 errors=0 modules=0 heap=6160KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] sub-res done: 6 css, 0 img
+[okai] render tab=0 doc_h=1318 scroll=0 in 10ms painted 0Kpx
+[net] rx 40 KB (34 pkts) tx 1 KB (29 pkts) | tcp in 38 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 0 | nic max-batch 4 missed 0 nobuf 0 poll-gap 46ms
+[fps] 12 loops=344 busy=10% awake: composed=1 cursor=11 mouse=0 fetch=248 okai=0 mplay=0
+[net] rx 0 KB (1 pkts) tx 0 KB (0 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 0 | nic max-batch 1 missed 0 nobuf 0 poll-gap 15ms
+[fps] 43 loops=160 busy=1% awake: composed=1 cursor=43 mouse=0 fetch=0 okai=0 mplay=0
+[mse] btn=1 x=748 y=644 pkts=339
+[okai] click x=746 y=546 (mx=748 my=644) hit=2 node=168
+[okai] focus -1 -> 168 <input id=searchbox>
+[okai] focus input node=168
+[okai] render tab=0 doc_h=1318 scroll=0 in 0ms painted 0Kpx
+[time] 1036 of 9000 ticks were not delivered (11%)
+[mse] btn=0 x=748 y=644 pkts=340
+[net] rx 0 KB (1 pkts) tx 0 KB (0 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 0 | nic max-batch 1 missed 0 nobuf 0 poll-gap 15ms
+[fps] 5 loops=117775 busy=11% awake: composed=2 cursor=4 mouse=117678 fetch=0 okai=0 mplay=0
+[mse] btn=1 x=748 y=648 pkts=343
+[okai] click x=746 y=550 (mx=748 my=648) hit=2 node=168
+[okai] focus input node=168
+[mse] btn=0 x=748 y=648 pkts=344
+[fps] 10 loops=124442 busy=11% awake: composed=2 cursor=8 mouse=124338 fetch=0 okai=0 mplay=0
+[okai] key 107 focus=168 addr=0
+[okai] render tab=0 doc_h=1318 scroll=0 in 0ms painted 4Kpx
+[okai] key 105 focus=168 addr=0
+[okai] render tab=0 doc_h=1318 scroll=0 in 0ms painted 1Kpx
+[okai] key 108 focus=168 addr=0
+[okai] render tab=0 doc_h=1318 scroll=0 in 0ms painted 1Kpx
+[okai] key 108 focus=168 addr=0
+[okai] render tab=0 doc_h=1318 scroll=0 in 0ms painted 2Kpx
+[okai] key 32 focus=168 addr=0
+[okai] render tab=0 doc_h=1318 scroll=0 in 0ms painted 2Kpx
+[okai] key 115 focus=168 addr=0
+[okai] render tab=0 doc_h=1318 scroll=0 in 0ms painted 2Kpx
+[okai] key 116 focus=168 addr=0
+[okai] render tab=0 doc_h=1318 scroll=0 in 0ms painted 3Kpx
+[okai] key 101 focus=168 addr=0
+[okai] render tab=0 doc_h=1318 scroll=0 in 0ms painted 3Kpx
+[fps] 1 loops=136 busy=5% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 112 focus=168 addr=0
+[okai] render tab=0 doc_h=1318 scroll=0 in 0ms painted 4Kpx
+[okai] key 104 focus=168 addr=0
+[okai] render tab=0 doc_h=1318 scroll=0 in 0ms painted 5Kpx
+[okai] key 101 focus=168 addr=0
+[okai] render tab=0 doc_h=1318 scroll=0 in 0ms painted 5Kpx
+[okai] key 110 focus=168 addr=0
+[okai] render tab=0 doc_h=1318 scroll=0 in 0ms painted 6Kpx
+[okai] key 10 focus=168 addr=0
+[okai] submit form -> https://yt.chocolatemoo53.com/search?q=kill+stephen
+[okai] navigate https://yt.chocolatemoo53.com/search?q=kill+stephen
+[tls-net] queued HTTPS yt.chocolatemoo53.com/search?q=kill+stephen
+[okai] fetch https://yt.chocolatemoo53.com/search?q=kill+stephen
+[tls-net] received 3602 bytes (yt.chocolatemoo53.com/search?q=kill+stephen, 200ms) [h2] [reused]
+[br] https parse: count=75 len=6528 dom_nodes=75 status=200 gzip ctype=text/html js
+[okai] sub-res fetch: CSS https://www.chocolatemoo53.com/custom.css
+[tls-net] queued HTTPS www.chocolatemoo53.com/custom.css
+[okai] sub-res fetch: JS https://cdn.jsdelivr.net/npm/@cap.js/widget
+[tls-net] queued HTTPS cdn.jsdelivr.net/npm/@cap.js/widget
+[okai] sub-res fetch: IMG https://www.chocolatemoo53.com/MooseLogo.svg
+[tls-net] queued HTTPS www.chocolatemoo53.com/MooseLogo.svg
+[tls-net] queued HTTPS cloudflare-dns.com/dns-query?dns=EjkBAAABAAAAAAAAA3d3dw5jaG9jb2xhdGVtb281MwNjb20AAAEAAQ
+[dns] querying 'www.chocolatemoo53.com' (DoH cloudflare-dns.com)...
+[tls-net] queued HTTPS cloudflare-dns.com/dns-query?dns=EjoBAAABAAAAAAAAA2Nkbghqc2RlbGl2cgNuZXQAAAEAAQ
+[dns] querying 'cdn.jsdelivr.net' (DoH cloudflare-dns.com)...
+[tls-net] received 373 bytes (cloudflare-dns.com/dns-query?dns=EjoBAAABAAAAAAAAA2Nkbghqc2RlbGl2cgNuZXQAAAEAAQ, 60ms) [h2] [reused]
+[dns] resolved: cdn.jsdelivr.net -> 104.17.207.5
+[tls-net] received 373 bytes (cloudflare-dns.com/dns-query?dns=EjkBAAABAAAAAAAAA3d3dw5jaG9jb2xhdGVtb281MwNjb20AAAEAAQ, 90ms) [h2] [reused]
+[fps] 1 loops=543 busy=12% awake: composed=1 cursor=0 mouse=0 fetch=456 okai=0 mplay=0
+[net] rx 4 KB (11 pkts) tx 2 KB (10 pkts) | tcp in 3 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 3 fetch 4 | nic max-batch 3 missed 0 nobuf 0 poll-gap 17ms
+[dns] resolved: www.chocolatemoo53.com -> 35.157.26.135
+[tls-net] TCP established, handshake... (cdn.jsdelivr.net/npm/@cap.js/widget)
+[tls-net] TCP established, handshake... (www.chocolatemoo53.com/custom.css)
+[tls] OCSP staple present (599B, validating post-auth)
+[tls] leaf key_type=1 sig_alg=1 cv_alg=804 sig_len=256
+[tls] certificate chain verified, host matched
+[tls] OCSP staple verdict: good
+[tls-net] HTTP/2 with cdn.jsdelivr.net
+[pins] pin store saved
+[tls] ticket stored for cdn.jsdelivr.net (192B, lifetime 64800s)
+[tls] ticket stored for cdn.jsdelivr.net (192B, lifetime 64800s)
+[tls-net] received 18570 bytes (cdn.jsdelivr.net/npm/@cap.js/widget, 320ms) [h2]
+[okai] sub-res JS: status=200 50634 bytes
+[okai] sub-res fetch: XHR https://cdn.jsdelivr.net/npm/@cap.js/wasm@0.0.8/browser/cap_wasm_bg.wasm
+[tls-net] queued HTTPS cdn.jsdelivr.net/npm/@cap.js/wasm@0.0.8/browser/cap_wasm_bg.wasm
+[tls] leaf key_type=2 sig_alg=5 cv_alg=403 sig_len=72
+[tls] certificate chain verified, host matched
+[tls-net] HTTP/2 with www.chocolatemoo53.com
+[pins] pin store saved
+[tls] ticket stored for www.chocolatemoo53.com (105B, lifetime 604800s)
+[tls-net] received 9760 bytes (cdn.jsdelivr.net/npm/@cap.js/wasm@0.0.8/browser/cap_wasm_bg.wasm, 90ms) [h2] [reused]
+[js] warn: %ccap %cwasm color:#1e1e2e;background:#89b4fa;margin-left:0;padding:0 6px;border-radius:9999px 0 0 9999px;font-weight:600 color:#1e1e2e;background:#b4befe;margin-left:-6px;padding:0 6px;border-radius:0 9999px 9999px 0;font-weight:600 load failed (110ms): WebAssembly.Module(): Compiling function #1 failed: SIMD is not supported
+[okai] sub-res XHR: status=200 22608 bytes
+[tls-net] received 39751 bytes (www.chocolatemoo53.com/custom.css, 790ms) [h2]
+[okai] sub-res CSS: status=200 52563 bytes
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=24KB
+[okai] link[0] x=970 y=226 w=89 h=28 href=https://yt.chocolatemoo53.com/__set_provider?provider=hcaptcha&return_to=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[1] x=1067 y=226 w=88 h=28 href=https://yt.chocolatemoo53.com/__set_provider?provider=slider&return_to=%2Fsearch%3Fq%3Dkill%2Bstephen
+[tls-net] received 27394 bytes (www.chocolatemoo53.com/MooseLogo.svg, 820ms) [h2] [reused]
+[okai] sub-res IMG: status=200 35976 bytes
+[okai] sub-res done: 1 css, 1 img
+[js] load event: scripts=3 ran=3 errors=0 modules=0 heap=8426KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 328Kpx
+[okai] link[0] x=970 y=270 w=89 h=28 href=https://yt.chocolatemoo53.com/__set_provider?provider=hcaptcha&return_to=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[1] x=1067 y=270 w=88 h=28 href=https://yt.chocolatemoo53.com/__set_provider?provider=slider&return_to=%2Fsearch%3Fq%3Dkill%2Bstephen
+[net] rx 109 KB (112 pkts) tx 4 KB (54 pkts) | tcp in 102 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 4 fetch 0 | nic max-batch 13 missed 0 nobuf 0 poll-gap 29ms
+[fps] 18 loops=949 busy=20% awake: composed=1 cursor=17 mouse=0 fetch=924 okai=0 mplay=0
+[fps] 37 loops=152 busy=1% awake: composed=1 cursor=36 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 3 loops=105 busy=1% awake: composed=1 cursor=2 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=101 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 1 loops=103 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 6 focus=-1 addr=0
+[fps] 1 loops=101 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[time] 1033 of 10000 ticks were not delivered (10%)
+[fps] 14 loops=121 busy=1% awake: composed=1 cursor=13 mouse=0 fetch=0 okai=0 mplay=0
+[net] rx 0 KB (1 pkts) tx 0 KB (0 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 4 fetch 0 | nic max-batch 1 missed 0 nobuf 0 poll-gap 14ms
+[fps] 1 loops=103 busy=3% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[net] rx 0 KB (1 pkts) tx 0 KB (0 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 4 fetch 0 | nic max-batch 1 missed 0 nobuf 0 poll-gap 33ms
+[fps] 1 loops=100 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[fps] 7 loops=112 busy=1% awake: composed=1 cursor=6 mouse=0 fetch=0 okai=0 mplay=0
+[mse] btn=1 x=627 y=76 pkts=447
+[okai] address bar focused
+[mse] btn=0 x=627 y=76 pkts=448
+[fps] 18 loops=127292 busy=12% awake: composed=2 cursor=16 mouse=127181 fetch=0 okai=0 mplay=0
+[okai] key 105 focus=-1 addr=1
+[okai] key 110 focus=-1 addr=1
+[okai] key 118 focus=-1 addr=1
+[okai] key 46 focus=-1 addr=1
+[fps] 1 loops=107 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 110 focus=-1 addr=1
+[okai] key 97 focus=-1 addr=1
+[okai] key 100 focus=-1 addr=1
+[okai] key 101 focus=-1 addr=1
+[okai] key 107 focus=-1 addr=1
+[okai] key 111 focus=-1 addr=1
+[fps] 1 loops=109 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 46 focus=-1 addr=1
+[okai] key 109 focus=-1 addr=1
+[okai] key 110 focus=-1 addr=1
+[okai] key 101 focus=-1 addr=1
+[okai] key 8 focus=-1 addr=1
+[okai] key 8 focus=-1 addr=1
+[okai] key 8 focus=-1 addr=1
+[fps] 1 loops=115 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 110 focus=-1 addr=1
+[okai] key 109 focus=-1 addr=1
+[okai] key 101 focus=-1 addr=1
+[okai] key 116 focus=-1 addr=1
+[okai] key 10 focus=-1 addr=1
+[okai] navigate https://inv.nadeko.nmet
+[tls-net] queued HTTPS inv.nadeko.nmet/
+[okai] fetch https://inv.nadeko.nmet
+[tls-net] queued HTTPS cloudflare-dns.com/dns-query?dns=EjsBAAABAAAAAAAAA2ludgZuYWRla28Ebm1ldAAAAQAB
+[dns] querying 'inv.nadeko.nmet' (DoH cloudflare-dns.com)...
+[tls-net] received 369 bytes (cloudflare-dns.com/dns-query?dns=EjsBAAABAAAAAAAAA2ludgZuYWRla28Ebm1ldAAAAQAB, 120ms) [h2] [reused]
+[dns] query error, rcode=3
+[dns] lookup failed for 'inv.nadeko.nmet'
+[tls-net] fetch failed: DNS failed (no A record) (inv.nadeko.nmet/)
+[okai] https failed, retrying http: http://inv.nadeko.nmet
+[okai] http fallback in flight for http://inv.nadeko.nmet
+[http] fetch failed: DNS failed (no A record) (inv.nadeko.nmet/)
+[okai] error page: Unable to load page for http://inv.nadeko.nmet
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=24KB
+[okai] link[0] x=662 y=304 w=43 h=20 href=okai:home
+[okai] link[1] x=578 y=304 w=65 h=20 href=http://inv.nadeko.nmet/
+[net] rx 0 KB (3 pkts) tx 0 KB (3 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 4 fetch 0 | nic max-batch 2 missed 0 nobuf 0 poll-gap 22ms
+[fps] 1 loops=285 busy=7% awake: composed=1 cursor=0 mouse=0 fetch=194 okai=0 mplay=0
+[fps] 1 loops=101 busy=1% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[mse] btn=1 x=639 y=76 pkts=453
+[okai] address bar focused
+[mse] btn=0 x=639 y=76 pkts=454
+[time] 1028 of 11000 ticks were not delivered (9%)
+[okai] key 105 focus=-1 addr=1
+[okai] key 111 focus=-1 addr=1
+[fps] 1 loops=159554 busy=12% awake: composed=1 cursor=0 mouse=159461 fetch=0 okai=0 mplay=0
+[okai] key 8 focus=-1 addr=1
+[okai] key 8 focus=-1 addr=1
+[okai] key 105 focus=-1 addr=1
+[okai] key 110 focus=-1 addr=1
+[okai] key 118 focus=-1 addr=1
+[fps] 1 loops=102 busy=5% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 46 focus=-1 addr=1
+[okai] key 110 focus=-1 addr=1
+[okai] key 97 focus=-1 addr=1
+[okai] key 100 focus=-1 addr=1
+[okai] key 101 focus=-1 addr=1
+[fps] 1 loops=109 busy=2% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 107 focus=-1 addr=1
+[okai] key 111 focus=-1 addr=1
+[okai] key 46 focus=-1 addr=1
+[okai] key 110 focus=-1 addr=1
+[net] rx 0 KB (1 pkts) tx 0 KB (0 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 4 fetch 0 | nic max-batch 1 missed 0 nobuf 0 poll-gap 15ms
+[okai] key 109 focus=-1 addr=1
+[fps] 1 loops=108 busy=3% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 8 focus=-1 addr=1
+[okai] key 101 focus=-1 addr=1
+[okai] key 116 focus=-1 addr=1
+[okai] key 10 focus=-1 addr=1
+[okai] navigate https://inv.nadeko.net
+[tls-net] queued HTTPS inv.nadeko.net/
+[okai] fetch https://inv.nadeko.net
+[tls-net] queued HTTPS cloudflare-dns.com/dns-query?dns=EjwBAAABAAAAAAAAA2ludgZuYWRla28DbmV0AAABAAE
+[dns] querying 'inv.nadeko.net' (DoH cloudflare-dns.com)...
+[tls-net] received 329 bytes (cloudflare-dns.com/dns-query?dns=EjwBAAABAAAAAAAAA2ludgZuYWRla28DbmV0AAABAAE, 70ms) [h2] [reused]
+[dns] resolved: inv.nadeko.net -> 151.242.242.26
+[net] rx 0 KB (4 pkts) tx 0 KB (4 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 5 fetch 1 | nic max-batch 2 missed 0 nobuf 0 poll-gap 14ms
+[fps] 1 loops=463 busy=4% awake: composed=1 cursor=0 mouse=0 fetch=377 okai=0 mplay=0
+[tls-net] TCP established, handshake... (inv.nadeko.net/)
+[tls] leaf key_type=2 sig_alg=5 cv_alg=403 sig_len=71
+[tls] certificate chain verified, host matched
+[tls-net] HTTP/2 with inv.nadeko.net
+[pins] pin store saved
+[tls] ticket stored for inv.nadeko.net (256B, lifetime 7200s)
+[tls] ticket stored for inv.nadeko.net (240B, lifetime 7200s)
+[tls-net] received 2501 bytes (inv.nadeko.net/, 1010ms) [h2]
+[okai] redirect 1 -> https://inv.nadeko.net/feed/popular
+[tls-net] queued HTTPS inv.nadeko.net/feed/popular
+[net] rx 7 KB (19 pkts) tx 3 KB (18 pkts) | tcp in 6 KB rto 1 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 5 fetch 1 | nic max-batch 3 missed 0 nobuf 0 poll-gap 10ms
+[fps] 1 loops=1629 busy=6% awake: composed=1 cursor=0 mouse=0 fetch=1629 okai=0 mplay=0
+[tls-net] queued HTTPS inv.nadeko.net/css/pure-min.css?v=9ea0302
+[okai] preload https://inv.nadeko.net/css/pure-min.css?v=9ea0302
+[tls-net] queued HTTPS inv.nadeko.net/css/grids-responsive-min.css?v=9ea0302
+[okai] preload https://inv.nadeko.net/css/grids-responsive-min.css?v=9ea0302
+[tls-net] queued HTTPS inv.nadeko.net/css/ionicons.min.css?v=9ea0302
+[okai] preload https://inv.nadeko.net/css/ionicons.min.css?v=9ea0302
+[tls-net] queued HTTPS inv.nadeko.net/css/default.css?v=9ea0302
+[okai] preload https://inv.nadeko.net/css/default.css?v=9ea0302
+[tls-net] received 9722 bytes (inv.nadeko.net/feed/popular, 420ms) [h2] [reused]
+[br] https parse: count=3711 len=113134 dom_nodes=3711 status=200 gzip ctype=text/html js
+[okai] sub-res fetch: CSS https://inv.nadeko.net/css/pure-min.css?v=9ea0302
+[cache] adopted prefetch inv.nadeko.net/css/pure-min.css?v=9ea0302
+[okai] sub-res fetch: CSS https://inv.nadeko.net/css/grids-responsive-min.css?v=9ea0302
+[cache] adopted prefetch inv.nadeko.net/css/grids-responsive-min.css?v=9ea0302
+[okai] sub-res fetch: CSS https://inv.nadeko.net/css/ionicons.min.css?v=9ea0302
+[cache] adopted prefetch inv.nadeko.net/css/ionicons.min.css?v=9ea0302
+[okai] sub-res fetch: CSS https://inv.nadeko.net/css/default.css?v=9ea0302
+[cache] adopted prefetch inv.nadeko.net/css/default.css?v=9ea0302
+[okai] sub-res fetch: CSS https://inv.nadeko.net/css/carousel.css?v=9ea0302
+[tls-net] queued HTTPS inv.nadeko.net/css/carousel.css?v=9ea0302
+[okai] sub-res fetch: JS https://inv.nadeko.net/js/minified/_helpers.js?v=9ea0302
+[tls-net] queued HTTPS inv.nadeko.net/js/minified/_helpers.js?v=9ea0302
+[tls-net] received 4667 bytes (inv.nadeko.net/css/pure-min.css?v=9ea0302, 340ms) [h2] [reused]
+[okai] sub-res CSS: status=200 17215 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/js/minified/watched_indicator.js
+[tls-net] queued HTTPS inv.nadeko.net/js/minified/watched_indicator.js
+[tls-net] received 2046 bytes (inv.nadeko.net/css/grids-responsive-min.css?v=9ea0302, 350ms) [h2] [reused]
+[okai] sub-res CSS: status=200 8035 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/js/minified/handlers.js?v=9ea0302
+[tls-net] queued HTTPS inv.nadeko.net/js/minified/handlers.js?v=9ea0302
+[tls-net] received 8758 bytes (inv.nadeko.net/css/ionicons.min.css?v=9ea0302, 420ms) [h2] [reused]
+[okai] sub-res CSS: status=200 45198 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/js/minified/themes.js?v=9ea0302
+[tls-net] queued HTTPS inv.nadeko.net/js/minified/themes.js?v=9ea0302
+[tls-net] received 5785 bytes (inv.nadeko.net/css/default.css?v=9ea0302, 460ms) [h2] [reused]
+[okai] sub-res CSS: status=200 19010 bytes
+[tls-net] received 1970 bytes (inv.nadeko.net/css/carousel.css?v=9ea0302, 410ms) [h2] [reused]
+[okai] sub-res CSS: status=200 2785 bytes
+[tls-net] received 2119 bytes (inv.nadeko.net/js/minified/_helpers.js?v=9ea0302, 410ms) [h2] [reused]
+[okai] render tab=0 1916x936 doc_h=4190 scroll=0 in 10ms (page origin 2,98) stack=24KB
+[okai] link[0] x=175 y=26 w=43 h=22 href=https://inv.nadeko.net/
+[okai] field[1] x=698 y=17 w=510 h=40 node=65 btn=0
+[okai] field[2] x=1206 y=16 w=12 h=42 node=68 btn=1
+[okai] link[3] x=1716 y=26 w=24 h=22 href=https://inv.nadeko.net/login?referer=%2Ffeed%2Fpopular
+[okai] link[4] x=230 y=73 w=24 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=0&referer=%2Ffeed%2Fpopular
+[okai] link[5] x=256 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=1&referer=%2Ffeed%2Fpopular
+[okai] link[6] x=284 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=2&referer=%2Ffeed%2Fpopular
+[okai] link[7] x=312 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=3&referer=%2Ffeed%2Fpopular
+[okai] link[8] x=341 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=4&referer=%2Ffeed%2Fpopular
+[okai] link[9] x=369 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=5&referer=%2Ffeed%2Fpopular
+[okai] link[10] x=397 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=6&referer=%2Ffeed%2Fpopular
+[okai] link[11] x=425 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=7&referer=%2Ffeed%2Fpopular
+[okai] link[12] x=887 y=127 w=69 h=38 href=https://inv.nadeko.net/feed/popular
+[okai] link[13] x=956 y=127 w=72 h=38 href=https://inv.nadeko.net/feed/trending
+[okai] link[14] x=175 y=398 w=367 h=22 href=https://inv.nadeko.net/watch?v=b3B36z3YI_w
+[okai] link[15] x=175 y=436 w=35 h=22 href=https://inv.nadeko.net/channel/UCq6VFHwMzcMXbuKyG7SQYIg
+[okai] link[16] x=574 y=398 w=367 h=22 href=https://inv.nadeko.net/watch?v=16-xQ-Dt2mk
+[okai] link[17] x=574 y=436 w=27 h=22 href=https://inv.nadeko.net/channel/UCZYTClx2T1of7BRZ86-8fow
+[okai] link[18] x=973 y=398 w=367 h=22 href=https://inv.nadeko.net/watch?v=BxXfeotgVVA
+[okai] link[19] x=973 y=436 w=30 h=44 href=https://inv.nadeko.net/channel/UCBa659QWEk1AI4Tg--mrJ2A
+[okai] link[20] x=1373 y=398 w=367 h=22 href=https://inv.nadeko.net/watch?v=sQJk6Hrsepk
+[okai] link[21] x=1373 y=436 w=52 h=44 href=https://inv.nadeko.net/channel/UCl2mFZoRqjw_ELax4Yisf6w
+[okai] link[22] x=175 y=750 w=367 h=22 href=https://inv.nadeko.net/watch?v=nts32hr4W9g
+[okai] link[23] x=175 y=788 w=79 h=22 href=https://inv.nadeko.net/channel/UCtMVHI3AJD4Qk4hcbZnI9ZQ
+[okai] link[24] x=574 y=750 w=367 h=22 href=https://inv.nadeko.net/watch?v=rzR6VPALFo4
+[okai] link[25] x=574 y=788 w=27 h=22 href=https://inv.nadeko.net/channel/UC7_YxT-KID8kRbqZo7MyscQ
+[okai] link[26] x=973 y=750 w=367 h=22 href=https://inv.nadeko.net/watch?v=HFbLI71G5DM
+[okai] link[27] x=973 y=788 w=50 h=44 href=https://inv.nadeko.net/channel/UChIs72whgZI9w6d6FhwGGHA
+[okai] link[28] x=1373 y=750 w=367 h=22 href=https://inv.nadeko.net/watch?v=YkEwyFpxWFc
+[okai] link[29] x=1373 y=788 w=37 h=44 href=https://inv.nadeko.net/channel/UC415bOPUcGSamy543abLmRA
+[okai] link[30] x=175 y=176 w=367 h=207 href=https://inv.nadeko.net/watch?v=b3B36z3YI_w
+[okai] link[31] x=574 y=176 w=367 h=207 href=https://inv.nadeko.net/watch?v=16-xQ-Dt2mk
+[okai] link[32] x=973 y=176 w=367 h=207 href=https://inv.nadeko.net/watch?v=BxXfeotgVVA
+[okai] link[33] x=1373 y=176 w=367 h=207 href=https://inv.nadeko.net/watch?v=sQJk6Hrsepk
+[okai] link[34] x=175 y=527 w=367 h=207 href=https://inv.nadeko.net/watch?v=nts32hr4W9g
+[okai] link[35] x=574 y=527 w=367 h=207 href=https://inv.nadeko.net/watch?v=rzR6VPALFo4
+[okai] link[36] x=973 y=527 w=367 h=207 href=https://inv.nadeko.net/watch?v=HFbLI71G5DM
+[okai] link[37] x=1373 y=527 w=367 h=207 href=https://inv.nadeko.net/watch?v=YkEwyFpxWFc
+[okai] link[38] x=175 y=879 w=367 h=207 href=https://inv.nadeko.net/watch?v=jsfxngunmbs
+[okai] link[39] x=574 y=879 w=367 h=207 href=https://inv.nadeko.net/watch?v=scwlR0QHGOk
+[okai] link[40] x=973 y=879 w=367 h=207 href=https://inv.nadeko.net/watch?v=AGc6cpcMRVQ
+[okai] link[41] x=1373 y=879 w=367 h=207 href=https://inv.nadeko.net/watch?v=Hr2ARNsKwHA
+[okai] key 6 focus=-1 addr=0
+[okai] sub-res JS: status=200 3302 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/b3B36z3YI_w/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/b3B36z3YI_w/mqdefault.jpg
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/16-xQ-Dt2mk/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/16-xQ-Dt2mk/mqdefault.jpg
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/BxXfeotgVVA/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/BxXfeotgVVA/mqdefault.jpg
+[tls-net] received 1045 bytes (inv.nadeko.net/js/minified/watched_indicator.js, 290ms) [h2] [reused]
+[okai] sub-res JS: status=200 418 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/sQJk6Hrsepk/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/sQJk6Hrsepk/mqdefault.jpg
+[tls-net] received 1865 bytes (inv.nadeko.net/js/minified/handlers.js?v=9ea0302, 300ms) [h2] [reused]
+[okai] sub-res JS: status=200 3639 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/nts32hr4W9g/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/nts32hr4W9g/mqdefault.jpg
+[tls-net] received 1195 bytes (inv.nadeko.net/js/minified/themes.js?v=9ea0302, 290ms) [h2] [reused]
+[okai] sub-res JS: status=200 1025 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/rzR6VPALFo4/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/rzR6VPALFo4/mqdefault.jpg
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 176Kpx
+[net] rx 41 KB (66 pkts) tx 26 KB (66 pkts) | tcp in 37 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 5 fetch 6 | nic max-batch 7 missed 0 nobuf 0 poll-gap 132ms
+[fps] 1 loops=1083 busy=38% awake: composed=1 cursor=0 mouse=0 fetch=1083 okai=0 mplay=0
+[tls-net] received 5548 bytes (inv.nadeko.net/vi/b3B36z3YI_w/mqdefault.jpg, 350ms) [h2] [reused]
+[okai] sub-res IMG: status=200 4999 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/HFbLI71G5DM/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/HFbLI71G5DM/mqdefault.jpg
+[tls-net] received 7719 bytes (inv.nadeko.net/vi/16-xQ-Dt2mk/mqdefault.jpg, 370ms) [h2] [reused]
+[okai] sub-res IMG: status=200 7170 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/YkEwyFpxWFc/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/YkEwyFpxWFc/mqdefault.jpg
+[tls-net] received 15145 bytes (inv.nadeko.net/vi/BxXfeotgVVA/mqdefault.jpg, 440ms) [h2] [reused]
+[okai] sub-res IMG: status=200 14595 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/jsfxngunmbs/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/jsfxngunmbs/mqdefault.jpg
+[tls-net] received 4560 bytes (inv.nadeko.net/vi/sQJk6Hrsepk/mqdefault.jpg, 440ms) [h2] [reused]
+[okai] sub-res IMG: status=200 4011 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/scwlR0QHGOk/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/scwlR0QHGOk/mqdefault.jpg
+[tls-net] received 7557 bytes (inv.nadeko.net/vi/nts32hr4W9g/mqdefault.jpg, 480ms) [h2] [reused]
+[okai] sub-res IMG: status=200 7008 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/AGc6cpcMRVQ/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/AGc6cpcMRVQ/mqdefault.jpg
+[tls-net] received 15926 bytes (inv.nadeko.net/vi/rzR6VPALFo4/mqdefault.jpg, 520ms) [h2] [reused]
+[okai] sub-res IMG: status=200 15376 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/Hr2ARNsKwHA/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/Hr2ARNsKwHA/mqdefault.jpg
+[tls-net] received 19278 bytes (inv.nadeko.net/vi/HFbLI71G5DM/mqdefault.jpg, 380ms) [h2] [reused]
+[okai] sub-res IMG: status=200 18728 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/fUrFytiutqc/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/fUrFytiutqc/mqdefault.jpg
+[tls-net] received 13278 bytes (inv.nadeko.net/vi/YkEwyFpxWFc/mqdefault.jpg, 410ms) [h2] [reused]
+[okai] sub-res IMG: status=200 12728 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/TVpMka43TFk/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/TVpMka43TFk/mqdefault.jpg
+[tls-net] received 10332 bytes (inv.nadeko.net/vi/jsfxngunmbs/mqdefault.jpg, 380ms) [h2] [reused]
+[okai] sub-res IMG: status=200 9783 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/YIrFd4uVwd4/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/YIrFd4uVwd4/mqdefault.jpg
+[tls-net] received 10296 bytes (inv.nadeko.net/vi/scwlR0QHGOk/mqdefault.jpg, 370ms) [h2] [reused]
+[okai] sub-res IMG: status=200 9747 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/LKrwhjOI8Nc/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/LKrwhjOI8Nc/mqdefault.jpg
+[tls-net] received 12851 bytes (inv.nadeko.net/vi/AGc6cpcMRVQ/mqdefault.jpg, 400ms) [h2] [reused]
+[okai] sub-res IMG: status=200 12300 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/aV81SqB6HQg/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/aV81SqB6HQg/mqdefault.jpg
+[tls-net] received 19583 bytes (inv.nadeko.net/vi/Hr2ARNsKwHA/mqdefault.jpg, 340ms) [h2] [reused]
+[okai] sub-res IMG: status=200 19033 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/kjUabhk54gg/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/kjUabhk54gg/mqdefault.jpg
+[tls-net] received 6776 bytes (inv.nadeko.net/vi/fUrFytiutqc/mqdefault.jpg, 310ms) [h2] [reused]
+[okai] sub-res IMG: status=200 6226 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/l3L_lETiSzc/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/l3L_lETiSzc/mqdefault.jpg
+[tls-net] received 7234 bytes (inv.nadeko.net/vi/TVpMka43TFk/mqdefault.jpg, 300ms) [h2] [reused]
+[okai] sub-res IMG: status=200 6684 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/R60ZGwd3n9E/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/R60ZGwd3n9E/mqdefault.jpg
+[tls-net] received 4842 bytes (inv.nadeko.net/vi/YIrFd4uVwd4/mqdefault.jpg, 290ms) [h2] [reused]
+[okai] sub-res IMG: status=200 4293 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/P8CVqDKeOKk/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/P8CVqDKeOKk/mqdefault.jpg
+[tls-net] received 12800 bytes (inv.nadeko.net/vi/LKrwhjOI8Nc/mqdefault.jpg, 320ms) [h2] [reused]
+[okai] sub-res IMG: status=200 12249 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/av3zdxYvCp8/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/av3zdxYvCp8/mqdefault.jpg
+[net] rx 179 KB (189 pkts) tx 30 KB (148 pkts) | tcp in 168 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 5 fetch 6 | nic max-batch 5 missed 0 nobuf 0 poll-gap 13ms
+[fps] 4 loops=1339 busy=23% awake: composed=1 cursor=3 mouse=0 fetch=1339 okai=0 mplay=0
+[tls-net] received 11320 bytes (inv.nadeko.net/vi/aV81SqB6HQg/mqdefault.jpg, 310ms) [h2] [reused]
+[okai] sub-res IMG: status=200 10770 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/6U6Z6pb6ewI/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/6U6Z6pb6ewI/mqdefault.jpg
+[tls-net] received 12171 bytes (inv.nadeko.net/vi/kjUabhk54gg/mqdefault.jpg, 310ms) [h2] [reused]
+[okai] sub-res IMG: status=200 11620 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/auScRXZwHhk/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/auScRXZwHhk/mqdefault.jpg
+[tls-net] received 11167 bytes (inv.nadeko.net/vi/l3L_lETiSzc/mqdefault.jpg, 310ms) [h2] [reused]
+[okai] sub-res IMG: status=200 10617 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/h8wpG_A3_6g/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/h8wpG_A3_6g/mqdefault.jpg
+[tls-net] received 16215 bytes (inv.nadeko.net/vi/R60ZGwd3n9E/mqdefault.jpg, 310ms) [h2] [reused]
+[okai] sub-res IMG: status=200 15665 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/NK8ZkNPstI4/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/NK8ZkNPstI4/mqdefault.jpg
+[tls-net] received 11193 bytes (inv.nadeko.net/vi/P8CVqDKeOKk/mqdefault.jpg, 330ms) [h2] [reused]
+[okai] sub-res IMG: status=200 10643 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/88itHnh8eMI/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/88itHnh8eMI/mqdefault.jpg
+[tls-net] received 17285 bytes (inv.nadeko.net/vi/av3zdxYvCp8/mqdefault.jpg, 320ms) [h2] [reused]
+[okai] sub-res IMG: status=200 16735 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/9eWJISlh0fw/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/9eWJISlh0fw/mqdefault.jpg
+[tls-net] received 6386 bytes (inv.nadeko.net/vi/6U6Z6pb6ewI/mqdefault.jpg, 300ms) [h2] [reused]
+[okai] sub-res IMG: status=200 5838 bytes
+[tls-net] received 16412 bytes (inv.nadeko.net/vi/auScRXZwHhk/mqdefault.jpg, 320ms) [h2] [reused]
+[okai] sub-res IMG: status=200 15863 bytes
+[tls-net] received 15298 bytes (inv.nadeko.net/vi/h8wpG_A3_6g/mqdefault.jpg, 310ms) [h2] [reused]
+[okai] sub-res IMG: status=200 14749 bytes
+[tls-net] received 14732 bytes (inv.nadeko.net/vi/NK8ZkNPstI4/mqdefault.jpg, 310ms) [h2] [reused]
+[okai] sub-res IMG: status=200 14183 bytes
+[tls-net] received 14042 bytes (inv.nadeko.net/vi/88itHnh8eMI/mqdefault.jpg, 320ms) [h2] [reused]
+[okai] sub-res IMG: status=200 13493 bytes
+[tls-net] received 13274 bytes (inv.nadeko.net/vi/9eWJISlh0fw/mqdefault.jpg, 310ms) [h2] [reused]
+[okai] sub-res IMG: status=200 12725 bytes
+[okai] sub-res done: 5 css, 28 img
+[js] load event: scripts=4 ran=4 errors=0 modules=0 heap=6145KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] render tab=0 doc_h=4190 scroll=0 in 30ms painted 712Kpx
+[net] rx 163 KB (152 pkts) tx 16 KB (113 pkts) | tcp in 154 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 5 fetch 0 | nic max-batch 8 missed 0 nobuf 0 poll-gap 51ms
+[fps] 24 loops=777 busy=24% awake: composed=1 cursor=23 mouse=0 fetch=733 okai=0 mplay=0
+[mse] btn=1 x=776 y=122 pkts=489
+[okai] click x=774 y=24 (mx=776 my=122) hit=2 node=65
+[okai] focus -1 -> 65 <input id=searchbox>
+[okai] focus input node=65
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 23Kpx
+[okai] link[0] x=175 y=26 w=43 h=22 href=https://inv.nadeko.net/
+[okai] field[1] x=697 y=16 w=510 h=42 node=65 btn=0
+[okai] field[2] x=1206 y=16 w=12 h=42 node=68 btn=1
+[okai] link[3] x=1716 y=26 w=24 h=22 href=https://inv.nadeko.net/login?referer=%2Ffeed%2Fpopular
+[okai] link[4] x=230 y=73 w=24 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=0&referer=%2Ffeed%2Fpopular
+[okai] link[5] x=256 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=1&referer=%2Ffeed%2Fpopular
+[okai] link[6] x=284 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=2&referer=%2Ffeed%2Fpopular
+[okai] link[7] x=312 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=3&referer=%2Ffeed%2Fpopular
+[okai] link[8] x=341 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=4&referer=%2Ffeed%2Fpopular
+[okai] link[9] x=369 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=5&referer=%2Ffeed%2Fpopular
+[okai] link[10] x=397 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=6&referer=%2Ffeed%2Fpopular
+[okai] link[11] x=425 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=7&referer=%2Ffeed%2Fpopular
+[okai] link[12] x=887 y=127 w=69 h=38 href=https://inv.nadeko.net/feed/popular
+[okai] link[13] x=956 y=127 w=72 h=38 href=https://inv.nadeko.net/feed/trending
+[okai] link[14] x=175 y=398 w=367 h=22 href=https://inv.nadeko.net/watch?v=b3B36z3YI_w
+[okai] link[15] x=175 y=436 w=35 h=22 href=https://inv.nadeko.net/channel/UCq6VFHwMzcMXbuKyG7SQYIg
+[okai] link[16] x=574 y=398 w=367 h=22 href=https://inv.nadeko.net/watch?v=16-xQ-Dt2mk
+[okai] link[17] x=574 y=436 w=27 h=22 href=https://inv.nadeko.net/channel/UCZYTClx2T1of7BRZ86-8fow
+[okai] link[18] x=973 y=398 w=367 h=22 href=https://inv.nadeko.net/watch?v=BxXfeotgVVA
+[okai] link[19] x=973 y=436 w=30 h=44 href=https://inv.nadeko.net/channel/UCBa659QWEk1AI4Tg--mrJ2A
+[okai] link[20] x=1373 y=398 w=367 h=22 href=https://inv.nadeko.net/watch?v=sQJk6Hrsepk
+[okai] link[21] x=1373 y=436 w=52 h=44 href=https://inv.nadeko.net/channel/UCl2mFZoRqjw_ELax4Yisf6w
+[okai] link[22] x=175 y=750 w=367 h=22 href=https://inv.nadeko.net/watch?v=nts32hr4W9g
+[okai] link[23] x=175 y=788 w=79 h=22 href=https://inv.nadeko.net/channel/UCtMVHI3AJD4Qk4hcbZnI9ZQ
+[okai] link[24] x=574 y=750 w=367 h=22 href=https://inv.nadeko.net/watch?v=rzR6VPALFo4
+[okai] link[25] x=574 y=788 w=27 h=22 href=https://inv.nadeko.net/channel/UC7_YxT-KID8kRbqZo7MyscQ
+[okai] link[26] x=973 y=750 w=367 h=22 href=https://inv.nadeko.net/watch?v=HFbLI71G5DM
+[okai] link[27] x=973 y=788 w=50 h=44 href=https://inv.nadeko.net/channel/UChIs72whgZI9w6d6FhwGGHA
+[okai] link[28] x=1373 y=750 w=367 h=22 href=https://inv.nadeko.net/watch?v=YkEwyFpxWFc
+[okai] link[29] x=1373 y=788 w=37 h=44 href=https://inv.nadeko.net/channel/UC415bOPUcGSamy543abLmRA
+[okai] link[30] x=175 y=176 w=367 h=207 href=https://inv.nadeko.net/watch?v=b3B36z3YI_w
+[okai] link[31] x=574 y=176 w=367 h=207 href=https://inv.nadeko.net/watch?v=16-xQ-Dt2mk
+[okai] link[32] x=973 y=176 w=367 h=207 href=https://inv.nadeko.net/watch?v=BxXfeotgVVA
+[okai] link[33] x=1373[mse] btn=0 x=776 y=122 pkts=490
+ y=176 w=367 h=207 href=https://inv.nadeko.net/watch?v=sQJk6Hrsepk
+[okai] link[34] x=175 y=527 w=367 h=207 href=https://inv.nadeko.net/watch?v=nts32hr4W9g
+[okai] link[35] x=574 y=527 w=367 h=207 href=https://inv.nadeko.net/watch?v=rzR6VPALFo4
+[okai] link[36] x=973 y=527 w=367 h=207 href=https://inv.nadeko.net/watch?v=HFbLI71G5DM
+[okai] link[37] x=1373 y=527 w=367 h=207 href=https://inv.nadeko.net/watch?v=YkEwyFpxWFc
+[okai] link[38] x=175 y=879 w=367 h=207 href=https://inv.nadeko.net/watch?v=jsfxngunmbs
+[okai] link[39] x=574 y=879 w=367 h=207 href=https://inv.nadeko.net/watch?v=scwlR0QHGOk
+[okai] link[40] x=973 y=879 w=367 h=207 href=https://inv.nadeko.net/watch?v=AGc6cpcMRVQ
+[okai] link[41] x=1373 y=879 w=367 h=207 href=https://inv.nadeko.net/watch?v=Hr2ARNsKwHA
+[mse] btn=1 x=776 y=138 pkts=498
+[okai] click x=774 y=40 (mx=776 my=138) hit=2 node=65
+[okai] focus input node=65
+[mse] btn=0 x=776 y=138 pkts=499
+[fps] 10 loops=86021 busy=22% awake: composed=3 cursor=7 mouse=85927 fetch=0 okai=0 mplay=0
+[time] 1031 of 12000 ticks were not delivered (8%)
+[okai] key 107 focus=65 addr=0
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 3Kpx
+[okai] key 105 focus=65 addr=0
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 1Kpx
+[okai] key 108 focus=65 addr=0
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 1Kpx
+[fps] 4 loops=117 busy=6% awake: composed=1 cursor=3 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 108 focus=65 addr=0
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 1Kpx
+[okai] key 32 focus=65 addr=0
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 2Kpx
+[okai] key 115 focus=65 addr=0
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 2Kpx
+[okai] key 116 focus=65 addr=0
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 2Kpx
+[okai] key 101 focus=65 addr=0
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 3Kpx
+[okai] key 112 focus=65 addr=0
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 3Kpx
+[okai] key 104 focus=65 addr=0
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 4Kpx
+[okai] key 101 focus=65 addr=0
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 4Kpx
+[fps] 1 loops=136 busy=10% awake: composed=1 cursor=0 mouse=0 fetch=0 okai=0 mplay=0
+[okai] key 110 focus=65 addr=0
+[okai] render tab=0 doc_h=4190 scroll=0 in 0ms painted 5Kpx
+[okai] key 10 focus=65 addr=0
+[okai] submit form -> https://inv.nadeko.net/search?q=kill+stephen
+[okai] navigate https://inv.nadeko.net/search?q=kill+stephen
+[tls-net] queued HTTPS inv.nadeko.net/search?q=kill+stephen
+[okai] fetch https://inv.nadeko.net/search?q=kill+stephen
+[net] rx 0 KB (3 pkts) tx 1 KB (3 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 5 fetch 1 | nic max-batch 3 missed 0 nobuf 0 poll-gap 21ms
+[fps] 1 loops=1144 busy=5% awake: composed=1 cursor=0 mouse=0 fetch=1107 okai=0 mplay=0
+[tls-net] received 7859 bytes (inv.nadeko.net/search?q=kill+stephen, 950ms) [h2] [reused]
+[br] https parse: count=2194 len=68718 dom_nodes=2194 status=200 gzip ctype=text/html js
+[okai] sub-res fetch: CSS https://inv.nadeko.net/css/search.css?v=9ea0302
+[tls-net] queued HTTPS inv.nadeko.net/css/search.css?v=9ea0302
+[okai] sub-res fetch: CSS https://inv.nadeko.net/css/pure-min.css?v=9ea0302
+[cache] hit inv.nadeko.net/css/pure-min.css?v=9ea0302 (4667 bytes)
+[okai] sub-res fetch: CSS https://inv.nadeko.net/css/grids-responsive-min.css?v=9ea0302
+[cache] hit inv.nadeko.net/css/grids-responsive-min.css?v=9ea0302 (2046 bytes)
+[okai] sub-res fetch: CSS https://inv.nadeko.net/css/ionicons.min.css?v=9ea0302
+[cache] hit inv.nadeko.net/css/ionicons.min.css?v=9ea0302 (8758 bytes)
+[okai] sub-res fetch: CSS https://inv.nadeko.net/css/default.css?v=9ea0302
+[cache] hit inv.nadeko.net/css/default.css?v=9ea0302 (5785 bytes)
+[okai] sub-res fetch: CSS https://inv.nadeko.net/css/carousel.css?v=9ea0302
+[cache] hit inv.nadeko.net/css/carousel.css?v=9ea0302 (1970 bytes)
+[okai] sub-res CSS: status=200 17215 bytes
+[okai] sub-res CSS: status=200 8035 bytes
+[okai] sub-res CSS: status=200 45198 bytes
+[okai] sub-res CSS: status=200 19010 bytes
+[okai] sub-res CSS: status=200 2785 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/js/minified/_helpers.js?v=9ea0302
+[cache] hit inv.nadeko.net/js/minified/_helpers.js?v=9ea0302 (2119 bytes)
+[okai] sub-res fetch: JS https://inv.nadeko.net/js/minified/watched_indicator.js
+[cache] hit inv.nadeko.net/js/minified/watched_indicator.js (1045 bytes)
+[okai] sub-res fetch: JS https://inv.nadeko.net/js/minified/handlers.js?v=9ea0302
+[cache] hit inv.nadeko.net/js/minified/handlers.js?v=9ea0302 (1865 bytes)
+[okai] sub-res fetch: JS https://inv.nadeko.net/js/minified/themes.js?v=9ea0302
+[cache] hit inv.nadeko.net/js/minified/themes.js?v=9ea0302 (1195 bytes)
+[okai] sub-res JS: status=200 3302 bytes
+[okai] sub-res JS: status=200 418 bytes
+[okai] sub-res JS: status=200 3639 bytes
+[okai] sub-res JS: status=200 1025 bytes
+[tls-net] received 1547 bytes (inv.nadeko.net/css/search.css?v=9ea0302, 310ms) [h2] [reused]
+[okai] sub-res CSS: status=200 2104 bytes
+[okai] sub-res done: 6 css, 0 img
+[js] load event: scripts=4 ran=4 errors=0 modules=0 heap=6145KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] render tab=0 1916x936 doc_h=3036 scroll=0 in 10ms (page origin 2,98) stack=24KB
+[okai] link[0] x=175 y=26 w=43 h=22 href=https://inv.nadeko.net/
+[okai] field[1] x=698 y=17 w=508 h=40 node=65 btn=0
+[okai] field[2] x=1206 y=16 w=12 h=42 node=68 btn=1
+[okai] link[3] x=1716 y=26 w=24 h=22 href=https://inv.nadeko.net/login?referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[4] x=230 y=73 w=24 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=0&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[5] x=256 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=1&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[6] x=284 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=2&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[7] x=312 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=3&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[8] x=341 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=4&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[9] x=369 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=5&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[10] x=397 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=6&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[11] x=425 y=73 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=7&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] field[12] x=209 y=258 w=13 h=13 node=204 btn=1
+[okai] field[13] x=209 y=288 w=13 h=13 node=209 btn=1
+[okai] field[14] x=209 y=317 w=13 h=13 node=214 btn=1
+[okai] field[15] x=209 y=347 w=13 h=13 node=219 btn=1
+[okai] field[16] x=209 y=377 w=13 h=13 node=224 btn=1
+[okai] field[17] x=209 y=406 w=13 h=13 node=229 btn=1
+[okai] field[18] x=495 y=258 w=13 h=13 node=245 btn=1
+[okai] field[19] x=495 y=288 w=13 h=13 node=250 btn=1
+[okai] field[20] x=495 y=317 w=13 h=13 node=255 btn=1
+[okai] field[21] x=495 y=347 w=13 h=13 node=260 btn=1
+[okai] field[22] x=495 y=377 w=13 h=13 node=265 btn=1
+[okai] field[23] x=495 y=406 w=13 h=13 node=270 btn=1
+[okai] field[24] x=781 y=258 w=13 h=13 node=286 btn=1
+[okai] field[25] x=781 y=288 w=13 h=13 node=291 btn=1
+[okai] field[26] x=781 y=317 w=13 h=13 node=296 btn=1
+[okai] field[27] x=781 y=347 w=13 h=13 node=301 btn=1
+[okai] field[28] x=1067 y=258 w=13 h=13 node=317 btn=1
+[okai] field[29] x=1067 y=288 w=13 h=13 node=322 btn=1
+[okai] field[30] x=1067 y=317 w=13 h=13 node=327 btn=1
+[okai] field[31] x=1067 y=347 w=13 h=13 node=332 btn=1
+[okai] field[32] x=1067 y=377 w=13 h=13 node=337 btn=1
+[okai] field[33] x=1067 y=406 w=13 h=13 node=342 btn=1
+[okai] field[34] x=1067 y=436 w=13 h=13 node=347 btn=1
+[okai] field[35] x=1067 y=466 w=13 h=13 node=352 btn=1
+[okai] field[36] x=1067 y=495 w=13 h=13 node=357 btn=1
+[okai] field[37] x=1067 y=525 w=13 h=13 node=362 btn=1
+[okai] field[38] x=1067 y=555 w=13 h=13 node=367 btn=1
+[okai] field[39] x=1353 y=258 w=13 h=13 node=383 btn=1
+[okai] field[40] x=1353 y=288 w=13 h=13 node=388 btn=1
+[okai] field[41] x=1634 y=598 w=80 h=40 node=396 btn=1
+[okai] link[42] x=175 y=735 w=367 h=207 href=https://inv.nadeko.net/watch?v=AllbgupanVc
+[okai] link[43] x=574 y=735 w=367 h=207 href=https://inv.nadeko.net/watch?v=6i8_p9JXEJE
+[okai] link[44] x=973 y=735 w=367 h=207 href=https://inv.nadeko.net/mix?list=RDAllbgupanVc&continuation=AllbgupanVc
+[okai] link[45] x=1373 y=735 w=367 h=207 href=https://inv.nadeko.net/watch?v=oxePq_AlKxI
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/AllbgupanVc/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/AllbgupanVc/mqdefault.jpg
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/6i8_p9JXEJE/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/6i8_p9JXEJE/mqdefault.jpg
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/AllbgupanVc/hqdefault.jpg?sqp=-oaymwEXCOADEI4CSFryq4qpAwkIARUAAIhCGAE=&rs=AOn4CLCQGMkTiDWhFU5ZVdUKKu0opoAoqA
+[tls-net] queued HTTPS inv.nadeko.net/vi/AllbgupanVc/hqdefault.jpg?sqp=-oaymwEXCOADEI4CSFryq4qpAwkIARUAAIhCGAE=&rs=AOn4CLC
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/oxePq_AlKxI/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/oxePq_AlKxI/mqdefault.jpg
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/wQ9MtZDKWAA/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/wQ9MtZDKWAA/mqdefault.jpg
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/_rZV1ZQmQGk/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/_rZV1ZQmQGk/mqdefault.jpg
+[net] rx 10 KB (21 pkts) tx 11 KB (20 pkts) | tcp in 8 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 4 fetch 6 | nic max-batch 11 missed 0 nobuf 0 poll-gap 125ms
+[fps] 1 loops=1212 busy=31% awake: composed=1 cursor=0 mouse=0 fetch=1211 okai=0 mplay=0
+[tls-net] received 10840 bytes (inv.nadeko.net/vi/oxePq_AlKxI/mqdefault.jpg, 320ms) [h2] [reused]
+[okai] sub-res IMG: status=200 10300 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/bFgBRuBf4sk/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/bFgBRuBf4sk/mqdefault.jpg
+[tls-net] received 24095 bytes (inv.nadeko.net/vi/AllbgupanVc/mqdefault.jpg, 380ms) [h2] [reused]
+[okai] sub-res IMG: status=200 23578 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/5GjYeZpOadg/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/5GjYeZpOadg/mqdefault.jpg
+[tls-net] received 18378 bytes (inv.nadeko.net/vi/6i8_p9JXEJE/mqdefault.jpg, 390ms) [h2] [reused]
+[okai] sub-res IMG: status=200 17861 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/9itXGj--el8/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/9itXGj--el8/mqdefault.jpg
+[tls-net] received 10349 bytes (inv.nadeko.net/vi/wQ9MtZDKWAA/mqdefault.jpg, 390ms) [h2] [reused]
+[okai] sub-res IMG: status=200 9810 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/whqfK1lV61M/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/whqfK1lV61M/mqdefault.jpg
+[tls-net] received 52098 bytes (inv.nadeko.net/vi/AllbgupanVc/hqdefault.jpg?sqp=-oaymwEXCOADEI4CSFryq4qpAwkIARUAAIhCGAE=&rs=AOn4CLC, 460ms) [h2] [reused]
+[okai] sub-res IMG: status=200 51581 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/u8RNiBICD7c/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/u8RNiBICD7c/mqdefault.jpg
+[tls-net] received 8127 bytes (inv.nadeko.net/vi/_rZV1ZQmQGk/mqdefault.jpg, 460ms) [h2] [reused]
+[okai] sub-res IMG: status=200 7588 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/9Tgg-j36-Yk/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/9Tgg-j36-Yk/mqdefault.jpg
+[tls-net] received 9010 bytes (inv.nadeko.net/vi/bFgBRuBf4sk/mqdefault.jpg, 310ms) [h2] [reused]
+[okai] sub-res IMG: status=200 8471 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/CK18SdGjWEI/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/CK18SdGjWEI/mqdefault.jpg
+[tls-net] received 11710 bytes (inv.nadeko.net/vi/9itXGj--el8/mqdefault.jpg, 310ms) [h2] [reused]
+[okai] sub-res IMG: status=200 11170 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/dyIilW_eBjc/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/dyIilW_eBjc/mqdefault.jpg
+[tls-net] received 5416 bytes (inv.nadeko.net/vi/9Tgg-j36-Yk/mqdefault.jpg, 310ms) [h2] [reused]
+[okai] sub-res IMG: status=200 4877 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/RYNMMhk2jjI/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/RYNMMhk2jjI/mqdefault.jpg
+[tls-net] received 5237 bytes (inv.nadeko.net/vi/5GjYeZpOadg/mqdefault.jpg, 450ms) [h2] [reused]
+[okai] sub-res IMG: status=200 4698 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/SdiThL6ZCMQ/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/SdiThL6ZCMQ/mqdefault.jpg
+[tls-net] received 11086 bytes (inv.nadeko.net/vi/dyIilW_eBjc/mqdefault.jpg, 310ms) [h2] [reused]
+[okai] sub-res IMG: status=200 10546 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/wwi_R2jnhb8/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/wwi_R2jnhb8/mqdefault.jpg
+[tls-net] received 7200 bytes (inv.nadeko.net/vi/whqfK1lV61M/mqdefault.jpg, 640ms) [h2] [reused]
+[okai] sub-res IMG: status=200 6661 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/AuFLsC_8WOU/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/AuFLsC_8WOU/mqdefault.jpg
+[tls-net] received 3723 bytes (inv.nadeko.net/vi/u8RNiBICD7c/mqdefault.jpg, 610ms) [h2] [reused]
+[okai] sub-res IMG: status=200 3206 bytes
+[okai] sub-res fetch: IMG https://inv.nadeko.net/vi/HERXilqn4iE/mqdefault.jpg
+[tls-net] queued HTTPS inv.nadeko.net/vi/HERXilqn4iE/mqdefault.jpg
+[tls-net] received 7637 bytes (inv.nadeko.net/vi/CK18SdGjWEI/mqdefault.jpg, 460ms) [h2] [reused]
+[okai] sub-res IMG: status=200 7120 bytes
+[net] rx 191 KB (198 pkts) tx 26 KB (123 pkts) | tcp in 179 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 5 | nic max-batch 15 missed 0 nobuf 0 poll-gap 19ms
+[fps] 12 loops=1356 busy=20% awake: composed=1 cursor=11 mouse=0 fetch=1356 okai=0 mplay=0
+[okai] wheel dy=1 old_scroll=0
+[okai] render tab=0 doc_h=3036 scroll=80 in 10ms painted 1793Kpx
+[okai] link[0] x=230 y=-7 w=24 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=0&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[1] x=256 y=-7 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=1&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[2] x=284 y=-7 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=2&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[3] x=312 y=-7 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=3&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[4] x=341 y=-7 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=4&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[5] x=369 y=-7 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=5&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[6] x=397 y=-7 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=6&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] link[7] x=425 y=-7 w=26 h=44 href=https://inv.nadeko.net/switchbackend?companion_id=7&referer=%2Fsearch%3Fq%3Dkill%2Bstephen
+[okai] field[8] x=209 y=178 w=13 h=13 node=204 btn=1
+[okai] field[9] x=209 y=208 w=13 h=13 node=209 btn=1
+[okai] field[10] x=209 y=237 w=13 h=13 node=214 btn=1
+[okai] field[11] x=209 y=267 w=13 h=13 node=219 btn=1
+[okai] field[12] x=209 y=297 w=13 h=13 node=224 btn=1
+[okai] field[13] x=209 y=326 w=13 h=13 node=229 btn=1
+[okai] field[14] x=495 y=178 w=13 h=13 node=245 btn=1
+[okai] field[15] x=495 y=208 w=13 h=13 node=250 btn=1
+[okai] field[16] x=495 y=237 w=13 h=13 node=255 btn=1
+[okai] field[17] x=495 y=267 w=13 h=13 node=260 btn=1
+[okai] field[18] x=495 y=297 w=13 h=13 node=265 btn=1
+[okai] field[19] x=495 y=326 w=13 h=13 node=270 btn=1
+[okai] field[20] x=781 y=178 w=13 h=13 node=286 btn=1
+[okai] field[21] x=781 y=208 w=13 h=13 node=291 btn=1
+[okai] field[22] x=781 y=237 w=13 h=13 node=296 btn=1
+[okai] field[23] x=781 y=267 w=13 h=13 node=301 btn=1
+[okai] field[24] x=1067 y=178 w=13 h=13 node=317 btn=1
+[okai] field[25] x=1067 y=208 w=13 h=13 node=322 btn=1
+[okai] field[26] x=1067 y=237 w=13 h=13 node=327 btn=1
+[okai] field[27] x=1067 y=267 w=13 h=13 node=332 btn=1
+[okai] field[28] x=1067 y=297 w=13 h=13 node=337 btn=1
+[okai] field[29] x=1067 y=326 w=13 h=13 node=342 btn=1
+[okai] field[30] x=1067 y=356 w=13 h=13 node=347 btn=1
+[okai] field[31] x=1067 y=386 w=13 h=13 node=352 btn=1
+[okai] field[32] x=1067 y=415 w=13 h=13 node=357 btn=1
+[okai] field[33] x=1067 y=445 w=13 h=13 node=362 btn=1
+[okai] field[34] x=1067 y=475 w=13 h=13 node=367 btn=1
+[okai] field[35] x=1353 y=178 w=13 h=13 node=383 btn=1
+[okai] field[36] x=1353 y=208 w=13 h=13 node=388 btn=1
+[okai] field[37] x=1634 y=518 w=80 h=40 node=396 btn=1
+[okai] link[38] x=175 y=878 w=367 h=22 href=https://inv.nadeko.net/watch?v=AllbgupanVc
+[okai] link[39] x=175 y=915 w=34 h=22 href=https://inv.nadeko.net/channel/UCn-jq3fmpFzfvWNVamw28ww
+[okai] link[40] x=574 y=878 w=367 h=22 href=https://inv.nadeko.net/watch?v=6i8_p9JXEJE
+[okai] link[41] x=574 y=915 w=34 h=22 href=https://inv.nadeko.net/channel/UCn-jq3fmpFzfvWNVamw28ww
+[okai] link[42] x=973 y=878 w=367 h=22 href=https://inv.nadeko.net/mix?list=RDAllbgupanVc&continuation=AllbgupanVc
+[okai] link[43] x=1373 y=878 w=367 h=22 href=https://inv.nadeko.net/watch?v=oxePq_AlKxI
+[okai] link[44] x=1373 y=915 w=47 h=22 href=https://inv.nadeko.net/channel/UCiQ6yrwwncfFprT5g6Fu6uw
+[okai] link[45] x=175 y=655 w=367 h=207 href=https://inv.nadeko.net/watch?v=AllbgupanVc
+[okai] link[46] x=574 y=655 w=367 h=207 href=https://inv.nadeko.net/watch?v=6i8_p9JXEJE
+[okai] link[47] x=973 y=655 w=367 h=207 href=https://inv.nadeko.net/mix?list=RDAllbgupanVc&continuation=AllbgupanVc
+[tls-net] received 10351 bytes (inv.nadeko.net/vi/SdiThL6ZCMQ/mqdefault.jpg, 560ms) [h2] [reused]
+[tls-net] received 9468 bytes (inv.nadeko.net/vi/AuFLsC_8WOU/mqdefault.jpg, 350ms) [h2] [reused]
+[okai] wheel dy=2 old_scroll=80
+[tls-net] received 5878 bytes (inv.nadeko.net/vi/RYNMMhk2jjI/mqdefault.jpg, 590ms) [h2] [reused]
+[okai] scroll dy=160 in 45495kcyc
+[okai] sub-res IMG: status=200 9812 bytes
+[okai] sub-res IMG: status=200 8929 bytes
+[okai] sub-res IMG: status=200 5361 bytes
+[tls-net] received 14162 bytes (inv.nadeko.net/vi/HERXilqn4iE/mqdefault.jpg, 330ms) [h2] [reused]
+[okai] sub-res IMG: status=200 13622 bytes
+[tls-net] received 7296 bytes (inv.nadeko.net/vi/wwi_R2jnhb8/mqdefault.jpg, 610ms) [h2] [reused]
+[okai] sub-res IMG: status=200 6779 bytes
+[okai] sub-res done: 6 css, 19 img
+[okai] render tab=0 doc_h=3036 scroll=240 in 20ms painted 1793Kpx
+[okai] field[0] x=209 y=18 w=13 h=13 node=204 btn=1
+[okai] field[1] x=209 y=48 w=13 h=13 node=209 btn=1
+[okai] field[2] x=209 y=77 w=13 h=13 node=214 btn=1
+[okai] field[3] x=209 y=107 w=13 h=13 node=219 btn=1
+[okai] field[4] x=209 y=137 w=13 h=13 node=224 btn=1
+[okai] field[5] x=209 y=166 w=13 h=13 node=229 btn=1
+[okai] field[6] x=495 y=18 w=13 h=13 node=245 btn=1
+[okai] field[7] x=495 y=48 w=13 h=13 node=250 btn=1
+[okai] field[8] x=495 y=77 w=13 h=13 node=255 btn=1
+[okai] field[9] x=495 y=107 w=13 h=13 node=260 btn=1
+[okai] field[10] x=495 y=137 w=13 h=13 node=265 btn=1
+[okai] field[11] x=495 y=166 w=13 h=13 node=270 btn=1
+[okai] field[12] x=781 y=18 w=13 h=13 node=286 btn=1
+[okai] field[13] x=781 y=48 w=13 h=13 node=291 btn=1
+[okai] field[14] x=781 y=77 w=13 h=13 node=296 btn=1
+[okai] field[15] x=781 y=107 w=13 h=13 node=301 btn=1
+[okai] field[16] x=1067 y=18 w=13 h=13 node=317 btn=1
+[okai] field[17] x=1067 y=48 w=13 h=13 node=322 btn=1
+[okai] field[18] x=1067 y=77 w=13 h=13 node=327 btn=1
+[okai] field[19] x=1067 y=107 w=13 h=13 node=332 btn=1
+[okai] field[20] x=1067 y=137 w=13 h=13 node=337 btn=1
+[okai] field[21] x=1067 y=166 w=13 h=13 node=342 btn=1
+[okai] field[22] x=1067 y=196 w=13 h=13 node=347 btn=1
+[okai] field[23] x=1067 y=226 w=13 h=13 node=352 btn=1
+[okai] field[24] x=1067 y=255 w=13 h=13 node=357 btn=1
+[okai] field[25] x=1067 y=285 w=13 h=13 node=362 btn=1
+[okai] field[26] x=1067 y=315 w=13 h=13 node=367 btn=1
+[okai] field[27] x=1353 y=18 w=13 h=13 node=383 btn=1
+[okai] field[28] x=1353 y=48 w=13 h=13 node=388 btn=1
+[okai] field[29] x=1634 y=358 w=80 h=40 node=396 btn=1
+[okai] link[30] x=175 y=718 w=367 h=22 href=https://inv.nadeko.net/watch?v=AllbgupanVc
+[okai] link[31] x=175 y=755 w=34 h=22 href=https://inv.nadeko.net/channel/UCn-jq3fmpFzfvWNVamw28ww
+[okai] link[32] x=574 y=718 w=367 h=22 href=https://inv.nadeko.net/watch?v=6i8_p9JXEJE
+[okai] link[33] x=574 y=755 w=34 h=22 href=https://inv.nadeko.net/channel/UCn-jq3fmpFzfvWNVamw28ww
+[okai] link[34] x=973 y=718 w=367 h=22 href=https://inv.nadeko.net/mix?list=RDAllbgupanVc&continuation=AllbgupanVc
+[okai] link[35] x=1373 y=718 w=367 h=22 href=https://inv.nadeko.net/watch?v=oxePq_AlKxI
+[okai] link[36] x=1373 y=755 w=47 h=22 href=https://inv.nadeko.net/channel/UCiQ6yrwwncfFprT5g6Fu6uw
+[okai] link[37] x=175 y=495 w=367 h=207 href=https://inv.nadeko.net/watch?v=AllbgupanVc
+[okai] link[38] x=574 y=495 w=367 h=207 href=https://inv.nadeko.net/watch?v=6i8_p9JXEJE
+[okai] link[39] x=973 y=495 w=367 h=207 href=https://inv.nadeko.net/mix?list=RDAllbgupanVc&continuation=AllbgupanVc
+[okai] link[40] x=1373 y=495 w=367 h=207 href=https://inv.nadeko.net/watch?v=oxePq_AlKxI
+[okai] link[41] x=175 y=825 w=367 h=207 href=https://inv.nadeko.net/watch?v=wQ9MtZDKWAA
+[okai] link[42] x=574 y=825 w=367 h=207 href=https://inv.nadeko.net/watch?v=_rZV1ZQmQGk
+[okai] link[43] x=973 y=825 w=367 h=207 href=https://inv.nadeko.net/watch?v=bFgBRuBf4sk
+[okai] link[44] x=1373 y=825 w=367 h=207 href=https://inv.nadeko.net/watch?v=5GjYeZpOadg
+[net] rx 48 KB (43 pkts) tx 0 KB (9 pkts) | tcp in 45 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 0 | nic max-batch 11 missed 0 nobuf 0 poll-gap 111ms
+[fps] 36 loops=513 busy=30% awake: composed=1 cursor=35 mouse=2 fetch=429 okai=0 mplay=0
+[mse] btn=1 x=371 y=721 pkts=556
+[okai] click x=369 y=623 (mx=371 my=721) hit=1 node=422
+[okai] LINK HIT -> https://inv.nadeko.net/watch?v=AllbgupanVc
+[okai] navigate https://inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] queued HTTPS inv.nadeko.net/watch?v=AllbgupanVc
+[okai] fetch https://inv.nadeko.net/watch?v=AllbgupanVc
+[mse] btn=0 x=371 y=721 pkts=557
+[tls-net] received 3610 bytes (inv.nadeko.net/watch?v=AllbgupanVc, 300ms) [h2] [reused]
+[br] https parse: count=86 len=3057 dom_nodes=86 status=418 ctype=text/html js
+[okai] sub-res fetch: CSS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/style.css?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/script.mjs?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] sub-res fetch: IMG https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca
+[tls-net] received 1276 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl, 320ms) [h2] [reused]
+[okai] sub-res CSS: status=200 1806 bytes
+[tls-net] received 1702 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 320ms) [h2] [reused]
+[tls-net] received 3593 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca, 320ms) [h2] [reused]
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=24KB
+[okai] link[0] x=1118 y=387 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=409 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=634 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=785 y=690 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] sub-res JS: status=200 2399 bytes
+[okai] sub-res IMG: status=200 3029 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/static/load.mjs
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 649Kpx
+[okai] link[0] x=1118 y=506 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=528 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=753 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=785 y=810 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[net] rx 11 KB (24 pkts) tx 9 KB (20 pkts) | tcp in 9 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 1 | nic max-batch 6 missed 0 nobuf 0 poll-gap 39ms
+[fps] 26 loops=95736 busy=25% awake: composed=1 cursor=25 mouse=94642 fetch=95728 okai=0 mplay=0
+[tls-net] received 1670 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 310ms) [h2] [reused]
+[okai] sub-res JS: status=200 3225 bytes
+[js] load event: scripts=1 ran=1 errors=0 modules=2 heap=6141KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] sub-res fetch: XHR https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/make-challenge
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 353Kpx
+[tls-net] received 916 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m, 310ms) [h2] [reused]
+[okai] sub-res XHR: status=200 177 bytes
+[js] {"result":"e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000","info":"iterations 1277"}
+[okai] sub-res done: 1 css, 1 img
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 90Kpx
+[okai] script navigation -> https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=ef4ae63c962a06be2f4d8faaec5ba46e&__goaway_elapsedTime=20
+[okai] navigate https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=ef4ae63c962a06be2f4d8faaec5ba46e&__goaway_elapsedTime=20
+[net] rx 2 KB (6 pkts) tx 1 KB (5 pkts) | tcp in 2 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 0 | nic max-batch 3 missed 0 nobuf 0 poll-gap 32ms
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v
+[okai] fetch https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=ef4ae63c962a06be2f4d8faaec5ba46e&__goaway_elapsedTime=20
+[fps] 2 loops=766 busy=11% awake: composed=1 cursor=1 mouse=0 fetch=715 okai=0 mplay=0
+[tls-net] received 2108 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v, 310ms) [h2] [reused]
+[okai] redirect 1 -> https://inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] queued HTTPS inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] received 3610 bytes (inv.nadeko.net/watch?v=AllbgupanVc, 310ms) [h2] [reused]
+[br] https parse: count=86 len=3057 dom_nodes=86 status=418 ctype=text/html js
+[okai] sub-res fetch: CSS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/style.css?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/script.mjs?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] sub-res fetch: IMG https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca
+[net] rx 6 KB (22 pkts) tx 9 KB (17 pkts) | tcp in 5 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 3 | nic max-batch 6 missed 0 nobuf 0 poll-gap 35ms
+[tls-net] received 1276 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl, 330ms) [h2] [reused]
+[tls-net] received 1704 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 320ms) [h2] [reused]
+[okai] sub-res CSS: status=200 1806 bytes
+[okai] sub-res JS: status=200 2399 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/static/load.mjs
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[tls-net] received 3593 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca, 310ms) [h2] [reused]
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 20ms (page origin 2,98) stack=24KB
+[okai] link[0] x=1118 y=387 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=409 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=634 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=788 y=690 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[fps] 1 loops=1514 busy=15% awake: composed=1 cursor=0 mouse=0 fetch=1514 okai=0 mplay=0
+[okai] sub-res IMG: status=200 3029 bytes
+[tls-net] received 1670 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 310ms) [h2] [reused]
+[okai] sub-res JS: status=200 3225 bytes
+[js] load event: scripts=1 ran=1 errors=0 modules=2 heap=6141KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] sub-res fetch: XHR https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/make-challenge
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m
+[tls-net] received 916 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m, 310ms) [h2] [reused]
+[okai] sub-res XHR: status=200 177 bytes
+[js] {"result":"e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000","info":"iterations 1277"}
+[okai] sub-res done: 1 css, 1 img
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 603Kpx
+[okai] link[0] x=1118 y=506 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=528 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=753 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=788 y=810 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[net] rx 9 KB (14 pkts) tx 3 KB (10 pkts) | tcp in 8 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 0 | nic max-batch 3 missed 0 nobuf 0 poll-gap 33ms
+[fps] 1 loops=999 busy=10% awake: composed=1 cursor=0 mouse=0 fetch=964 okai=0 mplay=0
+[okai] script navigation -> https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=09f7238b7f959ebe8e222fa83edd7405&__goaway_elapsedTime=20
+[okai] navigate https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=09f7238b7f959ebe8e222fa83edd7405&__goaway_elapsedTime=20
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v
+[okai] fetch https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=09f7238b7f959ebe8e222fa83edd7405&__goaway_elapsedTime=20
+[time] 1031 of 13000 ticks were not delivered (7%)
+[tls-net] received 2108 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v, 330ms) [h2] [reused]
+[okai] redirect 1 -> https://inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] queued HTTPS inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] received 3610 bytes (inv.nadeko.net/watch?v=AllbgupanVc, 290ms) [h2] [reused]
+[br] https parse: count=86 len=3057 dom_nodes=86 status=418 ctype=text/html js
+[okai] sub-res fetch: CSS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/style.css?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/script.mjs?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] sub-res fetch: IMG https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca
+[net] rx 6 KB (19 pkts) tx 9 KB (17 pkts) | tcp in 5 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 3 | nic max-batch 6 missed 0 nobuf 0 poll-gap 34ms
+[fps] 4 loops=1256 busy=14% awake: composed=1 cursor=3 mouse=0 fetch=1241 okai=0 mplay=0
+[tls-net] received 1702 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 320ms) [h2] [reused]
+[okai] sub-res JS: status=200 2399 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/static/load.mjs
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[tls-net] received 1276 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl, 340ms) [h2] [reused]
+[tls-net] received 3593 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca, 310ms) [h2] [reused]
+[okai] sub-res CSS: status=200 1806 bytes
+[okai] sub-res IMG: status=200 3029 bytes
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 10ms (page origin 2,98) stack=24KB
+[okai] link[0] x=1118 y=506 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=528 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=753 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=789 y=810 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[tls-net] received 1670 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 300ms) [h2] [reused]
+[okai] sub-res JS: status=200 3225 bytes
+[js] load event: scripts=1 ran=1 errors=0 modules=2 heap=6141KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] sub-res fetch: XHR https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/make-challenge
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 353Kpx
+[tls-net] received 916 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m, 310ms) [h2] [reused]
+[okai] sub-res XHR: status=200 177 bytes
+[js] {"result":"e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000","info":"iterations 1277"}
+[okai] sub-res done: 1 css, 1 img
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 90Kpx
+[net] rx 9 KB (15 pkts) tx 3 KB (10 pkts) | tcp in 8 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 0 | nic max-batch 4 missed 0 nobuf 0 poll-gap 21ms
+[fps] 1 loops=1223 busy=13% awake: composed=1 cursor=0 mouse=0 fetch=1204 okai=0 mplay=0
+[okai] script navigation -> https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=20c72ead53045e1e614e9ff538d04d89&__goaway_elapsedTime=20
+[okai] navigate https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=20c72ead53045e1e614e9ff538d04d89&__goaway_elapsedTime=20
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v
+[okai] fetch https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=20c72ead53045e1e614e9ff538d04d89&__goaway_elapsedTime=20
+[tls-net] received 2107 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v, 350ms) [h2] [reused]
+[okai] redirect 1 -> https://inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] queued HTTPS inv.nadeko.net/watch?v=AllbgupanVc
+[net] rx 2 KB (9 pkts) tx 4 KB (8 pkts) | tcp in 2 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 1 | nic max-batch 3 missed 0 nobuf 0 poll-gap 22ms
+[tls-net] received 3610 bytes (inv.nadeko.net/watch?v=AllbgupanVc, 300ms) [h2] [reused]
+[br] https parse: count=86 len=3057 dom_nodes=86 status=418 ctype=text/html js
+[okai] sub-res fetch: CSS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/style.css?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/script.mjs?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] sub-res fetch: IMG https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca
+[fps] 5 loops=1109 busy=14% awake: composed=1 cursor=4 mouse=0 fetch=1070 okai=0 mplay=0
+[tls-net] received 1276 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl, 330ms) [h2] [reused]
+[okai] sub-res CSS: status=200 1806 bytes
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=24KB
+[okai] link[0] x=1118 y=387 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=409 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=634 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=789 y=690 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[tls-net] received 3593 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca, 340ms) [h2] [reused]
+[tls-net] received 1702 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 340ms) [h2] [reused]
+[okai] sub-res JS: status=200 2399 bytes
+[okai] sub-res IMG: status=200 3029 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/static/load.mjs
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 649Kpx
+[okai] link[0] x=1118 y=506 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=528 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=753 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=789 y=810 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[tls-net] received 1670 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 300ms) [h2] [reused]
+[okai] sub-res JS: status=200 3225 bytes
+[js] load event: scripts=1 ran=1 errors=0 modules=2 heap=6141KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] sub-res fetch: XHR https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/make-challenge
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 353Kpx
+[net] rx 12 KB (23 pkts) tx 9 KB (19 pkts) | tcp in 11 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 1 | nic max-batch 6 missed 0 nobuf 0 poll-gap 28ms
+[tls-net] received 916 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m, 300ms) [h2] [reused]
+[okai] sub-res XHR: status=200 177 bytes
+[js] {"result":"e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000","info":"iterations 1277"}
+[okai] sub-res done: 1 css, 1 img
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 90Kpx
+[fps] 2 loops=1444 busy=15% awake: composed=2 cursor=0 mouse=0 fetch=1441 okai=0 mplay=0
+[okai] script navigation -> https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=b06fc2cf90d305a9badc6f38bc549a06&__goaway_elapsedTime=10
+[okai] navigate https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=b06fc2cf90d305a9badc6f38bc549a06&__goaway_elapsedTime=10
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v
+[okai] fetch https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=b06fc2cf90d305a9badc6f38bc549a06&__goaway_elapsedTime=10
+[tls-net] received 2111 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v, 310ms) [h2] [reused]
+[okai] redirect 1 -> https://inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] queued HTTPS inv.nadeko.net/watch?v=AllbgupanVc
+[net] rx 3 KB (12 pkts) tx 4 KB (8 pkts) | tcp in 2 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 1 | nic max-batch 3 missed 0 nobuf 0 poll-gap 29ms
+[fps] 3 loops=813 busy=9% awake: composed=0 cursor=3 mouse=0 fetch=764 okai=0 mplay=0
+[tls-net] received 3610 bytes (inv.nadeko.net/watch?v=AllbgupanVc, 300ms) [h2] [reused]
+[br] https parse: count=86 len=3057 dom_nodes=86 status=418 ctype=text/html js
+[okai] sub-res fetch: CSS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/style.css?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/script.mjs?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] sub-res fetch: IMG https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca
+[tls-net] received 3593 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca, 320ms) [h2] [reused]
+[tls-net] received 1704 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 320ms) [h2] [reused]
+[okai] sub-res JS: status=200 2399 bytes
+[okai] sub-res IMG: status=200 3029 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/static/load.mjs
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[tls-net] received 1276 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl, 350ms) [h2] [reused]
+[okai] sub-res CSS: status=200 1806 bytes
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=24KB
+[okai] link[0] x=1118 y=506 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=528 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=753 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=785 y=810 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[tls-net] received 1670 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 310ms) [h2] [reused]
+[okai] sub-res JS: status=200 3225 bytes
+[js] load event: scripts=1 ran=1 errors=0 modules=2 heap=6141KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] sub-res fetch: XHR https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/make-challenge
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m
+[net] rx 12 KB (25 pkts) tx 9 KB (22 pkts) | tcp in 11 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 1 | nic max-batch 6 missed 0 nobuf 0 poll-gap 42ms
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 353Kpx
+[fps] 1 loops=1460 busy=17% awake: composed=1 cursor=0 mouse=0 fetch=1460 okai=0 mplay=0
+[tls-net] received 916 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m, 290ms) [h2] [reused]
+[okai] sub-res XHR: status=200 177 bytes
+[js] {"result":"e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000","info":"iterations 1277"}
+[okai] sub-res done: 1 css, 1 img
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 90Kpx
+[okai] key 6 focus=-1 addr=0
+[okai] script navigation -> https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=b5800712e548928153d924ead0762259&__goaway_elapsedTime=10
+[okai] navigate https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=b5800712e548928153d924ead0762259&__goaway_elapsedTime=10
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v
+[okai] fetch https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=b5800712e548928153d924ead0762259&__goaway_elapsedTime=10
+[net] rx 1 KB (4 pkts) tx 2 KB (4 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 1 | nic max-batch 3 missed 0 nobuf 0 poll-gap 42ms
+[fps] 1 loops=759 busy=12% awake: composed=1 cursor=0 mouse=0 fetch=711 okai=0 mplay=0
+[tls-net] received 2110 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v, 320ms) [h2] [reused]
+[okai] redirect 1 -> https://inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] queued HTTPS inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] received 3610 bytes (inv.nadeko.net/watch?v=AllbgupanVc, 300ms) [h2] [reused]
+[br] https parse: count=86 len=3057 dom_nodes=86 status=418 ctype=text/html js
+[okai] sub-res fetch: CSS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/style.css?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/script.mjs?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] sub-res fetch: IMG https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca
+[tls-net] received 1276 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl, 320ms) [h2] [reused]
+[okai] sub-res CSS: status=200 1806 bytes
+[tls-net] received 1704 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 330ms) [h2] [reused]
+[tls-net] received 3593 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca, 310ms) [h2] [reused]
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 10ms (page origin 2,98) stack=24KB
+[okai] link[0] x=1118 y=387 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=409 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=634 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=785 y=690 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] sub-res JS: status=200 2399 bytes
+[okai] sub-res IMG: status=200 3029 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/static/load.mjs
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 649Kpx
+[okai] link[0] x=1118 y=506 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=528 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=753 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=785 y=810 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[net] rx 13 KB (25 pkts) tx 9 KB (19 pkts) | tcp in 11 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 1 | nic max-batch 6 missed 0 nobuf 0 poll-gap 33ms
+[fps] 1 loops=1402 busy=18% awake: composed=1 cursor=0 mouse=0 fetch=1402 okai=0 mplay=0
+[tls-net] received 1670 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 320ms) [h2] [reused]
+[okai] sub-res JS: status=200 3225 bytes
+[js] load event: scripts=1 ran=1 errors=0 modules=2 heap=6141KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] sub-res fetch: XHR https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/make-challenge
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 353Kpx
+[tls-net] received 916 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m, 300ms) [h2] [reused]
+[okai] sub-res XHR: status=200 177 bytes
+[js] {"result":"e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000","info":"iterations 1277"}
+[okai] sub-res done: 1 css, 1 img
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 90Kpx
+[okai] script navigation -> https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=97e7f231aeb0323b420b13fe1b638f1f&__goaway_elapsedTime=20
+[okai] navigate https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=97e7f231aeb0323b420b13fe1b638f1f&__goaway_elapsedTime=20
+[net] rx 2 KB (7 pkts) tx 1 KB (5 pkts) | tcp in 2 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 0 | nic max-batch 3 missed 0 nobuf 0 poll-gap 29ms
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v
+[okai] fetch https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=97e7f231aeb0323b420b13fe1b638f1f&__goaway_elapsedTime=20
+[fps] 1 loops=742 busy=11% awake: composed=1 cursor=0 mouse=0 fetch=691 okai=0 mplay=0
+[tls-net] received 2112 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v, 310ms) [h2] [reused]
+[okai] redirect 1 -> https://inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] queued HTTPS inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] received 3610 bytes (inv.nadeko.net/watch?v=AllbgupanVc, 300ms) [h2] [reused]
+[br] https parse: count=86 len=3057 dom_nodes=86 status=418 ctype=text/html js
+[okai] sub-res fetch: CSS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/style.css?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/script.mjs?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] sub-res fetch: IMG https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca
+[tls-net] received 3593 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca, 300ms) [h2] [reused]
+[okai] sub-res IMG: status=200 3029 bytes
+[tls-net] received 1276 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl, 310ms) [h2] [reused]
+[tls-net] received 1704 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 310ms) [h2] [reused]
+[okai] sub-res CSS: status=200 1806 bytes
+[okai] sub-res JS: status=200 2399 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/static/load.mjs
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 10ms (page origin 2,98) stack=24KB
+[okai] link[0] x=1118 y=506 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=528 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=753 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=785 y=810 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[net] rx 13 KB (26 pkts) tx 11 KB (22 pkts) | tcp in 11 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 1 | nic max-batch 6 missed 0 nobuf 0 poll-gap 33ms
+[fps] 1 loops=1487 busy=15% awake: composed=1 cursor=0 mouse=0 fetch=1487 okai=0 mplay=0
+[time] 1027 of 14000 ticks were not delivered (7%)
+[tls-net] received 1670 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 300ms) [h2] [reused]
+[okai] sub-res JS: status=200 3225 bytes
+[js] load event: scripts=1 ran=1 errors=0 modules=2 heap=6141KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] sub-res fetch: XHR https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/make-challenge
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 353Kpx
+[tls-net] received 916 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m, 300ms) [h2] [reused]
+[okai] sub-res XHR: status=200 177 bytes
+[js] {"result":"e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000","info":"iterations 1277"}
+[okai] sub-res done: 1 css, 1 img
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 90Kpx
+[net] rx 2 KB (6 pkts) tx 1 KB (5 pkts) | tcp in 2 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 0 | nic max-batch 3 missed 0 nobuf 0 poll-gap 17ms
+[fps] 1 loops=884 busy=7% awake: composed=1 cursor=0 mouse=0 fetch=838 okai=0 mplay=0
+[okai] script navigation -> https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=893900fdc07f59647c8dddc9657128b6&__goaway_elapsedTime=10
+[okai] navigate https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=893900fdc07f59647c8dddc9657128b6&__goaway_elapsedTime=10
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v
+[okai] fetch https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=893900fdc07f59647c8dddc9657128b6&__goaway_elapsedTime=10
+[tls-net] received 2111 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v, 350ms) [h2] [reused]
+[okai] redirect 1 -> https://inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] queued HTTPS inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] received 3610 bytes (inv.nadeko.net/watch?v=AllbgupanVc, 310ms) [h2] [reused]
+[br] https parse: count=86 len=3057 dom_nodes=86 status=418 ctype=text/html js
+[okai] sub-res fetch: CSS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/style.css?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/script.mjs?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] sub-res fetch: IMG https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca
+[net] rx 6 KB (18 pkts) tx 9 KB (16 pkts) | tcp in 5 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 3 | nic max-batch 6 missed 0 nobuf 0 poll-gap 28ms
+[fps] 1 loops=1430 busy=15% awake: composed=1 cursor=0 mouse=0 fetch=1424 okai=0 mplay=0
+[tls-net] received 1276 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl, 310ms) [h2] [reused]
+[okai] sub-res CSS: status=200 1806 bytes
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=24KB
+[okai] link[0] x=1118 y=387 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=409 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=634 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=795 y=690 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[tls-net] received 3593 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca, 330ms) [h2] [reused]
+[tls-net] received 1703 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 330ms) [h2] [reused]
+[okai] sub-res JS: status=200 2399 bytes
+[okai] sub-res IMG: status=200 3029 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/static/load.mjs
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 649Kpx
+[okai] link[0] x=1118 y=506 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=528 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=753 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=795 y=810 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[tls-net] received 1670 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 300ms) [h2] [reused]
+[okai] sub-res JS: status=200 3225 bytes
+[js] load event: scripts=1 ran=1 errors=0 modules=2 heap=6141KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] sub-res fetch: XHR https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/make-challenge
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 353Kpx
+[tls-net] received 916 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m, 330ms) [h2] [reused]
+[okai] sub-res XHR: status=200 177 bytes
+[js] {"result":"e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000","info":"iterations 1277"}
+[okai] sub-res done: 1 css, 1 img
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 90Kpx
+[net] rx 9 KB (14 pkts) tx 3 KB (10 pkts) | tcp in 8 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 0 | nic max-batch 3 missed 0 nobuf 0 poll-gap 20ms
+[fps] 1 loops=1095 busy=15% awake: composed=1 cursor=0 mouse=0 fetch=1072 okai=0 mplay=0
+[okai] script navigation -> https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=8e9886518dbf9e20ecc334d98e67d160&__goaway_elapsedTime=10
+[okai] navigate https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=8e9886518dbf9e20ecc334d98e67d160&__goaway_elapsedTime=10
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v
+[okai] fetch https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=8e9886518dbf9e20ecc334d98e67d160&__goaway_elapsedTime=10
+[tls-net] received 2108 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v, 320ms) [h2] [reused]
+[okai] redirect 1 -> https://inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] queued HTTPS inv.nadeko.net/watch?v=AllbgupanVc
+[net] rx 2 KB (9 pkts) tx 4 KB (8 pkts) | tcp in 2 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 2 fetch 1 | nic max-batch 3 missed 0 nobuf 0 poll-gap 21ms
+[tls-net] received 3610 bytes (inv.nadeko.net/watch?v=AllbgupanVc, 340ms) [h2] [reused]
+[br] https parse: count=86 len=3057 dom_nodes=86 status=418 ctype=text/html js
+[okai] sub-res fetch: CSS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/style.css?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/script.mjs?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] sub-res fetch: IMG https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca
+[fps] 1 loops=1036 busy=18% awake: composed=1 cursor=0 mouse=0 fetch=1008 okai=0 mplay=0
+[tls-net] received 1276 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl, 320ms) [h2] [reused]
+[tls-net] received 1702 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 310ms) [h2] [reused]
+[okai] sub-res CSS: status=200 1806 bytes
+[okai] sub-res JS: status=200 2399 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/static/load.mjs
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=24KB
+[okai] link[0] x=1118 y=387 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=409 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=634 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=795 y=690 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[tls-net] received 3593 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca, 340ms) [h2] [reused]
+[okai] sub-res IMG: status=200 3029 bytes
+[tls-net] received 1670 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 320ms) [h2] [reused]
+[okai] sub-res JS: status=200 3225 bytes
+[js] load event: scripts=1 ran=1 errors=0 modules=2 heap=6141KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] sub-res fetch: XHR https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/make-challenge
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m
+[net] rx 12 KB (26 pkts) tx 9 KB (19 pkts) | tcp in 11 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 1 fetch 1 | nic max-batch 6 missed 0 nobuf 0 poll-gap 36ms
+[tls-net] received 916 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m, 300ms) [h2] [reused]
+[okai] sub-res XHR: status=200 177 bytes
+[js] {"result":"e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000","info":"iterations 1277"}
+[okai] sub-res done: 1 css, 1 img
+[okai] render tab=0 doc_h=936 scroll=0 in 10ms painted 603Kpx
+[okai] link[0] x=1118 y=506 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=528 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=753 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=795 y=810 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[fps] 1 loops=1476 busy=14% awake: composed=1 cursor=0 mouse=0 fetch=1474 okai=0 mplay=0
+[okai] script navigation -> https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=61fe0ecf55de4e9eec3b4582f15d93f0&__goaway_elapsedTime=10
+[okai] navigate https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=61fe0ecf55de4e9eec3b4582f15d93f0&__goaway_elapsedTime=10
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v
+[okai] fetch https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=61fe0ecf55de4e9eec3b4582f15d93f0&__goaway_elapsedTime=10
+[tls-net] received 2104 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v, 310ms) [h2] [reused]
+[okai] redirect 1 -> https://inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] queued HTTPS inv.nadeko.net/watch?v=AllbgupanVc
+[net] rx 3 KB (10 pkts) tx 4 KB (9 pkts) | tcp in 2 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 1 fetch 1 | nic max-batch 3 missed 0 nobuf 0 poll-gap 25ms
+[fps] 1 loops=843 busy=7% awake: composed=1 cursor=0 mouse=0 fetch=795 okai=0 mplay=0
+[tls-net] received 3610 bytes (inv.nadeko.net/watch?v=AllbgupanVc, 310ms) [h2] [reused]
+[br] https parse: count=86 len=3057 dom_nodes=86 status=418 ctype=text/html js
+[okai] sub-res fetch: CSS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/style.css?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/script.mjs?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] sub-res fetch: IMG https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca
+[tls-net] received 1276 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl, 320ms) [h2] [reused]
+[okai] sub-res CSS: status=200 1806 bytes
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=24KB
+[okai] link[0] x=1118 y=387 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=409 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=634 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=792 y=690 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[tls-net] received 1703 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 340ms) [h2] [reused]
+[tls-net] received 3593 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca, 340ms) [h2] [reused]
+[okai] sub-res JS: status=200 2399 bytes
+[okai] sub-res IMG: status=200 3029 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/static/load.mjs
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 649Kpx
+[okai] link[0] x=1118 y=506 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=528 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=753 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=792 y=810 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[tls-net] received 1670 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 300ms) [h2] [reused]
+[okai] sub-res JS: status=200 3225 bytes
+[js] load event: scripts=1 ran=1 errors=0 modules=2 heap=6141KB live=0KB gcs=0 [str=0 obj=0 shape=0 code=0 arr=0 bytes=0 ptrs=0 gcms=0 markms=0]
+[okai] sub-res fetch: XHR https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/make-challenge
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m
+[net] rx 12 KB (27 pkts) tx 9 KB (18 pkts) | tcp in 11 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 1 fetch 1 | nic max-batch 6 missed 0 nobuf 0 poll-gap 39ms
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 353Kpx
+[fps] 1 loops=1443 busy=18% awake: composed=1 cursor=0 mouse=0 fetch=1443 okai=0 mplay=0
+[tls-net] received 916 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/m, 300ms) [h2] [reused]
+[okai] sub-res XHR: status=200 177 bytes
+[js] {"result":"e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000","info":"iterations 1277"}
+[okai] sub-res done: 1 css, 1 img
+[okai] render tab=0 doc_h=936 scroll=0 in 0ms painted 90Kpx
+[okai] script navigation -> https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=605e09401bf380c837014a94845e21c4&__goaway_elapsedTime=20
+[okai] navigate https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=605e09401bf380c837014a94845e21c4&__goaway_elapsedTime=20
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v
+[okai] fetch https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/verify-challenge?__goaway_token=e67401a6572d0c7e6319d9f74e16940c8fd3225926d6d63af4628595eb070c4efd04000000000000&__goaway_challenge=js-pow-sha256&__goaway_redirect=https%3A%2F%2Finv.nadeko.net%2Fwatch%3Fv%3DAllbgupanVc&__goaway_id=605e09401bf380c837014a94845e21c4&__goaway_elapsedTime=20
+[net] rx 1 KB (4 pkts) tx 2 KB (4 pkts) | tcp in 0 KB rto 0 fast 0 ooo 0 ooo-full 0 ring-full 0 | unread 0 KB (max 0 KB) socks 1 fetch 1 | nic max-batch 3 missed 0 nobuf 0 poll-gap 28ms
+[fps] 1 loops=771 busy=9% awake: composed=1 cursor=0 mouse=0 fetch=720 okai=0 mplay=0
+[tls-net] received 2112 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/v, 310ms) [h2] [reused]
+[okai] redirect 1 -> https://inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] queued HTTPS inv.nadeko.net/watch?v=AllbgupanVc
+[tls-net] received 3610 bytes (inv.nadeko.net/watch?v=AllbgupanVc, 330ms) [h2] [reused]
+[br] https parse: count=86 len=3057 dom_nodes=86 status=418 ctype=text/html js
+[okai] sub-res fetch: CSS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/style.css?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/script.mjs?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[okai] sub-res fetch: IMG https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?cacheBust=EwtaXIzHkeI4Kgm0DmhNFw
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca
+[tls-net] received 1705 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s, 310ms) [h2] [reused]
+[okai] sub-res JS: status=200 2399 bytes
+[okai] sub-res fetch: JS https://inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/static/load.mjs
+[tls-net] queued HTTPS inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/challenge/js-pow-sha256/s
+[tls-net] received 1276 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/anubis/styl, 340ms) [h2] [reused]
+[tls-net] received 3593 bytes (inv.nadeko.net/.well-known/.git.gammaspectra.live/git/go-away/cmd/go-away/assets/static/logo.png?ca, 330ms) [h2] [reused]
+[okai] sub-res CSS: status=200 1806 bytes
+[okai] sub-res IMG: status=200 3029 bytes
+[okai] render tab=0 1916x936 doc_h=936 scroll=0 in 0ms (page origin 2,98) stack=24KB
+[okai] link[0] x=1118 y=506 w=63 h=22 href=https://git.gammaspectra.live/git/go-away
+[okai] link[1] x=838 y=528 w=407 h=22 href=https://thelibre.news/foss-infrastructure-is-under-attack-by-ai-companies/
+[okai] link[2] x=721 y=753 w=180 h=18 href=https://nadeko.net/contact
+[okai] link[3] x=789 y=810 w=63 h=22 href=https://git.gammaspectra.live/git/go-away

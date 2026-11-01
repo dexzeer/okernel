@@ -59,6 +59,16 @@ static int num(const char* s, int len, int* i, int32_t* out16) {
     return 1;
 }
 
+static uint32_t w_isqrt64(uint64_t v) {
+    uint64_t r = 0, bit = (uint64_t)1 << 62;
+    while (bit > v) bit >>= 2;
+    while (bit) {
+        if (v >= r + bit) { v -= r + bit; r = (r >> 1) + bit; } else r >>= 1;
+        bit >>= 2;
+    }
+    return (uint32_t)r;
+}
+
 static int32_t attr_num(struct wdom* d, int el, int atom, int32_t dflt, int32_t pct_basis16) {
     int vl;
     const char* v = wdom_attr(d, el, atom, &vl);
@@ -519,6 +529,7 @@ struct sctx {
     uint32_t current;
     uint8_t alpha;
     int depth;
+    int32_t bx, by;       // percentage basis (16.16): the viewBox, or the viewport without one
 };
 
 static void render_el(struct sctx* c, int el, struct mat m, int in_use);
@@ -611,27 +622,30 @@ static void render_el(struct sctx* c, int el, struct mat m, int in_use) {
         break;
     }
     case T_rect: {
-        int32_t x = attr_num(d, el, A_x, 0, 0), y = attr_num(d, el, A_y, 0, 0);
-        int32_t w = attr_num(d, el, A_width, 0, 0), h = attr_num(d, el, A_height, 0, 0);
-        int32_t rx = attr_num(d, el, A_rx, -1, 0), ry = attr_num(d, el, A_ry, -1, 0);
+        int32_t bx = c->bx, by = c->by;
+        int32_t x = attr_num(d, el, A_x, 0, bx), y = attr_num(d, el, A_y, 0, by);
+        int32_t w = attr_num(d, el, A_width, 0, bx), h = attr_num(d, el, A_height, 0, by);
+        int32_t rx = attr_num(d, el, A_rx, -1, bx), ry = attr_num(d, el, A_ry, -1, by);
         if (rx < 0) rx = ry > 0 ? ry : 0;
         if (ry < 0) ry = rx;
         if (w > 0 && h > 0) build_rect(&p, x, y, w, h, rx, ry);
         break;
     }
     case T_circle: {
-        int32_t r = attr_num(d, el, A_r, 0, 0);
-        if (r > 0) build_ellipse(&p, attr_num(d, el, A_cx, 0, 0), attr_num(d, el, A_cy, 0, 0), r, r);
+        int32_t bx = c->bx, by = c->by, br = (int32_t)w_isqrt64(((int64_t)bx * bx + (int64_t)by * by) / 2);
+        int32_t r = attr_num(d, el, A_r, 0, br);
+        if (r > 0) build_ellipse(&p, attr_num(d, el, A_cx, 0, bx), attr_num(d, el, A_cy, 0, by), r, r);
         break;
     }
     case T_ellipse: {
-        int32_t rx = attr_num(d, el, A_rx, 0, 0), ry = attr_num(d, el, A_ry, 0, 0);
-        if (rx > 0 && ry > 0) build_ellipse(&p, attr_num(d, el, A_cx, 0, 0), attr_num(d, el, A_cy, 0, 0), rx, ry);
+        int32_t bx = c->bx, by = c->by;
+        int32_t rx = attr_num(d, el, A_rx, 0, bx), ry = attr_num(d, el, A_ry, 0, by);
+        if (rx > 0 && ry > 0) build_ellipse(&p, attr_num(d, el, A_cx, 0, bx), attr_num(d, el, A_cy, 0, by), rx, ry);
         break;
     }
     case T_line:
-        pb_point(&p, attr_num(d, el, A_x1, 0, 0), attr_num(d, el, A_y1, 0, 0), 1);
-        pb_point(&p, attr_num(d, el, A_x2, 0, 0), attr_num(d, el, A_y2, 0, 0), 0);
+        pb_point(&p, attr_num(d, el, A_x1, 0, c->bx), attr_num(d, el, A_y1, 0, c->by), 1);
+        pb_point(&p, attr_num(d, el, A_x2, 0, c->bx), attr_num(d, el, A_y2, 0, c->by), 0);
         break;
     case T_polyline: case T_polygon: {
         int pl;
@@ -684,6 +698,7 @@ void wsvg_paint(struct wsurf* s, struct wdom* d, const struct wstyleset* ss, int
     int32_t v4[4];
     int vi = 0, k = 0;
     while (vb && k < 4 && num(vb, vl, &vi, &v4[k])) k++;
+    if (vb && k == 4 && (v4[2] <= 0 || v4[3] <= 0)) return;     // a viewBox with no width or height disables rendering
     if (vb && k == 4 && v4[2] > 0 && v4[3] > 0) {
         // scale = viewport px / viewBox user units, in 16.16
         int32_t sx = w_div64((int64_t)w * 65536 * 65536, v4[2]);
@@ -698,6 +713,10 @@ void wsvg_paint(struct wsurf* s, struct wdom* d, const struct wstyleset* ss, int
     }
     int old[4];
     ws_push_clip(s, x, y, x + w, y + h, old);
+    if (ss) {                                   // the root element's background paints over the whole image
+        const struct wstyle* rs = css_style_of(ss, node);
+        if (rs && (rs->bg_color >> 24)) ws_fill_rect(s, x, y, w, h, (rs->bg_color & 0xFFFFFFu) | ((uint32_t)(((rs->bg_color >> 24) * alpha + 127) / 255) << 24));
+    }
     struct sctx c;
     c.s = s;
     c.d = d;
@@ -705,6 +724,8 @@ void wsvg_paint(struct wsurf* s, struct wdom* d, const struct wstyleset* ss, int
     c.current = current_color;
     c.alpha = alpha;
     c.depth = 0;
+    c.bx = w << 16; c.by = h << 16;
+    if (vb && k == 4 && v4[2] > 0 && v4[3] > 0) { c.bx = v4[2]; c.by = v4[3]; }
     render_children(&c, node, m);
     ws_pop_clip(s, old);
 }

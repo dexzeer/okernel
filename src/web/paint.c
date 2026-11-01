@@ -402,6 +402,7 @@ void wpaint(const struct wlayout* L, struct wsurf* s, int scroll_y, const struct
             const struct dtext* t = wlay_text_ref(L, d->ref);
             struct wfont f;
             f.family = t->family; f.bold = t->bold; f.italic = t->italic; f.px = t->px;
+            f.webfont = t->webfont;
             int32_t base = d->a - oy;
             uint32_t c = apply_alpha(d->color, d->alpha);
             if (y > s->cy1 || y + h < s->cy0) break;
@@ -425,6 +426,58 @@ void wpaint(const struct wlayout* L, struct wsurf* s, int scroll_y, const struct
             }
             break;
         }
+        case DI_MARKS: {
+            const struct dtext* t = wlay_text_ref(L, d->ref);
+            if (!t || !t->emph_cp) break;
+            if (y > s->cy1 || y + h < s->cy0) break;
+            struct wfont f;
+            f.family = t->family; f.bold = t->bold; f.italic = t->italic; f.px = t->px;
+            f.webfont = t->webfont;
+            struct wfont m50 = f;
+            m50.px = (uint16_t)(t->px / 2);
+            struct wfmetrics m5;
+            wfont_metrics(&m50, &m5);
+            char mb[4];
+            int ml = w_utf8_enc(t->emph_cp, mb);
+            int32_t mark_adv = wfont_advance(&m50, t->emph_cp);
+            uint32_t c = apply_alpha(d->color, d->alpha);
+            const char* txt = text + t->t0;
+            if (t->vmode) {
+                // vertical: the item rect is the annotation band (LU); one mark
+                // per base glyph cell along the band, centered across it
+                int32_t bx = d->x, by = d->y - oy, bw = d->w, bh = d->h;
+                int32_t em5 = m5.ascent + m5.descent;
+                int32_t at = t->vup ? by + bh : by;
+                for (uint32_t i = 0; i < t->tl;) {
+                    uint32_t cp;
+                    uint32_t n = (uint32_t)w_utf8_dec(txt + i, (int)(t->tl - i), &cp);
+                    if (!n) break;
+                    int32_t adv = wfont_advance(&f, cp) + t->letter_sp;
+                    if (t->vup) at -= adv;
+                    if (cp != ' ' && cp != 0x3000 && cp != '\n' && cp != '\t' && adv > 0) {
+                        int32_t top = at + (adv - em5) / 2;
+                        int32_t mx = bx + (bw - mark_adv) / 2;
+                        wfont_draw(s, &m50, mx, top + m5.ascent, c, mb, ml, 0, 0);
+                    }
+                    if (!t->vup) at += adv;
+                    i += n;
+                }
+                break;
+            }
+            int32_t base = d->a - oy;
+            int32_t at = d->x;
+            for (uint32_t i = 0; i < t->tl;) {
+                uint32_t cp;
+                uint32_t n = (uint32_t)w_utf8_dec(txt + i, (int)(t->tl - i), &cp);
+                if (!n) break;
+                int32_t adv = wfont_advance(&f, cp) + t->letter_sp;
+                if (cp != ' ' && cp != 0x3000 && cp != '\n' && cp != '\t')
+                    wfont_draw(s, &m50, at + (adv - mark_adv) / 2, base, c, mb, ml, 0, 0);
+                at += adv;
+                i += n;
+            }
+            break;
+        }
         case DI_IMAGE: {
             const struct wimg* im = env && env->image ? env->image(env->ctx, d->a) : 0;
             if (im) wpaint_image(s, im, x, y, w, h, d->alpha);
@@ -432,25 +485,36 @@ void wpaint(const struct wlayout* L, struct wsurf* s, int scroll_y, const struct
         }
         case DI_BGIMG: {
             const struct dbgimg* bgi = wlay_bgimg(L, d->ref);
-            const struct wimg* im = env && env->image ? env->image(env->ctx, bgi->img) : 0;
-            if (!im) break;
+            struct wdom* sdom = 0; const struct wstyleset* sss = 0; int sroot = -1;
+            int is_svg = env && env->svg && env->svg(env->ctx, bgi->img, &sdom, &sss, &sroot);
+            const struct wimg* im = !is_svg && env && env->image ? env->image(env->ctx, bgi->img) : 0;
+            if (!im && !is_svg) break;
             int o2[4];
             ws_push_clip(s, x, y, x + w, y + h, o2);
-            int tw = LU_ROUND(bgi->iw), th = LU_ROUND(bgi->ih);
-            if (tw < 1) tw = 1;
-            if (th < 1) th = 1;
-            int ix = LU_ROUND(bgi->ix), iy = LU_ROUND(bgi->iy - oy);
-            int rx = bgi->repeat == BG_REPEAT || bgi->repeat == BG_REPEAT_X;
-            int ry = bgi->repeat == BG_REPEAT || bgi->repeat == BG_REPEAT_Y;
-            int sx = ix, sy = iy;
-            if (rx) while (sx > s->cx0) sx -= tw;
-            if (ry) while (sy > s->cy0) sy -= th;
+            int32_t tw = bgi->iw, th = bgi->ih, ix = bgi->ix, iy = bgi->iy - oy;
+            int32_t stx = bgi->stepx > 0 ? bgi->stepx : tw, sty = bgi->stepy > 0 ? bgi->stepy : th;
+            if (stx < 1) stx = 1;
+            if (sty < 1) sty = 1;
+            int32_t cx0 = s->cx0 << 6, cy0 = s->cy0 << 6, cx1 = s->cx1 << 6, cy1 = s->cy1 << 6;
+            // the first tile that can reach the clip
+            int32_t sx = ix, sy = iy;
+            if (bgi->rx && sx + tw > cx0) sx -= ((sx + tw - cx0 - 1) / stx) * stx;
+            else if (bgi->rx && sx + tw <= cx0) sx += ((cx0 - sx - tw) / stx) * stx;
+            if (bgi->ry && sy + th > cy0) sy -= ((sy + th - cy0 - 1) / sty) * sty;
+            else if (bgi->ry && sy + th <= cy0) sy += ((cy0 - sy - th) / sty) * sty;
             int count = 0;
-            for (int yy = sy; yy < (ry ? s->cy1 : sy + 1); yy += th)
-                for (int xx = sx; xx < (rx ? s->cx1 : sx + 1); xx += tw) {
+            for (int32_t yy = sy; yy < (bgi->ry ? cy1 : sy + 1); yy += sty) {
+                for (int32_t xx = sx; xx < (bgi->rx ? cx1 : sx + 1); xx += stx) {
                     if (++count > 4000) break;
-                    wpaint_image(s, im, xx, yy, tw, th, d->alpha);
+                    int X = LU_ROUND(xx), Y = LU_ROUND(yy);
+                    int W = LU_ROUND(xx + tw) - X, H = LU_ROUND(yy + th) - Y;
+                    if (W < 1) W = 1;
+                    if (H < 1) H = 1;
+                    if (is_svg) wsvg_paint(s, sdom, sss, sroot, X, Y, W, H, 0xFF000000, d->alpha);
+                    else wpaint_image(s, im, X, Y, W, H, d->alpha);
                 }
+                if (count > 4000) break;
+            }
             ws_pop_clip(s, o2);
             break;
         }
@@ -530,12 +594,23 @@ static uint32_t item_sig(const struct wlayout* L, const struct ditem* d, const c
         *margin = 4 + (t ? t->px / 4 : 0);                 // italic overhang, descenders, decorations
         break;
     }
+    case DI_MARKS: {
+        const struct dtext* t = wlay_text_ref(L, d->ref);
+        if (t) {
+            h = hm(h, t->family | (uint32_t)t->bold << 8 | (uint32_t)t->italic << 16);
+            h = hm(h, t->px | (uint32_t)t->emph_cp << 16);
+            h = hm(h, (uint32_t)t->letter_sp); h = hm(h, (uint32_t)t->width);
+            for (uint32_t i = 0; i < t->tl; i++) h = hm(h, (uint8_t)text[t->t0 + i]);
+        }
+        *margin = 4 + (t ? t->px / 4 : 0);
+        break;
+    }
     case DI_IMAGE:
     case DI_BGIMG: {
         int id = d->a;
         if (d->kind == DI_BGIMG) {
             const struct dbgimg* g = wlay_bgimg(L, d->ref);
-            if (g) { id = g->img; h = hm(h, (uint32_t)g->ix); h = hm(h, (uint32_t)g->iy); h = hm(h, (uint32_t)g->iw); h = hm(h, (uint32_t)g->ih); h = hm(h, g->repeat); }
+            if (g) { id = g->img; h = hm(h, (uint32_t)g->ix); h = hm(h, (uint32_t)g->iy); h = hm(h, (uint32_t)g->iw); h = hm(h, (uint32_t)g->ih); h = hm(h, (uint32_t)g->stepx); h = hm(h, (uint32_t)g->stepy); h = hm(h, (uint32_t)g->rx | (uint32_t)g->ry << 1); }
         }
         uint32_t s = env && env->image_sig ? env->image_sig(env->ctx, id) : 0;
         if (!s) *always = 1; else h = hm(h, s);
@@ -590,7 +665,7 @@ static void item_rect(const struct ditem* d, int32_t scroll_lu, int margin, int 
     int x = LU_ROUND(d->x), y = LU_ROUND(d->y - oy);
     int w = LU_ROUND(d->x + d->w) - x, h = LU_ROUND(d->y - oy + d->h) - y;
     r->x0 = x - margin; r->y0 = y - margin; r->x1 = x + (w > 0 ? w : 1) + margin; r->y1 = y + (h > 0 ? h : 1) + margin;
-    if (d->kind == DI_TEXT) { r->y0 -= margin; r->y1 += margin; }   // the item's own box is the line box; glyphs may leave it a little
+    if (d->kind == DI_TEXT || d->kind == DI_MARKS) { r->y0 -= margin; r->y1 += margin; }   // the item's own box is the line box; glyphs may leave it a little
     if (r->x0 < 0) r->x0 = 0;
     if (r->y0 < 0) r->y0 = 0;
     if (r->x1 > sw) r->x1 = sw;

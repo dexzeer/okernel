@@ -37,6 +37,7 @@ enum { RK_IMG, RK_SVG, RK_INPUT_TEXT, RK_INPUT_BUTTON, RK_CHECKBOX, RK_RADIO, RK
 #define BF_MARKER        0x1000   // list item with an outside marker (text in t0/tl)
 #define BF_RAWTEXT       0x2000   // LB_TEXT whose t0/tl index wlayout.text (generated content)
 #define BF_POSITIONED    0x4000   // position != static (containing block for abs)
+#define BF_CLAMPED       0x8000   // after the clamp point of a line-clamp container: not laid out, not painted
 
 struct lbox {
     int32_t node;                 // DOM node, -1 anonymous
@@ -69,10 +70,17 @@ struct lbox {
     int32_t mo_w, mo_h, mo_m[4], mo_cm[4], mo_base, mo_lbase;
     uint16_t mo_flags;
     uint8_t mo_ok;
+    // writing modes: pst = the computed (physical) style, what paints; st = the style as the PARENT's layout sees it (its frame);
+    // st_in = the style in the box's own frame (what its own layout reads). Equal to st when both frames are the same.
+    const struct wstyle* pst;
+    const struct wstyle* st_in;
+    // scrolling: ux/uy = absolute origin before scroll offsets (and sticky shifts of ancestors included), sw/sh = scrollable overflow extent
+    // of a scroll container relative to its padding box, sox/soy = its scroll offset
+    int32_t ux, uy, sw, sh, sox, soy;
 };
 
 // IFC fragment
-enum { FR_TEXT, FR_ATOMIC, FR_IBOX, FR_MARKER };
+enum { FR_TEXT, FR_ATOMIC, FR_IBOX, FR_MARKER, FR_MARKS };
 struct lfrag {
     uint8_t kind;
     uint8_t first, last;          // FR_IBOX: box starts/ends on this line
@@ -84,6 +92,9 @@ struct lfrag {
 };
 
 struct bfloat { int32_t x, y, w, h; uint8_t right; };
+
+// a CSS counter in scope while the box tree is built (lay_tree.c)
+struct lctr { char name[28]; int32_t val; uint8_t rev; int32_t creator; };
 
 struct wlayout {
     struct wdom* d;
@@ -123,9 +134,28 @@ struct wlayout {
     int fl_base;                  // first float of the current BFC
     struct wstyle* anon_chunk[512]; // anonymous-box styles (chunks of 128)
     int nanon_chunk, anon_used;
+    int32_t bal_w[16];            // text-wrap: balance: the measure chosen for each paragraph (0 = the full width)
+    int seg_lines[16], bal_seg;
+    int ifc_balancing;            // text-wrap: balance in progress (no nested balancing)
+    int wm_orth;                  // inside a box whose frame differs from its parent's: no layout memo
+    const struct wstyle* wm_key[64];    // logical style cache: (physical style, frame) -> copy
+    uint8_t wm_keyf[64];
+    const struct wstyle* wm_val[64];
     uint8_t alpha;              // current group opacity during DL emission
     int fixed_ctx;                // emitting a fixed subtree
     int depth;
+    // active paint transform (CSS transform scale around the transform-origin):
+    // x' = x*psx/65536 + poff_x; sizes scale by psx/psy
+    int32_t poff_x, poff_y;
+    int32_t psx, psy;
+    // line-clamp: the lines the container being laid out still allows (-1 = no container), and the ellipsis frag reserved on its last line
+    int clamp_left;
+    int clamp_skip;              // inside a BFC descendant of a legacy -webkit-line-clamp: lines render but do not count
+    int pend_ef, pend_last, pend_root;
+    int32_t pend_limit;
+    const struct wstyle* clamp_st;      // style of the clamp container being laid out (block ellipsis)
+    struct lctr* ctr;            // counters in scope (tree build only)
+    int nctr, capctr;
 };
 
 // ---- shared helpers (lay_main.c) ----------------------------------------------
@@ -139,6 +169,11 @@ void lb_resolve_box_sides(struct wlayout* L, int bi, int32_t cbw);
 // Lay out box bi with available width avail (content-box width of the
 // containing block), positioned at provisional absolute (pax, pay) for float
 // queries. Sets w/h. forced_w >= 0 imposes a border-box width.
+int  lay_clamp_lines(const struct wlayout* L, const struct lbox* b);
+void lay_clamp_activate(struct wlayout* L);
+void lay_clamp_hide(struct wlayout* L, int c);
+void lay_abs_inline(struct wlayout* L, int root);
+void lay_intrinsic_content(struct wlayout* L, int bi, int32_t* mn, int32_t* mx);
 void lay_box(struct wlayout* L, int bi, int32_t avail, int32_t forced_w, int32_t forced_h);
 // shrink-to-fit border-box width for avail
 int32_t lay_shrink_width(struct wlayout* L, int bi, int32_t avail);
@@ -146,6 +181,7 @@ int32_t lay_shrink_width(struct wlayout* L, int bi, int32_t avail);
 void lay_intrinsic(struct wlayout* L, int bi, int32_t* mn, int32_t* mx);
 int32_t lay_content_w(struct wlayout* L, int bi);   // content box width
 int  lay_is_bfc(struct wlayout* L, int bi);
+void lay_assign_views(struct wlayout* L);
 // float area queries (absolute coordinates)
 void fl_avail(struct wlayout* L, int32_t y, int32_t h, int32_t left, int32_t right,
               int32_t* l_out, int32_t* r_out);

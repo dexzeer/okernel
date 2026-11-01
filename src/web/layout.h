@@ -23,6 +23,7 @@ enum {
     DI_UNCLIP,
     DI_LINE,      // decoration / hr line: x y w h color
     DI_WIDGET,    // form-control glyph: a = kind (checkbox/radio/select arrow...), b = state
+    DI_MARKS,     // text-emphasis marks over a text run: ref -> dtext (a = baseline), emph_cp in the dtext
     DI_SVG,       // inline <svg>: a = DOM node, x y w h viewport
     DI_BGIMG      // background image layer: x y w h (painting area), ref -> dbgimg
 };
@@ -49,17 +50,21 @@ struct dtext {
     uint32_t t0, tl;     // UTF-8 slice of wlayout.text
     uint8_t family, bold, italic, deco;  // deco: DECO_* bits
     uint16_t px;
-    uint8_t deco_style, _p;
+    int16_t webfont;     // 0 = embedded faces; else 1 + @font-face registry index
+    uint8_t deco_style;
     int32_t letter_sp, word_sp;  // LU
     uint32_t deco_color;
     int32_t width;       // LU advance of the run (for decorations)
+    uint16_t emph_cp;    // text-emphasis mark codepoint (DI_MARKS), 0 = none
+    uint8_t vmode, vup;  // DI_MARKS: vertical run (band rect), bottom-to-top
 };
 
 struct dshadow { int32_t blur, spread, ox, oy; int32_t r[4]; };
 struct dbgimg {
     int32_t img;         // image id
-    int32_t ix, iy, iw, ih; // tile origin + size (LU)
-    uint8_t repeat;      // BG_*
+    int32_t ix, iy, iw, ih; // first tile origin + tile size (LU)
+    int32_t stepx, stepy;   // distance between tiles (tile size + space gap)
+    uint8_t rx, ry;         // 1 = tiles repeat along this axis
 };
 
 // ---- hit regions --------------------------------------------------------------
@@ -78,6 +83,7 @@ struct wlay_images {
     void* ctx;
     int (*for_node)(void* ctx, int node, int* w, int* h);        // <img>, <input type=image>, video poster
     int (*for_url)(void* ctx, const char* url, int* w, int* h);  // CSS url()
+    int (*info)(void* ctx, int id, int* w, int* h, int32_t* ratio);   // intrinsic size px (-1 none) and ratio w/h*65536 (0 none) of image id
 };
 
 struct wlayout;
@@ -99,6 +105,7 @@ const int32_t* wlay_radii(const struct wlayout* L, int ref);
 const char* wlay_text(const struct wlayout* L);
 int  wlay_hits(const struct wlayout* L, const struct dhit** hits);
 // Box of a DOM element (absolute border box, LU); 0 if not rendered.
+int  wlay_scroll_info(const struct wlayout* L, int node, int32_t* sw, int32_t* sh, int32_t* cw, int32_t* ch);
 int  wlay_node_rect(const struct wlayout* L, int node, int32_t* x, int32_t* y, int32_t* w, int32_t* h);
 int  wlay_paint_rank(const struct wlayout* L, int node, int* fixed);   // paint order of the node's box (0 = unpainted); *fixed: inside a fixed box
 int  wlay_knows_node(const struct wlayout* L, int node);     // 1 if the node existed when this layout was made

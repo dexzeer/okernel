@@ -21,6 +21,7 @@ struct wfont {
     uint8_t bold;      // weight >= 600
     uint8_t italic;
     uint16_t px;       // font size in whole pixels (1..512)
+    int16_t webfont;   // 0 = embedded faces only; else 1 + wfont_register() index
 };
 
 struct wfmetrics {
@@ -34,6 +35,14 @@ struct wfmetrics {
 void    wfont_init(void);
 void    wfont_metrics(const struct wfont* f, struct wfmetrics* m);
 int32_t wfont_advance(const struct wfont* f, uint32_t cp);
+// Register a fetched TTF under a family name (lowercased internally). Returns
+// the wfont.webfont value to use (>= 1) or -1. Same (family, data)
+// re-registrations return the existing value.
+int     wfont_register(const uint8_t* ttf, int len, const char* family);
+// Registry lookup by family name: wfont.webfont value (> 0) or 0 if unknown.
+int     wfont_find(const char* family, int len);
+// Family name of a 0-based webfont registry entry ("" if out of range).
+const char* wfont_family_name(int registry_index);
 // Width of a UTF-8 run (no letter/word spacing).
 int32_t wfont_measure(const struct wfont* f, const char* s, int len);
 // Draw a UTF-8 run with its baseline at (x, y), both LU in surface space.

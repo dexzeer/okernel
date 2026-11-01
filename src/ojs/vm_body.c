@@ -307,6 +307,12 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
                 int h = obj_has(J, J->I.global, k);
                 if (h < 0) goto exception;
                 found = h;
+                if (!found && J->named_lookup && jv_is_str(nm)) {
+                    char nb[128];
+                    str_to_utf8_buf(jv_str(nm), nb, sizeof nb);
+                    jv v = J->named_lookup(J, nb, (int)strlen(nb));
+                    found = v != JV_UNDEFINED && v != JV_EXC;
+                }
             }
             PUSH(found ? JV_TRUE : JV_FALSE);
             break;

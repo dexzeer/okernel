@@ -1,0 +1,14 @@
+! ablock headless test list — appended to the shipped lists by
+!   make desktop ABLOCK_EXTRA=tests/headless/ablock_test.txt
+! Deterministic entries for the local test server (tests/headless/test_ablock.py).
+10.0.2.2:8031/ad.js$script
+10.0.2.2:8031/banner.png$image
+10.0.2.2:8031/track.gif$xmlhttprequest
+10.0.2.2:8031/badframe/$subdocument
+10.0.2.2:8031/gtm.js$redirect=noopjs
+||adhost.test^
+##.ad-banner
+##topad
+10.0.2.2##+js(set, window.__ablkOk, 1)
+10.0.2.2##+js(acs, document.__ablkTrap)
+10.0.2.2##.ht-elem:has-text(FREE_IPHONE)

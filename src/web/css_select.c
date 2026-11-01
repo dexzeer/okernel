@@ -84,6 +84,45 @@ static int text_input(const struct wdom* d, int el) {
 
 static int has_rel_match(const struct wdom* d, const struct wsheet* sh, int first, int count, int anchor);
 
+// Next hyphen-delimited subtag of s[0..len); *pos advances past the '-'.
+static const char* lang_next(const char* s, int len, int* pos, int* out_l) {
+    int i = *pos;
+    while (i < len && s[i] != '-') i++;
+    *out_l = i - *pos;
+    const char* p = s + *pos;
+    if (i < len) i++;
+    *pos = i;
+    return p;
+}
+
+static int lang_subtag_eq(const char* a, int al, const char* b, int bl) {
+    if (al != bl) return 0;
+    for (int i = 0; i < al; i++)
+        if (w_lower((unsigned char)a[i]) != w_lower((unsigned char)b[i])) return 0;
+    return 1;
+}
+
+// RFC 4647 3.3.2 extended filtering of range r[0..rl) against tag v[0..vl)
+static int lang_range_match(const char* r, int rl, const char* v, int vl) {
+    int rp = 0, vp = 0, rlen, vlen;
+    const char* rs = lang_next(r, rl, &rp, &rlen);
+    const char* vs = lang_next(v, vl, &vp, &vlen);
+    if (rlen == 0 || vlen == 0) return 0;
+    if (!(rlen == 1 && rs[0] == '*') && !lang_subtag_eq(rs, rlen, vs, vlen)) return 0;
+    while (rp < rl) {
+        rs = lang_next(r, rl, &rp, &rlen);
+        if (rlen == 1 && rs[0] == '*') continue;  // matches any sequence
+        for (;;) {
+            if (vp >= vl) return 0;
+            vs = lang_next(v, vl, &vp, &vlen);
+            if (vlen == 0) return 0;
+            if (lang_subtag_eq(rs, rlen, vs, vlen)) break;
+            if (vlen == 1) return 0;  // singleton cannot be skipped
+        }
+    }
+    return 1;
+}
+
 static int pseudo_match(const struct wdom* d, const struct wsheet* sh, const struct cpart* p, int el) {
     switch (p->op) {
     case PC_FIRST_CHILD: return prev_el(d, el) < 0;
@@ -155,15 +194,26 @@ static int pseudo_match(const struct wdom* d, const struct wsheet* sh, const str
         return !v || vl == 0;
     }
     case PC_LANG: {
-        const char* want = sh->pool.p + p->a;
-        int wl = p->b;
+        // :lang(range, ...): any range matches the element's language using
+        // RFC 4647 extended filtering (subtags align in order; a range
+        // wildcard matches any sequence of tag subtags; intermediate tag
+        // subtags may be skipped unless they are singletons).
+        const char* list = sh->pool.p + p->a;
+        int ll = p->b;
         for (int e = el; e >= 0; e = parent_el(d, e)) {
-            int vl;
+            int vl = 0;
             const char* v = wdom_attr(d, e, A_lang, &vl);
-            if (!v) continue;
-            if (vl < wl) return 0;
-            if (!w_ieq_n(v, want, wl)) return 0;
-            return vl == wl || v[wl] == '-';
+            if (!v) { v = wdom_attr_s(d, e, "xml:lang", &vl); if (!v) continue; }
+            const char* r = list;
+            int rem = ll;
+            for (int k = 0; k < p->cnt; k++) {
+                int rl = 0;
+                while (rl < rem && r[rl] != ',') rl++;
+                if (lang_range_match(r, rl, v, vl)) return 1;
+                r += rl + 1;
+                rem -= rl + 1;
+            }
+            return 0;
         }
         return 0;
     }

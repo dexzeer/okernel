@@ -21,6 +21,7 @@
 #define WL_MAX     4   // max-content
 #define WL_FIT     5   // fit-content
 #define WL_CONTENT 6   // flex-basis: content
+#define WL_FIT_ARG 0x40000000   // set in pct of a WL_FIT: fit-content(<length-percentage>), px + pct (without the flag) is the argument
 
 // ---- animation / transition keywords (struct wstyle tail) -------------------
 enum { ANIM_DIR_NORMAL, ANIM_DIR_REVERSE, ANIM_DIR_ALT, ANIM_DIR_ALT_REV };
@@ -54,7 +55,8 @@ static inline int32_t wl_resolve(struct wlen l, int32_t basis, int32_t dflt) {
 enum { D_NONE, D_INLINE, D_BLOCK, D_INLINE_BLOCK, D_LIST_ITEM, D_FLEX, D_INLINE_FLEX,
        D_GRID, D_INLINE_GRID, D_TABLE, D_INLINE_TABLE, D_TABLE_ROW_GROUP,
        D_TABLE_HEADER_GROUP, D_TABLE_FOOTER_GROUP, D_TABLE_ROW, D_TABLE_CELL,
-       D_TABLE_COLUMN, D_TABLE_COLUMN_GROUP, D_TABLE_CAPTION, D_CONTENTS, D_FLOW_ROOT };
+       D_TABLE_COLUMN, D_TABLE_COLUMN_GROUP, D_TABLE_CAPTION, D_CONTENTS, D_FLOW_ROOT,
+       D_RUBY, D_RUBY_TEXT };
 enum { POS_STATIC, POS_RELATIVE, POS_ABSOLUTE, POS_FIXED, POS_STICKY };
 enum { FL_NONE, FL_LEFT, FL_RIGHT };
 enum { CLR_NONE, CLR_LEFT, CLR_RIGHT, CLR_BOTH };
@@ -62,25 +64,44 @@ enum { OV_VISIBLE, OV_HIDDEN, OV_SCROLL, OV_AUTO, OV_CLIP };
 enum { BS_NONE, BS_HIDDEN, BS_SOLID, BS_DASHED, BS_DOTTED, BS_DOUBLE, BS_GROOVE, BS_RIDGE,
        BS_INSET, BS_OUTSET };
 enum { TA_START, TA_LEFT, TA_RIGHT, TA_CENTER, TA_JUSTIFY, TA_END,
-       TA_WEBKIT_CENTER };   // -webkit-center: also centers block-level children
+       TA_WEBKIT_CENTER, TA_JUSTIFY_ALL };   // -webkit-center: also centers block-level children
 enum { TT_NONE, TT_UPPER, TT_LOWER, TT_CAPITALIZE };
+enum { CT_SIZE = 1, CT_INLINE_SIZE = 2, CT_LAYOUT = 4, CT_PAINT = 8, CT_STYLE = 16 };
+enum { HY_MANUAL, HY_NONE, HY_AUTO };
+enum { BIR_STRETCH, BIR_REPEAT, BIR_ROUND, BIR_SPACE };
+enum { WM_HTB, WM_VRL, WM_VLR, WM_SLR };          // writing-mode: horizontal-tb, vertical-rl, vertical-lr, sideways-lr (sideways-rl = vertical-rl)
+enum { TOR_MIXED, TOR_UPRIGHT, TOR_SIDEWAYS };
+enum { LB_AUTO, LB_LOOSE, LB_NORMAL, LB_STRICT, LB_ANYWHERE };
 enum { WS_NORMAL, WS_NOWRAP, WS_PRE, WS_PRE_WRAP, WS_PRE_LINE, WS_BREAK_SPACES };
 enum { VA_BASELINE, VA_TOP, VA_MIDDLE, VA_BOTTOM, VA_SUB, VA_SUPER, VA_TEXT_TOP,
        VA_TEXT_BOTTOM, VA_LEN };
 enum { LS_DISC, LS_CIRCLE, LS_SQUARE, LS_DECIMAL, LS_DECIMAL_LZ, LS_LOWER_ALPHA,
        LS_UPPER_ALPHA, LS_LOWER_ROMAN, LS_UPPER_ROMAN, LS_LOWER_GREEK, LS_NONE,
        LS_DISCLOSURE_OPEN, LS_DISCLOSURE_CLOSED, LS_STRING };
+#define LS_CSTYLE0 0x40     // values >= this index the predefined counter-style table
 enum { FD_ROW, FD_ROW_REV, FD_COL, FD_COL_REV };
 enum { FW_NOWRAP, FW_WRAP, FW_WRAP_REV };
 // alignment (justify-content / align-*): shared value set
 enum { AL_NORMAL, AL_START, AL_END, AL_CENTER, AL_STRETCH, AL_BASELINE, AL_SPACE_BETWEEN,
-       AL_SPACE_AROUND, AL_SPACE_EVENLY, AL_AUTO, AL_LEFT, AL_RIGHT };
-enum { BG_REPEAT, BG_REPEAT_X, BG_REPEAT_Y, BG_NO_REPEAT };
+       AL_SPACE_AROUND, AL_SPACE_EVENLY, AL_AUTO, AL_LEFT, AL_RIGHT,
+       AL_WM_START, AL_WM_END };   // start / end of the writing mode, unlike flex-start / flex-end (AL_START / AL_END)
+// background-repeat: x | y << 2, each axis BGR_*
+enum { BGR_REPEAT, BGR_NO_REPEAT, BGR_SPACE, BGR_ROUND };
+enum { BG_REPEAT = 0, BG_REPEAT_X = 4, BG_REPEAT_Y = 1, BG_NO_REPEAT = 5 };
+// background-origin / -clip boxes
+enum { BGB_BORDER, BGB_PADDING, BGB_CONTENT, BGB_TEXT };
 enum { BGS_AUTO, BGS_COVER, BGS_CONTAIN, BGS_LEN };
 enum { OF_FILL, OF_CONTAIN, OF_COVER, OF_NONE, OF_SCALE_DOWN };
 enum { BX_CONTENT, BX_BORDER };
-enum { WB_NORMAL, WB_BREAK_ALL, WB_KEEP_ALL, WB_BREAK_WORD };
+enum { WB_NORMAL, WB_BREAK_ALL, WB_KEEP_ALL, WB_BREAK_WORD, WB_MANUAL };
 enum { FAM_SANS, FAM_SERIF, FAM_MONO };
+
+// margin-trim edges (which edges of a flex/grid/block container trim the
+// adjoining child margins)
+#define MT_BLOCK_START 1
+#define MT_BLOCK_END   2
+#define MT_INLINE_START 4
+#define MT_INLINE_END  8
 
 #define DECO_UNDERLINE 1
 #define DECO_OVERLINE  2
@@ -104,6 +125,7 @@ struct wstyle {
     int32_t z_index;
     struct wlen width, height, min_w, min_h, max_w, max_h;
     struct wlen margin[4];     // top right bottom left
+    uint8_t margin_trim;       // MT_* bits: trim child margins at the container's edges
     struct wlen padding[4];
     struct wlen inset[4];      // top right bottom left
     int32_t bw[4];             // border widths (LU), already 0 when style none
@@ -116,10 +138,13 @@ struct wstyle {
     int32_t bg_image_len;
     int16_t bg_grad;           // index into the document gradient table, -1 none
     uint8_t bg_repeat, bg_size_kind;
+    uint8_t bg_attach;            // 0 scroll, 1 fixed, 2 local (the first layer; local scrolls with the content of a scroll container)
+    uint8_t bg_origin, bg_clip;   // BGB_*; origin default padding-box, clip default border-box
     struct wlen bg_size[2];
     struct wlen bg_pos[2];
     // text
     uint8_t font_family;       // FAM_*
+    uint16_t webfont;          // 0 none; else 1 + @font-face registry index (wfont_find)
     uint8_t font_style;        // 0 normal 1 italic
     uint16_t font_weight;      // 100..900
     int32_t font_size;         // LU
@@ -127,6 +152,7 @@ struct wstyle {
     int32_t lh_factor;         // number * 1000 when line-height is a number (inherits as a number)
     uint8_t text_align, text_transform, white_space, word_break, text_overflow_ellipsis;
     uint8_t deco_line, deco_style, list_style_type, list_style_inside, vertical_align;
+    int16_t cstyle_idx;        // predefined counter style (list-style-type), -1 none
     uint8_t font_small_caps, direction_rtl;
     int32_t va_len;            // LU for VA_LEN
     uint32_t deco_color;       // 0 = currentColor
@@ -152,10 +178,13 @@ struct wstyle {
     int32_t border_spacing_h, border_spacing_v;
     // generated content (::before/::after): pool offset (+1) / length, 0 = none
     int32_t content, content_len;
+    int32_t ctr_reset, ctr_reset_len, ctr_inc, ctr_inc_len, ctr_set, ctr_set_len;   // counter-reset/-increment/-set: raw text (pool offset+1), parsed by the layout builder
     // effects
     int32_t shadow_x, shadow_y, shadow_blur, shadow_spread;
     uint32_t shadow_color; uint8_t shadow_inset, has_shadow;
     struct wlen translate_x, translate_y;
+    int32_t scale_x, scale_y;  // transform scale, fixed point 65536 = 1.0
+    struct wlen tfo_x, tfo_y;  // transform-origin from the border box top-left
     int32_t aspect_ratio;      // w/h * 1000, 0 none
     uint8_t object_fit, pointer_events_none, cursor_pointer, outline_style;
     int32_t outline_width; uint32_t outline_color;
@@ -165,6 +194,39 @@ struct wstyle {
     uint8_t deco_inh;
     uint8_t fs_default;        // font-size is the inherited UA default ("medium")
     uint8_t overflow_wrap;     // 1 = break-word / anywhere
+    uint8_t line_break;        // LB_*: line-break (inherited)
+    // border-image: source (url string pool ref / gradient), slice (number = LU of image px, or %), width (WL_NONE: number in milli of the
+    // border width; WL_LEN length / %; WL_AUTO), outset (WL_NONE: number of border widths in milli; WL_LEN length), repeat modes (BIR_*)
+    int32_t bi_src, bi_src_len;
+    int16_t bi_grad;
+    uint8_t bi_fill, bi_rep[2];
+    struct wlen bi_slice[4], bi_width[4], bi_outset[4];
+    uint8_t abs_inl;           // absolutely positioned and its display was inline-level before blockification (static position on the line)
+    uint8_t wmode, tor;        // writing-mode (WM_*) and text-orientation (TOR_*), both inherited
+    uint8_t tw_nowrap, tw_balance;   // text-wrap-mode: nowrap / text-wrap-style: balance (inherited)
+    uint8_t wst;               // word-space-transform (inherited): 0 none, 1 space, 2 ideographic-space
+    uint8_t ocm_box;           // overflow-clip-margin reference box: 0 padding-box, 1 content-box, 2 border-box
+    int32_t ocm_len;           // overflow-clip-margin length (LU)
+    uint8_t multicol;          // column-count / column-width / columns given (multicol layout itself is not done; line-clamp stays off in one)
+    int32_t tab_size;          // tab-size (inherited): > 0 a number of space widths * 1000, < 0 a length (LU) negated; 0 = initial (8)
+    uint8_t contain;           // CT_*: contain
+    int32_t cis_w, cis_h;      // contain-intrinsic-width / -height (LU): the size of an element under size containment, default 0
+    int32_t text_overflow_str, text_overflow_len;   // text-overflow: "string" (end side): pool offset + 1 / length
+    uint8_t text_align_last;   // TA_* + 1, 0 = auto (inherited)
+    struct wlen object_pos[2]; // object-position x y (initial 50% 50%)
+    uint8_t hyphens;           // HY_*: hyphens (inherited)
+    uint16_t emph_cp;          // text-emphasis-style: the mark codepoint, 0 = none (inherited)
+    uint8_t emph_under;        // text-emphasis-position: under (inherited; over is 0)
+    uint8_t emph_left;         // text-emphasis-position: left (vertical modes; inherited)
+    uint8_t ruby_under;        // ruby-position: under (inherited; over is 0)
+    uint8_t ruby_left;         // ruby-position: left (vertical modes; inherited)
+    uint8_t ubidi;             // unicode-bidi: 0 normal, 1 embed, 2 isolate, 3 bidi-override, 4 isolate-override, 5 plaintext
+    uint8_t webkit_box;        // display: -webkit-box (the legacy -webkit-line-clamp needs it)
+    uint8_t webkit_orient_v;   // -webkit-box-orient: vertical
+    uint8_t clamp_webkit;      // line_clamp was set by -webkit-line-clamp
+    uint8_t clamp_ell;         // line-clamp block ellipsis: 0 default (an ellipsis character), 1 the string below (empty = none)
+    int32_t clamp_ell_str, clamp_ell_len;
+    int16_t line_clamp;        // line-clamp / -webkit-line-clamp: 0 none, N lines, -1 auto (as many lines as max-height holds)
     uint8_t list_value_set;    // <li value> present (ordinal in list_value)
     uint8_t has_mask;          // mask-image set (unsupported: background not painted)
     int32_t list_value;
@@ -213,6 +275,9 @@ int  css_set_add_sheet_ex(struct wstyleset* ss, const char* text, int len, const
 // count and fills urls (absolute) + the sheet index to insert each before.
 int  css_set_pending_imports(struct wstyleset* ss, char urls[][256], int* before, int max);
 void css_set_mark_import_done(struct wstyleset* ss, const char* url);
+// @font-face src URLs (absolute) + family names not fetched yet.
+int  css_set_pending_fontfaces(struct wstyleset* ss, char urls[][256], char fams[][64], int max);
+void css_set_mark_fontface_done(struct wstyleset* ss, const char* url);
 // Inline <style> and <link> collection is done by the caller (document
 // order); this helper gathers <style> text from the DOM in order.
 int  css_collect_inline(struct wdom* d, char* out, int cap);

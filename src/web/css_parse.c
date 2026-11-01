@@ -48,6 +48,33 @@ static uint32_t pool_put(struct wsheet* sh, const char* s, int len) {
     return off;
 }
 
+// Selectors 4 language-range: 1-8 ALPHA followed by -(1-8 alphanum)*, with
+// "*" allowed as the whole range or as the first subtag (selectors-4 extends
+// RFC 4646's grammar for :lang()).
+static int lang_range_valid(const char* s, int l) {
+    int i = 0, first = 1;
+    while (i < l) {
+        int j = i;
+        while (j < l && s[j] != '-') j++;
+        int sl = j - i;
+        if (sl < 1 || sl > 8) return 0;
+        if (sl == 1 && s[i] == '*') {
+            if (!first) return 0;
+        } else {
+            for (int k = 0; k < sl; k++) {
+                unsigned char c = (unsigned char)s[i + k];
+                int al = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+                int an = al || (c >= '0' && c <= '9');
+                if (!an) return 0;
+                if (first && !al) return 0;
+            }
+        }
+        first = 0;
+        i = j + 1;
+    }
+    return l > 0 && s[l - 1] != '-';
+}
+
 #define POOL(sh, off) ((sh)->pool.p + (off))
 
 // Stable pool reference for text p[0..len): text inside the current parse
@@ -62,8 +89,9 @@ static uint32_t ref_of(struct wsheet* sh, const char* p, int len) {
 void csheet_free(struct wsheet* sh) {
     wbuf_free(&sh->pool);
     wbuf_free(&sh->imports);
+    wbuf_free(&sh->fontfaces);
     w_free(sh->decls); w_free(sh->rules); w_free(sh->sels); w_free(sh->parts);
-    w_free(sh->calcs); w_free(sh->mqs);
+    w_free(sh->calcs); w_free(sh->mqs); w_free(sh->kfs);
     memset(sh, 0, sizeof(*sh));
 }
 
@@ -187,6 +215,35 @@ static int read_ident(const char* s, int len, int* i, char* out, int cap) {
     }
     out[o] = 0;
     *i = j;
+    return o;
+}
+
+// Copy s[0..len) resolving CSS \-escapes (hex codepoints and literal chars);
+// used for pseudo-class arguments like :lang(\*-FR).
+static int unescape_arg(const char* s, int len, char* out, int cap) {
+    int o = 0, j = 0;
+    while (j < len && o < cap - 1) {
+        unsigned char c = (unsigned char)s[j];
+        if (c == '\\' && j + 1 < len) {
+            j++;
+            if (w_ishex((unsigned char)s[j])) {
+                uint32_t cp = 0;
+                int k = 0;
+                while (k < 6 && j < len && w_ishex((unsigned char)s[j])) { cp = cp * 16 + w_hexval((unsigned char)s[j]); j++; k++; }
+                if (j < len && w_isspace((unsigned char)s[j])) j++;
+                char u[4];
+                int ul = w_utf8_enc(cp ? cp : 0xFFFD, u);
+                for (int q = 0; q < ul && o < cap - 1; q++) out[o++] = u[q];
+            } else {
+                out[o++] = s[j];
+                j++;
+            }
+            continue;
+        }
+        out[o++] = (char)c;
+        j++;
+    }
+    out[o] = 0;
     return o;
 }
 
@@ -509,13 +566,44 @@ static int parse_complex(struct selp* p, int relative, uint32_t* spec_out, uint8
                             a += ms >> 20; b += (ms >> 10) & 1023; c += ms & 1023;
                         }
                     } else if (w_ieq(nm, n, "lang")) {
+                        // :lang(range, range, ...) - each an ident or string,
+                        // an RFC 4646 language-range ("*" or 1-8 alpha followed
+                        // by 1-8 alphanumerics). Ranges are packed into the
+                        // pool joined by ',' (invalid in a valid range); the
+                        // count lives in cp.cnt. An invalid range invalidates
+                        // the whole selector.
                         const char* v = arg; int vl = alen;
                         cv_trim(&v, &vl);
-                        if (vl && (v[0] == '"' || v[0] == '\'')) { v++; vl -= 2; }
-                        if (vl < 0) vl = 0;
+                        char ub[512];
+                        vl = unescape_arg(v, vl, ub, (int)sizeof ub);
+                        v = ub;
+                        cv_trim(&v, &vl);
                         cp.op = PC_LANG;
-                        cp.a = (int32_t)pool_put(sh, v, vl);
-                        cp.b = vl;
+                        cp.a = -1; cp.b = 0; cp.cnt = 0;
+                        int pos = 0;
+                        while (pos < vl) {
+                            int e = pos;
+                            while (e < vl && v[e] != ',') e++;
+                            const char* rs = v + pos; int rl = e - pos;
+                            cv_trim(&rs, &rl);
+                            if (rl >= 2 && (rs[0] == '"' || rs[0] == '\'') && rs[rl - 1] == rs[0]) {
+                                rs++; rl -= 2;
+                                cv_trim(&rs, &rl);
+                            }
+                            if (!lang_range_valid(rs, rl)) { p->bad = 1; return 0; }
+                            if (cp.cnt == 255) { p->bad = 1; return 0; }
+                            if (cp.cnt == 0) {
+                                cp.a = (int32_t)pool_put(sh, rs, rl);
+                                cp.b = rl;
+                            } else {
+                                pool_put(sh, ",", 1);
+                                pool_put(sh, rs, rl);
+                                cp.b += 1 + rl;
+                            }
+                            cp.cnt++;
+                            pos = e + 1;
+                        }
+                        if (!cp.cnt) { p->bad = 1; return 0; }
                     } else if (w_ieq(nm, n, "dir")) {
                         const char* v = arg; int vl = alen;
                         cv_trim(&v, &vl);
@@ -637,10 +725,10 @@ static const struct kw KW_DISPLAY[] = {
     {"table-header-group", D_TABLE_HEADER_GROUP}, {"table-footer-group", D_TABLE_FOOTER_GROUP},
     {"table-row", D_TABLE_ROW}, {"table-cell", D_TABLE_CELL}, {"table-column", D_TABLE_COLUMN},
     {"table-column-group", D_TABLE_COLUMN_GROUP}, {"table-caption", D_TABLE_CAPTION},
-    {"contents", D_CONTENTS}, {"flow-root", D_FLOW_ROOT}, {"-webkit-box", D_BLOCK},
+    {"contents", D_CONTENTS}, {"flow-root", D_FLOW_ROOT}, {"-webkit-box", D_BLOCK | 0x100},
     {"-webkit-inline-box", D_INLINE_BLOCK}, {"-ms-flexbox", D_FLEX}, {"-webkit-flex", D_FLEX},
     {"-ms-inline-flexbox", D_INLINE_FLEX}, {"-webkit-inline-flex", D_INLINE_FLEX},
-    {"-ms-grid", D_GRID}, {"run-in", D_BLOCK}, {"ruby", D_INLINE}, {"ruby-text", D_INLINE},
+    {"-ms-grid", D_GRID}, {"run-in", D_BLOCK}, {"ruby", D_RUBY}, {"ruby-text", D_RUBY_TEXT},
     {"ruby-base", D_INLINE}, {"block flow", D_BLOCK}, {"inline flow", D_INLINE},
     {"inline flow-root", D_INLINE_BLOCK}, {"block flex", D_FLEX}, {"inline flex", D_INLINE_FLEX},
     {"block grid", D_GRID}, {"inline grid", D_INLINE_GRID}, {"block flow-root", D_FLOW_ROOT},
@@ -673,8 +761,12 @@ static const struct kw KW_TALIGN[] = {
     {"start", TA_START}, {"left", TA_LEFT}, {"right", TA_RIGHT}, {"center", TA_CENTER},
     {"justify", TA_JUSTIFY}, {"end", TA_END}, {"-webkit-center", TA_WEBKIT_CENTER},
     {"-moz-center", TA_WEBKIT_CENTER}, {"-webkit-left", TA_LEFT}, {"-webkit-right", TA_RIGHT},
-    {"-moz-left", TA_LEFT}, {"-moz-right", TA_RIGHT}, {"match-parent", TA_START},
-    {"-webkit-match-parent", TA_START}, {"justify-all", TA_JUSTIFY}, {0, 0}
+    {"-moz-left", TA_LEFT}, {"-moz-right", TA_RIGHT}, {"match-parent", 100},
+    {"-webkit-match-parent", 100}, {"justify-all", TA_JUSTIFY_ALL}, {0, 0}
+};
+static const struct kw KW_TALAST[] = {
+    {"auto", 0}, {"start", TA_START + 1}, {"end", TA_END + 1}, {"left", TA_LEFT + 1}, {"right", TA_RIGHT + 1},
+    {"center", TA_CENTER + 1}, {"justify", TA_JUSTIFY + 1}, {"match-parent", 100}, {0, 0}
 };
 static const struct kw KW_TTRANS[] = {
     {"none", TT_NONE}, {"uppercase", TT_UPPER}, {"lowercase", TT_LOWER},
@@ -687,11 +779,16 @@ static const struct kw KW_WS[] = {
     {"collapse nowrap", WS_NOWRAP}, {"-moz-pre-wrap", WS_PRE_WRAP}, {0, 0}
 };
 static const struct kw KW_WBREAK[] = {
-    {"normal", WB_NORMAL}, {"break-all", WB_BREAK_ALL}, {"keep-all", WB_KEEP_ALL},
+    {"normal", WB_NORMAL}, {"break-all", WB_BREAK_ALL}, {"keep-all", WB_KEEP_ALL}, {"manual", WB_MANUAL},
     {"break-word", WB_BREAK_WORD}, {"auto-phrase", WB_NORMAL}, {0, 0}
 };
+static const struct kw KW_LBREAK[] = { {"auto", LB_AUTO}, {"loose", LB_LOOSE}, {"normal", LB_NORMAL}, {"strict", LB_STRICT}, {"anywhere", LB_ANYWHERE}, {0, 0} };
+static const struct kw KW_BOXORIENT[] = { {"horizontal", 0}, {"inline-axis", 0}, {"vertical", 1}, {"block-axis", 1}, {0, 0} };
+static const struct kw KW_WM[] = { {"horizontal-tb", WM_HTB}, {"vertical-rl", WM_VRL}, {"vertical-lr", WM_VLR}, {"sideways-rl", WM_VRL}, {"sideways-lr", WM_SLR}, {"lr", WM_HTB}, {"lr-tb", WM_HTB}, {"rl", WM_HTB}, {"rl-tb", WM_HTB}, {"tb", WM_VRL}, {"tb-rl", WM_VRL}, {0, 0} };
+static const struct kw KW_TOR[] = { {"mixed", TOR_MIXED}, {"upright", TOR_UPRIGHT}, {"sideways", TOR_SIDEWAYS}, {"sideways-right", TOR_SIDEWAYS}, {0, 0} };
+static const struct kw KW_HYPHENS[] = { {"manual", HY_MANUAL}, {"none", HY_NONE}, {"auto", HY_AUTO}, {0, 0} };
 static const struct kw KW_OWRAP[] = {
-    {"normal", 0}, {"break-word", 1}, {"anywhere", 1}, {0, 0}
+    {"normal", 0}, {"break-word", 1}, {"anywhere", 2}, {0, 0}
 };
 static const struct kw KW_VALIGN[] = {
     {"baseline", VA_BASELINE}, {"top", VA_TOP}, {"middle", VA_MIDDLE}, {"bottom", VA_BOTTOM},
@@ -705,8 +802,7 @@ static const struct kw KW_LSTYPE[] = {
     {"upper-latin", LS_UPPER_ALPHA}, {"lower-roman", LS_LOWER_ROMAN},
     {"upper-roman", LS_UPPER_ROMAN}, {"lower-greek", LS_LOWER_GREEK}, {"none", LS_NONE},
     {"disclosure-open", LS_DISCLOSURE_OPEN}, {"disclosure-closed", LS_DISCLOSURE_CLOSED},
-    {"armenian", LS_DECIMAL}, {"georgian", LS_DECIMAL}, {"cjk-decimal", LS_DECIMAL},
-    {"hebrew", LS_DECIMAL}, {"arabic-indic", LS_DECIMAL}, {"cjk-ideographic", LS_DECIMAL},
+#include "cstyles_kw.h"
     {0, 0}
 };
 static const struct kw KW_LSPOS[] = { {"outside", 0}, {"inside", 1}, {0, 0} };
@@ -718,15 +814,15 @@ static const struct kw KW_FWRAP[] = {
     {"nowrap", FW_NOWRAP}, {"wrap", FW_WRAP}, {"wrap-reverse", FW_WRAP_REV}, {0, 0}
 };
 static const struct kw KW_ALIGN[] = {
-    {"normal", AL_NORMAL}, {"start", AL_START}, {"end", AL_END}, {"flex-start", AL_START},
-    {"flex-end", AL_END}, {"self-start", AL_START}, {"self-end", AL_END},
+    {"normal", AL_NORMAL}, {"start", AL_WM_START}, {"end", AL_WM_END}, {"flex-start", AL_START},
+    {"flex-end", AL_END}, {"self-start", AL_WM_START}, {"self-end", AL_WM_END},
     {"center", AL_CENTER}, {"stretch", AL_STRETCH}, {"baseline", AL_BASELINE},
     {"first baseline", AL_BASELINE}, {"last baseline", AL_BASELINE},
     {"space-between", AL_SPACE_BETWEEN}, {"space-around", AL_SPACE_AROUND},
     {"space-evenly", AL_SPACE_EVENLY}, {"auto", AL_AUTO}, {"left", AL_LEFT}, {"right", AL_RIGHT},
-    {"safe center", AL_CENTER}, {"unsafe center", AL_CENTER}, {"safe end", AL_END},
+    {"safe center", AL_CENTER}, {"unsafe center", AL_CENTER}, {"safe end", AL_WM_END},
     {"safe flex-end", AL_END}, {"legacy", AL_NORMAL}, {"legacy center", AL_CENTER},
-    {"anchor-center", AL_CENTER}, {"start safe", AL_START}, {0, 0}
+    {"anchor-center", AL_CENTER}, {"start safe", AL_WM_START}, {0, 0}
 };
 static const struct kw KW_FSTYLE[] = { {"normal", 0}, {"italic", 1}, {"oblique", 1}, {0, 0} };
 static const struct kw KW_FVAR[] = { {"normal", 0}, {"small-caps", 1}, {"none", 0}, {0, 0} };
@@ -743,11 +839,14 @@ static const struct kw KW_OFIT[] = {
 static const struct kw KW_PEVENTS[] = { {"auto", 0}, {"none", 1}, {"all", 0}, {"visiblepainted", 0}, {0, 0} };
 static const struct kw KW_DIR[] = { {"ltr", 0}, {"rtl", 1}, {0, 0} };
 static const struct kw KW_TOVER[] = { {"clip", 0}, {"ellipsis", 1}, {0, 0} };
+static const struct kw KW_BGBOX[] = { {"border-box", BGB_BORDER}, {"padding-box", BGB_PADDING}, {"content-box", BGB_CONTENT}, {"text", BGB_TEXT}, {0, 0} };
 static const struct kw KW_BGREP[] = {
-    {"repeat", BG_REPEAT}, {"repeat-x", BG_REPEAT_X}, {"repeat-y", BG_REPEAT_Y},
-    {"no-repeat", BG_NO_REPEAT}, {"space", BG_REPEAT}, {"round", BG_REPEAT},
-    {"repeat repeat", BG_REPEAT}, {"no-repeat no-repeat", BG_NO_REPEAT},
-    {"repeat no-repeat", BG_REPEAT_X}, {"no-repeat repeat", BG_REPEAT_Y}, {0, 0}
+    {"repeat", 0}, {"repeat-x", BG_REPEAT_X}, {"repeat-y", BG_REPEAT_Y}, {"no-repeat", 5}, {"space", 10}, {"round", 15},
+    {"repeat repeat", 0}, {"repeat no-repeat", 4}, {"repeat space", 8}, {"repeat round", 12},
+    {"no-repeat repeat", 1}, {"no-repeat no-repeat", 5}, {"no-repeat space", 9}, {"no-repeat round", 13},
+    {"space repeat", 2}, {"space no-repeat", 6}, {"space space", 10}, {"space round", 14},
+    {"round repeat", 3}, {"round no-repeat", 7}, {"round space", 11}, {"round round", 15},
+    {0, 0}
 };
 
 // value with whitespace runs collapsed, lowercased into buf (for multi-word keywords)
@@ -794,6 +893,49 @@ static void emit_raw(struct dctx* c, int prop, const char* s, int len) {
     add_decl(c->sh, &d);
 }
 
+// border-image: <source> || <slice> [ / <width> [ / <outset> ] ] || <repeat>; missing parts take their initial values
+static void border_image_sh(struct dctx* c, const char* v, int vl) {
+    char buf[3][160];
+    int bl[3] = { 0, 0, 0 };
+    char rep[40]; int rl = 0;
+    const char* src = "none"; int srcl = 4;
+    int sec = 0, i = 0;
+    cv_trim(&v, &vl);
+    while (i < vl) {
+        while (i < vl && (v[i] == ' ' || v[i] == '\t' || v[i] == '\n')) i++;
+        if (i >= vl) break;
+        if (v[i] == '/') { if (++sec > 2) return; i++; continue; }
+        int st = i, depth = 0;
+        while (i < vl && (depth > 0 || (v[i] != ' ' && v[i] != '\t' && v[i] != '\n' && v[i] != '/'))) {
+            if (v[i] == '(') depth++;
+            else if (v[i] == ')') depth--;
+            i++;
+        }
+        const char* t = v + st; int tl = i - st;
+        if (w_ieq(t, tl, "stretch") || w_ieq(t, tl, "repeat") || w_ieq(t, tl, "round") || w_ieq(t, tl, "space")) {
+            if (rl + tl + 2 > (int)sizeof rep) return;
+            if (rl) rep[rl++] = ' ';
+            memcpy(rep + rl, t, (size_t)tl); rl += tl;
+        } else if (w_ieq(t, tl, "none") || w_ieq_prefix(t, tl, "url(") || w_ieq_prefix(t, tl, "image-set(") ||
+                   w_ieq_prefix(t, tl, "-webkit-image-set(") || w_ieq_prefix(t, tl, "linear-gradient(") || w_ieq_prefix(t, tl, "radial-gradient(") ||
+                   w_ieq_prefix(t, tl, "conic-gradient(") || w_ieq_prefix(t, tl, "repeating-") || w_ieq_prefix(t, tl, "-webkit-") ||
+                   w_ieq_prefix(t, tl, "cross-fade(") || w_ieq_prefix(t, tl, "image(")) {
+            src = t; srcl = tl;
+        } else {
+            char ch = t[0];
+            if (!((ch >= '0' && ch <= '9') || ch == '.' || ch == '-' || ch == '+' || w_ieq(t, tl, "auto") || w_ieq(t, tl, "fill") || w_ieq_prefix(t, tl, "calc("))) return;
+            if (bl[sec] + tl + 2 > (int)sizeof buf[0]) return;
+            if (bl[sec]) buf[sec][bl[sec]++] = ' ';
+            memcpy(buf[sec] + bl[sec], t, (size_t)tl); bl[sec] += tl;
+        }
+    }
+    emit_raw(c, P_BI_SRC, src, srcl);
+    if (bl[0]) emit_raw(c, P_BI_SLICE, buf[0], bl[0]); else emit_raw(c, P_BI_SLICE, "100%", 4);
+    if (bl[1]) emit_raw(c, P_BI_WIDTH, buf[1], bl[1]); else emit_raw(c, P_BI_WIDTH, "1", 1);
+    if (bl[2]) emit_raw(c, P_BI_OUTSET, buf[2], bl[2]); else emit_raw(c, P_BI_OUTSET, "0", 1);
+    if (rl) emit_raw(c, P_BI_REPEAT, rep, rl); else emit_raw(c, P_BI_REPEAT, "stretch", 7);
+}
+
 static int global_kw(const char* s, int len) {
     char b[16];
     int n = norm_kw(s, len, b, sizeof b);
@@ -816,8 +958,20 @@ static int parse_len(const char* s, int len, int flags, struct cdecl* d) {
     if (flags & 8) {
         if (w_ieq(s, len, "min-content") || w_ieq(s, len, "-webkit-min-content")) { d->kind = VK_KW; d->a = WL_MIN; return 1; }
         if (w_ieq(s, len, "max-content") || w_ieq(s, len, "-webkit-max-content")) { d->kind = VK_KW; d->a = WL_MAX; return 1; }
+        if (w_ieq_prefix(s, len, "fit-content(") && s[len - 1] == ')') {
+            const char* as = s + 12; int al = len - 13;
+            cv_trim(&as, &al);
+            int32_t m; int u;
+            d->kind = VK_KW; d->a = WL_FIT;
+            if (al > 0 && cv_number(as, al, &m, &u) && m >= 0) {
+                if (u < al && as[u] == '%' && u + 1 == al) { d->b = m; d->unit = 255; d->unit2 = 1; }
+                else if (u < al) { int un = cv_unit(as + u, al - u); if (un >= 0 && un < U_DEG) { d->b = m; d->unit = (uint8_t)un; d->unit2 = 1; } }
+                else if (m == 0) { d->b = 0; d->unit = U_PX; d->unit2 = 1; }
+            }
+            return 1;
+        }
         if (w_ieq(s, len, "fit-content") || w_ieq(s, len, "-webkit-fit-content") ||
-            w_ieq(s, len, "-moz-fit-content") || w_ieq_prefix(s, len, "fit-content(")) { d->kind = VK_KW; d->a = WL_FIT; return 1; }
+            w_ieq(s, len, "-moz-fit-content")) { d->kind = VK_KW; d->a = WL_FIT; return 1; }
         if (w_ieq(s, len, "stretch") || w_ieq(s, len, "-webkit-fill-available") ||
             w_ieq(s, len, "-moz-available")) { d->kind = VK_AUTO; return 1; }
     }
@@ -1133,6 +1287,8 @@ static int is_image_value(const char* s, int len) {
            w_ieq_prefix(s, len, "repeating-radial-gradient(") || w_ieq_prefix(s, len, "conic-gradient(");
 }
 
+static const struct kw KW_BGATT[] = { {"scroll", 0}, {"fixed", 1}, {"local", 2}, {0, 0} };
+
 static void background_sh(struct dctx* c, const char* s, int len) {
     // layers: take the first layer with an image; color from the final layer
     int pos = 0; const char* layer; int ll;
@@ -1141,7 +1297,7 @@ static void background_sh(struct dctx* c, const char* s, int len) {
     if (!nl) return;
     int img_done = 0;
     uint32_t col = 0; int cur = 0;
-    int rep = BG_REPEAT;
+    int rep = BG_REPEAT, org = BGB_PADDING, clp = BGB_BORDER, att = 0;
     const char* img = 0; int imgl = 0;
     const char* posx = 0; int posxl = 0;
     const char* posy = 0; int posyl = 0;
@@ -1152,7 +1308,8 @@ static void background_sh(struct dctx* c, const char* s, int len) {
         int this_has_img = 0;
         const char* lx = 0; int lxl = 0; const char* ly = 0; int lyl = 0;
         const char* lsz = 0; int lszl = 0;
-        int lrep = BG_REPEAT;
+        int lrep = BG_REPEAT, latt = 0;
+        int rep1 = -1, nbox = 0, lorg = BGB_PADDING, lclip = BGB_BORDER;
         while (cv_next(layers[L], lls[L], &p2, &cs, &cl)) {
             if (cl == 1 && cs[0] == '/') { after_slash = 1; continue; }
             if (after_slash) {
@@ -1163,10 +1320,15 @@ static void background_sh(struct dctx* c, const char* s, int len) {
             if (is_image_value(cs, cl)) { if (!this_has_img) { this_has_img = 1; if (!img_done) { img = cs; imgl = cl; } } continue; }
             if (w_ieq(cs, cl, "none")) continue;
             int k = kw_lookup(KW_BGREP, cs, cl);
-            if (k >= 0) { lrep = k; continue; }
-            if (w_ieq(cs, cl, "scroll") || w_ieq(cs, cl, "fixed") || w_ieq(cs, cl, "local") ||
-                w_ieq(cs, cl, "border-box") || w_ieq(cs, cl, "padding-box") ||
-                w_ieq(cs, cl, "content-box") || w_ieq(cs, cl, "text")) continue;
+            if (k >= 0) {
+                int plain = k == 0 || k == 5 || k == 10 || k == 15;    // repeat, no-repeat, space, round: may be followed by a second one
+                if (plain && rep1 >= 0) { lrep = rep1 | ((k & 3) << 2); rep1 = -1; }
+                else { lrep = k; rep1 = plain ? (k & 3) : -1; }
+                continue;
+            }
+            int bx = kw_lookup(KW_BGBOX, cs, cl);
+            if (bx >= 0) { if (nbox == 0) { lorg = bx; lclip = bx; } else lclip = bx; nbox++; continue; }
+            { int ka = kw_lookup(KW_BGATT, cs, cl); if (ka >= 0) { latt = ka; continue; } }
             uint32_t cc; int ccur;
             if (L == nl - 1 && cv_color(cs, cl, &cc, &ccur)) { col = cc; cur = ccur; continue; }
             // position component
@@ -1175,7 +1337,7 @@ static void background_sh(struct dctx* c, const char* s, int len) {
         }
         if (this_has_img && !img_done) {
             img_done = 1;
-            rep = lrep;
+            rep = lrep; org = lorg; clp = lclip; att = latt;
             posx = lx; posxl = lxl; posy = ly; posyl = lyl;
             size = lsz; sizel = lszl;
         }
@@ -1186,6 +1348,9 @@ static void background_sh(struct dctx* c, const char* s, int len) {
     if (img) emit_raw(c, P_BG_IMAGE, img, imgl);
     else emit_raw(c, P_BG_IMAGE, "none", 4);
     emit_kw(c, P_BG_REPEAT, rep);
+    emit_kw(c, P_BG_ATTACH, att);
+    emit_kw(c, P_BG_ORIGIN, org);
+    emit_kw(c, P_BG_CLIP, clp);
     if (size) emit_raw(c, P_BG_SIZE, size, sizel); else emit_raw(c, P_BG_SIZE, "auto", 4);
     // keywords may come in either order ("top left")
     if (posx && posy && (w_ieq(posx, posxl, "top") || w_ieq(posx, posxl, "bottom") ||
@@ -1389,9 +1554,9 @@ static int has_var(const char* s, int len) {
 enum {
     H_NONE, H_KW, H_LEN, H_COLOR, H_NUM, H_RAW, H_BOX4LEN, H_BOX4KW, H_BOX4COLOR, H_BORDER,
     H_BORDER_SIDE, H_BWIDTH, H_FONT, H_FWEIGHT, H_FSIZE, H_LHEIGHT, H_FLEX, H_GRIDPAIR,
-    H_GRIDAREA, H_BG, H_DECO, H_DECOLINE, H_LIST, H_GAP, H_PLACE, H_OVERFLOW, H_RADIUS,
+    H_WKCLAMP, H_CIS, H_GRIDAREA, H_BG, H_DECO, H_DECOLINE, H_LIST, H_GAP, H_PLACE, H_OVERFLOW, H_RADIUS,
     H_RADIUS1, H_BSPACING, H_WS, H_LOGICAL, H_ZINDEX, H_ORDER, H_BGCOLOR, H_OUTLINE,
-    H_FLEXFLOW, H_INSET, H_LSTYPE, H_IGNORE, H_GRIDTEMPLATE
+    H_FLEXFLOW, H_INSET, H_LSTYPE, H_IGNORE, H_GRIDTEMPLATE, H_BIMG
 };
 
 struct propdef {
@@ -1421,52 +1586,53 @@ static const struct propdef PROPS[] = {
     {"opacity", H_NUM, P_OPACITY, 1, 0, 0},
     {"width", H_LEN, P_WIDTH, 0, 1 | 8, 0},
     {"height", H_LEN, P_HEIGHT, 0, 1 | 8, 0},
-    {"inline-size", H_LEN, P_WIDTH, 0, 1 | 8, 0},
-    {"block-size", H_LEN, P_HEIGHT, 0, 1 | 8, 0},
+    {"inline-size", H_LEN, P_L_ISIZE, 0, 1 | 8, 0},
+    {"block-size", H_LEN, P_L_BSIZE, 0, 1 | 8, 0},
     {"min-width", H_LEN, P_MIN_WIDTH, 0, 1 | 8, 0},
     {"min-height", H_LEN, P_MIN_HEIGHT, 0, 1 | 8, 0},
-    {"min-inline-size", H_LEN, P_MIN_WIDTH, 0, 1 | 8, 0},
-    {"min-block-size", H_LEN, P_MIN_HEIGHT, 0, 1 | 8, 0},
+    {"min-inline-size", H_LEN, P_L_MINI, 0, 1 | 8, 0},
+    {"min-block-size", H_LEN, P_L_MINB, 0, 1 | 8, 0},
     {"max-width", H_LEN, P_MAX_WIDTH, 0, 2 | 8, 0},
     {"max-height", H_LEN, P_MAX_HEIGHT, 0, 2 | 8, 0},
-    {"max-inline-size", H_LEN, P_MAX_WIDTH, 0, 2 | 8, 0},
-    {"max-block-size", H_LEN, P_MAX_HEIGHT, 0, 2 | 8, 0},
+    {"max-inline-size", H_LEN, P_L_MAXI, 0, 2 | 8, 0},
+    {"max-block-size", H_LEN, P_L_MAXB, 0, 2 | 8, 0},
     {"margin", H_BOX4LEN, 0, 0, 1 | 4, 0},
     {"margin-top", H_LEN, P_MARGIN_TOP, 0, 1 | 4, 0},
     {"margin-right", H_LEN, P_MARGIN_RIGHT, 0, 1 | 4, 0},
     {"margin-bottom", H_LEN, P_MARGIN_BOTTOM, 0, 1 | 4, 0},
     {"margin-left", H_LEN, P_MARGIN_LEFT, 0, 1 | 4, 0},
-    {"margin-block-start", H_LEN, P_MARGIN_TOP, 0, 1 | 4, 0},
-    {"margin-block-end", H_LEN, P_MARGIN_BOTTOM, 0, 1 | 4, 0},
-    {"margin-inline-start", H_LEN, P_MARGIN_LEFT, 0, 1 | 4, 0},
-    {"margin-inline-end", H_LEN, P_MARGIN_RIGHT, 0, 1 | 4, 0},
-    {"-webkit-margin-start", H_LEN, P_MARGIN_LEFT, 0, 1 | 4, 0},
-    {"-webkit-margin-end", H_LEN, P_MARGIN_RIGHT, 0, 1 | 4, 0},
-    {"margin-block", H_LOGICAL, P_MARGIN_TOP, P_MARGIN_BOTTOM, 1 | 4, 0},
-    {"margin-inline", H_LOGICAL, P_MARGIN_LEFT, P_MARGIN_RIGHT, 1 | 4, 0},
+    {"margin-trim", H_RAW, P_MARGIN_TRIM, 0, 0, 0},
+    {"margin-block-start", H_LEN, P_L_M_BS, 0, 1 | 4, 0},
+    {"margin-block-end", H_LEN, P_L_M_BE, 0, 1 | 4, 0},
+    {"margin-inline-start", H_LEN, P_L_M_IS, 0, 1 | 4, 0},
+    {"margin-inline-end", H_LEN, P_L_M_IE, 0, 1 | 4, 0},
+    {"-webkit-margin-start", H_LEN, P_L_M_IS, 0, 1 | 4, 0},
+    {"-webkit-margin-end", H_LEN, P_L_M_IE, 0, 1 | 4, 0},
+    {"margin-block", H_LOGICAL, P_L_M_BS, P_L_M_BE, 1 | 4, 0},
+    {"margin-inline", H_LOGICAL, P_L_M_IS, P_L_M_IE, 1 | 4, 0},
     {"padding", H_BOX4LEN, 1, 0, 0, 0},
     {"padding-top", H_LEN, P_PADDING_TOP, 0, 0, 0},
     {"padding-right", H_LEN, P_PADDING_RIGHT, 0, 0, 0},
     {"padding-bottom", H_LEN, P_PADDING_BOTTOM, 0, 0, 0},
     {"padding-left", H_LEN, P_PADDING_LEFT, 0, 0, 0},
-    {"padding-block-start", H_LEN, P_PADDING_TOP, 0, 0, 0},
-    {"padding-block-end", H_LEN, P_PADDING_BOTTOM, 0, 0, 0},
-    {"padding-inline-start", H_LEN, P_PADDING_LEFT, 0, 0, 0},
-    {"padding-inline-end", H_LEN, P_PADDING_RIGHT, 0, 0, 0},
-    {"-webkit-padding-start", H_LEN, P_PADDING_LEFT, 0, 0, 0},
-    {"padding-block", H_LOGICAL, P_PADDING_TOP, P_PADDING_BOTTOM, 0, 0},
-    {"padding-inline", H_LOGICAL, P_PADDING_LEFT, P_PADDING_RIGHT, 0, 0},
+    {"padding-block-start", H_LEN, P_L_P_BS, 0, 0, 0},
+    {"padding-block-end", H_LEN, P_L_P_BE, 0, 0, 0},
+    {"padding-inline-start", H_LEN, P_L_P_IS, 0, 0, 0},
+    {"padding-inline-end", H_LEN, P_L_P_IE, 0, 0, 0},
+    {"-webkit-padding-start", H_LEN, P_L_P_IS, 0, 0, 0},
+    {"padding-block", H_LOGICAL, P_L_P_BS, P_L_P_BE, 0, 0},
+    {"padding-inline", H_LOGICAL, P_L_P_IS, P_L_P_IE, 0, 0},
     {"inset", H_INSET, 0, 0, 1 | 4, 0},
     {"top", H_LEN, P_TOP, 0, 1 | 4, 0},
     {"right", H_LEN, P_RIGHT, 0, 1 | 4, 0},
     {"bottom", H_LEN, P_BOTTOM, 0, 1 | 4, 0},
     {"left", H_LEN, P_LEFT, 0, 1 | 4, 0},
-    {"inset-block-start", H_LEN, P_TOP, 0, 1 | 4, 0},
-    {"inset-block-end", H_LEN, P_BOTTOM, 0, 1 | 4, 0},
-    {"inset-inline-start", H_LEN, P_LEFT, 0, 1 | 4, 0},
-    {"inset-inline-end", H_LEN, P_RIGHT, 0, 1 | 4, 0},
-    {"inset-block", H_LOGICAL, P_TOP, P_BOTTOM, 1 | 4, 0},
-    {"inset-inline", H_LOGICAL, P_LEFT, P_RIGHT, 1 | 4, 0},
+    {"inset-block-start", H_LEN, P_L_I_BS, 0, 1 | 4, 0},
+    {"inset-block-end", H_LEN, P_L_I_BE, 0, 1 | 4, 0},
+    {"inset-inline-start", H_LEN, P_L_I_IS, 0, 1 | 4, 0},
+    {"inset-inline-end", H_LEN, P_L_I_IE, 0, 1 | 4, 0},
+    {"inset-block", H_LOGICAL, P_L_I_BS, P_L_I_BE, 1 | 4, 0},
+    {"inset-inline", H_LOGICAL, P_L_I_IS, P_L_I_IE, 1 | 4, 0},
     {"border", H_BORDER, 0, 0, 0, 0},
     {"border-top", H_BORDER_SIDE, 0, 0, 0, 0},
     {"border-right", H_BORDER_SIDE, 1, 0, 0, 0},
@@ -1517,6 +1683,10 @@ static const struct propdef PROPS[] = {
     {"background-color", H_BGCOLOR, P_BG_COLOR, 0, 0, 0},
     {"background-image", H_RAW, P_BG_IMAGE, 0, 0, 0},
     {"background-repeat", H_KW, P_BG_REPEAT, 0, 0, KW_BGREP},
+    {"background-origin", H_KW, P_BG_ORIGIN, 0, 0, KW_BGBOX},
+    {"background-clip", H_KW, P_BG_CLIP, 0, 0, KW_BGBOX},
+    {"-webkit-background-clip", H_KW, P_BG_CLIP, 0, 0, KW_BGBOX},
+    {"-webkit-background-origin", H_KW, P_BG_ORIGIN, 0, 0, KW_BGBOX},
     {"background-size", H_RAW, P_BG_SIZE, 0, 0, 0},
     {"-webkit-background-size", H_RAW, P_BG_SIZE, 0, 0, 0},
     {"background-position", H_RAW, P_BG_POS_X, 0, 0, 0},
@@ -1531,7 +1701,13 @@ static const struct propdef PROPS[] = {
     {"font-variant-caps", H_KW, P_FONT_VARIANT, 0, 0, KW_FVAR},
     {"line-height", H_LHEIGHT, P_LINE_HEIGHT, 0, 0, 0},
     {"text-align", H_KW, P_TEXT_ALIGN, 0, 0, KW_TALIGN},
+    {"text-align-last", H_KW, P_TEXT_ALIGN_LAST, 0, 0, KW_TALAST},
     {"text-decoration", H_DECO, 0, 0, 0, 0},
+    {"text-emphasis-style", H_RAW, P_EMPH_STYLE, 0, 0, 0},
+    {"text-emphasis-position", H_RAW, P_EMPH_POS, 0, 0, 0},
+    {"text-emphasis", H_RAW, P_EMPH, 0, 0, 0},
+    {"ruby-position", H_RAW, P_RUBY_POS, 0, 0, 0},
+    {"unicode-bidi", H_RAW, P_UBIDI, 0, 0, 0},
     {"text-decoration-line", H_DECOLINE, 0, 0, 0, 0},
     {"-webkit-text-decoration-line", H_DECOLINE, 0, 0, 0, 0},
     {"text-decoration-color", H_COLOR, P_DECO_COLOR, 0, 0, 0},
@@ -1539,13 +1715,44 @@ static const struct propdef PROPS[] = {
     {"text-decoration-style", H_KW, P_DECO_STYLE, 0, 0, KW_DSTYLE},
     {"text-transform", H_KW, P_TEXT_TRANSFORM, 0, 0, KW_TTRANS},
     {"text-indent", H_LEN, P_TEXT_INDENT, 0, 4, 0},
-    {"text-overflow", H_KW, P_TEXT_OVERFLOW, 0, 0, KW_TOVER},
+    {"text-overflow", H_RAW, P_TEXT_OVERFLOW, 0, 0, 0},
     {"letter-spacing", H_LEN, P_LETTER_SPACING, 0, 4, 0},
     {"word-spacing", H_LEN, P_WORD_SPACING, 0, 4, 0},
     {"white-space", H_WS, 0, 0, 0, 0},
     {"white-space-collapse", H_WS, 0, 0, 0, 0},
-    {"text-wrap-mode", H_IGNORE, 0, 0, 0, 0},
+    {"text-wrap", H_RAW, P_TW, 0, 0, 0},
+    {"text-wrap-mode", H_RAW, P_TWM, 0, 0, 0},
+    {"text-wrap-style", H_RAW, P_TWS, 0, 0, 0},
     {"word-break", H_KW, P_WORD_BREAK, 0, 0, KW_WBREAK},
+    {"line-break", H_KW, P_LINE_BREAK, 0, 0, KW_LBREAK},
+    {"contain", H_RAW, P_CONTAIN, 0, 0, 0},
+    {"contain-intrinsic-width", H_RAW, P_CIS_W, 0, 0, 0},
+    {"contain-intrinsic-inline-size", H_RAW, P_CIS_W, 0, 0, 0},
+    {"contain-intrinsic-height", H_RAW, P_CIS_H, 0, 0, 0},
+    {"contain-intrinsic-block-size", H_RAW, P_CIS_H, 0, 0, 0},
+    {"contain-intrinsic-size", H_CIS, 0, 0, 0, 0},
+    {"hyphens", H_KW, P_HYPHENS, 0, 0, KW_HYPHENS},
+    {"writing-mode", H_KW, P_WM, 0, 0, KW_WM},
+    {"background-attachment", H_KW, P_BG_ATTACH, 0, 0, KW_BGATT},
+    {"border-image", H_BIMG, 0, 0, 0, 0},
+    {"border-image-source", H_RAW, P_BI_SRC, 0, 0, 0},
+    {"border-image-slice", H_RAW, P_BI_SLICE, 0, 0, 0},
+    {"border-image-width", H_RAW, P_BI_WIDTH, 0, 0, 0},
+    {"border-image-outset", H_RAW, P_BI_OUTSET, 0, 0, 0},
+    {"border-image-repeat", H_RAW, P_BI_REPEAT, 0, 0, 0},
+    {"-webkit-writing-mode", H_KW, P_WM, 0, 0, KW_WM},
+    {"text-orientation", H_KW, P_TOR, 0, 0, KW_TOR},
+    {"word-space-transform", H_RAW, P_WST, 0, 0, 0},
+    {"overflow-clip-margin", H_RAW, P_OCM, 0, 0, 0},
+    {"columns", H_RAW, P_MULTICOL, 0, 0, 0},
+    {"column-count", H_RAW, P_MULTICOL, 0, 0, 0},
+    {"column-width", H_RAW, P_MULTICOL, 0, 0, 0},
+    {"tab-size", H_RAW, P_TAB_SIZE, 0, 0, 0},
+    {"-moz-tab-size", H_RAW, P_TAB_SIZE, 0, 0, 0},
+    {"-webkit-hyphens", H_KW, P_HYPHENS, 0, 0, KW_HYPHENS},
+    {"line-clamp", H_RAW, P_LINE_CLAMP, 0, 0, 0},
+    {"-webkit-line-clamp", H_WKCLAMP, 0, 0, 0, 0},
+    {"-webkit-box-orient", H_KW, P_WEBKIT_ORIENT, 0, 0, KW_BOXORIENT},
     {"overflow-wrap", H_KW, P_OVERFLOW_WRAP, 0, 0, KW_OWRAP},
     {"word-wrap", H_KW, P_OVERFLOW_WRAP, 0, 0, KW_OWRAP},
     {"vertical-align", H_LEN, P_VERTICAL_ALIGN, 0, 4, KW_VALIGN},
@@ -1602,14 +1809,20 @@ static const struct propdef PROPS[] = {
     {"table-layout", H_KW, P_TABLE_LAYOUT, 0, 0, KW_TLAYOUT},
     {"caption-side", H_KW, P_CAPTION_SIDE, 0, 0, KW_CAPSIDE},
     {"content", H_RAW, P_CONTENT, 0, 0, 0},
+    {"counter-reset", H_RAW, P_CTR_RESET, 0, 0, 0},
+    {"counter-increment", H_RAW, P_CTR_INC, 0, 0, 0},
+    {"counter-set", H_RAW, P_CTR_SET, 0, 0, 0},
     {"box-shadow", H_RAW, P_BOX_SHADOW, 0, 0, 0},
     {"-webkit-box-shadow", H_RAW, P_BOX_SHADOW, 0, 0, 0},
     {"transform", H_RAW, P_TRANSFORM, 0, 0, 0},
     {"-webkit-transform", H_RAW, P_TRANSFORM, 0, 0, 0},
     {"-ms-transform", H_RAW, P_TRANSFORM, 0, 0, 0},
     {"translate", H_RAW, P_TRANSFORM, 0, 0, 0},
+    {"scale", H_RAW, P_SCALE, 0, 0, 0},
+    {"transform-origin", H_RAW, P_TFO, 0, 0, 0},
     {"aspect-ratio", H_RAW, P_ASPECT_RATIO, 0, 0, 0},
     {"object-fit", H_KW, P_OBJECT_FIT, 0, 0, KW_OFIT},
+    {"object-position", H_RAW, P_OBJECT_POS, 0, 0, 0},
     {"pointer-events", H_KW, P_POINTER_EVENTS, 0, 0, KW_PEVENTS},
     {"cursor", H_RAW, P_CURSOR, 0, 0, 0},
     {"outline", H_OUTLINE, 0, 0, 0, 0},
@@ -1685,6 +1898,37 @@ static int apply_prop(struct dctx* c, const struct propdef* pd, const char* v, i
     case H_BGCOLOR: emit_color(c, P_BG_COLOR, v, vl); break;
     case H_NUM: emit_num(c, pd->prop, v, vl, pd->p2); break;
     case H_RAW: emit_raw(c, pd->prop, v, vl); break;
+    case H_BIMG: border_image_sh(c, v, vl); break;
+    case H_CIS: {         // contain-intrinsic-size: <width> [<height>]
+        const char* t1; int l1; const char* t2 = 0; int l2 = 0;
+        int pos = 0;
+        const char* tk; int tl;
+        int nt = 0;
+        const char* tks[4]; int tkl[4];
+        while (nt < 4 && cv_next(v, vl, &pos, &tk, &tl)) { tks[nt] = tk; tkl[nt] = tl; nt++; }
+        // "auto 10px" counts as one value
+        int i = 0;
+        t1 = tks[0]; l1 = tkl[0];
+        if (nt && w_ieq(tks[0], tkl[0], "auto") && nt > 1) { l1 = (int)(tks[1] + tkl[1] - tks[0]); i = 2; } else i = 1;
+        if (i < nt) {
+            t2 = tks[i]; l2 = tkl[i];
+            if (w_ieq(tks[i], tkl[i], "auto") && i + 1 < nt) l2 = (int)(tks[i + 1] + tkl[i + 1] - tks[i]);
+        }
+        if (nt) {
+            emit_raw(c, P_CIS_W, t1, l1);
+            if (t2) emit_raw(c, P_CIS_H, t2, l2); else emit_raw(c, P_CIS_H, t1, l1);
+        }
+        break;
+    }
+    case H_WKCLAMP: {       // -webkit-line-clamp is another spelling of line-clamp: same cascade slot, marked "w:"
+        char buf[48];
+        const char* t = v; int tl = vl; cv_trim(&t, &tl);
+        if (tl > 40) tl = 40;
+        buf[0] = 'w'; buf[1] = ':';
+        memcpy(buf + 2, t, (size_t)tl);
+        emit_raw(c, P_LINE_CLAMP, buf, tl + 2);
+        break;
+    }
     case H_ZINDEX: {
         const char* s = v; int l = vl; cv_trim(&s, &l);
         if (w_ieq(s, l, "auto")) { emit_kw(c, P_Z_INDEX, 0); c->sh->decls[c->sh->ndecl - 1].kind = VK_AUTO; }
@@ -1803,8 +2047,8 @@ static int longhands_of(const struct propdef* pd, int* out) {
         out[n++] = P_GRID_ROW_END; out[n++] = P_GRID_COLUMN_END;
         break;
     case H_BG:
-        out[n++] = P_BG_COLOR; out[n++] = P_BG_IMAGE; out[n++] = P_BG_REPEAT;
-        out[n++] = P_BG_SIZE; out[n++] = P_BG_POS_X; out[n++] = P_BG_POS_Y;
+        out[n++] = P_BG_COLOR; out[n++] = P_BG_IMAGE; out[n++] = P_BG_REPEAT; out[n++] = P_BG_ATTACH;
+        out[n++] = P_BG_SIZE; out[n++] = P_BG_POS_X; out[n++] = P_BG_POS_Y; out[n++] = P_BG_ORIGIN; out[n++] = P_BG_CLIP;
         break;
     case H_DECO: out[n++] = P_DECO_LINE; out[n++] = P_DECO_STYLE; out[n++] = P_DECO_COLOR; break;
     case H_DECOLINE: out[n++] = P_DECO_LINE; break;
@@ -1815,6 +2059,7 @@ static int longhands_of(const struct propdef* pd, int* out) {
     case H_BSPACING: out[n++] = P_BORDER_SPACING; break;
     case H_WS: out[n++] = P_WHITE_SPACE; break;
     case H_IGNORE: break;
+    case H_BIMG: out[n++] = P_BI_SRC; out[n++] = P_BI_SLICE; out[n++] = P_BI_WIDTH; out[n++] = P_BI_OUTSET; out[n++] = P_BI_REPEAT; break;
     case H_GRIDTEMPLATE:
         out[n++] = P_GRID_TEMPLATE_ROWS; out[n++] = P_GRID_TEMPLATE_COLUMNS; out[n++] = P_GRID_TEMPLATE_AREAS;
         break;
@@ -2021,6 +2266,85 @@ static int supports_cond(struct pctx* pc, const char* s, int len) {
     return 0;
 }
 
+// @font-face { font-family: X; src: url(...) }: record the family and the
+// absolute first url() src for the document to fetch and register
+// (local() and format() hints are ignored).
+static void parse_font_face(struct pctx* pc, const char* s, int len) {
+    const char* fam = 0; int fl = 0;
+    const char* url = 0; int ul = 0;
+    int i = 0;
+    while (i < len && !(fam && url)) {
+        // one declaration: split at ';' at paren/string depth 0
+        int depth = 0, st = i;
+        char q = 0;
+        while (i < len) {
+            char ch = s[i];
+            if (q) { if (ch == q) q = 0; }
+            else if (ch == '"' || ch == '\'') q = ch;
+            else if (ch == '(') depth++;
+            else if (ch == ')') { if (depth) depth--; }
+            else if (ch == ';' && depth == 0) break;
+            i++;
+        }
+        const char* item = s + st; int il = i - st;
+        i++;
+        int d2 = 0, colon = -1;
+        char q2 = 0;
+        for (int k = 0; k < il; k++) {
+            char ch = item[k];
+            if (q2) { if (ch == q2) q2 = 0; }
+            else if (ch == '"' || ch == '\'') q2 = ch;
+            else if (ch == '(') d2++;
+            else if (ch == ')') { if (d2) d2--; }
+            else if (ch == ':' && d2 == 0) { colon = k; break; }
+        }
+        if (colon < 0) continue;
+        const char* nm = item; int nl = colon;
+        const char* val = item + colon + 1; int vl = il - colon - 1;
+        cv_trim(&nm, &nl); cv_trim(&val, &vl);
+        if (nl <= 0 || vl <= 0) continue;
+        char lown[24];
+        int nn = 0;
+        for (int k = 0; k < nl && nn < 23; k++) lown[nn++] = (char)w_lower((unsigned char)nm[k]);
+        lown[nn] = 0;
+        if (!strcmp(lown, "font-family")) {
+            const char* v = val; int l2 = vl;
+            if (l2 && (v[0] == '"' || v[0] == '\'')) { v++; l2 -= 2; if (l2 < 0) l2 = 0; }
+            cv_trim(&v, &l2);
+            for (int k = 0; k < l2; k++) if (v[k] == ',') { l2 = k; break; }
+            cv_trim(&v, &l2);
+            fam = v; fl = l2;
+        } else if (!strcmp(lown, "src")) {
+            for (int k = 0; k + 4 <= vl; k++) {
+                if (!w_ieq_prefix(val + k, vl - k, "url(")) continue;
+                const char* u = val + k + 4;
+                int e = 0;
+                while (e < vl - k - 4 && u[e] != ')') e++;
+                cv_trim(&u, &e);
+                if (e && (u[0] == '"' || u[0] == '\'')) {
+                    char qc = u[0]; u++; e -= 2;
+                    int t = 0;
+                    while (t < e && u[t] != qc) t++;
+                    e = t;
+                }
+                if (e > 0) { url = u; ul = e; }
+                break;
+            }
+        }
+    }
+    if (!fam || fl <= 0 || fl > 47 || !url || ul <= 0 || ul > 200) return;
+    char famb[48];
+    int cfl = fl < 47 ? fl : 47;
+    memcpy(famb, fam, (size_t)cfl);
+    famb[cfl] = 0;
+    char abs[256];
+    css_resolve_url(pc->sh->base, url, ul, abs, sizeof abs);
+    if (!abs[0]) return;
+    wbuf_put(&pc->sh->fontfaces, famb, cfl + 1);
+    wbuf_put(&pc->sh->fontfaces, abs, (int)strlen(abs) + 1);
+    pc->sh->nfontfaces++;
+}
+
 // Parse a run of top-level rules (sheet body or an at-rule block).
 static void parse_rules(struct pctx* pc, const char* s, int len, int mq) {
     int i = 0;
@@ -2097,8 +2421,10 @@ static void parse_rules(struct pctx* pc, const char* s, int len, int mq) {
             } else if (w_ieq(name, nl, "layer") || w_ieq(name, nl, "scope") ||
                        w_ieq(name, nl, "document") || w_ieq(name, nl, "-moz-document")) {
                 parse_rules(pc, body, bl, mq);
+            } else if (w_ieq(name, nl, "font-face")) {
+                parse_font_face(pc, body, bl);
             }
-            // @font-face, @keyframes, @page, @font-feature-values, @counter-style,
+            // @keyframes, @page, @font-feature-values, @counter-style,
             // @property, @starting-style...: skipped
             i = be < len ? be + 1 : len;
             continue;

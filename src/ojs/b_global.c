@@ -45,7 +45,15 @@ jv global_get(ojs* J, struct str* name, int typeof_mode) {
     }
     int h = obj_has(J, g, k);
     if (h < 0) return JV_EXC;
-    if (!h) { OJS_MISS(J, g, k, typeof_mode ? "typeof" : "ident"); return typeof_mode ? JV_UNDEFINED : not_defined(J, name); }
+    if (!h) {
+        if (J->named_lookup) {
+            char nb[128];
+            str_to_utf8_buf(name, nb, sizeof nb);
+            jv v = J->named_lookup(J, nb, (int)strlen(nb));
+            if (v != JV_UNDEFINED && v != JV_EXC) return v;
+        }
+        OJS_MISS(J, g, k, typeof_mode ? "typeof" : "ident"); return typeof_mode ? JV_UNDEFINED : not_defined(J, name);
+    }
     return obj_get(J, g, k, jv_from_obj(g));
 }
 

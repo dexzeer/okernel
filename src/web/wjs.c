@@ -1327,6 +1327,7 @@ void wjs_inserted(struct wjs* js, int node) {
     }
     wdoc_dom_changed(js->doc, what);
     for (int i = 0; i < ns; i++) wjs_dynamic_script(js, scripts[i]);
+    wdoc_ablock_touch(js->doc);           // new nodes may need hide rules
 }
 
 void wjs_removed(struct wjs* js, int parent, int node) {
@@ -1359,6 +1360,7 @@ void wjs_attr_changed(struct wjs* js, int el, int a) {
             wjs_dynamic_script(js, el);
     }
     wdoc_dom_changed(js->doc, what);
+    wdoc_ablock_touch(js->doc);           // a class/id change can pull in hide rules
 }
 
 void wjs_text_changed(struct wjs* js, int node) {
@@ -1380,6 +1382,28 @@ void wjs_text_changed(struct wjs* js, int node) {
 }
 
 // ---- lifecycle --------------------------------------------------------------------------
+
+// window named properties: an element whose id (or name, on the HTML nameable
+// set: embed/form/iframe/img/object) matches a bare identifier is reachable as
+// a global
+static ojsv named_global(ojs* J, const char* name, int len) {
+    struct wjs* js = (struct wjs*)ojs_get_opaque(J);
+    if (!js || !js->d) return OJS_UNDEFINED;
+    int el = wdom_find_id(js->d, name);
+    if (el < 0) {
+        static const int NAMEABLE[5] = { T_embed, T_form, T_iframe, T_img, T_object };
+        for (int e = js->d->n[0].first; e >= 0; e = wdom_next(js->d, e, 0)) {
+            if (js->d->n[e].type != WN_ELEM || js->d->n[e].ns != NS_HTML) continue;
+            int hit = 0;
+            for (int k = 0; k < 5; k++) if (js->d->n[e].tag == NAMEABLE[k]) { hit = 1; break; }
+            if (!hit) continue;
+            int vl;
+            const char* v = wdom_attr(js->d, e, A_name, &vl);
+            if (v && vl == len && !memcmp(v, name, (size_t)len)) { el = e; break; }
+        }
+    }
+    return el >= 0 ? wjs_wrap(js, el) : OJS_UNDEFINED;
+}
 
 struct wjs* wjs_new(struct wdoc* doc) {
     struct wjs* js = (struct wjs*)w_calloc(1, sizeof(struct wjs));
@@ -1416,6 +1440,7 @@ struct wjs* wjs_new(struct wdoc* doc) {
     ojs_set_stack_size(ctx, REALM_STACK_MAX);
     ojs_set_interrupt_handler(ctx, interrupt_cb, js);
     ojs_set_rejection_tracker(ctx, rejection_cb, js);
+    ojs_set_named_lookup(ctx, named_global);
 #if !(defined(KERNEL) && KERNEL)
     if (getenv("OJS_GCSTRESS")) ojs_set_gc_stress(ctx, (uint32_t)atoi(getenv("OJS_GCSTRESS")));   // host GC-root testing
 #endif
@@ -1475,6 +1500,16 @@ struct wjs* wjs_new(struct wdoc* doc) {
 }
 
 int wjs_ok(struct wjs* js) { return js && !js->dead; }
+
+// The adblocker's scriptlets (ablock.c) must be in place before any page
+// script runs: wdoc.c evaluates the generated source right after wjs_new.
+void wjs_inject_scriptlets(struct wjs* js, const char* src, int len) {
+    if (!js || !js->J || !src || len <= 0) return;
+    GUARD(js, );
+    ojsv r = ojs_eval(js->J, src, len, "<ablock>", OJS_EVAL_SCRIPT | OJS_EVAL_HIDE_SOURCE);
+    if (ojs_is_exception(r)) wjs_report_exception(js, "<ablock>");
+    UNGUARD(js);
+}
 
 void wjs_free(struct wjs* js) {
     if (!js) return;
