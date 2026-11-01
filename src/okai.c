@@ -43,6 +43,7 @@
 #include "web/wcommon.h"
 #include "web/wdom.h"
 #include "web/wurl.h"
+#include "ablock.h"
 #include "web/image.h"
 #include "web/surface.h"
 #include "ui_draw.h"
@@ -508,7 +509,8 @@ static void req_free(struct oreq* q) {
 
 // Start the GET for q->url. top: the page a resource belongs to (cookie
 // SameSite context), NULL for a top-level navigation. 0 = started, -1 = no
-// host in the URL, -2 = the fetch engine is full (try again later).
+// host in the URL, -2 = the fetch engine is full (try again later),
+// -3 = blocked by the adblock filter lists (ablock.c).
 // Request headers a page may not set (the browser owns them).
 static int header_forbidden(const char* n, int nl) {
     static const char* const bad[] = { "host", "content-length", "connection", "keep-alive", "transfer-encoding",
@@ -702,7 +704,54 @@ static void fdbg_req(struct oreq* q, const struct fetch_opts* o) {
     if (o->body && o->body_len) fdbg_body("req", o->body, (int)o->body_len);
 }
 
+// ABK_* kind for the request. Resources carry their rk; documents (rk -1)
+// are distinguished from iframe documents by the tab's is_frame. The
+// preload scanner's speculative oreq has sub_id -1 and no doc, but a real
+// rk — check rk first.
+static int ablock_kind_of(const struct oreq* q) {
+    if (q->rk >= 0) {
+        switch (q->rk) {
+        case WDOC_RK_CSS:    return ABK_CSS;
+        case WDOC_RK_IMG:    return ABK_IMG;
+        case WDOC_RK_SCRIPT: return ABK_SCRIPT;
+        case WDOC_RK_FONT:   return ABK_FONT;
+        default:             return ABK_REQ;
+        }
+    }
+    const struct okai_tab* T = &okais[q->bi].tabs[q->tab];
+    return T->is_frame ? ABK_FRAME : ABK_MAIN;
+}
+
 static int req_fetch(struct oreq* q, const char* top) {
+    // the adblock lists (ablock.c) get the final say before anything goes
+    // out — before the cache lookup, the prefetch and fetch_begin
+    int ak = ablock_kind_of(q);
+    int redir = -1;
+    if (!ablock_allows2(q->url, top, ak, &redir)) {
+        if (redir >= 0 && q->doc && q->sub_id >= 0) {
+            // $redirect=: serve a built-in resource (noop.js, 1x1.gif, ...)
+            // instead of the request, exactly like the data:-URL path does
+            const char* rb;
+            int rl;
+            const char* rct;
+            ablock_resource(redir, &rb, &rl, &rct);
+            struct job j;
+            memset(&j, 0, sizeof j);
+            j.op = JOB_FETCH_DONE;
+            j.doc = q->doc;
+            j.id = q->sub_id;
+            j.bytes = rb;
+            j.len = rl;
+            j.status = 200;
+            j.charset = rct;
+            j.final_url = q->url;
+            run_job(&j);
+            serial_printf("[ablk] redirect %s\n", q->url);
+            return -4;
+        }
+        serial_printf("[ablk] block %s %s\n", ablock_kind_name(ak), q->url);
+        return -3;
+    }
     char host[128];
     static char path[OKAI_URL_LEN];
     static char cookie_hdr[NET_EXTRA_MAX + 16384];
@@ -2060,6 +2109,13 @@ static int start_main_fetch(int id, int tab) {
     q->post_ref = T->post_ref;
     int r = req_fetch(q, top_url_for(id, tab, 0));
     if (r == -2) { q->used = 0; return 2; }
+    if (r == -3) {
+        // blocked by the filter lists (ablock.c)
+        q->used = 0;
+        serial_printf("[ablk] navigation to %s blocked\n", T->url);
+        show_error(id, tab);
+        return -1;
+    }
     if (r < 0) {
         // No hostname (e.g. a malformed address-bar entry). Never fire the
         // request — a DNS query for an empty host wedged the old fetch owner.
@@ -2166,9 +2222,10 @@ static int start_next_sub(int bi, int ti) {
         struct oreq* q = req_new(bi, ti, T->doc, id, url);
         if (q) q->cors = kind == WDOC_RK_REQ;
         serial_printf("[okai] sub-res fetch: %s %s\n", kind_name(kind), url);
-        if (!q || req_fetch(q, top_url_for(bi, ti, 1)) != 0) {
+        int r = -1;
+        if (!q || (r = req_fetch(q, top_url_for(bi, ti, 1))) != 0) {
             if (q) q->used = 0;
-            sub_fail(T, id, url);
+            if (r != -4) sub_fail(T, id, url);   // -4: served from a built-in redirect resource
             continue;
         }
         T->sub_inflight++;

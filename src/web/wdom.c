@@ -133,7 +133,7 @@ struct wdom* wdom_new(void) {
 
 void wdom_free(struct wdom* d) {
     if (!d) return;
-    w_free(d->n); w_free(d->a); w_free(d->text); w_free(d->classes);
+    w_free(d->n); w_free(d->a); w_free(d->text); w_free(d->classes); w_free(d->scr);
     atoms_free(&d->atoms);
     w_free(d);
 }
@@ -660,3 +660,23 @@ void wdom_serialize(const struct wdom* d, int node, int outer, struct wbuf* b) {
 }
 
 int wdom_create_fragment(struct wdom* d) { return new_node(d, WN_FRAG); }
+
+// Scroll offset of an element that is a scroll container (px).
+void wdom_scroll_get(const struct wdom* d, int node, int* x, int* y) {
+    *x = *y = 0;
+    if (node < 0 || node >= d->nscr) return;
+    *x = d->scr[2 * node]; *y = d->scr[2 * node + 1];
+}
+int wdom_scroll_set(struct wdom* d, int node, int x, int y) {
+    if (node < 0) return 0;
+    if (node >= d->nscr) {
+        int nc = d->nn + 16;
+        int32_t* n = (int32_t*)w_realloc(d->scr, (size_t)nc * 2 * sizeof(int32_t));
+        if (!n) return 0;
+        for (int i = d->nscr * 2; i < nc * 2; i++) n[i] = 0;
+        d->scr = n; d->nscr = nc;
+        if (node >= nc) return 0;
+    }
+    d->scr[2 * node] = x; d->scr[2 * node + 1] = y;
+    return 1;
+}

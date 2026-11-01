@@ -61,6 +61,9 @@ uint32_t wdoc_background(struct wdoc* d);
 struct wdom* wdoc_dom(struct wdoc* d);
 // Mark the DOM changed (form typing, scripts): restyle + relayout next update.
 void wdoc_invalidate(struct wdoc* d);
+// The adblocker's hide rules are re-collected when the DOM changes
+// (called by the script mutation hooks in wjs.c; picked up by wdoc_update).
+void wdoc_ablock_touch(struct wdoc* d);
 // Document y (px) of an element with id/name (fragment navigation), -1 if none.
 int  wdoc_anchor_y(struct wdoc* d, const char* frag);
 // Stylesheets not yet delivered (gate the first paint).
@@ -69,6 +72,9 @@ int  wdoc_pending_css(struct wdoc* d);
 int  wdoc_has_fixed(struct wdoc* d);
 // Border box of a node in document px; 0 if it has no box.
 int  wdoc_node_rect(struct wdoc* d, int node, int* x, int* y, int* w, int* h);
+int  wdoc_scroll_get(struct wdoc* d, int node, int* x, int* y);               // element scroll offset (px); 0 = not a scroll container
+int  wdoc_scroll_set(struct wdoc* d, int node, int x, int y);                 // clamped to the scrollable range; 1 = changed
+int  wdoc_scroll_extent(struct wdoc* d, int node, int* sw, int* sh);          // scrollWidth / scrollHeight; 0 = not a scroll container
 // Hit regions (links, controls) of the current layout, document px.
 struct wdoc_region {
     int kind, node, fixed;
@@ -89,6 +95,7 @@ char* wdoc_data_url(const char* url, int len, int* out_len, char* mime, int mime
 #define WDOC_RK_IMG    1
 #define WDOC_RK_SCRIPT 2
 #define WDOC_RK_REQ    3   // fetch()/XMLHttpRequest
+#define WDOC_RK_FONT   4   // @font-face src (TTF)
 struct wjs;
 // Run page scripts (ojs) for the next wdoc_load. Off by default.
 void wdoc_set_scripting(struct wdoc* d, int on);

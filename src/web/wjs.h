@@ -33,6 +33,9 @@ int  wjs_now(void);                          // ms (host clock)
 void wjs_debug_eval(struct wjs* js, const char* src);   // host builds only
 struct wjs* wjs_new(struct wdoc* doc);
 void wjs_free(struct wjs* js);
+// Evaluate the adblocker's generated scriptlet source in this realm (before
+// the page's own scripts; called by wdoc.c right after wjs_new).
+void wjs_inject_scriptlets(struct wjs* js, const char* src, int len);
 int  wjs_ok(struct wjs* js);                 // realm alive (not aborted/OOM)
 // After wdoc parsed the document: register parser-inserted scripts.
 void wjs_scan_scripts(struct wjs* js);

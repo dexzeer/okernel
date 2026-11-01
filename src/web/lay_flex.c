@@ -38,6 +38,8 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
     const struct wstyle* s = fb->st;
     int row = s->flex_direction == FD_ROW || s->flex_direction == FD_ROW_REV;
     int rev = s->flex_direction == FD_ROW_REV || s->flex_direction == FD_COL_REV;
+    int rev0 = rev;                                   // as written (start / end keywords follow the writing mode, not this)
+    if (row && s->direction_rtl) rev = !rev;       // a row follows the inline direction
     int wrap = s->flex_wrap != FW_NOWRAP;
     int32_t cleft = fb->b[3] + fb->p[3], ctop = fb->b[0] + fb->p[0];
     // definite inner height?
@@ -51,7 +53,7 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
     for (int c = fb->first; c >= 0; c = L->b[c].next) total++;
     if (total > MAXFI) total = MAXFI;
     // per-call scratch (flex containers nest): items + order + per-line arrays
-    size_t need = (size_t)(total + 2) * (sizeof(struct fitem) + 5 * sizeof(int32_t));
+    size_t need = (size_t)(total + 2) * (sizeof(struct fitem) + 9 * sizeof(int32_t));
     char* scratch = (char*)w_malloc(need);
     if (!scratch) { *content_h = 0; return; }
     struct fitem* items = (struct fitem*)scratch;
@@ -59,6 +61,10 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
     int* line_start = order + total + 2;
     int32_t* line_cross = line_start + total + 2;
     int32_t* line_off = line_cross + total + 2;
+    int32_t* om_main0 = line_off + total + 2;
+    int32_t* om_main1 = om_main0 + total + 2;
+    int32_t* om_cross0 = om_main1 + total + 2;
+    int32_t* om_cross1 = om_cross0 + total + 2;
     int n = 0;
     for (int c = fb->first; c >= 0; c = L->b[c].next) {
         struct lbox* cb = &L->b[c];
@@ -84,9 +90,10 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
         int32_t extra_main = row ? cb->p[1] + cb->p[3] + cb->b[1] + cb->b[3] : cb->p[0] + cb->p[2] + cb->b[0] + cb->b[2];
         int bb = cs->box_sizing == BX_BORDER;
         if (row) {
-            it->mainm0 = cb->m[3]; it->mainm1 = cb->m[1];
+            int ms = rev ? 1 : 3, me = rev ? 3 : 1;       // the main-start margin is the right one in a mirrored (reversed) row
+            it->mainm0 = cb->m[ms]; it->mainm1 = cb->m[me];
             it->crossm0 = cb->m[0]; it->crossm1 = cb->m[2];
-            it->auto_m0 = cs->margin[3].t == WL_AUTO; it->auto_m1 = cs->margin[1].t == WL_AUTO;
+            it->auto_m0 = cs->margin[ms].t == WL_AUTO; it->auto_m1 = cs->margin[me].t == WL_AUTO;
             it->auto_c0 = cs->margin[0].t == WL_AUTO; it->auto_c1 = cs->margin[2].t == WL_AUTO;
         } else {
             it->mainm0 = cb->m[0]; it->mainm1 = cb->m[2];
@@ -109,6 +116,18 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
             if (v >= 0) base = v + (bb ? 0 : extra_main);
         }
         int32_t content_main = -1;
+        if (base < 0 && row && !wrap && cs->aspect_ratio > 0 && cs->height.t != WL_LEN && cs->width.t != WL_LEN && cross_size >= 0 &&
+            !it->auto_c0 && !it->auto_c1 && !(cs->contain & CT_SIZE)) {
+            // a stretched item has a definite cross size, so its ratio gives the main size
+            int st = cs->align_self == AL_AUTO ? s->align_items : cs->align_self;
+            if (st == AL_STRETCH || st == AL_NORMAL) {
+                int32_t extra_cross = cb->p[0] + cb->p[2] + cb->b[0] + cb->b[2];
+                int32_t hb = cross_size - it->crossm0 - it->crossm1;       // border-box cross size
+                if (hb < 0) hb = 0;
+                base = bb ? w_muldiv(hb, cs->aspect_ratio, 1000) : w_muldiv(hb - extra_cross, cs->aspect_ratio, 1000) + extra_main;
+                if (base < 0) base = 0;
+            }
+        }
         if (base < 0) {
             if (row) {
                 int32_t mn, mx;
@@ -140,10 +159,23 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
             // automatic minimum size: min-content, capped by a definite size
             if (row) {
                 int32_t a, z;
-                lay_intrinsic(L, c, &a, &z);
+                lay_intrinsic_content(L, c, &a, &z);     // the content's min-content size, not the item's specified width
                 minm = a;
             } else {
-                minm = content_main >= 0 ? content_main : 0;
+                if (content_main < 0) {
+                    // flex-basis (or height) was definite, so the item was not
+                    // measured for its base: lay it out at its cross size to
+                    // get the content size suggestion
+                    int32_t cw = content_w - it->crossm0 - it->crossm1;
+                    int stretch = (cs->align_self == AL_AUTO ? s->align_items : cs->align_self);
+                    int32_t fw = (cs->width.t != WL_LEN && (stretch == AL_STRETCH || stretch == AL_NORMAL) &&
+                                  !it->auto_c0 && !it->auto_c1) ? cw : -1;
+                    cb->pax = fb->pax + cleft;
+                    cb->pay = fb->pay + ctop;
+                    lay_box(L, c, content_w, fw >= 0 ? fw : (cs->width.t == WL_LEN ? -1 : lay_shrink_width(L, c, cw)), -1);
+                    content_main = L->b[c].h;
+                }
+                minm = content_main;
                 if (minm > PX(20000)) minm = 0;
             }
             int32_t v = resolve_main_len(msz, main_size, 1);
@@ -183,6 +215,65 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
         }
         nlines++;
         line_start[nlines] = n;
+    }
+    // margin-trim (css-box-4): adjoining child margins at the container's
+    // edges are treated as zero — first/last item of each line for the main
+    // axis, all items of the first/last line for the cross axis. Trimming
+    // changes the main sizes, so the lines are re-broken once with trimmed
+    // margins and the trims are re-applied to the new lines.
+    if (s->margin_trim) {
+        for (int i = 0; i < n; i++) {
+            om_main0[i] = items[i].mainm0; om_main1[i] = items[i].mainm1;
+            om_cross0[i] = items[i].crossm0; om_cross1[i] = items[i].crossm1;
+        }
+        for (int pass = 0; pass < 2; pass++) {
+            int mt = s->margin_trim;
+            for (int ln = 0; ln < nlines; ln++) {
+                int a = line_start[ln], z = line_start[ln + 1];
+                int first_line = ln == 0, last_line = ln == nlines - 1;
+                for (int i = a; i < z; i++) {
+                    struct fitem* it = &items[i];
+                    struct lbox* cb = &L->b[it->box];
+                    if (row) {
+                        if (first_line && (mt & MT_BLOCK_START)) { it->crossm0 = 0; cb->m[0] = 0; }
+                        if (last_line && (mt & MT_BLOCK_END)) { it->crossm1 = 0; cb->m[2] = 0; }
+                        if ((mt & MT_INLINE_START) && i == a) { it->mainm0 = 0; cb->m[3] = 0; }
+                        if ((mt & MT_INLINE_END) && i == z - 1) { it->mainm1 = 0; cb->m[1] = 0; }
+                    } else {
+                        if (first_line && (mt & MT_INLINE_START)) { it->crossm0 = 0; cb->m[3] = 0; }
+                        if (last_line && (mt & MT_INLINE_END)) { it->crossm1 = 0; cb->m[1] = 0; }
+                        if ((mt & MT_BLOCK_START) && i == a) { it->mainm0 = 0; cb->m[0] = 0; }
+                        if ((mt & MT_BLOCK_END) && i == z - 1) { it->mainm1 = 0; cb->m[2] = 0; }
+                    }
+                }
+            }
+            if (pass == 1 || !wrap || main_size < 0) break;
+            // re-break with trimmed main margins
+            nlines = 0;
+            line_start[0] = 0;
+            int32_t used = 0;
+            int cnt = 0;
+            for (int i = 0; i < n; i++) {
+                int32_t outer = items[i].hyp + items[i].mainm0 + items[i].mainm1;
+                if (wrap && main_size >= 0 && cnt > 0 && used + gap_main + outer > main_size) {
+                    line_start[++nlines] = i;
+                    used = 0;
+                    cnt = 0;
+                }
+                used += (cnt ? gap_main : 0) + outer;
+                cnt++;
+            }
+            nlines++;
+            line_start[nlines] = n;
+            // restore the margins and trim again for the new line assignment
+            for (int i = 0; i < n; i++) {
+                struct lbox* cb = &L->b[items[i].box];
+                items[i].mainm0 = om_main0[i]; items[i].mainm1 = om_main1[i];
+                items[i].crossm0 = om_cross0[i]; items[i].crossm1 = om_cross1[i];
+                if (row) { cb->m[0] = om_cross0[i]; cb->m[2] = om_cross1[i]; cb->m[3] = om_main0[i]; cb->m[1] = om_main1[i]; }
+                else { cb->m[3] = om_cross0[i]; cb->m[1] = om_cross1[i]; cb->m[0] = om_main0[i]; cb->m[2] = om_main1[i]; }
+            }
+        }
     }
     // ---- resolve flexible lengths per line ----
     for (int ln = 0; ln < nlines; ln++) {
@@ -293,7 +384,7 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
             int al = cs->align_self == AL_AUTO ? s->align_items : cs->align_self;
             int cross_auto = row ? cs->height.t != WL_LEN : cs->width.t != WL_LEN;
             if ((al == AL_STRETCH || al == AL_NORMAL) && cross_auto && !it->auto_c0 && !it->auto_c1 &&
-                L->b[c].kind != LB_REPLACED) {
+                (L->b[c].kind != LB_REPLACED || L->b[c].rk == RK_INPUT_TEXT || L->b[c].rk == RK_INPUT_BUTTON || L->b[c].rk == RK_SELECT)) {
                 int32_t want = line_cross[ln] - it->crossm0 - it->crossm1;
                 struct wlen mxc = row ? cs->max_h : cs->max_w;
                 if (mxc.t == WL_LEN && !mxc.pct) { if (want > mxc.px) want = mxc.px; }
@@ -314,6 +405,8 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
         int32_t free = container_cross - total_cross;
         int32_t start = 0, between = 0;
         int ac = s->align_content;
+        if (ac == AL_WM_START) ac = s->flex_wrap == FW_WRAP_REV ? AL_END : AL_START;
+        else if (ac == AL_WM_END) ac = s->flex_wrap == FW_WRAP_REV ? AL_START : AL_END;
         if (nlines > 1 || wrap) {
             if (free > 0) {
                 if (ac == AL_END) start = free;
@@ -355,6 +448,11 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
             free = 0;
         }
         int jc = s->justify_content;
+        // start / end / left / right are physical sides of the writing mode: row-reverse mirrors the positions afterwards
+        if (jc == AL_WM_START) jc = rev0 ? AL_END : AL_START;
+        else if (jc == AL_WM_END) jc = rev0 ? AL_START : AL_END;
+        else if (jc == AL_LEFT) jc = (row && rev) ? AL_END : AL_START;
+        else if (jc == AL_RIGHT) jc = (row && rev) ? AL_START : (row ? AL_END : AL_START);
         int cnt = z - a;
         if (free > 0 && cnt > 0) {                  // an empty line has nothing to distribute the space over
             if (jc == AL_END || jc == AL_RIGHT) start = free;
@@ -374,6 +472,8 @@ void lay_flex(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
             struct fitem* it = &items[i];
             const struct wstyle* cs = L->b[it->box].st;
             int al = cs->align_self == AL_AUTO ? s->align_items : cs->align_self;
+            if (al == AL_WM_START) al = s->flex_wrap == FW_WRAP_REV ? AL_END : AL_START;
+            else if (al == AL_WM_END) al = s->flex_wrap == FW_WRAP_REV ? AL_START : AL_END;
             int32_t lc = line_cross[ln];
             int32_t outer = it->cross + it->crossm0 + it->crossm1;
             int32_t off = 0;
@@ -424,14 +524,39 @@ void lay_flex_intrinsic(struct wlayout* L, int bi, int32_t* mn, int32_t* mx) {
     int32_t gap = (s->column_gap.t == WL_LEN && !s->column_gap.pct) ? s->column_gap.px : 0;
     int32_t a = 0, z = 0;
     int cnt = 0;
+    // margin-trim: the first item's start / last item's end margin does not
+    // count toward the intrinsic main size (row case)
+    int mt = s->margin_trim;
+    int first_c = -1, last_c = -1;
+    for (int c = fb->first; c >= 0; c = L->b[c].next) {
+        if (L->b[c].flags & BF_ABS) continue;
+        if (first_c < 0) first_c = c;
+        last_c = c;
+    }
     for (int c = fb->first; c >= 0; c = L->b[c].next) {
         if (L->b[c].flags & BF_ABS) continue;
         int32_t m1, m2;
         lay_intrinsic(L, c, &m1, &m2);
         struct lbox* cb = &L->b[c];
-        int32_t mm = 0;
-        if (cb->st->margin[1].t == WL_LEN && !cb->st->margin[1].pct) mm += cb->st->margin[1].px;
-        if (cb->st->margin[3].t == WL_LEN && !cb->st->margin[3].pct) mm += cb->st->margin[3].px;
+        if (row && cb->st->aspect_ratio > 0 && cb->st->width.t == WL_AUTO && cb->st->height.t == WL_AUTO &&
+            s->height.t == WL_LEN && !s->height.pct && (s->align_items == AL_STRETCH || s->align_items == AL_NORMAL) &&
+            (cb->st->align_self == AL_AUTO || cb->st->align_self == AL_STRETCH || cb->st->align_self == AL_NORMAL)) {
+            // a stretched item's cross size is the container's definite height: its ratio turns that into a width
+            lb_resolve_box_sides(L, c, 0);
+            cb = &L->b[c];
+            int32_t inner = s->height.px;
+            if (s->box_sizing == BX_BORDER) { lb_resolve_box_sides(L, bi, 0); fb = &L->b[bi]; inner -= fb->p[0] + fb->p[2] + fb->b[0] + fb->b[2]; }
+            int32_t hb = inner - cb->m[0] - cb->m[2];
+            int32_t ex_h = cb->p[0] + cb->p[2] + cb->b[0] + cb->b[2], ex_w = cb->p[1] + cb->p[3] + cb->b[1] + cb->b[3];
+            int32_t w = cb->st->box_sizing == BX_BORDER ? w_muldiv(hb, cb->st->aspect_ratio, 1000) : w_muldiv(hb - ex_h, cb->st->aspect_ratio, 1000) + ex_w;
+            if (w > m1) m1 = w;
+            if (w > m2) m2 = w;
+        }
+        int32_t m1px = (cb->st->margin[1].t == WL_LEN && !cb->st->margin[1].pct) ? cb->st->margin[1].px : 0;
+        int32_t m3px = (cb->st->margin[3].t == WL_LEN && !cb->st->margin[3].pct) ? cb->st->margin[3].px : 0;
+        int32_t mm = m1px + m3px;
+        if (row && (mt & MT_INLINE_START) && c == first_c) mm -= m3px;
+        if (row && (mt & MT_INLINE_END) && c == last_c) mm -= m1px;
         if (mm < 0) mm = 0;
         // a flex-basis length overrides the content size for max-content
         if (row && cb->st->flex_basis.t == WL_LEN && !cb->st->flex_basis.pct) {

@@ -312,7 +312,7 @@ static int grid_place(struct wlayout* L, int bi, struct gstate* g, int32_t conte
 }
 
 static void size_columns(struct wlayout* L, struct gstate* g, int32_t content_w, int32_t gap, int intrinsic_max,
-                         int32_t* mn_out, int32_t* mx_out) {
+                         int32_t* mn_out, int32_t* mx_out, int mt) {
     int nc = g->ncols;
     int32_t minc[MAXTRACK], maxc[MAXTRACK];
     for (int i = 0; i < nc; i++) { minc[i] = 0; maxc[i] = 0; }
@@ -323,9 +323,14 @@ static void size_columns(struct wlayout* L, struct gstate* g, int32_t content_w,
         int32_t a, z;
         lay_intrinsic(L, gi->box, &a, &z);
         struct lbox* cb = &L->b[gi->box];
-        int32_t mm = 0;
-        if (cb->st->margin[1].t == WL_LEN && !cb->st->margin[1].pct) mm += cb->st->margin[1].px;
-        if (cb->st->margin[3].t == WL_LEN && !cb->st->margin[3].pct) mm += cb->st->margin[3].px;
+        // margin-trim: the first/last column item's adjoining margin does
+        // not count toward the track size
+        int32_t m1px = (cb->st->margin[1].t == WL_LEN && !cb->st->margin[1].pct) ? cb->st->margin[1].px : 0;
+        int32_t m3px = (cb->st->margin[3].t == WL_LEN && !cb->st->margin[3].pct) ? cb->st->margin[3].px : 0;
+        int32_t mm = m1px + m3px;
+        if ((mt & MT_INLINE_END) && gi->c1 == nc) mm -= m1px;
+        if ((mt & MT_INLINE_START) && gi->c0 == 0) mm -= m3px;
+        if (mm < 0) mm = 0;
         if (a + mm > minc[gi->c0]) minc[gi->c0] = a + mm;
         if (z + mm > maxc[gi->c0]) maxc[gi->c0] = z + mm;
     }
@@ -425,6 +430,18 @@ static void size_columns(struct wlayout* L, struct gstate* g, int32_t content_w,
     }
 }
 
+// margin-trim: child margins adjoining the container's edges are zero. Must
+// be re-applied after every lay_box: it re-resolves margins from style.
+static void grid_trim_item(struct wlayout* L, struct gstate* g, const struct wstyle* s, struct gitem* gi) {
+    int mt = s->margin_trim;
+    if (!mt) return;
+    struct lbox* cb = &L->b[gi->box];
+    if ((mt & MT_BLOCK_START) && gi->r0 == 0) cb->m[0] = 0;
+    if ((mt & MT_BLOCK_END) && gi->r1 >= g->nrows) cb->m[2] = 0;
+    if ((mt & MT_INLINE_START) && gi->c0 == 0) cb->m[3] = 0;
+    if ((mt & MT_INLINE_END) && gi->c1 >= g->ncols) cb->m[1] = 0;
+}
+
 void lay_grid(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) {
     struct gstate* g = (struct gstate*)w_malloc(sizeof(struct gstate));
     if (!g) { *content_h = 0; return; }
@@ -434,7 +451,7 @@ void lay_grid(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
     int32_t gapc = wl_resolve(s->column_gap, content_w, 0);
     int32_t gapr = wl_resolve(s->row_gap, inner_h > 0 ? inner_h : 0, 0);
     grid_place(L, bi, g, content_w, gapc);
-    size_columns(L, g, content_w, gapc, 0, 0, 0);
+    size_columns(L, g, content_w, gapc, 0, 0, 0, s->margin_trim);
     int nc = g->ncols, nr = g->nrows;
     int32_t colx[MAXTRACK + 1];
     {
@@ -447,6 +464,8 @@ void lay_grid(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
     if (total_w < content_w && nc > 0) {
         int32_t free = content_w - total_w;
         int jc = s->justify_content;
+        if (jc == AL_WM_START) jc = AL_START;
+        else if (jc == AL_WM_END) jc = AL_END;
         int32_t shift = 0, between = 0;
         if (jc == AL_CENTER) shift = free / 2;
         else if (jc == AL_END || jc == AL_RIGHT) shift = free;
@@ -469,11 +488,15 @@ void lay_grid(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
         if (gi->c1 >= nc) w = colx[nc] - colx[gi->c0];
         lb_resolve_box_sides(L, gi->box, w);
         cb = &L->b[gi->box];
+        grid_trim_item(L, g, s, gi);
         int js = cb->st->justify_self == AL_AUTO ? s->justify_items : cb->st->justify_self;
         int32_t fw = -1;
         int32_t avail = w - cb->m[1] - cb->m[3];
         if (cb->st->width.t != WL_LEN && cb->kind != LB_REPLACED) {
-            if (js == AL_STRETCH || js == AL_NORMAL || js == AL_AUTO) fw = avail;
+            // a definite block size and a ratio make the inline size
+            // transferred: stretch does not apply (css-sizing-4 5.1)
+            int tr = cb->st->aspect_ratio > 0 && cb->st->height.t == WL_LEN && !(cb->st->contain & CT_SIZE);
+            if (!tr && (js == AL_STRETCH || js == AL_NORMAL || js == AL_AUTO)) fw = avail;
             else fw = lay_shrink_width(L, gi->box, avail);
         }
         cb->pax = gb->pax + gb->b[3] + gb->p[3] + colx[gi->c0];
@@ -481,6 +504,7 @@ void lay_grid(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
         cb->cbh = -1;
         lay_box(L, gi->box, w, fw, -1);
         cb = &L->b[gi->box];
+        grid_trim_item(L, g, s, gi);
         if (gi->r1 - gi->r0 == 1) {
             struct track* t = &g->rows[gi->r0];
             if (t->maxk != TK_FIXED && !(t->maxk == TK_PCT && inner_h >= 0)) {
@@ -528,11 +552,19 @@ void lay_grid(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
         int32_t ch = (gi->r1 >= nr ? rowy[nr] : rowy[gi->r1] - gapr) - rowy[gi->r0];
         int as = cb->st->align_self == AL_AUTO ? s->align_items : cb->st->align_self;
         int js = cb->st->justify_self == AL_AUTO ? s->justify_items : cb->st->justify_self;
-        if ((as == AL_STRETCH || as == AL_NORMAL) && cb->st->height.t != WL_LEN && cb->kind != LB_REPLACED) {
+        // a definite inline size and a ratio make the block size transferred:
+        // stretch does not apply (css-sizing-4 5.1)
+        int trh = cb->st->aspect_ratio > 0 && cb->st->width.t == WL_LEN && !(cb->st->contain & CT_SIZE);
+        if ((as == AL_STRETCH || as == AL_NORMAL) && cb->st->height.t != WL_LEN && cb->kind != LB_REPLACED && !trh) {
             int32_t want = ch - cb->m[0] - cb->m[2];
             if (want > cb->h) lay_box(L, gi->box, cw, cb->w, want);
             cb = &L->b[gi->box];
+            grid_trim_item(L, g, s, gi);
         }
+        if (js == AL_WM_START) js = AL_START;
+        else if (js == AL_WM_END) js = AL_END;
+        if (as == AL_WM_START) as = AL_START;
+        else if (as == AL_WM_END) as = AL_END;
         int32_t ox = cb->m[3], oy = cb->m[0];
         int32_t fx = cw - cb->w - cb->m[1] - cb->m[3];
         int32_t fy = ch - cb->h - cb->m[0] - cb->m[2];
@@ -559,7 +591,7 @@ void lay_grid_intrinsic(struct wlayout* L, int bi, int32_t* mn, int32_t* mx) {
     // placement with an "infinite" width so auto-fill yields one repetition
     grid_place(L, bi, g, 0, gapc);
     int32_t a = 0, z = 0;
-    size_columns(L, g, 0, gapc, 1, &a, &z);
+    size_columns(L, g, 0, gapc, 1, &a, &z, s->margin_trim);
     w_free(g);
     *mn = a;
     *mx = z;

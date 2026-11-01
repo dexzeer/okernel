@@ -1,4 +1,5 @@
 #include "font.h"
+#include "image.h"
 #include "raster.h"
 #include "wcommon.h"
 #include "../cjk.h"
@@ -36,6 +37,150 @@ struct face {
 static struct face faces[F_COUNT];
 static int fonts_ready;
 
+// ---- Webfonts (@font-face) -------------------------------------------------
+// Faces loaded at runtime from fetched TTF data, addressed by family name.
+// Registry index i is face index F_COUNT + i everywhere a face index is used.
+
+struct webfont {
+    struct face f;
+    uint8_t* data;       // owned copy of the TTF (the face reads tables in place)
+    char name[48];       // lowercased family name
+    struct webfont* next;
+};
+
+static struct webfont* webfonts;
+static int nwebfonts;
+
+static void face_load(struct face* f, const uint8_t* d, const uint8_t* end);
+
+static struct webfont* webfont_at(int i) {
+    for (struct webfont* w = webfonts; w; w = w->next)
+        if (i-- == 0) return w;
+    return 0;
+}
+
+static struct face* face_at(int fi) {
+    if (fi < F_COUNT) return &faces[fi];
+    struct webfont* w = webfont_at(fi - F_COUNT);
+    return w ? &w->f : &faces[F_SANS_R];
+}
+
+static const char* face_family_name(int fi) {
+    if (fi < F_COUNT) return "";
+    struct webfont* w = webfont_at(fi - F_COUNT);
+    return w ? w->name : "";
+}
+
+// Register a TTF blob under a family name. Dedupes on (family, data hash) so
+// stylesheet rebuilds can re-deliver the same @font-face. Returns the face
+// index (>= F_COUNT) or -1.
+// WOFF 1.0 is an sfnt with zlib-compressed tables: rebuild the plain sfnt (heap, caller frees; NULL when malformed).
+static uint8_t* woff_to_sfnt(const uint8_t* in, int len, int* out_len) {
+    if (len < 44) return 0;
+    #define U32(o) (((uint32_t)in[o] << 24) | ((uint32_t)in[(o) + 1] << 16) | ((uint32_t)in[(o) + 2] << 8) | in[(o) + 3])
+    #define U16(o) (((uint32_t)in[o] << 8) | in[(o) + 1])
+    uint32_t flavor = U32(4), total = U32(16);
+    int nt = (int)U16(12);
+    if (nt <= 0 || nt > 64 || 44 + nt * 20 > len || total < 12 + (uint32_t)nt * 16 || total > 64u * 1024 * 1024) return 0;
+    uint8_t* out = (uint8_t*)w_malloc(total + 16);
+    if (!out) return 0;
+    memset(out, 0, total + 16);
+    out[0] = (uint8_t)(flavor >> 24); out[1] = (uint8_t)(flavor >> 16); out[2] = (uint8_t)(flavor >> 8); out[3] = (uint8_t)flavor;
+    out[4] = (uint8_t)(nt >> 8); out[5] = (uint8_t)nt;
+    int sr = 1, es = 0;
+    while (sr * 2 <= nt) { sr *= 2; es++; }
+    out[6] = (uint8_t)((sr * 16) >> 8); out[7] = (uint8_t)(sr * 16);
+    out[8] = (uint8_t)(es >> 8); out[9] = (uint8_t)es;
+    out[10] = (uint8_t)((nt * 16 - sr * 16) >> 8); out[11] = (uint8_t)(nt * 16 - sr * 16);
+    uint32_t pos = 12 + (uint32_t)nt * 16;
+    for (int i = 0; i < nt; i++) {
+        int e = 44 + i * 20;
+        uint32_t off = U32(e + 4), clen = U32(e + 8), olen = U32(e + 12);
+        if (off > (uint32_t)len || clen > (uint32_t)len - off || pos + olen > total) { w_free(out); return 0; }
+        memcpy(out + 12 + i * 16, in + e, 4);                        // tag
+        memcpy(out + 12 + i * 16 + 4, in + e + 16, 4);               // checksum
+        out[12 + i * 16 + 8] = (uint8_t)(pos >> 24); out[12 + i * 16 + 9] = (uint8_t)(pos >> 16);
+        out[12 + i * 16 + 10] = (uint8_t)(pos >> 8); out[12 + i * 16 + 11] = (uint8_t)pos;
+        memcpy(out + 12 + i * 16 + 12, in + e + 12, 4);              // length
+        if (clen == olen) memcpy(out + pos, in + off, olen);
+        else {
+            int ol = 0;
+            uint8_t* t = winflate_zlib(in + off, (int)clen, &ol, (int)olen + 16);
+            if (!t || (uint32_t)ol != olen) { w_free(t); w_free(out); return 0; }
+            memcpy(out + pos, t, olen);
+            w_free(t);
+        }
+        pos += (olen + 3) & ~3u;
+    }
+    #undef U32
+    #undef U16
+    *out_len = (int)(pos < total ? pos : total);
+    return out;
+}
+
+int wfont_register(const uint8_t* ttf, int len, const char* family) {
+    if (!ttf || len < 12 || !family || !family[0]) return -1;
+    if (ttf[0] == 'w' && ttf[1] == 'O' && ttf[2] == 'F' && ttf[3] == 'F') {
+        int sl = 0;
+        uint8_t* sf = woff_to_sfnt(ttf, len, &sl);
+        if (!sf) return -1;
+        int r = wfont_register(sf, sl, family);
+        w_free(sf);
+        return r;
+    }
+    // only raw TrueType glyf fonts: WOFF/WOF2 are containers (zlib tables),
+    // TTC collections would need the face offset — neither is supported
+    uint32_t magic = ((uint32_t)ttf[0] << 24) | ((uint32_t)ttf[1] << 16) |
+                     ((uint32_t)ttf[2] << 8) | ttf[3];
+    if (magic == 0x774F4632u /*wOF2*/ ||
+        magic == 0x74746366u /*ttcf*/) return -1;
+    char low[48];
+    int n = 0;
+    for (const char* p = family; *p && n < 47; p++) low[n++] = (char)w_lower((unsigned char)*p);
+    low[n] = 0;
+    uint32_t h = 2166136261u;
+    for (int i = 0; i < len; i++) h = (h ^ ttf[i]) * 16777619u;
+    int idx = 0;
+    for (struct webfont* w = webfonts; w; w = w->next, idx++) {
+        if (strcmp(w->name, low) || w->f.size != (uint32_t)len) continue;
+        uint32_t h2 = 2166136261u;
+        for (int i = 0; i < len; i++) h2 = (h2 ^ w->data[i]) * 16777619u;
+        if (h2 == h) return idx + 1;
+    }
+    struct webfont* w = (struct webfont*)w_malloc(sizeof(struct webfont));
+    if (!w) return -1;
+    w->data = (uint8_t*)w_malloc((size_t)len);
+    if (!w->data) { w_free(w); return -1; }
+    memcpy(w->data, ttf, (size_t)len);
+    face_load(&w->f, w->data, w->data + len);
+    memcpy(w->name, low, (size_t)n + 1);
+    w->next = 0;
+    if (!webfonts) webfonts = w;
+    else { struct webfont* t = webfonts; while (t->next) t = t->next; t->next = w; }
+    return ++nwebfonts;   // webfont id = registry index (appended) + 1
+}
+
+// Registry lookup by family name (case-insensitive). Returns the wfont.webfont
+// id (1-based; 0 = unknown).
+int wfont_find(const char* family, int len) {
+    if (!family || len <= 0) return -1;
+    char low[48];
+    int n = 0;
+    for (int i = 0; i < len && n < 47; i++) low[n++] = (char)w_lower((unsigned char)family[i]);
+    low[n] = 0;
+    int idx = 0;
+    for (struct webfont* w = webfonts; w; w = w->next, idx++)
+        if (!strcmp(w->name, low)) return idx + 1;
+    return 0;
+}
+
+const char* wfont_family_name(int registry_index) {
+    int idx = 0;
+    for (struct webfont* w = webfonts; w; w = w->next, idx++)
+        if (idx == registry_index) return w->name;
+    return "";
+}
+
 static inline uint32_t u16(const uint8_t* p) { return ((uint32_t)p[0] << 8) | p[1]; }
 static inline int32_t i16(const uint8_t* p) { return (int16_t)(((uint32_t)p[0] << 8) | p[1]); }
 static inline uint32_t u32(const uint8_t* p) {
@@ -44,6 +189,7 @@ static inline uint32_t u32(const uint8_t* p) {
 
 static uint32_t find_table(const struct face* f, const char* tag) {
     uint32_t n = u16(f->d + 4);
+    if (n > 256) return 0;   // garbage header (WOFF et al. parsed as SFNT)
     for (uint32_t i = 0; i < n; i++) {
         const uint8_t* r = f->d + 12 + i * 16;
         if (r[0] == (uint8_t)tag[0] && r[1] == (uint8_t)tag[1] &&
@@ -83,6 +229,7 @@ static void face_load(struct face* f, const uint8_t* d, const uint8_t* end) {
     }
     // cmap: prefer (3,10) format 12, then (3,1)/(0,x) format 4
     uint32_t n = u16(d + cmap + 2), best = 0;
+    if (n > 256) return;
     int best_rank = 0;
     for (uint32_t i = 0; i < n; i++) {
         const uint8_t* r = d + cmap + 4 + i * 8;
@@ -119,6 +266,10 @@ void wfont_init(void) {
 // Face index + whether to shear (synthetic oblique) for a font spec.
 static int pick_face(const struct wfont* f, int* synth) {
     *synth = 0;
+    if (f->webfont) {
+        int fi = F_COUNT + f->webfont - 1;
+        if (face_at(fi)->ok) return fi;   // not loaded yet / failed: generic fallback below
+    }
     switch (f->family) {
     case WF_FAMILY_SERIF:
         if (f->italic && !f->bold) return F_SERIF_I;
@@ -203,7 +354,7 @@ static inline int32_t fu_lu(const struct face* f, int32_t v, int px) {
 // carries Latin too but must stay last so western text keeps Noto Sans).
 // Returns face index or -1 (no outline anywhere).
 static int resolve(int fi, uint32_t cp, uint32_t* gid) {
-    uint32_t g = face_gid(&faces[fi], cp);
+    uint32_t g = face_gid(face_at(fi), cp);
     if (g) { *gid = g; return fi; }
     if (cp < 0x20) { *gid = 0; return fi; }
     g = face_gid(&faces[F_SYM], cp);
@@ -224,7 +375,7 @@ void wfont_metrics(const struct wfont* f, struct wfmetrics* m) {
     wfont_init();
     int synth;
     int fi = pick_face(f, &synth);
-    const struct face* fc = &faces[fi];
+    const struct face* fc = face_at(fi);
     int px = f->px ? f->px : 16;
     if (!fc->ok) {
         m->ascent = PX(px) * 8 / 10; m->descent = PX(px) / 5; m->line_gap = 0;
@@ -250,6 +401,11 @@ static int32_t missing_adv(int px, uint32_t cp) {
     return PX(px) * 6 / 10;
 }
 
+// C0/C1 control characters (but tab and newline, handled as white space before they get here) are drawn as the missing-glyph box
+static int is_ctrl(uint32_t cp) {
+    return (cp < 0x20 && cp != 9 && cp != 10) || (cp >= 0x7F && cp <= 0x9F);
+}
+
 static int is_zero_width(uint32_t cp) {
     return (cp >= 0x300 && cp <= 0x36F) || cp == 0x200B || cp == 0x200C ||
            cp == 0x200D || cp == 0xFEFF || cp == 0xAD || (cp >= 0xFE00 && cp <= 0xFE0F) ||
@@ -268,9 +424,9 @@ int32_t wfont_advance(const struct wfont* f, uint32_t cp) {
         if (r < 0 || cp == 0xAD) return 0;
     }
     uint32_t gid;
-    int r = resolve(fi, cp, &gid);
+    int r = is_ctrl(cp) ? -1 : resolve(fi, cp, &gid);
     if (r < 0) return missing_adv(px, cp);
-    return fu_lu(&faces[r], face_adv_fu(&faces[r], gid), px);
+    return fu_lu(face_at(r), face_adv_fu(face_at(r), gid), px);
 }
 
 int32_t wfont_measure(const struct wfont* f, const char* s, int len) {
@@ -441,7 +597,7 @@ static void emit_glyph(struct gctx* g, uint32_t gid, const struct xf* t, int dep
 // ---- Glyph cache ------------------------------------------------------------
 
 struct gent {
-    uint32_t key;
+    uint64_t key;
     struct gent* next;
     int16_t w, h, left, top;   // bitmap size; left/top offsets from pen/baseline
     uint8_t bm[];
@@ -488,12 +644,15 @@ static void mask_span(void* ctx, int y, int x, int len, const uint8_t* cov) {
 }
 
 static struct gent* glyph_get(int fi, int synth, int px, uint32_t gid, int phase) {
-    uint32_t key = ((uint32_t)fi << 28) | ((uint32_t)synth << 27) | ((uint32_t)phase << 25) |
-                   ((uint32_t)(px & 0x1FF) << 16) | (gid & 0xFFFF);
-    uint32_t h = (key * 2654435761u) >> 20;
+    // face:16 | synth:1 | phase:2 | px:9 | gid:24
+    uint64_t key = ((uint64_t)(uint32_t)fi << 40) | ((uint64_t)(uint32_t)synth << 39) |
+                   ((uint64_t)(uint32_t)phase << 37) | ((uint64_t)(uint32_t)(px & 0x1FF) << 28) |
+                   (uint64_t)(gid & 0xFFFFFFu);
+    uint32_t h = (uint32_t)((key * 0x9E3779B97F4A7C15ull) >> 32);
+    h = (h ^ (h >> 13)) & (GHASH - 1);
     for (struct gent* e = ghash[h]; e; e = e->next)
         if (e->key == key) return e;
-    const struct face* f = &faces[fi];
+    const struct face* f = face_at(fi);
     uint32_t off, len;
     int32_t xmin = 0, ymin = 0, xmax = 0, ymax = 0;
     int empty = !glyph_loc(f, gid, &off, &len) || len < 10;
@@ -612,7 +771,7 @@ int32_t wfont_draw(struct wsurf* s, const struct wfont* f, int32_t x, int32_t y,
         i += w_utf8_dec(str + i, len - i, &cp);
         if (cp == 0xA0) cp = ' ';
         uint32_t gid;
-        int r = resolve(fi, cp, &gid);
+        int r = is_ctrl(cp) ? -1 : resolve(fi, cp, &gid);
         int32_t adv;
         if (r < 0) {
             if (is_zero_width(cp) || is_pua(cp)) continue;
@@ -622,7 +781,7 @@ int32_t wfont_draw(struct wsurf* s, const struct wfont* f, int32_t x, int32_t y,
             else draw_tofu(s, pxx, base_y, px, argb);
             adv = missing_adv(px, cp);
         } else {
-            adv = (cp == 0xAD) ? 0 : fu_lu(&faces[r], face_adv_fu(&faces[r], gid), px);
+            adv = (cp == 0xAD) ? 0 : fu_lu(face_at(r), face_adv_fu(face_at(r), gid), px);
             if (cp > ' ' && cp != 0xAD) {
                 int32_t pp = pen; // LU; quarter-pixel phase
                 int ipx = pp >> 6;

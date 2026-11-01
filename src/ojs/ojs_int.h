@@ -446,6 +446,9 @@ struct ojs {
     uint32_t interrupt_counter;
     void (*rejection_tracker)(ojs* J, jv promise, jv reason, int handled, void* op);
     void* rejection_op;
+    // named-property fallback on the global object (window named elements):
+    // a global reference that misses everywhere consults this before throwing
+    jv (*named_lookup)(ojs* J, const char* name, int len);
     struct ojs_module_hooks* modhooks;
     // roots
     struct root_range* roots;

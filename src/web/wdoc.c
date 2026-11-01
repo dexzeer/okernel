@@ -7,11 +7,13 @@
 #include "image.h"
 #include "wurl.h"
 #include "wcommon.h"
+#include "ablock.h"
 #include "css_int.h"
 #include "wdoc_int.h"
 #include "wjs.h"
+#include "font.h"
 
-enum { RES_CSS = WDOC_RK_CSS, RES_IMG = WDOC_RK_IMG, RES_SCRIPT = WDOC_RK_SCRIPT, RES_REQ = WDOC_RK_REQ };
+enum { RES_CSS = WDOC_RK_CSS, RES_IMG = WDOC_RK_IMG, RES_SCRIPT = WDOC_RK_SCRIPT, RES_REQ = WDOC_RK_REQ, RES_FONT = WDOC_RK_FONT };
 enum { RS_PENDING, RS_INFLIGHT, RS_DONE, RS_FAILED };
 #define SHEET_CACHE_MAX 96
 
@@ -42,6 +44,10 @@ struct wdimg {
     uint32_t* px;
     int ext;                // px belongs to someone else (a <video> frame): never freed
     int state;              // 0 pending, 1 ok, 2 failed
+    // an SVG image keeps its document: CSS backgrounds paint it as vectors at any size (CSS Images 3 intrinsic size rules)
+    struct wdom* sdom; struct wstyleset* sss; int sroot;
+    int sw, sh;             // intrinsic width / height in px, -1 = none (absent or a percentage)
+    int32_t sratio;         // intrinsic ratio w/h * 65536, 0 = none
     uint8_t use;            // collect_images: 1 = used by lazy <img>, 2 = by anything else
     int res;
     char url[512];
@@ -84,6 +90,11 @@ struct wdoc {
     // tens of thousands of rules again each time was most of that cost
     struct { uint32_t h1, h2; int len; struct wsheet* sh; } sc[SHEET_CACHE_MAX];
     int nsc, sc_next;
+    // adblock hide rules (ablock.c): the built CSS of this document and a
+    // mutation flag (the rules are re-collected when scripts change the DOM)
+    char* ablock_css;
+    int ablock_dirty;
+    int ablock_ms;
 };
 
 // ---- data: URLs --------------------------------------------------------------------
@@ -274,6 +285,60 @@ static int svg_to_image(const char* bytes, int len, int* W, int* H, uint32_t** o
     return scale;
 }
 
+static void svg_free(struct wdimg* im) {
+    if (im->sss) css_set_free(im->sss);
+    if (im->sdom) wdom_free(im->sdom);
+    im->sss = 0; im->sdom = 0;
+}
+
+// Parse an SVG file again and keep it for vector painting; fills the intrinsic size and ratio
+static void svg_keep(struct wdimg* im, const char* bytes, int len) {
+    im->sw = im->sh = -1;
+    im->sratio = 0;
+    struct wdom* dom = whtml_parse(bytes, len, "utf-8");
+    if (!dom) return;
+    int root = -1;
+    for (int i = dom->n[0].first; i >= 0; i = wdom_next(dom, i, 0))
+        if (dom->n[i].type == WN_ELEM && dom->n[i].ns == NS_SVG && dom->n[i].tag == T_svg) { root = i; break; }
+    if (root < 0) { wdom_free(dom); return; }
+    int vl;
+    const char* av;
+    int32_t w = -1, h = -1;
+    int32_t m; int u;
+    av = wdom_attr(dom, root, A_width, &vl);
+    if (av && cv_number(av, vl, &m, &u) && m > 0 && !(u < vl && av[u] == '%')) w = m;
+    av = wdom_attr(dom, root, A_height, &vl);
+    if (av && cv_number(av, vl, &m, &u) && m > 0 && !(u < vl && av[u] == '%')) h = m;
+    const char* vb = wdom_attr(dom, root, A_viewbox, &vl);
+    int32_t vw = 0, vh = 0;
+    if (vb) {
+        int32_t v[4]; int k = 0, pos = 0;
+        while (k < 4 && pos < vl) {
+            while (pos < vl && (vb[pos] == ' ' || vb[pos] == ',')) pos++;
+            if (!cv_number(vb + pos, vl - pos, &m, &u)) break;
+            v[k++] = m;
+            pos += u;
+        }
+        if (k == 4 && v[2] > 0 && v[3] > 0) { vw = v[2]; vh = v[3]; }
+    }
+    im->sw = w > 0 ? w / 1000 : -1;
+    im->sh = h > 0 ? h / 1000 : -1;
+    int64_t rt = 0;
+    if (w > 0 && h > 0) rt = w_div64((int64_t)w * 65536, h);      // width and height give the ratio; else the viewBox
+    else if (vw > 0) rt = w_div64((int64_t)vw * 65536, vh);
+    im->sratio = rt > 0x7FFFFFFF ? 0x7FFFFFFF : (int32_t)rt;
+    struct wstyleset* ss = css_set_new(dom);
+    if (!ss) { wdom_free(dom); return; }
+    for (int i = dom->n[0].first; i >= 0; i = wdom_next(dom, i, 0)) {
+        if (dom->n[i].type != WN_ELEM || dom->n[i].tag != T_style) continue;
+        char buf[16384];
+        int n = wdom_text_content(dom, i, buf, sizeof buf);
+        css_set_add_sheet(ss, buf, n, "", -1);
+    }
+    css_compute_all(ss, 300, 150);
+    im->sdom = dom; im->sss = ss; im->sroot = root;
+}
+
 static void img_decode_into(struct wdoc* d, int slot, const char* bytes, int len) {
     struct wdimg* im = &d->img[slot];
     int w = 0, h = 0;
@@ -286,6 +351,7 @@ static void img_decode_into(struct wdoc* d, int slot, const char* bytes, int len
             im->h = h;
             im->svg_scale = sc;
             im->state = 1;
+            svg_keep(im, bytes, len);
         } else im->state = 2;
         return;
     }
@@ -382,6 +448,26 @@ static int lay_img_node(void* ctx, int node, int* w, int* h) {
     return slot;
 }
 
+// intrinsic size (px, -1 = none) and ratio (w/h * 65536, 0 = none) of a CSS background image
+static int lay_img_info(void* ctx, int id, int* w, int* h, int32_t* ratio) {
+    struct wdoc* d = (struct wdoc*)ctx;
+    *w = *h = -1; *ratio = 0;
+    if (id < 0 || id >= d->nimg || d->img[id].state != 1) return 0;
+    struct wdimg* im = &d->img[id];
+    if (im->sdom) { *w = im->sw; *h = im->sh; *ratio = im->sratio; return 1; }
+    int sc = im->svg_scale > 0 ? im->svg_scale : 1;
+    *w = im->w / sc; *h = im->h / sc;
+    if (*w > 0 && *h > 0) *ratio = (int32_t)w_div64((int64_t)*w * 65536, *h);
+    return 1;
+}
+
+static int paint_img_svg(void* ctx, int id, struct wdom** dom, const struct wstyleset** ss, int* root) {
+    struct wdoc* d = (struct wdoc*)ctx;
+    if (id < 0 || id >= d->nimg || d->img[id].state != 1 || !d->img[id].sdom) return 0;
+    *dom = d->img[id].sdom; *ss = d->img[id].sss; *root = d->img[id].sroot;
+    return 1;
+}
+
 static int lay_img_url(void* ctx, const char* url, int* w, int* h) {
     struct wdoc* d = (struct wdoc*)ctx;
     *w = *h = 0;
@@ -427,6 +513,7 @@ struct wdoc* wdoc_new(void) {
     d->li.ctx = d;
     d->li.for_node = lay_img_node;
     d->li.for_url = lay_img_url;
+    d->li.info = lay_img_info;
     return d;
 }
 
@@ -441,7 +528,7 @@ static void doc_clear(struct wdoc* d) {
     for (int i = 0; i < d->nsc; i++) css_sheet_unref(d->sc[i].sh);
     d->nsc = d->sc_next = 0;
     if (d->d) wdom_free(d->d);
-    for (int i = 0; i < d->nimg; i++) if (!d->img[i].ext) w_free(d->img[i].px);
+    for (int i = 0; i < d->nimg; i++) { svg_free(&d->img[i]); if (!d->img[i].ext) w_free(d->img[i].px); }
     w_free(d->img);
     for (int i = 0; i < d->nres; i++) {
         w_free(d->res[i].url);
@@ -452,7 +539,9 @@ static void doc_clear(struct wdoc* d) {
     w_free(d->res);
     w_free(d->sheet_order);
     w_free(d->node_img);
+    w_free(d->ablock_css);
     d->L = 0; d->ss = 0; d->d = 0; d->img = 0; d->res = 0; d->sheet_order = 0; d->node_img = 0;
+    d->ablock_css = 0;
     d->nimg = d->capimg = d->nres = d->capres = d->nsheet = d->capsheet = d->node_img_cap = 0;
     d->styles_dirty = d->images_dirty = 0;
     d->focus = -1;
@@ -462,6 +551,7 @@ static void doc_clear(struct wdoc* d) {
 // pending one, or queue a new fetch.
 static void add_sheet_ordered(struct wdoc* d, const char* text, int len, const char* base, int32_t order,
                               const char* media, int mlen);
+static void font_request(struct wdoc* d, const char* url, const char* family);
 static int rel_has(const char* rel, int rl, const char* word);
 static int cur_link_el = -1;      // collect_styles: the <link> whose sheet css_request is asked for (-1: an @import)
 
@@ -553,6 +643,24 @@ static void add_sheet_ordered(struct wdoc* d, const char* text, int len, const c
         int32_t o = d->sheet_order[before[k] < d->nsheet ? before[k] : d->nsheet - 1] - 256 + k;
         css_request(d, urls[k], o, 0, 0);
     }
+    // newly discovered @font-face src urls: fetch + register (family rides
+    // in r->media, unused for this kind)
+    char fams[16][64];
+    n = css_set_pending_fontfaces(d->ss, urls, fams, 16);
+    for (int k = 0; k < n; k++) {
+        css_set_mark_fontface_done(d->ss, urls[k]);
+        font_request(d, urls[k], fams[k]);
+    }
+}
+
+// @font-face src: dedupe by url, or queue the fetch (family kept in media).
+static void font_request(struct wdoc* d, const char* url, const char* family) {
+    for (int i = 0; i < d->nres; i++) {
+        struct wres* r = &d->res[i];
+        if (r->kind == RES_FONT && !strcmp(r->url, url)) return;
+        if (r->kind == RES_CSS && !strcmp(r->url, url)) return;   // a sheet doubles as a font? rare, but never fetch twice
+    }
+    res_add(d, url, RES_FONT, 0, family, (int)strlen(family));
 }
 
 static int rel_has(const char* rel, int rl, const char* word) {
@@ -634,6 +742,20 @@ static void collect_images(struct wdoc* d) {
                 const char* lz = wdom_attr_s(dom, el, "loading", &ll);
                 d->img[slot].use |= (tag == T_img && lz && ll == 4 && w_ieq(lz, 4, "lazy")) ? 1 : 2;
             }
+        } else if (tag == T_object || tag == T_embed) {
+            // <object data> / <embed src> holding an image is drawn like an <img>
+            int ul, tl;
+            const char* u = wdom_attr_s(dom, el, tag == T_object ? "data" : "src", &ul);
+            const char* ty = wdom_attr_s(dom, el, "type", &tl);
+            int img = u && ul > 0 && ((ty && tl >= 6 && w_ieq_prefix(ty, tl, "image/")) || w_ieq_prefix(u, ul, "data:image/") ||
+                                      (ul > 4 && (w_ieq(u + ul - 4, 4, ".png") || w_ieq(u + ul - 4, 4, ".jpg") || w_ieq(u + ul - 4, 4, ".gif") ||
+                                                  w_ieq(u + ul - 4, 4, ".svg") || w_ieq(u + ul - 4, 4, ".bmp") || (ul > 5 && w_ieq(u + ul - 5, 5, ".jpeg")))));
+            slot = -1;
+            if (img) {
+                if (w_ieq_prefix(u, ul, "data:")) { int n = ul < (int)sizeof abs - 1 ? ul : (int)sizeof abs - 1; memcpy(abs, u, (size_t)n); abs[n] = 0; slot = img_slot(d, abs); }
+                else if (wurl_resolve(d->base, u, ul, abs, sizeof abs) > 0) slot = img_slot(d, abs);
+            }
+            if (slot >= 0) d->img[slot].use |= 2;
         } else if (tag == T_video) {
             int pl;
             const char* poster = wdom_attr_s(dom, el, "poster", &pl);
@@ -663,6 +785,32 @@ static int doc_wants_scripts(struct wdoc* d) {
     return 0;
 }
 
+// The adblock hide rules (ablock.c) sort last in the cascade and carry
+// !important, so plain author CSS cannot override them.
+static void ablock_sheet_add(struct wdoc* d) {
+    if (!d->ablock_css) return;
+    add_sheet_ordered(d, d->ablock_css, (int)strlen(d->ablock_css), 0, 0x7F000000, 0, 0);
+}
+
+// (Re)build the hide-rule CSS for the document: ablock_doc_css matches the
+// lists against this host and against the element names the DOM uses.
+static void ablock_sheet_text(struct wdoc* d) {
+    if (!ablock_ready()) { d->ablock_dirty = 1; return; }
+    char h[128];
+    if (wurl_host(d->url, h, sizeof h) <= 0) h[0] = 0;
+    char* css = ablock_doc_css(d->d, h);
+    if (d->ablock_css) w_free(d->ablock_css);
+    d->ablock_css = css;
+    d->ablock_dirty = 0;
+    d->ablock_ms = wjs_now();
+}
+
+// The page's adblock rules, re-collected when scripts change the DOM
+// (wjs_inserted/wjs_attr_changed set the flag; wdoc_update rebuilds).
+void wdoc_ablock_touch(struct wdoc* d) {
+    if (d) d->ablock_dirty = 1;
+}
+
 static void rebuild_styles(struct wdoc* d) {
     if (d->ss) css_set_free(d->ss);
     d->ss = css_set_new(d->d);
@@ -670,6 +818,7 @@ static void rebuild_styles(struct wdoc* d) {
     if (!d->ss) return;
     css_set_doc_base(d->ss, d->base);
     collect_styles(d);
+    ablock_sheet_add(d);          // the set is rebuilt from scratch: ours goes back in
     d->style_dirty = 1;
     d->layout_dirty = 1;
 }
@@ -696,12 +845,24 @@ int wdoc_load(struct wdoc* d, const char* url, const char* html, int len, const 
     if (!d->ss) return -1;
     css_set_doc_base(d->ss, d->base);
     collect_styles(d);
+    ablock_sheet_text(d);         // the hide rules are in before the first paint (no flash)
+    ablock_sheet_add(d);
     collect_images(d);
     d->style_dirty = 1;
     d->layout_dirty = 1;
     if (d->scripting && doc_wants_scripts(d)) {
         d->js = wjs_new(d);
-        if (d->js) wjs_scan_scripts(d->js);
+        if (d->js) {
+            // the adblocker's scriptlets go in before anything of the page's
+            char sh[128] = {0};
+            wurl_host(d->url, sh, sizeof sh);
+            char* sc = ablock_doc_scriptlets(sh);
+            if (sc) {
+                wjs_inject_scriptlets(d->js, sc, (int)strlen(sc));
+                w_free(sc);
+            }
+            wjs_scan_scripts(d->js);
+        }
     }
     return 0;
 }
@@ -840,7 +1001,9 @@ void wdoc_fetch_done2(struct wdoc* d, int id, const char* bytes, int len, const 
         return;
     }
     r->state = RS_DONE;
-    if (r->kind == RES_CSS) {
+    if (r->kind == RES_FONT) {
+        if (len > 0 && wfont_register((const uint8_t*)bytes, len, r->media) >= 0) d->style_dirty = 1;
+    } else if (r->kind == RES_CSS) {
         r->text = (char*)w_malloc(len + 1);
         if (r->text) { memcpy(r->text, bytes, len); r->text[len] = 0; r->tlen = len; }
         add_sheet_ordered(d, bytes, len, r->url, r->order, r->media[0] ? r->media : 0, (int)strlen(r->media));
@@ -864,6 +1027,12 @@ void wdoc_invalidate(struct wdoc* d) { d->style_dirty = 1; d->layout_dirty = 1; 
 
 int wdoc_update(struct wdoc* d) {
     if (!d->d) return 0;
+    // pending adblock re-collection: rebuild the sheet set with fresh hide
+    // rules (throttled; rebuild_styles re-attaches ours)
+    if (d->ablock_dirty && ablock_ready() && wjs_now() - d->ablock_ms >= 200) {
+        ablock_sheet_text(d);
+        d->styles_dirty = 1;
+    }
     int t0 = wjs_now(), rebuilt = d->styles_dirty;
     if (d->styles_dirty) { d->styles_dirty = 0; rebuild_styles(d); }
     if (d->images_dirty) { d->images_dirty = 0; collect_images(d); }
@@ -899,6 +1068,7 @@ void wdoc_paint_stale(struct wdoc* d, struct wsurf* s, int scroll_y) {
     d->env.ss = d->ss;
     d->env.d = d->d;
     d->env.image = paint_img;
+    d->env.svg = paint_img_svg;
     d->env.ctx = d;
     wpaint(d->L, s, scroll_y, &d->env);
 }
@@ -914,6 +1084,7 @@ void wdoc_paint(struct wdoc* d, struct wsurf* s, int scroll_y) {
     d->env.ss = d->ss;
     d->env.d = d->d;
     d->env.image = paint_img;
+    d->env.svg = paint_img_svg;
     d->env.image_sig = paint_img_sig;
     d->env.ctx = d;
     if (s->cx0 != 0 || s->cy0 != 0 || s->cx1 != s->w || s->cy1 != s->h) {      // a band or a rectangle: the surface is no longer what the cache describes
@@ -1197,6 +1368,42 @@ int wdoc_layout_rect(struct wdoc* d, int node, int* x, int* y, int* w, int* h) {
     return 1;
 }
 
+int wdoc_scroll_get(struct wdoc* d, int node, int* x, int* y) {
+    *x = *y = 0;
+    if (!script_layout(d)) return 0;
+    int32_t sw, sh, cw, ch;
+    if (!wlay_scroll_info(d->L, node, &sw, &sh, &cw, &ch)) return 0;
+    wdom_scroll_get(d->d, node, x, y);
+    return 1;
+}
+
+int wdoc_scroll_set(struct wdoc* d, int node, int x, int y) {
+    if (!script_layout_ex(d, 1)) return 0;
+    int32_t sw, sh, cw, ch;
+    if (!wlay_scroll_info(d->L, node, &sw, &sh, &cw, &ch)) return 0;
+    int mx = LU_FLOOR(sw - cw), my = LU_FLOOR(sh - ch);
+    if (mx < 0) mx = 0;
+    if (my < 0) my = 0;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+    if (x > mx) x = mx;
+    if (y > my) y = my;
+    int ox, oy;
+    wdom_scroll_get(d->d, node, &ox, &oy);
+    if (ox == x && oy == y) return 0;
+    if (!wdom_scroll_set(d->d, node, x, y)) return 0;
+    d->layout_dirty = 1;
+    return 1;
+}
+
+int wdoc_scroll_extent(struct wdoc* d, int node, int* sw, int* sh) {
+    if (!script_layout(d)) return 0;
+    int32_t a, b, cw, ch;
+    if (!wlay_scroll_info(d->L, node, &a, &b, &cw, &ch)) return 0;
+    *sw = LU_ROUND(a); *sh = LU_ROUND(b);
+    return 1;
+}
+
 int wdoc_custom_value(struct wdoc* d, int node, const char* name, int nl, char* out, int cap) {
     script_layout(d);
     if (!d->ss) return -1;
@@ -1353,3 +1560,8 @@ int wdoc_set_view(struct wdoc* d, int y0, int y1) {
     }
     return woke;
 }
+
+#if !(defined(KERNEL) && KERNEL)
+void wlay_dump(const struct wlayout* L);
+void wdoc_dump_layout(struct wdoc* d) { if (d->L) wlay_dump(d->L); }
+#endif

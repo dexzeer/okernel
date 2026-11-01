@@ -843,6 +843,7 @@ for (const [p, i] of [['clientWidth', 2], ['clientHeight', 3], ['offsetWidth', 2
     accessor(Element.prototype, p, function () {
         if (this === document.documentElement && (p === 'clientWidth' || p === 'clientHeight')) return W.view()[i - 2];
         if (this === document.documentElement && (p === 'scrollHeight')) return W.view()[4];
+        if (p === 'scrollWidth' || p === 'scrollHeight') { const e = W.scrollExt(this); if (e) return e[p === 'scrollWidth' ? 0 : 1]; }
         const r = W.rect(this); return r ? Math.round(r[i]) : 0;
     });
 accessor(Element.prototype, 'clientTop', function () { return 0; });
@@ -877,9 +878,30 @@ accessor(Element.prototype, 'offsetTop', function () { return offsetXY(this, 1);
 accessor(Element.prototype, 'offsetLeft', function () { return offsetXY(this, 0); });
 accessor(Element.prototype, 'offsetParent', function () { return offsetParentOf(this); });
 accessor(Element.prototype, 'scrollTop', function () {
-    return (this === document.documentElement || this === document.body) ? W.view()[2] : 0;
-}, function (v) { if (this === document.documentElement || this === document.body) W.scroll(Math.max(0, +v | 0)); });
-accessor(Element.prototype, 'scrollLeft', function () { return 0; }, function () {});
+    if (this === document.documentElement || this === document.body) return W.view()[2];
+    const s = W.scrollGet(this); return s ? s[1] : 0;
+}, function (v) {
+    if (this === document.documentElement || this === document.body) W.scroll(Math.max(0, +v | 0));
+    else W.scrollSet(this, null, Math.round(+v || 0));
+});
+accessor(Element.prototype, 'scrollLeft', function () { const s = W.scrollGet(this); return s ? s[0] : 0; },
+         function (v) { W.scrollSet(this, Math.round(+v || 0), null); });
+// scrollTo / scroll / scrollBy on an element: (x, y) or ({left, top, behavior})
+function scrollArgs(a, b) {
+    if (a !== null && typeof a === 'object') return [a.left === undefined ? null : +a.left, a.top === undefined ? null : +a.top];
+    return [a === undefined ? null : +a, b === undefined ? null : +b];
+}
+Element.prototype.scrollTo = Element.prototype.scroll = function (a, b) {
+    const [x, y] = scrollArgs(a, b);
+    if (this === document.documentElement || this === document.body) { if (y !== null) W.scroll(Math.max(0, y | 0)); return; }
+    W.scrollSet(this, x === null ? null : Math.round(x), y === null ? null : Math.round(y));
+};
+Element.prototype.scrollBy = function (a, b) {
+    const [x, y] = scrollArgs(a, b);
+    if (this === document.documentElement || this === document.body) { if (y !== null) W.scroll(Math.max(0, (W.view()[2] + y) | 0)); return; }
+    const s = W.scrollGet(this) || [0, 0];
+    W.scrollSet(this, x === null ? null : Math.round(s[0] + x), y === null ? null : Math.round(s[1] + y));
+};
 defineHandlers(HTMLElement.prototype);
 defineHandlers(SVGElement.prototype);
 

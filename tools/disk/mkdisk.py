@@ -35,6 +35,7 @@ def fat(path, part, files, dirs):
 
 def main():
     out, desktop, lxroot = sys.argv[1:4]
+    ablists = sys.argv[4] if len(sys.argv) > 4 else None
     work = 'build-disk'
     shutil.rmtree(work, ignore_errors=True)
     os.makedirs(work)
@@ -54,10 +55,15 @@ def main():
     assert os.path.getsize(env) == 1024
     here = os.path.dirname(os.path.abspath(__file__))
     bootfat = os.path.join(work, 'boot.fat')
-    fat(bootfat, P1, [(desktop, '/boot/kanarchy.bin'), (lxroot, '/boot/lxroot.tar'), (os.path.join(here, 'grub.cfg'), '/boot/grub/grub.cfg'), (env, '/boot/grub/grubenv')] + efis,
-        ['/boot', '/boot/grub', '/EFI', '/EFI/BOOT'])
+    bootfiles = [(desktop, '/boot/kanarchy.bin'), (lxroot, '/boot/lxroot.tar'), (os.path.join(here, 'grub.cfg'), '/boot/grub/grub.cfg'), (env, '/boot/grub/grubenv')] + efis
+    if ablists:
+        bootfiles.append((ablists, '/boot/ablists.txt'))
+    fat(bootfat, P1, bootfiles, ['/boot', '/boot/grub', '/EFI', '/EFI/BOOT'])
     recfat = os.path.join(work, 'recovery.fat')
-    fat(recfat, P2, [(desktop, '/known/kanarchy.bin'), (lxroot, '/known/lxroot.tar')], ['/known'])   # booted with `recovery` = the recovery desktop
+    recfiles = [(desktop, '/known/kanarchy.bin'), (lxroot, '/known/lxroot.tar')]
+    if ablists:
+        recfiles.append((ablists, '/known/ablists.txt'))   # booted with `recovery` = the recovery desktop
+    fat(recfat, P2, recfiles, ['/known'])
 
     corebytes = open(core, 'rb').read()
     ncore = (len(corebytes) + 511) // 512

@@ -61,6 +61,8 @@ struct watoms {
 };
 
 struct wdom {
+    int32_t* scr;        // scroll offsets (x, y in px) per node, 2 ints each; grown on demand
+    int nscr;
     struct wnode* n;
     int nn, ncap;
     struct wattr* a;
@@ -81,6 +83,8 @@ struct wdom {
 
 struct wdom* wdom_new(void);
 void wdom_free(struct wdom* d);
+void wdom_scroll_get(const struct wdom* d, int node, int* x, int* y);
+int  wdom_scroll_set(struct wdom* d, int node, int x, int y);
 
 // Atoms
 int         watom_intern(struct watoms* t, const char* s, int len); // 0 on failure

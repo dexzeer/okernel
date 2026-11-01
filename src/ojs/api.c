@@ -121,6 +121,10 @@ void ojs_set_rejection_tracker(ojs* J, void (*fn)(ojs* J, ojsv promise, ojsv rea
     J->rejection_op = op;
 }
 
+void ojs_set_named_lookup(ojs* J, ojsv (*fn)(ojs* J, const char* name, int len)) {
+    J->named_lookup = (jv (*)(ojs*, const char*, int))fn;
+}
+
 void ojs_gc(ojs* J) { if (J->stack_top) gc_collect(J); }
 size_t ojs_heap_bytes(ojs* J) { return J->heap_bytes; }
 void ojs_get_stats(ojs* J, struct ojs_stats* st) {

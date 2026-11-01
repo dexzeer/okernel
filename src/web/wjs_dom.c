@@ -8,6 +8,7 @@
 #include "image.h"
 #include "css.h"
 #include "wurl.h"
+#include "font.h"
 
 int wjs_class_id;
 
@@ -661,6 +662,33 @@ NATIVE(n_rect) {
     ojs_set_index(ctx, a, 3, ojs_int(h));
     return a;
 }
+NATIVE(n_scroll_get) {          // W.scrollGet(el) -> [scrollLeft, scrollTop] or null when el does not scroll
+    struct wjs* js = JSX(ctx); UNUSED_THIS; ARG_NODE(0, n);
+    int x, y;
+    if (js->d->n[n].type != WN_ELEM || !wdom_is_connected(js->d, n) || !wdoc_scroll_get(js->doc, n, &x, &y)) return OJS_NULL;
+    ojsv a = ojs_array(ctx);
+    ojs_set_index(ctx, a, 0, ojs_int(x));
+    ojs_set_index(ctx, a, 1, ojs_int(y));
+    return a;
+}
+NATIVE(n_scroll_set) {          // W.scrollSet(el, x, y): x / y null = keep
+    struct wjs* js = JSX(ctx); UNUSED_THIS; ARG_NODE(0, n);
+    int x, y;
+    if (js->d->n[n].type != WN_ELEM || !wdom_is_connected(js->d, n) || !wdoc_scroll_get(js->doc, n, &x, &y)) return OJS_FALSE;
+    int32_t v = 0;
+    if (argc > 1 && argv[1] != OJS_NULL && argv[1] != OJS_UNDEFINED) { ojs_to_int32(ctx, &v, argv[1]); x = v; }
+    if (argc > 2 && argv[2] != OJS_NULL && argv[2] != OJS_UNDEFINED) { v = 0; ojs_to_int32(ctx, &v, argv[2]); y = v; }
+    return ojs_bool(wdoc_scroll_set(js->doc, n, x, y));
+}
+NATIVE(n_scroll_ext) {          // W.scrollExt(el) -> [scrollWidth, scrollHeight] or null
+    struct wjs* js = JSX(ctx); UNUSED_THIS; ARG_NODE(0, n);
+    int w, h;
+    if (js->d->n[n].type != WN_ELEM || !wdom_is_connected(js->d, n) || !wdoc_scroll_extent(js->doc, n, &w, &h)) return OJS_NULL;
+    ojsv a = ojs_array(ctx);
+    ojs_set_index(ctx, a, 0, ojs_int(w));
+    ojs_set_index(ctx, a, 1, ojs_int(h));
+    return a;
+}
 NATIVE(n_obs_active) {          // W.obsActive(bool): the page has observer targets, so layout/scroll changes wake the script side
     struct wjs* js = JSX(ctx); UNUSED_THIS;
     js->obs_active = argc > 0 && ojs_to_bool(ctx, argv[0]);
@@ -789,7 +817,7 @@ NATIVE(n_cstyle) {
         ojs_set(ctx, o, "font-weight", ojs_string_len(ctx, b, k));
     }
     ojs_set(ctx, o, "font-style", ojs_string(ctx, s->font_style ? "italic" : "normal"));
-    ojs_set(ctx, o, "font-family", ojs_string(ctx, s->font_family == FAM_SERIF ? "serif" : s->font_family == FAM_MONO ? "monospace" : "sans-serif"));
+    ojs_set(ctx, o, "font-family", ojs_string(ctx, s->webfont ? wfont_family_name(s->webfont - 1) : s->font_family == FAM_SERIF ? "serif" : s->font_family == FAM_MONO ? "monospace" : "sans-serif"));
     if (s->line_height) put_px(ctx, o, "line-height", s->line_height);
     else ojs_set(ctx, o, "line-height", ojs_string(ctx, "normal"));
     static const char* const side[4] = { "top", "right", "bottom", "left" };
@@ -1012,6 +1040,9 @@ static const struct ojs_func_entry dom_funcs[] = {
     { "byId", n_by_id, 1 },
     { "byTag", n_by_tag, 2 },
     { "rect", n_rect, 1 },
+    { "scrollGet", n_scroll_get, 1 },
+    { "scrollSet", n_scroll_set, 3 },
+    { "scrollExt", n_scroll_ext, 1 },
     { "view", n_view, 0 },
     { "obsActive", n_obs_active, 1 },
     { "scroll", n_scroll, 1 },

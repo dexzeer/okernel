@@ -11,6 +11,7 @@ struct wpaint_env {
     const struct wstyleset* ss;          // gradients
     struct wdom* d;                      // inline SVG
     const struct wimg* (*image)(void* ctx, int id);
+    int (*svg)(void* ctx, int id, struct wdom** dom, const struct wstyleset** ss, int* root);   // image id is an SVG: its document, painted as vectors
     void* ctx;
     uint32_t (*image_sig)(void* ctx, int id);   // identity of what image `id` would draw (0 = it changes by itself: always repaint)
 };

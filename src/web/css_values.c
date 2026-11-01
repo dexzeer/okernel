@@ -173,6 +173,12 @@ static const struct ncolor NAMED[] = {
     {"highlighttext",0x000000},{"graytext",0x6D6D6D},{"mark",0xFFFF00},{"marktext",0x000000},
     {"accentcolor",0x0075FF},{"accentcolortext",0xFFFFFF},{"window",0xFFFFFF},
     {"windowtext",0x000000},{"buttonhighlight",0xEFEFEF},{"buttonshadow",0x767676},
+    // deprecated system colors: aliases of the ones above (CSS Color 4)
+    {"activeborder",0x767676},{"activecaption",0xFFFFFF},{"appworkspace",0xFFFFFF},{"background",0xFFFFFF},
+    {"captiontext",0x000000},{"inactiveborder",0x767676},{"inactivecaption",0xFFFFFF},{"inactivecaptiontext",0x6D6D6D},
+    {"infobackground",0xFFFFFF},{"infotext",0x000000},{"menu",0xFFFFFF},{"menutext",0x000000},{"scrollbar",0xFFFFFF},
+    {"threeddarkshadow",0x767676},{"threedface",0xEFEFEF},{"threedhighlight",0x767676},{"threedlightshadow",0x767676},
+    {"threedshadow",0x767676},{"windowframe",0x767676},{"selecteditem",0xB5D5FF},{"selecteditemtext",0x000000},
     {0, 0}
 };
 
@@ -278,6 +284,249 @@ static uint32_t oklab_rgb(int64_t L, int64_t A, int64_t B) {
     return out;
 }
 
+// ---- CSS Color 4: color(), lab(), lch(), oklab(), oklch(), hwb() ---------------------------------------------------------
+// Computed in double precision (the engine's other users of doubles are the canvas and wasm; kmath supplies pow/sin/cos).
+
+extern double km_pow(double x, double y);
+extern double km_sin(double x);
+extern double km_cos(double x);
+
+// a number with the digits kept exactly: integer part and fraction as one integer, divided once
+static int dbl_exact(const char* s, int len, double* out) {
+    int i = 0, neg = 0;
+    if (i < len && (s[i] == '+' || s[i] == '-')) { neg = s[i] == '-'; i++; }
+    uint64_t ip = 0; int nd = 0, fd = 0;
+    while (i < len && s[i] >= '0' && s[i] <= '9') { if (nd < 18) ip = ip * 10 + (uint64_t)(s[i] - '0'); i++; nd++; }
+    if (i < len && s[i] == '.') {
+        i++;
+        while (i < len && s[i] >= '0' && s[i] <= '9') { if (nd + fd < 18) { ip = ip * 10 + (uint64_t)(s[i] - '0'); fd++; } i++; }
+    }
+    if (!nd && !fd) return 0;
+    double v = (double)ip;
+    if (fd) v /= km_pow(10.0, fd);
+    if (i < len && (s[i] == 'e' || s[i] == 'E') && i + 1 < len && ((s[i + 1] >= '0' && s[i + 1] <= '9') || ((s[i + 1] == '-' || s[i + 1] == '+') && i + 2 < len))) {
+        int ex = 0, en = 0;
+        i++;
+        if (s[i] == '+' || s[i] == '-') { en = s[i] == '-'; i++; }
+        while (i < len && s[i] >= '0' && s[i] <= '9') { ex = ex * 10 + (s[i] - '0'); i++; }
+        v *= km_pow(10.0, en ? -ex : ex);
+    }
+    *out = neg ? -v : v;
+    return i;
+}
+
+// one component: number, percentage (100% = pct_base), "none" (0); angles only when hue is set (degrees out)
+static int col_comp(const char* s, int len, double pct_base, int hue, double* out) {
+    cv_trim(&s, &len);
+    if (w_ieq(s, len, "none")) { *out = 0; return 1; }
+    double v;
+    int n = dbl_exact(s, len, &v);
+    if (!n) return 0;
+    if (n < len && s[n] == '%' && n + 1 == len) { *out = hue ? v * 3.6 : v * pct_base / 100.0; return 1; }
+    if (n == len) { *out = v; return 1; }
+    if (!hue) return 0;
+    const char* u = s + n; int ul = len - n;
+    if (w_ieq(u, ul, "deg")) { *out = v; return 1; }
+    if (w_ieq(u, ul, "rad")) { *out = v * 57.29577951308232; return 1; }
+    if (w_ieq(u, ul, "grad")) { *out = v * 0.9; return 1; }
+    if (w_ieq(u, ul, "turn")) { *out = v * 360.0; return 1; }
+    return 0;
+}
+
+static double srgb_to_linear(double v) {
+    double a = v < 0 ? -v : v;
+    double r = a <= 0.04045 ? a / 12.92 : km_pow((a + 0.055) / 1.055, 2.4);
+    return v < 0 ? -r : r;
+}
+
+static double linear_to_srgb(double l) {
+    double a = l < 0 ? -l : l;
+    double r = a > 0.0031308 ? 1.055 * km_pow(a, 1.0 / 2.4) - 0.055 : 12.92 * a;
+    return l < 0 ? -r : r;
+}
+
+static void mat3(const double m[9], const double v[3], double o[3]) {
+    o[0] = m[0] * v[0] + m[1] * v[1] + m[2] * v[2];
+    o[1] = m[3] * v[0] + m[4] * v[1] + m[5] * v[2];
+    o[2] = m[6] * v[0] + m[7] * v[1] + m[8] * v[2];
+}
+
+static const double M_XYZ65_RGB[9] = { 3.2409699419045226, -1.537383177570094, -0.4986107602930034,
+                                       -0.9692436362808796, 1.8759675015077202, 0.04155505740717559,
+                                       0.05563007969699366, -0.20397695888897652, 1.0569715142428786 };
+static const double M_D50_D65[9] = { 0.9554734527042182, -0.023098536874261423, 0.0632593086610217,
+                                     -0.028369706963208136, 1.0099954580058226, 0.021041398966943008,
+                                     0.012314001688319899, -0.020507696433477, 1.3303659366080753 };
+static const double M_P3_XYZ[9] = { 0.4865709486482162, 0.26566769316909306, 0.1982172852343625,
+                                    0.2289745640697488, 0.6917385218365064, 0.079286914093745,
+                                    0.0, 0.04511338185890264, 1.043944368900976 };
+static const double M_A98_XYZ[9] = { 0.5766690429101305, 0.1855582379065463, 0.1882286462349947,
+                                     0.29734497525053605, 0.6273635662554661, 0.0752914584939981,
+                                     0.02703136138641234, 0.07068885253582723, 0.9913375368376388 };
+static const double M_PRO_XYZ[9] = { 0.7977604896723027, 0.13518583717574031, 0.0313493495815248,
+                                     0.2880711282292934, 0.7118432178101014, 0.00008565396060525902,
+                                     0.0, 0.0, 0.8251046025104601 };
+static const double M_REC2020_XYZ[9] = { 0.6369580483012914, 0.14461690358620832, 0.1688809751641721,
+                                         0.2627002120112671, 0.6779980715188708, 0.05930171646986196,
+                                         0.0, 0.028072693049087428, 1.0609850577107909 };
+static const double M_SRGB_XYZ[9] = { 0.41239079926595934, 0.357584339383878, 0.1804807884018343,
+                                      0.21263900587151027, 0.715168678767756, 0.07219231536073371,
+                                      0.01933081871559182, 0.11919477979462598, 0.9505321522496607 };
+
+static uint32_t col_pack(double r, double g, double b, int a8) {
+    double c[3] = { r, g, b };
+    uint32_t o = 0;
+    for (int i = 0; i < 3; i++) {
+        double v = c[i];
+        if (v < 0) v = 0;
+        if (v > 1) v = 1;
+        uint32_t q = (uint32_t)(v * 255.0 + 0.5);
+        o = (o << 8) | q;
+    }
+    return ((uint32_t)a8 << 24) | o;
+}
+
+static uint32_t xyz65_pack(const double xyz[3], int a8) {
+    double lin[3];
+    mat3(M_XYZ65_RGB, xyz, lin);
+    return col_pack(linear_to_srgb(lin[0]), linear_to_srgb(lin[1]), linear_to_srgb(lin[2]), a8);
+}
+
+static uint32_t xyz50_pack(const double xyz[3], int a8) {
+    double x65[3];
+    mat3(M_D50_D65, xyz, x65);
+    return xyz65_pack(x65, a8);
+}
+
+static uint32_t lab_pack(double L, double a, double b, int a8) {
+    const double eps = 216.0 / 24389.0, kap = 24389.0 / 27.0;
+    double fy = (L + 16.0) / 116.0, fx = a / 500.0 + fy, fz = fy - b / 200.0;
+    double fx3 = fx * fx * fx, fz3 = fz * fz * fz;
+    double x = fx3 > eps ? fx3 : (116.0 * fx - 16.0) / kap;
+    double y = L > kap * eps ? fy * fy * fy : L / kap;
+    double z = fz3 > eps ? fz3 : (116.0 * fz - 16.0) / kap;
+    double xyz[3] = { x * 0.3457 / 0.3585, y, z * (1.0 - 0.3457 - 0.3585) / 0.3585 };
+    return xyz50_pack(xyz, a8);
+}
+
+static uint32_t oklab_pack(double L, double a, double b, int a8) {
+    double l_ = L + 0.3963377773761749 * a + 0.2158037573099136 * b;
+    double m_ = L - 0.1055613458156586 * a - 0.0638541728258133 * b;
+    double s_ = L - 0.0894841775298119 * a - 1.2914855480194092 * b;
+    double l = l_ * l_ * l_, m = m_ * m_ * m_, s = s_ * s_ * s_;
+    double r = 4.0767416621308 * l - 3.3077115913371 * m + 0.2309699292064 * s;
+    double g = -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s;
+    double bl = -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s;
+    return col_pack(linear_to_srgb(r), linear_to_srgb(g), linear_to_srgb(bl), a8);
+}
+
+// color(<space> a b c [/ alpha])
+static int color_fn(const char* args, int alen, uint32_t* argb) {
+    const char* a[8]; int al[8]; int slash;
+    int n = fn_args(args, alen, a, al, 8, &slash);
+    if (n < 4) return 0;
+    double v[3];
+    const char* sp = a[0]; int spl = al[0];
+    cv_trim(&sp, &spl);
+    int xyz_like = w_ieq(sp, spl, "xyz") || w_ieq(sp, spl, "xyz-d65") || w_ieq(sp, spl, "xyz-d50");
+    for (int i = 0; i < 3; i++) if (!col_comp(a[i + 1], al[i + 1], 1.0, 0, &v[i])) return 0;
+    (void)xyz_like;
+    int a8 = 255;
+    if (n >= 5 && !alpha_of(a[4], al[4], &a8)) return 0;
+    double lin[3], xyz[3];
+    if (w_ieq(sp, spl, "srgb")) { *argb = col_pack(v[0], v[1], v[2], a8); return 1; }
+    if (w_ieq(sp, spl, "srgb-linear")) { *argb = col_pack(linear_to_srgb(v[0]), linear_to_srgb(v[1]), linear_to_srgb(v[2]), a8); return 1; }
+    if (w_ieq(sp, spl, "display-p3")) {
+        for (int i = 0; i < 3; i++) lin[i] = srgb_to_linear(v[i]);
+        mat3(M_P3_XYZ, lin, xyz); *argb = xyz65_pack(xyz, a8); return 1;
+    }
+    if (w_ieq(sp, spl, "a98-rgb")) {
+        for (int i = 0; i < 3; i++) { double t = v[i] < 0 ? -v[i] : v[i]; lin[i] = (v[i] < 0 ? -1.0 : 1.0) * km_pow(t, 563.0 / 256.0); }
+        mat3(M_A98_XYZ, lin, xyz); *argb = xyz65_pack(xyz, a8); return 1;
+    }
+    if (w_ieq(sp, spl, "prophoto-rgb")) {
+        for (int i = 0; i < 3; i++) {
+            double t = v[i] < 0 ? -v[i] : v[i];
+            lin[i] = (v[i] < 0 ? -1.0 : 1.0) * (t <= 16.0 / 512.0 ? t / 16.0 : km_pow(t, 1.8));
+        }
+        mat3(M_PRO_XYZ, lin, xyz); *argb = xyz50_pack(xyz, a8); return 1;
+    }
+    if (w_ieq(sp, spl, "rec2020")) {
+        const double alpha = 1.09929682680944, beta = 0.018053968510807;
+        for (int i = 0; i < 3; i++) {
+            double t = v[i] < 0 ? -v[i] : v[i];
+            lin[i] = (v[i] < 0 ? -1.0 : 1.0) * (t < beta * 4.5 ? t / 4.5 : km_pow((t + alpha - 1.0) / alpha, 1.0 / 0.45));
+        }
+        mat3(M_REC2020_XYZ, lin, xyz); *argb = xyz65_pack(xyz, a8); return 1;
+    }
+    if (w_ieq(sp, spl, "xyz") || w_ieq(sp, spl, "xyz-d65")) { *argb = xyz65_pack(v, a8); return 1; }
+    if (w_ieq(sp, spl, "xyz-d50")) { *argb = xyz50_pack(v, a8); return 1; }
+    return 0;
+}
+
+// lab() lch() oklab() oklch() hwb(); 0 when fn is none of them or the arguments are wrong
+static int modern_fn(const char* fn, int fl, const char* args, int alen, uint32_t* argb, int* handled) {
+    int is_lab = w_ieq(fn, fl, "lab"), is_lch = w_ieq(fn, fl, "lch"), is_oklab = w_ieq(fn, fl, "oklab"),
+        is_oklch = w_ieq(fn, fl, "oklch"), is_hwb = w_ieq(fn, fl, "hwb"), is_color = w_ieq(fn, fl, "color");
+    *handled = is_lab || is_lch || is_oklab || is_oklch || is_hwb || is_color;
+    if (!*handled) return 0;
+    if (is_color) return color_fn(args, alen, argb);
+    const char* a[6]; int al[6]; int slash;
+    int n = fn_args(args, alen, a, al, 6, &slash);
+    if (n < 3) return 0;
+    int a8 = 255;
+    if (n >= 4 && !alpha_of(a[3], al[3], &a8)) return 0;
+    double x, y, z;
+    if (is_hwb) {
+        double h, w, b;
+        if (!col_comp(a[0], al[0], 360.0, 1, &h) || !col_comp(a[1], al[1], 100.0, 0, &w) || !col_comp(a[2], al[2], 100.0, 0, &b)) return 0;
+        w /= 100.0; b /= 100.0;
+        if (w < 0) w = 0;
+        if (b < 0) b = 0;
+        if (w + b >= 1.0) { double g = w / (w + b); *argb = col_pack(g, g, g, a8); return 1; }
+        double hh = h - 360.0 * (double)(int)(h / 360.0);
+        if (hh < 0) hh += 360.0;
+        double h6 = hh / 60.0;
+        int sector = (int)h6;
+        double f = h6 - (double)sector, r0, g0, b0;
+        switch (sector) {
+        case 0: r0 = 1; g0 = f; b0 = 0; break;
+        case 1: r0 = 1 - f; g0 = 1; b0 = 0; break;
+        case 2: r0 = 0; g0 = 1; b0 = f; break;
+        case 3: r0 = 0; g0 = 1 - f; b0 = 1; break;
+        case 4: r0 = f; g0 = 0; b0 = 1; break;
+        default: r0 = 1; g0 = 0; b0 = 1 - f; break;
+        }
+        double sc = 1.0 - w - b;
+        *argb = col_pack(r0 * sc + w, g0 * sc + w, b0 * sc + w, a8);
+        return 1;
+    }
+    double lpct = (is_lab || is_lch) ? 100.0 : 1.0;
+    double abase = is_lab ? 125.0 : is_oklab ? 0.4 : 0.0;
+    double cbase = is_lch ? 150.0 : 0.4;
+    if (!col_comp(a[0], al[0], lpct, 0, &x)) return 0;
+    if (is_lab || is_oklab) {
+        if (!col_comp(a[1], al[1], abase, 0, &y) || !col_comp(a[2], al[2], abase, 0, &z)) return 0;
+    } else {
+        double c, h;
+        if (!col_comp(a[1], al[1], cbase, 0, &c) || !col_comp(a[2], al[2], 360.0, 1, &h)) return 0;
+        if (c < 0) c = 0;
+        double rad = h * 0.017453292519943295;
+        y = c * km_cos(rad);
+        z = c * km_sin(rad);
+    }
+    if (is_lab || is_lch) {
+        if (x < 0) x = 0;
+        if (x > 100) x = 100;
+        *argb = lab_pack(x, y, z, a8);
+    } else {
+        if (x < 0) x = 0;
+        if (x > 1) x = 1;
+        *argb = oklab_pack(x, y, z, a8);
+    }
+    return 1;
+}
+
 int cv_color(const char* s, int len, uint32_t* argb, int* current) {
     cv_trim(&s, &len);
     if (current) *current = 0;
@@ -331,34 +580,10 @@ int cv_color(const char* s, int len, uint32_t* argb, int* current) {
             *argb = ((uint32_t)al8 << 24) | hsl_rgb(h, W_CLAMP(sm / 100, 0, 1000), W_CLAMP(lm / 100, 0, 1000));
             return 1;
         }
-        if (w_ieq(fn, fl, "oklch") || w_ieq(fn, fl, "oklab")) {
-            int n = fn_args(args, alen, a, al, 6, &slash);
-            if (n < 3) return 0;
-            int32_t L, c2, h2; int u;
-            const char* x = a[0]; int xl = al[0]; cv_trim(&x, &xl);
-            if (!cv_number(x, xl, &L, &u)) return 0;
-            if (u < xl && x[u] == '%') L /= 100; // 0..1000
-            x = a[1]; xl = al[1]; cv_trim(&x, &xl);
-            if (!cv_number(x, xl, &c2, &u)) c2 = 0;
-            else if (u < xl && x[u] == '%') c2 = c2 * 4 / 1000; // 100% = 0.4
-            int64_t A, B;
-            if (w_ieq(fn, fl, "oklch")) {
-                h2 = hue_milli(a[2], al[2]) / 1000;
-                h2 %= 360; if (h2 < 0) h2 += 360;
-                int32_t cs = sin_deg[(h2 + 90) % 360], sn = sin_deg[h2];
-                A = ((int64_t)c2 * 1000 * cs) >> 16;
-                B = ((int64_t)c2 * 1000 * sn) >> 16;
-            } else {
-                x = a[2]; xl = al[2]; cv_trim(&x, &xl);
-                if (!cv_number(x, xl, &h2, &u)) h2 = 0;
-                else if (u < xl && x[u] == '%') h2 = h2 * 4 / 1000;
-                A = (int64_t)c2 * 1000;
-                B = (int64_t)h2 * 1000;
-            }
-            int al8 = 255;
-            if (n >= 4 && !alpha_of(a[3], al[3], &al8)) return 0;
-            *argb = ((uint32_t)al8 << 24) | oklab_rgb((int64_t)L * 1000, A, B);
-            return 1;
+        {
+            int handled = 0;
+            int ok = modern_fn(fn, fl, args, alen, argb, &handled);
+            if (handled) return ok;
         }
         if (w_ieq(fn, fl, "light-dark")) {
             int pos = 0; const char* c; int cl;

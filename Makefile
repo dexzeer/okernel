@@ -52,7 +52,7 @@ USERLAND_GEN = $(wildcard userland/gen_*.h)
 WEB_OBJ = src/web/wdom.o src/web/html5.o src/web/charset.o src/web/wurl.o \
           src/web/css_values.o src/web/css_parse.o src/web/css_select.o src/web/css_style.o \
           src/web/lay_tree.o src/web/lay_main.o src/web/lay_inline.o src/web/lay_flex.o \
-          src/web/lay_grid.o src/web/lay_table.o src/web/lay_dl.o \
+          src/web/lay_grid.o src/web/lay_table.o src/web/lay_dl.o src/web/bidi.o src/web/cstyles.o \
           src/web/paint.o src/web/raster.o src/web/font.o src/web/svg.o src/web/image.o \
           src/web/wdoc.o src/web/pscan.o src/web/fontdata.o src/web/callstack.o \
           src/web/wjs.o src/web/wjs_dom.o src/web/wjs_media.o src/web/wjs_canvas.o src/web/wjs_crypto.o src/web/wjs_wasm.o src/web/wasm.o src/web/wcanvas.o src/web/wjs_sys.o src/web/wjs_prelude.o src/web/wcookie.o
@@ -105,7 +105,7 @@ src/gamewin.o: src/gamewin.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
 src/game/levels.o: src/game/levels.asm games/level1.dmccl games/level2.dmccl games/level3.dmccl games/level4.dmccl
 	$(AS) $(ASFLAGS) $< -o $@
-DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/ac97.o src/audio_rate.o src/pcix.o src/acpi_pm.o src/xhci.o src/wifigui.o src/rtw/rtw_hw.o src/rtw/rtw_pci.o src/rtw/rtw_wifi.o src/rtw/wsta.o src/rtw/wcrypto.o src/rtw/rtw_tables.o src/rtw/rtwfw.o src/hid.o src/devlog.o src/dwi2c.o src/hidi2c.o src/ptp.o src/i2caml.o src/i2chid.o src/klog.o src/virtio.o src/vgpu.o src/i915.o src/cpufreq.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/winfx.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/part.o src/pfs.o src/panic.o src/recovery.o src/textview.o src/lx.o src/lx_elf.o src/lx_sys.o src/lx_tty.o src/lx_fb.o src/lx_okwin.o src/lx_sig.o src/lx_sys2.o src/lx_net.o src/lx_ev.o src/lx_pe.o src/lxfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o \
+DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/ac97.o src/audio_rate.o src/pcix.o src/acpi_pm.o src/xhci.o src/wifigui.o src/rtw/rtw_hw.o src/rtw/rtw_pci.o src/rtw/rtw_wifi.o src/rtw/wsta.o src/rtw/wcrypto.o src/rtw/rtw_tables.o src/rtw/rtwfw.o src/hid.o src/devlog.o src/dwi2c.o src/hidi2c.o src/ptp.o src/i2caml.o src/i2chid.o src/klog.o src/virtio.o src/vgpu.o src/i915.o src/cpufreq.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/winfx.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/part.o src/pfs.o src/panic.o src/recovery.o src/textview.o src/lx.o src/lx_elf.o src/lx_sys.o src/lx_tty.o src/lx_fb.o src/lx_okwin.o src/lx_sig.o src/lx_sys2.o src/lx_net.o src/lx_ev.o src/lx_pe.o src/lxfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o src/ablock.o \
               src/font_data.o $(WEB_OBJ) $(OJS_OBJ) \
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/aes.o src/crypto/chacha20.o src/crypto/poly1305.o \
@@ -131,7 +131,7 @@ win:
 # tests/web/; ASan: SAN="-fsanitize=address,undefined" sh tests/web/build.sh).
 WEB_HOST_SRC = src/web/wdom.c src/web/html5.c src/web/charset.c src/web/css_values.c src/web/css_parse.c \
                src/web/css_select.c src/web/css_style.c src/web/wurl.c src/web/font.c src/web/raster.c \
-               src/web/lay_tree.c src/web/lay_main.c src/web/lay_inline.c src/web/lay_flex.c src/web/lay_grid.c \
+               src/web/lay_tree.c src/web/lay_main.c src/web/lay_inline.c src/web/lay_flex.c src/web/lay_grid.c src/web/bidi.c src/web/cstyles.c \
                src/web/lay_table.c src/web/lay_dl.c src/web/paint.c src/web/svg.c src/web/wdoc.c src/web/image.c src/cjk.c src/web/wcookie.c
 # media engine sources the script realm links (wjs_media.c)
 WEB_HOST_MEDIA = src/web/wjs_media.c src/web/wjs_canvas.c src/web/wjs_crypto.c src/web/wjs_wasm.c src/web/wasm.c src/crypto/sha1.c src/crypto/sha256.c src/crypto/sha512.c src/web/wcanvas.c src/media/meng.c src/media/webm.c src/media/opus_dec.c src/media/opus_packet.c src/media/celt.c src/media/celt_tables.c src/media/ec.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_simd.c src/media/vcvt.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/mp4.c src/media/aac.c src/media/aac_tables.c src/media/resample.c src/media/h264.c src/media/h264_slice.c src/media/h264_recon.c src/media/h264_cabac.c src/media/h264_inter.c src/media/h264_lf.c src/media/h264_tables.c
@@ -195,6 +195,7 @@ host-tests:
 	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_edtext tests/test_editor_text.c src/editor.c src/textslot.c && ./build-host/t_edtext | tail -n 2
 	gcc -m32 -O1 -fsanitize=address,undefined -Isrc -o build-host/t_acpi tests/test_acpi.c && ./build-host/t_acpi | tail -n 1
 	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc -o build-host/t_hid tests/test_hid.c src/hid.c && ./build-host/t_hid | tail -n 1
+	gcc -m32 -O2 -Isrc -o build-host/t_ablock tests/test_ablock.c src/ablock.c src/web/wdom.c && ./build-host/t_ablock | tail -n 2
 	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc -o build-host/t_touch tests/test_touch.c src/hid.c src/ptp.c src/dwi2c.c src/hidi2c.c src/i2caml.c && ./build-host/t_touch | tail -n 1
 	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc -o build-host/t_rtw -DRTWPCI_HOST tests/test_rtw.c src/rtw/rtw_pci.c src/rtw/rtw_tables.c src/rtw/wsta.c src/rtw/wcrypto.c src/crypto/sha1.c src/crypto/aes.c && ./build-host/t_rtw | tail -n 1
 	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_wcrypto tests/test_wcrypto.c src/rtw/wcrypto.c src/crypto/sha1.c src/crypto/aes.c && (python3 tests/wcrypto_vectors.py 1 | ./build-host/t_wcrypto | tail -n 1)
@@ -338,11 +339,20 @@ LX_SRC := $(shell find lx tools/pe tools/lx -type f \( -name '*.c' -o -name '*.h
 build-host/lxsys.tar: $(LX_SRC)
 	sh tools/lx/build_root.sh build-host/lxsys
 
-kanarchy-desktop.iso: kanarchy-desktop.bin build-host/lxsys.tar
+# The adblock filter lists (filters/): shipped as a second GRUB module with
+# the cmdline tag "ablock" (src/ablock.c finds it via memory_boot_module).
+# ABLOCK_EXTRA=<file> appends a test list (make desktop ABLOCK_EXTRA=...).
+ABLOCK_DEPS = filters/easylist.txt filters/easyprivacy.txt $(if $(ABLOCK_EXTRA),$(ABLOCK_EXTRA))
+build-host/ablists.txt: $(ABLOCK_DEPS)
+	mkdir -p build-host
+	cat filters/easylist.txt filters/easyprivacy.txt $(if $(ABLOCK_EXTRA),$(ABLOCK_EXTRA)) > $@
+
+kanarchy-desktop.iso: kanarchy-desktop.bin build-host/lxsys.tar build-host/ablists.txt
 	rm -rf isodir
 	mkdir -p isodir/boot/grub
 	cp kanarchy-desktop.bin isodir/boot/kanarchy.bin
 	cp build-host/lxsys.tar isodir/boot/lxroot.tar
+	cp build-host/ablists.txt isodir/boot/ablists.txt
 	echo 'set timeout=0' > isodir/boot/grub/grub.cfg
 	echo 'set default=0' >> isodir/boot/grub/grub.cfg
 	echo '' >> isodir/boot/grub/grub.cfg
@@ -350,6 +360,7 @@ kanarchy-desktop.iso: kanarchy-desktop.bin build-host/lxsys.tar
 	echo '    set gfxpayload=1920x1080x32' >> isodir/boot/grub/grub.cfg
 	echo '    multiboot /boot/kanarchy.bin' >> isodir/boot/grub/grub.cfg
 	echo '    module /boot/lxroot.tar' >> isodir/boot/grub/grub.cfg
+	echo '    module /boot/ablists.txt ablock' >> isodir/boot/grub/grub.cfg
 	echo '    boot' >> isodir/boot/grub/grub.cfg
 	echo '}' >> isodir/boot/grub/grub.cfg
 	grub-mkrescue -o $@ isodir 2>/dev/null
@@ -475,8 +486,8 @@ kanarchy-fbtext.bin: build-fbtext/start.o boot/isr.o $(COMMON_OBJ) build-fbtext/
 
 # ---- Installed disk: MBR + GRUB (BIOS and UEFI), boot / recovery / log / data partitions (src/part.h) ----
 disk: kanarchy-disk.img
-kanarchy-disk.img: kanarchy-desktop.bin build-host/lxsys.tar tools/disk/mkdisk.py tools/disk/grub.cfg
-	python3 tools/disk/mkdisk.py $@ kanarchy-desktop.bin build-host/lxsys.tar
+kanarchy-disk.img: kanarchy-desktop.bin build-host/lxsys.tar build-host/ablists.txt tools/disk/mkdisk.py tools/disk/grub.cfg
+	python3 tools/disk/mkdisk.py $@ kanarchy-desktop.bin build-host/lxsys.tar build-host/ablists.txt
 
 laptop: kanarchy-laptop.iso
 kanarchy-laptop.iso: kanarchy-text.bin kanarchy-fbtext.bin build-laptop/kanarchy-1366x768.bin build-laptop/kanarchy-1280x800.bin build-laptop/kanarchy-1024x768.bin build-laptop/kanarchy-auto.bin boot/laptop-grub.cfg

@@ -49,6 +49,9 @@ void* ojs_get_opaque(ojs* J);
 void  ojs_set_interrupt_handler(ojs* J, int (*fn)(ojs* J, void* op), void* op);
 // unhandled promise rejections (handled = 1 when a handler is attached later)
 void  ojs_set_rejection_tracker(ojs* J, void (*fn)(ojs* J, ojsv promise, ojsv reason, int handled, void* op), void* op);
+// named-property fallback on the global object: a bare identifier that
+// resolves to nothing consults this (window named element access)
+void  ojs_set_named_lookup(ojs* J, ojsv (*fn)(ojs* J, const char* name, int len));
 void  ojs_gc(ojs* J);
 size_t ojs_heap_bytes(ojs* J);
 struct ojs_stats {

@@ -25,6 +25,7 @@
 #include "filesystem.h"
 #include "editor.h"
 #include "okai.h"
+#include "ablock.h"
 #include "media/meng.h"
 
 #include "theme.h"
@@ -2027,6 +2028,7 @@ void kernel_main(uint32_t mboot_phys) {
     // working until then (fail-soft: no userland, no wedge).
     editor_init();
     okai_init();
+    ablock_init();    // the adblock lists ship as the "ablock" boot module (src/ablock.c)
 
     // Cache wallpaper for fast blitting
     {
@@ -3256,6 +3258,8 @@ void kernel_main(uint32_t mboot_phys) {
             {   // idle: pay the hypervisor's first-touch cost of heap pages now instead of in the middle of a page load (memory.c)
                 uint32_t mhz = cpufreq_tsc_mhz();
                 heap_pretouch(mhz ? mhz * (net_wait || timed_wait ? 300u : 6000u) : 400000u);   // 0.3 ms between packet polls, 6 ms when fully idle
+                // and parse the adblock filter lists the same way (ablock.c)
+                ablock_parse_step(mhz ? mhz * (net_wait || timed_wait ? 300u : 6000u) : 400000u);
             }
             uint64_t h0 = rdtsc_now();
             // A key queued after this iteration's dispatch must not sleep

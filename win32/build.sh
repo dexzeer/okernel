@@ -40,7 +40,7 @@ WEB="src/web/wdom.c src/web/html5.c src/web/charset.c src/web/css_values.c \
      src/web/lay_dl.c src/web/paint.c src/web/svg.c src/web/wdoc.c src/web/image.c \
      src/web/pscan.c src/web/wjs.c src/web/wjs_dom.c src/web/wjs_media.c \
      src/web/wjs_canvas.c src/web/wjs_crypto.c src/web/wjs_wasm.c src/web/wasm.c \
-     src/web/wcanvas.c src/web/wjs_sys.c src/web/wcookie.c src/cjk.c"
+     src/web/wcanvas.c src/web/wjs_sys.c src/web/wcookie.c src/cjk.c src/web/bidi.c src/web/cstyles.c src/ablock.c"
 
 MEDIA="src/media/meng.c src/media/webm.c src/media/opus_dec.c src/media/opus_packet.c \
        src/media/celt.c src/media/celt_tables.c src/media/ec.c src/media/vp9.c \
