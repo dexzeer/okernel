@@ -133,6 +133,7 @@ struct wstyle {
     uint32_t bc[4];            // border colors ARGB
     struct wlen radius[4];     // tl tr br bl
     uint32_t color;            // ARGB
+    uint8_t color_set;         // color was declared on this style (not inherited)
     uint32_t bg_color;         // ARGB
     int32_t bg_image;          // URL: string pool offset (+1), 0 none
     int32_t bg_image_len;

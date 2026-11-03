@@ -512,6 +512,8 @@ static int parse_complex(struct selp* p, int relative, uint32_t* spec_out, uint8
                     else if (w_ieq(nm, n, "after")) *pe_out = PE_AFTER;
                     else if (w_ieq(nm, n, "marker")) *pe_out = PE_MARKER;
                     else if (w_ieq(nm, n, "placeholder")) *pe_out = PE_PLACEHOLDER;
+                    else if (w_ieq(nm, n, "first-line")) *pe_out = PE_FLINE;
+                    else if (w_ieq(nm, n, "first-letter")) *pe_out = PE_FLETTER;
                     else {
                         int known = 0;
                         for (int k = 0; PELEMS_OTHER[k]; k++) if (w_ieq(nm, n, PELEMS_OTHER[k])) known = 1;

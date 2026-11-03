@@ -25,8 +25,11 @@ WBROWSE = os.environ.get("WBROWSE") or os.path.join(REPO, "build-host", "wbrowse
 WPT_DIR = os.environ.get("WPT_DIR", os.path.expanduser("~/wpt"))
 PORT = int(os.environ.get("WPT_PORT", "8125"))
 VW, VH = 800, 600
-XHT_TESTS = os.environ.get("WPT_XHT") == "2"          # WPT_XHT=2: tests written as .xht / .xhtml / .htm are discovered too
-XHT = bool(os.environ.get("WPT_XHT"))     # WPT_XHT=1: references written as .xht / .xhtml / .htm are rendered too (the default skips them)
+# .xht/.xhtml/.htm support is on by default (tests are discovered AND references
+# rendered); WPT_XHT=0 falls back to the old .html-only mode. The default used to
+# skip .xht tests, which hid ~6.5k reftests (CSS2 alone went 378 -> 6275).
+XHT_TESTS = os.environ.get("WPT_XHT", "2") != "0"
+XHT = os.environ.get("WPT_XHT", "2") != "0"
 RENDER_SECONDS = "2.5"
 
 

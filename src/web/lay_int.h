@@ -89,6 +89,7 @@ struct lfrag {
     int32_t x, y, w, h;           // relative to the IFC root content box; text: y = baseline
     uint32_t t0, tl;              // text slice
     int32_t word_extra;           // justification extra per space (LU)
+    const struct wstyle* ov;      // ::first-line override style (0 = the box's own)
 };
 
 struct bfloat { int32_t x, y, w, h; uint8_t right; };

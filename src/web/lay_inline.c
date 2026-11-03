@@ -25,6 +25,7 @@ struct piece {
     int32_t w;
     int32_t nsp;                 // spaces (justification)
     int32_t rw;                  // P_RT: the annotation's own width (w stays 0: it consumes no line width)
+    const struct wstyle* ov;     // ::first-line override style (0 = the item's own)
 };
 
 // scratch (single-threaded engine)
@@ -32,6 +33,11 @@ static struct iitem* IT;
 static int nit, capit;
 static struct piece* PC;
 static int npc, cappc;
+
+// a piece's effective style (::first-line overrides the item's on line 1)
+static const struct wstyle* psty(const struct piece* p) {
+    return p->ov ? p->ov : IT[p->item].st;
+}
 
 static int it_push(void) {
     if (nit >= capit) {
@@ -547,6 +553,7 @@ struct ifc {
     int32_t open[128];
     int nopen;
     uint8_t needs_bidi;            // any rtl content, formatting chars or unicode-bidi elements
+    const struct wstyle* fl_st;    // ::first-line style of the block (0 none)
 };
 
 static void line_bounds(struct ifc* c) {
@@ -682,8 +689,8 @@ static void emit_line_bidi(struct ifc* c, int n, int32_t x, int32_t base, int32_
             struct iitem* it = &IT[p->item];
             if (p->kind == P_ATOMIC) { bx[idx] = wx; bw[idx] = p->w; wx += p->w; continue; }
             struct wfont f;
-            lb_font(it->st, &f);
-            int32_t adv = wfont_advance(&f, bcp[idx]) + it->st->letter_spacing;
+            lb_font(psty(p), &f);
+            int32_t adv = wfont_advance(&f, bcp[idx]) + psty(p)->letter_spacing;
             bx[idx] = wx; bw[idx] = adv;
             wx += adv;
         }
@@ -759,7 +766,7 @@ static void emit_line_bidi(struct ifc* c, int n, int32_t x, int32_t base, int32_
         int k2 = k + 1;
         while (k2 < nb && bown[border[k2]] == bown[idx] && !(bctrl[border[k2]] & 1)) k2++;
         int rtl = blvl[idx] & 1;
-        const struct wstyle* s = it->st;
+        const struct wstyle* s = psty(p);
         uint32_t t0 = (uint32_t)L->text.len;
         int spaces = 0;
         for (int q = k; q < k2; q++) {
@@ -787,6 +794,7 @@ static void emit_line_bidi(struct ifc* c, int n, int32_t x, int32_t base, int32_
             fr->t0 = t0;
             fr->tl = tl2;
             fr->word_extra = spaces ? extra : 0;
+            fr->ov = p->ov;
             struct wfmetrics m;
             lb_font_metrics(s, &m);
             fr->h = m.ascent + m.descent;
@@ -857,6 +865,19 @@ static void finish_line(struct ifc* c, int n, int forced) {
         }
         return;
     }
+    // ::first-line: the block's first formatted line is styled with the
+    // pseudo-element's computed style (the line was already broken with the
+    // base styles, so only paint-time properties follow the override). An
+    // inline box that declared its own color keeps it; the block's own text
+    // always takes the override.
+    if (c->lines == 0 && c->fl_st) {
+        for (int i = 0; i < n; i++) {
+            if (PC[i].kind != P_TEXT && PC[i].kind != P_SPACE) continue;
+            const struct wstyle* bs = IT[PC[i].item].st;
+            if (bs && bs != c->rst && bs->color_set == 1) continue;
+            PC[i].ov = c->fl_st;
+        }
+    }
     // alignment
     int ta = c->rst->text_align;
     int last_line = forced != 0;                  // the last line of the block, or the one before a forced break
@@ -880,7 +901,7 @@ static void finish_line(struct ifc* c, int n, int forced) {
         int32_t a, b;
         if (PC[i].kind == P_TEXT || PC[i].kind == P_SPACE || PC[i].kind == P_OPEN || PC[i].kind == P_CLOSE) {
             if (!it->st) continue;
-            text_metrics(it->st, &a, &b);
+            text_metrics(PC[i].ov ? PC[i].ov : it->st, &a, &b);
             if (-it->shift + a > above) above = -it->shift + a;
             if (it->shift + b > below) below = it->shift + b;
         } else if (PC[i].kind == P_ATOMIC) {
@@ -929,13 +950,13 @@ static void finish_line(struct ifc* c, int n, int forced) {
             else if (rs->ruby_under) over = 0;
             int32_t* target = over ? &anno_over : &anno_under;
             if (m.ascent + m.descent > *target) *target = m.ascent + m.descent;
-        } else if (p->kind == P_TEXT && it->st && it->st->emph_cp) {
+        } else if (p->kind == P_TEXT && psty(p) && psty(p)->emph_cp) {
             struct wfont f;
-            lb_font(it->st, &f);
+            lb_font(psty(p), &f);
             f.px = (uint16_t)(f.px / 2);
             struct wfmetrics m;
             wfont_metrics(&f, &m);
-            const struct wstyle* es = it->st;
+            const struct wstyle* es = psty(p);
             int over = 1;
             if (es->wmode == WM_VRL) over = !(es->emph_left || es->emph_under);           // right = logical over; left or under = logical under
             else if (es->wmode == WM_VLR || es->wmode == WM_SLR) over = !es->emph_under || es->emph_left; // left = logical over; right or under = logical under
@@ -1108,20 +1129,21 @@ static void finish_line(struct ifc* c, int n, int forced) {
             fr->t0 = p->t0;
             fr->tl = p->tl;
             fr->word_extra = extra;
+            fr->ov = p->ov;
             struct wfmetrics m;
-            lb_font_metrics(it->st, &m);
+            lb_font_metrics(psty(p), &m);
             fr->h = m.ascent + m.descent;
             fr_text = f;
             cur_item = p->item;
         }
-        if (it->st && it->st->emph_cp) {
+        if (psty(p) && psty(p)->emph_cp) {
             // text-emphasis: one marks fragment per piece (paint walks the glyphs)
             struct wfont f50;
-            lb_font(it->st, &f50);
+            lb_font(psty(p), &f50);
             f50.px = (uint16_t)(f50.px / 2);
             struct wfmetrics m5;
             wfont_metrics(&f50, &m5);
-            const struct wstyle* es = it->st;
+            const struct wstyle* es = psty(p);
             int mover = 1;
             if (es->wmode == WM_VRL) mover = !(es->emph_left || es->emph_under);
             else if (es->wmode == WM_VLR || es->wmode == WM_SLR) mover = !es->emph_under || es->emph_left;
@@ -1131,6 +1153,7 @@ static void finish_line(struct ifc* c, int n, int forced) {
                 struct lfrag* mr = &L->fr[mf];
                 mr->kind = FR_MARKS;
                 mr->box = it->box;
+                mr->ov = p->ov;
                 mr->x = px;
                 mr->y = mover ? anno_base_over - m5.descent : anno_base_under + m5.ascent;
                 mr->w = adv;
@@ -1187,7 +1210,7 @@ static void break_at(struct ifc* c, int k, int forced) {
             wbuf_putc(&L0->text, '-');
             hy.t0 = off; hy.tl = 1; hy.brk = 1; hy.nsp = 0;
             struct wfont f;
-            lb_font(IT[hy.item].st, &f);
+            lb_font(psty(&hy), &f);
             hy.w = wfont_measure(&f, "-", 1);
             for (int i = hp; i > k + 1; i--) PC[i] = PC[i - 1];
             PC[k + 1] = hy;
@@ -1198,12 +1221,24 @@ static void break_at(struct ifc* c, int k, int forced) {
     // pieces [0..k] form the line; the rest carries over
     int carry = npc - (k + 1);
     finish_line(c, k + 1, forced);
-    // move the carried pieces to the front
-    for (int i = 0; i < carry; i++) PC[i] = PC[k + 1 + i];
+    // move the carried pieces to the front; they left the first line, so
+    // drop the ::first-line override and re-measure with the base style
+    for (int i = 0; i < carry; i++) {
+        PC[i] = PC[k + 1 + i];
+        if (PC[i].ov) {
+            const struct wstyle* bs = IT[PC[i].item].st;
+            if (bs) {
+                int nsp2 = 0;
+                PC[i].w = measure(bs, c->L->text.p + PC[i].t0, (int)PC[i].tl, &nsp2);
+                PC[i].nsp = PC[i].kind == P_SPACE ? nsp2 : 0;
+            }
+            PC[i].ov = 0;
+        }
+    }
     npc = carry;
     // drop leading collapsible spaces on the new line
     while (npc > 0 && PC[0].kind == P_SPACE && !PC[0].hang) {
-        const struct wstyle* s = IT[PC[0].item].st;
+        const struct wstyle* s = psty(&PC[0]);
         if (s->white_space == WS_PRE || s->white_space == WS_PRE_WRAP || s->white_space == WS_BREAK_SPACES) break;
         for (int i = 1; i < npc; i++) PC[i - 1] = PC[i];
         npc--;
@@ -1499,6 +1534,24 @@ static void lay_ifc_run(struct wlayout* L, int bi, int32_t content_w, int32_t* h
     struct lbox* rb = &L->b[bi];
     nit = 0;
     npc = 0;
+    const struct wstyle* fl_st = rb->node >= 0 ? css_pseudo_of(L->ss, rb->node, 4) : 0;
+    if (!fl_st && !(rb->flags & (BF_FLOAT | BF_ABS))) {
+        // a ::first-line on an ancestor block covers this block's first line
+        // when it is also the ancestor's first line (first-child chain);
+        // out-of-flow boxes are not part of the ancestor's first line, and
+        // flex/grid containers have no first line to inherit from
+        int child = bi, p = L->b[bi].parent;
+        while (p >= 0 && L->b[p].first == child) {
+            if (L->b[p].fc == FC_FLEX || L->b[p].fc == FC_GRID) break;
+            int nd = L->b[p].node;
+            if (nd >= 0) {
+                const struct wstyle* s2 = css_pseudo_of(L->ss, nd, 4);
+                if (s2) { fl_st = s2; break; }
+            }
+            child = p;
+            p = L->b[p].parent;
+        }
+    }
     struct tstate ts = { 0, 1, 1 };
     int fr0 = L->nfr;
     // flatten (needs IT scratch; nested IFCs inside atomics run later, so
@@ -1561,6 +1614,7 @@ static void lay_ifc_run(struct wlayout* L, int bi, int32_t content_w, int32_t* h
     c.first_line = 1;
     c.last_brk = -1;
     c.baseline_first = -1;
+    c.fl_st = fl_st;
     text_metrics(rb->st, &c.strut_above, &c.strut_below);
     line_bounds(&c);
     // bidi is engaged only when the paragraph or some content needs it: pure
@@ -1589,9 +1643,13 @@ static void lay_ifc_run(struct wlayout* L, int bi, int32_t content_w, int32_t* h
             const char* text = L->text.p;
             uint32_t p = it->t0, e = it->t0 + it->tl;
             struct tok t;
-            int wrap = wraps(it->st);
-            int ow = it->st->overflow_wrap || it->st->word_break == WB_BREAK_ALL;
-            while (next_tok(L->text.p, p, e, it->st, &t)) {
+            // ::first-line styles the first line: measure pieces of the not-yet-
+            // broken first line with the override style (paint uses it anyway)
+            const struct wstyle* ist = it->st;
+            if (c.lines == 0 && c.fl_st && ist && (ist == c.rst || ist->color_set != 1)) ist = c.fl_st;
+            int wrap = wraps(ist);
+            int ow = ist->overflow_wrap || ist->word_break == WB_BREAK_ALL;
+            while (next_tok(L->text.p, p, e, ist, &t)) {
                 text = L->text.p;
                 struct piece pc;
                 memset(&pc, 0, sizeof pc);
@@ -1599,8 +1657,9 @@ static void lay_ifc_run(struct wlayout* L, int bi, int32_t content_w, int32_t* h
                 pc.t0 = t.t0;
                 pc.tl = t.tl;
                 pc.kind = t.space ? P_SPACE : P_TEXT;
+                pc.ov = ist != it->st ? ist : 0;
                 int nsp = 0;
-                pc.w = measure(it->st, text + t.t0, (int)t.tl, &nsp);
+                pc.w = measure(ist, text + t.t0, (int)t.tl, &nsp);
                 pc.nsp = t.space ? nsp : 0;
                 pc.hang = (uint8_t)t.hang;
                 pc.brk = (uint8_t)(wrap && t.brk);
@@ -1613,7 +1672,7 @@ static void lay_ifc_run(struct wlayout* L, int bi, int32_t content_w, int32_t* h
                         while (q < qe) {
                             uint32_t cp;
                             int nn = w_utf8_dec(L->text.p + q, (int)(qe - q), &cp);
-                            int32_t cw = measure(it->st, L->text.p + q, nn, 0);
+                            int32_t cw = measure(ist, L->text.p + q, nn, 0);
                             if (w + cw > c.avail - c.used && q > s0) break;
                             w += cw;
                             q += nn;

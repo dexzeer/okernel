@@ -811,7 +811,7 @@ static void emit_ifc(struct wlayout* L, int bi, int depth) {
             break;
         }
         case FR_TEXT: case FR_MARKER: {
-            const struct wstyle* s = fb->pst;
+            const struct wstyle* s = fr->ov ? fr->ov : fb->pst;
             int32_t x = ox + fr->x, base = oy + fr->y;
             if (fr->_p & 1) {              // rectangle form (the fragment went through a writing mode transform)
                 if (s->wmode != WM_HTB) { emit_text_vert(L, s, x, base, fr->w, fr->h, fr->t0, fr->tl); break; }
@@ -831,7 +831,7 @@ static void emit_ifc(struct wlayout* L, int bi, int depth) {
             break;
         }
         case FR_MARKS: {
-            const struct wstyle* s = fb->pst;
+            const struct wstyle* s = fr->ov ? fr->ov : fb->pst;
             int32_t x = ox + fr->x, base = oy + fr->y;
             if ((fr->_p & 1) && s->wmode != WM_HTB) {
                 emit_marks(L, s, x, base, fr->w, fr->h, 0, fr->t0, fr->tl, 1);

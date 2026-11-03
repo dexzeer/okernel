@@ -155,7 +155,7 @@ struct wstyleset {
     int32_t* shash;
     int shcap;
     int32_t* node_style;
-    int32_t* node_pseudo;    // 3 per node: before, after, marker
+    int32_t* node_pseudo;    // 5 per node: before, after, marker, first-line, first-letter
     int node_cap;
     struct wbuf strpool;
     int32_t* strhash;
@@ -3082,8 +3082,9 @@ static int32_t compute_one(struct wstyleset* ss, int el, int pe, const struct ws
     int ncustom;
     cascade(ss, pe, slots, customs, custom_sh, &ncustom, hint_first, hint_count, inl_first, inl_count);
     if (pe != PE_NONE) {
-        // pseudo-element exists only with content
-        if (!slots[P_CONTENT].d && pe != PE_MARKER) return -1;
+        // pseudo-element exists only with content (first-line/first-letter style
+        // existing text instead of generating content)
+        if (!slots[P_CONTENT].d && pe != PE_MARKER && pe != PE_FLINE && pe != PE_FLETTER) return -1;
     }
     struct wstyle s;
     memcpy(&s, &initial, sizeof s);
@@ -3201,7 +3202,13 @@ static int32_t compute_one(struct wstyleset* ss, int el, int pe, const struct ws
         if (parent->lh_factor) s.line_height = w_muldiv(s.font_size, parent->lh_factor, 1000);
     }
     // color before currentColor users
-    if (slots[P_COLOR].d) { c.sh = slots[P_COLOR].sh; apply_decl(&c, P_COLOR, slots[P_COLOR].d); }
+    if (slots[P_COLOR].d) {
+        c.sh = slots[P_COLOR].sh;
+        // 1 = a color value was declared (a ::first-line inherited color must
+        // not win over it); 2 = declared inherit: it follows the first-line box
+        s.color_set = (slots[P_COLOR].d->kind == VK_KW && slots[P_COLOR].d->a == KW_INHERIT) ? 2 : 1;
+        apply_decl(&c, P_COLOR, slots[P_COLOR].d);
+    }
     // line-height before the lengths: the lh unit is the element's own line height
     if (slots[P_LINE_HEIGHT].d) { c.sh = slots[P_LINE_HEIGHT].sh; apply_decl(&c, P_LINE_HEIGHT, slots[P_LINE_HEIGHT].d); }
     {
@@ -3301,7 +3308,7 @@ static int ensure_nodes(struct wstyleset* ss) {
     int32_t* a = (int32_t*)w_realloc(ss->node_style, nc * sizeof(int32_t));
     if (!a) return 0;
     ss->node_style = a;
-    int32_t* b = (int32_t*)w_realloc(ss->node_pseudo, nc * 3 * sizeof(int32_t));
+    int32_t* b = (int32_t*)w_realloc(ss->node_pseudo, nc * 5 * sizeof(int32_t));
     if (!b) return 0;
     ss->node_pseudo = b;
     ss->node_cap = nc;
@@ -3326,7 +3333,7 @@ void css_compute_all(struct wstyleset* ss, int vw, int vh) {
     // whole capacity: nodes created by scripts after this pass must read "no style"
     for (int i = 0; i < ss->node_cap; i++) {
         ss->node_style[i] = -1;
-        ss->node_pseudo[i * 3] = ss->node_pseudo[i * 3 + 1] = ss->node_pseudo[i * 3 + 2] = -1;
+        for (int k = 0; k < 5; k++) ss->node_pseudo[i * 5 + k] = -1;
     }
     ss->inl.ndecl = 0;
     ss->inl.pool.len = 0;
@@ -3374,16 +3381,20 @@ void css_compute_all(struct wstyleset* ss, int vw, int vh) {
                 struct wstyle rcopy;
                 if (rs2) memcpy(&rcopy, rs2, sizeof rcopy);
                 // pseudo-elements: only when some matched rule targets them
-                int has_b = 0, has_a = 0, has_m = 0;
+                int has_b = 0, has_a = 0, has_m = 0, has_fl = 0, has_fletter = 0;
                 for (int m = 0; m < ss->nmatch; m++) {
                     int pe = ss->match[m]->sh->rules[ss->match[m]->rule].pseudo;
                     if (pe == PE_BEFORE) has_b = 1;
                     else if (pe == PE_AFTER) has_a = 1;
                     else if (pe == PE_MARKER) has_m = 1;
+                    else if (pe == PE_FLINE) has_fl = 1;
+                    else if (pe == PE_FLETTER) has_fletter = 1;
                 }
-                if (has_b) ss->node_pseudo[node * 3] = compute_one(ss, node, PE_BEFORE, &me, rs2 ? &rcopy : 0, 0, 0, 0, 0);
-                if (has_a) ss->node_pseudo[node * 3 + 1] = compute_one(ss, node, PE_AFTER, &me, rs2 ? &rcopy : 0, 0, 0, 0, 0);
-                if (has_m) ss->node_pseudo[node * 3 + 2] = compute_one(ss, node, PE_MARKER, &me, rs2 ? &rcopy : 0, 0, 0, 0, 0);
+                if (has_b) ss->node_pseudo[node * 5] = compute_one(ss, node, PE_BEFORE, &me, rs2 ? &rcopy : 0, 0, 0, 0, 0);
+                if (has_a) ss->node_pseudo[node * 5 + 1] = compute_one(ss, node, PE_AFTER, &me, rs2 ? &rcopy : 0, 0, 0, 0, 0);
+                if (has_m) ss->node_pseudo[node * 5 + 2] = compute_one(ss, node, PE_MARKER, &me, rs2 ? &rcopy : 0, 0, 0, 0, 0);
+                if (has_fl) ss->node_pseudo[node * 5 + 3] = compute_one(ss, node, PE_FLINE, &me, rs2 ? &rcopy : 0, 0, 0, 0, 0);
+                if (has_fletter) ss->node_pseudo[node * 5 + 4] = compute_one(ss, node, PE_FLETTER, &me, rs2 ? &rcopy : 0, 0, 0, 0, 0);
                 descend = d->n[node].first >= 0;
                 if (descend) {
                     if (sp >= cap) {
@@ -3433,8 +3444,8 @@ const struct wstyle* css_style_of(const struct wstyleset* ss, int node) {
 }
 
 const struct wstyle* css_pseudo_of(const struct wstyleset* ss, int node, int which) {
-    if (node < 0 || node >= ss->node_cap || which < 1 || which > 3) return 0;
-    int32_t i = ss->node_pseudo[node * 3 + which - 1];
+    if (node < 0 || node >= ss->node_cap || which < 1 || which > 5) return 0;
+    int32_t i = ss->node_pseudo[node * 5 + which - 1];
     return i >= 0 ? &ss->styles[i] : 0;
 }
 

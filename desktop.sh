@@ -1,1 +1,1 @@
-qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0
+qemu-system-i386 -m 512 -cdrom "/media/notdexy/Новый том/projects/okernel/kanarchy-desktop.iso" -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0 -audiodev sdl,id=snd0,out.buffer-length=120000,in.voices=0,out.frequency=48000 -device AC97,audiodev=snd0 %*

@@ -1,6 +1,7 @@
 // Box tree construction + anonymous box fixups.
 #include "lay_int.h"
 #include "cstyles.h"
+#include "gcat.h"
 
 const struct wstyle* lay_anon_style(struct wlayout* L, const struct wstyle* parent, int display) {
     if (L->anon_used % 128 == 0) {
@@ -20,6 +21,10 @@ const char* lay_box_raw(struct wlayout* L, int bi, int* len) {
     *len = (int)b->tl;
     if (b->flags & BF_RAWTEXT) return L->text.p + b->t0;
     if (b->node >= 0 && L->d->n[b->node].type == WN_TEXT) {
+        if (b->tl) {          // windowed by ::first-letter splitting (t0/tl are bytes)
+            *len = (int)b->tl;
+            return L->d->text + L->d->n[b->node].text + b->t0;
+        }
         *len = (int)L->d->n[b->node].tlen;
         return L->d->text + L->d->n[b->node].text;
     }
@@ -628,8 +633,106 @@ static int text_box(struct wlayout* L, int parent, int node, const struct wstyle
     int t = lb_new(L, node, st, LB_TEXT);
     if (t < 0) return -1;
     L->b[t].flags |= L->b[parent].flags & BF_FIXED;
+    L->b[t].t0 = 0;
+    L->b[t].tl = L->d->n[node].tlen;
     lb_append(L, parent, t);
     return t;
+}
+
+// Byte extent of the ::first-letter run at the start of s (n bytes):
+// preceding punctuation, the first typographic letter unit (one codepoint),
+// and immediately following punctuation (CSS2.1 selector.html#first-letter).
+// Selection works on the collapsed text: leading white space that the
+// formatter would collapse is skipped; in white-space modes that preserve it
+// (and for preserved Unicode spaces like &nbsp;) it is visible content and
+// prevents the box. With no letter unit the punctuation run alone is
+// selected. 0 = no run; *s0 receives where the run starts.
+static uint32_t first_letter_run(const unsigned char* s, uint32_t n, int ws, uint32_t* s0) {
+    uint32_t i = 0;
+    *s0 = 0;
+    int keep = ws == WS_PRE || ws == WS_PRE_WRAP || ws == WS_BREAK_SPACES;
+    int keep_nl = keep || ws == WS_PRE_LINE;
+    if (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' || s[i] == '\f')) {
+        if (keep || (keep_nl && s[i] == '\n')) return 0;
+        while (i < n && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r' || s[i] == '\f')) i++;
+    }
+    if (i < n) {
+        uint32_t cp;
+        int cl = w_utf8_dec((const char*)s + i, (int)(n - i), &cp);
+        if (cl > 0 && gcat_space(cp)) return 0;    // preserved space: not selectable
+    }
+    *s0 = i;
+    for (;;) {
+        uint32_t cp;
+        int cl = w_utf8_dec((const char*)s + i, (int)(n - i), &cp);
+        if (cl <= 0 || !gcat_punct(cp)) break;
+        i += (uint32_t)cl;
+    }
+    if (i == *s0) {           // no leading punctuation: the letter unit itself
+        uint32_t cp;
+        int cl = w_utf8_dec((const char*)s + i, (int)(n - i), &cp);
+        if (cl <= 0) return 0;
+        i += (uint32_t)cl;
+    } else if (i < n) {       // punctuation, then a letter unit (not whitespace)
+        uint32_t cp;
+        int cl = w_utf8_dec((const char*)s + i, (int)(n - i), &cp);
+        if (cl > 0 && cp != ' ' && cp != '\t' && cp != '\n' && cp != '\r' && cp != '\f' && !gcat_space(cp)) {
+            i += (uint32_t)cl;
+        }
+    }
+    for (;;) {
+        uint32_t cp;
+        int cl = w_utf8_dec((const char*)s + i, (int)(n - i), &cp);
+        if (cl <= 0 || !gcat_punct(cp)) break;
+        i += (uint32_t)cl;
+    }
+    return i > *s0 ? i : 0;
+}
+
+// ::first-letter: the run of the block's first text child becomes its own
+// inline box carrying the pseudo style; the boxes window the DOM text (a
+// leading whitespace run keeps the base style in its own box).
+static void split_first_letter(struct wlayout* L, int box, int c, const struct wstyle* st, const struct wstyle* fls) {
+    struct lbox* pb = &L->b[box];
+    const struct wnode* n = &L->d->n[c];
+    uint32_t s0 = 0;
+    uint32_t e = first_letter_run((const unsigned char*)L->d->text + n->text, n->tlen, st->white_space, &s0);
+    if (!e) {
+        text_box(L, box, c, st);
+        return;
+    }
+    if (s0 > 0) {
+        int w = lb_new(L, c, st, LB_TEXT);
+        if (w >= 0) {
+            L->b[w].flags |= pb->flags & BF_FIXED;
+            L->b[w].t0 = 0;
+            L->b[w].tl = s0;
+            lb_append(L, box, w);
+        }
+    }
+    int f = lb_new(L, c, fls, LB_INLINE);
+    if (f < 0) {
+        text_box(L, box, c, st);
+        return;
+    }
+    L->b[f].flags |= pb->flags & BF_FIXED;
+    lb_append(L, box, f);
+    int ft = lb_new(L, c, fls, LB_TEXT);
+    if (ft >= 0) {
+        L->b[ft].flags |= pb->flags & BF_FIXED;
+        L->b[ft].t0 = s0;
+        L->b[ft].tl = e - s0;
+        lb_append(L, f, ft);
+    }
+    if (e < n->tlen) {
+        int t = lb_new(L, c, st, LB_TEXT);
+        if (t >= 0) {
+            L->b[t].flags |= pb->flags & BF_FIXED;
+            L->b[t].t0 = e;
+            L->b[t].tl = n->tlen - e;
+            lb_append(L, box, t);
+        }
+    }
 }
 
 static void build_children(struct wlayout* L, int el, int box, const struct cset* mine, struct cset* cprev);
@@ -790,14 +893,33 @@ static void build_children(struct wlayout* L, int el, int box, const struct cset
     struct wdom* d = L->d;
     const struct wstyle* st = css_style_of(L->ss, el);
     const struct wstyle* bst = L->b[box].st;
+    // ::first-letter applies to the block's first text content; an element
+    // sibling before it takes the first line out of our reach
+    const struct wstyle* fls = css_pseudo_of(L->ss, el, 5);
     for (int c = d->n[el].first; c >= 0; c = d->n[c].next) {
         const struct wnode* n = &d->n[c];
         if (n->type == WN_TEXT) {
             // text inherits through the element whose children these are —
             // for display:contents that is the contents element, not the box
-            if (n->tlen) text_box(L, box, c, st ? st : bst);
+            if (!n->tlen) continue;
+            if (fls) {
+                int allws = 1;
+                for (uint32_t k = 0; k < n->tlen; k++) {
+                    char ch = L->d->text[n->text + k];
+                    if (ch != ' ' && ch != '\t' && ch != '\n' && ch != '\r' && ch != '\f') { allws = 0; break; }
+                }
+                if (allws) {
+                    text_box(L, box, c, st ? st : bst);
+                    continue;                       // whitespace first: try the next text node
+                }
+                split_first_letter(L, box, c, st ? st : bst, fls);
+                fls = 0;
+            } else {
+                text_box(L, box, c, st ? st : bst);
+            }
         } else if (n->type == WN_ELEM) {
             build_el(L, c, box, mine, cprev);
+            fls = 0;
         }
     }
 }

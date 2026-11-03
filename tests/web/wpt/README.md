@@ -44,14 +44,16 @@ python3 tests/web/wpt/run_wpt.py -o build-host/wpt_out_big <areas>
 ```
 
 An area can be a sub-directory (`css-text/white-space`) or one test file. Environment: `WBROWSE=path` picks the binary,
-`WPT_PORT=n` the local server port (two runs at the same time need two ports), `WPT_XHT=1` also renders references
-written as `.xht` / `.xhtml` / `.htm` (see below), `WPT_XHT=2` also discovers tests written that way (CSS2 alone has about
-6000). `-j8` is fine on 12 cores; much more makes renders miss their 2.5 s budget.
+`WPT_PORT=n` the local server port (two runs at the same time need two ports). `.xht`/`.xhtml`/`.htm` tests are discovered
+and their references rendered by default now (until 2026-11-01 they were skipped, which hid ~6.5k reftests — CSS2 alone
+went 378 -> 6275); `WPT_XHT=0` restores the old `.html`-only mode. `-j8` is fine on 12 cores; much more makes renders miss
+their 2.5 s budget. Rebuild before a measuring run: the runner honors `WBROWSE` and a stale binary silently produces
+wrong numbers (that bit us once: a mid-debugging `wbrowse2` cost counter-styles 65 passes).
 
 `error` = the engine crashed or a page failed to render/compare (runner
 problem; a failed render is tried three times); `fail` = rendered but differs from the reference
-(engine bug or unimplemented feature); `skip` = non-HTML reference (without `WPT_XHT`: the 952 tests whose reference is
-an `.xht` file, a handful of svg/png refs).
+(engine bug or unimplemented feature); `skip` = non-HTML reference (a handful of svg/png refs; with `WPT_XHT=0`
+that includes the 952 tests whose reference is an `.xht` file).
 
 ## Eyeballing a failure
 
@@ -77,22 +79,32 @@ WB_DUMP=1 build-host/wbrowse <url> 800 600 out.ppm 2.5   # prints every text fra
 |            | printing, css-transitions, cssom, cssom-view;          |                                 |
 |            | 15415 rendered, `WPT_XHT=1`)                           |                                 |
 | 2026-11-01 | same 44 areas, after bidi + predefined counter styles  | **7540 pass (48.9%)**           |
+| 2026-11-01 | same 44 areas, `.xht` tests discovered (22742 rendered, | **12093 pass (53.1%)**          |
+|            | fresh build; Servo's css score for scale: 67.8%)       |                                 |
+| 2026-11-01 | same 44 areas, after ::first-letter + ::first-line     | **12474 pass (54.8%)**          |
 
 The first three rows were measured before backgrounds loaded their images (see below), so some of their passes were two
 equally broken pages that happened to match.
 
-Per-area (2026-11-01, `WPT_XHT=1`): CSS2 60.3%, css-align 38.7%, css-backgrounds 67.8%, css-borders 29.4%, css-box 87.5%,
-css-break 12.8%, css-cascade 38.8%, css-color 77.8%, css-conditional 45.7%, css-contain 56.9%, css-counter-styles 40.2%,
-css-display 67.1%, css-flexbox 64.7%, css-fonts 35.1%, css-grid 27.9%, css-image-animation 100%, css-images 59.5%,
-css-inline 19.9%, css-lists 70.1%, css-masking 31.8%, css-multicol 31.2%, css-overflow 51.4%, css-page 44.5%,
-css-position 47.8%, css-pseudo 41.8%, css-ruby 26.2%, css-scrollbars 100%, css-sizing 58.2%, css-syntax 100% (1 test),
-css-tables 48.5%, css-text 62.0%, css-text-decor 44.0%, css-transforms 42.0%, css-ui 92.9%, css-values 37.4%,
-css-variables 53.0%, css-view-transitions 21.1%, css-writing-modes 35.0%, mediaqueries 49.1%, printing 71.8%,
-css-transitions 100%, cssom 41.7%, cssom-view 54.5%, selectors 77.2%.
+Per-area (2026-11-01, full24): CSS2 72.5%, css-align 38.7%, css-backgrounds 67.0%, css-borders 29.4%,
+css-box 87.5%, css-break 12.8%, css-cascade 40.0%, css-color 77.9%, css-conditional 56.6%, css-contain 56.9%,
+css-counter-styles 40.2%, css-display 44.0%, css-flexbox 61.2%, css-fonts 35.0%, css-grid 27.9%, css-image-animation 100%,
+css-images 59.5%, css-inline 19.9%, css-lists 69.7%, css-masking 31.8%, css-multicol 24.8%, css-overflow 49.6%,
+css-page 44.5%, css-position 48.2%, css-pseudo 42.8%, css-ruby 23.8%, css-scrollbars 100%, css-sizing 58.3%,
+css-syntax 100% (1 test), css-tables 48.5%, css-text 61.2%, css-text-decor 56.3%, css-transforms 41.8%, css-ui 92.9%,
+css-values 36.9%, css-variables 53.0%, css-view-transitions 21.1%, css-writing-modes 40.5%,
+css-transitions 100%, cssom 41.7%, cssom-view 54.5%, mediaqueries 50.0%, printing 71.8%, selectors 76.7%.
 
 Areas probed and left out (net-negative or feature-less): css-logical (0), css-scroll-snap (1), css-anchor-position 7.4%,
 css-gaps 5.8%, css-shapes 3.9%, css-shadow 14%, css-will-change 14%, css-nesting 17.6%, css-forms 20%, css-viewport 13.9%,
 css-content 12.5%, css-highlight-api 12.6%, motion 8.2%, compositing 8.5%, css-layout-api 4.4%, css-paint-api 1.7%.
+
+## What changed on 2026-11-01 (corpus + ::first-letter/::first-line)
+
+- **Corpus fix**: `.xht` test files were never discovered (only rendered as references) — `WPT_XHT=2` (now the default) unlocked ~6.5k reftests: CSS2 378 -> 6275 (66.7%), css-writing-modes 394 -> 1152, css-flexbox/multicol/display +130 each. 15415 -> 22742 rendered.
+- **::first-letter** (CSS2.1): the run — leading punctuation, one typographic letter unit, trailing punctuation — becomes its own inline box with the pseudo style. Selection works on the collapsed text: white space the formatter would collapse is skipped, preserved spaces (nbsp, em space...) prevent the box. Punctuation categories (Ps/Pe/Pi/Pf/Po) and spaces (Zs) come from a generated table (`src/web/gcat.h`, `build-host/gengcat.py`). The pseudo style lives in two new `node_pseudo` slots (stride 3 -> 5). CSS2/selectors 174 -> 440 pass (91.9%).
+- **::first-line** (CSS2.1): pieces of the block's first formatted line carry an override style (`psty()`), measured with it on the not-yet-broken first line and painted with it everywhere (plain + bidi paths, marks, spans). It propagates down the first-child chain to descendant blocks whose first line is also the ancestor's, stops at floats, abspos and flex/grid containers, and does not override a box's own declared color (`color_set` flag on wstyle; declared `inherit` follows the first-line box). Net ~+20 across CSS2/css-pseudo/css-display (the CSS2 first-line reftests mostly use color, which was already right).
+- Costs/limits: `::selection` styling is still unsupported (text-decoration-color-selection tests regressed from pass to fail because their *reference* uses ::first-line), first-letter with a background image paints at the wrong size, first-letter inside inline descendants (nested/quote tests) is not absorbed, first-line vertical-align/font-relative-unit stragglers remain.
 
 ## What changed on 2026-11-01 (bidi + counter styles)
 
