@@ -11,9 +11,9 @@
 //    ServerHellos, flight-order violations, Finished tampering, alert
 //    injection, app-data ciphertext bit-flips, record garbage/overflow.
 //
-// Build: gcc -m32 -O1 -g -fsanitize=address,undefined -Isrc/crypto -Isrc ...
+// Build: gcc -m64 -O1 -g -fsanitize=address,undefined -Isrc/crypto -Isrc ...
 
-// 64-bit stat even in the -m32 build: on WSL's /mnt drives inode numbers
+// 64-bit stat: on WSL's /mnt drives inode numbers
 // exceed 32 bits, plain stat() fails with EOVERFLOW and adv_clocks would
 // silently fall back to a fixed date.
 #define _FILE_OFFSET_BITS 64

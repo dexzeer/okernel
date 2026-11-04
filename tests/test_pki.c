@@ -1,6 +1,6 @@
 // Host test: X.509 parser + RSA PKCS#1 v1.5 + ECDSA P-256/P-384 against REAL
 // certificates (the live example.com chain + system root CAs).
-// Build: gcc -m32 -O2 -Isrc/crypto -Isrc -o t test_pki.c ../src/crypto/... 
+// Build: gcc -m64 -O2 -Isrc/crypto -Isrc -o t test_pki.c ../src/crypto/... 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

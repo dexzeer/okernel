@@ -1,6 +1,6 @@
 // tests/test_ablock.c — host unit tests for the built-in adblocker
 // (src/ablock.c). Builds the same way the kernel does (freestanding subset)
-// but on the host:  gcc -m32 -O2 -Isrc -o t_ablock tests/test_ablock.c
+// but on the host:  gcc -m64 -O2 -Isrc -o t_ablock tests/test_ablock.c
 //                   src/ablock.c src/web/wdom.c
 #include <stdio.h>
 #include <stdlib.h>

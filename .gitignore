@@ -40,6 +40,8 @@ tests/web/corpus/
 tests/web/out/
 isodir-x2/
 build-x2/
+isodir-hb/
+build-hb/
 isodir-res/
 build-res/
 kanarchy-res.*

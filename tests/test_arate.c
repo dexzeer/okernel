@@ -1,5 +1,5 @@
 // Host test for src/audio_rate.c: measuring the sound card's real speed, resampling by it, and the nominal clock.
-//   gcc -m32 -O1 -fsanitize=address,undefined -o build-host/t_arate tests/test_arate.c src/audio_rate.c -lm && build-host/t_arate
+//   gcc -m64 -O1 -fsanitize=address,undefined -o build-host/t_arate tests/test_arate.c src/audio_rate.c -lm && build-host/t_arate
 #include "../src/audio_rate.h"
 #include <math.h>
 #include <stdio.h>

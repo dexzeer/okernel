@@ -6,6 +6,7 @@
 
 #include <stdint.h>
 #include "lxfs.h"
+#include "memlayout.h"
 
 // ---- errno (Linux values) ---------------------------------------------------------------------------------------
 #define LX_EPERM 1
@@ -66,19 +67,19 @@ struct lx_regs {
 #define LX_MAP_NORESERVE 0x4000
 
 struct lx_vma {
-    uint32_t start, end;                     // page aligned, end exclusive; the user space is below 3 GB
+    uint64_t start, end;                     // page aligned, end exclusive
     uint32_t prot, flags;
     struct lx_node *node;                    // file backing (private mappings copy from it on first touch)
     uint64_t off;                            // file offset of `start`
-    uint32_t fend;                           // file bytes are copied only below this address (the rest of a segment is bss)
+    uint64_t fend;                           // file bytes are copied only below this address (the rest of a segment is bss)
     uint8_t  shared_fb;                      // maps the framebuffer window instead of anonymous memory
 };
 
 #define LX_USER_BASE   0x00010000u
-#define LX_USER_TOP    0xC0000000u
-#define LX_STACK_TOP   0xBFFFF000u
+#define LX_USER_TOP    0x00007FFFFFFFF000ull
+#define LX_STACK_TOP   0x00007FFFFFFFE000ull
 #define LX_STACK_SIZE  (8u << 20)
-#define LX_MMAP_TOP    0xB0000000u
+#define LX_MMAP_TOP    0x00007F0000000000ull
 
 // ---- open files -------------------------------------------------------------------------------------------------
 #define LX_O_RDONLY 0
@@ -140,11 +141,11 @@ struct lx_sigaction { uint64_t handler, flags, restorer, mask; };
 // What threads of one program can share (clone flags): the address space, the open files, the signal handlers.
 struct lx_mm {
     int refs;
-    uint32_t cr3;
+    phys_t cr3;
     struct lx_vma *vma;
     int nvma;
-    uint32_t brk_start, brk;
-    uint32_t mmap_hint;
+    uint64_t brk_start, brk;
+    uint64_t mmap_hint;
     uint32_t rss;                            // pages
     void *win;                               // Windows process data (lx_pe.c), or 0
 };
@@ -228,11 +229,11 @@ int lx_exec_load(struct lx_task *t, const char *path, const char *const *argv, c
 
 // helpers shared by the lx_*.c files
 struct lx_task *lx_current(void);
-struct lx_vma *lx_vma_find(struct lx_task *t, uint32_t addr);
-int lx_map_region(struct lx_task *t, uint32_t start, uint32_t len, uint32_t prot, uint32_t flags, struct lx_node *node, uint64_t off);
-int lx_unmap_region(struct lx_task *t, uint32_t start, uint32_t len);
-int lx_protect_region(struct lx_task *t, uint32_t start, uint32_t len, uint32_t prot);
-uint32_t lx_find_free(struct lx_task *t, uint32_t len);
+struct lx_vma *lx_vma_find(struct lx_task *t, uint64_t addr);
+int lx_map_region(struct lx_task *t, uint64_t start, uint64_t len, uint32_t prot, uint32_t flags, struct lx_node *node, uint64_t off);
+int lx_unmap_region(struct lx_task *t, uint64_t start, uint64_t len);
+int lx_protect_region(struct lx_task *t, uint64_t start, uint64_t len, uint32_t prot);
+uint64_t lx_find_free(struct lx_task *t, uint64_t len);
 void lx_free_user(struct lx_task *t);
 // Make [addr, addr+len) readable (write=0) or writable (write=1) from the kernel: pages are brought in. 0 or -EFAULT.
 int lx_user_range(struct lx_task *t, uint64_t addr, uint64_t len, int write);

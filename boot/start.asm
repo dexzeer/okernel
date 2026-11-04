@@ -1,4 +1,9 @@
-; Multiboot header constants
+; Kernel entry: multiboot header, the 32-bit stub GRUB jumps to, and the switch to 64-bit long mode.
+;
+; GRUB loads the ELF64 image by physical address and enters _start in 32-bit protected mode with paging off, so everything up to
+; lm64 runs at its low (physical) address. The stub builds the boot page tables, enables long mode and jumps to _start_high, the
+; first code at the kernel's linked address.
+
 MBALIGN  equ 1 << 0            ; align loaded modules on page boundaries
 MEMINFO  equ 1 << 1            ; provide memory map
 VIDEO    equ 1 << 2            ; provide video mode info
@@ -20,13 +25,7 @@ FLAGS    equ MBALIGN | MEMINFO | VIDEO
 MAGIC    equ 0x1BADB002        ; multiboot magic number
 CHECKSUM equ -(MAGIC + FLAGS)
 
-; Multiboot header (must be in first 8KB of kernel)
-; ELF-STYLE header (NO address fields — original working form): GRUB loads
-; by ELF segments (VMA high, LMA phys) and honors VIDEO 1920x1080x32.
-; (The bit-16 a.out-kludge variant was tried 2026-09-07: same 640x480 text
-; result — the video issue is elsewhere, not the header style. Keep the
-; original form so GRUB entry uses ELF e_entry = high _start... see the
-; ENTRY-LOW note in linker-high.ld.)
+; Multiboot header (must be in the first 8 KB of the image). No address fields: GRUB loads by ELF segments.
 section .multiboot
 align 4
     dd MAGIC
@@ -45,76 +44,29 @@ align 4
     dd 32   ; bpp
 %endif
 
-; Minimal boot GDT (phys addresses, loaded pre-paging): null + flat 4G code
-; (0x08: exec/read, DPL0) + flat 4G data (0x10: read/write, DPL0). The ljmp
-; after CR3 validates against THESE, not GRUB's GDT (whose 0x08 is invalid —
-; GDB showed CS=0x10 GRUB-data at the fault). 6-byte pseudo-descriptor.
-section .data
-align 8
-boot_gdt:
-    dq 0x0000000000000000        ; null
-    dq 0x00CF9A000000FFFF        ; 0x08: code, base 0, limit 4G, gran 4K, 32-bit
-    dq 0x00CF92000000FFFF        ; 0x10: data, base 0, limit 4G, gran 4K, 32-bit
-boot_gdtr:
-    dw boot_gdtr - boot_gdt - 1 ; limit = 24-1
-    dd boot_gdt                 ; base (LINKED high; fixed at runtime below)
-    dd 0                        ; base[63:32]: the CPU is in long mode when this is loaded (10-byte form)
+; Boot page tables, linked and loaded low (the stub uses them with paging off). They map the first 4 GB three times with 2 MB pages:
+;   0x0000000000000000  identity (the stub itself, multiboot structures, devices of the text kernel)
+;   0xFFFF800000000000  the direct map (memlayout.h), which is what P2V gives before paging_init
+;   0xFFFFFFFF80000000  the kernel image: only the first GB, the code model only reaches the top 2 GB of the address space
+; The last GB is the PCI hole on any machine with less RAM than that, so it is uncached. paging_init replaces all of this on the desktop;
+; the text kernel never leaves these tables.
+section .boottab nobits alloc write align=4096
+boot_pml4:    resb 4096
+boot_pdpt_lo: resb 4096
+boot_pdpt_hi: resb 4096
+boot_pd:      resb 4096 * 4
 
-; Boot page tables (x86-64, 4 levels): identity-map 0-64M AND high-map 0xC0000000-0xC4000000
-; to the same phys 0-64M (2MB pages), so the high-linked kernel can enable paging while
-; still running low and then jump high. The CPU goes into long mode right here (see _start);
-; the kernel proper then runs in compatibility mode, i.e. as the 32-bit code it always was. Phys addrs
-; stored (CPU reads CR3 + PD entries as phys). 4K-aligned.
-; PHYS LABELS (the NASM wrap-around trap): `mov edx, boot_pd-0xC0000000'
-; does NOT subtract at build time — with unlinked .o VMAs NASM emits a
-; RELOCATION (R_386_32 of 0x40000000+off), and LD resolves the subtraction
-; against the FINAL high VMA. So the linked disassembly shows the correct
-; phys while a raw `nasm -o /tmp` object shows 0x400xxxxx (unlinked). Both
-; are correct stages of the same arithmetic — do NOT "fix" the expression
-; to a hardcoded phys.
-section .data
-align 4096
-global boot_pml4
-boot_pml4:
-    times 1024 dd 0
-boot_pdpt:
-    times 1024 dd 0
-boot_pdlo:
-    times 1024 dd 0
-boot_pdhi:
-    times 1024 dd 0
-
-; Stack — 256KB (TLS needs it). HIGH-linked .bss: pre-PG code must NOT touch
-; it (the LOW trampoline runs on a scratch ESP). Post-PG high code uses the
-; VMA name; the boot PD's 0-64M high window covers it.
-section .bss
-align 16
-stack_bottom:
-    resb 262144
-stack_top:
-
-section .note.GNU-stack noalloc noexec nowrite progbits
-
-; LOW TRAMPOLINE (VMA == LMA == phys): GRUB jumps here with paging OFF, so
-; e_entry must be LOW. This section holds ONLY the pre-paging sequence
-; (fill boot PD, enable PG, lgdt, ljmp high). The `label - 0xC0000000'
-; expressions below resolve against the HIGH-VMA boot tables in .data
-; (VMA 0xC0187xxx -> phys 0x187xxx via relocation) — verified objdump -dr.
 section .trampoline
+bits 32
 global _start
 extern kernel_main
 
 _start:
-    ; ENTRY: GRUB jumps here at LOW phys with paging OFF. VMA == LMA here
-    ; (see .trampoline in linker-high.ld), so labels are already phys — but
-    ; the boot TABLES live in HIGH-VMA .data, hence `- 0xC0000000' on those.
-    ; Set a LOW scratch ESP first (phys 0x7FF00, free low mem under 1M).
-    mov esp, 0x7FF00
-    ; ebx = phys multiboot pointer, eax = multiboot magic: kept on the scratch stack (cpuid clobbers ebx).
-    push ebx
-    push eax
+    mov esp, 0x7FF00            ; free low memory below 1 MB
+    push ebx                    ; multiboot info (phys): cpuid clobbers ebx
+    push eax                    ; multiboot magic
 
-    ; The desktop kernel needs an x86-64 CPU (long mode). Without one, say so on the debug ports and halt.
+    ; x86-64 is required. Without it, say so on the debug ports and halt.
     mov eax, 0x80000000
     cpuid
     cmp eax, 0x80000001
@@ -125,7 +77,6 @@ _start:
     jnz .have_lm
 .no_lm:
     mov esi, .nolm_msg
-    sub esi, 0                  ; (low image: labels are phys here)
 .say:
     lodsb
     test al, al
@@ -142,38 +93,43 @@ _start:
 .nolm_msg: db "KAnarchy needs an x86-64 CPU (long mode)", 10, 0
 .have_lm:
 
-    ; Boot map: 2MB pages, phys 0-64M both identity (PDPT[0] -> boot_pdlo) and high (PDPT[3] -> boot_pdhi,
-    ; 0xC0000000+). The image outgrew one 4K-page table (fonts + the web engine put .bss, and the boot stack in
-    ; it, past 4M), and paging_init only runs after memory_init/mboot copy touch .bss too.
-    ; ABSOLUTE-ADDRESS WARNING: `mov edx, boot_pml4 - 0xC0000000' looks like a numeric subtraction, but NASM
-    ; treats `label - const' as LABEL+(-const): it emits a RELOCATION (R_386_32 of 0x40000000), NOT a folded
-    ; immediate. The .o disassembly shows 0x40000000 (unlinked); LD resolves it against the HIGH VMA to phys.
-    ; Verified via objdump -dr. Same for every boot_* expression below - do NOT replace with hardcoded phys.
-    mov edx, boot_pml4 - 0xC0000000
-    mov eax, boot_pdpt - 0xC0000000
-    or eax, 3                   ; present + rw
-    mov [edx], eax              ; PML4[0] -> PDPT
-    mov edx, boot_pdpt - 0xC0000000
-    mov eax, boot_pdlo - 0xC0000000
-    or eax, 3
-    mov [edx], eax              ; PDPT[0] -> identity PD
-    mov eax, boot_pdhi - 0xC0000000
-    or eax, 3
-    mov [edx + 3*8], eax        ; PDPT[3] -> high PD
-    mov edx, boot_pdlo - 0xC0000000
-    mov esi, boot_pdhi - 0xC0000000
-    mov ecx, 0
+    ; .boottab is nobits: GRUB does not promise to clear it.
+    mov edi, boot_pml4
+    mov ecx, (4096 * 7) / 4
+    xor eax, eax
+    cld
+    rep stosd
+
+    mov eax, boot_pdpt_lo + 3
+    mov [boot_pml4], eax                    ; identity
+    mov [boot_pml4 + 256 * 8], eax          ; direct map
+    mov eax, boot_pdpt_hi + 3
+    mov [boot_pml4 + 511 * 8], eax          ; kernel image
+    mov eax, boot_pd + 3
+    mov [boot_pdpt_hi + 510 * 8], eax       ; 0xFFFFFFFF80000000 = the first GB
+    xor ecx, ecx
+.fill_pdpt:
+    mov eax, ecx
+    shl eax, 12
+    add eax, boot_pd + 3
+    mov [boot_pdpt_lo + ecx * 8], eax
+    inc ecx
+    cmp ecx, 4
+    jb .fill_pdpt
+    xor ecx, ecx
 .fill_pd:
     mov eax, ecx
     shl eax, 21
-    or eax, 0x83                ; present + rw + PS (2MB)
-    mov [edx + ecx*8], eax
-    mov [esi + ecx*8], eax
+    or eax, 0x83                            ; present, writable, 2 MB
+    cmp ecx, 512 * 3
+    jb .cached
+    or eax, 0x18                            ; PWT + PCD: the last GB holds device registers
+.cached:
+    mov [boot_pd + ecx * 8], eax
     inc ecx
-    cmp ecx, 32
-    jl .fill_pd
+    cmp ecx, 512 * 4
+    jb .fill_pd
 
-    ; Long mode: PAE, then EFER.LME, then paging (which makes the CPU active in IA-32e mode).
     mov eax, cr4
     or eax, 0x20                ; CR4.PAE
     mov cr4, eax
@@ -181,54 +137,56 @@ _start:
     rdmsr
     or eax, 0x100               ; LME
     wrmsr
-    mov eax, boot_pml4 - 0xC0000000
+    mov eax, boot_pml4
     mov cr3, eax
     mov eax, cr0
     or eax, 0x80000000
-    mov cr0, eax                ; PG: from here on the CPU is in long mode, running our 32-bit code as compatibility mode
+    mov cr0, eax                ; paging on: the CPU is in long mode, this code runs in compatibility mode under GRUB's CS
 
-    ; Load OUR boot GDT (flat 0x08/0x10) before the far jump: GRUB's 0x08 is
-    ; invalid (GDB: CS=0x10 at entry), so `jmp 0x08:.high' GP-faults against
-    ; GRUB's tables. boot_gdtr.base is LINKED high - fix to phys first.
-    mov eax, boot_gdtr - 0xC0000000
-    mov edx, boot_gdt - 0xC0000000
-    mov [eax + 2], edx
-    lgdt [eax]
-    ; Reload data segments to our 0x10 (code follows via the far jump)
+    pop esi                     ; multiboot magic
+    pop edi                     ; multiboot info
+    lgdt [boot_gdtr]
+    jmp 0x08:lm64
+
+bits 64
+lm64:
     mov ax, 0x10
     mov ds, ax
     mov es, ax
+    mov ss, ax
+    xor eax, eax
     mov fs, ax
     mov gs, ax
-    mov ss, ax
+    mov rax, _start_high
+    jmp rax
 
-    pop eax                     ; multiboot magic
-    pop ebx                     ; phys multiboot pointer
-    mov edi, ebx
+align 8
+boot_gdt:
+    dq 0x0000000000000000        ; null
+    dq 0x00AF9A000000FFFF        ; 0x08: code, 64-bit
+    dq 0x00CF92000000FFFF        ; 0x10: data
+boot_gdtr:
+    dw boot_gdtr - boot_gdt - 1
+    dq boot_gdt
 
-    ; Far jump to the HIGH kernel (validates against our boot GDT now).
-    ; Target is _start_high (HIGH VMA in .text) - LD resolves the relocation.
-    jmp 0x08:_start_high
-
-; HIGH ENTRY (VMA high in .text): runs with paging ON via the boot PD high window.
-; Fixes ESP to the high stack_top and calls kernel_main(mboot_phys).
 section .text
+bits 64
+; First code at the linked address: edi = multiboot info (phys), esi = multiboot magic; the upper halves are zero.
 global _start_high
 _start_high:
-    ; Now running HIGH: fix ESP to the high stack_top, call kernel_main.
-    ; NASM resolves stack_top/kernel_main to high linked addrs — correct now.
-    ; The phys stack page is the same (identity + high windows alias it).
-    ; edi = multiboot pointer: the LOW trampoline sets it from ebx before the
-    ; far jump, but the TEXT build enters here DIRECTLY from GRUB (ENTRY
-    ; _start_high — the trampoline's phys math is high-link-only), so take it
-    ; from ebx fresh. Harmless no-op on the desktop path (edi == ebx there).
-    mov edi, ebx
-    mov esp, stack_top
-    push eax                ; multiboot magic (1st push = [esp+8], unused)
-    push edi                ; phys multiboot pointer (2nd push = [esp+4])
+    mov rsp, stack_top
+    xor ebp, ebp
     call kernel_main
-
     cli
 .hang:
     hlt
     jmp .hang
+
+; The boot stack, on which the main loop runs for good.
+section .bss
+align 16
+stack_bottom:
+    resb 524288
+stack_top:
+
+section .note.GNU-stack noalloc noexec nowrite progbits

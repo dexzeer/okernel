@@ -1,3 +1,4 @@
+#include "paging.h"
 #include "lapic.h"
 #include "io.h"
 #include "serial.h"
@@ -26,7 +27,7 @@
 
 #define LVT_MASKED 0x00010000u
 
-static volatile uint32_t* mmio;     // xAPIC window (identity-mapped uncached by paging_init)
+static volatile uint32_t* mmio;     // xAPIC window
 static int x2;
 static int ready;
 static int want_x2;     // switch the CPUs to x2APIC mode (needed for APIC ids above 254)
@@ -97,7 +98,7 @@ int lapic_init(int bsp) {
         base = rdmsr(MSR_APIC_BASE);
     }
     x2 = (base & APIC_BASE_X2) ? 1 : 0;
-    if (!x2) mmio = (volatile uint32_t*)((uint32_t)base & 0xFFFFF000u);
+    if (!x2) mmio = (volatile uint32_t*)paging_map_mmio(base & 0xFFFFFFFFFFFFF000ull, 4096);
 
     // Software-enable and set the spurious vector; accept every priority.
     wr(R_SVR, 0x100 | LAPIC_VEC_SPUR);

@@ -102,7 +102,7 @@ int acpi_phys_read(uint32_t phys, void* dst, uint32_t len) {
         const uint8_t* src;
         if (phys < 0x08000000u) {
             if (chunk > 0x08000000u - phys) chunk = 0x08000000u - phys;
-            src = (const uint8_t*)P2V_U32(phys);
+            src = (const uint8_t*)P2V_ADDR(phys);
         } else {
             uint32_t room = 0x00400000u - (phys & 0x003FFFFFu);
             if (chunk > room) chunk = room;

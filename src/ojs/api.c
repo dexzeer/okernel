@@ -291,13 +291,54 @@ ojsv ojs_own_keys(ojs* J, ojsv obj) {
 
 // ---------------------------------------------------------------- functions
 
+// A native keeps an int `magic` next to its C function, too small for a pointer: host functions are numbered here, and the number is the magic.
+// Host functions are static code, so the table only ever holds a few hundred entries and is never shrunk; a hash keeps registration O(1).
+static ojs_cfunc* host_fn;
+static int host_nfn, host_capfn;
+static int* host_idx;
+static int host_idxsize;
+
+static uint32_t host_hash(ojs_cfunc fn) { uint64_t a = (uint64_t)(uintptr_t)fn; return (uint32_t)((a ^ (a >> 29)) * 2654435761u); }
+
+static int host_number(ojs_cfunc fn) {
+    if (host_idxsize) {
+        for (uint32_t i = host_hash(fn) & (uint32_t)(host_idxsize - 1);; i = (i + 1) & (uint32_t)(host_idxsize - 1)) {
+            if (host_idx[i] < 0) break;
+            if (host_fn[host_idx[i]] == fn) return host_idx[i];
+        }
+    }
+    if (host_nfn == host_capfn) {
+        int nc = host_capfn ? host_capfn * 2 : 256;
+        ojs_cfunc* t = (ojs_cfunc*)ojs_sys_realloc(host_fn, (size_t)nc * sizeof(ojs_cfunc));
+        int* ix = (int*)ojs_sys_malloc((size_t)nc * 2 * sizeof(int));
+        if (!t || !ix) { if (t) host_fn = t; ojs_sys_free(ix); return -1; }
+        host_fn = t;
+        host_capfn = nc;
+        ojs_sys_free(host_idx);
+        host_idx = ix;
+        host_idxsize = nc * 2;
+        for (int i = 0; i < host_idxsize; i++) host_idx[i] = -1;
+        for (int n = 0; n < host_nfn; n++) {
+            uint32_t i = host_hash(host_fn[n]) & (uint32_t)(host_idxsize - 1);
+            while (host_idx[i] >= 0) i = (i + 1) & (uint32_t)(host_idxsize - 1);
+            host_idx[i] = n;
+        }
+    }
+    uint32_t i = host_hash(fn) & (uint32_t)(host_idxsize - 1);
+    while (host_idx[i] >= 0) i = (i + 1) & (uint32_t)(host_idxsize - 1);
+    host_idx[i] = host_nfn;
+    host_fn[host_nfn] = fn;
+    return host_nfn++;
+}
+
 static jv host_trampoline(ojs* J, jv this_v, int argc, jv* argv, int magic) {
-    ojs_cfunc fn = (ojs_cfunc)(uintptr_t)(uint32_t)magic;
-    return fn(J, this_v, argc, argv);
+    return host_fn[magic](J, this_v, argc, argv);
 }
 
 ojsv ojs_function(ojs* J, ojs_cfunc fn, const char* name, int length) {
-    struct obj* f = new_native(J, host_trampoline, name, length, (int)(uint32_t)(uintptr_t)fn);
+    int num = host_number(fn);
+    if (num < 0) return JV_EXC;
+    struct obj* f = new_native(J, host_trampoline, name, length, num);
     return f ? jv_from_obj(f) : JV_EXC;
 }
 

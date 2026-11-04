@@ -2,8 +2,7 @@
 rem Boot KAnarchy OS (desktop ISO) in Windows QEMU.
 rem
 rem Uses the Windows Hypervisor Platform (WHPX) for near-native CPU speed:
-rem the 32-bit kernel boots fine in qemu-system-x86_64, which (unlike the
-rem i386 build) has the whpx accelerator. If WHPX is unavailable, QEMU falls
+rem the kernel is x86-64 (qemu-system-x86_64). If WHPX is unavailable, QEMU falls
 rem back to software emulation (TCG) automatically. To enable WHPX: Windows
 rem Features -> "Windows Hypervisor Platform", then reboot.
 rem

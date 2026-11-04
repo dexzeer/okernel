@@ -32,7 +32,7 @@ int sys_proc_term_win(void);
 // sbrk (user heap), wait/kill (zombies + signals).
 int sys_proc_fork(void);
 int sys_proc_exec(const char *path);
-uint32_t sys_proc_sbrk(uint32_t inc);
+uint64_t sys_proc_sbrk(uint64_t inc);
 int sys_proc_wait(int pid);
 // Blocking wait for kernel-thread callers only (never trap context).
 int sys_proc_wait_blocking(int pid);
@@ -55,8 +55,8 @@ void sys_proc_reparent_to_init(uint32_t dead_pid);
 int sys_proc_kill(int pid, int signo);
 
 // Anonymous user mapping (fresh zero page at virt, or auto-pick) + unmap.
-uint32_t sys_proc_mmap_anon(uint32_t virt);
-void sys_proc_munmap(uint32_t virt);
+uint64_t sys_proc_mmap_anon(uint64_t virt);
+void sys_proc_munmap(uint64_t virt);
 
 // Pipes: pipe(), dup(), and the shared open-file refcounting.
 int sys_proc_pipe(int *fds);

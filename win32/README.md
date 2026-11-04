@@ -25,7 +25,8 @@ useful when a real click or drag does nothing.
 ## Toolchain
 
 32-bit is not a preference: `crypto/rand.c` uses `rdtsc` with `"=A"`,
-`wcommon.h` inlines `divl`, and the host build of the engine is `-m32`. GNU C is
+`wcommon.h` inlines `divl`, and this toolchain is the i686 one (the kernel and the host builds are x86-64; on 32-bit the JS engine has no
+JIT and runs in its interpreter). GNU C is
 required (computed goto in ojs, `__attribute__((packed))`, inline asm).
 
 ```sh

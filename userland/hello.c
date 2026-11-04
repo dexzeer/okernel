@@ -7,16 +7,13 @@
 
 #include "usys.h"
 
-void _start(void) {
-    // Read argc/argv from the kernel-built stack. NOTE: this prologue
-    // (push ebp/mov esp,ebp + pushes) shifts ESP by 16, so read the entry
-    // ESP back from EBP (entry ESP == EBP after `mov esp,ebp`): ESP_at_entry
-    // -> [argc][argv][envp]. Do NOT use a live ESP read (it points 16+ bytes
-    // into our own frame — the classic argc=0 bug).
-    int argc;
-    char **argv;
-    __asm__ volatile("mov %%ebp, %%eax; mov (%%eax), %%ecx; mov 4(%%eax), %%edx"
-                     : "=c"(argc), "=d"(argv) : : "eax", "memory");
+// The entry stack is [argc][argv][envp] (the kernel's ELF spawn): _start hands that RSP to hmain, so no guess about what the compiler's
+// prologue pushed.
+__asm__(".globl _start\n_start:\n    mov %rsp, %rdi\n    call hmain\n");
+
+void hmain(long *sp) {
+    int argc = (int)sp[0];
+    char **argv = (char **)sp[1];
     usys_print("hello from userland");
     {
         // write(1, "pid=", ...) — tiny itoa inline (no libc).

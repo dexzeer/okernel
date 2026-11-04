@@ -1,5 +1,5 @@
 // IDCT accuracy vs the T.81 definition evaluated in double precision.
-//   gcc -m32 -O2 -Isrc -Itests/web -o build-host/t_idct tests/web/test_idct.c -lm
+//   gcc -m64 -O2 -Isrc -Itests/web -o build-host/t_idct tests/web/test_idct.c -lm
 // Includes image.c to reach the static idct_block(). Random blocks at
 // several coefficient magnitudes (sparse like real JPEGs, and dense); the
 // reference is rounded and clamped like the decoder. Expect |err| <= 1.

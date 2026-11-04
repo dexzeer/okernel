@@ -1,3 +1,4 @@
+#include "memlayout.h"
 #include "prof.h"
 #include "serial.h"
 
@@ -14,27 +15,27 @@ extern uint32_t tick_count;
 volatile uint32_t stall_beat;
 volatile int stall_halted;
 #define STALL_SLOTS 48
-struct stall_ent { uint32_t eip, w0, w1, n; };
+struct stall_ent { uint32_t rip, w0, w1, n; };
 static struct stall_ent stall_tab[STALL_SLOTS];
 static uint32_t stall_total, stall_t0;
 
-void stall_sample(uint32_t eip, uint32_t cs, uint32_t esp) {
+void stall_sample(uint64_t trap_rip, uint32_t cs, uint64_t rsp) {
     if (!prof_on || stall_halted || (uint32_t)(tick_count - stall_beat) < 10) return;
-    if (cs != 0x08) eip = 0;                                  // ring 3: no address worth keeping
+    uint32_t rip = cs == 0x08 ? (uint32_t)(trap_rip - KERNEL_VBASE) : 0;   // image offsets (stallsym.py); ring 3: no address worth keeping
     if (!stall_total) stall_t0 = stall_beat;
     stall_total++;
     // who called a leaf function (memset, memcpy): code addresses found near the top of the stack
     uint32_t w0 = 0, w1 = 0;
-    if (esp >= 0xC0000000u && esp < 0xFFFFF000u) {                  // the first two words of the top of the stack that look like kernel code addresses
+    if (cs == 0x08) {                                               // the first two words of the top of the stack that look like kernel code addresses
         for (int i = 0; i < 12; i++) {
-            uint32_t w = ((const volatile uint32_t*)esp)[i];
-            if (w < 0xC0100000u || w >= 0xC0900000u) continue;
-            if (!w0) w0 = w; else { w1 = w; break; }
+            uint64_t w = ((const volatile uint64_t*)rsp)[i];
+            if (w < KERNEL_VBASE + 0x100000u || w >= KERNEL_VBASE + 0x4000000u) continue;
+            if (!w0) w0 = (uint32_t)(w - KERNEL_VBASE); else { w1 = (uint32_t)(w - KERNEL_VBASE); break; }
         }
     }
     for (int i = 0; i < STALL_SLOTS; i++) {
-        if (stall_tab[i].n && stall_tab[i].eip == eip && stall_tab[i].w0 == w0) { stall_tab[i].n++; return; }
-        if (!stall_tab[i].n) { stall_tab[i].eip = eip; stall_tab[i].w0 = w0; stall_tab[i].w1 = w1; stall_tab[i].n = 1; return; }
+        if (stall_tab[i].n && stall_tab[i].rip == rip && stall_tab[i].w0 == w0) { stall_tab[i].n++; return; }
+        if (!stall_tab[i].n) { stall_tab[i].rip = rip; stall_tab[i].w0 = w0; stall_tab[i].w1 = w1; stall_tab[i].n = 1; return; }
     }
 }
 
@@ -51,7 +52,7 @@ void stall_report(void) {
     }
     stall_total = 0;
     serial_printf("[stall] %u ms (%u samples) since tick %u:", (tick_count - t0) * 10, total, t0);
-    for (int k = 0; k < 6 && top[k].n; k++) serial_printf(" %x<%x,%x>*%u", top[k].eip, top[k].w0, top[k].w1, top[k].n);
+    for (int k = 0; k < 6 && top[k].n; k++) serial_printf(" %x<%x,%x>*%u", top[k].rip, top[k].w0, top[k].w1, top[k].n);
     serial_puts("\n");
 }
 

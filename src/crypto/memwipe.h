@@ -16,7 +16,7 @@
 // builds (which link libc, not string.c) get it with zero link impact;
 // -O2 inlines it in the kernel. Assembly-verified 2026-09-12: inlines to
 // per-byte movb stores under the real kernel flags (-O2 -fno-pic
-// -fno-pie -mno-red-zone -m32); never a memset call, never elided.
+// -fno-pie -mno-red-zone -m64); never a memset call, never elided.
 static inline void secure_zero(void* p, unsigned int n) {
     volatile unsigned char* v = (volatile unsigned char*)p;
     while (n--) *v++ = 0;

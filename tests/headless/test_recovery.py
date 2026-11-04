@@ -77,7 +77,7 @@ try:
     check("[part] 4 partitions" in log, "recovery sees the partitions")
     check(not re.search(r"next_entry=[^\s#]", grubenv()), "GRUB cleared the one-shot entry")
     m = re.search(r"\[recovery\] crash window close (\d+),(\d+)", log)
-    check(m and "invalid opcode\n  syscall_handler+0x" in log and "You're on your own now." in log,
+    check(m and "invalid opcode\n  syscall_handler+0x" in log and "you're on your own now." in log,
           "crash window: cause, function, message")
     vm.mon(f"screendump {okvm.OUTDIR}/rec_crashwin.ppm", 1.0)
     n = log.count("[recovery] done")

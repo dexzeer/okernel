@@ -20,6 +20,21 @@ int devlog_fmt(char* out, int cap, const char* fmt, va_list ap) {
         while (*p >= '0' && *p <= '9') { width = width * 10 + (*p - '0'); p++; }
         char c = *p;
         if (!c) break;
+        if (c == 'l' || c == 'p') {                     // 64-bit values: %lx %lu %ld %p
+            if (c == 'l') { while (*p == 'l') p++; c = *p; if (!c) break; } else c = 'x';
+            uint64_t v = va_arg(ap, uint64_t);
+            int neg = 0;
+            if (c == 'd' && (int64_t)v < 0) { neg = 1; v = (uint64_t)-(int64_t)v; }
+            uint64_t base = c == 'x' ? 16 : 10;
+            char t[24];
+            int k = 0;
+            if (!v) t[k++] = '0';
+            while (v) { t[k++] = "0123456789abcdef"[v % base]; v /= base; }
+            if (neg && o < end) *o++ = '-';
+            for (int i = k; i < width && o < end; i++) *o++ = zero ? '0' : ' ';
+            while (k && o < end) *o++ = t[--k];
+            continue;
+        }
         if (c == 's') {
             const char* s = va_arg(ap, const char*);
             while (s && *s && o < end) *o++ = *s++;

@@ -1,8 +1,8 @@
 // jit.c — the baseline compiler (see jit.h). Included by vm.c: it shares the interpreter's helpers and the frame layout.
 //
-// Registers in compiled code:  ebx = f->locals (the operand stack follows the locals: slot k is [ebx + 8k]), esi = J, edi = f,
-// ebp = the C frame. eax/ecx/edx are scratch. The C frame has 32 bytes of outgoing arguments at [esp] and a result slot for
-// jit_step at [esp+32].
+// Registers in compiled code:  rbx = f->locals (the operand stack follows the locals: slot k is [rbx + 8k]), r12 = J, r13 = f,
+// rbp = the C frame. rax/rcx/rdx/rsi/rdi/r8/r9 are scratch. The C frame has a result slot for jit_step at [rsp], and rsp stays
+// 16-byte aligned, so C can be called at any point.
 //
 // Every value is a jv in the frame; nothing lives in a register across instructions. Instructions this file translates have a fast path
 // that handles the common types inline; if a guard fails (or the instruction is not translated at all) the instruction is executed by
@@ -491,12 +491,13 @@ int jit_depth_at(struct ftempl* t, uint32_t pc_off) {
 
 // ---------------------------------------------------------------- the assembler
 
-enum { EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI };
+enum { RAX, RCX, RDX, RBX, RSP, RBP, RSI, RDI, R8, R9, R10, R11, R12, R13, R14, R15 };
 enum { CC_O, CC_NO, CC_B, CC_AE, CC_E, CC_NE, CC_BE, CC_A, CC_S, CC_NS, CC_P, CC_NP, CC_L, CC_GE, CC_LE, CC_G };
-#define NOBASE (-1)
+#define RJ R12          // J
+#define RF R13          // f
+#define RSCRATCH RSI    // an address constant between two uses (nothing passes through it)
 
 struct label_ref { uint32_t pos; uint32_t lab; };
-struct call_ref { uint32_t pos; const void* fn; };
 
 struct cg {
     ojs* J;
@@ -507,8 +508,6 @@ struct cg {
     int fail;
     uint32_t* lab; uint32_t nlab, caplab;                 // label positions (~0: not bound)
     struct label_ref* rel; uint32_t nrel, caprel;         // rel32 -> label
-    struct label_ref* abs; uint32_t nabs, capabs;         // abs32 -> label (rebased)
-    struct call_ref* calls; uint32_t ncalls, capcalls;    // rel32 -> C function
     uint32_t* stub;                                       // per ordinal: label of its stub (0 none)
     uint8_t* skind;                                       // and what the stub does first: 0 nothing, 1 the cached get, 2 the cached put
     uint32_t* stub_list; uint32_t nstub;
@@ -526,6 +525,7 @@ static void em8(struct cg* c, uint32_t v) {
     c->b[c->n++] = (uint8_t)v;
 }
 static void em32(struct cg* c, uint32_t v) { em8(c, v); em8(c, v >> 8); em8(c, v >> 16); em8(c, v >> 24); }
+static void em64(struct cg* c, uint64_t v) { em32(c, (uint32_t)v); em32(c, (uint32_t)(v >> 32)); }
 
 static uint32_t new_label(struct cg* c) {
     if (c->nlab == c->caplab) {
@@ -539,117 +539,151 @@ static uint32_t new_label(struct cg* c) {
 }
 static void bind(struct cg* c, uint32_t l) { c->lab[l] = c->n; }
 
-#define PUSH_REF(arr, narr, cap, T, ...) do { \
-        if (c->narr == c->cap) { \
-            uint32_t nc_ = c->cap ? c->cap * 2 : 256; \
-            T* nr_ = (T*)ojs_sys_realloc(c->arr, nc_ * sizeof(T)); \
-            if (!nr_) { c->fail = 1; return; } \
-            c->arr = nr_; c->cap = nc_; \
-        } \
-        c->arr[c->narr++] = (T){ __VA_ARGS__ }; \
-    } while (0)
+static void rel32_to(struct cg* c, uint32_t lab) {
+    if (c->nrel == c->caprel) {
+        uint32_t nc = c->caprel ? c->caprel * 2 : 256;
+        struct label_ref* nr = (struct label_ref*)ojs_sys_realloc(c->rel, nc * sizeof(struct label_ref));
+        if (!nr) { c->fail = 1; return; }
+        c->rel = nr; c->caprel = nc;
+    }
+    c->rel[c->nrel++] = (struct label_ref){ c->n, lab };
+    em32(c, 0);
+}
 
-static void rel32_to(struct cg* c, uint32_t lab) { PUSH_REF(rel, nrel, caprel, struct label_ref, c->n, lab); em32(c, 0); }
-static void abs32_of(struct cg* c, uint32_t lab) { PUSH_REF(abs, nabs, capabs, struct label_ref, c->n, lab); em32(c, 0); }
+// REX prefix: w = 64-bit operand, reg / index / base = the registers the instruction names (their high bit goes here)
+static void rex(struct cg* c, int w, int reg, int index, int base) {
+    int b = 0x40 | (w ? 8 : 0) | ((reg >> 3) << 2) | ((index >> 3) << 1) | (base >> 3);
+    if (b != 0x40) em8(c, (uint32_t)b);
+}
 
-// ModRM for [base + disp] (NOBASE: [disp32])
+// ModRM for [base + disp]. rsp/r12 need a SIB byte, rbp/r13 cannot go without a displacement.
 static void mrm(struct cg* c, int reg, int base, int32_t disp) {
-    if (base == NOBASE) { em8(c, (reg << 3) | 5); em32(c, (uint32_t)disp); return; }
-    int mod = (disp == 0 && base != EBP) ? 0 : (disp >= -128 && disp <= 127) ? 1 : 2;
-    em8(c, (mod << 6) | (reg << 3) | (base == ESP ? 4 : base));
-    if (base == ESP) em8(c, 0x24);
+    int mod = (disp == 0 && (base & 7) != RBP) ? 0 : (disp >= -128 && disp <= 127) ? 1 : 2;
+    em8(c, (uint32_t)((mod << 6) | ((reg & 7) << 3) | ((base & 7) == RSP ? 4 : (base & 7))));
+    if ((base & 7) == RSP) em8(c, 0x24);
     if (mod == 1) em8(c, (uint32_t)disp);
     else if (mod == 2) em32(c, (uint32_t)disp);
 }
-static void mov_rm(struct cg* c, int r, int base, int32_t d) { em8(c, 0x8B); mrm(c, r, base, d); }      // mov r, [m]
-static void mov_mr(struct cg* c, int base, int32_t d, int r) { em8(c, 0x89); mrm(c, r, base, d); }      // mov [m], r
-static void mov_ri(struct cg* c, int r, uint32_t imm) { em8(c, 0xB8 + r); em32(c, imm); }
-static void mov_mi(struct cg* c, int base, int32_t d, uint32_t imm) { em8(c, 0xC7); mrm(c, 0, base, d); em32(c, imm); }
-static void mov_rr(struct cg* c, int dst, int src) { em8(c, 0x89); em8(c, 0xC0 | (src << 3) | dst); }
+// [base + index*8 + disp]
+static void mrm_idx8(struct cg* c, int reg, int base, int index, int32_t disp) {
+    int mod = (disp == 0 && (base & 7) != RBP) ? 0 : (disp >= -128 && disp <= 127) ? 1 : 2;
+    em8(c, (uint32_t)((mod << 6) | ((reg & 7) << 3) | 4));
+    em8(c, (uint32_t)((3 << 6) | ((index & 7) << 3) | (base & 7)));
+    if (mod == 1) em8(c, (uint32_t)disp); else if (mod == 2) em32(c, (uint32_t)disp);
+}
+
+// 32-bit operands
+static void mov_rm(struct cg* c, int r, int base, int32_t d) { rex(c, 0, r, 0, base); em8(c, 0x8B); mrm(c, r, base, d); }      // mov r32, [m]
+static void mov_mr(struct cg* c, int base, int32_t d, int r) { rex(c, 0, r, 0, base); em8(c, 0x89); mrm(c, r, base, d); }      // mov [m], r32
+static void mov_ri(struct cg* c, int r, uint32_t imm) { rex(c, 0, 0, 0, r); em8(c, 0xB8 + (uint32_t)(r & 7)); em32(c, imm); }  // zero-extends
+static void mov_mi(struct cg* c, int base, int32_t d, uint32_t imm) { rex(c, 0, 0, 0, base); em8(c, 0xC7); mrm(c, 0, base, d); em32(c, imm); }
 // ALU r, [m]: 0x03 add, 0x0B or, 0x23 and, 0x2B sub, 0x33 xor, 0x3B cmp
-static void alu_rm(struct cg* c, int opc, int r, int base, int32_t d) { em8(c, opc); mrm(c, r, base, d); }
+static void alu_rm(struct cg* c, int opc, int r, int base, int32_t d) { rex(c, 0, r, 0, base); em8(c, (uint32_t)opc); mrm(c, r, base, d); }
 // ALU with an immediate: n = 0 add, 1 or, 4 and, 5 sub, 6 xor, 7 cmp
 static void alu_ri(struct cg* c, int n, int r, int32_t imm) {
-    if (imm >= -128 && imm <= 127) { em8(c, 0x83); em8(c, 0xC0 | (n << 3) | r); em8(c, (uint32_t)imm); }
-    else { em8(c, 0x81); em8(c, 0xC0 | (n << 3) | r); em32(c, (uint32_t)imm); }
+    rex(c, 0, 0, 0, r);
+    if (imm >= -128 && imm <= 127) { em8(c, 0x83); em8(c, (uint32_t)(0xC0 | (n << 3) | (r & 7))); em8(c, (uint32_t)imm); }
+    else { em8(c, 0x81); em8(c, (uint32_t)(0xC0 | (n << 3) | (r & 7))); em32(c, (uint32_t)imm); }
 }
 static void alu_mi(struct cg* c, int n, int base, int32_t d, int32_t imm) {
+    rex(c, 0, 0, 0, base);
     if (imm >= -128 && imm <= 127) { em8(c, 0x83); mrm(c, n, base, d); em8(c, (uint32_t)imm); }
     else { em8(c, 0x81); mrm(c, n, base, d); em32(c, (uint32_t)imm); }
 }
-static void test_rr(struct cg* c, int a, int b) { em8(c, 0x85); em8(c, 0xC0 | (b << 3) | a); }
-static void lea(struct cg* c, int r, int base, int32_t d) { em8(c, 0x8D); mrm(c, r, base, d); }
-static void jcc(struct cg* c, int cc, uint32_t lab) { em8(c, 0x0F); em8(c, 0x80 + cc); rel32_to(c, lab); }
-static void jmp(struct cg* c, uint32_t lab) { em8(c, 0xE9); rel32_to(c, lab); }
-static void jmp_r(struct cg* c, int r) { em8(c, 0xFF); em8(c, 0xE0 | r); }
-static void call_c(struct cg* c, const void* fn) { em8(c, 0xE8); PUSH_REF(calls, ncalls, capcalls, struct call_ref, c->n, fn); em32(c, 0); }
-static void setcc(struct cg* c, int cc, int r8) { em8(c, 0x0F); em8(c, 0x90 + cc); em8(c, 0xC0 | r8); }
-static void movzx8(struct cg* c, int dst, int src8) { em8(c, 0x0F); em8(c, 0xB6); em8(c, 0xC0 | (dst << 3) | src8); }
-static void shift_cl(struct cg* c, int n, int r) { em8(c, 0xD3); em8(c, 0xC0 | (n << 3) | r); }        // 4 shl, 5 shr, 7 sar
-static void unary(struct cg* c, int n, int r) { em8(c, 0xF7); em8(c, 0xC0 | (n << 3) | r); }            // 2 not, 3 neg, 6 div, 7 idiv
-static void imul_rm(struct cg* c, int r, int base, int32_t d) { em8(c, 0x0F); em8(c, 0xAF); mrm(c, r, base, d); }
-static void ret(struct cg* c) { em8(c, 0xC3); }
-// [base + index*8 + disp] (SIB)
-static void mrm_idx8(struct cg* c, int reg, int base, int index, int32_t disp) {
-    int mod = (disp == 0 && base != EBP) ? 0 : (disp >= -128 && disp <= 127) ? 1 : 2;
-    em8(c, (mod << 6) | (reg << 3) | 4);
-    em8(c, (3 << 6) | (index << 3) | base);
-    if (mod == 1) em8(c, (uint32_t)disp); else if (mod == 2) em32(c, (uint32_t)disp);
-}
-static void mov_rx(struct cg* c, int r, int base, int index, int32_t d) { em8(c, 0x8B); mrm_idx8(c, r, base, index, d); }   // mov r, [base+index*8+d]
-static void mov_xr(struct cg* c, int base, int index, int32_t d, int r) { em8(c, 0x89); mrm_idx8(c, r, base, index, d); }
-static void lea_x(struct cg* c, int r, int base, int index, int32_t d) { em8(c, 0x8D); mrm_idx8(c, r, base, index, d); }
-static void cmpw_mi(struct cg* c, int base, int32_t d, uint32_t imm) { em8(c, 0x66); em8(c, 0x81); mrm(c, 7, base, d); em8(c, imm); em8(c, imm >> 8); }
-static void test_mi(struct cg* c, int base, int32_t d, uint32_t imm) { em8(c, 0xF7); mrm(c, 0, base, d); em32(c, imm); }
+static void test_rr(struct cg* c, int a, int b) { rex(c, 0, b, 0, a); em8(c, 0x85); em8(c, (uint32_t)(0xC0 | ((b & 7) << 3) | (a & 7))); }
+static void setcc(struct cg* c, int cc, int r8) { em8(c, 0x0F); em8(c, 0x90 + (uint32_t)cc); em8(c, 0xC0 | (uint32_t)r8); }    // al, cl, dl, bl only
+static void movzx8(struct cg* c, int dst, int src8) { em8(c, 0x0F); em8(c, 0xB6); em8(c, (uint32_t)(0xC0 | (dst << 3) | src8)); }
+static void movzx16_rm(struct cg* c, int r, int base, int32_t d) { rex(c, 0, r, 0, base); em8(c, 0x0F); em8(c, 0xB7); mrm(c, r, base, d); }
+static void shift_cl(struct cg* c, int n, int r) { em8(c, 0xD3); em8(c, (uint32_t)(0xC0 | (n << 3) | r)); }        // 4 shl, 5 shr, 7 sar
+static void unary(struct cg* c, int n, int r) { em8(c, 0xF7); em8(c, (uint32_t)(0xC0 | (n << 3) | r)); }            // 2 not, 3 neg, 6 div, 7 idiv
+static void imul_rm(struct cg* c, int r, int base, int32_t d) { rex(c, 0, r, 0, base); em8(c, 0x0F); em8(c, 0xAF); mrm(c, r, base, d); }
+static void cmpw_mi(struct cg* c, int base, int32_t d, uint32_t imm) { em8(c, 0x66); rex(c, 0, 0, 0, base); em8(c, 0x81); mrm(c, 7, base, d); em8(c, imm); em8(c, imm >> 8); }
+static void test_mi(struct cg* c, int base, int32_t d, uint32_t imm) { rex(c, 0, 0, 0, base); em8(c, 0xF7); mrm(c, 0, base, d); em32(c, imm); }
+static void dec_m(struct cg* c, int base, int32_t d) { rex(c, 0, 0, 0, base); em8(c, 0xFF); mrm(c, 1, base, d); }
 
-#define SLOT_LO(k) EBX, (int32_t)(8 * (c->nl + (k)))
-#define SLOT_HI(k) EBX, (int32_t)(8 * (c->nl + (k)) + 4)
-#define LOC_LO(i)  EBX, (int32_t)(8 * (i))
-#define LOC_HI(i)  EBX, (int32_t)(8 * (i) + 4)
+// 64-bit operands
+static void mov64_rm(struct cg* c, int r, int base, int32_t d) { rex(c, 1, r, 0, base); em8(c, 0x8B); mrm(c, r, base, d); }
+static void mov64_mr(struct cg* c, int base, int32_t d, int r) { rex(c, 1, r, 0, base); em8(c, 0x89); mrm(c, r, base, d); }
+static void mov64_ri(struct cg* c, int r, uint64_t imm) { rex(c, 1, 0, 0, r); em8(c, 0xB8 + (uint32_t)(r & 7)); em64(c, imm); }
+static void mov64_rr(struct cg* c, int dst, int src) { rex(c, 1, src, 0, dst); em8(c, 0x89); em8(c, (uint32_t)(0xC0 | ((src & 7) << 3) | (dst & 7))); }
+static void cmp64_rm(struct cg* c, int r, int base, int32_t d) { rex(c, 1, r, 0, base); em8(c, 0x3B); mrm(c, r, base, d); }
+static void cmp64_rr(struct cg* c, int a, int b) { rex(c, 1, b, 0, a); em8(c, 0x39); em8(c, (uint32_t)(0xC0 | ((b & 7) << 3) | (a & 7))); }
+static void or64_rr(struct cg* c, int a, int b) { rex(c, 1, b, 0, a); em8(c, 0x09); em8(c, (uint32_t)(0xC0 | ((b & 7) << 3) | (a & 7))); }
+static void test64_rr(struct cg* c, int a, int b) { rex(c, 1, b, 0, a); em8(c, 0x85); em8(c, (uint32_t)(0xC0 | ((b & 7) << 3) | (a & 7))); }
+static void lea(struct cg* c, int r, int base, int32_t d) { rex(c, 1, r, 0, base); em8(c, 0x8D); mrm(c, r, base, d); }
+static void mov64_rx(struct cg* c, int r, int base, int index, int32_t d) { rex(c, 1, r, index, base); em8(c, 0x8B); mrm_idx8(c, r, base, index, d); }   // mov r, [base+index*8+d]
+static void mov64_xr(struct cg* c, int base, int index, int32_t d, int r) { rex(c, 1, r, index, base); em8(c, 0x89); mrm_idx8(c, r, base, index, d); }
+static void lea_x(struct cg* c, int r, int base, int index, int32_t d) { rex(c, 1, r, index, base); em8(c, 0x8D); mrm_idx8(c, r, base, index, d); }
+static void shift64_i(struct cg* c, int n, int r, int count) { rex(c, 1, 0, 0, r); em8(c, 0xC1); em8(c, (uint32_t)(0xC0 | (n << 3) | (r & 7))); em8(c, (uint32_t)count); }   // 4 shl, 5 shr, 7 sar
+static void lea_rip(struct cg* c, int r, uint32_t lab) { rex(c, 1, r, 0, 0); em8(c, 0x8D); em8(c, (uint32_t)(((r & 7) << 3) | 5)); rel32_to(c, lab); }
+
+static void jcc(struct cg* c, int cc, uint32_t lab) { em8(c, 0x0F); em8(c, 0x80 + (uint32_t)cc); rel32_to(c, lab); }
+static void jmp(struct cg* c, uint32_t lab) { em8(c, 0xE9); rel32_to(c, lab); }
+static void jmp_r(struct cg* c, int r) { rex(c, 0, 0, 0, r); em8(c, 0xFF); em8(c, (uint32_t)(0xE0 | (r & 7))); }
+static void ret(struct cg* c) { em8(c, 0xC3); }
+// C functions may be further than a rel32 from the code pool: the kernel's heap and image are terabytes apart.
+static void call_c(struct cg* c, const void* fn) { mov64_ri(c, RAX, (uint64_t)(uintptr_t)fn); em8(c, 0xFF); em8(c, 0xD0); }
+static void push64(struct cg* c, int r) { rex(c, 0, 0, 0, r); em8(c, 0x50 + (uint32_t)(r & 7)); }
+static void pop64(struct cg* c, int r) { rex(c, 0, 0, 0, r); em8(c, 0x58 + (uint32_t)(r & 7)); }
+
+#define SLOT_LO(k) RBX, (int32_t)(8 * (c->nl + (k)))
+#define SLOT_HI(k) RBX, (int32_t)(8 * (c->nl + (k)) + 4)
+#define SLOT_TAG(k) RBX, (int32_t)(8 * (c->nl + (k)) + 6)
+#define LOC_LO(i)  RBX, (int32_t)(8 * (i))
+#define LOC_HI(i)  RBX, (int32_t)(8 * (i) + 4)
 #define F_OFF(m) ((int32_t)offsetof(struct ojs_frame, m))
 #define J_OFF(m) ((int32_t)offsetof(struct ojs, m))
 
+// The upper dword of an int or a special value (their payload is 32 bits). A pointer's upper dword also holds address bits, so pointer tags
+// are compared as 16 bits (SLOT_TAG).
 #define V_INT     0xFFF90000u
 #define V_SPECIAL 0xFFFA0000u
-#define V_OBJ     0xFFFB0000u
-#define V_STR     0xFFFC0000u
-#define V_SYM     0xFFFD0000u
+#define T_OBJ     TAG_OBJ
+#define T_STR     TAG_STR
+#define T_SYM     TAG_SYM
 
-// copy a 64-bit slot: dst <- src (through ecx)
+// copy a 64-bit slot: dst <- src (through rcx)
 static void cpy(struct cg* c, int db, int32_t dd, int sb, int32_t sd) {
-    mov_rm(c, ECX, sb, sd);     mov_mr(c, db, dd, ECX);
-    mov_rm(c, ECX, sb, sd + 4); mov_mr(c, db, dd + 4, ECX);
+    mov64_rm(c, RCX, sb, sd); mov64_mr(c, db, dd, RCX);
 }
-#define CPY(dst, src) cpy(c, EBX, (int32_t)(8 * (dst)), EBX, (int32_t)(8 * (src)))   // slot indices (absolute in the block)
+#define CPY(dst, src) cpy(c, RBX, (int32_t)(8 * (dst)), RBX, (int32_t)(8 * (src)))   // slot indices (absolute in the block)
 #define ST(k) (c->nl + (uint32_t)(k))                                                 // absolute slot index of stack entry k
 
-static void load_slot(struct cg* c, int rlo, int rhi, uint32_t slot) {
-    mov_rm(c, rlo, EBX, (int32_t)(8 * slot)); mov_rm(c, rhi, EBX, (int32_t)(8 * slot + 4));
-}
-static void store_slot(struct cg* c, uint32_t slot, int rlo, int rhi) {
-    mov_mr(c, EBX, (int32_t)(8 * slot), rlo); mov_mr(c, EBX, (int32_t)(8 * slot + 4), rhi);
-}
+static void load_slot(struct cg* c, int r, uint32_t slot) { mov64_rm(c, r, RBX, (int32_t)(8 * slot)); }
+static void store_slot(struct cg* c, uint32_t slot, int r) { mov64_mr(c, RBX, (int32_t)(8 * slot), r); }
 static void push_const(struct cg* c, uint32_t slot, uint32_t lo, uint32_t hi) {
-    mov_mi(c, EBX, (int32_t)(8 * slot), lo); mov_mi(c, EBX, (int32_t)(8 * slot + 4), hi);
+    mov_mi(c, RBX, (int32_t)(8 * slot), lo); mov_mi(c, RBX, (int32_t)(8 * slot + 4), hi);
+}
+// the pointer in stack entry k: the low 48 bits, sign-extended (JV_PTR)
+static void load_ptr(struct cg* c, int r, int k) {
+    mov64_rm(c, r, SLOT_LO(k));
+    shift64_i(c, 4, r, 16);
+    shift64_i(c, 7, r, 16);
+}
+static void set_frame_pc(struct cg* c, const uint8_t* pc) {         // clobbers rax
+    mov64_ri(c, RAX, (uint64_t)(uintptr_t)pc);
+    mov64_mr(c, RF, F_OFF(pc), RAX);
+}
+static void set_frame_sp(struct cg* c, int d) {                     // clobbers rax
+    lea(c, RAX, RBX, (int32_t)(8 * (c->nl + (uint32_t)d)));
+    mov64_mr(c, RF, F_OFF(sp), RAX);
 }
 
 // ---- the step call: run the instruction at `ord` in the interpreter and continue wherever it says
 static void gen_step(struct cg* c, uint32_t ord, int d) {
     struct ftempl* t = c->t;
-    uint32_t pc = c->an.ord_pc[ord];
-    mov_mi(c, EDI, F_OFF(pc), (uint32_t)(uintptr_t)(t->code + pc));
-    lea(c, EAX, EBX, (int32_t)(8 * (c->nl + (uint32_t)d)));
-    mov_mr(c, EDI, F_OFF(sp), EAX);
-    mov_mr(c, ESP, 0, ESI);
-    mov_mr(c, ESP, 4, EDI);
-    em8(c, 0xC7); mrm(c, 0, ESP, 8); abs32_of(c, ord + 1);                         // resume: the next instruction
-    mov_mi(c, ESP, 12, (uint32_t)(uintptr_t)(t->code + c->an.ord_pc[ord + 1]));   // its pc
-    lea(c, EAX, ESP, 32); mov_mr(c, ESP, 16, EAX);
-    mov_mi(c, ESP, 20, 0);
+    set_frame_pc(c, t->code + c->an.ord_pc[ord]);
+    set_frame_sp(c, d);
+    mov64_rr(c, RDI, RJ);
+    mov64_rr(c, RSI, RF);
+    lea_rip(c, RDX, ord + 1);                                                       // resume: the next instruction
+    mov64_ri(c, RCX, (uint64_t)(uintptr_t)(t->code + c->an.ord_pc[ord + 1]));       // its pc
+    lea(c, R8, RSP, 0);                                                             // the result slot
+    mov_ri(c, R9, 0);
     call_c(c, (const void*)jit_step);
-    test_rr(c, EAX, EAX);
+    test64_rr(c, RAX, RAX);
     jcc(c, CC_E, c->L_fin);
-    jmp_r(c, EAX);
+    jmp_r(c, RAX);
 }
 
 // a label whose code runs instruction `ord` in the interpreter (emitted after the main body)
@@ -665,27 +699,24 @@ static uint32_t step_stub(struct cg* c, uint32_t ord) { return step_stub_k(c, or
 
 // call helper(J, t, ici, slot pointer) with the address of stack entry slot_k; the answer is in eax
 static void call_ic_helper(struct cg* c, const void* fn, uint32_t ici, int slot_k) {
-    mov_mr(c, ESP, 0, ESI);
-    mov_mi(c, ESP, 4, (uint32_t)(uintptr_t)c->t);
-    mov_mi(c, ESP, 8, ici);
-    lea(c, EAX, EBX, (int32_t)(8 * (c->nl + (uint32_t)slot_k)));
-    mov_mr(c, ESP, 12, EAX);
+    mov64_rr(c, RDI, RJ);
+    mov64_ri(c, RSI, (uint64_t)(uintptr_t)c->t);
+    mov_ri(c, RDX, ici);
+    lea(c, RCX, RBX, (int32_t)(8 * (c->nl + (uint32_t)slot_k)));
     call_c(c, fn);
 }
 
 // call one of the jit_h_* slow roads: f->pc = the next instruction, f->sp = the stack top before the instruction, `slot_k` = the lowest operand;
 // an exception (answer 0) goes to the unwinder
 static void call_op_helper(struct cg* c, uint32_t ord, int d, const void* fn, int slot_k, uint32_t arg) {
-    mov_mi(c, EDI, F_OFF(pc), (uint32_t)(uintptr_t)(c->t->code + c->an.ord_pc[ord + 1]));
-    lea(c, EAX, EBX, (int32_t)(8 * (c->nl + (uint32_t)d)));
-    mov_mr(c, EDI, F_OFF(sp), EAX);
-    mov_mr(c, ESP, 0, ESI);
-    mov_mr(c, ESP, 4, EDI);
-    lea(c, EAX, EBX, (int32_t)(8 * (c->nl + (uint32_t)slot_k)));
-    mov_mr(c, ESP, 8, EAX);
-    mov_mi(c, ESP, 12, arg);
+    set_frame_pc(c, c->t->code + c->an.ord_pc[ord + 1]);
+    set_frame_sp(c, d);
+    mov64_rr(c, RDI, RJ);
+    mov64_rr(c, RSI, RF);
+    lea(c, RDX, RBX, (int32_t)(8 * (c->nl + (uint32_t)slot_k)));
+    mov_ri(c, RCX, arg);
     call_c(c, fn);
-    test_rr(c, EAX, EAX); jcc(c, CC_E, c->L_exc);
+    test_rr(c, RAX, RAX); jcc(c, CC_E, c->L_exc);
 }
 
 static void guard_int(struct cg* c, int d_slot_k, uint32_t slow) {            // jump to `slow` unless stack entry k holds an int
@@ -695,10 +726,37 @@ static void guard_int(struct cg* c, int d_slot_k, uint32_t slow) {            //
 
 // materialise a boolean in ecx (0/1 in cl already) into stack entry k
 static void store_bool_cl(struct cg* c, int k) {
-    movzx8(c, ECX, ECX);                       // cl -> ecx
-    alu_ri(c, 0, ECX, 2);                      // JV_FALSE = 2, JV_TRUE = 3
-    mov_mr(c, SLOT_LO(k), ECX);
+    movzx8(c, RCX, RCX);                       // cl -> ecx
+    alu_ri(c, 0, RCX, 2);                      // JV_FALSE = 2, JV_TRUE = 3
+    mov_mr(c, SLOT_LO(k), RCX);
     mov_mi(c, SLOT_HI(k), V_SPECIAL);
+}
+
+// rax = the upvalue cell of closure variable i
+static void load_upv(struct cg* c, uint32_t i) {
+    mov64_rm(c, RAX, RF, F_OFF(fn));
+    mov64_rm(c, RAX, RAX, (int32_t)offsetof(struct func, upv));
+    mov64_rm(c, RAX, RAX, (int32_t)(8 * i));
+    mov64_rm(c, RAX, RAX, (int32_t)offsetof(struct upval, loc));
+}
+
+// the interrupt counter on a loop back-edge (the interpreter's own step takes the tick that reaches zero)
+static void loop_tick(struct cg* c, uint32_t slow) {
+    alu_mi(c, 7, RJ, J_OFF(interrupt_counter), 1); jcc(c, CC_E, slow);
+    dec_m(c, RJ, J_OFF(interrupt_counter));
+}
+
+// rcx = the slot number of the own data property cached for the shape of the object in rax (two ways); a miss jumps to `miss`.
+static void ic_lookup(struct cg* c, struct ic* ways, uint32_t miss) {
+    uint32_t try1 = new_label(c), done = new_label(c);
+    mov64_ri(c, RSCRATCH, (uint64_t)(uintptr_t)ways);
+    mov64_rm(c, RDX, RAX, (int32_t)offsetof(struct obj, shape));
+    cmp64_rm(c, RDX, RSCRATCH, (int32_t)offsetof(struct ic, fshape)); jcc(c, CC_NE, try1);
+    mov_rm(c, RCX, RSCRATCH, (int32_t)offsetof(struct ic, fslot)); jmp(c, done);
+    bind(c, try1);
+    cmp64_rm(c, RDX, RSCRATCH, (int32_t)(sizeof(struct ic) + offsetof(struct ic, fshape))); jcc(c, CC_NE, miss);
+    mov_rm(c, RCX, RSCRATCH, (int32_t)(sizeof(struct ic) + offsetof(struct ic, fslot)));
+    bind(c, done);
 }
 
 // ---- one instruction. d = operand stack depth before it.
@@ -726,9 +784,9 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
     case OP_INT32: push_const(c, ST(d), rd32(ip + 1), V_INT); break;
     case OP_CONST: case OP_CONST_W: {
         uint32_t k = op == OP_CONST ? rd16(ip + 1) : rd32(ip + 1);
-        uint32_t a = (uint32_t)(uintptr_t)t->consts + 8 * k;
-        mov_rm(c, ECX, NOBASE, (int32_t)a);       mov_mr(c, SLOT_LO(d), ECX);
-        mov_rm(c, ECX, NOBASE, (int32_t)a + 4);   mov_mr(c, SLOT_HI(d), ECX);
+        mov64_ri(c, RAX, (uint64_t)(uintptr_t)&t->consts[k]);
+        mov64_rm(c, RCX, RAX, 0);
+        mov64_mr(c, SLOT_LO(d), RCX);
         break;
     }
     case OP_DUP: CPY(ST(d), ST(d - 1)); break;
@@ -737,18 +795,18 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
     case OP_PICK: CPY(ST(d), ST(d - 1 - ip[1])); break;
     case OP_NIP: CPY(ST(d - 2), ST(d - 1)); break;
     case OP_SWAP:
-        load_slot(c, EAX, EDX, ST(d - 1)); CPY(ST(d - 1), ST(d - 2)); store_slot(c, ST(d - 2), EAX, EDX); break;
+        load_slot(c, RAX, ST(d - 1)); CPY(ST(d - 1), ST(d - 2)); store_slot(c, ST(d - 2), RAX); break;
     case OP_ROT3L:      // [a b c] -> [b c a]
-        load_slot(c, EAX, EDX, ST(d - 3)); CPY(ST(d - 3), ST(d - 2)); CPY(ST(d - 2), ST(d - 1)); store_slot(c, ST(d - 1), EAX, EDX); break;
+        load_slot(c, RAX, ST(d - 3)); CPY(ST(d - 3), ST(d - 2)); CPY(ST(d - 2), ST(d - 1)); store_slot(c, ST(d - 1), RAX); break;
     case OP_ROT3R:      // [a b c] -> [c a b]
-        load_slot(c, EAX, EDX, ST(d - 1)); CPY(ST(d - 1), ST(d - 2)); CPY(ST(d - 2), ST(d - 3)); store_slot(c, ST(d - 3), EAX, EDX); break;
+        load_slot(c, RAX, ST(d - 1)); CPY(ST(d - 1), ST(d - 2)); CPY(ST(d - 2), ST(d - 3)); store_slot(c, ST(d - 3), RAX); break;
     case OP_ROT4R:
-        load_slot(c, EAX, EDX, ST(d - 1)); CPY(ST(d - 1), ST(d - 2)); CPY(ST(d - 2), ST(d - 3)); CPY(ST(d - 3), ST(d - 4)); store_slot(c, ST(d - 4), EAX, EDX); break;
+        load_slot(c, RAX, ST(d - 1)); CPY(ST(d - 1), ST(d - 2)); CPY(ST(d - 2), ST(d - 3)); CPY(ST(d - 3), ST(d - 4)); store_slot(c, ST(d - 4), RAX); break;
     case OP_INSERT: {   // move the top below n items
         int n = ip[1];
-        load_slot(c, EAX, EDX, ST(d - 1));
+        load_slot(c, RAX, ST(d - 1));
         for (int i = 1; i <= n; i++) CPY(ST(d - i), ST(d - i - 1));
-        store_slot(c, ST(d - 1 - n), EAX, EDX);
+        store_slot(c, ST(d - 1 - n), RAX);
         break;
     }
     case OP_GET_LOC: CPY(ST(d), rd16(ip + 1)); break;
@@ -765,27 +823,18 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         break;
     }
     case OP_GET_UPV: case OP_SET_UPV: case OP_PUT_UPV: case OP_INIT_UPV: {
-        uint32_t i = rd16(ip + 1);
-        mov_rm(c, EAX, EDI, F_OFF(fn));
-        mov_rm(c, EAX, EAX, (int32_t)offsetof(struct func, upv));
-        mov_rm(c, EAX, EAX, (int32_t)(4 * i));
-        mov_rm(c, EAX, EAX, (int32_t)offsetof(struct upval, loc));
+        load_upv(c, rd16(ip + 1));
         if (op == OP_GET_UPV) {
-            mov_rm(c, ECX, EAX, 0); mov_mr(c, SLOT_LO(d), ECX);
-            mov_rm(c, ECX, EAX, 4); mov_mr(c, SLOT_HI(d), ECX);
+            mov64_rm(c, RCX, RAX, 0); mov64_mr(c, SLOT_LO(d), RCX);
         } else {
-            mov_rm(c, ECX, SLOT_LO(d - 1)); mov_mr(c, EAX, 0, ECX);
-            mov_rm(c, ECX, SLOT_HI(d - 1)); mov_mr(c, EAX, 4, ECX);
+            mov64_rm(c, RCX, SLOT_LO(d - 1)); mov64_mr(c, RAX, 0, RCX);
         }
         break;
     }
     case OP_JMP: {
         int32_t off = (int32_t)rd32(ip + 1);
         uint32_t tgt = c->an.pc_ord[c->an.ord_pc[ord] + 5 + off];
-        if (off < 0) {          // a loop: the interrupt counter (the interpreter's own step takes the tick that reaches zero)
-            alu_mi(c, 7, ESI, J_OFF(interrupt_counter), 1); jcc(c, CC_E, SLOW());
-            em8(c, 0xFF); mrm(c, 1, ESI, J_OFF(interrupt_counter));     // dec dword [J->interrupt_counter]
-        }
+        if (off < 0) loop_tick(c, SLOW());
         jmp(c, tgt);
         break;
     }
@@ -794,22 +843,22 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         uint32_t tgt = c->an.pc_ord[c->an.ord_pc[ord] + 5 + off];
         int jump_if_true = (op == OP_JT || op == OP_JT_KEEP);
         uint32_t istrue = new_label(c), isfalse = new_label(c);
-        mov_rm(c, EAX, SLOT_HI(d - 1));
-        alu_ri(c, 7, EAX, (int32_t)V_SPECIAL);
+        mov_rm(c, RAX, SLOT_HI(d - 1));
+        alu_ri(c, 7, RAX, (int32_t)V_SPECIAL);
         uint32_t notspecial = new_label(c);
         jcc(c, CC_NE, notspecial);
         alu_mi(c, 7, SLOT_LO(d - 1), 3); jcc(c, CC_E, istrue); jmp(c, isfalse);        // only `true` is truthy among the specials
         bind(c, notspecial);
         uint32_t isint = new_label(c);
-        alu_ri(c, 7, EAX, (int32_t)V_INT); jcc(c, CC_E, isint);
-        lea(c, EAX, EBX, (int32_t)(8 * (c->nl + (uint32_t)(d - 1)))); mov_mr(c, ESP, 0, EAX);       // anything else: to_boolean in C
+        alu_ri(c, 7, RAX, (int32_t)V_INT); jcc(c, CC_E, isint);
+        lea(c, RDI, RBX, (int32_t)(8 * (c->nl + (uint32_t)(d - 1))));                  // anything else: to_boolean in C
         call_c(c, (const void*)jit_h_truthy);
-        test_rr(c, EAX, EAX); jcc(c, CC_NE, istrue); jmp(c, isfalse);
+        test_rr(c, RAX, RAX); jcc(c, CC_NE, istrue); jmp(c, isfalse);
         bind(c, isint);
         alu_mi(c, 7, SLOT_LO(d - 1), 0); jcc(c, CC_E, isfalse);
         bind(c, istrue);
         if (jump_if_true) {
-            if (off < 0 && op == OP_JT) { alu_mi(c, 7, ESI, J_OFF(interrupt_counter), 1); jcc(c, CC_E, SLOW()); em8(c, 0xFF); mrm(c, 1, ESI, J_OFF(interrupt_counter)); }
+            if (off < 0 && op == OP_JT) loop_tick(c, SLOW());
             jmp(c, tgt);
         } else jmp(c, NEXT_L);
         bind(c, isfalse);
@@ -818,33 +867,33 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
     }
     case OP_INC: case OP_DEC: {
         guard_int(c, d - 1, SLOW());
-        mov_rm(c, EAX, SLOT_LO(d - 1));
-        alu_ri(c, op == OP_INC ? 0 : 5, EAX, 1); jcc(c, CC_O, SLOW());
-        mov_mr(c, SLOT_LO(d - 1), EAX);
+        mov_rm(c, RAX, SLOT_LO(d - 1));
+        alu_ri(c, op == OP_INC ? 0 : 5, RAX, 1); jcc(c, CC_O, SLOW());
+        mov_mr(c, SLOT_LO(d - 1), RAX);
         break;
     }
     case OP_NEG: {
         guard_int(c, d - 1, SLOW());
-        mov_rm(c, EAX, SLOT_LO(d - 1));
-        test_rr(c, EAX, EAX); jcc(c, CC_E, SLOW());
-        unary(c, 3, EAX); jcc(c, CC_O, SLOW());
-        mov_mr(c, SLOT_LO(d - 1), EAX);
+        mov_rm(c, RAX, SLOT_LO(d - 1));
+        test_rr(c, RAX, RAX); jcc(c, CC_E, SLOW());
+        unary(c, 3, RAX); jcc(c, CC_O, SLOW());
+        mov_mr(c, SLOT_LO(d - 1), RAX);
         break;
     }
     case OP_ADD: case OP_SUB: case OP_MUL: case OP_BAND: case OP_BOR: case OP_BXOR: {
         uint32_t hl = new_label(c);
         slowl = hl;
         guard_int(c, d - 2, SLOW()); guard_int(c, d - 1, SLOW());
-        mov_rm(c, EAX, SLOT_LO(d - 2));
+        mov_rm(c, RAX, SLOT_LO(d - 2));
         if (op == OP_MUL) {
-            imul_rm(c, EAX, SLOT_LO(d - 1)); jcc(c, CC_O, SLOW());
-            test_rr(c, EAX, EAX); jcc(c, CC_E, SLOW());               // 0 might be -0
+            imul_rm(c, RAX, SLOT_LO(d - 1)); jcc(c, CC_O, SLOW());
+            test_rr(c, RAX, RAX); jcc(c, CC_E, SLOW());               // 0 might be -0
         } else {
             static const uint8_t opc[] = { [OP_ADD] = 0x03, [OP_SUB] = 0x2B, [OP_BAND] = 0x23, [OP_BOR] = 0x0B, [OP_BXOR] = 0x33 };
-            alu_rm(c, opc[op], EAX, SLOT_LO(d - 1));
+            alu_rm(c, opc[op], RAX, SLOT_LO(d - 1));
             if (op == OP_ADD || op == OP_SUB) jcc(c, CC_O, SLOW());
         }
-        mov_mr(c, SLOT_LO(d - 2), EAX);
+        mov_mr(c, SLOT_LO(d - 2), RAX);
         jmp(c, NEXT_L);
         bind(c, hl);
         call_op_helper(c, ord, d, (const void*)jit_h_arith, d - 2, (uint32_t)op);
@@ -855,11 +904,11 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         uint32_t hl = new_label(c);
         slowl = hl;
         guard_int(c, d - 2, SLOW()); guard_int(c, d - 1, SLOW());
-        mov_rm(c, ECX, SLOT_LO(d - 1));
-        mov_rm(c, EAX, SLOT_LO(d - 2));
-        shift_cl(c, op == OP_SHL ? 4 : op == OP_SAR ? 7 : 5, EAX);
-        if (op == OP_SHR) { test_rr(c, EAX, EAX); jcc(c, CC_S, SLOW()); }      // above INT32_MAX: a double
-        mov_mr(c, SLOT_LO(d - 2), EAX);
+        mov_rm(c, RCX, SLOT_LO(d - 1));
+        mov_rm(c, RAX, SLOT_LO(d - 2));
+        shift_cl(c, op == OP_SHL ? 4 : op == OP_SAR ? 7 : 5, RAX);
+        if (op == OP_SHR) { test_rr(c, RAX, RAX); jcc(c, CC_S, SLOW()); }      // above INT32_MAX: a double
+        mov_mr(c, SLOT_LO(d - 2), RAX);
         jmp(c, NEXT_L);
         bind(c, hl);
         call_op_helper(c, ord, d, (const void*)jit_h_arith, d - 2, (uint32_t)op);
@@ -874,11 +923,11 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         uint32_t hl = new_label(c);
         slowl = hl;
         guard_int(c, d - 2, SLOW()); guard_int(c, d - 1, SLOW());
-        mov_rm(c, EAX, SLOT_LO(d - 2)); test_rr(c, EAX, EAX); jcc(c, CC_S, SLOW());
-        mov_rm(c, ECX, SLOT_LO(d - 1)); test_rr(c, ECX, ECX); jcc(c, CC_LE, SLOW());
-        mov_ri(c, EDX, 0);
-        unary(c, 6, ECX);                                                  // div ecx: edx = eax % ecx
-        mov_mr(c, SLOT_LO(d - 2), EDX);
+        mov_rm(c, RAX, SLOT_LO(d - 2)); test_rr(c, RAX, RAX); jcc(c, CC_S, SLOW());
+        mov_rm(c, RCX, SLOT_LO(d - 1)); test_rr(c, RCX, RCX); jcc(c, CC_LE, SLOW());
+        mov_ri(c, RDX, 0);
+        unary(c, 6, RCX);                                                  // div ecx: edx = eax % ecx
+        mov_mr(c, SLOT_LO(d - 2), RDX);
         jmp(c, NEXT_L);
         bind(c, hl);
         call_op_helper(c, ord, d, (const void*)jit_h_arith, d - 2, (uint32_t)op);
@@ -895,10 +944,10 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         } else {
             guard_int(c, d - 2, SLOW()); guard_int(c, d - 1, SLOW());
         }
-        mov_rm(c, EAX, SLOT_LO(d - 2));
-        alu_rm(c, 0x3B, EAX, SLOT_LO(d - 1));
+        mov_rm(c, RAX, SLOT_LO(d - 2));
+        alu_rm(c, 0x3B, RAX, SLOT_LO(d - 1));
         int cc = op == OP_LT ? CC_L : op == OP_LE ? CC_LE : op == OP_GT ? CC_G : op == OP_GE ? CC_GE : (op == OP_EQ || op == OP_SEQ) ? CC_E : CC_NE;
-        setcc(c, cc, ECX);
+        setcc(c, cc, RCX);
         store_bool_cl(c, d - 2);
         if (hl) {
             jmp(c, NEXT_L);
@@ -910,11 +959,11 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
     case OP_NOT: {
         uint32_t notsp = new_label(c), gen = new_label(c);
         alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_SPECIAL); jcc(c, CC_NE, notsp);
-        alu_mi(c, 7, SLOT_LO(d - 1), 3); setcc(c, CC_NE, ECX);
+        alu_mi(c, 7, SLOT_LO(d - 1), 3); setcc(c, CC_NE, RCX);
         store_bool_cl(c, d - 1); jmp(c, NEXT_L);
         bind(c, notsp);
         alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_INT); jcc(c, CC_NE, gen);
-        alu_mi(c, 7, SLOT_LO(d - 1), 0); setcc(c, CC_E, ECX);
+        alu_mi(c, 7, SLOT_LO(d - 1), 0); setcc(c, CC_E, RCX);
         store_bool_cl(c, d - 1); jmp(c, NEXT_L);
         bind(c, gen);
         call_op_helper(c, ord, d, (const void*)jit_h_not, d - 1, 0);
@@ -930,17 +979,22 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         int32_t off = (int32_t)rd32(ip + 1);
         uint32_t tgt = c->an.pc_ord[c->an.ord_pc[ord] + 5 + off];
         call_op_helper(c, ord, d, op == OP_FOR_OF_STEP ? (const void*)jit_h_forofstep : (const void*)jit_h_forinnext, d - 1, 0);
-        alu_ri(c, 7, EAX, 2); jcc(c, CC_E, tgt);
+        alu_ri(c, 7, RAX, 2); jcc(c, CC_E, tgt);
         break;
     }
     case OP_THIS_FUNC: {
-        uint32_t none = new_label(c);
-        mov_rm(c, EAX, EDI, F_OFF(fn));
-        mov_ri(c, EDX, V_OBJ);
-        test_rr(c, EAX, EAX); jcc(c, CC_NE, none);
-        mov_ri(c, EDX, V_SPECIAL);              // no function: undefined (EAX is 0)
-        bind(c, none);
-        store_slot(c, ST(d), EAX, EDX);
+        uint32_t some = new_label(c), done = new_label(c);
+        mov64_rm(c, RAX, RF, F_OFF(fn));
+        test64_rr(c, RAX, RAX); jcc(c, CC_NE, some);
+        push_const(c, ST(d), 0, V_SPECIAL);     // no function: undefined
+        jmp(c, done);
+        bind(c, some);
+        shift64_i(c, 4, RAX, 16);
+        shift64_i(c, 5, RAX, 16);
+        mov64_ri(c, RCX, (uint64_t)TAG_OBJ << 48);
+        or64_rr(c, RAX, RCX);
+        store_slot(c, ST(d), RAX);
+        bind(c, done);
         break;
     }
     case OP_TYPEOF: call_op_helper(c, ord, d, (const void*)jit_h_typeof, d - 1, 0); break;
@@ -951,94 +1005,78 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
     case OP_CLOSURE: call_op_helper(c, ord, d, (const void*)jit_h_closure, d, rd32(ip + 1)); break;
     case OP_TO_PROPKEY: {
         alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_INT); jcc(c, CC_E, NEXT_L);
-        alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_STR); jcc(c, CC_E, NEXT_L);
-        alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_SYM); jcc(c, CC_NE, SLOW());
+        cmpw_mi(c, SLOT_TAG(d - 1), T_STR); jcc(c, CC_E, NEXT_L);
+        cmpw_mi(c, SLOT_TAG(d - 1), T_SYM); jcc(c, CC_NE, SLOW());
         break;
     }
     case OP_GET_UPV_CHK: case OP_PUT_UPV_CHK: {         // u16 slot, u32 name: a hole is a binding in its temporal dead zone
-        uint32_t i = rd16(ip + 1);
-        mov_rm(c, EAX, EDI, F_OFF(fn));
-        mov_rm(c, EAX, EAX, (int32_t)offsetof(struct func, upv));
-        mov_rm(c, EAX, EAX, (int32_t)(4 * i));
-        mov_rm(c, EAX, EAX, (int32_t)offsetof(struct upval, loc));
+        load_upv(c, rd16(ip + 1));
         uint32_t ok = new_label(c);
-        alu_mi(c, 7, EAX, 4, (int32_t)V_SPECIAL); jcc(c, CC_NE, ok);
-        alu_mi(c, 7, EAX, 0, 4); jcc(c, CC_E, SLOW());
+        alu_mi(c, 7, RAX, 4, (int32_t)V_SPECIAL); jcc(c, CC_NE, ok);
+        alu_mi(c, 7, RAX, 0, 4); jcc(c, CC_E, SLOW());
         bind(c, ok);
         if (op == OP_GET_UPV_CHK) {
-            mov_rm(c, ECX, EAX, 0); mov_mr(c, SLOT_LO(d), ECX);
-            mov_rm(c, ECX, EAX, 4); mov_mr(c, SLOT_HI(d), ECX);
+            mov64_rm(c, RCX, RAX, 0); mov64_mr(c, SLOT_LO(d), RCX);
         } else {
-            mov_rm(c, ECX, SLOT_LO(d - 1)); mov_mr(c, EAX, 0, ECX);
-            mov_rm(c, ECX, SLOT_HI(d - 1)); mov_mr(c, EAX, 4, ECX);
+            mov64_rm(c, RCX, SLOT_LO(d - 1)); mov64_mr(c, RAX, 0, RCX);
         }
         break;
     }
     case OP_IS_UNDEF: {
-        mov_rm(c, EAX, SLOT_HI(d - 1)); alu_ri(c, 6, EAX, (int32_t)V_SPECIAL);
-        alu_rm(c, 0x0B, EAX, SLOT_LO(d - 1));
-        setcc(c, CC_E, ECX);
+        mov_rm(c, RAX, SLOT_HI(d - 1)); alu_ri(c, 6, RAX, (int32_t)V_SPECIAL);
+        alu_rm(c, 0x0B, RAX, SLOT_LO(d - 1));
+        setcc(c, CC_E, RCX);
         store_bool_cl(c, d - 1);
         break;
     }
     case OP_IS_NULLISH: {
-        uint32_t no = new_label(c), done = new_label(c);
-        mov_ri(c, ECX, 0);
+        uint32_t no = new_label(c);
+        mov_ri(c, RCX, 0);
         alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_SPECIAL); jcc(c, CC_NE, no);
-        alu_mi(c, 7, SLOT_LO(d - 1), 1); setcc(c, CC_BE, ECX);
+        alu_mi(c, 7, SLOT_LO(d - 1), 1); setcc(c, CC_BE, RCX);
         bind(c, no);
         store_bool_cl(c, d - 1);
-        (void)done;
         break;
     }
     case OP_TO_NUMERIC:
         alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_SPECIAL); jcc(c, CC_AE, SLOW()); break;      // already a number: nothing to do
     case OP_TO_STRING:
-        alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_STR); jcc(c, CC_NE, SLOW()); break;
+        cmpw_mi(c, SLOT_TAG(d - 1), T_STR); jcc(c, CC_NE, SLOW()); break;
     case OP_TO_OBJECT:
-        alu_mi(c, 7, SLOT_HI(d - 1), (int32_t)V_OBJ); jcc(c, CC_NE, SLOW()); break;
+        cmpw_mi(c, SLOT_TAG(d - 1), T_OBJ); jcc(c, CC_NE, SLOW()); break;
     case OP_GET_FIELD: case OP_GET_FIELD_KEEP: {
         uint32_t ici = rd16(ip + 5);
         if (!t->ic || ici >= t->nic) goto generic;
         int keep = op == OP_GET_FIELD_KEEP;
         int D = d - 1;
         uint32_t miss = step_stub_k(c, ord, 1);
-        uint32_t w0 = (uint32_t)(uintptr_t)&t->ic[(size_t)ici * IC_WAYS], w1 = w0 + (uint32_t)sizeof(struct ic);
         if (keep) CPY(ST(d), ST(D));
         if (!keep && atom_key(J, t->consts[rd32(ip + 1)]) == A(length)) {     // x.length
             uint32_t notstr = new_label(c), icpath = new_label(c);
-            mov_rm(c, EDX, SLOT_HI(D));
-            alu_ri(c, 7, EDX, (int32_t)V_STR); jcc(c, CC_NE, notstr);
-            mov_rm(c, EAX, SLOT_LO(D));
-            mov_rm(c, EAX, EAX, (int32_t)offsetof(struct gch, aux32));
-            mov_mr(c, SLOT_LO(D), EAX); mov_mi(c, SLOT_HI(D), V_INT);
+            movzx16_rm(c, RDX, SLOT_TAG(D));
+            alu_ri(c, 7, RDX, (int32_t)T_STR); jcc(c, CC_NE, notstr);
+            load_ptr(c, RAX, D);
+            mov_rm(c, RAX, RAX, (int32_t)offsetof(struct gch, aux32));
+            mov_mr(c, SLOT_LO(D), RAX); mov_mi(c, SLOT_HI(D), V_INT);
             jmp(c, ord + 1);
             bind(c, notstr);
-            alu_ri(c, 7, EDX, (int32_t)V_OBJ); jcc(c, CC_NE, miss);
-            mov_rm(c, EAX, SLOT_LO(D));
-            cmpw_mi(c, EAX, (int32_t)offsetof(struct gch, aux), OC_ARRAY); jcc(c, CC_NE, icpath);
-            mov_rm(c, ECX, EAX, (int32_t)offsetof(struct obj, alen));
-            test_rr(c, ECX, ECX); jcc(c, CC_S, miss);
-            mov_mr(c, SLOT_LO(D), ECX); mov_mi(c, SLOT_HI(D), V_INT);
+            alu_ri(c, 7, RDX, (int32_t)T_OBJ); jcc(c, CC_NE, miss);
+            load_ptr(c, RAX, D);
+            cmpw_mi(c, RAX, (int32_t)offsetof(struct gch, aux), OC_ARRAY); jcc(c, CC_NE, icpath);
+            mov_rm(c, RCX, RAX, (int32_t)offsetof(struct obj, alen));
+            test_rr(c, RCX, RCX); jcc(c, CC_S, miss);
+            mov_mr(c, SLOT_LO(D), RCX); mov_mi(c, SLOT_HI(D), V_INT);
             jmp(c, ord + 1);
             bind(c, icpath);
         } else {
-            alu_mi(c, 7, SLOT_HI(D), (int32_t)V_OBJ); jcc(c, CC_NE, miss);
-            mov_rm(c, EAX, SLOT_LO(D));
+            cmpw_mi(c, SLOT_TAG(D), T_OBJ); jcc(c, CC_NE, miss);
+            load_ptr(c, RAX, D);
         }
-        test_mi(c, EAX, (int32_t)offsetof(struct obj, flags), OF_EXOTIC); jcc(c, CC_NE, miss);
-        uint32_t try1 = new_label(c), load = new_label(c);
-        mov_rm(c, EDX, EAX, (int32_t)offsetof(struct obj, shape));
-        alu_rm(c, 0x3B, EDX, NOBASE, (int32_t)(w0 + offsetof(struct ic, fshape))); jcc(c, CC_NE, try1);
-        mov_rm(c, ECX, NOBASE, (int32_t)(w0 + offsetof(struct ic, fslot))); jmp(c, load);
-        bind(c, try1);
-        alu_rm(c, 0x3B, EDX, NOBASE, (int32_t)(w1 + offsetof(struct ic, fshape))); jcc(c, CC_NE, miss);
-        mov_rm(c, ECX, NOBASE, (int32_t)(w1 + offsetof(struct ic, fslot)));
-        bind(c, load);
-        mov_rm(c, EAX, EAX, (int32_t)offsetof(struct obj, slots));
-        mov_rx(c, EDX, EAX, ECX, 4);
-        mov_rx(c, EAX, EAX, ECX, 0);
-        mov_mr(c, SLOT_LO(D), EAX); mov_mr(c, SLOT_HI(D), EDX);
+        test_mi(c, RAX, (int32_t)offsetof(struct obj, flags), OF_EXOTIC); jcc(c, CC_NE, miss);
+        ic_lookup(c, &t->ic[(size_t)ici * IC_WAYS], miss);
+        mov64_rm(c, RAX, RAX, (int32_t)offsetof(struct obj, slots));
+        mov64_rx(c, RAX, RAX, RCX, 0);
+        mov64_mr(c, SLOT_LO(D), RAX);
         break;
     }
     case OP_PUT_FIELD: {                // [obj, value] -> [value]
@@ -1046,21 +1084,12 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         if (!t->ic || ici >= t->nic) goto generic;
         int O = d - 2, V = d - 1;
         uint32_t miss = step_stub_k(c, ord, 2);
-        uint32_t w0 = (uint32_t)(uintptr_t)&t->ic[(size_t)ici * IC_WAYS], w1 = w0 + (uint32_t)sizeof(struct ic);
-        alu_mi(c, 7, SLOT_HI(O), (int32_t)V_OBJ); jcc(c, CC_NE, miss);
-        mov_rm(c, EAX, SLOT_LO(O));
-        test_mi(c, EAX, (int32_t)offsetof(struct obj, flags), OF_EXOTIC); jcc(c, CC_NE, miss);
-        uint32_t try1 = new_label(c), store = new_label(c);
-        mov_rm(c, EDX, EAX, (int32_t)offsetof(struct obj, shape));
-        alu_rm(c, 0x3B, EDX, NOBASE, (int32_t)(w0 + offsetof(struct ic, fshape))); jcc(c, CC_NE, try1);
-        mov_rm(c, ECX, NOBASE, (int32_t)(w0 + offsetof(struct ic, fslot))); jmp(c, store);
-        bind(c, try1);
-        alu_rm(c, 0x3B, EDX, NOBASE, (int32_t)(w1 + offsetof(struct ic, fshape))); jcc(c, CC_NE, miss);
-        mov_rm(c, ECX, NOBASE, (int32_t)(w1 + offsetof(struct ic, fslot)));
-        bind(c, store);
-        mov_rm(c, EAX, EAX, (int32_t)offsetof(struct obj, slots));
-        mov_rm(c, EDX, SLOT_LO(V)); mov_xr(c, EAX, ECX, 0, EDX);
-        mov_rm(c, EDX, SLOT_HI(V)); mov_xr(c, EAX, ECX, 4, EDX);
+        cmpw_mi(c, SLOT_TAG(O), T_OBJ); jcc(c, CC_NE, miss);
+        load_ptr(c, RAX, O);
+        test_mi(c, RAX, (int32_t)offsetof(struct obj, flags), OF_EXOTIC); jcc(c, CC_NE, miss);
+        ic_lookup(c, &t->ic[(size_t)ici * IC_WAYS], miss);
+        mov64_rm(c, RAX, RAX, (int32_t)offsetof(struct obj, slots));
+        mov64_rm(c, RDX, SLOT_LO(V)); mov64_xr(c, RAX, RCX, 0, RDX);
         CPY(ST(O), ST(V));
         break;
     }
@@ -1070,20 +1099,17 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         uint32_t hl = new_label(c);
         slowl = hl;
         guard_int(c, K, SLOW());
-        alu_mi(c, 7, SLOT_HI(O), (int32_t)V_OBJ); jcc(c, CC_NE, SLOW());
-        mov_rm(c, EAX, SLOT_LO(O));
-        mov_rm(c, ECX, SLOT_LO(K));
-        mov_rm(c, EDX, EAX, (int32_t)offsetof(struct obj, flags));
-        alu_ri(c, 4, EDX, OF_ARRAY_FAST | OF_EXOTIC); alu_ri(c, 7, EDX, OF_ARRAY_FAST); jcc(c, CC_NE, SLOW());
-        alu_rm(c, 0x3B, ECX, EAX, (int32_t)offsetof(struct obj, elen)); jcc(c, CC_AE, SLOW());
-        mov_rm(c, EAX, EAX, (int32_t)offsetof(struct obj, elems));
-        mov_rx(c, EDX, EAX, ECX, 4);
-        mov_rx(c, EAX, EAX, ECX, 0);
-        uint32_t ok = new_label(c);
-        alu_ri(c, 7, EDX, (int32_t)V_SPECIAL); jcc(c, CC_NE, ok);
-        alu_ri(c, 7, EAX, 4); jcc(c, CC_E, SLOW());                      // a hole: the prototype chain may have the element
-        bind(c, ok);
-        mov_mr(c, SLOT_LO(O), EAX); mov_mr(c, SLOT_HI(O), EDX);
+        cmpw_mi(c, SLOT_TAG(O), T_OBJ); jcc(c, CC_NE, SLOW());
+        load_ptr(c, RAX, O);
+        mov_rm(c, RCX, SLOT_LO(K));
+        mov_rm(c, RDX, RAX, (int32_t)offsetof(struct obj, flags));
+        alu_ri(c, 4, RDX, OF_ARRAY_FAST | OF_EXOTIC); alu_ri(c, 7, RDX, OF_ARRAY_FAST); jcc(c, CC_NE, SLOW());
+        alu_rm(c, 0x3B, RCX, RAX, (int32_t)offsetof(struct obj, elen)); jcc(c, CC_AE, SLOW());
+        mov64_rm(c, RAX, RAX, (int32_t)offsetof(struct obj, elems));
+        mov64_rx(c, RAX, RAX, RCX, 0);
+        mov64_ri(c, RDX, JV_HOLE);
+        cmp64_rr(c, RAX, RDX); jcc(c, CC_E, SLOW());                     // a hole: the prototype chain may have the element
+        mov64_mr(c, SLOT_LO(O), RAX);
         jmp(c, NEXT_L);
         bind(c, hl);
         call_op_helper(c, ord, d, (const void*)jit_h_getelem, d - 2, 0);
@@ -1095,21 +1121,17 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         uint32_t hl = new_label(c);
         slowl = hl;
         guard_int(c, K, SLOW());
-        alu_mi(c, 7, SLOT_HI(O), (int32_t)V_OBJ); jcc(c, CC_NE, SLOW());
-        mov_rm(c, EAX, SLOT_LO(O));
-        mov_rm(c, ECX, SLOT_LO(K));
-        mov_rm(c, EDX, EAX, (int32_t)offsetof(struct obj, flags));
-        alu_ri(c, 4, EDX, OF_ARRAY_FAST | OF_EXOTIC | OF_FROZEN_ELEMS | OF_SEALED_ELEMS); alu_ri(c, 7, EDX, OF_ARRAY_FAST); jcc(c, CC_NE, SLOW());
-        alu_rm(c, 0x3B, ECX, EAX, (int32_t)offsetof(struct obj, elen)); jcc(c, CC_AE, SLOW());
-        mov_rm(c, EAX, EAX, (int32_t)offsetof(struct obj, elems));
-        lea_x(c, EAX, EAX, ECX, 0);                                      // &elems[i]
-        uint32_t ok = new_label(c);
-        mov_rm(c, EDX, EAX, 4);
-        alu_ri(c, 7, EDX, (int32_t)V_SPECIAL); jcc(c, CC_NE, ok);
-        alu_mi(c, 7, EAX, 0, 4); jcc(c, CC_E, SLOW());                   // a hole
-        bind(c, ok);
-        mov_rm(c, ECX, SLOT_LO(V)); mov_mr(c, EAX, 0, ECX);
-        mov_rm(c, ECX, SLOT_HI(V)); mov_mr(c, EAX, 4, ECX);
+        cmpw_mi(c, SLOT_TAG(O), T_OBJ); jcc(c, CC_NE, SLOW());
+        load_ptr(c, RAX, O);
+        mov_rm(c, RCX, SLOT_LO(K));
+        mov_rm(c, RDX, RAX, (int32_t)offsetof(struct obj, flags));
+        alu_ri(c, 4, RDX, OF_ARRAY_FAST | OF_EXOTIC | OF_FROZEN_ELEMS | OF_SEALED_ELEMS); alu_ri(c, 7, RDX, OF_ARRAY_FAST); jcc(c, CC_NE, SLOW());
+        alu_rm(c, 0x3B, RCX, RAX, (int32_t)offsetof(struct obj, elen)); jcc(c, CC_AE, SLOW());
+        mov64_rm(c, RAX, RAX, (int32_t)offsetof(struct obj, elems));
+        lea_x(c, RAX, RAX, RCX, 0);                                      // &elems[i]
+        mov64_ri(c, RDX, JV_HOLE);
+        cmp64_rm(c, RDX, RAX, 0); jcc(c, CC_E, SLOW());                  // a hole
+        mov64_rm(c, RCX, SLOT_LO(V)); mov64_mr(c, RAX, 0, RCX);
         CPY(ST(O), ST(V));
         jmp(c, NEXT_L);
         bind(c, hl);
@@ -1121,51 +1143,49 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         uint32_t ici = rd16(ip + 5);
         if (!t->ic || ici >= t->nic) goto generic;
         call_ic_helper(c, (const void*)jit_ic_define, ici, d - 2);
-        test_rr(c, EAX, EAX); jcc(c, CC_E, SLOW());
+        test_rr(c, RAX, RAX); jcc(c, CC_E, SLOW());
         break;
     }
     case OP_GET_GLOBAL: {
         uint32_t ici = rd16(ip + 5);
         if (!t->ic || ici >= t->nic) goto generic;
         call_ic_helper(c, (const void*)jit_gl_get, ici, d);
-        test_rr(c, EAX, EAX); jcc(c, CC_E, SLOW());
+        test_rr(c, RAX, RAX); jcc(c, CC_E, SLOW());
         break;
     }
     case OP_PUT_GLOBAL: case OP_PUT_GLOBAL_STRICT: {
         uint32_t ici = rd16(ip + 5);
         if (!t->ic || ici >= t->nic) goto generic;
         call_ic_helper(c, (const void*)jit_gl_put, ici, d - 1);
-        test_rr(c, EAX, EAX); jcc(c, CC_E, SLOW());
+        test_rr(c, RAX, RAX); jcc(c, CC_E, SLOW());
         break;
     }
     case OP_CALL: case OP_CALL_METHOD: case OP_NEW: {
         int argc = rd16(ip + 1);
         int base = d - argc - 2;                                         // the callee's slot: [fn, this, args...] -> [result]
-        mov_mi(c, EDI, F_OFF(pc), (uint32_t)(uintptr_t)(t->code + c->an.ord_pc[ord] + 3));
-        lea(c, EAX, EBX, (int32_t)(8 * (c->nl + (uint32_t)d)));
-        mov_mr(c, EDI, F_OFF(sp), EAX);
-        mov_mr(c, ESP, 0, ESI);
-        mov_mr(c, ESP, 4, EDI);
-        lea(c, EAX, EBX, (int32_t)(8 * (c->nl + (uint32_t)(d - argc)))); mov_mr(c, ESP, 8, EAX);
-        mov_mi(c, ESP, 12, (uint32_t)argc);
+        set_frame_pc(c, t->code + c->an.ord_pc[ord] + 3);
+        set_frame_sp(c, d);
+        mov64_rr(c, RDI, RJ);
+        mov64_rr(c, RSI, RF);
+        lea(c, RDX, RBX, (int32_t)(8 * (c->nl + (uint32_t)(d - argc))));
+        mov_ri(c, RCX, (uint32_t)argc);
         call_c(c, op == OP_NEW ? (const void*)jit_new : (const void*)jit_call);
-        alu_ri(c, 7, EDX, (int32_t)V_SPECIAL);
-        { uint32_t ok = new_label(c); jcc(c, CC_NE, ok); alu_ri(c, 7, EAX, 5); jcc(c, CC_E, c->L_exc); bind(c, ok); }
-        store_slot(c, ST(base), EAX, EDX);
+        mov64_ri(c, RCX, JV_EXC);
+        cmp64_rr(c, RAX, RCX); jcc(c, CC_E, c->L_exc);
+        store_slot(c, ST(base), RAX);
         break;
     }
     case OP_FRAME_THIS: case OP_NEW_TARGET: {
         int32_t off = op == OP_FRAME_THIS ? F_OFF(this_v) : F_OFF(new_target);
-        mov_rm(c, ECX, EDI, off);     mov_mr(c, SLOT_LO(d), ECX);
-        mov_rm(c, ECX, EDI, off + 4); mov_mr(c, SLOT_HI(d), ECX);
+        mov64_rm(c, RCX, RF, off); mov64_mr(c, SLOT_LO(d), RCX);
         break;
     }
     case OP_RETURN:
-        load_slot(c, EAX, EDX, ST(d - 1));
+        load_slot(c, RAX, ST(d - 1));
         jmp(c, c->L_epi);
         break;
     case OP_RETURN_UNDEF:
-        mov_ri(c, EAX, 0); mov_ri(c, EDX, V_SPECIAL);
+        mov64_ri(c, RAX, JV_UNDEFINED);
         jmp(c, c->L_epi);
         break;
     default: generic:
@@ -1181,6 +1201,9 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
 // ---- the whole function
 static int jit_compile_(ojs* J, struct ftempl* t);
 int jit_compile(ojs* J, struct ftempl* t) {
+#if !defined(__x86_64__)
+    (void)J; (void)t; return -1;        // the emitter is x86-64 only (the 32-bit Windows port runs the interpreter)
+#endif
 #if !(defined(KERNEL) && KERNEL)
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -1216,14 +1239,15 @@ static int jit_compile_(ojs* J, struct ftempl* t) {
     memset(c.stub, 0, (ni + 1) * sizeof(uint32_t));
     memset(c.skind, 0, ni + 1);
 
-    // prologue: push ebp; mov ebp,esp; push ebx/esi/edi; sub esp,44; load J, f, locals; jump to the target in [ebp+16]
-    em8(&c, 0x55); em8(&c, 0x89); em8(&c, 0xE5);
-    em8(&c, 0x53); em8(&c, 0x56); em8(&c, 0x57);
-    alu_ri(&c, 5, ESP, 44);
-    mov_rm(&c, ESI, EBP, 8);
-    mov_rm(&c, EDI, EBP, 12);
-    mov_rm(&c, EBX, EDI, F_OFF(locals));
-    em8(&c, 0xFF); mrm(&c, 4, EBP, 16);
+    // prologue, entered as jv entry(J = rdi, f = rsi, target = rdx): saves what the compiled code keeps in callee-saved registers. On entry
+    // rsp = 8 mod 16; four pushes and 24 bytes make it 0.
+    push64(&c, RBP); mov64_rr(&c, RBP, RSP);
+    push64(&c, RBX); push64(&c, R12); push64(&c, R13);
+    { em8(&c, 0x48); em8(&c, 0x83); em8(&c, 0xEC); em8(&c, 24); }       // sub rsp, 24
+    mov64_rr(&c, RJ, RDI);
+    mov64_rr(&c, RF, RSI);
+    mov64_rm(&c, RBX, RF, F_OFF(locals));
+    jmp_r(&c, RDX);
 
     for (uint32_t o = 0; o < ni; o++) {
         bind(&c, o);
@@ -1252,23 +1276,22 @@ static int jit_compile_(ojs* J, struct ftempl* t) {
     }
     // a callee threw: unwind from f->pc (set by the call)
     bind(&c, c.L_exc);
-    mov_mr(&c, ESP, 0, ESI);
-    mov_mr(&c, ESP, 4, EDI);
-    mov_mi(&c, ESP, 8, 0);
-    mov_mi(&c, ESP, 12, 0);
-    lea(&c, EAX, ESP, 32); mov_mr(&c, ESP, 16, EAX);
-    mov_mi(&c, ESP, 20, 1);
+    mov64_rr(&c, RDI, RJ);
+    mov64_rr(&c, RSI, RF);
+    mov_ri(&c, RDX, 0);
+    mov_ri(&c, RCX, 0);
+    lea(&c, R8, RSP, 0);
+    mov_ri(&c, R9, 1);
     call_c(&c, (const void*)jit_step);
-    test_rr(&c, EAX, EAX);
+    test64_rr(&c, RAX, RAX);
     jcc(&c, CC_E, c.L_fin);
-    jmp_r(&c, EAX);
-    // function exit: the result of a step is at [esp+32]
+    jmp_r(&c, RAX);
+    // function exit: the result of a step is at [rsp]
     bind(&c, c.L_fin);
-    mov_rm(&c, EAX, ESP, 32);
-    mov_rm(&c, EDX, ESP, 36);
+    mov64_rm(&c, RAX, RSP, 0);
     bind(&c, c.L_epi);
-    alu_ri(&c, 0, ESP, 44);
-    em8(&c, 0x5F); em8(&c, 0x5E); em8(&c, 0x5B); em8(&c, 0x5D);
+    { em8(&c, 0x48); em8(&c, 0x83); em8(&c, 0xC4); em8(&c, 24); }       // add rsp, 24
+    pop64(&c, R13); pop64(&c, R12); pop64(&c, RBX); pop64(&c, RBP);
     ret(&c);
     if (c.fail) goto out;
 
@@ -1284,16 +1307,6 @@ static int jit_compile_(ojs* J, struct ftempl* t) {
             if (tgt == ~0u) { code_release(pool); goto out; }
             uint32_t v = tgt - (c.rel[i].pos + 4);
             memcpy(mem + c.rel[i].pos, &v, 4);
-        }
-        for (uint32_t i = 0; i < c.nabs; i++) {
-            uint32_t tgt = c.lab[c.abs[i].lab];
-            if (tgt == ~0u) { code_release(pool); goto out; }
-            uint32_t v = (uint32_t)(uintptr_t)mem + tgt;
-            memcpy(mem + c.abs[i].pos, &v, 4);
-        }
-        for (uint32_t i = 0; i < c.ncalls; i++) {
-            uint32_t v = (uint32_t)(uintptr_t)c.calls[i].fn - ((uint32_t)(uintptr_t)mem + c.calls[i].pos + 4);
-            memcpy(mem + c.calls[i].pos, &v, 4);
         }
         struct jitcode* jc = (struct jitcode*)ojs_sys_malloc(sizeof *jc);
         uint32_t nmap = 0;
@@ -1319,7 +1332,7 @@ static int jit_compile_(ojs* J, struct ftempl* t) {
         ok = 1;
     }
 out:
-    ojs_sys_free(c.b); ojs_sys_free(c.lab); ojs_sys_free(c.rel); ojs_sys_free(c.abs); ojs_sys_free(c.calls);
+    ojs_sys_free(c.b); ojs_sys_free(c.lab); ojs_sys_free(c.rel);
     ojs_sys_free(c.stub); ojs_sys_free(c.stub_list); ojs_sys_free(c.skind);
     jan_free(&c.an);
     if (!ok) { ojs_jit_stats.rejected++; return -1; }

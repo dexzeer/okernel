@@ -10,12 +10,12 @@ static int is(const char *a, const char *b) {
     return *a == *b;
 }
 
-// The entry stack is [argc][argv][envp] (the kernel's ELF spawn): _start hands that ESP to main, so no guess about
+// The entry stack is [argc][argv][envp] (the kernel's ELF spawn): _start hands that RSP to main, so no guess about
 // what the compiler's prologue pushed.
-__asm__(".globl _start\n_start:\n    push %esp\n    call pmain\n");
+__asm__(".globl _start\n_start:\n    mov %rsp, %rdi\n    call pmain\n");
 
-void pmain(int *sp) {
-    int argc = sp[0];
+void pmain(long *sp) {
+    int argc = (int)sp[0];
     char **argv = (char **)sp[1];
     int mode = argc > 1 && is(argv[1], "fault") ? 1 : 0;
     if (argc > 1 && !mode) {

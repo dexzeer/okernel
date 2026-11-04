@@ -423,17 +423,17 @@ static int64_t do_mmap(struct lx_task *t, uint64_t addr, uint64_t len, uint32_t 
         if (off & 0xFFF) return -LX_EINVAL;
         node = f->node;
     }
-    uint32_t start;
+    uint64_t start;
     if (flags & LX_MAP_FIXED) {
         if (addr & 0xFFF) return -LX_EINVAL;
-        start = (uint32_t)addr;
+        start = addr;
         if (addr < LX_USER_BASE || addr + l > LX_USER_TOP) return -LX_ENOMEM;
     } else {
         start = 0;
         if (addr && !(addr & 0xFFF) && addr >= LX_USER_BASE && addr + l <= LX_USER_TOP) {
             int free = 1;
             for (int i = 0; i < t->mm->nvma; i++) if (addr < t->mm->vma[i].end && addr + l > t->mm->vma[i].start) { free = 0; break; }
-            if (free) start = (uint32_t)addr;
+            if (free) start = addr;
         }
         if (!start) start = lx_find_free(t, l);
         if (!start) return -LX_ENOMEM;
@@ -449,7 +449,7 @@ static int64_t do_brk(struct lx_task *t, uint64_t req) {
     if (req == 0 || req < t->mm->brk_start) return t->mm->brk;
     if (req >= LX_MMAP_TOP - (64u << 20)) return t->mm->brk;
     uint32_t nb = (uint32_t)req;
-    uint32_t old_end = (t->mm->brk + 0xFFF) & ~0xFFFu, new_end = (nb + 0xFFF) & ~0xFFFu;
+    uint64_t old_end = (t->mm->brk + 0xFFF) & ~0xFFFull, new_end = (nb + 0xFFF) & ~0xFFFull;
     if (new_end > old_end) {
         for (int i = 0; i < t->mm->nvma; i++)
             if (old_end < t->mm->vma[i].end && new_end > t->mm->vma[i].start && !(t->mm->vma[i].start == t->mm->brk_start && 0)) return t->mm->brk;
@@ -795,36 +795,36 @@ int64_t lx_syscall_dispatch(struct lx_task *t) {
         return do_mmap(t, a0, a1, (uint32_t)a2, (uint32_t)a3, (int64_t)(int32_t)a4, a5);
     case 10: // mprotect
         if (a0 & 0xFFF) return -LX_EINVAL;
-        return lx_protect_region(t, (uint32_t)a0, (uint32_t)a1, (uint32_t)a2);
+        return lx_protect_region(t, a0, a1, (uint32_t)a2);
     case 11: // munmap
         if (a0 & 0xFFF || !a1) return -LX_EINVAL;
-        return lx_unmap_region(t, (uint32_t)a0, (uint32_t)a1);
+        return lx_unmap_region(t, a0, a1);
     case 12: // brk
         return do_brk(t, a0);
     case 25: { // mremap (move or resize)
-        struct lx_vma *v = lx_vma_find(t, (uint32_t)a0);
+        struct lx_vma *v = lx_vma_find(t, a0);
         if (!v || v->start != a0) return -LX_EINVAL;
-        uint32_t olen = (uint32_t)((a1 + 0xFFF) & ~0xFFFull), nlen = (uint32_t)((a2 + 0xFFF) & ~0xFFFull);
+        uint64_t olen = (a1 + 0xFFF) & ~0xFFFull, nlen = (a2 + 0xFFF) & ~0xFFFull;
         if (nlen == olen) return (int64_t)a0;
-        if (nlen < olen) { lx_unmap_region(t, (uint32_t)a0 + nlen, olen - nlen); return (int64_t)a0; }
+        if (nlen < olen) { lx_unmap_region(t, a0 + nlen, olen - nlen); return (int64_t)a0; }
         // grow in place if the space after is free, else move
         int free = 1;
-        for (int i = 0; i < t->mm->nvma; i++) if ((uint32_t)a0 + olen < t->mm->vma[i].end && (uint32_t)a0 + nlen > t->mm->vma[i].start && t->mm->vma[i].start != a0) free = 0;
-        if (free && (uint32_t)a0 + nlen <= LX_USER_TOP) {
-            if (lx_map_region(t, (uint32_t)a0 + olen, nlen - olen, v->prot, v->flags, 0, 0)) return -LX_ENOMEM;
+        for (int i = 0; i < t->mm->nvma; i++) if (a0 + olen < t->mm->vma[i].end && a0 + nlen > t->mm->vma[i].start) free = 0;
+        if (free && a0 + nlen <= LX_USER_TOP) {
+            if (lx_map_region(t, a0 + olen, nlen - olen, v->prot, v->flags, 0, 0)) return -LX_ENOMEM;
             return (int64_t)a0;
         }
         if (!(a3 & 1)) return -LX_ENOMEM;                         // MREMAP_MAYMOVE
-        uint32_t ns = lx_find_free(t, nlen);
+        uint64_t ns = lx_find_free(t, nlen);
         if (!ns) return -LX_ENOMEM;
         uint32_t prot = v->prot, fl = v->flags;
         if (lx_map_region(t, ns, nlen, prot, fl, 0, 0)) return -LX_ENOMEM;
-        for (uint32_t o = 0; o < olen; o += 0x1000) {                 // move the touched pages
-            uint32_t ph = aspace_unmap(t->mm->cr3, (uint32_t)a0 + o);
+        for (uint64_t o = 0; o < olen; o += 0x1000) {                 // move the touched pages
+            phys_t ph = aspace_unmap(t->mm->cr3, a0 + o);
             if (ph) { if (aspace_map(t->mm->cr3, ns + o, ph, (prot & LX_PROT_WRITE) != 0)) pmm_free_page(ph); }
         }
-        lx_unmap_region(t, (uint32_t)a0, olen);
-        return ns;
+        lx_unmap_region(t, a0, olen);
+        return (int64_t)ns;
     }
     case 28: return 0;                                              // madvise
     case 13: { // rt_sigaction(sig, act, oldact, sigsetsize)

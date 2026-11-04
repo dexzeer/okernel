@@ -9,22 +9,24 @@ LD = ld
 # repair, flush) ran 3-5x slower than needed and drags crawled.
 # -fno-strict-aliasing: the network stack type-puns packet buffers through
 # struct pointers (ip_header*, tcp on byte arrays) — UB under strict aliasing.
-CFLAGS = -m32 -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
-         -nostartfiles -nodefaultlibs -fno-pic -fno-pie -mno-red-zone \
+# -mcmodel=kernel: the kernel is linked in the top 2 GB of the address space (linker-high.ld). -mno-sse: interrupt handlers must never touch
+# XMM (only a context switch saves it); code that computes in floating point is built with FP_CFLAGS below and only ever runs in thread context.
+CFLAGS = -m64 -mcmodel=kernel -ffreestanding -nostdlib -fno-builtin -fno-stack-protector \
+         -nostartfiles -nodefaultlibs -fno-pic -fno-pie -mno-red-zone -mno-sse -mno-sse2 -mno-mmx \
+         -fno-asynchronous-unwind-tables -fno-unwind-tables \
          -O2 -fno-strict-aliasing -MMD -MP \
-         -Wall -Wextra -DKERNEL -DLONGMODE -Isrc
+         -Wall -Wextra -Werror=implicit-function-declaration -Werror=int-conversion -DKERNEL -Isrc
+FP_CFLAGS = $(filter-out -mno-sse -mno-sse2,$(CFLAGS)) -msse2 -mfpmath=sse
 
 # Assembler flags
-ASFLAGS = -f elf32
+ASFLAGS = -f elf64
 
-# Linker flags (text = low link; desktop = high-half link at 0xC0100000)
-LDFLAGS = -m elf_i386 -T linker.ld
-LDFLAGS_HIGH = -m elf_i386 -T linker-high.ld
+# Linker flags. max-page-size: the default 2 MB segment alignment would pad the low load area of the image.
+LDFLAGS_HIGH = -m elf_x86_64 -T linker-high.ld -z max-page-size=0x1000 -z noexecstack --no-warn-rwx-segments
+LDFLAGS = $(LDFLAGS_HIGH)
 
-# Common objects (no kernel.c, no desktop.c). ORDER: start.o FIRST — its
-# .text must land at 0xC0100030 (right after .multiboot) so _start's LOW
-# alias (phys 0x100030+0x30) is where GRUB jumps. isr.o second.
-ASM_OBJ = boot/start.o boot/isr.o boot/lm.o boot/smp_stubs.o boot/ap_tramp.o
+# Common objects (no kernel.c, no desktop.c).
+ASM_OBJ = boot/start.o boot/isr.o boot/lm.o boot/ap_tramp.o
 COMMON_OBJ = src/gdt.o src/idt.o src/memory.o src/serial.o src/keyboard.o src/mouse.o src/string.o src/syscall.o
 
 # Text mode objects
@@ -33,7 +35,7 @@ TEXT_OBJ = src/vga.o src/shell.o src/terminal.o src/hwinfo.o src/i915.o src/pcix
 # Text boot keeps VGA text mode: start.asm built WITHOUT the multiboot
 # video request (desktop start.o asks GRUB for 1920x1080x32, which would
 # leave the text kernel writing an invisible 0xB8000).
-TEXT_ASM_OBJ = boot/start_text.o boot/isr.o
+TEXT_ASM_OBJ = boot/start_text.o boot/isr.o boot/lm.o
 boot/start_text.o: boot/start.asm
 	$(AS) $(ASFLAGS) -DTEXTMODE $< -o $@
 
@@ -67,18 +69,16 @@ src/web/wjs_prelude.o: src/web/wjs_prelude.asm src/web/wjs_prelude.js
 	$(AS) $(ASFLAGS) $< -o $@
 
 # ojs (src/ojs): our JavaScript engine for page scripts (see src/ojs/README).
-# x87 doubles only (-mno-sse: the kernel FNSAVEs per thread and each realm runs
-# at 53-bit precision); our libm (src/kmath.c), our 64-bit division helpers
-# (src/divdi3.c - no libgcc), the realm clock (src/kclock.c). vm.c is the
+# SSE2 doubles (thread context only; a context switch saves XMM); our libm (src/kmath.c), the realm clock (src/kclock.c). vm.c is the
 # interpreter: GCC copies its dispatch jump into every instruction.
-OJS_CFLAGS = -m32 -ffreestanding -fno-pic -fno-pie -mno-red-zone -O2 -fno-strict-aliasing \
-             -fno-stack-protector -mno-sse -mno-sse2 -mno-mmx -mfpmath=387 \
-             -fno-asynchronous-unwind-tables -DKERNEL -Isrc -MMD -MP \
+OJS_CFLAGS = -m64 -mcmodel=kernel -ffreestanding -fno-pic -fno-pie -mno-red-zone -O2 -fno-strict-aliasing \
+             -fno-stack-protector -msse2 -mfpmath=sse -mno-mmx \
+             -fno-asynchronous-unwind-tables -fno-unwind-tables -DKERNEL -Isrc -MMD -MP -Werror=implicit-function-declaration -Werror=int-conversion \
              -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
 OJS_SRC = gc str obj util conv num unicode unicode_data lex parse compile ops vm realm b_object b_function \
           b_error b_iter b_array b_string b_number b_global b_promise generator b_map b_proxy b_typed bigint \
           b_json b_date re b_regexp module api srctext
-OJS_OBJ = $(patsubst %,src/ojs/%.o,$(OJS_SRC)) src/kmath.o src/kclock.o src/divdi3.o
+OJS_OBJ = $(patsubst %,src/ojs/%.o,$(OJS_SRC)) src/kmath.o src/kclock.o
 src/ojs/vm.o: src/ojs/vm.c
 	$(CC) $(OJS_CFLAGS) --param max-goto-duplication-insns=64 -c $< -o $@
 src/ojs/%.o: src/ojs/%.c
@@ -86,15 +86,13 @@ src/ojs/%.o: src/ojs/%.c
 # kmath: computes in x87 extended precision (see the file header)
 src/kmath.o: src/kmath.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
-src/divdi3.o: src/divdi3.c
-	$(CC) $(OJS_CFLAGS) -c $< -o $@
-# Media decoders (src/media): doubles/floats on the x87 like ojs, libm from src/kmath.c.
+# Media decoders (src/media): SSE2 floating point like ojs, libm from src/kmath.c.
 MEDIA_SRC = ec opus_packet celt celt_tables opus_dec webm vp9 vp9_recon vp9_simd vcvt vp9_lf vp9_tables mp4 aac aac_tables resample h264 h264_slice h264_recon h264_cabac h264_inter h264_lf h264_tables meng
 MEDIA_OBJ = $(patsubst %,src/media/%.o,$(MEDIA_SRC))
 src/media/%.o: src/media/%.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
 src/userland_seed.o: $(USERLAND_GEN)
-# The dmccl language (src/dmccl) and the game engine on top of it (src/game, src/gamewin.c): doubles on the x87 like ojs.
+# The dmccl language (src/dmccl) and the game engine on top of it (src/game, src/gamewin.c): SSE2 floating point like ojs.
 GAME_SRC = dmccl/dm_lex dmccl/dm_compile dmccl/dm_vm dmccl/dm_lib game/phys game/game game/game_chars game/game_gfx
 GAME_OBJ = $(patsubst %,src/%.o,$(GAME_SRC)) src/gamewin.o src/game/levels.o
 src/dmccl/%.o: src/dmccl/%.c
@@ -136,17 +134,17 @@ WEB_HOST_SRC = src/web/wdom.c src/web/html5.c src/web/charset.c src/web/css_valu
 # media engine sources the script realm links (wjs_media.c)
 WEB_HOST_MEDIA = src/web/wjs_media.c src/web/wjs_canvas.c src/web/wjs_crypto.c src/web/wjs_wasm.c src/web/wasm.c src/crypto/sha1.c src/crypto/sha256.c src/crypto/sha512.c src/web/wcanvas.c src/media/meng.c src/media/webm.c src/media/opus_dec.c src/media/opus_packet.c src/media/celt.c src/media/celt_tables.c src/media/ec.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_simd.c src/media/vcvt.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/mp4.c src/media/aac.c src/media/aac_tables.c src/media/resample.c src/media/h264.c src/media/h264_slice.c src/media/h264_recon.c src/media/h264_cabac.c src/media/h264_inter.c src/media/h264_lf.c src/media/h264_tables.c
 # the ojs objects tests/web/build.sh made (globbed when the recipe runs)
-WEB_HOST_LINK = build-host/fontdata.o build-host/wjs_prelude.o build-host/ojs-web-nopie_O2/*.o -lm
-WEB_HOST_CC = gcc -m32 -msse2 -fno-pie -fno-pic -no-pie -O2 -Isrc -Itests/web
+WEB_HOST_LINK = build-host/fontdata.o build-host/wjs_prelude.o build-host/ojs-web64-nopie_O2/*.o -lm
+WEB_HOST_CC = gcc -m64 -msse2 -fno-pie -fno-pic -no-pie -O2 -Isrc -Itests/web
 web-tests:
 	mkdir -p build-host
 	sh tests/web/build.sh
 	$(WEB_HOST_CC) -o build-host/t_webcss tests/web/test_css.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_webcss | tail -n 2
 	$(WEB_HOST_CC) -o build-host/t_font tests/web/test_font.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_font | tail -n 2
 	$(WEB_HOST_CC) -o build-host/t_lazy tests/web/test_lazy.c $(WEB_HOST_SRC) src/web/wjs.c src/web/wjs_dom.c src/web/wjs_sys.c $(WEB_HOST_MEDIA) $(WEB_HOST_LINK) && ./build-host/t_lazy | tail -n 2
-	gcc -m32 -O1 -Isrc -o build-host/t_cookie tests/web/test_cookie.c src/web/wcookie.c src/web/wurl.c && ./build-host/t_cookie | tail -n 1
-	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_hpack tests/test_hpack.c && ASAN_OPTIONS=detect_leaks=1 ./build-host/t_hpack | tail -n 1
-	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_h2 tests/test_h2.c && ASAN_OPTIONS=detect_leaks=1 ./build-host/t_h2 | tail -n 1
+	gcc -m64 -O1 -Isrc -o build-host/t_cookie tests/web/test_cookie.c src/web/wcookie.c src/web/wurl.c && ./build-host/t_cookie | tail -n 1
+	gcc -m64 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_hpack tests/test_hpack.c && ASAN_OPTIONS=detect_leaks=1 ./build-host/t_hpack | tail -n 1
+	gcc -m64 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_h2 tests/test_h2.c && ASAN_OPTIONS=detect_leaks=1 ./build-host/t_h2 | tail -n 1
 	$(WEB_HOST_CC) -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_pscan tests/web/test_pscan.c src/web/pscan.c src/web/wurl.c && ./build-host/t_pscan | tail -n 1
 	./build-host/wbrowse tests/web/js/basic.html 800 600 build-host/js-basic.ppm 3 | grep RESULT
 	./build-host/wbrowse tests/web/js/fragparse.html 640 400 build-host/js-frag.ppm 3 | grep 'RESULT ALLPASS'
@@ -166,8 +164,7 @@ web-tests:
 	sh tests/web/test_webapi.sh
 	sh tests/web/test_wasm.sh
 	sh tests/web/test_canvas.sh
-	gcc -m32 -O2 -Isrc -Itests/web -o build-host/t_idct tests/web/test_idct.c -lm && ./build-host/t_idct | tail -n 1
-	gcc -m32 -O2 -o build-host/t_divdi3 tests/test_divdi3.c && ./build-host/t_divdi3 2000000
+	gcc -m64 -O2 -Isrc -Itests/web -o build-host/t_idct tests/web/test_idct.c -lm && ./build-host/t_idct | tail -n 1
 	sh tests/ojs/build.sh && ./build-host/ojs_run tests/ojs/smoke.js | tail -n 1 | grep 'ALL OK'
 	OJS_MEMLIMIT=64 ./build-host/ojs_run tests/ojs/memlimit.js | grep 'ALL OK'
 	./build-host/ojs_run tests/ojs/manyconsts.js | grep 'ALL OK'
@@ -187,64 +184,64 @@ HOST_CRYPTO_SRC = src/crypto/tls_client.c src/crypto/tls_record.c src/crypto/tls
               src/crypto/ec.c src/crypto/certverify.c src/crypto/roots.c
 host-tests:
 	mkdir -p build-host
-	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tls_crypto tests/test_tls_crypto.c src/crypto/sha256.c src/crypto/sha1.c src/crypto/sha512.c src/crypto/hmac.c src/crypto/hkdf.c src/crypto/aead.c src/crypto/chacha20.c src/crypto/poly1305.c src/crypto/x25519.c && ./build-host/t_tls_crypto | tail -n 2
-	gcc -m32 -O2 -Isrc -Isrc/crypto -o build-host/t_chachapoly tests/test_chachapoly.c src/crypto/chacha20.c src/crypto/poly1305.c && ./build-host/t_chachapoly | tail -n 3
-	gcc -m32 -O2 -mfpmath=387 -DKMATH_NO_STD_NAMES -o build-host/t_kmath tests/test_kmath.c src/kmath.c -lm && ./build-host/t_kmath 100000 | tail -n 1
-	gcc -m32 -O2 -Isrc -Isrc/crypto -o build-host/t_rng tests/test_rng.c src/crypto/rand.c src/crypto/chacha20.c src/crypto/sha256.c && ./build-host/t_rng | tail -n 2
-	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_strict tests/test_crypto_strict.c $(HOST_CRYPTO_SRC) && ./build-host/t_strict | tail -n 2
-	gcc -m32 -O2 -DKERNEL=0 -Isrc -o build-host/t_edtext tests/test_editor_text.c src/editor.c src/textslot.c && ./build-host/t_edtext | tail -n 2
-	gcc -m32 -O1 -fsanitize=address,undefined -Isrc -o build-host/t_acpi tests/test_acpi.c && ./build-host/t_acpi | tail -n 1
-	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc -o build-host/t_hid tests/test_hid.c src/hid.c && ./build-host/t_hid | tail -n 1
-	gcc -m32 -O2 -Isrc -o build-host/t_ablock tests/test_ablock.c src/ablock.c src/web/wdom.c && ./build-host/t_ablock | tail -n 2
-	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc -o build-host/t_touch tests/test_touch.c src/hid.c src/ptp.c src/dwi2c.c src/hidi2c.c src/i2caml.c && ./build-host/t_touch | tail -n 1
-	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc -o build-host/t_rtw -DRTWPCI_HOST tests/test_rtw.c src/rtw/rtw_pci.c src/rtw/rtw_tables.c src/rtw/wsta.c src/rtw/wcrypto.c src/crypto/sha1.c src/crypto/aes.c && ./build-host/t_rtw | tail -n 1
-	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_wcrypto tests/test_wcrypto.c src/rtw/wcrypto.c src/crypto/sha1.c src/crypto/aes.c && (python3 tests/wcrypto_vectors.py 1 | ./build-host/t_wcrypto | tail -n 1)
-	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_wsta tests/test_wsta.c src/rtw/wsta.c src/rtw/wcrypto.c src/crypto/sha1.c src/crypto/aes.c && ./build-host/t_wsta | tail -n 1
-	gcc -m32 -O1 -fsanitize=address,undefined -o build-host/t_i915 tests/test_i915.c src/i915.c && ./build-host/t_i915 | tail -n 1
+	gcc -m64 -O2 -Isrc/crypto -Isrc -o build-host/t_tls_crypto tests/test_tls_crypto.c src/crypto/sha256.c src/crypto/sha1.c src/crypto/sha512.c src/crypto/hmac.c src/crypto/hkdf.c src/crypto/aead.c src/crypto/chacha20.c src/crypto/poly1305.c src/crypto/x25519.c && ./build-host/t_tls_crypto | tail -n 2
+	gcc -m64 -O2 -Isrc -Isrc/crypto -o build-host/t_chachapoly tests/test_chachapoly.c src/crypto/chacha20.c src/crypto/poly1305.c && ./build-host/t_chachapoly | tail -n 3
+	gcc -m64 -O2 -mfpmath=sse -DKMATH_NO_STD_NAMES -o build-host/t_kmath tests/test_kmath.c src/kmath.c -lm && ./build-host/t_kmath 100000 | tail -n 1
+	gcc -m64 -O2 -Isrc -Isrc/crypto -o build-host/t_rng tests/test_rng.c src/crypto/rand.c src/crypto/chacha20.c src/crypto/sha256.c && ./build-host/t_rng | tail -n 2
+	gcc -m64 -O2 -Isrc/crypto -Isrc -o build-host/t_strict tests/test_crypto_strict.c $(HOST_CRYPTO_SRC) && ./build-host/t_strict | tail -n 2
+	gcc -m64 -O2 -DKERNEL=0 -Isrc -o build-host/t_edtext tests/test_editor_text.c src/editor.c src/textslot.c && ./build-host/t_edtext | tail -n 2
+	gcc -m64 -O1 -fsanitize=address,undefined -Isrc -o build-host/t_acpi tests/test_acpi.c && ./build-host/t_acpi | tail -n 1
+	gcc -m64 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc -o build-host/t_hid tests/test_hid.c src/hid.c && ./build-host/t_hid | tail -n 1
+	gcc -m64 -O2 -Isrc -o build-host/t_ablock tests/test_ablock.c src/ablock.c src/web/wdom.c && ./build-host/t_ablock | tail -n 2
+	gcc -m64 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc -o build-host/t_touch tests/test_touch.c src/hid.c src/ptp.c src/dwi2c.c src/hidi2c.c src/i2caml.c && ./build-host/t_touch | tail -n 1
+	gcc -m64 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc -o build-host/t_rtw -DRTWPCI_HOST tests/test_rtw.c src/rtw/rtw_pci.c src/rtw/rtw_tables.c src/rtw/wsta.c src/rtw/wcrypto.c src/crypto/sha1.c src/crypto/aes.c && ./build-host/t_rtw | tail -n 1
+	gcc -m64 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_wcrypto tests/test_wcrypto.c src/rtw/wcrypto.c src/crypto/sha1.c src/crypto/aes.c && (python3 tests/wcrypto_vectors.py 1 | ./build-host/t_wcrypto | tail -n 1)
+	gcc -m64 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_wsta tests/test_wsta.c src/rtw/wsta.c src/rtw/wcrypto.c src/crypto/sha1.c src/crypto/aes.c && ./build-host/t_wsta | tail -n 1
+	gcc -m64 -O1 -fsanitize=address,undefined -o build-host/t_i915 tests/test_i915.c src/i915.c && ./build-host/t_i915 | tail -n 1
 	$(MAKE) web-tests
-	gcc -m32 -O2 -Isrc/crypto -o build-host/t_aes tests/test_aes.c src/crypto/aes.c && (python3 tests/aes_vectors.py 300 2>/dev/null | ./build-host/t_aes - || ./build-host/t_aes) | tail -n 2
-	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_pki tests/test_pki.c $(HOST_CRYPTO_SRC) && ./build-host/t_pki | tail -n 2
-	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_alpn tests/test_alpn.c $(HOST_CRYPTO_SRC) && ./build-host/t_alpn | tail -n 1
+	gcc -m64 -O2 -Isrc/crypto -o build-host/t_aes tests/test_aes.c src/crypto/aes.c && (python3 tests/aes_vectors.py 300 2>/dev/null | ./build-host/t_aes - || ./build-host/t_aes) | tail -n 2
+	gcc -m64 -O2 -Isrc/crypto -Isrc -o build-host/t_pki tests/test_pki.c $(HOST_CRYPTO_SRC) && ./build-host/t_pki | tail -n 2
+	gcc -m64 -O2 -Isrc/crypto -Isrc -o build-host/t_alpn tests/test_alpn.c $(HOST_CRYPTO_SRC) && ./build-host/t_alpn | tail -n 1
 	printf '#include <string.h>\n#include <stdint.h>\n#include "tls_client.h"\n' > build-host/dechunk_fn.c
 	awk '/^int http_dechunk\(char\* buf, int len\) \{/{p=1} p{print} p&&/^}/{exit}' src/net/network.c >> build-host/dechunk_fn.c
-	gcc -m32 -O1 -fsanitize=address,undefined -Isrc/crypto -Isrc -o build-host/t_dechunk tests/test_dechunk.c build-host/dechunk_fn.c $(HOST_CRYPTO_SRC) && ./build-host/t_dechunk | tail -n 1
-	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_adv tests/test_adversarial.c $(HOST_CRYPTO_SRC) && timeout 300 ./build-host/t_adv | tail -n 3
-	-gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tls_live tests/test_tls_client.c $(HOST_CRYPTO_SRC) && timeout 60 ./build-host/t_tls_live | tail -n 3; echo "(tls_client_test: needs internet; SKIP if unreachable)"
+	gcc -m64 -O1 -fsanitize=address,undefined -Isrc/crypto -Isrc -o build-host/t_dechunk tests/test_dechunk.c build-host/dechunk_fn.c $(HOST_CRYPTO_SRC) && ./build-host/t_dechunk | tail -n 1
+	gcc -m64 -O2 -Isrc/crypto -Isrc -o build-host/t_adv tests/test_adversarial.c $(HOST_CRYPTO_SRC) && timeout 300 ./build-host/t_adv | tail -n 3
+	-gcc -m64 -O2 -Isrc/crypto -Isrc -o build-host/t_tls_live tests/test_tls_client.c $(HOST_CRYPTO_SRC) && timeout 60 ./build-host/t_tls_live | tail -n 3; echo "(tls_client_test: needs internet; SKIP if unreachable)"
 
 # Media decoders (src/media) against the RFC 6716 reference decoder's output; the vectors
 # are checked in (tests/media/vec), regenerate with tests/media/gen_opus_vectors.py.
-# -mfpmath=387 matches what the kernel executes (x87, no SSE).
+# -mfpmath=sse matches what the kernel executes (x87, no SSE).
 media-tests:
 	mkdir -p build-host
-	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -o build-host/t_celt tests/media/test_celt.c src/media/celt.c src/media/celt_tables.c src/media/ec.c src/media/opus_packet.c -lm
-	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_celt_fuzz tests/media/fuzz_celt.c src/media/celt.c src/media/celt_tables.c src/media/ec.c -lm
-	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_opus_ms tests/media/test_opus_ms.c src/media/opus_dec.c src/media/opus_packet.c src/media/celt.c src/media/celt_tables.c src/media/ec.c -lm
+	gcc -m64 -O1 -mfpmath=sse -fsanitize=address,undefined -o build-host/t_celt tests/media/test_celt.c src/media/celt.c src/media/celt_tables.c src/media/ec.c src/media/opus_packet.c -lm
+	gcc -m64 -O1 -mfpmath=sse -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_celt_fuzz tests/media/fuzz_celt.c src/media/celt.c src/media/celt_tables.c src/media/ec.c -lm
+	gcc -m64 -O1 -mfpmath=sse -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_opus_ms tests/media/test_opus_ms.c src/media/opus_dec.c src/media/opus_packet.c src/media/celt.c src/media/celt_tables.c src/media/ec.c -lm
 	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_opus_ms tests/media/vec | tail -n 1
-	gcc -m32 -O1 -mfpmath=387 -fsanitize=address,undefined -o build-host/t_opus tests/media/test_opus.c src/media/opus_dec.c src/media/opus_packet.c src/media/celt.c src/media/celt_tables.c src/media/ec.c -lm
+	gcc -m64 -O1 -mfpmath=sse -fsanitize=address,undefined -o build-host/t_opus tests/media/test_opus.c src/media/opus_dec.c src/media/opus_packet.c src/media/celt.c src/media/celt_tables.c src/media/ec.c -lm
 	@test -d tests/media/vec || { echo "no test vectors: run tests/media/gen_opus_vectors.py (needs ffmpeg + the RFC reference decoder)"; exit 1; }
 	@set -e; for f in tests/media/vec/opus_*.bit; do n=$${f%.bit}; ASAN_OPTIONS=detect_leaks=0 ./build-host/t_opus $$n.bit $$n.ref | tail -n 1 | sed "s|^|$$n: |"; done
 	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_celt_fuzz 50000 1 tests/media/vec/opus_celt_fb_st.bit tests/media/vec/opus_celt_ld_st_12k.bit tests/media/vec/opus_celt_2_5ms.bit | tail -n 1
-	gcc -m32 -O1 -fsanitize=address,undefined -o build-host/t_webm tests/media/test_webm.c src/media/webm.c -lm
-	gcc -m32 -O1 -fsanitize=address,undefined -o build-host/t_webm_unit tests/media/test_webm_unit.c src/media/webm.c -lm
-	gcc -m32 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_webm_fuzz tests/media/fuzz_webm.c src/media/webm.c -lm
+	gcc -m64 -O1 -fsanitize=address,undefined -o build-host/t_webm tests/media/test_webm.c src/media/webm.c -lm
+	gcc -m64 -O1 -fsanitize=address,undefined -o build-host/t_webm_unit tests/media/test_webm_unit.c src/media/webm.c -lm
+	gcc -m64 -O1 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_webm_fuzz tests/media/fuzz_webm.c src/media/webm.c -lm
 	@set -e; for f in tests/media/vec/webm_*.webm; do n=$${f%.webm}; ASAN_OPTIONS=detect_leaks=0 ./build-host/t_webm $$n.webm $$n.pkts | tail -n 1 | sed "s|^|$$n: |"; done
-	gcc -m32 -O1 -fsanitize=address,undefined -o build-host/t_arate tests/test_arate.c src/audio_rate.c -lm
+	gcc -m64 -O1 -fsanitize=address,undefined -o build-host/t_arate tests/test_arate.c src/audio_rate.c -lm
 	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_arate | tail -n 1
-	gcc -m32 -O1 -msse2 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_vcvt tests/media/test_vcvt.c src/media/vcvt.c
+	gcc -m64 -O1 -msse2 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_vcvt tests/media/test_vcvt.c src/media/vcvt.c
 	./build-host/t_vcvt | tail -n 1
-	gcc -m32 -O2 -msse2 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_vp9_lf tests/media/test_vp9_lf.c src/media/vp9_simd.c
+	gcc -m64 -O2 -msse2 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_vp9_lf tests/media/test_vp9_lf.c src/media/vp9_simd.c
 	./build-host/t_vp9_lf | tail -n 1
-	gcc -m32 -O1 -msse2 -fsanitize=address,undefined -o build-host/t_vp9 tests/media/test_vp9.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_simd.c src/media/vcvt.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/webm.c -lm
+	gcc -m64 -O1 -msse2 -fsanitize=address,undefined -o build-host/t_vp9 tests/media/test_vp9.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_simd.c src/media/vcvt.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/webm.c -lm
 	@set -e; for f in tests/media/vec/vp9_*.webm; do n=$${f%.webm}; ASAN_OPTIONS=detect_leaks=0 ./build-host/t_vp9 $$n.webm $$n.yuv | tail -n 1 | sed "s|^|$$n: |"; done
-	gcc -m32 -O1 -msse2 -pthread -DVP9_TEST_THREADS -fsanitize=address,undefined -o build-host/t_vp9_par tests/media/test_vp9.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_simd.c src/media/vcvt.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/webm.c -lm
+	gcc -m64 -O1 -msse2 -pthread -DVP9_TEST_THREADS -fsanitize=address,undefined -o build-host/t_vp9_par tests/media/test_vp9.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_simd.c src/media/vcvt.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/webm.c -lm
 	@set -e; for f in tests/media/vec/vp9_*.webm; do n=$${f%.webm}; VP9_PAR=1 ASAN_OPTIONS=detect_leaks=0 ./build-host/t_vp9_par $$n.webm $$n.yuv | tail -n 1 | sed "s|^|$$n (tiles + loop filter on threads): |"; done
-	gcc -m32 -O1 -msse2 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_vp9_fuzz tests/media/fuzz_vp9.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_simd.c src/media/vcvt.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/webm.c -lm
+	gcc -m64 -O1 -msse2 -fsanitize=address,undefined -fno-sanitize-recover=undefined -o build-host/t_vp9_fuzz tests/media/fuzz_vp9.c src/media/vp9.c src/media/vp9_recon.c src/media/vp9_simd.c src/media/vcvt.c src/media/vp9_lf.c src/media/vp9_tables.c src/media/webm.c -lm
 	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_vp9_fuzz 400 1 tests/media/vec/vp9_inter.webm tests/media/vec/vp9_intra.webm tests/media/vec/vp9_tiles.webm tests/media/vec/vp9_aq3.webm tests/media/vec/vp9_yuv422.webm tests/media/vec/vp9_yuv440.webm tests/media/vec/vp9_p10.webm tests/media/vec/vp9_odd.webm | tail -n 1
 	sh tests/media/build_meng.sh | tail -n 1
 	sh tests/media/build_aac.sh | tail -n 30 | grep -v PASS; true
-	gcc -m32 -O1 -fsanitize=address,undefined -o build-host/t_mp4 tests/media/test_mp4.c src/media/mp4.c -lm
+	gcc -m64 -O1 -fsanitize=address,undefined -o build-host/t_mp4 tests/media/test_mp4.c src/media/mp4.c -lm
 	@set -e; for f in tests/media/vec/mp4_*.mp4; do n=$${f%.mp4}; ASAN_OPTIONS=detect_leaks=0 ./build-host/t_mp4 $$n.mp4 $$n.pkts | tail -n 1; done
-	gcc -m32 -O1 -fsanitize=address,undefined -o build-host/t_resample tests/media/test_resample.c src/media/resample.c -lm
+	gcc -m64 -O1 -fsanitize=address,undefined -o build-host/t_resample tests/media/test_resample.c src/media/resample.c -lm
 	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_resample | tail -n 1
 	sh tests/media/build_h264.sh | grep -v "PASS"; true
 	ASAN_OPTIONS=detect_leaks=0 ./build-host/t_webm_unit | tail -n 1
@@ -255,7 +252,7 @@ media-tests:
 # after crypto/TLS changes, not on every edit.
 host-tests-asan:
 	mkdir -p build-host
-	gcc -m32 -O1 -g -fsanitize=address,undefined -Isrc/crypto -Isrc -o build-host/t_adv_asan tests/test_adversarial.c $(HOST_CRYPTO_SRC) && timeout 590 ./build-host/t_adv_asan | tail -n 3
+	gcc -m64 -O1 -g -fsanitize=address,undefined -Isrc/crypto -Isrc -o build-host/t_adv_asan tests/test_adversarial.c $(HOST_CRYPTO_SRC) && timeout 590 ./build-host/t_adv_asan | tail -n 3
 
 # Independent differential: okernel primitives vs Python `cryptography`
 # (OpenSSL-backed — fully independent C code). X25519 (both directions +
@@ -266,7 +263,7 @@ DIFF_ORACLE_SRC = src/crypto/sha256.c src/crypto/hmac.c src/crypto/hkdf.c \
               src/crypto/x25519.c
 diff-oracle:
 	mkdir -p build-host
-	gcc -m32 -O2 -Isrc/crypto -o build-host/diff_oracle tests/differential/diff_oracle.c $(DIFF_ORACLE_SRC)
+	gcc -m64 -O2 -Isrc/crypto -o build-host/diff_oracle tests/differential/diff_oracle.c $(DIFF_ORACLE_SRC)
 diff-test: diff-oracle
 	python3 tests/differential/test_crypto_diff.py 200
 
@@ -289,21 +286,14 @@ diff-test: diff-oracle
 # expected elements: configuredMessages, SupportedVersions, Application.)
 tls-interop:
 	mkdir -p build-host
-	gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/t_tlsa tests/test_tls_attacker.c $(HOST_CRYPTO_SRC)
+	gcc -m64 -O2 -Isrc/crypto -Isrc -o build-host/t_tlsa tests/test_tls_attacker.c $(HOST_CRYPTO_SRC)
 
 all: text
 
 # ---- Text mode build ----
 text: kanarchy-text.iso
 
-# The text kernel stays in 32-bit protected mode: its own gdt/idt objects, built without LONGMODE.
-TEXT_COMMON_OBJ = build-text/gdt.o build-text/idt.o $(filter-out src/gdt.o src/idt.o,$(COMMON_OBJ))
-build-text/gdt.o: src/gdt32.c $(HEADERS)
-	mkdir -p build-text
-	$(CC) $(CFLAGS) -ULONGMODE -c $< -o $@
-build-text/idt.o: src/idt.c $(HEADERS)
-	mkdir -p build-text
-	$(CC) $(CFLAGS) -ULONGMODE -c $< -o $@
+TEXT_COMMON_OBJ = $(COMMON_OBJ)
 
 kanarchy-text.bin: $(TEXT_ASM_OBJ) $(TEXT_COMMON_OBJ) $(TEXT_OBJ) src/kernel.o
 	$(LD) $(LDFLAGS) -o $@ $^
@@ -381,7 +371,7 @@ HEADERS := $(wildcard src/*.h) $(wildcard src/net/*.h) $(wildcard src/crypto/*.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 src/web/%.o: src/web/%.c $(HEADERS) $(WEB_HEADERS)
-	$(CC) $(CFLAGS) -Wno-unused-parameter -c $< -o $@
+	$(CC) $(FP_CFLAGS) -Wno-unused-parameter -c $< -o $@
 
 # SSE2 helpers: the only objects the compiler may use XMM registers in. They run
 # in thread context only (interrupt handlers must not touch XMM; see src/fpu.h).
@@ -389,24 +379,24 @@ src/simd.o src/simd_test.o: src/%.o: src/%.c $(HEADERS)
 	$(CC) $(CFLAGS) -msse2 -fno-tree-vectorize -c $< -o $@
 
 src/okai.o: src/okai.c $(HEADERS) $(WEB_HEADERS)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(FP_CFLAGS) -c $< -o $@
 
 # ---- Run ----
 run: text
-	qemu-system-i386 -cdrom kanarchy-text.iso -boot d
+	qemu-system-x86_64 -cdrom kanarchy-text.iso -boot d
 
 run-desktop: desktop
-	qemu-system-i386 -accel kvm -accel tcg -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0 -fullscreen
+	qemu-system-x86_64 -accel kvm -accel tcg -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std -device e1000,netdev=net0 -netdev user,id=net0 -fullscreen
 
 debug: text
-	qemu-system-i386 -cdrom kanarchy-text.iso -boot d -serial stdio
+	qemu-system-x86_64 -cdrom kanarchy-text.iso -boot d -serial stdio
 
 ALL_C_OBJ = $(COMMON_OBJ) $(TEXT_OBJ) $(DESKTOP_OBJ) src/kernel.o src/desktop.o
 
 clean:
 	rm -f $(ASM_OBJ) boot/start_text.o $(ALL_C_OBJ) $(ALL_C_OBJ:.o=.d)
 	rm -f kanarchy-text.bin kanarchy-text.iso kanarchy-desktop.bin kanarchy-desktop.iso kanarchy-disk.img
-	rm -rf isodir build-ksyms build-disk build-text build-win32
+	rm -rf isodir build-ksyms build-disk build-text build-win32 build-hb isodir-hb kanarchy-highbar.bin kanarchy-highbar.iso
 
 -include $(wildcard $(ALL_C_OBJ:.o=.d))
 
@@ -481,8 +471,20 @@ build-fbtext/start.o: boot/start.asm
 build-fbtext/%.o: src/%.c $(HEADERS)
 	mkdir -p build-fbtext
 	$(CC) $(CFLAGS) -DFBTEXT -c $< -o $@
-kanarchy-fbtext.bin: build-fbtext/start.o boot/isr.o $(COMMON_OBJ) build-fbtext/vga.o build-fbtext/terminal.o build-fbtext/kernel.o build-fbtext/fbtext.o src/shell.o src/hwinfo.o src/i915.o src/pcix.o src/acpi_pm.o src/text_stubs.o src/font_data.o
+kanarchy-fbtext.bin: build-fbtext/start.o boot/isr.o boot/lm.o $(COMMON_OBJ) build-fbtext/vga.o build-fbtext/terminal.o build-fbtext/kernel.o build-fbtext/fbtext.o src/shell.o src/hwinfo.o src/i915.o src/pcix.o src/acpi_pm.o src/text_stubs.o src/font_data.o
 	$(LD) $(LDFLAGS) -o $@ $^
+
+# ---- Test image: the USB controller's registers above 4 GB (tests/headless/test_highbar.py) ----
+build-hb/xhci.o: src/xhci.c $(HEADERS)
+	mkdir -p build-hb
+	$(CC) $(CFLAGS) -DXHCI_TEST_HIGH_BAR -c $< -o $@
+kanarchy-highbar.bin: $(ASM_OBJ) $(COMMON_OBJ) $(DESKTOP_OBJ) src/desktop.o build-hb/xhci.o linker-high.ld
+	$(LD) $(LDFLAGS_HIGH) -o $@ $(ASM_OBJ) $(COMMON_OBJ) $(filter-out src/xhci.o,$(DESKTOP_OBJ)) src/desktop.o build-hb/xhci.o
+kanarchy-highbar.iso: kanarchy-highbar.bin
+	rm -rf isodir-hb; mkdir -p isodir-hb/boot/grub
+	cp kanarchy-highbar.bin isodir-hb/boot/kanarchy.bin
+	printf 'set timeout=0\nset default=0\n\nmenuentry "KAnarchy OS" {\n    set gfxpayload=1920x1080x32\n    multiboot /boot/kanarchy.bin\n    boot\n}\n' > isodir-hb/boot/grub/grub.cfg
+	grub-mkrescue -o $@ isodir-hb 2>/dev/null
 
 # ---- Installed disk: MBR + GRUB (BIOS and UEFI), boot / recovery / log / data partitions (src/part.h) ----
 disk: kanarchy-disk.img

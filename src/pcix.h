@@ -32,9 +32,9 @@ uint8_t pcix_find_cap(struct pci_loc l, uint8_t id, uint8_t after);
 // Physical base of BAR `idx` (64-bit BARs are combined; *is64 and *mem say what
 // it was). Returns 0 when the BAR is unassigned or an I/O BAR; sets *hi_nonzero
 // when the address does not fit in 32 bits.
-uint32_t pcix_bar(struct pci_loc l, int idx, int* is_mem, int* above4g);
+uint64_t pcix_bar(struct pci_loc l, int idx, int* is_mem, int* above4g);   // the full address; above4g tells where it is
 
 // Size of BAR `idx` in bytes (probes by writing all ones, restores the value).
-uint32_t pcix_bar_size(struct pci_loc l, int idx);
+uint64_t pcix_bar_size(struct pci_loc l, int idx);
 
 #endif

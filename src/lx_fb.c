@@ -76,7 +76,7 @@ int lx_fb_open_hook(struct lx_task *t) {
     if (!F.raw) {
         F.raw = (uint8_t*)kmalloc(w * h * 4 + 4096);
         if (!F.raw) return -LX_ENOMEM;
-        F.pix = (uint32_t*)(((uint32_t)F.raw + 4095) & ~4095u);
+        F.pix = (uint32_t*)(((uintptr_t)F.raw + 4095) & ~(uintptr_t)4095);
         memset(F.pix, 0, w * h * 4);
     }
     F.w = w; F.h = h;
@@ -103,13 +103,13 @@ int64_t lx_fb_mmap(struct lx_task *t, uint32_t len) {
     if (F.win < 0 || !F.pix) return -LX_ENODEV;
     uint32_t size = (F.w * F.h * 4 + 0xFFF) & ~0xFFFu;
     if (len > size) len = size;
-    uint32_t va = lx_find_free(t, len);
+    uint64_t va = lx_find_free(t, len);
     if (!va) return -LX_ENOMEM;
     int r = lx_map_region(t, va, len, LX_PROT_READ | LX_PROT_WRITE, LX_MAP_SHARED, 0, 0);
     if (r) return r;
     struct lx_vma *v = lx_vma_find(t, va);
     if (v) v->shared_fb = 1;
-    uint32_t phys = V2P((uint32_t)F.pix);
+    phys_t phys = V2P(F.pix);
     for (uint32_t o = 0; o < len; o += 0x1000)
         if (aspace_map(t->mm->cr3, va + o, phys + o, 1)) return -LX_ENOMEM;
     F.mapped = 1;
@@ -142,7 +142,7 @@ int lx_fb_ioctl(struct lx_task *t, uint64_t req, uint64_t arg) {
         uint8_t f[80];
         memset(f, 0, sizeof f);
         memcpy(f, "KAnarchy fb", 12);
-        uint64_t smem = V2P((uint32_t)F.pix);
+        uint64_t smem = V2P(F.pix);
         uint32_t len = F.w * F.h * 4, type = 0, visual = 2, line = F.w * 4;
         memcpy(f + 16, &smem, 8); memcpy(f + 24, &len, 4);
         memcpy(f + 28, &type, 4); memcpy(f + 36, &visual, 4);

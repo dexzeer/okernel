@@ -32,7 +32,7 @@ void wjs_selq_forget(struct wdom* d);
 #define BUDGET_SCALE     (wjs_host.budget_scale > 1 ? wjs_host.budget_scale : 1)
 #define SCRIPT_BUDGET_MS (4000 * BUDGET_SCALE)   // one script evaluation (the whole OS waits: keep it short)
 #define TASK_BUDGET_MS   (3000 * BUDGET_SCALE)   // one timer / event / callback / promise job (killing a half-run job corrupts a framework's state: only a runaway loop should hit this)
-#define REALM_STACK_MAX  (900u << 10)
+#define REALM_STACK_MAX  (1800u << 10)
 #define MAX_SCRIPTS      256
 #define MAX_MODULES      512
 

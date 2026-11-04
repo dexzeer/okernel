@@ -371,16 +371,16 @@ void graphics_init(uint32_t mboot_phys) {
     // mboot_phys is PHYS (GRUB structs live low). Plain phys derefs through
     // the 0-4M LOW identity window (see kernel_main). Offsets from struct
     // mboot_info above: flags@0, pitch@96, addr@88.
-    uint32_t flags = *(volatile uint32_t*)(mboot_phys + 0);
+    uint32_t flags = *(volatile uint32_t*)(uintptr_t)(mboot_phys + 0);
 
     // VIDEO DIAG (2026-09-07): log the full multiboot framebuffer block so
     // the next agent can see what GRUB actually set (addr/pitch/w/h/bpp).
     {
-        uint64_t dfb = *(volatile uint64_t*)(mboot_phys + 88);
-        uint32_t dpitch = *(volatile uint32_t*)(mboot_phys + 96);
-        uint32_t dw = *(volatile uint32_t*)(mboot_phys + 100);
-        uint32_t dh = *(volatile uint32_t*)(mboot_phys + 104);
-        uint8_t dbpp = *(volatile uint8_t*)(mboot_phys + 108);
+        uint64_t dfb = *(volatile uint64_t*)(uintptr_t)(mboot_phys + 88);
+        uint32_t dpitch = *(volatile uint32_t*)(uintptr_t)(mboot_phys + 96);
+        uint32_t dw = *(volatile uint32_t*)(uintptr_t)(mboot_phys + 100);
+        uint32_t dh = *(volatile uint32_t*)(uintptr_t)(mboot_phys + 104);
+        uint8_t dbpp = *(volatile uint8_t*)(uintptr_t)(mboot_phys + 108);
         serial_printf("[gfx] mboot fb=%x pitch=%d w=%d h=%d bpp=%d flags=%x\n",
                       (uint32_t)dfb, dpitch, dw, dh, dbpp, flags);
     }
@@ -388,16 +388,16 @@ void graphics_init(uint32_t mboot_phys) {
     // The mode the bootloader set. Everything sizes itself from gfx_w/gfx_h; only
     // 32 bits per pixel is supported (what GRUB gives us with gfxpayload ...x32).
     if (flags & (1 << 12)) {
-        uint32_t mw = *(volatile uint32_t*)(mboot_phys + 100);
-        uint32_t mh = *(volatile uint32_t*)(mboot_phys + 104);
-        uint32_t mp = *(volatile uint32_t*)(mboot_phys + 96);
-        uint8_t mbpp = *(volatile uint8_t*)(mboot_phys + 108);
-        uint8_t mtype = *(volatile uint8_t*)(mboot_phys + 109);
+        uint32_t mw = *(volatile uint32_t*)(uintptr_t)(mboot_phys + 100);
+        uint32_t mh = *(volatile uint32_t*)(uintptr_t)(mboot_phys + 104);
+        uint32_t mp = *(volatile uint32_t*)(uintptr_t)(mboot_phys + 96);
+        uint8_t mbpp = *(volatile uint8_t*)(uintptr_t)(mboot_phys + 108);
+        uint8_t mtype = *(volatile uint8_t*)(uintptr_t)(mboot_phys + 109);
 #ifdef GFX_TEST_W
         // test build: pretend the panel is GFX_TEST_W x GFX_TEST_H (e.g. 1366 wide, not a multiple of 8) with a tight pitch, drawn
         // into the top of whatever bigger framebuffer QEMU gave us
         mw = GFX_TEST_W; mh = GFX_TEST_H; mp = GFX_TEST_W * 4; mbpp = 32; mtype = 1;
-        *(volatile uint32_t*)(mboot_phys + 96) = mp;
+        *(volatile uint32_t*)(uintptr_t)(mboot_phys + 96) = mp;
 #endif
         if (mtype == 1 && mbpp == 32 && mw >= 640 && mh >= 480 && mw <= SCREEN_W_MAX && mh <= SCREEN_H_MAX &&
             mp >= mw * 4) {
@@ -419,18 +419,9 @@ void graphics_init(uint32_t mboot_phys) {
     dirty_ylo = SCREEN_H; dirty_yhi = 0;
 
     if (flags & (1 << 12)) {
-        uint64_t fb = *(volatile uint64_t*)(mboot_phys + 88);
-        // FB is identity-mapped by paging_init (PD phys>>22, supervisor):
-        // use the PHYS address directly, NOT paging_map's MMIO window
-        // (that double-maps 0xFD000000 -> 0xC8000000+ and the flush wrote to
-        // the wrong window = black 640x480 screendump despite 1080p mode).
-        if (fb >> 32)
-            serial_printf("[gfx] framebuffer at %x:%x is above 4GB; this 32-bit kernel cannot map it\n",
-                          (uint32_t)(fb >> 32), (uint32_t)fb);
-        framebuffer = (uint8_t*)(uint32_t)fb;
-        fb_pitch = *(volatile uint32_t*)(mboot_phys + 96);
-        serial_printf("[gfx] using identity FB %x pitch=%d\n",
-                      (uint32_t)fb, fb_pitch);
+        framebuffer = paging_fb_ptr();          // mapped by paging_init, write-combining
+        fb_pitch = *(volatile uint32_t*)(uintptr_t)(mboot_phys + 96);
+        serial_printf("[gfx] framebuffer at %lx pitch=%d\n", paging_fb_phys(), fb_pitch);
     } else {
         framebuffer = (uint8_t*)paging_map_low(0xA0000);
         fb_pitch = SCREEN_W * 4;
@@ -484,7 +475,8 @@ void putpixel(int x, int y, uint32_t color) {
 
 // n pixels of one color: rep stosl (the per-pixel loops were a hot spot).
 static inline void fill32(uint32_t* d, uint32_t v, int n) {
-    if (n > 0) __asm__ volatile("rep stosl" : "+D"(d), "+c"(n) : "a"(v) : "memory");
+    uint64_t c = n > 0 ? (uint64_t)n : 0;   // RCX: all 64 bits count
+    __asm__ volatile("rep stosl" : "+D"(d), "+c"(c) : "a"(v) : "memory");
 }
 
 void rect_fill(int x, int y, int w, int h, uint32_t color) {
@@ -1039,6 +1031,7 @@ void graphics_fill(uint32_t color) {
 }
 
 uint8_t* graphics_fb_base(void) { return framebuffer; }
+uint64_t graphics_fb_phys(void) { return paging_fb_phys(); }
 int graphics_fb_pitch(void) { return (int)fb_pitch; }
 
 // ---- presenting damage ---------------------------------------------------------
@@ -1058,7 +1051,7 @@ static void fb_present(const struct display_rect* rects, int n) {
             int y1 = y + FLUSH_CHUNK;
             if (y1 > rects[i].y + rects[i].h) y1 = rects[i].y + rects[i].h;
             uint32_t fl;
-            __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
+            __asm__ volatile("pushfq; popq %q0; cli" : "=r"(fl) :: "memory");
             if (xa == 0 && xb == SCREEN_W && fb_pitch == SCREEN_W * 4) {
                 simd_copy_stream(framebuffer + y * fb_pitch, backbuffer + y * SCREEN_W,
                                  (unsigned)(y1 - y) * SCREEN_W * 4);
@@ -1124,7 +1117,7 @@ int graphics_verify(int* fx, int* fy) {
     int bad = 0;
     for (int y = 0; y < SCREEN_H; y++) {
         uint32_t fl;
-        __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
+        __asm__ volatile("pushfq; popq %q0; cli" : "=r"(fl) :: "memory");
         int cx0 = 0, cy0 = 0, cx1 = 0, cy1 = 0;
         int has = cursor_rect(&cx0, &cy0, &cx1, &cy1) && y >= cy0 && y < cy1;
         const uint32_t* f = (const uint32_t*)(framebuffer + y * fb_pitch);

@@ -15,6 +15,26 @@
 section .text
 global call_on_stack
 global engine_main_sp
+%ifidn __OUTPUT_FORMAT__,elf64
+bits 64
+call_on_stack:                      ; rdi = fn, rsi = arg, rdx = stack top
+    push rbp
+    mov rbp, rsp
+    push qword [engine_main_sp]     ; the enclosing value, put back below
+    sub rsp, 8                      ; (keeps this frame 16-byte aligned; the fake value below is what a pump starts under)
+    mov [engine_main_sp], rsp
+    mov rax, rdi
+    mov rdi, rsi
+    and rdx, -16                    ; 16-byte align
+    mov rsp, rdx
+    call rax
+    lea rsp, [rbp - 8]              ; back to the caller's stack, at the saved value
+    pop qword [engine_main_sp]
+    pop rbp
+    ret
+section .bss
+engine_main_sp: resq 1
+%else
 call_on_stack:
     push ebp
     mov ebp, esp
@@ -32,9 +52,9 @@ call_on_stack:
     pop dword [engine_main_sp]
     pop ebp
     ret
-
 section .bss
 engine_main_sp: resd 1
+%endif
 
 ; Must be LAST (see AGENTS.md: code after it lands non-executable)
 %ifnidn __OUTPUT_FORMAT__,win32

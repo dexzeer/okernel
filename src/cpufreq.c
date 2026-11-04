@@ -15,19 +15,19 @@
 #define MSR_ATOM_TURBO     0x66C     // bits 6:0 highest turbo ratio (one core active)
 
 // A fault-safe RDMSR/WRMSR: isr_handler (idt.c) resumes at msr_fix_to when a #GP hits msr_fix_from.
-volatile uint32_t msr_fix_from, msr_fix_to;
+volatile uintptr_t msr_fix_from, msr_fix_to;
 
 static int rdmsr_safe(uint32_t msr, uint64_t* v) {
     uint32_t lo = 0, hi = 0, ok;
     __asm__ volatile(
-        "movl $1f, msr_fix_from\n\t"
-        "movl $2f, msr_fix_to\n\t"
+        "movq $1f, msr_fix_from\n\t"
+        "movq $2f, msr_fix_to\n\t"
         "1: rdmsr\n\t"
         "movl $1, %[ok]\n\t"
         "jmp 3f\n"
         "2: movl $0, %[ok]\n"
         "3:\n\t"
-        "movl $0, msr_fix_from\n\t"
+        "movq $0, msr_fix_from\n\t"
         : "=a"(lo), "=d"(hi), [ok] "=&r"(ok)
         : "c"(msr)
         : "memory", "cc");
@@ -38,14 +38,14 @@ static int rdmsr_safe(uint32_t msr, uint64_t* v) {
 __attribute__((unused)) static int wrmsr_safe(uint32_t msr, uint64_t v) {   // kept (and self-tested); nothing writes an MSR at the moment, see request_ratio
     uint32_t ok;
     __asm__ volatile(
-        "movl $1f, msr_fix_from\n\t"
-        "movl $2f, msr_fix_to\n\t"
+        "movq $1f, msr_fix_from\n\t"
+        "movq $2f, msr_fix_to\n\t"
         "1: wrmsr\n\t"
         "movl $1, %[ok]\n\t"
         "jmp 3f\n"
         "2: movl $0, %[ok]\n"
         "3:\n\t"
-        "movl $0, msr_fix_from\n\t"
+        "movq $0, msr_fix_from\n\t"
         : [ok] "=&r"(ok)
         : "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32))
         : "memory", "cc");
@@ -225,15 +225,15 @@ int cpufreq_slow_factor(void) { return bench_factor; }
 int cpufreq_msr_selftest(void) {
     uint32_t ok;
     __asm__ volatile(
-        "movl $1f, msr_fix_from\n\t"
-        "movl $2f, msr_fix_to\n\t"
+        "movq $1f, msr_fix_from\n\t"
+        "movq $2f, msr_fix_to\n\t"
         "movw $0x7FF8, %%ax\n\t"
         "1: movw %%ax, %%gs\n\t"
         "movl $0, %[ok]\n\t"                      // the load worked: not what a bad selector should do
         "jmp 3f\n"
         "2: movl $1, %[ok]\n"                     // resumed here after the #GP
         "3:\n\t"
-        "movl $0, msr_fix_from\n\t"
+        "movq $0, msr_fix_from\n\t"
         : [ok] "=&r"(ok)
         :
         : "eax", "memory", "cc");

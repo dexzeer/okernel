@@ -2,6 +2,8 @@
 // tables, channel switch) runs against a software model of the chip behind the USB calls, then received beacons go through
 // the receive path into the scan list. The model encodes what we know of the hardware, so it checks the driver's own logic
 // (loops that end, buffer sizes, register arithmetic, table conditions), not the hardware.
+#define _GNU_SOURCE
+#include <sys/mman.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
@@ -23,10 +25,22 @@ uint8_t* net_get_ip(void) { static uint8_t ip[4] = { 192, 168, 1, 9 }; return ip
 uint8_t* net_get_gateway(void) { static uint8_t ip[4] = { 192, 168, 1, 1 }; return ip; }
 int net_wifi_bound(void) { return 1; }
 int rand_bytes(uint8_t* o, uint32_t n) { (void)o; (void)n; return 0; }          // not seeded: the driver falls back to its own mixing
-void* kmalloc(uint32_t n) { return malloc(n); }
-void* kcalloc(uint32_t n, uint32_t sz) { return calloc(n, sz); }
+// DMA addresses are 32-bit: the driver's memory comes from an arena below 4 GB, where V2P (memlayout.h) is the identity.
+static void* arena_alloc(size_t n) {
+    static uint8_t* arena; static size_t used;
+    if (!arena) {
+        arena = (uint8_t*)mmap(0, 64u << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_32BIT, -1, 0);
+        if (arena == (uint8_t*)MAP_FAILED) { printf("FAIL: no memory below 4 GB\n"); exit(1); }
+    }
+    void* p = arena + used;
+    used += (n + 15) & ~(size_t)15;
+    if (used > (64u << 20)) { printf("FAIL: arena exhausted\n"); exit(1); }
+    return p;      // zeroed: never reused
+}
+void* kmalloc(size_t n) { return arena_alloc(n); }
+void* kcalloc(size_t n, size_t sz) { return arena_alloc(n * sz); }
 void rtwpci_host_attach(uint16_t did);
-void kfree(void* p) { free(p); }
+void kfree(void* p) { (void)p; }
 int devlog_fmt(char* out, int cap, const char* fmt, va_list ap);
 static int vlog_n;
 int devlog_fmt(char* out, int cap, const char* fmt, va_list ap) { return vsnprintf(out, (size_t)cap, fmt, ap); }
@@ -131,7 +145,7 @@ static const uint16_t m_desa[8] = { 0x330, 0x328, 0x320, 0x318, 0x310, 0x340, 0x
 static const uint16_t m_num[8]  = { 0x38A, 0x388, 0x386, 0x384, 0x380, 0x38C, 0x1328, 0 };
 static const uint16_t m_idx[8]  = { 0x3AC, 0x3A8, 0x3A4, 0x3A0, 0x3B0, 0x3B8, 0x132C, 0 };
 static int pci_tx_pkts, pci_bad_bd;
-static uint8_t* dma_ptr(uint32_t phys) { return (uint8_t*)(uintptr_t)(phys + 0xC0000000u); }
+static uint8_t* dma_ptr(uint32_t phys) { return (uint8_t*)(uintptr_t)phys; }
 static uint16_t rd16m(uint32_t a) { return (uint16_t)(regs[a] | (regs[a + 1] << 8)); }
 
 static void pci_one_tx(const uint8_t* bd, int own_expected) {

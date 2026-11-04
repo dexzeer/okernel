@@ -64,12 +64,7 @@ static void head(const char* t) {
 static void gpu_line(const char* s, void* ud) { (void)ud; pf("%s\n", s); }
 
 // ---- cpu -------------------------------------------------------------------------------------
-static int has_cpuid(void) {
-    uint32_t a, b;
-    __asm__ volatile("pushfl; pushfl; popl %0; movl %0, %1; xorl $0x200000, %0; pushl %0; popfl; pushfl; popl %0; popfl"
-                     : "=r"(a), "=r"(b) :: "cc");
-    return ((a ^ b) & 0x200000) != 0;
-}
+static int has_cpuid(void) { return 1; }      // every x86-64 CPU has it
 
 static void cpuid(uint32_t leaf, uint32_t* a, uint32_t* b, uint32_t* c, uint32_t* d) {
     __asm__ volatile("cpuid" : "=a"(*a), "=b"(*b), "=c"(*c), "=d"(*d) : "a"(leaf), "c"(0));
@@ -81,13 +76,13 @@ void hwinfo_cpu(void) {
     uint32_t a, b, c, d, maxleaf;
     char vendor[13];
     cpuid(0, &maxleaf, &b, &c, &d);
-    *(uint32_t*)(vendor + 0) = b; *(uint32_t*)(vendor + 4) = d; *(uint32_t*)(vendor + 8) = c; vendor[12] = 0;
+    *(uint32_t*)(uintptr_t)(vendor + 0) = b; *(uint32_t*)(uintptr_t)(vendor + 4) = d; *(uint32_t*)(uintptr_t)(vendor + 8) = c; vendor[12] = 0;
     pf("vendor %s, highest basic leaf %u\n", vendor, maxleaf);
     uint32_t emax;
     cpuid(0x80000000u, &emax, &b, &c, &d);
     if (emax >= 0x80000004u) {
         char brand[49];
-        for (int i = 0; i < 3; i++) cpuid(0x80000002u + (uint32_t)i, (uint32_t*)(brand + i * 16), (uint32_t*)(brand + i * 16 + 4), (uint32_t*)(brand + i * 16 + 8), (uint32_t*)(brand + i * 16 + 12));
+        for (int i = 0; i < 3; i++) cpuid(0x80000002u + (uint32_t)i, (uint32_t*)(uintptr_t)(brand + i * 16), (uint32_t*)(uintptr_t)(brand + i * 16 + 4), (uint32_t*)(uintptr_t)(brand + i * 16 + 8), (uint32_t*)(uintptr_t)(brand + i * 16 + 12));
         brand[48] = 0;
         const char* s = brand;
         while (*s == ' ') s++;
@@ -119,22 +114,22 @@ void hwinfo_cpu(void) {
 // ---- memory map ------------------------------------------------------------------------------
 void hwinfo_memmap(void) {
     head("Memory map (from the bootloader)");
-    uint32_t flags = *(volatile uint32_t*)(g_mboot + 0);
-    pf("lower %u KB, upper %u KB\n", *(volatile uint32_t*)(g_mboot + 4), *(volatile uint32_t*)(g_mboot + 8));
+    uint32_t flags = *(volatile uint32_t*)(uintptr_t)(g_mboot + 0);
+    pf("lower %u KB, upper %u KB\n", *(volatile uint32_t*)(uintptr_t)(g_mboot + 4), *(volatile uint32_t*)(uintptr_t)(g_mboot + 8));
     if (!(flags & (1u << 6))) { pf("no memory map\n"); return; }
-    uint32_t len = *(volatile uint32_t*)(g_mboot + 44), addr = *(volatile uint32_t*)(g_mboot + 48), off = 0;
+    uint32_t len = *(volatile uint32_t*)(uintptr_t)(g_mboot + 44), addr = *(volatile uint32_t*)(uintptr_t)(g_mboot + 48), off = 0;
     static const char* const T[] = { "?", "usable", "reserved", "ACPI reclaim", "ACPI NVS", "bad" };
     while (off + 24 <= len && off < 4096) {
-        uint32_t sz = *(volatile uint32_t*)(addr + off);
-        uint32_t bl = *(volatile uint32_t*)(addr + off + 4), bh = *(volatile uint32_t*)(addr + off + 8);
-        uint32_t ll = *(volatile uint32_t*)(addr + off + 12), lh = *(volatile uint32_t*)(addr + off + 16);
-        uint32_t ty = *(volatile uint32_t*)(addr + off + 20);
+        uint32_t sz = *(volatile uint32_t*)(uintptr_t)(addr + off);
+        uint32_t bl = *(volatile uint32_t*)(uintptr_t)(addr + off + 4), bh = *(volatile uint32_t*)(uintptr_t)(addr + off + 8);
+        uint32_t ll = *(volatile uint32_t*)(uintptr_t)(addr + off + 12), lh = *(volatile uint32_t*)(uintptr_t)(addr + off + 16);
+        uint32_t ty = *(volatile uint32_t*)(uintptr_t)(addr + off + 20);
         pf("  %08x%08x  %08x%08x  %s\n", bh, bl, lh, ll, ty < 6 ? T[ty] : "?");
         off += sz + 4;
     }
     if (flags & (1u << 12)) {
-        pf("bootloader framebuffer: %x pitch %u %ux%u bpp %u type %u\n", *(volatile uint32_t*)(g_mboot + 88), *(volatile uint32_t*)(g_mboot + 96),
-           *(volatile uint32_t*)(g_mboot + 100), *(volatile uint32_t*)(g_mboot + 104), (uint32_t)*(volatile uint8_t*)(g_mboot + 108), (uint32_t)*(volatile uint8_t*)(g_mboot + 109));
+        pf("bootloader framebuffer: %x pitch %u %ux%u bpp %u type %u\n", *(volatile uint32_t*)(uintptr_t)(g_mboot + 88), *(volatile uint32_t*)(uintptr_t)(g_mboot + 96),
+           *(volatile uint32_t*)(uintptr_t)(g_mboot + 100), *(volatile uint32_t*)(uintptr_t)(g_mboot + 104), (uint32_t)*(volatile uint8_t*)(uintptr_t)(g_mboot + 108), (uint32_t)*(volatile uint8_t*)(uintptr_t)(g_mboot + 109));
     }
 }
 
@@ -149,23 +144,23 @@ static uint32_t find_rsdp(void) {
         uint32_t lo = pass == 0 ? ebda : 0xE0000, hi = pass == 0 ? ebda + 1024 : 0x100000;
         if (pass == 0 && (ebda < 0x80000 || ebda > 0xA0000)) continue;
         for (uint32_t p = lo; p + 20 <= hi; p += 16)
-            if (!memcmp((const void*)p, "RSD PTR ", 8) && sum_ok((const uint8_t*)p, 20)) return p;
+            if (!memcmp((const void*)(uintptr_t)p, "RSD PTR ", 8) && sum_ok((const uint8_t*)(uintptr_t)p, 20)) return p;
     }
-    uint32_t flags = *(volatile uint32_t*)(g_mboot + 0);
+    uint32_t flags = *(volatile uint32_t*)(uintptr_t)(g_mboot + 0);
     if (!(flags & (1u << 6))) return 0;
-    uint32_t len = *(volatile uint32_t*)(g_mboot + 44), addr = *(volatile uint32_t*)(g_mboot + 48);
+    uint32_t len = *(volatile uint32_t*)(uintptr_t)(g_mboot + 44), addr = *(volatile uint32_t*)(uintptr_t)(g_mboot + 48);
     for (int want = 3; want <= 4; want++)                      // reclaim first, then NVS
         for (uint32_t off = 0; off + 24 <= len;) {
-            volatile uint8_t* e = (volatile uint8_t*)(addr + off);
+            volatile uint8_t* e = (volatile uint8_t*)(uintptr_t)(addr + off);
             uint32_t esz = *(volatile uint32_t*)e;
-            uint64_t base = *(volatile uint64_t*)(e + 4), rl = *(volatile uint64_t*)(e + 12);
-            uint32_t type = *(volatile uint32_t*)(e + 20);
+            uint64_t base = *(volatile uint64_t*)(uintptr_t)(e + 4), rl = *(volatile uint64_t*)(uintptr_t)(e + 12);
+            uint32_t type = *(volatile uint32_t*)(uintptr_t)(e + 20);
             if (esz < 20) break;
             off += esz + 4;
             if ((int)type != want || base >= 0xFFFFF000ull) continue;
             uint32_t b = (uint32_t)base, n = rl > 0x1000000ull ? 0x1000000u : (uint32_t)rl;
             for (uint32_t p = (b + 15) & ~15u; p + 20 <= b + n; p += 16)
-                if (!memcmp((const void*)p, "RSD PTR ", 8) && sum_ok((const uint8_t*)p, 20)) return p;
+                if (!memcmp((const void*)(uintptr_t)p, "RSD PTR ", 8) && sum_ok((const uint8_t*)(uintptr_t)p, 20)) return p;
         }
     return 0;
 }
@@ -173,9 +168,9 @@ static uint32_t find_rsdp(void) {
 // the table at a physical address when it is reachable (below 4GB) and plausible
 static const uint8_t* table_at(uint64_t a, const char* sig) {
     if (a < 0x1000 || a >= 0xFFFFF000ull) return 0;
-    const uint8_t* t = (const uint8_t*)(uint32_t)a;
+    const uint8_t* t = (const uint8_t*)(uintptr_t)(uint32_t)a;
     if (sig && memcmp(t, sig, 4)) return 0;
-    uint32_t l = *(const uint32_t*)(t + 4);
+    uint32_t l = *(const uint32_t*)(uintptr_t)(t + 4);
     return l >= 36 && l < 0x400000 ? t : 0;
 }
 
@@ -183,23 +178,23 @@ static const uint8_t* table_at(uint64_t a, const char* sig) {
 static int acpi_tables(const uint8_t** out_t, int max) {
     uint32_t rsdp = find_rsdp();
     if (!rsdp) return 0;
-    const uint8_t* r = (const uint8_t*)rsdp;
+    const uint8_t* r = (const uint8_t*)(uintptr_t)rsdp;
     int n = 0;
-    uint64_t xs = r[15] >= 2 ? *(const uint64_t*)(r + 24) : 0;
+    uint64_t xs = r[15] >= 2 ? *(const uint64_t*)(uintptr_t)(r + 24) : 0;
     const uint8_t* x = xs ? table_at(xs, "XSDT") : 0;
     if (x) {
-        uint32_t l = *(const uint32_t*)(x + 4);
+        uint32_t l = *(const uint32_t*)(uintptr_t)(x + 4);
         for (uint32_t i = 36; i + 8 <= l && n < max; i += 8) {
-            const uint8_t* t = table_at(*(const uint64_t*)(x + i), 0);
+            const uint8_t* t = table_at(*(const uint64_t*)(uintptr_t)(x + i), 0);
             if (t) out_t[n++] = t;
         }
         return n;
     }
-    const uint8_t* rs = table_at(*(const uint32_t*)(r + 16), "RSDT");
+    const uint8_t* rs = table_at(*(const uint32_t*)(uintptr_t)(r + 16), "RSDT");
     if (!rs) return 0;
-    uint32_t l = *(const uint32_t*)(rs + 4);
+    uint32_t l = *(const uint32_t*)(uintptr_t)(rs + 4);
     for (uint32_t i = 36; i + 4 <= l && n < max; i += 4) {
-        const uint8_t* t = table_at(*(const uint32_t*)(rs + i), 0);
+        const uint8_t* t = table_at(*(const uint32_t*)(uintptr_t)(rs + i), 0);
         if (t) out_t[n++] = t;
     }
     return n;
@@ -211,11 +206,11 @@ void hwinfo_acpi(void) {
     head("ACPI");
     uint32_t rsdp = find_rsdp();
     if (!rsdp) { pf("no RSDP found\n"); return; }
-    const uint8_t* r = (const uint8_t*)rsdp;
+    const uint8_t* r = (const uint8_t*)(uintptr_t)rsdp;
     char oem[7];
     for (int i = 0; i < 6; i++) oem[i] = (char)r[9 + i];
     oem[6] = 0;
-    pf("RSDP at %x, revision %u, OEM %s, RSDT %x\n", rsdp, (uint32_t)r[15], oem, *(const uint32_t*)(r + 16));
+    pf("RSDP at %x, revision %u, OEM %s, RSDT %x\n", rsdp, (uint32_t)r[15], oem, *(const uint32_t*)(uintptr_t)(r + 16));
     const uint8_t* tabs[48];
     int n = acpi_tables(tabs, 48);
     if (!n) { pf("no readable RSDT/XSDT\n"); return; }
@@ -238,9 +233,9 @@ static int build_pm(struct acpi_pm* pm) {
     pm->valid = 0;
     for (int i = 0; i < n; i++) {
         if (memcmp(tabs[i], "FACP", 4)) continue;
-        if (!acpi_parse_fadt(tabs[i], *(const uint32_t*)(tabs[i] + 4), pm)) return 0;
+        if (!acpi_parse_fadt(tabs[i], *(const uint32_t*)(uintptr_t)(tabs[i] + 4), pm)) return 0;
         const uint8_t* d = pm->dsdt ? table_at(pm->dsdt, "DSDT") : 0;
-        if (d) pm->have_s5 = acpi_find_s5(d, *(const uint32_t*)(d + 4), &pm->slp_typa, &pm->slp_typb);
+        if (d) pm->have_s5 = acpi_find_s5(d, *(const uint32_t*)(uintptr_t)(d + 4), &pm->slp_typa, &pm->slp_typb);
         return 1;
     }
     return 0;
@@ -272,7 +267,7 @@ static void hid_add(const char* s) {
 }
 
 static void scan_aml(const uint8_t* t) {
-    uint32_t len = *(const uint32_t*)(t + 4);
+    uint32_t len = *(const uint32_t*)(uintptr_t)(t + 4);
     for (uint32_t i = 36; i + 12 < len; i++) {
         if (t[i] != '_' || !((t[i + 1] == 'H' && t[i + 2] == 'I' && t[i + 3] == 'D') || (t[i + 1] == 'C' && t[i + 2] == 'I' && t[i + 3] == 'D'))) continue;
         uint32_t p = i + 4;
@@ -313,8 +308,8 @@ static void input_acpi(void) {
     for (int i = 0; i < n; i++) {
         const char* sg = (const char*)tabs[i];
         if (!memcmp(sg, "FACP", 4)) {                              // the DSDT hangs off the FADT
-            const uint8_t* d = table_at(*(const uint32_t*)(tabs[i] + 40), "DSDT");
-            if (!d && *(const uint32_t*)(tabs[i] + 4) >= 148) d = table_at(*(const uint64_t*)(tabs[i] + 140), "DSDT");
+            const uint8_t* d = table_at(*(const uint32_t*)(uintptr_t)(tabs[i] + 40), "DSDT");
+            if (!d && *(const uint32_t*)(uintptr_t)(tabs[i] + 4) >= 148) d = table_at(*(const uint64_t*)(uintptr_t)(tabs[i] + 140), "DSDT");
             if (d) { scan_aml(d); nscan++; }
         } else if (!memcmp(sg, "SSDT", 4)) { scan_aml(tabs[i]); nscan++; }
     }
@@ -376,7 +371,7 @@ static const char* hexs(int v) {
 static void input_ps2(void) {
     head("PS/2 controller and pointing device");
     uint32_t fl;
-    __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
+    __asm__ volatile("pushfq; popq %q0; cli" : "=r"(fl) :: "memory");
     pit_start();
     uint32_t st = inb(0x64);
     pf("status port 0x64 = %02x%s\n", st, st == 0xFF ? "  (0xFF: there may be no PS/2 controller at all)" : "");
@@ -426,7 +421,7 @@ static void input_ps2(void) {
     kbc_data(cfg >= 0 ? (uint8_t)cfg : 0x47);                    // put the controller back as it was
     kbc_cmd(0xAE);
     kbc_flush();
-    __asm__ volatile("pushl %0; popfl" :: "r"(fl) : "memory", "cc");
+    __asm__ volatile("pushq %q0; popfq" :: "r"(fl) : "memory", "cc");
 }
 
 // ---- I2C-HID touchpad: what ACPI says and whether its controller answers ------------------------
@@ -443,8 +438,8 @@ static void aml_collect(void) {
     for (int i = 0; i < n && aml_n < 32; i++) {
         const char* sg = (const char*)tabs[i];
         if (!memcmp(sg, "FACP", 4)) {
-            const uint8_t* d = table_at(*(const uint32_t*)(tabs[i] + 40), "DSDT");
-            if (!d && *(const uint32_t*)(tabs[i] + 4) >= 148) d = table_at(*(const uint64_t*)(tabs[i] + 140), "DSDT");
+            const uint8_t* d = table_at(*(const uint32_t*)(uintptr_t)(tabs[i] + 40), "DSDT");
+            if (!d && *(const uint32_t*)(uintptr_t)(tabs[i] + 4) >= 148) d = table_at(*(const uint64_t*)(uintptr_t)(tabs[i] + 140), "DSDT");
             if (d) aml_t[aml_n++] = d;
         } else if (!memcmp(sg, "SSDT", 4)) aml_t[aml_n++] = tabs[i];
     }
@@ -460,7 +455,7 @@ static uint32_t aml_u32(const uint8_t* p) { return (uint32_t)p[0] | ((uint32_t)p
 
 // a DesignWare I2C block: component type register 0xFC reads "DW" 0x44570140
 static void i2c_probe_regs(uint32_t base) {
-    volatile uint32_t* r = (volatile uint32_t*)base;
+    volatile uint32_t* r = (volatile uint32_t*)(uintptr_t)base;
     uint32_t ctype = r[0xFC / 4], cver = r[0xF8 / 4];
     pf("    regs at %x: COMP_TYPE %x COMP_VERSION %x %s\n", base, ctype, cver,
        ctype == 0x44570140u ? "(DesignWare I2C)" : ctype == 0xFFFFFFFFu ? "(reads all ones: powered off or clock gated)" : "(not a DesignWare I2C?)");
@@ -477,7 +472,7 @@ void hwinfo_i2c_scan(void) {
     int n = 0;
     for (uint64_t a = 0x7D000000ull; a < 0xFEC00000ull; a += 0x1000) {
         if ((a >= 0x80000000ull && a < 0x81000000ull) || (a >= 0x90000000ull && a < 0xA0000000ull) || (a >= 0xE0000000ull && a < 0xF0000000ull)) continue;
-        volatile uint32_t* r = (volatile uint32_t*)(uint32_t)a;
+        volatile uint32_t* r = (volatile uint32_t*)(uintptr_t)(uint32_t)a;
         if (r[0xFC / 4] != 0x44570140u) continue;
         pf("DesignWare I2C at %x:\n", (uint32_t)a);
         i2c_probe_regs((uint32_t)a);
@@ -494,7 +489,7 @@ void hwinfo_i2c(void) {
     int found = 0;
     for (int ti = 0; ti < aml_n && !found; ti++) {
         const uint8_t* t = aml_t[ti];
-        uint32_t len = *(const uint32_t*)(t + 4);
+        uint32_t len = *(const uint32_t*)(uintptr_t)(t + 4);
         int hid = -1;
         static const char* const ids[] = { "SYNA3602", "SYNA", "ELAN", "ALPS", "CYAP", "MSFT0001", 0 };   // known touchpad ids, best first
         for (int k = 0; ids[k] && hid < 0; k++) hid = find_bytes(t, len, 36, ids[k], (uint32_t)strlen(ids[k]));
@@ -532,7 +527,7 @@ void hwinfo_i2c(void) {
         int dev_found = 0;
         for (int ti = 0; ti < aml_n; ti++) {
             const uint8_t* t = aml_t[ti];
-            uint32_t len = *(const uint32_t*)(t + 4);
+            uint32_t len = *(const uint32_t*)(uintptr_t)(t + 4);
             for (uint32_t i = 36; i + 12 < len; i++) {
                 if (t[i] != 0x5B || t[i + 1] != 0x82) continue;                         // DeviceOp
                 uint32_t p = i + 2, lead = t[p], cnt = (lead >> 6) & 3;
@@ -597,7 +592,7 @@ void hwinfo_i2c(void) {
         struct pci_loc l;
         if (!pcix_find_id(0x8086, d, 0, &l)) continue;
         int is_mem, above;
-        uint32_t bar = pcix_bar(l, 0, &is_mem, &above);
+        uint32_t bar = (uint32_t)pcix_bar(l, 0, &is_mem, &above);
         pf("PCI I2C controller 8086:%x at %02x:%02x.%u BAR0 %x\n", (uint32_t)d, l.bus, l.dev, l.fn, bar);
         if (bar && bar != 0xFFFFFFFFu) i2c_probe_regs(bar);
         npci++;
@@ -696,7 +691,7 @@ void hwinfo_gpu(void) {
            vendor_name((uint16_t)id), pcix_read32(loc, 0x2C));
         for (int b = 0; b < 6; b++) {
             int is_mem, above;
-            uint32_t bar = pcix_bar(loc, b, &is_mem, &above);
+            uint32_t bar = (uint32_t)pcix_bar(loc, b, &is_mem, &above);
             if (bar) pf("  BAR%u %08x  %s  %u KB%s\n", (uint32_t)b, bar, is_mem ? "mem" : "io ", pcix_bar_size(loc, b) >> 10, above ? "  (64-bit)" : "");
         }
     }

@@ -12,7 +12,7 @@
 //
 // Compile (host, system libc — note: do NOT add -Isrc; the kernel's
 // freestanding string.h would shadow the system one):
-//   gcc -m32 -O2 -Isrc/crypto -o build-host/diff_oracle \
+//   gcc -m64 -O2 -Isrc/crypto -o build-host/diff_oracle \
 //     tests/differential/diff_oracle.c <crypto sources...>
 #include <stdint.h>
 #include <stdio.h>

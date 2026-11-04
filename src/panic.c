@@ -17,7 +17,10 @@
 #include "graphics.h"
 #include "io.h"
 #include "paging.h"
+#include "idt.h"
 #include "klog.h"
+#include "memlayout.h"
+#include "process.h"
 #include "part.h"
 #include "serial.h"
 #include "string.h"
@@ -62,30 +65,32 @@ static const char* exc_name(int v) {
 
 // ---- symbols ----
 
-static int is_code(uint32_t a) { return a >= (uint32_t)_kernel_start && a < (uint32_t)_rodata_start; }
+static int is_code(uintptr_t a) { return a >= (uintptr_t)_kernel_start && a < (uintptr_t)_rodata_start; }
 
-static const char* sym_lookup(uint32_t addr, uint32_t* off) {
+// The table holds addresses as offsets from the base of the kernel image (tools/ksyms.py).
+static const char* sym_lookup(uintptr_t addr, uint32_t* off) {
     const uint8_t* t = _ksyms_start;
     if (_ksyms_end - t < 8 || memcmp(t, "KSYM", 4) || !is_code(addr)) return 0;
     uint32_t n = *(const uint32_t*)(t + 4);
     const uint32_t* e = (const uint32_t*)(t + 8);
     const char* names = (const char*)(t + 8 + n * 8);
-    if (!n || addr < e[0]) return 0;
+    uint32_t a = (uint32_t)(addr - KERNEL_VBASE);
+    if (!n || a < e[0]) return 0;
     uint32_t lo = 0, hi = n;                                  // the last entry with address <= addr
-    while (hi - lo > 1) { uint32_t m = (lo + hi) / 2; if (e[m * 2] <= addr) lo = m; else hi = m; }
-    *off = addr - e[lo * 2];
+    while (hi - lo > 1) { uint32_t m = (lo + hi) / 2; if (e[m * 2] <= a) lo = m; else hi = m; }
+    *off = a - e[lo * 2];
     return names + e[lo * 2 + 1];
 }
 
-static void put_addr(uint32_t a) {
+static void put_addr(uintptr_t a) {
     uint32_t off;
     const char* s = sym_lookup(a, &off);
-    if (s) rprintf("%08x  %s+0x%x\n", a, s, off);
-    else rprintf("%08x\n", a);
+    if (s) rprintf("%016lx  %s+0x%x\n", a, s, off);
+    else rprintf("%016lx\n", a);
 }
 
 // Whether a code address follows a CALL instruction (rel32, or FF /2 through a register or memory operand).
-static int after_call(uint32_t r) {
+static int after_call(uintptr_t r) {
     if (!is_code(r - 7) || !is_code(r)) return 0;
     const uint8_t* p = (const uint8_t*)r;
     if (p[-5] == 0xE8) return 1;
@@ -96,24 +101,25 @@ static int after_call(uint32_t r) {
 }
 
 // Whether a kernel address can be read without faulting (walks the current page tables).
-static int mapped(uint32_t va) { return paging_va_mapped(va); }
+static int mapped(uintptr_t va) { return paging_va_mapped(va); }
 
 
-// Return addresses on the stack, starting at esp (the frame pointer is omitted at -O2: this is a scan, like Linux's,
+// Return addresses on the stack, starting at rsp (the frame pointer is omitted at -O2: this is a scan, like Linux's,
 // so older entries can be stale). The first entry is the faulting address itself.
 #define TRACE_MAX 12
-static uint32_t trace[TRACE_MAX];
+static uintptr_t trace[TRACE_MAX];
 static int ntrace;
 
-static void stack_trace(uint32_t esp, uint32_t eip) {
+static void stack_trace(uintptr_t rsp, uintptr_t rip) {
     rputs("\ncall trace:\n  ");
-    put_addr(eip);
-    trace[0] = eip;
+    put_addr(rip);
+    trace[0] = rip;
     ntrace = 1;
-    uint32_t page = 0xFFFFFFFFu;
-    for (uint32_t a = esp & ~3u, k = 0; k < 2048 && ntrace < TRACE_MAX; a += 4, k++) {
+    uintptr_t page = ~(uintptr_t)0;
+    uintptr_t a = rsp & ~(uintptr_t)7;
+    for (uint32_t k = 0; k < 2048 && ntrace < TRACE_MAX; a += 8, k++) {
         if ((a >> 12) != page) { if (!mapped(a)) break; page = a >> 12; }
-        uint32_t v = *(const uint32_t*)a;
+        uintptr_t v = *(const uintptr_t*)a;
         uint32_t off;
         if (after_call(v) && (!sym_lookup(v, &off) || off)) {   // (a function's first byte is no return address)
             rputs("  ");
@@ -315,15 +321,14 @@ static void copy(char* d, int cap, const char* s) {
     d[n] = 0;
 }
 
-void panic_exception(int vec, uint32_t* f) {
+void panic_exception(int vec, struct trapframe* f) {
     begin();
-    // f: pusha (EDI ESI EBP ESP EBX EDX ECX EAX), int no, error code, EIP, CS, EFLAGS [, ESP, SS from ring 3]
-    uint32_t err = f[9], eip = f[10], cs = f[11] & 0xFFFF, efl = f[12], cr0, cr2, cr3, cr4;
+    uint32_t err = (uint32_t)f->err, cs = (uint32_t)f->cs & 0xFFFF, efl = (uint32_t)f->rflags;
+    uint64_t rip = f->rip, rsp = f->rsp, cr0, cr2, cr3, cr4;
     __asm__ volatile("mov %%cr0, %0; mov %%cr2, %1; mov %%cr3, %2; mov %%cr4, %3" : "=r"(cr0), "=r"(cr2), "=r"(cr3), "=r"(cr4));
     int user = (cs & 3) == 3;
-    uint32_t esp = user ? f[13] : (uint32_t)&f[13];
     int pid = -1;
-    if (process_current) { uint32_t* pcb = (uint32_t*)process_current(); if (pcb) pid = (int)pcb[0]; }
+    if (process_current) { struct process* pcb = process_current(); if (pcb) pid = (int)pcb->pid; }
     copy(title, sizeof title, exc_name(vec));
     if (vec == 14) {
         int n = 0;
@@ -331,24 +336,26 @@ void panic_exception(int vec, uint32_t* f) {
         while (*a) cause[n++] = *a++;
         a = err & 16 ? " fetching " : err & 2 ? " writing " : " reading ";
         while (*a) cause[n++] = *a++;
-        for (int b = 28; b >= 0; b -= 4) cause[n++] = "0123456789abcdef"[(cr2 >> b) & 15];
+        for (int b = 60; b >= 0; b -= 4) cause[n++] = "0123456789abcdef"[(cr2 >> b) & 15];
         cause[n] = 0;
     } else copy(cause, sizeof cause, exc_name(vec));
     if (user) { int n = (int)strlen(cause); copy(cause + n, (int)sizeof cause - n, " in a user program"); }
-    rec.err = err; rec.eip = eip; rec.cr2 = cr2; rec.cs = cs; rec.eflags = efl;
+    rec.err = err; rec.rip = rip; rec.cr2 = cr2; rec.cs = cs; rec.eflags = efl;
     uint32_t off;
-    const char* fn = sym_lookup(eip, &off);
+    const char* fn = sym_lookup(rip, &off);
     rprintf("%s, vector %d, error %x, %s, cpu %d, pid %d, up %us\n", exc_name(vec), vec, err,
             user ? "user" : "kernel", smp_cpu_index ? smp_cpu_index() : 0, pid, tick_count / 100);
-    if (fn) rprintf("at %08x %s+0x%x\n", eip, fn, off);
-    else rprintf("at %08x\n", eip);
+    if (fn) rprintf("at %016lx %s+0x%x\n", rip, fn, off);
+    else rprintf("at %016lx\n", rip);
     if (vec == 14)
-        rprintf("cr2 %08x: %s, %s, %s%s\n", cr2, err & 1 ? "protection" : "not present",
+        rprintf("cr2 %016lx: %s, %s, %s%s\n", cr2, err & 1 ? "protection" : "not present",
                 err & 2 ? "write" : "read", err & 4 ? "user" : "kernel", err & 16 ? ", fetch" : "");
-    rprintf("\neax %08x  ebx %08x  ecx %08x  edx %08x  esi %08x  edi %08x\n", f[7], f[4], f[6], f[5], f[1], f[0]);
-    rprintf("ebp %08x  esp %08x  eflags %08x  cs %x  cr0 %08x  cr3 %08x  cr4 %08x\n", f[2], esp, efl, cs, cr0, cr3, cr4);
-    if (!user) stack_trace(esp, eip);
-    else { trace[0] = eip; ntrace = 1; }
+    rprintf("\nrax %016lx  rbx %016lx  rcx %016lx\nrdx %016lx  rsi %016lx  rdi %016lx\n", f->rax, f->rbx, f->rcx, f->rdx, f->rsi, f->rdi);
+    rprintf("r8  %016lx  r9  %016lx  r10 %016lx\nr11 %016lx  r12 %016lx  r13 %016lx\n", f->r8, f->r9, f->r10, f->r11, f->r12, f->r13);
+    rprintf("r14 %016lx  r15 %016lx  rbp %016lx\nrsp %016lx  rflags %08x  cs %x\n", f->r14, f->r15, f->rbp, rsp, efl, cs);
+    rprintf("cr0 %lx  cr3 %lx  cr4 %lx\n", cr0, cr3, cr4);
+    if (!user) stack_trace(rsp, rip);
+    else { trace[0] = rip; ntrace = 1; }
     serial_printf("[panic] %s\n", title);
     serial_puts(rep);
     setup_screen();
@@ -362,11 +369,11 @@ void kpanic(const char* fmt, ...) {
     devlog_fmt(cause, sizeof cause, fmt, ap);
     va_end(ap);
     copy(title, sizeof title, cause);
-    uint32_t eip = (uint32_t)__builtin_return_address(0), esp;
-    __asm__ volatile("mov %%esp, %0" : "=r"(esp));
-    rec.eip = eip;
+    uintptr_t rip = (uintptr_t)__builtin_return_address(0), rsp;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
+    rec.rip = rip;
     rprintf("panic: %s\ncpu %d, up %us\n", cause, smp_cpu_index ? smp_cpu_index() : 0, tick_count / 100);
-    stack_trace(esp, eip);
+    stack_trace(rsp, rip);
     serial_printf("[panic] %s\n%s", title, rep);
     setup_screen();
     finish(0xFFFFFFFFu);

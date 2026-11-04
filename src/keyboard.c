@@ -88,7 +88,7 @@ static void keyboard_irq(void) {
         extern void rand_stir_src(const uint8_t e[32], int src) __attribute__((weak));
         if (rand_stir_src) {
             uint64_t t = 0;
-            __asm__ volatile("rdtsc" : "=A"(t));
+            { uint32_t tsc_lo_, tsc_hi_; __asm__ volatile("rdtsc" : "=a"(tsc_lo_), "=d"(tsc_hi_)); t = ((uint64_t)tsc_hi_ << 32) | tsc_lo_; }
             uint8_t sample[32];
             for (int i = 0; i < 32; i++)
                 sample[i] = (uint8_t)(((t >> ((i & 7) * 8)) & 0xFF) ^ (scancode + i));

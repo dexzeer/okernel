@@ -69,24 +69,24 @@ void smp_stop_others(void) {
 }
 uint32_t smp_cpu_apic_id(int cpu) { return (cpu >= 0 && cpu < SMP_MAX_CPUS) ? cpus[cpu].apic_id : 0; }
 
-static int cpu_of_stack(uint32_t esp) {
+static int cpu_of_stack(uintptr_t rsp) {
     for (int i = 1; i < SMP_MAX_CPUS; i++) {
-        uint32_t s = (uint32_t)cpus[i].stack;
-        if (s && esp >= s && esp < s + AP_STACK_SIZE) return i;
+        uintptr_t s = (uintptr_t)cpus[i].stack;
+        if (s && rsp >= s && rsp < s + AP_STACK_SIZE) return i;
     }
     return -1;
 }
 
 int smp_on_ap(void) {
-    uint32_t esp;
-    __asm__ volatile("mov %%esp, %0" : "=r"(esp));
-    return cpu_of_stack(esp) > 0;
+    uintptr_t rsp;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
+    return cpu_of_stack(rsp) > 0;
 }
 
 int smp_cpu_index(void) {
-    uint32_t esp;
-    __asm__ volatile("mov %%esp, %0" : "=r"(esp));
-    int c = cpu_of_stack(esp);
+    uintptr_t rsp;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
+    int c = cpu_of_stack(rsp);
     return c > 0 ? c : 0;
 }
 
@@ -252,18 +252,23 @@ void smp_ap_entry(void) {
 
 // Called from isr_handler for CPU exceptions. On an AP it is fatal for that
 // CPU only: report it and park the CPU. Returns 0 on the boot CPU.
-int smp_fault_hook(int int_num, uint32_t* frame) {
-    uint32_t esp;
-    __asm__ volatile("mov %%esp, %0" : "=r"(esp));
-    int c = cpu_of_stack(esp);
+int smp_fault_hook(int int_num, struct trapframe* frame) {
+    uintptr_t rsp;
+    __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
+    int c = cpu_of_stack(rsp);
     if (c <= 0) return 0;
     cpus[c].state = CPU_DEAD;
-    serial_printf("[smp] cpu %d (apic %d) fault vec=%d err=%x eip=%x -- cpu parked\n",
-                  c, cpus[c].apic_id, int_num, frame[9], frame[10]);
+    serial_printf("[smp] cpu %d (apic %d) fault vec=%d err=%x rip=%lx -- cpu parked\n",
+                  c, cpus[c].apic_id, int_num, (uint32_t)frame->err, frame->rip);
     for (;;) __asm__ volatile("cli; hlt");
 }
 
 // ---- bring-up -----------------------------------------------------------
+
+// The wake-up IPI: the AP leaves hlt, the handler acknowledges it, and the worker loop looks at the job queue.
+static void ipi_wake_entry(struct trapframe* f) { (void)f; smp_ipi_wake(); }
+// A spurious interrupt must not be acknowledged.
+static void spurious_entry(struct trapframe* f) { (void)f; }
 
 static int start_ap(int idx, uint32_t apic_id) {
     struct cpu_state* c = &cpus[idx];
@@ -271,12 +276,12 @@ static int start_ap(int idx, uint32_t apic_id) {
     if (!c->stack) { serial_puts("[smp] no memory for an AP stack\n"); return 0; }
     c->apic_id = apic_id;
 
-    uint8_t* tr = (uint8_t*)P2V_U32(TRAMP_PAGE << 12);
+    uint8_t* tr = (uint8_t*)P2V_ADDR(TRAMP_PAGE << 12);
     uint32_t len = (uint32_t)(ap_tramp_end - ap_tramp_start);
     for (uint32_t i = 0; i < len; i++) tr[i] = ap_tramp_start[i];
-    *(volatile uint32_t*)(tr + (ap_tramp_cr3 - ap_tramp_start)) = paging_kernel_pd_phys();
-    *(volatile uint32_t*)(tr + (ap_tramp_stack - ap_tramp_start)) = (uint32_t)c->stack + AP_STACK_SIZE - 4;
-    *(volatile uint32_t*)(tr + (ap_tramp_entry - ap_tramp_start)) = (uint32_t)smp_ap_entry;
+    *(volatile uint64_t*)(tr + (ap_tramp_cr3 - ap_tramp_start)) = paging_kernel_pd_phys();
+    *(volatile uint64_t*)(tr + (ap_tramp_stack - ap_tramp_start)) = (uint64_t)(uintptr_t)c->stack + AP_STACK_SIZE - 8;     // as if just called: rsp = 8 mod 16
+    *(volatile uint64_t*)(tr + (ap_tramp_entry - ap_tramp_start)) = (uint64_t)(uintptr_t)smp_ap_entry;
 
     start_idx = idx;
     c->state = CPU_STARTING;
@@ -313,15 +318,15 @@ int smp_init(void) {
     cpus[0].apic_id = lapic_id();
     serial_printf("[smp] boot cpu apic id %d (%s)\n", cpus[0].apic_id,
                   lapic_is_x2apic() ? "x2APIC" : "xAPIC");
-    idt_set_vector(LAPIC_VEC_WAKE, isr_ipi_wake);        // also the boot CPU's sleep timer (lapic_timer_oneshot_us)
-    idt_set_vector(LAPIC_VEC_SPUR, isr_spurious);
+    idt_set_vector(LAPIC_VEC_WAKE, ipi_wake_entry);        // also the boot CPU's sleep timer (lapic_timer_oneshot_us)
+    idt_set_vector(LAPIC_VEC_SPUR, spurious_entry);
     if (lapic_timer_calibrate()) serial_puts("[smp] local APIC timer calibrated (idle wake-ups)\n");
     if (!a->madt || a->ncpu < 2) {
         serial_puts("[smp] one CPU\n");
         return 1;
     }
-    idt_set_vector(LAPIC_VEC_WAKE, isr_ipi_wake);
-    idt_set_vector(LAPIC_VEC_SPUR, isr_spurious);
+    idt_set_vector(LAPIC_VEC_WAKE, ipi_wake_entry);
+    idt_set_vector(LAPIC_VEC_SPUR, spurious_entry);
 
     int started = 0;
     for (int i = 0; i < a->ncpu && ncpu_total < SMP_MAX_CPUS; i++) {

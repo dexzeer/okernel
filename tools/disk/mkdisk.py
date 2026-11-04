@@ -5,7 +5,7 @@
 # lxroot.tar (the Linux/Windows subsystem root, tools/lx/build_root.sh) is loaded by GRUB as a multiboot module.
 # BIOS: GRUB's boot.img in the MBR, its core image in the gap before the first partition.
 # UEFI: /EFI/BOOT/BOOTX64.EFI and BOOTIA32.EFI on the boot partition (type 0xEF, so firmware takes it as the ESP).
-# Run in QEMU:  qemu-system-i386 -m 1024 -hda kanarchy-disk.img -vga std
+# Run in QEMU:  qemu-system-x86_64 -m 1024 -hda kanarchy-disk.img -vga std
 import os, shutil, struct, subprocess, sys
 
 MB = 2048                                           # sectors

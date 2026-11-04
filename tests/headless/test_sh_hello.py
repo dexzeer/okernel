@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # QEMU regression: userland hello end-to-end + post-run crash check.
 # Exercises the generation-guard change (process.c): run /bin/hello must
-# print, exit 0, return to the shell, and NOT #PF with eip=esp=0 after.
+# print, exit 0, return to the shell, and NOT #PF with rip=rsp=0 after.
 import sys, time
 sys.path.insert(0, 'tests/headless')
 from okvm import OkVM
@@ -28,7 +28,7 @@ crash = ("Exception 14" in s.split("Back from user mode.")[-1]
 print("post-run #PF:", "FAIL (crashed)" if crash else "PASS (clean)")
 if crash:
     for l in s.splitlines():
-        if "Exception" in l or "eip=0" in l:
+        if "Exception" in l or "rip=0" in l:
             print("   ", l.strip()[-160:])
     ok = False
 

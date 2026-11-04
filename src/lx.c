@@ -13,7 +13,7 @@
 
 extern uint32_t lx_enter(void);                 // boot/lm.asm
 extern void lx_syscall_entry(void);
-extern uint32_t lx_ktop;                        // TSS.rsp0 / the registers of the task to run
+extern uint64_t lx_ktop;                        // TSS.rsp0 / the registers of the task to run
 extern uint64_t lx_fault_cr2;
 extern uint32_t tick_count;
 
@@ -47,14 +47,14 @@ int64_t lx_now_ms(void) {
 
 // ---- user memory ------------------------------------------------------------------------------------------------
 
-static uint32_t page_alloc_zero(void) {
-    uint32_t ph = pmm_alloc_page();
+static uint64_t page_alloc_zero(void) {
+    uint64_t ph = pmm_alloc_page();
     if (!ph) return 0;
-    memset((void*)P2V_U32(ph), 0, 4096);
+    memset((void*)P2V_ADDR(ph), 0, 4096);
     return ph;
 }
 
-struct lx_vma *lx_vma_find(struct lx_task *t, uint32_t addr) {
+struct lx_vma *lx_vma_find(struct lx_task *t, uint64_t addr) {
     for (int i = 0; i < t->mm->nvma; i++)
         if (addr >= t->mm->vma[i].start && addr < t->mm->vma[i].end) return &t->mm->vma[i];
     return 0;
@@ -75,22 +75,22 @@ static void vma_remove_at(struct lx_task *t, int i) {
 }
 
 // Does [start, end) overlap an existing mapping?
-static int vma_overlaps(struct lx_task *t, uint32_t start, uint32_t end) {
+static int vma_overlaps(struct lx_task *t, uint64_t start, uint64_t end) {
     for (int i = 0; i < t->mm->nvma; i++)
         if (start < t->mm->vma[i].end && end > t->mm->vma[i].start) return 1;
     return 0;
 }
 
-uint32_t lx_find_free(struct lx_task *t, uint32_t len) {
-    len = (len + 0xFFF) & ~0xFFFu;
-    uint32_t top = t->mm->mmap_hint ? t->mm->mmap_hint : LX_MMAP_TOP;
+uint64_t lx_find_free(struct lx_task *t, uint64_t len) {
+    len = (len + 0xFFF) & ~0xFFFull;
+    uint64_t top = t->mm->mmap_hint ? t->mm->mmap_hint : LX_MMAP_TOP;
     for (int pass = 0; pass < 2; pass++) {
-        uint32_t end = pass == 0 ? top : LX_MMAP_TOP;
+        uint64_t end = pass == 0 ? top : LX_MMAP_TOP;
         // first fit going down from `end`
-        uint32_t cand = end;
+        uint64_t cand = end;
         for (;;) {
             if (cand < LX_USER_BASE + len) break;
-            uint32_t s = cand - len;
+            uint64_t s = cand - len;
             int hit = -1;
             for (int i = 0; i < t->mm->nvma; i++)
                 if (s < t->mm->vma[i].end && cand > t->mm->vma[i].start) hit = i;
@@ -104,17 +104,17 @@ uint32_t lx_find_free(struct lx_task *t, uint32_t len) {
 }
 
 // Free the pages of [start, end) (those that were touched).
-static void free_pages(struct lx_task *t, uint32_t start, uint32_t end) {
-    for (uint32_t a = start; a < end; a += 0x1000) {
-        uint32_t ph = aspace_unmap(t->mm->cr3, a);
+static void free_pages(struct lx_task *t, uint64_t start, uint64_t end) {
+    for (uint64_t a = start; a < end; a += 0x1000) {
+        uint64_t ph = aspace_unmap(t->mm->cr3, a);
         struct lx_vma *fv = lx_vma_find(t, a);
         if (ph && fv && fv->shared_fb) continue;                // the framebuffer window owns these pages
         if (ph) { pmm_free_page(ph); if (t->mm->rss) t->mm->rss--; }
     }
 }
 
-int lx_map_region(struct lx_task *t, uint32_t start, uint32_t len, uint32_t prot, uint32_t flags, struct lx_node *node, uint64_t off) {
-    len = (len + 0xFFF) & ~0xFFFu;
+int lx_map_region(struct lx_task *t, uint64_t start, uint64_t len, uint32_t prot, uint32_t flags, struct lx_node *node, uint64_t off) {
+    len = (len + 0xFFF) & ~0xFFFull;
     if (!len || start < LX_USER_BASE || start + len > LX_USER_TOP || start + len < start) return -LX_ENOMEM;
     if (vma_overlaps(t, start, start + len)) lx_unmap_region(t, start, len);          // MAP_FIXED replaces
     struct lx_vma v = { start, start + len, prot, flags, node, off, start + len, 0 };
@@ -124,12 +124,12 @@ int lx_map_region(struct lx_task *t, uint32_t start, uint32_t len, uint32_t prot
     return r;
 }
 
-int lx_unmap_region(struct lx_task *t, uint32_t start, uint32_t len) {
-    uint32_t end = start + ((len + 0xFFF) & ~0xFFFu);
+int lx_unmap_region(struct lx_task *t, uint64_t start, uint64_t len) {
+    uint64_t end = start + ((len + 0xFFF) & ~0xFFFull);
     for (int i = 0; i < t->mm->nvma; ) {
         struct lx_vma *v = &t->mm->vma[i];
         if (v->end <= start || v->start >= end) { i++; continue; }
-        uint32_t cs = v->start > start ? v->start : start, ce = v->end < end ? v->end : end;
+        uint64_t cs = v->start > start ? v->start : start, ce = v->end < end ? v->end : end;
         free_pages(t, cs, ce);
         if (cs <= v->start && ce >= v->end) { vma_remove_at(t, i); continue; }       // wholly inside
         if (cs <= v->start) {                                                        // cut the front
@@ -149,14 +149,14 @@ int lx_unmap_region(struct lx_task *t, uint32_t start, uint32_t len) {
     return 0;
 }
 
-int lx_protect_region(struct lx_task *t, uint32_t start, uint32_t len, uint32_t prot) {
-    uint32_t end = start + ((len + 0xFFF) & ~0xFFFu);
+int lx_protect_region(struct lx_task *t, uint64_t start, uint64_t len, uint32_t prot) {
+    uint64_t end = start + ((len + 0xFFF) & ~0xFFFull);
     // every page must be mapped
-    for (uint32_t a = start; a < end; a += 0x1000) if (!lx_vma_find(t, a)) return -LX_ENOMEM;
+    for (uint64_t a = start; a < end; a += 0x1000) if (!lx_vma_find(t, a)) return -LX_ENOMEM;
     for (int i = 0; i < t->mm->nvma; i++) {
         struct lx_vma *v = &t->mm->vma[i];
         if (v->end <= start || v->start >= end || v->prot == prot) continue;
-        uint32_t cs = v->start > start ? v->start : start, ce = v->end < end ? v->end : end;
+        uint64_t cs = v->start > start ? v->start : start, ce = v->end < end ? v->end : end;
         // split off the parts outside [cs, ce)
         if (cs > v->start) {
             struct lx_vma head = *v;
@@ -175,7 +175,7 @@ int lx_protect_region(struct lx_task *t, uint32_t start, uint32_t len, uint32_t 
             if (vma_insert(t, &tail)) return -LX_ENOMEM;
         }
         v->prot = prot;
-        for (uint32_t a = v->start; a < v->end; a += 0x1000) aspace_set_writable(t->mm->cr3, a, (prot & LX_PROT_WRITE) != 0);
+        for (uint64_t a = v->start; a < v->end; a += 0x1000) aspace_set_writable(t->mm->cr3, a, (prot & LX_PROT_WRITE) != 0);
     }
     return 0;
 }
@@ -187,15 +187,15 @@ void lx_free_user(struct lx_task *t) { mm_free_user(t->mm); }
 static void mm_put(struct lx_mm *m);
 void lx_mm_hold(struct lx_mm *m) { m->refs++; }
 void lx_mm_release(struct lx_mm *m) { mm_put(m); }
-void lx_mm_unmap(struct lx_mm *m, uint32_t va, uint32_t len) {
+void lx_mm_unmap(struct lx_mm *m, uint64_t va, uint64_t len) {
     static struct lx_task stand;                   // lx_unmap_region only looks at ->mm
     stand.mm = m;
     lx_unmap_region(&stand, va, len);
 }
 
 // Bring the page at `addr` in. Returns the physical address of the page, or 0 if the access is not allowed.
-static uint32_t page_in(struct lx_task *t, uint32_t addr, int write) {
-    uint32_t page = addr & ~0xFFFu;
+static uint64_t page_in(struct lx_task *t, uint64_t addr, int write) {
+    uint64_t page = addr & ~0xFFFull;
     struct lx_vma *v = lx_vma_find(t, addr);
     if (!v) return 0;
     if (!(v->prot & (LX_PROT_READ | LX_PROT_WRITE | LX_PROT_EXEC))) return 0;
@@ -203,10 +203,10 @@ static uint32_t page_in(struct lx_task *t, uint32_t addr, int write) {
     uint64_t *e = aspace_pte(t->mm->cr3, page, 0);
     if (e && (*e & 1)) {                       // present: only a write to a page that was mapped read-only gets here
         if (write && !(*e & 2)) aspace_set_writable(t->mm->cr3, page, 1);
-        return (uint32_t)*e & 0xFFFFF000u;
+        return PTE_ADDR(*e);
     }
     if (pmm_get_free_pages() < 4096) { serial_puts("[lx] out of memory\n"); return 0; }
-    uint32_t ph = page_alloc_zero();
+    uint64_t ph = page_alloc_zero();
     if (!ph) return 0;
     if (v->node && v->node->type == LXN_REG) {
         uint64_t foff = v->off + (page - v->start);
@@ -214,7 +214,7 @@ static uint32_t page_in(struct lx_task *t, uint32_t addr, int write) {
             uint64_t n = v->node->size - foff;
             if (n > 4096) n = 4096;
             if (v->fend - page < n) n = v->fend - page;
-            memcpy((void*)P2V_U32(ph), v->node->data + foff, (uint32_t)n);
+            memcpy((void*)P2V_ADDR(ph), v->node->data + foff, (uint64_t)n);
         }
         // bytes past the file end inside the segment's last page stay zero; bytes of the page that precede the
         // segment's file part (an unaligned start) are handled by the loader (it maps whole pages from the file)
@@ -225,11 +225,11 @@ static uint32_t page_in(struct lx_task *t, uint32_t addr, int write) {
 }
 
 // Physical address of user byte `va` (bringing the page in); 0 if it cannot be accessed.
-static uint32_t user_phys(struct lx_task *t, uint64_t va, int write) {
+static uint64_t user_phys(struct lx_task *t, uint64_t va, int write) {
     if (va < LX_USER_BASE || va >= LX_USER_TOP) return 0;
-    uint32_t ph = page_in(t, (uint32_t)va, write);
+    uint64_t ph = page_in(t, va, write);
     if (!ph) return 0;
-    return ph | ((uint32_t)va & 0xFFF);
+    return ph | (va & 0xFFF);
 }
 
 int lx_user_range(struct lx_task *t, uint64_t addr, uint64_t len, int write) {
@@ -243,11 +243,11 @@ int lx_user_range(struct lx_task *t, uint64_t addr, uint64_t len, int write) {
 int lx_copy_in(struct lx_task *t, void *dst, uint64_t src, uint64_t len) {
     uint8_t *d = (uint8_t*)dst;
     while (len) {
-        uint32_t ph = user_phys(t, src, 0);
+        uint64_t ph = user_phys(t, src, 0);
         if (!ph) return -LX_EFAULT;
-        uint32_t n = 0x1000 - (ph & 0xFFF);
-        if (n > len) n = (uint32_t)len;
-        memcpy(d, (void*)P2V_U32(ph), n);
+        uint64_t n = 0x1000 - (ph & 0xFFF);
+        if (n > len) n = (uint64_t)len;
+        memcpy(d, (void*)P2V_ADDR(ph), n);
         d += n; src += n; len -= n;
     }
     return 0;
@@ -256,23 +256,23 @@ int lx_copy_in(struct lx_task *t, void *dst, uint64_t src, uint64_t len) {
 int lx_copy_out(struct lx_task *t, uint64_t dst, const void *src, uint64_t len) {
     const uint8_t *s = (const uint8_t*)src;
     while (len) {
-        uint32_t ph = user_phys(t, dst, 1);
+        uint64_t ph = user_phys(t, dst, 1);
         if (!ph) return -LX_EFAULT;
-        uint32_t n = 0x1000 - (ph & 0xFFF);
-        if (n > len) n = (uint32_t)len;
-        memcpy((void*)P2V_U32(ph), s, n);
+        uint64_t n = 0x1000 - (ph & 0xFFF);
+        if (n > len) n = (uint64_t)len;
+        memcpy((void*)P2V_ADDR(ph), s, n);
         s += n; dst += n; len -= n;
     }
     return 0;
 }
 
 int lx_copy_str(struct lx_task *t, char *dst, uint64_t src, uint32_t max) {
-    for (uint32_t i = 0; i < max; ) {
-        uint32_t ph = user_phys(t, src + i, 0);
+    for (uint64_t i = 0; i < max; ) {
+        uint64_t ph = user_phys(t, src + i, 0);
         if (!ph) return -LX_EFAULT;
-        const char *p = (const char*)P2V_U32(ph);
-        uint32_t n = 0x1000 - (ph & 0xFFF);
-        for (uint32_t k = 0; k < n && i < max; k++, i++) {
+        const char *p = (const char*)P2V_ADDR(ph);
+        uint64_t n = 0x1000 - (ph & 0xFFF);
+        for (uint64_t k = 0; k < n && i < max; k++, i++) {
             dst[i] = p[k];
             if (!p[k]) return (int)i;
         }
@@ -285,7 +285,7 @@ int lx_copy_str(struct lx_task *t, char *dst, uint64_t src, uint32_t max) {
 static void mm_free_user(struct lx_mm *m) {
     for (int i = 0; i < m->nvma; i++)                           // detach shared pages first: aspace_free_user would free them
         if (m->vma[i].shared_fb)
-            for (uint32_t a = m->vma[i].start; a < m->vma[i].end; a += 0x1000) aspace_unmap(m->cr3, a);
+            for (uint64_t a = m->vma[i].start; a < m->vma[i].end; a += 0x1000) aspace_unmap(m->cr3, a);
     for (int i = 0; i < m->nvma; i++) if (m->vma[i].node) lxfs_unref(m->vma[i].node);
     m->nvma = 0;
     aspace_free_user(m->cr3);
@@ -316,12 +316,12 @@ static void mm_put(struct lx_mm *m) {
     kfree(m);
 }
 
-static int fork_page(uint32_t va, uint32_t src_phys, void *ctx) {
+static int fork_page(uint64_t va, uint64_t src_phys, void *ctx) {
     struct lx_task *child = (struct lx_task*)ctx;
     struct lx_vma *v = lx_vma_find(child, va);
-    uint32_t ph = pmm_alloc_page();
+    uint64_t ph = pmm_alloc_page();
     if (!ph) return -1;
-    memcpy((void*)P2V_U32(ph), (void*)P2V_U32(src_phys), 4096);
+    memcpy((void*)P2V_ADDR(ph), (void*)P2V_ADDR(src_phys), 4096);
     if (aspace_map(child->mm->cr3, va, ph, v ? (v->prot & LX_PROT_WRITE) != 0 : 1)) { pmm_free_page(ph); return -1; }
     child->mm->rss++;
     return 0;
@@ -409,9 +409,9 @@ int lx_pid_alive(int pid) {
 static struct lx_task *task_slot(void) {
     for (int i = 0; i < LX_MAX_TASKS; i++) {
         if (!tasks[i]) {
-            uint32_t ph = pmm_alloc_page();
+            phys_t ph = pmm_alloc_page();
             if (!ph) return 0;
-            struct lx_task *t = (struct lx_task*)P2V_U32(ph);
+            struct lx_task *t = (struct lx_task*)P2V_ADDR(ph);
             memset(t, 0, 4096);
             tasks[i] = t;
         }
@@ -551,7 +551,7 @@ static void apply_exit_signal(struct lx_task *c, uint32_t flags) { (void)c; (voi
 #define CL_CHILD_CLEARTID 0x200000
 #define CL_CHILD_SETTID 0x1000000
 
-struct lx_task *lx_clone(struct lx_task *p, uint64_t flags, uint64_t stack, uint64_t ptid, uint64_t ctid, uint64_t tls) {
+struct lx_task *lx_clone(struct lx_task *p, uint32_t flags, uint64_t stack, uint64_t ptid, uint64_t ctid, uint64_t tls) {
     if ((flags & CL_THREAD) && !((flags & CL_VM) && (flags & CL_SIGHAND))) return 0;
     struct lx_task *c = task_slot();
     if (!c) return 0;
@@ -660,7 +660,7 @@ static void fault_signal(struct lx_task *t, uint64_t vec) {
     uint64_t h = t->sh->act[sig].handler;
     if (h <= 1 || (t->sig_blocked & (1ull << (sig - 1)))) {
         serial_printf("[lx] pid %d (%s): fault vec=%d err=%x rip=%x addr=%x -> signal %d\n", t->tgid, t->comm, (int)vec,
-                      (uint32_t)t->regs.err, (uint32_t)t->regs.rip, (uint32_t)lx_fault_cr2, sig);
+                      (uint32_t)t->regs.err, t->regs.rip, lx_fault_cr2, sig);
         lx_task_exit(t, sig);
         return;
     }
@@ -668,13 +668,13 @@ static void fault_signal(struct lx_task *t, uint64_t vec) {
 }
 
 static inline void load_user_state(struct lx_task *t) {
-    __asm__ volatile("mov %0, %%cr3" :: "r"(t->mm->cr3) : "memory");
+    __asm__ volatile("mov %0, %%cr3" :: "r"((uint64_t)t->mm->cr3) : "memory");
     wrmsr(0xC0000100, t->fs_base);                  // IA32_FS_BASE
     if (t->is_win) wrmsr(0xC0000101, t->gs_base);   // IA32_GS_BASE: the TEB
 }
 
 static inline void load_kernel_state(void) {
-    __asm__ volatile("mov %0, %%cr3" :: "r"(paging_kernel_pd_phys()) : "memory");
+    __asm__ volatile("mov %0, %%cr3" :: "r"((uint64_t)paging_kernel_pd_phys()) : "memory");
 }
 
 int lx_trace;
@@ -695,7 +695,7 @@ static void lx_trace_call(struct lx_task *t, int64_t r) {
 
 static void run_slice(struct lx_task *t) {
     cur = t;
-    uint32_t ktop = (uint32_t)&t->regs + sizeof t->regs;
+    uint64_t ktop = (uint64_t)(uintptr_t)&t->regs + sizeof t->regs;
     lx_ktop = ktop;
     tss_set_kernel_stack(ktop);
     fpu_restore(t->fx);
@@ -737,6 +737,7 @@ static void run_slice(struct lx_task *t) {
         load_user_state(t);
     }
     fpu_save(t->fx);
+    fpu_reset();                                      // the kernel computes in SSE: the task's MXCSR must not follow it (fxsave leaves the state as it was)
     load_kernel_state();
     cur = 0;
 }
@@ -799,10 +800,6 @@ void lx_init(void) {
     mk_text("/etc/hostname", "kanarchy\n");
     mk_text("/etc/os-release", "NAME=KAnarchy\nID=kanarchy\nPRETTY_NAME=\"KAnarchy OS\"\n");
     // SYSCALL/SYSRET: EFER.SCE, kernel CS/SS = 0x30/0x38, user bases 0x18 (64-bit CS = 0x28, SS = 0x20)
-    wrmsr(0xC0000080, rdmsr(0xC0000080) | 1);
-    wrmsr(0xC0000081, ((uint64_t)0x18 << 48) | ((uint64_t)0x30 << 32));      // STAR
-    wrmsr(0xC0000082, (uint32_t)lx_syscall_entry);                            // LSTAR
-    wrmsr(0xC0000084, 0x44700);                                               // SFMASK: IF TF DF NT AC cleared on entry
     lx_ready = 1;
     serial_puts("[lx] Linux subsystem ready\n");
 }

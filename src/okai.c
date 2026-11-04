@@ -114,7 +114,7 @@ static int url_is_http(const char* u) { return iprefix(u, "http:") || iprefix(u,
 
 extern void call_on_stack(void (*fn)(void*), void* arg, void* stack_top);
 
-#define ENGINE_STACK (2u << 20) // layout peaks ~20KB; ojs may use up to 900KB
+#define ENGINE_STACK (4u << 20) // layout peaks ~40KB; ojs may use up to 1800KB
 #define STACK_FILL 0x5AC4F00Du
 static uint8_t* engine_stack;
 static int in_engine;
@@ -1228,7 +1228,6 @@ static void okai_rewrite_scheme_http(char* url) {
 }
 
 int okai_is_home(const char* url) { return strcmp(url, OKAI_HOME_URL) == 0; }
-int okai_is_secret(const char* url) { return strcmp(url, OKAI_SECRET_URL) == 0; }
 
 // ---- init / tabs -----------------------------------------------------------------
 
@@ -1252,7 +1251,7 @@ static void okai_js_log(const char* s) { serial_puts(s); }
 // every ~20 ms. It hands the CPU to the device pollers on the MAIN stack (below the point where call_on_stack left it):
 // the touchpad/USB pointer keeps moving, the Wi-Fi/Ethernet receive rings are emptied and TLS handshakes advance, so
 // nothing times out just because a script is busy. It never calls into the page or draws.
-extern uint32_t engine_main_sp;
+extern uintptr_t engine_main_sp;
 extern void desktop_bg_poll(void);
 extern void desktop_present_window(int win_id);
 static void present_pending_video(void);
@@ -1522,26 +1521,6 @@ static void load_home(int id, int tab) {
     request_render(T, 0);
     if (okais[id].active_tab == tab) okai_render_content(id);
     serial_puts("[br] home rendered\n");
-}
-
-static const char OKAI_SECRET_HTML[] =
-"<!DOCTYPE html><html><head><meta charset=utf-8><title>okai</title><style>"
-"html,body{height:100%;margin:0;background:#000;color:#e8eef5;"
-"font-family:'Noto Sans',sans-serif}"
-"body{display:flex;align-items:center;justify-content:center}"
-"p{font-size:42px;letter-spacing:1px;text-align:center;padding:0 32px}"
-"</style></head><body><p>I know what you did.</p></body></html>";
-
-static void load_secret(int id, int tab) {
-    struct okai_tab* T = &okais[id].tabs[tab];
-    scopy(T->url, OKAI_SECRET_URL, OKAI_URL_LEN);
-    tab_reset_load(T);
-    T->is_https = 0;
-    tab_load_html(id, tab, OKAI_SECRET_HTML, (int)sizeof(OKAI_SECRET_HTML) - 1, "utf-8", 0);
-    T->load_state = 1;
-    request_render(T, 0);
-    if (okais[id].active_tab == tab) okai_render_content(id);
-    serial_puts("[br] secret rendered\n");
 }
 
 // Error pages are ordinary documents (rendered by the engine like any page).
@@ -2095,7 +2074,6 @@ static int start_main_fetch(int id, int tab) {
     struct okai* b = &okais[id];
     struct okai_tab* T = &b->tabs[tab];
     if (okai_is_home(T->url)) { load_home(id, tab); return 1; }
-    if (okai_is_secret(T->url)) { load_secret(id, tab); return 1; }
     if (!url_is_http(T->url)) {
         serial_printf("[okai] unsupported scheme in '%s'\n", T->url);
         show_error(id, tab);
@@ -3075,7 +3053,6 @@ static void navigate_slot(int id, int slot, const char* url, int push) {
     b->chrome_dirty = 1;
     serial_printf("[okai] navigate %s%s\n", frame ? "(frame) " : "", T->url);
     if (okai_is_home(T->url)) load_home(id, slot);
-    else if (okai_is_secret(T->url)) load_secret(id, slot);
     // otherwise okai_poll starts the fetch; the old page stays visible
     // until the new one arrives.
 }

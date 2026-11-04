@@ -92,34 +92,45 @@ uint8_t pcix_find_cap(struct pci_loc l, uint8_t id, uint8_t after) {
     return 0;
 }
 
-uint32_t pcix_bar(struct pci_loc l, int idx, int* is_mem, int* above4g) {
+uint64_t pcix_bar(struct pci_loc l, int idx, int* is_mem, int* above4g) {
     uint8_t off = (uint8_t)(0x10 + 4 * idx);
     uint32_t lo = pcix_read32(l, off);
     if (is_mem) *is_mem = !(lo & 1);
     if (above4g) *above4g = 0;
     if (lo & 1) return 0;                                   // I/O BAR
-    uint32_t base = lo & 0xFFFFFFF0u;
+    uint64_t base = lo & 0xFFFFFFF0u;
     if (((lo >> 1) & 3) == 2 && idx < 5) {                  // 64-bit memory BAR
-        uint32_t hi = pcix_read32(l, off + 4);
-        if (hi) { if (above4g) *above4g = 1; return 0; }
+        uint32_t hi = pcix_read32(l, (uint8_t)(off + 4));
+        if (hi && above4g) *above4g = 1;
+        base |= (uint64_t)hi << 32;
     }
     return base;
 }
 
-uint32_t pcix_bar_size(struct pci_loc l, int idx) {
+uint64_t pcix_bar_size(struct pci_loc l, int idx) {
     uint8_t off = (uint8_t)(0x10 + 4 * idx);
     // Memory decode is off and the BAR holds all-ones for a moment: no interrupt
     // handler may touch the device (or the framebuffer behind it) in between.
     uint32_t fl;
-    __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
+    __asm__ volatile("pushfq; popq %q0; cli" : "=r"(fl) :: "memory");
     uint16_t cmd = pcix_read16(l, 0x04);
     pcix_write16(l, 0x04, cmd & ~0x0003);
     uint32_t orig = pcix_read32(l, off);
     pcix_write32(l, off, 0xFFFFFFFF);
     uint32_t v = pcix_read32(l, off);
     pcix_write32(l, off, orig);
+    uint32_t vh = 0xFFFFFFFFu;
+    int is64 = !(orig & 1) && ((orig >> 1) & 3) == 2 && idx < 5;
+    if (is64) {
+        uint32_t oh = pcix_read32(l, (uint8_t)(off + 4));
+        pcix_write32(l, (uint8_t)(off + 4), 0xFFFFFFFF);
+        vh = pcix_read32(l, (uint8_t)(off + 4));
+        pcix_write32(l, (uint8_t)(off + 4), oh);
+    }
     pcix_write16(l, 0x04, cmd);
     if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
     if (orig & 1) v &= 0xFFFFFFFCu; else v &= 0xFFFFFFF0u;
-    return v ? (~v + 1) : 0;
+    uint64_t m = ((uint64_t)vh << 32) | v;
+    if (!is64 && !v) return 0;
+    return m ? (~m + 1) : 0;
 }

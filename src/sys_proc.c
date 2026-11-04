@@ -1,4 +1,11 @@
+#include "syscall.h"
 #include "sys_proc.h"
+
+// One 64-bit word of a program's entry stack, written through the kernel's mapping of the page.
+static inline void ustack_put(uint8_t *page, uint32_t off, uint64_t v) {
+    for (int i = 0; i < 8; i++) page[off + (uint32_t)i] = (uint8_t)(v >> (8 * i));
+}
+
 #include "process.h"
 #include "sched.h"
 #include "paging.h"
@@ -395,42 +402,42 @@ int sys_proc_dup(int oldfd) {
 #define USER_HEAP_BASE 0x08000000u
 #define USER_HEAP_MAX  0x40000000u
 #define USER_MMAP_BASE 0x40000000u
-#define USER_MMAP_TOP  0xB0000000u
+#define USER_MMAP_TOP  0x00007F0000000000ull
 
-uint32_t sys_proc_sbrk(uint32_t inc) {
+uint64_t sys_proc_sbrk(uint64_t inc) {
     struct process *cur = process_current();
     if (!cur || !cur->page_dir) return 0;
     if (cur->heap_break == 0) cur->heap_break = USER_HEAP_BASE;
-    uint32_t old = cur->heap_break;
+    uint64_t old = cur->heap_break;
     if (inc == 0) return old;
     // Only growth (no shrink — freed heap pages stay mapped; munmap the
     // top explicitly if you need them back). Cap at USER_HEAP_MAX.
     if (old + inc < old || old + inc > USER_HEAP_MAX) return 0;
-    uint32_t start_page = (old + 0xFFF) & 0xFFFFF000;
-    uint32_t end_page = (old + inc + 0xFFF) & 0xFFFFF000;
-    for (uint32_t page = start_page; page < end_page; page += 0x1000) {
+    uint64_t start_page = (old + 0xFFF) & ~0xFFFull;
+    uint64_t end_page = (old + inc + 0xFFF) & ~0xFFFull;
+    for (uint64_t page = start_page; page < end_page; page += 0x1000) {
         // Skip already-mapped pages (heap/stack overlap region).
-        uint32_t phys = pmm_alloc_page();
+        phys_t phys = pmm_alloc_page();
         if (!phys) return 0; // out of memory — break unchanged
         paging_map_user_pd(cur->page_dir, page, phys);
-        uint8_t *z = (uint8_t*)P2V_U32(phys);
+        uint8_t *z = (uint8_t*)P2V_ADDR(phys);
         for (int i = 0; i < 4096; i++) z[i] = 0;
     }
     cur->heap_break = old + inc;
     return old;
 }
 
-uint32_t sys_proc_mmap_anon(uint32_t virt) {
+uint64_t sys_proc_mmap_anon(uint64_t virt) {
     struct process *cur = process_current();
     if (!cur || !cur->page_dir) return 0;
     if (cur->mmap_next == 0) cur->mmap_next = USER_MMAP_TOP;
-    uint32_t page;
+    uint64_t page;
     if (virt == 0) {
         // Auto: scan down from the hint for a free page (present-bit test
         // through the HIGH alias — no paging.h readback helper exists, so
         // read the PD/PT directly here).
         page = 0;
-        for (uint32_t cand = (cur->mmap_next - 0x1000) & 0xFFFFF000;
+        for (uint64_t cand = (cur->mmap_next - 0x1000) & ~0xFFFull;
              cand >= USER_MMAP_BASE; cand -= 0x1000) {
             int present = aspace_present(cur->page_dir, cand);
             if (!present) { page = cand; break; }
@@ -441,33 +448,33 @@ uint32_t sys_proc_mmap_anon(uint32_t virt) {
     } else {
         page = virt;
     }
-    uint32_t phys = pmm_alloc_page();
+    phys_t phys = pmm_alloc_page();
     if (!phys) return 0;
     paging_map_user_pd(cur->page_dir, page, phys);
-    uint8_t *z = (uint8_t*)P2V_U32(phys);
+    uint8_t *z = (uint8_t*)P2V_ADDR(phys);
     for (int i = 0; i < 4096; i++) z[i] = 0;
     return page;
 }
 
-void sys_proc_munmap(uint32_t virt) {
+void sys_proc_munmap(uint64_t virt) {
     struct process *cur = process_current();
     if (!cur || !cur->page_dir) return;
-    uint32_t phys = aspace_unmap(cur->page_dir, virt);
+    phys_t phys = aspace_unmap(cur->page_dir, virt);
     if (!phys) return;
     pmm_free_page(phys);
-    __asm__ volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax", "memory");
+    __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
 }
 
 // ---- fork: copy the calling process's user-low address space ----
 // One user page of the parent: a fresh PMM page for the child with the same contents (through the HIGH alias).
-struct fork_copy { uint32_t child_cr3; };
-static int fork_copy_page(uint32_t virt, uint32_t src_phys, void *ctx) {
+struct fork_copy { phys_t child_cr3; };
+static int fork_copy_page(uint64_t virt, phys_t src_phys, void *ctx) {
     struct fork_copy *fc = (struct fork_copy*)ctx;
-    uint32_t phys = pmm_alloc_page();
+    phys_t phys = pmm_alloc_page();
     if (!phys) return -1;
     paging_map_user_pd(fc->child_cr3, virt, phys);
-    uint8_t *dst = (uint8_t*)P2V_U32(phys);
-    uint8_t *src = (uint8_t*)P2V_U32(src_phys);
+    uint8_t *dst = (uint8_t*)P2V_ADDR(phys);
+    uint8_t *src = (uint8_t*)P2V_ADDR(src_phys);
     for (int b = 0; b < 4096; b++) dst[b] = src[b];
     return 0;
 }
@@ -484,88 +491,57 @@ int sys_proc_fork(void) {
     // (create_page_directory already shares it — never copy it).
     struct fork_copy fc = { child->page_dir };
     if (aspace_walk_user(parent->page_dir, fork_copy_page, &fc)) { process_destroy((uint32_t)child_pid); return -1; }
-    // Child resumes AFTER the fork trap (same ESP the parent trapped with;
-    // EIP = return address: the word the trap pushed... precisely, the
+    // Child resumes AFTER the fork trap (same RSP the parent trapped with;
+    // RIP = return address: the word the trap pushed... precisely, the
     // INT 0x80 trap pushed NOTHING on the user stack (ring-3 int pushes
-    // EFLAGS/CS/EIP on the KERNEL trap stack via TSS.ESP0, not the user
-    // stack) — so user ESP is unchanged by the trap and the return address
+    // RFLAGS/CS/RIP on the KERNEL trap stack via TSS.RSP0, not the user
+    // stack) — so user RSP is unchanged by the trap and the return address
     // is wherever the CALLER put it. For our ring-3 wrappers the fork call
-    // site is `int $0x80` inline in straight-line code; resume EIP = trapped
-    // EIP (next instruction after int), ESP = trapped ESP verbatim.
-    // Stashed by idt.c pre-dispatch (pushed[11/14] = CPU EIP/ESP).
+    // site is `int $0x80` inline in straight-line code; resume RIP = trapped
+    // RIP (next instruction after int), RSP = trapped RSP verbatim.
+    // Stashed by idt.c pre-dispatch (pushed[11/14] = CPU RIP/RSP).
     // (The old code resumed the child at image entry — it re-ran _start,
     // forked again, and fork-bombed grandchildren that all printed "parent".)
     {
-        extern uint32_t syscall_trap_eip(void);
-        extern uint32_t syscall_trap_esp(void);
-        extern uint32_t syscall_trap_ebx(void);
-        extern uint32_t syscall_trap_edi(void);
-        extern uint32_t syscall_trap_esi(void);
-        extern uint32_t syscall_trap_ebp(void);
-        uint32_t teip = syscall_trap_eip();
-        uint32_t tesp = syscall_trap_esp();
-        // Sanity: trapped EIP must be user-low text, ESP the user stack.
+        uint64_t t_rip = syscall_trap_rip();
+        uint64_t t_rsp = syscall_trap_rsp();
+        // Sanity: trapped RIP must be user-low text, RSP the user stack.
         // (If idt.c ever fails to stash, both read 0 — refuse the child
         // rather than IRETing to NULL and faulting obscurely.)
-        if (teip < 0x1000 || teip >= 0xC0000000 ||
-            tesp < 0xB0000000 || tesp >= 0xC0000000) {
-            serial_printf("[fork] BAD trapped resume eip=%x esp=%x — abort child\n",
-                          teip, tesp);
+        if (t_rip < 0x1000 || t_rip >= USER_SPACE_TOP || t_rsp < 0x1000 || t_rsp >= USER_SPACE_TOP) {
+            serial_printf("[fork] BAD trapped resume rip=%lx rsp=%lx — abort child\n",
+                          t_rip, t_rsp);
             process_destroy((uint32_t)child_pid);
             return -1;
         }
-        // FORK STUB (2026-09-08): fresh-IRET children inherit garbage
-        // callee-saved regs (EBX/EDI/ESI/EBP) — mid-function resumes (sh's
-        // fork inside _start) die touching EBP-relative state. Push the
-        // parent's trapped (EBX,EDI,ESI,EBP) + resume-EIP onto the child's
-        // stack copy (via the HIGH alias; child PD not running) and enter
-        // the child at a 5-byte stub (pop ebx; pop edi; pop esi; pop ebp;
-        // ret = 5b 5f 5e 5d c3) laid at the stack page base. Frame order
-        // (low→high): [EBX][EDI][ESI][EBP][resume-EIP] at the entry ESP;
-        // pops run low→high and ret lands at resume-EIP with ESP exactly on
-        // the trapped ESP. EAX=0 via the fork flag (stub preserves EAX).
-        // Needs 21 free bytes below the trapped ESP; require tesp offset
-        // >= 32 (page-relative) else abort the child (loud, not silent).
+        // FORK STUB: a child enters through a fresh IRET, which loads only RIP/CS/RFLAGS/RSP/SS and RAX, so a mid-function resume would find
+        // garbage in the callee-saved registers. Put the parent's trapped registers + the resume RIP on the child's stack copy and enter the
+        // child at a 13-byte stub laid at the stack page base:
+        //   pop rbx; pop rbp; pop r12; pop r13; pop r14; pop r15; ret
+        // The pops run low -> high and the ret lands at the resume RIP with RSP exactly on the trapped RSP. RAX = 0 via the fork flag (the stub
+        // preserves it). Needs 56 free bytes below the trapped RSP and room for the stub below them, else the child is aborted (loud, not silent).
         {
-            uint32_t tebx = syscall_trap_ebx();
-            uint32_t tedi = syscall_trap_edi();
-            uint32_t tesi = syscall_trap_esi();
-            uint32_t tebp = syscall_trap_ebp();
-            uint32_t page_off = tesp & 0xFFF;
-            if (page_off < 32) {
-                serial_printf("[fork] stub: no room esp=%x — abort child\n",
-                              tesp);
+            uint64_t regs[6];
+            syscall_trap_regs(regs);
+            uint32_t page_off = (uint32_t)(t_rsp & 0xFFF);
+            if (page_off < 80) {
+                serial_printf("[fork] stub: no room rsp=%lx, abort child\n", t_rsp);
                 process_destroy((uint32_t)child_pid);
                 return -1;
             }
             // Locate the child's stack page phys (walk ITS address space; the stack page is the last user page).
-            uint64_t *spte = aspace_pte(child->page_dir, tesp, 0);
-            uint32_t sph = spte ? ((uint32_t)*spte & 0xFFFFF000) : 0;
-            uint8_t *spage = (uint8_t*)P2V_U32(sph);
-            // Stub bytes at page base (5B; .text-adjacent low page is mapped
-            // user — reuse the stack page base, never executed otherwise).
-            spage[0] = 0x5b; spage[1] = 0x5f; spage[2] = 0x5e;
-            spage[3] = 0x5d; spage[4] = 0xc3;
-            uint32_t stub_virt = (tesp & 0xFFFFF000);
-            // Frame (low→high): [EBX][EDI][ESI][EBP][resume-EIP], 20 bytes
-            // below trapped ESP (pop order is low→high: EBX must sit at the
-            // entry ESP; the final ret pops resume-EIP and lands ESP exactly
-            // on the trapped ESP). Write LE by bytes (no unaligned u32 store).
-            uint32_t vals[5];
-            vals[0] = tebx; vals[1] = tedi;
-            vals[2] = tesi; vals[3] = tebp; vals[4] = teip;
-            uint32_t woff = page_off - 20;
-            for (uint32_t wi = 0; wi < 5; wi++) {
-                uint32_t v = vals[wi];
-                spage[woff + wi * 4] = v & 0xFF;
-                spage[woff + wi * 4 + 1] = (v >> 8) & 0xFF;
-                spage[woff + wi * 4 + 2] = (v >> 16) & 0xFF;
-                spage[woff + wi * 4 + 3] = (v >> 24) & 0xFF;
-            }
-            child->user_eip = stub_virt;
-            child->user_esp = (tesp & 0xFFFFF000) + woff;
-            serial_printf("[fork] child=%d stub=%x resume eip=%x esp=%x (frame ebp=%x esi=%x)\n",
-                          child_pid, stub_virt, teip, tesp, tebp, tesi);
+            uint64_t *spte = aspace_pte(child->page_dir, t_rsp, 0);
+            phys_t sph = spte ? PTE_ADDR(*spte) : 0;
+            uint8_t *spage = (uint8_t*)P2V_ADDR(sph);
+            static const uint8_t stub[13] = { 0x5B, 0x5D, 0x41, 0x5C, 0x41, 0x5D, 0x41, 0x5E, 0x41, 0x5F, 0xC3, 0x90, 0x90 };
+            for (int b = 0; b < 13; b++) spage[b] = stub[b];
+            uint64_t stub_virt = t_rsp & ~0xFFFull;
+            uint32_t woff = page_off - 56;
+            for (int r = 0; r < 6; r++) ustack_put(spage, woff + (uint32_t)r * 8, regs[r]);
+            ustack_put(spage, woff + 48, t_rip);
+            child->user_rip = stub_virt;
+            child->user_rsp = (t_rsp & ~0xFFFull) + woff;
+            serial_printf("[fork] child=%d stub=%lx resume rip=%lx rsp=%lx\n", child_pid, stub_virt, t_rip, t_rsp);
         }
     }
     child->heap_break = parent->heap_break;
@@ -574,7 +550,7 @@ int sys_proc_fork(void) {
     child->ticks_left = SCHED_SLICE_TICKS;
     child->term_win = parent->term_win; // stdio follows the parent's window
     // Child ring-3 return value: fork() returns 0 in the child. The entry
-    // IRET path (main loop) forces pushed-EAX 0 for fork children — flagged
+    // IRET path (main loop) forces pushed-RAX 0 for fork children — flagged
     // here so the entry site knows (see sched_fork_child_entry below).
     child->exit_code = 0;
     child->pending_signals = 0;
@@ -586,11 +562,11 @@ int sys_proc_fork(void) {
     }
     serial_printf("[fork] parent=%d child=%d pages copied\n",
                   parent->pid, child_pid);
-    // Stage the child's ring-3 entry (EAX forced 0 — see sched layer).
+    // Stage the child's ring-3 entry (RAX forced 0 — see sched layer).
     // Drop any stale park resume for this pid first (slot reuse: the
     // previous occupant may have parked and never been re-entered; the
     // drain keys resumes by pid, so a stale entry would hijack the child's
-    // first entry with a dead EIP/ESP — garbage-exec/#PF class).
+    // first entry with a dead RIP/RSP — garbage-exec/#PF class).
     {
         extern int sched_fork_child_entry(uint32_t child_pid);
         extern void sched_park_drop(uint32_t pid);
@@ -601,8 +577,8 @@ int sys_proc_fork(void) {
 }
 
 // ---- exec: load an ELF from the VFS into the CALLING process ----
-static uint32_t exec_map_target_pd = 0;
-static void exec_map_cb(uint32_t virt_page, uint32_t phys_page) {
+static phys_t exec_map_target_pd = 0;
+static void exec_map_cb(uint64_t virt_page, uint64_t phys_page) {
     paging_map_user_pd(exec_map_target_pd, virt_page, phys_page);
 }
 
@@ -638,12 +614,12 @@ int sys_proc_exec(const char *path) {
         // NOT-FOUND PATH TRACE (input-bug bisect 2026-09-08: the failing
         // exec never reaches syscall.c's [exec-arg] trace — it fails INSIDE
         // fs_exists on a garbage pointer. Log the pointer + first 16 bytes
-        // hex here to prove whether the garbage is in the caller's EBX or
+        // hex here to prove whether the garbage is in the caller's RBX or
         // introduced by the kernel copy... path IS the kernel copy (kpath),
         // so garbage here = the USER buffer was already garbage at trap
         // time = caller-stack corruption, NOT a kernel bug).
         serial_puts("[exec] not found ptr=");
-        serial_printf("%x", (uint32_t)path);
+        serial_printf("%p", path);
         serial_puts(" bytes=");
         for (uint32_t bi = 0; bi < 16; bi++) {
             uint8_t b = ((const uint8_t*)path)[bi];
@@ -668,57 +644,53 @@ int sys_proc_exec(const char *path) {
     // the wipe above only cleared PDEs/PTEs in MEMORY, but the TLB still
     // holds the OLD translations... actually worse: it holds NOTHING valid
     // yet the CPU may have cached the freed pages; either way the resume
-    // EIP faults). CR3 reload flushes all non-global entries; safe here
+    // RIP faults). CR3 reload flushes all non-global entries; safe here
     // (same address space, ring 0, no frame dependence).
-    __asm__ volatile("mov %%cr3, %%eax; mov %%eax, %%cr3" ::: "eax", "memory");
+    __asm__ volatile("mov %%cr3, %%rax; mov %%rax, %%cr3" ::: "rax", "memory");
     // Fresh user stack (top of user-low, same ABI as spawn).
-    uint32_t stack_phys = pmm_alloc_page();
+    phys_t stack_phys = pmm_alloc_page();
     if (!stack_phys) return -1;
-    uint32_t u_stack_top = 0xBFFFF000 + 4096;
+    uint64_t u_stack_top = PROC_STACK_TOP;
     paging_map_user_pd(cur->page_dir, u_stack_top - 4096, stack_phys);
     // Load segments.
     exec_map_target_pd = cur->page_dir;
-    uint32_t entry = 0;
+    uint64_t entry = 0;
     int rc = elf_load(elf_img, (uint32_t)len, exec_map_cb, &entry);
     exec_map_target_pd = 0;
     if (rc) return -1;
     // Rebuild the SysV entry stack on the fresh stack page (same layout as
     // sched_spawn_elf: [argc][argv_tab][envp_tab][strings]). sys_proc_exec
-    // used to leave user_esp = stack TOP (empty stack): every exec'd program
+    // used to leave user_rsp = stack TOP (empty stack): every exec'd program
     // then read argc/argv from unmapped... actually mapped-but-zero stack
     // memory — garbage argc, garbage argv, #PF on first dereference
     // (bisected 2026-09-08: forkexec child #PF err=5 cr2=C0000000 at
-    // hello+0xd reading argv[0] — ESP pointed at the empty top, not a
+    // hello+0xd reading argv[0] — RSP pointed at the empty top, not a
     // header). Kernel-owned argv: argv[0] = path, argc = 1, envp empty.
     {
-        uint8_t *sp0 = (uint8_t*)P2V_U32(stack_phys);
+        uint8_t *sp0 = (uint8_t*)P2V_ADDR(stack_phys);
         uint32_t path_len = 0;
         while (path[path_len] && path_len < 255) path_len++;
         path_len++; // NUL
-        uint32_t need = path_len + 4 * 2 + 4 * 1 + 12 + 15;     // + 15: the string area's alignment pad
+        uint32_t need = path_len + 8 * 2 + 8 * 1 + 24 + 15;     // + 15: the string area's alignment pad
         need = (need + 15) & ~15u;
         if (need > 4096) return -1;
         uint32_t base = 4096 - need;
-        uint32_t final_esp = (u_stack_top - 4096) + base;
-        uint32_t a_tab = final_esp + 12;
-        uint32_t e_tab = a_tab + 8;
-        uint32_t s_base = (e_tab + 4 + 15) & ~15u;             // rounded UP: down landed on argv[1]/envp[0], zeroing the path's first bytes
-        uint32_t h = base;
-        sp0[h] = 1; sp0[h+1] = 0; sp0[h+2] = 0; sp0[h+3] = 0; // argc = 1
-        sp0[h+4] = a_tab & 0xFF; sp0[h+5] = (a_tab >> 8) & 0xFF;
-        sp0[h+6] = (a_tab >> 16) & 0xFF; sp0[h+7] = (a_tab >> 24) & 0xFF;
-        sp0[h+8] = e_tab & 0xFF; sp0[h+9] = (e_tab >> 8) & 0xFF;
-        sp0[h+10] = (e_tab >> 16) & 0xFF; sp0[h+11] = (e_tab >> 24) & 0xFF;
-        uint32_t w = a_tab - (u_stack_top - 4096);
-        uint32_t s = s_base - (u_stack_top - 4096);
-        uint32_t v = (u_stack_top - 4096) + s;
+        uint64_t final_rsp = (u_stack_top - 4096) + base;
+        uint64_t a_tab = final_rsp + 24;
+        uint64_t e_tab = a_tab + 16;
+        uint64_t s_base = (e_tab + 8 + 15) & ~15u;             // rounded UP: down landed on argv[1]/envp[0], zeroing the path's first bytes
+        ustack_put(sp0, base, 1);                               // argc
+        ustack_put(sp0, base + 8, a_tab);
+        ustack_put(sp0, base + 16, e_tab);
+        uint32_t w = (uint32_t)(a_tab - (u_stack_top - 4096));
+        uint32_t s = (uint32_t)(s_base - (u_stack_top - 4096));
+        uint64_t v = (u_stack_top - 4096) + s;
         for (uint32_t b = 0; b < path_len; b++) sp0[s + b] = (uint8_t)path[b];
-        sp0[w] = v & 0xFF; sp0[w+1] = (v >> 8) & 0xFF;
-        sp0[w+2] = (v >> 16) & 0xFF; sp0[w+3] = (v >> 24) & 0xFF;
-        sp0[w+4] = sp0[w+5] = sp0[w+6] = sp0[w+7] = 0; // argv[1]
-        sp0[w+8] = sp0[w+9] = sp0[w+10] = sp0[w+11] = 0; // envp[0] (e_tab)
-        cur->user_eip = entry;
-        cur->user_esp = final_esp;
+        ustack_put(sp0, w, v);                                  // argv[0]
+        ustack_put(sp0, w + 8, 0);                              // argv[1]
+        ustack_put(sp0, w + 16, 0);                             // envp[0]
+        cur->user_rip = entry;
+        cur->user_rsp = final_rsp;
     }
     cur->heap_break = 0;
     cur->mmap_next = 0;
@@ -732,7 +704,7 @@ int sys_proc_exec(const char *path) {
             ofd_drop(v);
         }
     }
-    serial_printf("[exec] pid=%d '%s' entry=%x\n", cur->pid, path, entry);
+    serial_printf("[exec] pid=%d '%s' entry=%lx\n", cur->pid, path, entry);
     return 0;
 }
 
@@ -807,7 +779,7 @@ int sys_proc_wait_park(int pid) {
     // No zombie YET → -2. The caller (syscall.c) arms the park trampoline:
     // no iret back to ring 3, straight to the main loop, which runs the
     // queued sibling THIS iteration. Re-entry resumes after the int $0x80
-    // with EAX=-2 → ring 3 retries and reaps.
+    // with RAX=-2 → ring 3 retries and reaps.
     return -2;
 }
 

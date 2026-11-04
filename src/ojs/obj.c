@@ -24,7 +24,7 @@ struct class_ops class_ops[OC_COUNT];
 
 // ---------------------------------------------------------------- shapes
 
-static inline uint32_t pk_hash(pkey k) { return (k * 2654435761u) >> 7; }
+static inline uint32_t pk_hash(pkey k) { return (uint32_t)(((uint64_t)k * 2654435761u) >> 7); }
 
 static int shape_build_index(ojs* J, struct shape* s) {
     if (s->nprops < HASH_MIN) { s->hidx = 0; s->hsize = 0; return 0; }

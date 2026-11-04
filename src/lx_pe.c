@@ -15,7 +15,7 @@
 struct pe_mod {
     char name[64];                    // lower case, as imported
     struct lx_node *node;
-    uint32_t base, size;
+    uint64_t base; uint32_t size;
     uint32_t entry_rva;
     uint32_t exp_rva, exp_size;
     int is_dll;
@@ -29,7 +29,7 @@ struct lx_win {
     struct pe_mod mod[MAX_MODS];
     int nmissing;
     char missing[MAX_MISSING][80];
-    uint32_t peb, teb, stack_base, stack_limit;
+    uint64_t peb, teb, stack_base, stack_limit;
     int ntls;
 };
 
@@ -196,7 +196,7 @@ static uint64_t export_lookup(struct lx_task *t, struct lx_win *w, struct pe_mod
     return (uint64_t)m->base + frva;
 }
 
-static int apply_relocs(struct lx_task *t, const struct pe_info *p, uint32_t base) {
+static int apply_relocs(struct lx_task *t, const struct pe_info *p, uint64_t base) {
     int64_t delta = (int64_t)base - (int64_t)p->image_base;
     if (!delta) return 0;
     if (!p->dir_rva[5]) return -LX_ENOEXEC;                                // no relocations: cannot move
@@ -282,10 +282,10 @@ static int load_module(struct lx_task *t, struct lx_win *w, struct lx_node *n, c
     strncpy(m->name, name, sizeof m->name - 1);
     m->node = n; m->is_dll = (p.file_chars & 0x2000) != 0;
     uint32_t span = (p.size_of_image + 0xFFF) & ~0xFFFu;
-    // preferred base if it fits in the low 3 GB and is free, else somewhere free
-    uint32_t base = 0;
-    if (p.image_base >= 0x00400000 && p.image_base + span < 0xA0000000ull) {
-        base = (uint32_t)p.image_base;
+    // preferred base if it is free and clear of the loader's own regions, else somewhere free
+    uint64_t base = 0;
+    if (p.image_base >= 0x00400000 && p.image_base + span < LX_MMAP_TOP && (p.image_base + span <= MISSING_BASE || p.image_base >= WIN_META + WIN_META_SIZE)) {
+        base = p.image_base;
         for (int i = 0; i < t->mm->nvma; i++) if (base < t->mm->vma[i].end && base + span > t->mm->vma[i].start) { base = 0; break; }
     }
     if (!base) {
@@ -373,7 +373,7 @@ int lx_pe_load(struct lx_task *t, struct lx_node *exe, const char *path, const c
     for (int i = 0; envp && envp[i]; i++) { uint32_t dummy; put_u16str(m, &sp, envp[i], &dummy); }
     m[sp] = m[sp + 1] = 0; sp += 2;
     // PEB
-    uint32_t exe_base = w->mod[0].base;
+    uint64_t exe_base = w->mod[0].base;
     m[(peb - WIN_META) + 2] = 0;
     uint64_t v;
     v = exe_base; memcpy(m + (peb - WIN_META) + 0x10, &v, 8);                           // ImageBaseAddress

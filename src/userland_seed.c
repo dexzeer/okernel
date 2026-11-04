@@ -21,7 +21,11 @@
 
 static void seed_one(const char *name, const unsigned char *img,
                      unsigned int len) {
-    if (fs_exists(name)) return; // disk copy wins
+    if (fs_exists(name)) {
+        // The disk copy wins, unless it is an old program this kernel cannot run (a disk written by the 32-bit kernels).
+        unsigned char hdr[5] = {0, 0, 0, 0, 0};
+        if (fs_read(name, hdr, 5) < 5 || hdr[0] != 0x7F || hdr[4] == 2) return;
+    }
     fs_write(name, img, (int)len);
     serial_puts("[seed] /");
     serial_puts(name);
@@ -56,7 +60,6 @@ void userland_seed(void) {
         "Try:\n"
         "  open /readme.txt   (editable)\n"
         "  open /bin/hello    (read-only)\n");
-    seed_text("/iknowwhatyoudid.txt", "I know what you did.\n");
     seed_one("/bin/hello", hello, hello_len);
     seed_one("/bin/forktest", forktest, forktest_len);
     seed_one("/bin/pipetest", pipetest, pipetest_len);

@@ -96,7 +96,7 @@ static void* aligned(void** raw, uint32_t bytes, uint32_t align) {
     uint8_t* p = (uint8_t*)kcalloc(1, bytes + align);
     *raw = p;
     if (!p) return 0;
-    return (void*)(((uint32_t)p + align - 1) & ~(align - 1));
+    return (void*)(((uintptr_t)p + align - 1) & ~(uintptr_t)(align - 1));
 }
 
 static int corb_rirb_init(void) {
@@ -113,8 +113,8 @@ static int corb_rirb_init(void) {
     if (!mem) return -1;
     H.corb = (uint32_t*)mem;
     H.rirb = (uint64_t*)(mem + 1024);
-    wr32(CORBLBASE, V2P((uint32_t)H.corb)); wr32(CORBUBASE, 0);
-    wr32(RIRBLBASE, V2P((uint32_t)H.rirb)); wr32(RIRBUBASE, 0);
+    wr32(CORBLBASE, V2P(H.corb)); wr32(CORBUBASE, 0);
+    wr32(RIRBLBASE, V2P(H.rirb)); wr32(RIRBUBASE, 0);
     // CORB read pointer reset handshake
     wr16(CORBRP, 0x8000);
     if (!wait_bits(CORBRP, 16, 0x8000, 0x8000, 2000)) return -1;
@@ -309,12 +309,12 @@ static int stream_setup(void) {
     if (!H.ring || !bdl) return -1;
     for (uint32_t i = 0; i < BDL_ENTRIES; i++) {
         uint32_t* e = (uint32_t*)(bdl + i * 16);
-        e[0] = V2P((uint32_t)H.ring) + i * (RING_BYTES / BDL_ENTRIES);
+        e[0] = V2P(H.ring) + i * (RING_BYTES / BDL_ENTRIES);
         e[1] = 0;
         e[2] = RING_BYTES / BDL_ENTRIES;
         e[3] = 0;                                        // no interrupt on completion
     }
-    wr32(b + SD_BDPL, V2P((uint32_t)bdl));
+    wr32(b + SD_BDPL, V2P(bdl));
     wr32(b + SD_BDPU, 0);
     wr32(b + SD_CBL, RING_BYTES);
     wr16(b + SD_LVI, (uint16_t)(BDL_ENTRIES - 1));
@@ -366,7 +366,7 @@ int audio_init(void) {
     H.loc = loc;
     pcix_enable(loc, 1);
     int is_mem, above;
-    uint32_t bar = pcix_bar(loc, 0, &is_mem, &above);
+    uint64_t bar = pcix_bar(loc, 0, &is_mem, &above);
     if (!bar || !is_mem) { serial_puts("[hda] controller BAR0 unusable\n"); return -1; }
     H.mmio = (volatile uint8_t*)paging_map_mmio(bar, 16384);
     if (!H.mmio) { serial_puts("[hda] out of MMIO windows\n"); return -1; }
@@ -479,7 +479,7 @@ void audio_tick(void) {
 // wr_abs is 64-bit: the timer tick must not see it half updated.
 static void set_wr(uint64_t v) {
     uint32_t fl;
-    __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
+    __asm__ volatile("pushfq; popq %q0; cli" : "=r"(fl) :: "memory");
     H.wr_abs = v;
     if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
 }
@@ -488,7 +488,7 @@ static void set_wr(uint64_t v) {
 // tick (or any call here) happens at least once per ring lap (683 ms).
 static uint64_t played_abs(void) {
     uint32_t fl;                                         // the timer tick updates the lap state
-    __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
+    __asm__ volatile("pushfq; popq %q0; cli" : "=r"(fl) :: "memory");
     uint32_t p = lpib();
     uint64_t base = H.played_base;
     if (p < H.last_lpib) base += RING_BYTES;             // wrapped since the last tick
@@ -523,7 +523,7 @@ static uint64_t smooth_clock(uint64_t raw) {                     // interrupts a
 uint64_t audio_clock(void) {
     if (!H.ready) return 0;
     uint32_t fl;                                         // audio_tick (timer IRQ) updates the rate state
-    __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
+    __asm__ volatile("pushfq; popq %q0; cli" : "=r"(fl) :: "memory");
     uint64_t dev = played_abs() >> 2;
     uint64_t nom = smooth_clock(arate_nominal(&H.rate, dev));
     if (fl & 0x200) __asm__ volatile("sti" ::: "memory");

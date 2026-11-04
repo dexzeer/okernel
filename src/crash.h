@@ -15,7 +15,7 @@
 #define CRASH_TEXT_SECTORS 31
 #define CRASH_SER_SECTORS 96
 #define CRASH_PART_SECTORS (CRASH_FIRST + 1 + CRASH_SLOTS * CRASH_SLOT_SECTORS)
-#define CRASH_MAGIC "KANARCHY-CRASH1"
+#define CRASH_MAGIC "KANARCHY-CRASH2"
 
 struct crash_hdr {
     char magic[16];
@@ -27,11 +27,12 @@ struct crash_rec {
     char magic[16];
     uint32_t seq;                       // 1-based record number (crash_hdr.count when it was written)
     uint32_t boot;                      // klog boot counter of the boot that crashed (0 = unknown)
-    uint32_t vec, err, eip, cr2, cs, eflags;
+    uint32_t vec, err, cs, eflags;
+    uint64_t rip, cr2;
     uint32_t uptime_ms;
     uint32_t text_len, ser_len;
     char title[64];
-    uint32_t pad[(512 - 16 - 4 * 11 - 64) / 4];
+    uint32_t pad[(512 - 16 - 4 * 9 - 16 - 64) / 4];
 };
 
 #endif

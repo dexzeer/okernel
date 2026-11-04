@@ -3,7 +3,7 @@
 // and reports why each one fails. Mirrors the browser fetch: SNI, the same
 // request headers, a 2MB response buffer.
 //
-//   gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/tls_scan tests/tls_scan.c $(HOST_CRYPTO_SRC)
+//   gcc -m64 -O2 -Isrc/crypto -Isrc -o build-host/tls_scan tests/tls_scan.c $(HOST_CRYPTO_SRC)
 //   ./build-host/tls_scan example.com wikipedia.org ...      (or -f hosts.txt)
 #include <stdio.h>
 #include <string.h>

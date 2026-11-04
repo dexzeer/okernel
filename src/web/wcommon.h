@@ -16,9 +16,9 @@
 #include "memory.h"
 #include "string.h"
 #include "serial.h"
-#define w_malloc(n)     kmalloc((uint32_t)(n))
-#define w_calloc(n, s)  kcalloc((uint32_t)(n), (uint32_t)(s))
-#define w_realloc(p, n) krealloc((p), (uint32_t)(n))
+#define w_malloc(n)     kmalloc(n)
+#define w_calloc(n, s)  kcalloc((n), (s))
+#define w_realloc(p, n) krealloc((p), (n))
 #define w_free(p)       kfree(p)
 #define w_log(...)      serial_printf(__VA_ARGS__)
 #else

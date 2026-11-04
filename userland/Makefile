@@ -1,14 +1,14 @@
-# userland/ Makefile — builds freestanding i386 ET_EXEC programs for /bin.
+# userland/ Makefile — builds freestanding x86-64 ET_EXEC programs for /bin.
 # Same discipline as the kernel: no libc, no PIC, no red zone, no stack
-# protector. Host gcc+multilib emits valid ET_EXEC i386 (verified readelf).
+# protector.
 # `make` builds all programs; `make gen` regenerates bindata C includes.
 
 CC = gcc
-CFLAGS = -m32 -nostdlib -static -Os -fno-builtin -fno-stack-protector \
-         -mno-red-zone -fno-pic -fno-pie -Wall
-LDFLAGS = -e _start
+CFLAGS = -m64 -nostdlib -static -Os -fno-builtin -fno-stack-protector \
+         -mno-red-zone -fno-pic -fno-pie -mno-sse -mno-mmx -fno-asynchronous-unwind-tables -Wall
+LDFLAGS = -e _start -Wl,-z,max-page-size=0x1000 -Wl,-z,noseparate-code -Wl,--build-id=none
 
-PROGS = hello forktest pipetest exectest sh init forkexec dbg2 dbg3 panic
+PROGS = hello forktest pipetest exectest sh init dbgchild forkexec dbg2 dbg3 panic
 
 # Ring-3 ABI library: every userland program links usys.o, so the INT 0x80
 # trap site lives in exactly one translation unit (usys.c).

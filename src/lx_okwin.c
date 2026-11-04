@@ -33,7 +33,7 @@ struct okwin {
     uint8_t *raw;
     uint32_t *pix;                 // page aligned inside raw
     struct lx_mm *map_mm;          // the address space that mapped it (and where)
-    uint32_t map_va, map_len;
+    uint64_t map_va; uint32_t map_len;
     int last_focus, last_w, last_h;
     int frameless;
 };
@@ -45,7 +45,7 @@ static uint8_t keyheld[256];
 static uint8_t extheld[128];
 static int inited;
 
-extern void lx_mm_unmap(struct lx_mm *m, uint32_t va, uint32_t len);
+extern void lx_mm_unmap(struct lx_mm *m, uint64_t va, uint64_t len);
 extern void lx_mm_hold(struct lx_mm *m);
 extern void lx_mm_release(struct lx_mm *m);
 
@@ -106,7 +106,7 @@ static int alloc_buffer(struct okwin *w, int pw, int ph) {
     uint8_t *raw = (uint8_t*)kmalloc((uint32_t)pw * (uint32_t)ph * 4 + 4096);
     if (!raw) return -LX_ENOMEM;
     w->raw = raw;
-    w->pix = (uint32_t*)(((uint32_t)raw + 4095) & ~4095u);
+    w->pix = (uint32_t*)(((uintptr_t)raw + 4095) & ~(uintptr_t)4095);
     memset(w->pix, 0xFF, (uint32_t)pw * (uint32_t)ph * 4);
     w->w = pw; w->h = ph;
     return 0;
@@ -149,12 +149,12 @@ static int64_t do_map(struct lx_task *t, struct okconn *c, uint64_t uarg) {
     if (!w || w->conn != c) return -LX_EINVAL;
     uint32_t len = ((uint32_t)w->w * (uint32_t)w->h * 4 + 0xFFF) & ~0xFFFu;
     if (w->map_mm) { lx_mm_unmap(w->map_mm, w->map_va, w->map_len); lx_mm_release(w->map_mm); w->map_mm = 0; }
-    uint32_t va = lx_find_free(t, len);
+    uint64_t va = lx_find_free(t, len);
     if (!va) return -LX_ENOMEM;
     if (lx_map_region(t, va, len, LX_PROT_READ | LX_PROT_WRITE, LX_MAP_SHARED, 0, 0)) return -LX_ENOMEM;
     struct lx_vma *v = lx_vma_find(t, va);
     if (v) v->shared_fb = 1;
-    uint32_t phys = V2P((uint32_t)w->pix);
+    phys_t phys = V2P(w->pix);
     for (uint32_t o = 0; o < len; o += 0x1000) if (aspace_map(t->mm->cr3, va + o, phys + o, 1)) return -LX_ENOMEM;
     lx_mm_hold(t->mm);
     w->map_mm = t->mm; w->map_va = va; w->map_len = len;
@@ -168,7 +168,7 @@ static int64_t do_resize(struct lx_task *t, struct okconn *c, uint64_t uarg) {
     struct okwin *w = by_wid(a.wid);
     if (!w || w->conn != c || a.w < 16 || a.h < 16 || a.w > 2048 || a.h > 1200) return -LX_EINVAL;
     uint8_t *old_raw = w->raw;
-    struct lx_mm *old_mm = w->map_mm; uint32_t old_va = w->map_va, old_len = w->map_len;
+    struct lx_mm *old_mm = w->map_mm; uint64_t old_va = w->map_va; uint32_t old_len = w->map_len;
     w->map_mm = 0;
     window_set_pixels(w->wid, 0, 0, 0, 0, 0, 0);
     int r = alloc_buffer(w, a.w, a.h);
@@ -181,11 +181,11 @@ static int64_t do_resize(struct lx_task *t, struct okconn *c, uint64_t uarg) {
     w->last_w = a.w; w->last_h = a.h;
     {   // map the new buffer
         uint32_t len = ((uint32_t)a.w * (uint32_t)a.h * 4 + 0xFFF) & ~0xFFFu;
-        uint32_t va = lx_find_free(t, len);
+        uint64_t va = lx_find_free(t, len);
         if (!va || lx_map_region(t, va, len, LX_PROT_READ | LX_PROT_WRITE, LX_MAP_SHARED, 0, 0)) return -LX_ENOMEM;
         struct lx_vma *v = lx_vma_find(t, va);
         if (v) v->shared_fb = 1;
-        uint32_t phys = V2P((uint32_t)w->pix);
+        phys_t phys = V2P(w->pix);
         for (uint32_t o = 0; o < len; o += 0x1000) if (aspace_map(t->mm->cr3, va + o, phys + o, 1)) return -LX_ENOMEM;
         lx_mm_hold(t->mm);
         w->map_mm = t->mm; w->map_va = va; w->map_len = len;

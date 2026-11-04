@@ -52,7 +52,8 @@ void simd_copy_stream(void* dst, const void* src, uint32_t n) { copy_impl(dst, s
 
 void simd_fill32(uint32_t* dst, uint32_t v, uint32_t n) {
     if (!fpu_has_sse2() || n < 64) {
-        if (n) __asm__ volatile("rep stosl" : "+D"(dst), "+c"(n) : "a"(v) : "memory");
+        uint64_t c = n;                     // RCX: all 64 bits count
+        __asm__ volatile("rep stosl" : "+D"(dst), "+c"(c) : "a"(v) : "memory");
         return;
     }
     while (((uintptr_t)dst & 15u) && n) { *dst++ = v; n--; }

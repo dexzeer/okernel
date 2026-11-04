@@ -13,14 +13,14 @@ static struct process processes[MAX_PROCESSES];
 static uint32_t current_slot = 0; // SLOT index 0..15 (NOT a pid)
 static uint32_t next_pid = 1;
 // Preemption re-entrancy guard (file scope — NOT function-static: the fault
-// EIP c010735c proved the block-scoped static lived at address 0x4 (BSS
-// mislink under -O2) and every switch wrote ESI+4==4 → #PF e=0002 on write.
+// RIP c010735c proved the block-scoped static lived at address 0x4 (BSS
+// mislink under -O2) and every switch wrote RSI+4==4 → #PF e=0002 on write.
 // File-scope statics link correctly; function-static volatile did not.)
 volatile int switch_busy = 0;
 
-// PID 0 (kernel idle) trap stack: ESP0 fallback whenever no user process is
+// PID 0 (kernel idle) trap stack: RSP0 fallback whenever no user process is
 // prepared. Same 4K as every other kernel_stack; never freed (pid 0 is
-// immortal). Set as ESP0 at init so any early ring transition lands valid.
+// immortal). Set as RSP0 at init so any early ring transition lands valid.
 static uint8_t idle_stack[PROCESS_STACK_SIZE] __attribute__((aligned(16)));
 
 void process_init(void) {
@@ -33,21 +33,21 @@ void process_init(void) {
     processes[0].pid = 0;
     processes[0].state = PROC_RUNNING;
     processes[0].page_dir = 0; // Kernel uses the boot page directory
-    processes[0].kernel_stack = (uint32_t)idle_stack;
-    processes[0].esp0_top = (uint32_t)(idle_stack + PROCESS_STACK_SIZE);
+    processes[0].kernel_stack = (uintptr_t)idle_stack;
+    processes[0].rsp0_top = (uintptr_t)(idle_stack + PROCESS_STACK_SIZE);
     // The main loop runs on the BOOT stack (start.asm), NOT idle_stack — but
-    // the preemption stub saves/restores p->esp per thread. Capture the live
-    // boot ESP as pid 0's thread ESP so timer switches preserve the main
-    // loop's frame (the old code left esp=0/ebp=0 → first switch_to pid 0
-    // loaded ESP=0 and triple-faulted in context_switch, bisected 2026-09-08
-    // via -d int: #PF at CR2=EIP inside context_switch after mov cr3).
+    // the preemption stub saves/restores p->rsp per thread. Capture the live
+    // boot RSP as pid 0's thread RSP so timer switches preserve the main
+    // loop's frame (the old code left rsp=0/rbp=0 → first switch_to pid 0
+    // loaded RSP=0 and triple-faulted in context_switch, bisected 2026-09-08
+    // via -d int: #PF at CR2=RIP inside context_switch after mov cr3).
     // NOTE: process_init runs on the boot stack itself (called from
-    // kernel_main before the loop), so ESP here == the thread's live ESP
+    // kernel_main before the loop), so RSP here == the thread's live RSP
     // minus this frame — close enough: the stub only needs a valid frame
     // chain, and the first real save overwrites it on first preemption.
     // Better: main loop re-captures right before sti (see desktop.c).
-    __asm__ volatile("mov %%esp, %0" : "=r"(processes[0].esp));
-    __asm__ volatile("mov %%ebp, %0" : "=r"(processes[0].ebp));
+    __asm__ volatile("mov %%rsp, %0" : "=r"(processes[0].rsp));
+    __asm__ volatile("mov %%rbp, %0" : "=r"(processes[0].rbp));
     processes[0].ticks_left = 0;
     processes[0].parent_pid = 0;
     processes[0].exit_code = 0;
@@ -59,7 +59,7 @@ void process_init(void) {
     processes[0].fds[0] = PROC_FD_KBD;
     processes[0].fds[1] = PROC_FD_TERM;
     processes[0].fds[2] = PROC_FD_TERM;
-    tss_set_kernel_stack(processes[0].esp0_top);
+    tss_set_kernel_stack(processes[0].rsp0_top);
     current_slot = 0;
     serial_puts("[proc] process table initialized\n");
 }
@@ -71,17 +71,17 @@ void process_idle_arm(void) {
     processes[0].ticks_left = 10; // == SCHED_SLICE_TICKS (see sched.h)
 }
 
-// Re-capture pid 0's live thread ESP/EBP (called from kernel_main right
+// Re-capture pid 0's live thread RSP/RBP (called from kernel_main right
 // before sti — the exact frame the timer will preempt). process_init's own
 // capture is one frame up the boot stack; this one is precise.
-void process_capture_idle_esp(void) {
-    __asm__ volatile("mov %%esp, %0" : "=r"(processes[0].esp));
-    __asm__ volatile("mov %%ebp, %0" : "=r"(processes[0].ebp));
+void process_capture_idle_rsp(void) {
+    __asm__ volatile("mov %%rsp, %0" : "=r"(processes[0].rsp));
+    __asm__ volatile("mov %%rbp, %0" : "=r"(processes[0].rbp));
 }
 
 // New address space: empty user half (0..3 GB) plus the kernel half every space shares (aspace_create).
 // CR3 values are PHYS; tables are dereferenced through P2V (high kernel map covers all phys).
-static uint32_t create_page_directory(void) {
+static phys_t create_page_directory(void) {
     return aspace_create();
 }
 
@@ -117,20 +117,20 @@ int process_create(void) {
     }
 
     // Allocate a kernel stack for this process
-    p->kernel_stack = (uint32_t)kmalloc(PROCESS_STACK_SIZE);
+    p->kernel_stack = (uintptr_t)kmalloc(PROCESS_STACK_SIZE);
     if (!p->kernel_stack) {
         pmm_free_page(p->page_dir);
         serial_puts("[proc] failed to allocate kernel stack\n");
         return -1;
     }
-    // Allocate a SEPARATE trap stack (TSS.ESP0) for ring-3 traps. It MUST
+    // Allocate a SEPARATE trap stack (TSS.RSP0) for ring-3 traps. It MUST
     // differ from kernel_stack: the preemption stub seeds/saves thread
     // frames at kstack_top-20, while trap frames (pusha+ds+int_num ≈ 48B+)
-    // grow down from esp0_top on EVERY syscall/IRQ during ring 3. Sharing
+    // grow down from rsp0_top on EVERY syscall/IRQ during ring 3. Sharing
     // one page lets trap frames overwrite the seed (and vice versa) —
-    // bisected 2026-09-08: post-Back EIP=0 on pid1 kstack (seed ret slot
+    // bisected 2026-09-08: post-Back RIP=0 on pid1 kstack (seed ret slot
     // smashed by trap frames, then a switch loaded the smashed frame).
-    uint32_t trap_stack = (uint32_t)kmalloc(PROCESS_STACK_SIZE);
+    uintptr_t trap_stack = (uintptr_t)kmalloc(PROCESS_STACK_SIZE);
     if (!trap_stack) {
         pmm_free_page(p->page_dir);
         serial_puts("[proc] failed to allocate trap stack\n");
@@ -139,18 +139,18 @@ int process_create(void) {
 
     // Set up initial stack frame (as if the process was just interrupted)
     // The kernel stack grows DOWN, so we start at the top
-    uint32_t kstack_top = p->kernel_stack + PROCESS_STACK_SIZE;
+    uintptr_t kstack_top = p->kernel_stack + PROCESS_STACK_SIZE;
 
-    // Initial register state: all zero except eip (user code) and esp (user stack)
-    p->eip = 0;      // Switch-seed flag (see process.h): 0 = unseeded
+    // Initial register state: all zero except rip (user code) and rsp (user stack)
+    p->rip = 0;      // Switch-seed flag (see process.h): 0 = unseeded
     p->entered_ring3 = 0; // Set by the main-loop entry drain on first IRET
-    p->esp = kstack_top;
-    p->ebp = kstack_top;
-    p->user_eip = 0;
-    p->user_esp = 0;
-    // Trap stack is SEPARATE from kernel_stack (see above) — ESP0 points
+    p->rsp = kstack_top;
+    p->rbp = kstack_top;
+    p->user_rip = 0;
+    p->user_rsp = 0;
+    // Trap stack is SEPARATE from kernel_stack (see above) — RSP0 points
     // there, never at the thread frame area.
-    p->esp0_top = trap_stack + PROCESS_STACK_SIZE;
+    p->rsp0_top = trap_stack + PROCESS_STACK_SIZE;
     p->ticks_left = 0;
     // Fork/exec/IPC bookkeeping: parent filled by fork/spawn paths (0 here =
     // spawned from the shell); standard fds pre-wired, rest free.
@@ -177,7 +177,7 @@ void process_destroy(uint32_t pid) {
             // 768-1023 are shared kernel-high tables — freeing them would
             // unmap the kernel for every other process. page_dir is PHYS.
             // USE-AFTER-FREE GUARD (bisected 2026-09-09: post-hello #PF — the
-            // timer tick snapshots next_esp/next_cr3 with IF SET, then a
+            // timer tick snapshots next_rsp/next_cr3 with IF SET, then a
             // ring-3 wait() reaps the target (PMM-frees its PD pages) BEFORE
             // the tick's cli+context_switch loads the freed PD. PMM instantly
             // recycles the pages (pmm_alloc hands them to the next fork) so
@@ -195,17 +195,17 @@ void process_destroy(uint32_t pid) {
             }
             // Poison schedule-relevant fields so a use-after-reap faults LOUD
             // (serial-visible) instead of switching onto a freed stack/PD:
-            // ticks 0 (never picked by elevators), esp/ebp/esp0 0 (stub seed
-            // path re-seeds only via eip==0 — and eip stays poisoned-nonzero
+            // ticks 0 (never picked by elevators), rsp/rbp/rsp0 0 (stub seed
+            // path re-seeds only via rip==0 — and rip stays poisoned-nonzero
             // so no reseed either; any switch attempt triple-faults fast).
             // Also drop any staged park resume for this pid (destroy hygiene:
-            // a parked-then-killed thread must not leave a dead EIP/ESP that
+            // a parked-then-killed thread must not leave a dead RIP/RSP that
             // hijacks a future same-pid... same-slot child entry).
             sched_park_drop(pid);
             processes[i].ticks_left = 0;
-            processes[i].esp = 0;
-            processes[i].ebp = 0;
-            processes[i].esp0_top = 0;
+            processes[i].rsp = 0;
+            processes[i].rbp = 0;
+            processes[i].rsp0_top = 0;
             processes[i].page_dir = 0;
             processes[i].kernel_stack = 0;
             processes[i].state = PROC_UNUSED;
@@ -217,7 +217,7 @@ void process_destroy(uint32_t pid) {
 
 struct process *process_get(uint32_t pid) {
     // Linear scan by pid field (NOT slot — pids diverge from slots on
-    // reuse; every preemption-bisect fault with ESI=0 traced to a lookup
+    // reuse; every preemption-bisect fault with RSI=0 traced to a lookup
     // that assumed pid==slot). Skips UNUSED (reaped/poisoned) slots.
     for (int i = 0; i < MAX_PROCESSES; i++) {
         if (processes[i].pid == pid && processes[i].state != PROC_UNUSED) {
@@ -261,7 +261,7 @@ void process_switch(uint32_t pid) {
     if (!next) return;
     // BLOCKED processes must never be switched INTO via the lightweight
     // path (bisected 2026-09-09: kbd-wake IRET into pid 1's stale park
-    // resume faulted #PF err=4 at the resume EIP with pid=0 live — the
+    // resume faulted #PF err=4 at the resume RIP with pid=0 live — the
     // parked thread has no live kernel frame; its resume runs through the
     // entry drain (prepare + enter_user_mode), never a CR3-only handoff.
     // The drain's wake path sets READY before entering; the tick never
@@ -276,22 +276,21 @@ void process_switch(uint32_t pid) {
 
     struct process *prev = process_current();
     if (prev->pid == pid) return; // Already running
-    // LIGHTWEIGHT handoff (entry/exit paths only): switches CR3 + ESP0 but
+    // LIGHTWEIGHT handoff (entry/exit paths only): switches CR3 + RSP0 but
     // does NOT save/restore the outgoing kernel-thread frame. Safe ONLY when
     // the outgoing thread will never resume mid-frame (ring-3 entry: the
     // main loop parks in enter_user_mode's IRET, resumed by the trampoline;
     // exit: sys_exit never returns). NEVER call this to preempt a live
     // kernel thread — that strands it (use process_switch_to). The timer
     // tick path (sched_tick → process_switch_to) is the only preempter.
-    uint32_t next_cr3 = next->page_dir ? next->page_dir
-                                       : paging_kernel_pd_phys();
+    phys_t next_cr3 = next->page_dir ? next->page_dir : paging_kernel_pd_phys();
     __asm__ volatile("mov %0, %%cr3" : : "r"(next_cr3));
 
-    // ESP0 follows the kernel stack: per-process top if known, else derive
-    // from the allocated stack base. Never leave a stale ESP0 behind — a
+    // RSP0 follows the kernel stack: per-process top if known, else derive
+    // from the allocated stack base. Never leave a stale RSP0 behind — a
     // ring-3 trap would land on another process's stack.
-    if (next->esp0_top)
-        tss_set_kernel_stack(next->esp0_top);
+    if (next->rsp0_top)
+        tss_set_kernel_stack(next->rsp0_top);
     else if (next->kernel_stack)
         tss_set_kernel_stack(next->kernel_stack + PROCESS_STACK_SIZE);
 
@@ -301,7 +300,7 @@ void process_switch(uint32_t pid) {
     // the dead, and the reap check then misses it; bisected 2026-09-08 via
     // [reapchk] state=1 post-exit: unprepare demoted the just-zombied pid1
     // back to READY, reap took the else-branch, and the next tick switched
-    // into the half-dead slot → #PF EIP=0).
+    // into the half-dead slot → #PF RIP=0).
     if (prev->state == PROC_RUNNING)
         prev->state = PROC_READY;
     next->state = PROC_RUNNING;
@@ -314,16 +313,15 @@ void process_switch(uint32_t pid) {
     // context) carry the serial story.
 }
 
-// Naked asm stub (boot/isr.asm): saves outgoing frame, loads CR3+ESP.
-extern void context_switch(uint32_t *old_esp_p, uint32_t new_esp,
-                           uint32_t new_cr3);
+// Naked asm stub (boot/isr.asm): saves outgoing frame, loads CR3+RSP.
+extern void context_switch(uintptr_t *old_rsp_p, uintptr_t new_rsp, uintptr_t new_cr3);
 
 void process_switch_to(uint32_t pid) {
     // Snapshot ALL PCB reads into locals BEFORE any call that can sleep or
     // re-enter (serial, tss_set, nested tick): -O2 keeps PCB pointers in
     // registers across calls, and a nested switch_to can free/reuse the slot
     // (reap) between our read and our write → stale-pointer write to a dead
-    // slot (bisected 2026-09-08: ESI=0 write ESI+4 after a clean run+Back —
+    // slot (bisected 2026-09-08: RSI=0 write RSI+4 after a clean run+Back —
     // prev/next pointers went stale across the trap-guard block).
     struct process *next = process_get(pid);
     if (!next) return;
@@ -331,38 +329,37 @@ void process_switch_to(uint32_t pid) {
     if (next_state != PROC_READY && next_state != PROC_RUNNING) return;
     uint32_t target_pid = next->pid;
     uint32_t next_gen = next->generation;
-    uint32_t next_esp = next->esp;
-    uint32_t next_eip = next->eip;
-    uint32_t next_pd = next->page_dir;
-    uint32_t next_kstack = next->kernel_stack;
-    uint32_t next_esp0 = next->esp0_top ? next->esp0_top
+    uintptr_t next_rsp = next->rsp;
+    uint32_t next_rip = next->rip;
+    phys_t next_pd = next->page_dir;
+    uintptr_t next_kstack = next->kernel_stack;
+    uintptr_t next_rsp0 = next->rsp0_top ? next->rsp0_top
                        : next_kstack ? next_kstack + PROCESS_STACK_SIZE : 0;
 
     struct process *prev = process_current();
     uint32_t prev_pid = prev->pid;
     if (prev_pid == pid) return; // Already running
     uint32_t prev_gen = prev->generation;
-    uint32_t prev_esp0 = prev->esp0_top;
-    uint32_t *prev_esp_p = &prev->esp;
+    uintptr_t prev_rsp0 = prev->rsp0_top;
     uint32_t prev_slot = slot_of(prev);
     // Preemption guard: NEVER switch while a ring-3 trap frame is live on
     // the current trap stack. The timer IRQ fires on whatever stack is live
-    // — including the TSS.esp0 trap stack MID-syscall (ring 3 -> INT 0x80 ->
-    // timer nests on the SAME esp0 stack, above the stub's pusha frame).
-    // Switching CR3+ESP there strands the stub frame on the old stack: the
+    // — including the TSS.rsp0 trap stack MID-syscall (ring 3 -> INT 0x80 ->
+    // timer nests on the SAME rsp0 stack, above the stub's pusha frame).
+    // Switching CR3+RSP there strands the stub frame on the old stack: the
     // iret would popa from the NEW stack (garbage) and iret into garbage.
-    // Detect: compare current ESP against the current process's trap-stack
-    // range [esp0_top-4096, esp0_top). If inside → defer (re-arm slice,
+    // Detect: compare current RSP against the current process's trap-stack
+    // range [rsp0_top-4096, rsp0_top). If inside → defer (re-arm slice,
     // return; the next tick retries after the syscall irets back to ring 3).
     {
-        uint32_t cur_esp;
-        __asm__ volatile("mov %%esp, %0" : "=r"(cur_esp));
-        uint32_t ttop = prev_esp0;
-        // pid 0's esp0_top is the idle stack; the main loop runs on the BOOT
-        // stack, not the trap stack — only treat ESP as trapped when it is
+        uintptr_t cur_rsp;
+        __asm__ volatile("mov %%rsp, %0" : "=r"(cur_rsp));
+        uintptr_t ttop = prev_rsp0;
+        // pid 0's rsp0_top is the idle stack; the main loop runs on the BOOT
+        // stack, not the trap stack — only treat RSP as trapped when it is
         // inside the CURRENT trap-stack window AND a user process is current.
         if (prev_pid != 0 && ttop != 0 &&
-            cur_esp < ttop && cur_esp >= ttop - PROCESS_STACK_SIZE) {
+            cur_rsp < ttop && cur_rsp >= ttop - PROCESS_STACK_SIZE) {
             // Mid-trap: defer the switch one tick (keep the slice expired so
             // the very next tick retries immediately after iret).
             return;
@@ -370,9 +367,9 @@ void process_switch_to(uint32_t pid) {
     }
 
     // Full switch, IRQs OFF throughout (a trap on a half-switched stack —
-    // new CR3 but old ESP, or vice versa — faults or corrupts).
+    // new CR3 but old RSP, or vice versa — faults or corrupts).
     //
-    // RE-ENTRANCY GUARD (bisected 2026-09-08 via -d int: #PF at CR2==EIP
+    // RE-ENTRANCY GUARD (bisected 2026-09-08 via -d int: #PF at CR2==RIP
     // inside context_switch after mov cr3, then #DF): IRQ gates are 0x8E
     // (interrupt gates → CPU clears IF on entry), so a tick CANNOT nest
     // inside process_switch_to's prologue-to-cli window... EXCEPT the window
@@ -386,46 +383,42 @@ void process_switch_to(uint32_t pid) {
     // switch already picked process_next fresh).
     // (The trap-stack guard above covers ring-3-trap nesting; this covers
     // kernel-thread nesting. Both must hold.)
-    uint32_t next_cr3 = next_pd ? next_pd : paging_kernel_pd_phys();
-    // First switch ever for this thread: the stub pops ebp/edi/esi/ebx
-    // then ret → needs [ebp][edi][esi][ebx][ret] low→high with esp at
-    // [ebp]. Seed regs 0, ret = switch_resume below (uniform: every thread
-    // enters through THIS function). ebp seed 0 = bottom of thread stack.
-    // Detect via LOCAL next_eip snapshot (never otherwise written —
-    // process_create zeroes it; no other path sets p->eip). Do NOT key on
-    // esp==kstack_top: pid 0's esp IS live (idle capture) and re-seeding it
+    phys_t next_cr3 = next_pd ? next_pd : paging_kernel_pd_phys();
+    // First switch ever for this thread: the stub pops the six callee-saved registers
+    // then ret. Seed regs 0, ret = switch_resume below (uniform: every thread
+    // enters through THIS function). rbp seed 0 = bottom of thread stack.
+    // Detect via LOCAL next_rip snapshot (never otherwise written —
+    // process_create zeroes it; no other path sets p->rip). Do NOT key on
+    // rsp==kstack_top: pid 0's rsp IS live (idle capture) and re-seeding it
     // would discard the main-loop frame (bisected 2026-09-08: re-seed →
-    // ESP=c1d92f28 garbage → #PF at CR2==EIP in context_switch, then #DF).
+    // RSP=c1d92f28 garbage → #PF at CR2==RIP in context_switch, then #DF).
     // Seed writes go to the LOCAL snapshot stack (always mapped: kernel
     // kstacks are kernel-high shared), then publish via re-resolved PCB
     // pointer under cli below (locals may be stale by then — see below).
-    uint32_t seed_esp = next_esp;
-    int need_seed = (next_eip == 0);
-    // SEED-SANITY (bisect 2026-09-09: post-hello cs=8 NULL-EIP with no rogue
-    // enter — a poisoned esp==0 (destroy zeroes esp, and the zombie-target
+    uintptr_t seed_rsp = next_rsp;
+    int need_seed = (next_rip == 0);
+    // SEED-SANITY (bisect 2026-09-09: post-hello cs=8 NULL-RIP with no rogue
+    // enter — a poisoned rsp==0 (destroy zeroes rsp, and the zombie-target
     // guard below runs AFTER this write) would make sp-=5 underflow to
     // 0xFFFFFFEC and the five stores corrupt the IDT/GDT region... then
-    // publish esp=0xFFFFFFEC and resume into garbage. Refuse to seed a zero
-    // (or absurdly-low, <64K — null-adjacent) ESP: return with the guard
+    // publish rsp=0xFFFFFFEC and resume into garbage. Refuse to seed a zero
+    // (or absurdly-low, <64K — null-adjacent) RSP: return with the guard
     // clear (the target is dead; its waiter reaps it; tick retries).
-    if (need_seed && seed_esp < 65536) {
+    if (need_seed && seed_rsp < 65536) {
         return;
     }
     if (need_seed) {
-        uint32_t *sp = (uint32_t*)seed_esp;
-        sp -= 5;
-        sp[0] = 0; // ebp
-        sp[1] = 0; // edi
-        sp[2] = 0; // esi
-        sp[3] = 0; // ebx
-        sp[4] = (uint32_t)&&switch_resume;
-        seed_esp = (uint32_t)sp;
+        uintptr_t *sp = (uintptr_t*)seed_rsp;
+        sp -= 7;
+        for (int r = 0; r < 6; r++) sp[r] = 0;   // r15 r14 r13 r12 rbp rbx
+        sp[6] = (uintptr_t)&&switch_resume;
+        seed_rsp = (uintptr_t)sp;
     }
     {
         if (switch_busy) return; // nested tick: outer switch covers it
         switch_busy = 1;
         __asm__ volatile("cli" ::: "memory");
-        if (next_esp0) tss_set_kernel_stack(next_esp0);
+        if (next_rsp0) tss_set_kernel_stack(next_rsp0);
         // Re-resolve BOTH threads NOW (under cli, no nesting possible past
         // this point): locals above may be stale — a tick between our
         // prologue and cli could have reaped/reused slots (reap runs on the
@@ -451,7 +444,7 @@ void process_switch_to(uint32_t pid) {
         // tick-into-reused-slot — the pid lookup above misses the case where
         // OUR OWN slot was reaped AND reused between prologue and cli (same
         // slot index, new pid+generation, state READY: passes every check
-        // above, but pv->esp is someone else's stack and saving there
+        // above, but pv->rsp is someone else's stack and saving there
         // corrupts the new occupant). The target side is covered by the pid
         // lookup (pids are monotonic, never reused until 2^32 wraps); still
         // re-check its generation for symmetry. Abort on any mismatch —
@@ -467,21 +460,21 @@ void process_switch_to(uint32_t pid) {
             return;
         }
         if (need_seed) {
-            nx->esp = seed_esp;
-            nx->eip = 1; // seeded (opaque flag, never executed as address)
+            nx->rsp = seed_rsp;
+            nx->rip = 1; // seeded (opaque flag, never executed as address)
         }
         // Same zombie rule as process_switch (see above): only demote a
         // RUNNING outgoing thread. A ZOMBIE/EXITED/BLOCKED prev keeps its
         // state (exit_current races the tick — the tick must not resurrect).
         // ZOMBIE-TARGET GUARD (bisected 2026-09-09: post-hello #PF err=0
-        // cr2=eip=esp=0 — the tick's prologue snapshots next_esp BEFORE the
+        // cr2=rip=rsp=0 — the tick's prologue snapshots next_rsp BEFORE the
         // drain reaps the target (IF SET on kernel threads); the re-resolve
         // checks UNUSED but a ZOMBIE slot is NOT unused (reap deferred to
-        // waiters) — without this the switch loads poisoned esp=0 and resumes
-        // into nothing. Refuse ZOMBIE/EXITED/esp==0 targets (waiter reaps;
+        // waiters) — without this the switch loads poisoned rsp=0 and resumes
+        // into nothing. Refuse ZOMBIE/EXITED/rsp==0 targets (waiter reaps;
         // tick retries next slice).
         if (nx->state == PROC_ZOMBIE || nx->state == PROC_EXITED ||
-            nx->esp == 0) {
+            nx->rsp == 0) {
             switch_busy = 0;
             __asm__ volatile("sti" ::: "memory");
             return;
@@ -497,7 +490,7 @@ void process_switch_to(uint32_t pid) {
         // so a first-run thread sees a clean unit).
         fpu_save(fpu_has_fxsave() ? (void*)pv->fx_state : (void*)pv->fpu_state);
         pv->fpu_valid = 1;
-        context_switch(&pv->esp, nx->esp, next_cr3);
+        context_switch(&pv->rsp, nx->rsp, (uintptr_t)next_cr3);
     switch_resume:
         // Every thread (seeded or resumed) lands here with current_slot =
         // itself: restore its FPU image, or start clean.

@@ -1,4 +1,4 @@
-// jit.h — the baseline compiler: bytecode -> i386 machine code (jit.c).
+// jit.h — the baseline compiler: bytecode -> x86-64 machine code (jit.c).
 //
 // A function that has been called often enough (or whose loop has run often enough) is translated instruction by instruction into native
 // code that works on the SAME frame the interpreter uses: locals and operand stack stay in memory (so the collector, closures'

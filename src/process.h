@@ -2,9 +2,10 @@
 #define PROCESS_H
 
 #include <stdint.h>
+#include "memlayout.h"
 
 #define MAX_PROCESSES 16
-#define PROCESS_STACK_SIZE 4096
+#define PROCESS_STACK_SIZE 16384
 
 // Process states
 #define PROC_UNUSED   0
@@ -52,30 +53,30 @@ struct open_file {
 // Lifetime: created by process_create (run/fork), reaped by
 // process_destroy (sys_exit path / shell). page_dir is the PHYS address of a
 // private directory (PD 0-767 private user-low, PD 768-1023 shared kernel).
-// kernel_stack is a HIGH virtual address (kmalloc'd); esp0_top is the TSS
+// kernel_stack is a HIGH virtual address (kmalloc'd); rsp0_top is the TSS
 // value (stack top) used on ring-3 -> ring-0 traps for THIS process.
 struct process {
     uint32_t pid;
     uint32_t state;        // PROC_*
-    uint32_t page_dir;     // Physical address of page directory (for CR3)
-    uint32_t esp;          // Kernel stack pointer (saved on context switch)
-    uint32_t ebp;          // Base pointer (saved on context switch)
-    uint32_t eip;          // Switch-seed flag: 0 = never switched-to (seed on
+    phys_t page_dir;       // Physical address of the PML4 (for CR3)
+    uintptr_t rsp;         // Kernel stack pointer (saved on context switch)
+    uintptr_t rbp;         // Base pointer (saved on context switch)
+    uint32_t rip;          // Switch-seed flag: 0 = never switched-to (seed on
                            // first switch_to), 1 = seeded/live (never an addr)
     uint32_t entered_ring3; // 1 once the main-loop entry drain IRETed here
-    uint32_t user_esp;     // User-mode stack pointer
-    uint32_t user_eip;     // User-mode instruction pointer
-    uint32_t kernel_stack; // Kernel thread stack HIGH virt (kmalloc'd 4K).
+    uint64_t user_rsp;     // User-mode stack pointer
+    uint64_t user_rip;     // User-mode instruction pointer
+    uintptr_t kernel_stack; // Kernel thread stack HIGH virt (kmalloc'd).
                            // Preemption frames live here (seed/saves).
-    uint32_t trap_stack;   // Ring-3 trap stack HIGH virt (kmalloc'd 4K).
-                           // TSS.ESP0 points here (pusha frames on syscalls).
-    uint32_t esp0_top;     // TSS ESP0 value = trap_stack + SIZE (NOT kstack)
+    uintptr_t trap_stack;  // Ring-3 trap stack HIGH virt (kmalloc'd).
+                           // TSS.RSP0 points here (pusha frames on syscalls).
+    uintptr_t rsp0_top;    // TSS RSP0 value = trap_stack + SIZE (NOT kstack)
     uint32_t ticks_left;   // Scheduler time slice remaining (timer ticks)
     uint32_t parent_pid;   // fork parent (0 = spawned from shell)
     int exit_code;         // wait() status once ZOMBIE/EXITED
     uint32_t pending_signals; // bitmask (1<<SIG_*)
-    uint32_t heap_break;   // sbrk-managed user heap top (0 = not started)
-    uint32_t mmap_next;    // next auto-mmap hint (grows down from stack gap)
+    uint64_t heap_break;   // sbrk-managed user heap top (0 = not started)
+    uint64_t mmap_next;    // next auto-mmap hint (grows down from stack gap)
     int fds[PROC_MAX_FDS]; // open-file indices, PROC_FD_* or -1 free
     int term_win;        // owning terminal window for stdio (PROC_FD_TERM
                           // backing); -1 = none (falls back to focused)
@@ -84,7 +85,7 @@ struct process {
                             // snapshots a PCB before its cli can detect slot
                             // reuse under it (see process_switch_to). LAST
                             // field by ABI convention: idt.c's exec-redirect
-                            // reads user_eip/esp by offsetof (see below), but
+                            // reads user_rip/rsp by offsetof (see below), but
                             // keeping growth at the tail minimizes churn for
                             // any future raw-offset readers.
     // x87 context across PREEMPTIVE switches (process_switch_to): ojs
@@ -102,8 +103,8 @@ struct process {
 // Initialize the process table
 void process_init(void);
 
-// Re-capture pid 0's live thread ESP/EBP (call right before sti).
-void process_capture_idle_esp(void);
+// Re-capture pid 0's live thread RSP/RBP (call right before sti).
+void process_capture_idle_rsp(void);
 
 // Arm pid 0's slice once before sti (first tick decrements, not expires).
 void process_idle_arm(void);
@@ -125,8 +126,8 @@ struct process* process_current(void);
 void process_switch(uint32_t pid);
 
 // Full kernel-thread switch (Phase 2 preemption): saves the outgoing
-// thread's frame (EBX/ESI/EDI/EBP/ESP+EIP via context_switch stub), loads
-// CR3 + TSS.ESP0 + ESP for the incoming thread. IRQs OFF across the whole
+// thread's frame (RBX/RSI/RDI/RBP/RSP+RIP via context_switch stub), loads
+// CR3 + TSS.RSP0 + RSP for the incoming thread. IRQs OFF across the whole
 // switch. Safe from timer IRQ AND from kernel threads — NEVER from ring-3
 // trap context (the isr_common_stub frame must popa+iret, not be switched
 // under — see the sched_yield trap-safe rule).

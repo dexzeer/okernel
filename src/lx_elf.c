@@ -60,24 +60,24 @@ static const struct elf64_hdr *check(struct lx_node *n, int *err) {
     return h;
 }
 
-static uint32_t pgdown(uint64_t v) { return (uint32_t)v & ~0xFFFu; }
-static uint32_t pgup(uint64_t v) { return (uint32_t)((v + 0xFFF) & ~0xFFFull); }
+static uint64_t pgdown(uint64_t v) { return v & ~0xFFFull; }
+static uint64_t pgup(uint64_t v) { return (v + 0xFFF) & ~0xFFFull; }
 
 // Map the PT_LOAD segments of `n` at `bias`. Returns 0 and the extent [*lo, *hi) of the mapped range.
-static int map_segments(struct lx_task *t, struct lx_node *n, const struct elf64_hdr *h, uint32_t bias, uint32_t *lo, uint32_t *hi) {
-    *lo = 0xFFFFFFFFu; *hi = 0;
+static int map_segments(struct lx_task *t, struct lx_node *n, const struct elf64_hdr *h, uint64_t bias, uint64_t *lo, uint64_t *hi) {
+    *lo = ~0ull; *hi = 0;
     for (int i = 0; i < h->phnum; i++) {
         const struct elf64_phdr *p = (const struct elf64_phdr*)(n->data + h->phoff + (uint64_t)i * h->phentsize);
         if (p->type != PT_LOAD || !p->memsz) continue;
         if (p->vaddr + bias + p->memsz > LX_USER_TOP || p->vaddr + bias < LX_USER_BASE) return -LX_ENOEXEC;
         if (p->offset + p->filesz > n->size || p->filesz > p->memsz) return -LX_ENOEXEC;
-        uint32_t va = (uint32_t)p->vaddr + bias;
-        uint32_t start = pgdown(va), end = pgup((uint64_t)va + p->memsz);
+        uint64_t va = p->vaddr + bias;
+        uint64_t start = pgdown(va), end = pgup(va + p->memsz);
         uint32_t prot = ((p->flags & PF_R) ? LX_PROT_READ : 0) | ((p->flags & PF_W) ? LX_PROT_WRITE : 0) | ((p->flags & PF_X) ? LX_PROT_EXEC : 0);
         int r = lx_map_region(t, start, end - start, prot, LX_MAP_PRIVATE, n, p->offset - (va - start));
         if (r) return r;
         struct lx_vma *v = lx_vma_find(t, start);
-        if (v) v->fend = va + (uint32_t)p->filesz;
+        if (v) v->fend = va + p->filesz;
         if (start < *lo) *lo = start;
         if (end > *hi) *hi = end;
     }
@@ -173,8 +173,8 @@ int lx_exec_load(struct lx_task *t, const char *path, const char *const *argv, c
     for (int k = 0; k < LX_NSIG; k++) if (t->sh->act[k].handler != 1) memset(&t->sh->act[k], 0, sizeof t->sh->act[k]);   // handlers go, ignored stays
     t->sig_pending = 0;
 
-    uint32_t bias = h->type == 3 ? 0x10000000u : 0;
-    uint32_t lo, hi;
+    uint64_t bias = h->type == 3 ? 0x10000000u : 0;
+    uint64_t lo, hi;
     int r = map_segments(t, n, h, bias, &lo, &hi);
     if (r) return r;
     t->mm->brk_start = t->mm->brk = hi;
@@ -194,21 +194,21 @@ int lx_exec_load(struct lx_task *t, const char *path, const char *const *argv, c
     if (interp) {
         const struct elf64_hdr *ih = check(interp, &err);
         if (!ih) return err;
-        uint32_t span_lo = 0xFFFFFFFFu, span_hi = 0;
+        uint64_t span_lo = ~0ull, span_hi = 0;
         for (int i = 0; i < ih->phnum; i++) {
             const struct elf64_phdr *p = (const struct elf64_phdr*)(interp->data + ih->phoff + (uint64_t)i * ih->phentsize);
             if (p->type != PT_LOAD) continue;
             if (pgdown(p->vaddr) < span_lo) span_lo = pgdown(p->vaddr);
             if (pgup(p->vaddr + p->memsz) > span_hi) span_hi = pgup(p->vaddr + p->memsz);
         }
-        uint32_t ibias = 0;
+        uint64_t ibias = 0;
         if (ih->type == 3) {
             ibias = lx_find_free(t, span_hi - span_lo);
             if (!ibias) return -LX_ENOMEM;
             ibias -= span_lo;
             t->mm->mmap_hint = ibias + span_lo;               // later mmaps go below the loader
         }
-        uint32_t ilo, ihi;
+        uint64_t ilo, ihi;
         r = map_segments(t, interp, ih, ibias, &ilo, &ihi);
         if (r) return r;
         entry = ih->entry + ibias;

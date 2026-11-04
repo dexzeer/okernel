@@ -61,7 +61,7 @@ static struct {
     int ready;
 } G;
 
-static uint32_t phys_of(const void* p) { return V2P((uint32_t)p); }
+static uint32_t phys_of(const void* p) { return V2P(p); }
 
 // Synchronous control command: cmd (+ optional extra payload) in, resp out.
 static int ctl(const void* cmd, uint32_t clen, const void* extra, uint32_t elen, void* resp, uint32_t rlen) {

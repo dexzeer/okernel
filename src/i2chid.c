@@ -66,9 +66,9 @@ static struct {
 } T;
 
 static int cmdline_has(uint32_t mboot, const char* word) {
-    uint32_t flags = *(volatile uint32_t*)(mboot + 0);
+    uint32_t flags = *(volatile uint32_t*)(uintptr_t)(mboot + 0);
     if (!(flags & (1u << 2))) return 0;
-    const char* c = (const char*)P2V_U32(*(volatile uint32_t*)(mboot + 16));
+    const char* c = (const char*)P2V_ADDR(*(volatile uint32_t*)(uintptr_t)(mboot + 16));
     uint32_t wl = (uint32_t)strlen(word);
     for (int i = 0; c[i] && i < 512; i++)
         if (!strncmp(c + i, word, wl) && (i == 0 || c[i - 1] == ' ') && (c[i + wl] == 0 || c[i + wl] == ' ')) return 1;
@@ -88,11 +88,11 @@ static int rng_has(uint32_t a) {
 
 static void collect_ranges(uint32_t mboot) {
     nrng = 0;
-    uint32_t flags = *(volatile uint32_t*)(mboot + 0);
+    uint32_t flags = *(volatile uint32_t*)(uintptr_t)(mboot + 0);
     if (flags & (1u << 6)) {                                          // RAM, ACPI tables, NVS from the firmware map
-        uint32_t mlen = *(volatile uint32_t*)(mboot + 44), maddr = *(volatile uint32_t*)(mboot + 48);
+        uint32_t mlen = *(volatile uint32_t*)(uintptr_t)(mboot + 44), maddr = *(volatile uint32_t*)(uintptr_t)(mboot + 48);
         for (uint32_t o = 0; o + 24 <= mlen && o < 4096; ) {
-            const volatile uint32_t* e = (const volatile uint32_t*)P2V_U32(maddr + o);
+            const volatile uint32_t* e = (const volatile uint32_t*)P2V_ADDR(maddr + o);
             uint32_t esz = e[0], base = e[1], baseh = e[2], rl = e[3], rlh = e[4], type = e[5];
             if (esz < 20) break;
             devlog('p', "mem %x%08x +%x%08x type %u", baseh, base, rlh, rl, type);
@@ -116,8 +116,8 @@ static void collect_ranges(uint32_t mboot) {
             if (raw & 1) continue;                                    // I/O BAR
             int is64 = ((raw >> 1) & 3) == 2;
             int mem, above;
-            uint32_t base = pcix_bar(l, b, &mem, &above);
-            uint32_t size = base ? pcix_bar_size(l, b) : 0;
+            uint32_t base = (uint32_t)pcix_bar(l, b, &mem, &above);
+            uint32_t size = base ? (uint32_t)pcix_bar_size(l, b) : 0;
             if (base) devlog('p', "  bar%d %x%s size %x", b, base, above ? " (above 4G)" : "", size);
             if (base && !above && size) rng_add(base, base + size < base ? 0xFFFFFFFFu : base + size);
             if (is64) b++;
@@ -506,8 +506,8 @@ void i2chid_init(uint32_t mboot_phys) {
         if (i2caml_gpioint((const uint8_t* const*)tabs, lens, nt, d0->name, &pin, src) && i2caml_mem32((const uint8_t* const*)tabs, lens, nt, src, &gb, &chv)) {
             tlog("%s interrupt: pin %u of %s (registers %x, %s)", d0->hid, pin, src, gb, chv ? "Cherry Trail pin controller" : "unknown controller type");
             if (chv && gb >= 0xFEC00000u && gb < 0xFF000000u) {
-                T.attn = (volatile uint32_t*)(gb + 0x4400 + 0x400 * (pin / 15) + 8 * (pin % 15));      // inside the identity-mapped uncached 0xFEC00000 window
-                tlog("  pad %x: control0 %x control1 %x", (uint32_t)T.attn, T.attn[0], T.attn[1]);
+                T.attn = (volatile uint32_t*)paging_map_mmio(gb + 0x4400 + 0x400 * (pin / 15) + 8 * (pin % 15), 4);
+                tlog("  pad %x: control0 %x control1 %x", gb + 0x4400 + 0x400 * (pin / 15) + 8 * (pin % 15), T.attn[0], T.attn[1]);
                 T.attn_last = (T.attn[0] >> 1) & 1;
             }
         } else tlog("%s: no interrupt pin found in the AML", d0->hid);

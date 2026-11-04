@@ -25,7 +25,7 @@ void sched_yield(void);
 int sched_spawn_elf(const char *path, char *const argv[], char *const envp[],
                     int win_id);
 
-// Switch address space + ESP0 to a process WITHOUT touching the running
+// Switch address space + RSP0 to a process WITHOUT touching the running
 // thread (used to BUILD the space: map + copy while kernel PD is live).
 // After building, sched_activate(pid) makes it current for ring-3 entry.
 void sched_prepare(uint32_t pid);
@@ -43,24 +43,24 @@ void sched_reap(uint32_t pid);
 // Trap-safe (static slots only). Returns 0 on success, -1 when full.
 int sched_fork_child_entry(uint32_t child_pid);
 
-// Flag a pid as a fork child (its next entry IRET forces saved-EAX 0).
+// Flag a pid as a fork child (its next entry IRET forces saved-RAX 0).
 void sched_fork_mark_child(uint32_t pid);
 
 // 1 if pid is a flagged fork child (consumes the flag), else 0.
 int sched_fork_take_child(uint32_t pid);
 
-// Stage a parked thread's resume (pid + trapped EIP/ESP + EAX retval).
+// Stage a parked thread's resume (pid + trapped RIP/RSP + RAX retval).
 // The drain re-enters it via enter_user_mode once woken (tick WAKE pass or
-// SIG_CHLD); the re-entry forces EAX=park_ret (separate flag from fork).
-void sched_park_stage(uint32_t pid, uint32_t eip, uint32_t esp, uint32_t ret);
+// SIG_CHLD); the re-entry forces RAX=park_ret (separate flag from fork).
+void sched_park_stage(uint32_t pid, uint64_t rip, uint64_t rsp, uint32_t ret);
 
-// 1 + EAX retval if pid has a staged park resume (consumes the flag; the
+// 1 + RAX retval if pid has a staged park resume (consumes the flag; the
 // drain calls this before enter_user_mode), else 0.
 int sched_park_take(uint32_t pid, uint32_t *ret_out);
 
-// Peek a staged park resume's EIP/ESP (drain re-entry needs them; take()
+// Peek a staged park resume's RIP/RSP (drain re-entry needs them; take()
 // returns the retval — call this first, then take()).
-int sched_park_resume(uint32_t pid, uint32_t *eip_out, uint32_t *esp_out);
+int sched_park_resume(uint32_t pid, uint64_t *eip_out, uint64_t *esp_out);
 
 // Drop a pid's staged park resume without consuming it (fork hygiene: fresh
 // children must not inherit a reused slot's stale resume; destroy hygiene:
@@ -69,7 +69,7 @@ void sched_park_drop(uint32_t pid);
 
 // Ring-3 trap reconcile: if the current thread is pid 0 (kernel) but a
 // RUNNING user process exists (preempted ring-3 thread stolen by the main
-// loop), switch CR3+ESP0+current back to it. Trap-safe (no frame changes,
+// loop), switch CR3+RSP0+current back to it. Trap-safe (no frame changes,
 // shared-high-map stacks stay valid; future traps land correctly).
 void syscall_reconcile_ring3(void);
 

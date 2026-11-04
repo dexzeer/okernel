@@ -13,14 +13,14 @@ int fpu_has_fxsave(void) { return has_fxsr; }
 void fpu_init_cpu(void) {
     uint32_t c, d;
     cpuid1(&c, &d);
-    uint32_t cr0;
+    uint64_t cr0;
     __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
-    cr0 &= ~(0x4u | 0x8u);          // EM, TS
+    cr0 &= ~(uint64_t)(0x4u | 0x8u);          // EM, TS
     cr0 |= 0x2u | 0x20u;            // MP, NE
     __asm__ volatile("mov %0, %%cr0" :: "r"(cr0));
     int fx = (d >> 24) & 1, sse = (d >> 25) & 1, sse2 = (d >> 26) & 1;
     if (fx) {
-        uint32_t cr4;
+        uint64_t cr4;
         __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
         cr4 |= 1u << 9;             // OSFXSR: FXSAVE/FXRSTOR and SSE allowed
         if (sse) cr4 |= 1u << 10;   // OSXMMEXCPT: unmasked SSE exceptions raise #XM

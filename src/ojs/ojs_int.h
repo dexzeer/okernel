@@ -48,7 +48,9 @@ typedef uint64_t jv;
 #define JV_TAG(v)        ((uint32_t)((v) >> 48))
 #define JV_MAKE(tag, lo) (((uint64_t)(tag) << 48) | (uint32_t)(lo))
 #define JV_LO(v)         ((uint32_t)(v))
-#define JV_PTR(v)        ((void*)(uintptr_t)(uint32_t)(v))
+// Pointers keep their low 48 bits; bit 47 is sign-extended back, which restores both user-half (host) and kernel-half addresses.
+#define JV_MAKE_P(tag, p) (((uint64_t)(tag) << 48) | ((uint64_t)(uintptr_t)(p) & 0xFFFFFFFFFFFFull))
+#define JV_PTR(v)        ((void*)(uintptr_t)((int64_t)((uint64_t)(v) << 16) >> 16))
 
 #define JV_UNDEFINED JV_MAKE(TAG_SPECIAL, 0)
 #define JV_NULL      JV_MAKE(TAG_SPECIAL, 1)
@@ -104,11 +106,11 @@ static inline struct obj* jv_obj(jv v) { return (struct obj*)JV_PTR(v); }
 static inline struct str* jv_str(jv v) { return (struct str*)JV_PTR(v); }
 static inline struct sym* jv_sym(jv v) { return (struct sym*)JV_PTR(v); }
 static inline struct bigint* jv_bigv(jv v) { return (struct bigint*)JV_PTR(v); }
-static inline jv jv_from_obj(struct obj* o) { return JV_MAKE(TAG_OBJ, (uintptr_t)o); }
-static inline jv jv_from_str(struct str* s) { return JV_MAKE(TAG_STR, (uintptr_t)s); }
-static inline jv jv_from_sym(struct sym* s) { return JV_MAKE(TAG_SYM, (uintptr_t)s); }
-static inline jv jv_from_big(struct bigint* b) { return JV_MAKE(TAG_BIG, (uintptr_t)b); }
-static inline jv jv_from_ptr(void* p) { return JV_MAKE(TAG_PTR, (uintptr_t)p); }
+static inline jv jv_from_obj(struct obj* o) { return JV_MAKE_P(TAG_OBJ, o); }
+static inline jv jv_from_str(struct str* s) { return JV_MAKE_P(TAG_STR, s); }
+static inline jv jv_from_sym(struct sym* s) { return JV_MAKE_P(TAG_SYM, s); }
+static inline jv jv_from_big(struct bigint* b) { return JV_MAKE_P(TAG_BIG, b); }
+static inline jv jv_from_ptr(void* p) { return JV_MAKE_P(TAG_PTR, p); }
 
 // ---------------------------------------------------------------- GC heap
 //
@@ -251,13 +253,13 @@ struct sym {
 
 // ---------------------------------------------------------------- property keys
 //
-// pkey (32 bits): (index << 1) | 1 for array indices 0 .. 2^31-1, otherwise
+// pkey (pointer-sized): (index << 1) | 1 for array indices 0 .. 2^31-1, otherwise
 // a pointer (8-aligned, low bit 0) to an atom string or a symbol.
 
-typedef uint32_t pkey;
+typedef uintptr_t pkey;
 #define PK_IS_INDEX(k) ((k) & 1u)
 #define PK_INDEX(k)    ((uint32_t)(k) >> 1)
-#define PK_FROM_INDEX(i) (((uint32_t)(i) << 1) | 1u)
+#define PK_FROM_INDEX(i) ((pkey)(((uint32_t)(i) << 1) | 1u))
 #define PK_NONE        0u
 static inline int pk_is_sym(pkey k) { return !PK_IS_INDEX(k) && k && ((struct gch*)(uintptr_t)k)->type == GT_SYM; }
 static inline int pk_is_str(pkey k) { return !PK_IS_INDEX(k) && k && ((struct gch*)(uintptr_t)k)->type == GT_STR; }

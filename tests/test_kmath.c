@@ -1,5 +1,5 @@
 // Host test for src/kmath.c (okernel's own libm) against glibc.
-//   gcc -m32 -O2 -mfpmath=387 -DKMATH_NO_STD_NAMES -o build-host/t_kmath tests/test_kmath.c src/kmath.c -lm
+//   gcc -m64 -O2 -mfpmath=sse -DKMATH_NO_STD_NAMES -o build-host/t_kmath tests/test_kmath.c src/kmath.c -lm
 // - accuracy: ulp error vs glibc's 80-bit long double functions (a
 //   reference ~2^11 times more precise than double), random inputs over
 //   many ranges; limit 1 ulp (functions are designed for ~0.5 ulp)

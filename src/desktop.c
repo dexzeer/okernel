@@ -654,7 +654,7 @@ static void shell_execute_run(int win_id, const char *rest) {
     // instead of silently dropping the entry (which wedges the waiter: the
     // drain announces Back/exit for a pid that never runs).
     if (rp) {
-        if (entry_enqueue(pid, rp->user_eip, rp->user_esp, win_id)) {
+        if (entry_enqueue(pid, rp->user_rip, rp->user_rsp, win_id)) {
             serial_printf("[run] pid=%d entry queue full — dropped\n", pid);
             window_puts(win_id, "run: system busy, try again\n");
             sched_reap((uint32_t)pid);
@@ -666,12 +666,12 @@ static void shell_execute_run(int win_id, const char *rest) {
             return;
         }
     } else {
-        entry_enqueue(pid, 0x08048000, 0xBFFFF000 + 4096, win_id);
+        entry_enqueue(pid, 0x08048000, PROC_STACK_TOP, win_id);
     }
     // Init entry goes second (FIFO after the program that triggered first-run).
     if (init_pid >= 0) {
         struct process *ip = process_get((uint32_t)init_pid);
-        if (ip && entry_enqueue(init_pid, ip->user_eip, ip->user_esp, win_id)) {
+        if (ip && entry_enqueue(init_pid, ip->user_rip, ip->user_rsp, win_id)) {
             // Queue filled between the two enqueues (absurd — 4 slots):
             // reap init, keep the program (fail-soft, no wedge).
             serial_puts("[run] init entry dropped (queue full)\n");
@@ -1739,12 +1739,12 @@ static void on_keypress(char c, int alt) {
         if (sys_proc_kbd_offer(term_bufs[tidx], term_lens[tidx]))
             kbd_wake_armed = 1;
         // OFFER-WAKE SHAPE (2026-09-09: waking the reader INLINE (IRET
-        // from inside the keyboard IRQ) faulted — #PF err=4 at the resume EIP
+        // from inside the keyboard IRQ) faulted — #PF err=4 at the resume RIP
         // with pid=0 live: the IRQ trap frame (keyboard IRQ entered via
         // irq_common_stub on the CURRENT trap stack) is buried under our IRET
         // — enter's caller-frame save + iret discards it, and the IRQ never
         // returns (EOI already sent? no — we never reach irq_handler's EOI...
-        // actually EOI ran (irq_handler prologue); the fault is CR3/ESP0: we
+        // actually EOI ran (irq_handler prologue); the fault is CR3/RSP0: we
         // prepared the reader's space but IRETed from IRQ context whose stack
         // is the interrupted thread's — trampoline resumes the IRQ stub frame
         // as if it were the drain caller → garbage). Correct shape: ARM a
@@ -1831,7 +1831,7 @@ static void on_timer(void) {
     {
         uint8_t sample[32];
         uint64_t t = 0;
-        __asm__ volatile("rdtsc" : "=A"(t));
+        { uint32_t tsc_lo_, tsc_hi_; __asm__ volatile("rdtsc" : "=a"(tsc_lo_), "=d"(tsc_hi_)); t = ((uint64_t)tsc_hi_ << 32) | tsc_lo_; }
         for (int i = 0; i < 32; i++)
             sample[i] = (uint8_t)((t >> ((i & 7) * 8)) & 0xFF);
         rand_stir(sample); // TIMER class (wrapper)
@@ -1874,7 +1874,7 @@ static int sys_write_to_window(int win_id, const char *buf, uint32_t len) {
     for (uint32_t i = 0; i < len; i++) window_put_char(win_id, buf[i]);
     return (int)len;
 }
-void desktop_mmap_user(uint32_t virt, uint32_t phys) {
+void desktop_mmap_user(uint64_t virt, uint64_t phys) {
     paging_map_user(virt, phys);
 }
 static int desktop_current_pid(void) {
@@ -1916,8 +1916,8 @@ void kernel_main(uint32_t mboot_phys) {
     // TS=0. Preemptive switches FNSAVE/FRSTOR per thread (process.c).
     fpu_init_cpu();   // also CR4.OSFXSR/OSXMMEXCPT when the CPU has SSE2 (see fpu.c)
     memory_init(mboot_phys);
-    if (*(volatile uint32_t*)(mboot_phys + 0) & (1u << 2)) {        // the command line: "/known/kanarchy.bin recovery"
-        const volatile char* cl = (const volatile char*)*(volatile uint32_t*)(mboot_phys + 16);
+    if (*(volatile uint32_t*)(uintptr_t)(mboot_phys + 0) & (1u << 2)) {        // the command line: "/known/kanarchy.bin recovery"
+        const volatile char* cl = (const volatile char*)(uintptr_t)*(volatile uint32_t*)(uintptr_t)(mboot_phys + 16);
         for (int i = 0; i < 240 && cl[i]; i++)
             if ((i == 0 || cl[i - 1] == ' ') && cl[i] == 'r' && cl[i + 1] == 'e' && cl[i + 2] == 'c' && cl[i + 3] == 'o' &&
                 cl[i + 4] == 'v' && cl[i + 5] == 'e' && cl[i + 6] == 'r' && cl[i + 7] == 'y' && (!cl[i + 8] || cl[i + 8] == ' '))
@@ -1928,16 +1928,16 @@ void kernel_main(uint32_t mboot_phys) {
     // mboot_info.framebuffer_addr is the uint64 at offset 88 (NOT 44: count
     // the packed struct above — 4+4+4*9+2*4 = 88). A wrong offset reads
     // vbe_mode_info/garbage as fb (0x90 class) and paging maps nothing.
-    uint32_t mboot_flags = *(volatile uint32_t*)(mboot_phys + 0);
-    uint64_t mboot_fb = *(volatile uint64_t*)(mboot_phys + 88);
-    uint32_t fb_addr = 0, fb_bytes = 0;
+    uint32_t mboot_flags = *(volatile uint32_t*)(uintptr_t)(mboot_phys + 0);
+    uint64_t mboot_fb = *(volatile uint64_t*)(uintptr_t)(mboot_phys + 88);
+    uint64_t fb_addr = 0, fb_bytes = 0;
     if (mboot_flags & (1 << 12)) {
-        fb_addr = (uint32_t)mboot_fb;
+        fb_addr = mboot_fb;
         // pitch (96) x height (104): how much address space the mapping must cover
-        fb_bytes = *(volatile uint32_t*)(mboot_phys + 96) * *(volatile uint32_t*)(mboot_phys + 104);
+        fb_bytes = *(volatile uint32_t*)(uintptr_t)(mboot_phys + 96) * *(volatile uint32_t*)(uintptr_t)(mboot_phys + 104);
         if (fb_bytes > 48u * 1024 * 1024) fb_bytes = 48u * 1024 * 1024;
     }
-    serial_printf("[boot] mboot phys=%x flags=%x fb=%x\n",
+    serial_printf("[boot] mboot phys=%x flags=%x fb=%lx\n",
                   mboot_phys, mboot_flags, fb_addr);
     // paging_init BEFORE process_init: the boot PD maps only 0-4M, but .bss
     // statics (page_directory at phys ~0x2C00000, processes, bitmap tail)
@@ -2128,13 +2128,13 @@ void kernel_main(uint32_t mboot_phys) {
         rand_personalize(mac, 6);
         uint8_t seed[32];
         uint64_t tsc = 0;
-        __asm__ volatile("rdtsc" : "=A"(tsc));
+        { uint32_t tsc_lo_, tsc_hi_; __asm__ volatile("rdtsc" : "=a"(tsc_lo_), "=d"(tsc_hi_)); tsc = ((uint64_t)tsc_hi_ << 32) | tsc_lo_; }
         for (int i = 0; i < 32; i++)
             seed[i] = (uint8_t)(((tsc >> ((i & 7) * 8)) & 0xFF) ^ (i * 0x9E));
         rand_seed(seed);
         for (int s = 0; s < 16; s++) {
             uint64_t t2 = 0;
-            __asm__ volatile("rdtsc" : "=A"(t2));
+            { uint32_t tsc_lo_, tsc_hi_; __asm__ volatile("rdtsc" : "=a"(tsc_lo_), "=d"(tsc_hi_)); t2 = ((uint64_t)tsc_hi_ << 32) | tsc_lo_; }
             uint8_t sample[32];
             for (int i = 0; i < 32; i++)
                 sample[i] = (uint8_t)(((t2 >> ((i & 7) * 8)) & 0xFF) ^ (s * 37 + i));
@@ -2149,11 +2149,11 @@ void kernel_main(uint32_t mboot_phys) {
         // ~16k port reads ≈ milliseconds at boot.
         for (int s = 0; s < 16; s++) {
             uint64_t t0 = 0, t1 = 0;
-            __asm__ volatile("rdtsc" : "=A"(t0));
+            { uint32_t tsc_lo_, tsc_hi_; __asm__ volatile("rdtsc" : "=a"(tsc_lo_), "=d"(tsc_hi_)); t0 = ((uint64_t)tsc_hi_ << 32) | tsc_lo_; }
             uint8_t sink = 0;
             for (volatile int k = 0; k < 1000; k++)
                 sink ^= inb(0x80);
-            __asm__ volatile("rdtsc" : "=A"(t1));
+            { uint32_t tsc_lo_, tsc_hi_; __asm__ volatile("rdtsc" : "=a"(tsc_lo_), "=d"(tsc_hi_)); t1 = ((uint64_t)tsc_hi_ << 32) | tsc_lo_; }
             uint64_t dt = t1 - t0;
             uint8_t sample[32];
             for (int i = 0; i < 32; i++)
@@ -2191,14 +2191,14 @@ void kernel_main(uint32_t mboot_phys) {
     i2chid_init(mboot_phys);    // I2C-HID touchpad (only when the AML describes one); fail-safe
     keyboard_init();
     keyboard_set_callback(on_key_irq);
-    // Capture the main-loop thread's live ESP/EBP into pid 0 BEFORE sti:
-    // the preemption stub saves/restores p->esp per thread, and process_init
-    // ran one frame up (its ESP capture is stale by a frame). This is the
+    // Capture the main-loop thread's live RSP/RBP into pid 0 BEFORE sti:
+    // the preemption stub saves/restores p->rsp per thread, and process_init
+    // ran one frame up (its RSP capture is stale by a frame). This is the
     // exact thread the timer will preempt — seed it precisely. Also arm
     // pid 0's slice (first tick decrements instead of expiring at boot).
     {
-        extern void process_capture_idle_esp(void);
-        process_capture_idle_esp();
+        extern void process_capture_idle_rsp(void);
+        process_capture_idle_rsp();
     }
     process_idle_arm();
     sti();
@@ -2218,31 +2218,31 @@ void kernel_main(uint32_t mboot_phys) {
             if (lx_fg_pid > 0 && !lx_pid_alive(lx_fg_pid)) { lx_fg_pid = 0; shell_prompt(lx_fg_win); }
         }
         textview_redraw_if_resized();
-        // Ring-3 entry drain: the shell (and fork) stage pid+eip+esp+window
+        // Ring-3 entry drain: the shell (and fork) stage pid+rip+rsp+window
         // into the entry run queue; here is plain ring-0 thread context, so
-        // prepare (CR3+ESP0) + IRET below is safe. sys_exit resumes right
+        // prepare (CR3+RSP0) + IRET below is safe. sys_exit resumes right
         // after the call (trampoline restores the caller frame:
-        // EBP/ESI/EDI/ESP + segments): drain signals, unprepare, reap (or
+        // RBP/RSI/RDI/RSP + segments): drain signals, unprepare, reap (or
         // leave zombies for wait()), announce, re-enable, loop on.
         // (The legacy single-slot usermode path was retired 2026-09-10;
         // only the queue remains.)
         for (;;) {
-            uint32_t eip = 0, esp = 0;
+            uint64_t rip = 0, rsp = 0;
             int pid = -1, win_id = -1, is_fork_child = 0;
-            if (!entry_dequeue(&pid, &eip, &esp, &win_id)) {
+            if (!entry_dequeue(&pid, &rip, &rsp, &win_id)) {
                 // queued entry (fork child or run-spawn)
             } else {
                 break; // queue empty
             }
             is_fork_child = (pid >= 0) ? sched_fork_take_child((uint32_t)pid) : 0;
-            // EXITED-SKIP (2026-09-09: post-hello #PF err=0 cr2=0 eip=0 — a
+            // EXITED-SKIP (2026-09-09: post-hello #PF err=0 cr2=0 rip=0 — a
             // wait-parked parent was re-entered, reaped its zombie, and
             // EXITED... then a STALE queued entry for the same pid (staged
             // before the exit, e.g. fork-child entry + park-resume entry
-            // both queued) dequeued into prepare+IRET with user_eip/esp from
-            // a FREED address space (destroy poisoned esp/esp0/page_dir to 0
+            // both queued) dequeued into prepare+IRET with user_rip/rsp from
+            // a FREED address space (destroy poisoned rsp/rsp0/page_dir to 0
             // → CR3=kernel-PD-fallback... actually page_dir=0 → kernel PD,
-            // eip/esp=stale user values → #PF at CR2==EIP==0 class). Never
+            // rip/rsp=stale user values → #PF at CR2==RIP==0 class). Never
             // enter a pid whose slot is UNUSED or whose state is
             // ZOMBIE/EXITED (reaped or awaiting reap — wait() owns it now).
             if (pid >= 0) {
@@ -2266,10 +2266,10 @@ void kernel_main(uint32_t mboot_phys) {
             if (pid >= 0 && !is_fork_child) {
                 struct process *dp = process_get((uint32_t)pid);
                 if (dp && dp->state == PROC_BLOCKED && dp->entered_ring3) {
-                    extern int sched_park_resume(uint32_t, uint32_t*, uint32_t*);
+                    extern int sched_park_resume(uint32_t, uint64_t *, uint64_t *);
                     extern int sched_park_take(uint32_t, uint32_t*);
-                    uint32_t peip = 0, pesp = 0;
-                    if (sched_park_resume((uint32_t)pid, &peip, &pesp)) {
+                    uint64_t p_rip = 0, p_rsp = 0;
+                    if (sched_park_resume((uint32_t)pid, &p_rip, &p_rsp)) {
                         // Staged resume exists: check its wake condition.
                         // Wait-park (ret == -2): wake iff a matching child
                         // is a zombie NOW (reaped by the drain below after
@@ -2279,8 +2279,8 @@ void kernel_main(uint32_t mboot_phys) {
                         uint32_t pret = 0;
                         sched_park_take((uint32_t)pid, &pret);
                         // Peek only (take consumed the flag — re-stage).
-                        extern void sched_park_stage(uint32_t, uint32_t, uint32_t, uint32_t);
-                        sched_park_stage((uint32_t)pid, peip, pesp, pret);
+                        extern void sched_park_stage(uint32_t, uint64_t, uint64_t, uint32_t);
+                        sched_park_stage((uint32_t)pid, p_rip, p_rsp, pret);
                         int wake = 0;
                         if (pret == (uint32_t)-2) {
                             // wait-park: wake iff matching zombie exists
@@ -2317,10 +2317,10 @@ void kernel_main(uint32_t mboot_phys) {
                             // Consume the staged resume for real this time.
                             sched_park_take((uint32_t)pid, &park_ret);
                             // WAKE-TRACE (bisect 2026-09-09: post-hello #PF
-                            // eip=esp=0 — find who enters zeros).
-                            serial_printf("[wake] pid=%d eip=%x esp=%x ret=%d\n",
-                                          pid, peip, pesp, (int)park_ret);
-                            eip = peip; esp = pesp;
+                            // rip=rsp=0 — find who enters zeros).
+                            serial_printf("[wake] pid=%d rip=%lx rsp=%lx ret=%d\n",
+                                          pid, p_rip, p_rsp, (int)park_ret);
+                            rip = p_rip; rsp = p_rsp;
                             is_park_resume = 1;
                             dp->state = PROC_READY;
                             dp->ticks_left = SCHED_SLICE_TICKS;
@@ -2370,47 +2370,37 @@ void kernel_main(uint32_t mboot_phys) {
                 struct process *ent = process_get((uint32_t)pid);
                 if (ent) ent->entered_ring3 = 1;
             }
-            // Fork child: EAX forced 0 by the enter path (see isr.asm), so
-            // ring-3 observes fork() == 0. Park resume: staged EAX likewise.
+            // Fork child: RAX forced 0 by the enter path (see isr.asm), so
+            // ring-3 observes fork() == 0. Park resume: staged RAX likewise.
             // Plain calls BEFORE the enter asm (flags live in .bss — safe
-            // against the asm's EAX clobber). Never both (a pid is either a
+            // against the asm's RAX clobber). Never both (a pid is either a
             // fresh child or a resumed parker, not both — fork wins).
             // FORK-TRACE (input-bug bisect 2026-09-08): prove the flag path.
             if (is_fork_child) {
-                serial_printf("[fork-enter] pid=%d eip=%x esp=%x EAX=0\n",
-                              pid, eip, esp);
+                serial_printf("[fork-enter] pid=%d rip=%lx rsp=%lx RAX=0\n",
+                              pid, rip, rsp);
             }
             if (is_fork_child) enter_user_mode_fork_child();
-            else if (is_park_resume) enter_user_mode_park_ret(park_ret);
-            // ENTER-TRACE (bisect 2026-09-09: post-hello #PF eip=esp=0 —
+            else if (is_park_resume) { enter_user_mode_park_ret(park_ret); syscall_load_park_regs((uint32_t)pid); }
+            // ENTER-TRACE (bisect 2026-09-09: post-hello #PF rip=rsp=0 —
             // prove every IRET's target; the crash enters pid 4 with zeros
             // and NO [wake]/[fork-enter]/[kbd-wake] line precedes it).
-            serial_printf("[enter] pid=%d eip=%x esp=%x fork=%d park=%d\n",
-                          pid, eip, esp, is_fork_child, is_park_resume);
-            // Register calling convention: eip->EAX, esp->EDX (enter takes NO
-            // stack args, so ESP points AT the return address and the save is
-            // exact). Clobbers: eax,ebx,ecx,edx + memory. EBX is consumed as
-            // the user_eip carrier and NOT restored — list it clobbered.
-            __asm__ volatile(
-                "push %%ebx; push %%esi;"
-                "mov %0, %%eax; mov %1, %%edx;"
-                "call enter_user_mode"
-                : : "r"(eip), "r"(esp) : "eax", "ebx", "ecx", "edx", "memory");
-            // RESUMED VIA TRAMPOLINE (not a normal return): sys_exit jumped
-            // here with the caller frame restored (EBP/ESI/EDI/ESP/segments).
-            // EBX is stale (entry clobbered it) — never trust it below.
+            serial_printf("[enter] pid=%d rip=%lx rsp=%lx fork=%d park=%d\n",
+                          pid, rip, rsp, is_fork_child, is_park_resume);
+            enter_user_mode(rip, rsp);
+            // RESUMED VIA TRAMPOLINE: sys_exit or a park jumped here with the callee-saved registers and the stack pointer restored.
             // NOTE: NO sti here. The trampoline ran cli, and the preemptive
             // scheduler needs IF managed by the switch paths, not blanket
             // set: an sti here opens a preemption window INSIDE the exit
             // sequence (unprepare/reap touch CR3 + free pages — a tick there
-            // switches onto freed stacks/PDs → #PF at CR2==EIP in
+            // switches onto freed stacks/PDs → #PF at CR2==RIP in
             // context_switch, bisected 2026-09-08). IRQs stay off until the
             // exit sequence completes; the next loop iteration's hlt (idle)
             // or the next switch_to's sti re-enables.
             // Re-capture the drain pid (locals lived in registers/stack slots
-            // across the IRET — the trampoline restored EBP/ESI/EDI/ESP but
-            // EBX/EAX/ECX/EDX are STALE (entry clobbered EBX, idt hijack
-            // clobbered EAX). The reap probe proved it: pid read 0 post-resume
+            // across the IRET — the trampoline restored RBP/RSI/RDI/RSP but
+            // RBX/RAX/RCX/RDX are STALE (entry clobbered RBX, idt hijack
+            // clobbered RAX). The reap probe proved it: pid read 0 post-resume
             // (should be 1) → reap skipped → zombie never freed → next tick
             // switched to the dead slot (bisected 2026-09-08: [reapchk] pid=0
             // post-Back, then [sw] 0->1 into the zombie).
@@ -2428,40 +2418,40 @@ void kernel_main(uint32_t mboot_phys) {
                 pid = drain_last_pid();
             }
             // Parked? (process alive, not a zombie) → stage its resume
-            // (BLOCKED + trapped EIP/ESP/retval already saved by the arm),
+            // (BLOCKED + trapped RIP/RSP/retval already saved by the arm),
             // re-arm the exit latch, sti, and continue the drain loop so
             // queued siblings run THIS iteration. The parker is re-entered
-            // later via enter_user_mode(park_eip/esp) with the staged EAX
+            // later via enter_user_mode(park_rip/rsp) with the staged RAX
             // (park_ret_pending flag, fork-child-style).
             {
                 struct process *pp = (pid >= 0) ? process_get((uint32_t)pid) : 0;
                 if (pp && pp->state != PROC_ZOMBIE && pp->state != PROC_EXITED) {
                     // Drain-side pid getters (NOT self-slot: the drain runs
                     // as pid 0; self-slot reads slot 0's empty park state —
-                    // bisected 2026-09-09: parked readers staged EIP=ESP=0
+                    // bisected 2026-09-09: parked readers staged RIP=RSP=0
                     // and slept forever).
-                    extern uint32_t syscall_park_eip_for(uint32_t pid);
-                    extern uint32_t syscall_park_esp_for(uint32_t pid);
+                    extern uint64_t syscall_park_rip_for(uint32_t pid);
+                    extern uint64_t syscall_park_rsp_for(uint32_t pid);
                     extern uint32_t syscall_take_park_ret_for(uint32_t pid);
-                    extern void sched_park_stage(uint32_t pid, uint32_t eip, uint32_t esp, uint32_t ret);
-                    uint32_t peip = syscall_park_eip_for((uint32_t)pid);
-                    uint32_t pesp = syscall_park_esp_for((uint32_t)pid);
+                    extern void sched_park_stage(uint32_t pid, uint64_t rip, uint64_t rsp, uint32_t ret);
+                    uint64_t p_rip = syscall_park_rip_for((uint32_t)pid);
+                    uint64_t p_rsp = syscall_park_rsp_for((uint32_t)pid);
                     uint32_t pret = syscall_take_park_ret_for((uint32_t)pid);
                     // PARK-TRACE (bisect 2026-09-09): prove the drain stages
                     // the parker's real resume (not slot-0 zeros).
-                    serial_printf("[park] pid=%d eip=%x esp=%x ret=%d\n",
-                                  pid, peip, pesp, (int)pret);
+                    serial_printf("[park] pid=%d rip=%lx rsp=%lx ret=%d\n",
+                                  pid, p_rip, p_rsp, (int)pret);
                     pp->state = PROC_BLOCKED;
                     pp->ticks_left = SCHED_SLICE_TICKS;
-                    sched_park_stage((uint32_t)pid, peip, pesp, pret);
+                    sched_park_stage((uint32_t)pid, p_rip, p_rsp, pret);
                     syscall_can_exit = 1;
                     // PARK-HOME INVARIANT (2026-09-08: e1000_poll #PF err=0
-                    // cr2=0x8001c esp=garbage after park cycles — the park
+                    // cr2=0x8001c rsp=garbage after park cycles — the park
                     // trampoline resumes the drain with the PARKED process's
-                    // PD still live + ITS ESP0 armed. Any IRQ before the next
+                    // PD still live + ITS RSP0 armed. Any IRQ before the next
                     // prepare (timer → sched_tick → e1000_poll → DMA decode)
                     // runs on the wrong address space/stack. Restore kernel
-                    // PD + idle ESP0 here (same as the exit path below); the
+                    // PD + idle RSP0 here (same as the exit path below); the
                     // parker's resume re-prepares at re-entry.)
                     sched_unprepare();
                     {
@@ -2560,7 +2550,7 @@ void kernel_main(uint32_t mboot_phys) {
         // attempt but on a valid caller frame).
         if (kbd_wake_armed) {
             kbd_wake_armed = 0;
-            extern int sched_park_resume(uint32_t, uint32_t*, uint32_t*);
+            extern int sched_park_resume(uint32_t, uint64_t *, uint64_t *);
             extern int sched_park_take(uint32_t, uint32_t*);
             extern void enter_user_mode_park_ret(uint32_t v);
             for (int s = 0; s < 16; s++) {
@@ -2568,8 +2558,9 @@ void kernel_main(uint32_t mboot_phys) {
                 if (!rp || rp->pid == 0) continue;
                 if (rp->state != PROC_BLOCKED) continue;
                 if (!rp->entered_ring3) continue;
-                uint32_t reip = 0, resp = 0, rret = 0;
-                if (!sched_park_resume((uint32_t)rp->pid, &reip, &resp)) continue;
+                uint64_t r_rip = 0, r_rsp = 0;
+                uint32_t rret = 0;
+                if (!sched_park_resume((uint32_t)rp->pid, &r_rip, &r_rsp)) continue;
                 sched_park_take((uint32_t)rp->pid, &rret);
                 if (rret == (uint32_t)-2) {
                     // WAIT-park, not a reader: a keyboard line is never
@@ -2578,12 +2569,12 @@ void kernel_main(uint32_t mboot_phys) {
                     // taking the oldest BLOCKED slot unconditionally let
                     // wait-parked init steal every line sh was parked on
                     // (slot 1 always beat slot 2: deterministic starvation).
-                    extern void sched_park_stage(uint32_t, uint32_t, uint32_t, uint32_t);
-                    sched_park_stage((uint32_t)rp->pid, reip, resp, rret);
+                    extern void sched_park_stage(uint32_t, uint64_t, uint64_t, uint32_t);
+                    sched_park_stage((uint32_t)rp->pid, r_rip, r_rsp, rret);
                     continue;
                 }
-                serial_printf("[kbd-wake] pid=%d eip=%x esp=%x\n",
-                              rp->pid, reip, resp);
+                serial_printf("[kbd-wake] pid=%d rip=%lx rsp=%lx\n",
+                              rp->pid, r_rip, r_rsp);
                 {
                     extern volatile int switch_busy;
                     switch_busy = 1;
@@ -2600,14 +2591,10 @@ void kernel_main(uint32_t mboot_phys) {
                 rp->entered_ring3 = 1;
                 rp->ticks_left = SCHED_SLICE_TICKS;
                 enter_user_mode_park_ret(rret);
-                serial_printf("[enter] pid=%d eip=%x esp=%x fork=0 park=1 (kbd-wake)\n",
-                              rp->pid, reip, resp);
-                __asm__ volatile(
-                    "push %%ebx; push %%esi;"
-                    "mov %0, %%eax; mov %1, %%edx;"
-                    "call enter_user_mode"
-                    : : "r"(reip), "r"(resp)
-                    : "eax", "ebx", "ecx", "edx", "memory");
+                syscall_load_park_regs((uint32_t)rp->pid);
+                serial_printf("[enter] pid=%d rip=%lx rsp=%lx fork=0 park=1 (kbd-wake)\n",
+                              rp->pid, r_rip, r_rsp);
+                enter_user_mode(r_rip, r_rsp);
                 // Resumed via trampoline (park or exit — same resume shape
                 // as the drain: caller frame restored, pid from the stash).
                 {
@@ -2615,12 +2602,12 @@ void kernel_main(uint32_t mboot_phys) {
                     int wpid = drain_last_pid();
                     struct process *wpp = (wpid >= 0) ? process_get((uint32_t)wpid) : 0;
                     if (wpp && wpp->state != PROC_ZOMBIE && wpp->state != PROC_EXITED) {
-                        uint32_t wpeip = syscall_park_eip_for((uint32_t)wpid);
-                        uint32_t wpesp = syscall_park_esp_for((uint32_t)wpid);
+                        uint64_t wp_rip = syscall_park_rip_for((uint32_t)wpid);
+                        uint64_t wp_rsp = syscall_park_rsp_for((uint32_t)wpid);
                         uint32_t wpret = syscall_take_park_ret_for((uint32_t)wpid);
                         wpp->state = PROC_BLOCKED;
                         wpp->ticks_left = SCHED_SLICE_TICKS;
-                        sched_park_stage((uint32_t)wpid, wpeip, wpesp, wpret);
+                        sched_park_stage((uint32_t)wpid, wp_rip, wp_rsp, wpret);
                     }
                     sched_unprepare();
                     {

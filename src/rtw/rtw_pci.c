@@ -27,7 +27,7 @@ int rtwpci_present(void) { return P.found && P.mapped; }
 uint16_t rtwpci_device_id(void) { return P.did; }
 
 #ifdef RTWPCI_HOST
-// host test: the chip model supplies the register file and the "DMA" memory is the process's own (V2P/P2V are a fixed offset on -m32)
+// host test: the chip model supplies the register file and the "DMA" memory is an arena of the process below 4 GB (V2P is the identity there)
 uint32_t host_mmio_rd(uint32_t addr, int len);
 void host_mmio_wr(uint32_t addr, uint32_t v, int len);
 void rtwpci_host_attach(uint16_t did) { P.found = P.mapped = did != 0; P.did = did; }
@@ -42,14 +42,14 @@ int rtwpci_init(void) {
         if (pm) { uint16_t cs = pcix_read16(l, (uint8_t)(pm + 4)); if (cs & 3) pcix_write16(l, (uint8_t)(pm + 4), cs & ~3u); }
         pcix_enable(l, 1);
         int is_mem, above;
-        uint32_t bar = pcix_bar(l, 2, &is_mem, &above);                  // the register window is BAR 2 (BAR 0 is the I/O copy)
-        uint32_t size = pcix_bar_size(l, 2);
-        if (!bar || !is_mem || above || size < 0x10000) { wlog("pcie: RTL%04x at %x:%x.%x: BAR2 unusable (base %x size %x)", did, l.bus, l.dev, l.fn, bar, size); return 0; }
+        uint64_t bar = pcix_bar(l, 2, &is_mem, &above);                  // the register window is BAR 2 (BAR 0 is the I/O copy)
+        uint64_t size = pcix_bar_size(l, 2);
+        if (!bar || !is_mem || size < 0x10000) { wlog("pcie: RTL%04x at %x:%x.%x: BAR2 unusable (base %x size %x)", did, l.bus, l.dev, l.fn, bar, size); return 0; }
         P.mmio = (volatile uint8_t*)paging_map_mmio(bar, 0x10000);
         if (!P.mmio) { wlog("pcie: cannot map the registers"); return 0; }
         P.loc = l; P.did = did; P.found = 1; P.mapped = 1;
         P.pcie_cap = pcix_find_cap(l, 0x10, 0);
-        wlog("pcie: Realtek %04x at %x:%x.%x, registers at %x", did, l.bus, l.dev, l.fn, bar);
+        wlog("pcie: Realtek %04x at %x:%x.%x, registers at %lx", did, l.bus, l.dev, l.fn, bar);
         return 1;
     }
     return 0;
@@ -130,7 +130,7 @@ static int alloc_done;
 static void* dma_alloc(uint32_t size, uint32_t align) {
     uint8_t* p = (uint8_t*)kcalloc(1, size + align);
     if (!p) return 0;
-    return (void*)(((uint32_t)p + align - 1) & ~(align - 1));
+    return (void*)(((uintptr_t)p + align - 1) & ~(uintptr_t)(align - 1));
 }
 
 static int ring_alloc(struct ring* r, int len, int slot_bytes) {

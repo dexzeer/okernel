@@ -29,7 +29,7 @@ static int uart_absent = -1;                 // -1 not probed yet; 1 = no UART a
 
 void serial_putchar(char c) {
     uint32_t fl;
-    __asm__ volatile("pushfl; popl %0; cli" : "=r"(fl) :: "memory");
+    __asm__ volatile("pushfq; popq %q0; cli" : "=r"(fl) :: "memory");
     serial_ring[serial_total & (SERIAL_RING - 1)] = c;
     serial_total++;
     if (fl & 0x200) __asm__ volatile("sti" ::: "memory");
@@ -89,6 +89,18 @@ void serial_printf(const char* fmt, ...) {
         }
         if (*p == 0) break;
         char c = *p;
+        if (c == 'l' || c == 'p') {                     // 64-bit values: %lx %lu %ld %p
+            if (c == 'l') { while (*p == 'l') p++; c = *p; if (!c) break; } else c = 'x';
+            uint64_t v = va_arg(ap, uint64_t);
+            if ((c == 'd' || c == 'i') && (int64_t)v < 0) { serial_putchar('-'); v = (uint64_t)-(int64_t)v; }
+            uint64_t base = (c == 'x' || c == 'X') ? 16 : 10;
+            char t[24];
+            int k = 0;
+            if (!v) t[k++] = '0';
+            while (v) { t[k++] = "0123456789abcdef"[v % base]; v /= base; }
+            while (k) serial_putchar(t[--k]);
+            continue;
+        }
         if (c == 's') {
             const char* s = va_arg(ap, const char*);
             if (s) serial_puts(s);

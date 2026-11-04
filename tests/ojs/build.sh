@@ -1,13 +1,13 @@
 #!/bin/sh
-# Host build of the ojs engine + the test runner (32-bit x87, like the kernel).
+# Host build of the ojs engine + the test runner (x86-64, SSE2 doubles, like the kernel).
 # usage: tests/ojs/build.sh [extra cflags]   -> build-host/ojs_run
 # Objects are rebuilt when their source or anything they include changed
 # (gcc -MMD dependency files); FORCE=1 rebuilds everything.
 set -e
 cd "$(dirname "$0")/../.."
-OUT=${OUTDIR:-build-host/ojs}
+OUT=${OUTDIR:-build-host/ojs64}
 mkdir -p $OUT
-CFLAGS="-m32 -fno-pie -fno-pic -std=gnu11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -fno-strict-aliasing $*"
+CFLAGS="-m64 -msse2 -mfpmath=sse -fno-pie -fno-pic -std=gnu11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -fno-strict-aliasing $*"
 SRCS="gc str obj util conv num unicode unicode_data lex parse compile ops vm realm b_object b_function b_error b_iter b_array b_string b_number b_global b_promise generator b_map b_proxy b_typed bigint b_json b_date re b_regexp module api srctext"
 
 stale() {   # stale <obj> <dep file>

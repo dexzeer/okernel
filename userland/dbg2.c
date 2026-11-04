@@ -2,20 +2,20 @@
 // pointer right after fork returns) and its reed ESP via a read trap.
 // Proves whether the child's stack mapping itself is corrupt.
 #include "usys.h"
-static unsigned get_esp(void) { unsigned v; __asm__ volatile("mov %%esp, %0" : "=r"(v)); return v; }
-static void print_hex(unsigned v) {
-    char b[12]; b[0]='0'; b[1]='x';
-    for (int i = 0; i < 8; i++) { unsigned n = (v >> (28 - i*4)) & 15; b[2+i] = n < 10 ? '0'+n : 'a'+n-10; }
-    b[10]=0; usys_print(b);
+static unsigned long get_rsp(void) { unsigned long v; __asm__ volatile("mov %%rsp, %0" : "=r"(v)); return v; }
+static void print_hex(unsigned long v) {
+    char b[20]; b[0]='0'; b[1]='x';
+    for (int i = 0; i < 16; i++) { unsigned n = (unsigned)(v >> (60 - i*4)) & 15; b[2+i] = n < 10 ? '0'+n : 'a'+n-10; }
+    b[18]=0; usys_print(b);
 }
 void _start(void) {
-    unsigned before = get_esp();
+    unsigned long before = get_rsp();
     usys_print("dbg2: parent esp before fork:");
     print_hex(before);
     int c = usys_fork();
     if (c < 0) { usys_print("dbg2: fork failed"); usys_exit(1); }
     if (c == 0) {
-        unsigned ce = get_esp();
+        unsigned long ce = get_rsp();
         usys_print("dbg2: CHILD esp after fork:");
         print_hex(ce);
         // touch the stack hard: 512B memset + readback
@@ -27,7 +27,7 @@ void _start(void) {
         else usys_print("dbg2: child stack OK");
         usys_exit(7);
     }
-    unsigned pe = get_esp();
+    unsigned long pe = get_rsp();
     usys_print("dbg2: parent esp after fork:");
     print_hex(pe);
     usys_exit(0);

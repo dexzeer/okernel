@@ -45,9 +45,10 @@ b = null;
 check("churn of dropped 8MB buffers", sum === 199 * 200 / 2);
 
 // garbage made by calls that returned is collected
-function churn() { var k = []; for (var j = 0; j < 5; j++) k.push(new ArrayBuffer(8 * MB)); return k.length; }
+// (three buffers a call: one stale copy of the previous `k`, 24 MB, must not fill the 64 MB limit on its own)
+function churn() { var k = []; for (var j = 0; j < 3; j++) k.push(new ArrayBuffer(8 * MB)); return k.length; }
 var total = 0;
 for (var c = 0; c < 10; c++) total += churn();
-check("buffers of returned calls are collected", total === 50);
+check("buffers of returned calls are collected", total === 30);
 
 console.log(fails ? "FAILED " + fails : "ALL OK");

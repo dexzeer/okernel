@@ -13,7 +13,7 @@
 #ifdef KERNEL
 static inline uint32_t rng_cli(void) {
     uint32_t f;
-    __asm__ volatile("pushfl; popl %0; cli" : "=r"(f) :: "memory");
+    __asm__ volatile("pushfq; popq %q0; cli" : "=r"(f) :: "memory");
     return f;
 }
 static inline void rng_sti(uint32_t f) {
@@ -283,7 +283,7 @@ int rand_bytes(uint8_t* out, uint32_t len) {
     // two boots/snapshots with identical pools still diverge immediately.
     {
         uint64_t t = 0;
-        __asm__ volatile("rdtsc" : "=A"(t));
+        { uint32_t tsc_lo_, tsc_hi_; __asm__ volatile("rdtsc" : "=a"(tsc_lo_), "=d"(tsc_hi_)); t = ((uint64_t)tsc_hi_ << 32) | tsc_lo_; }
         for (int i = 0; i < 8; i++)
             rng_nonce[i] ^= (uint8_t)((t >> (8 * i)) & 0xFF);
     }

@@ -31,9 +31,8 @@ Things to know
   collector scans the C stack between ojs_enter() and the current frame, and
   the VM value stack conservatively; C heap memory holding values must be
   registered (ojs_add_root / ojs_add_root_range).
-* x87 only, like the kernel: double -> int conversions go through the IEEE
-  bits (d2i64, dtoi32, jv_number) because a C cast changes the x87 rounding
-  mode twice per conversion.
+* SSE2 doubles on x86-64 (thread context only in the kernel: interrupt handlers do not save XMM). double -> int conversions
+  still go through the IEEE bits (d2i64, dtoi32, jv_number), which is also what the 32-bit x87 Windows port needs.
 * Inline caches (struct ic, per property/global site) are made on first use
   and dropped by every collection, so they never point at freed objects.
 * The realm memory limit (ojs_set_memory_limit) counts memory taken from the
@@ -45,7 +44,6 @@ Things to know
 * Templates keep their script's source (toString, stack traces). A big script
   that needed UTF-16 is re-stored as UTF-8 after compiling (srctext.c), so it
   costs about its UTF-8 size, not twice that.
-* 64-bit division in the kernel comes from src/divdi3.c (no libgcc).
 
 Tests
 -----

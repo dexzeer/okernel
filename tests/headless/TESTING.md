@@ -32,7 +32,7 @@ If the serial log doesn't tell you what you need — **add instrumentation**. Th
 Boot the desktop ISO headless with serial-to-file and a monitor socket:
 
 ```
-qemu-system-i386 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std \
+qemu-system-x86_64 -m 512 -cdrom kanarchy-desktop.iso -boot d -vga std \
   -device e1000,netdev=net0 -netdev user,id=net0 \
   -serial file:/tmp/ok/<tag>_serial.log \
   -display none \
@@ -223,7 +223,7 @@ Each headless test boots QEMU (~25s), drives the scenario, prints PASS/FAIL, exi
 - **/tmp gets wiped** (found all yesterday's drivers gone). Anything you want to keep → project tree. /tmp is scratch only.
 - **~/d is a SYMLINK to an external NTFS volume** ("Новый том"). If `~/d` looks empty, the symlink was moved to trash — the real project is at `/media/notdexy/Новый том/projects/okernel`. Do NOT `mkdir -p ~/d/...`; you'll create a shadow directory and test the wrong tree (this happened).
 - **Other agents may be editing the same tree concurrently.** Check `ps aux | grep mimocode`, compare source mtimes to the ISO before diagnosing "regressions". A failed test during concurrent edits proves nothing.
-- QEMU 8.2.2, `qemu-system-i386`. Monitor socket needs ~0.5s after boot before it accepts commands.
+- QEMU 8.2.2, `qemu-system-x86_64`. Monitor socket needs ~0.5s after boot before it accepts commands.
 - google.com content is IP-localized (Russian here) — don't assume English when writing pixel/text assertions.
 
 ## 11. Quick reference: the 30-second test

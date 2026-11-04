@@ -2,7 +2,7 @@
 // connections (PSK from the first one's tickets) to the same host, timing
 // the ServerHello wait and the whole fetch. Diagnoses resumption-specific
 // server delays.
-//   gcc -m32 -O2 -Isrc/crypto -Isrc -o build-host/tls_resume_time tests/tls_resume_time.c $(HOST_CRYPTO_SRC)
+//   gcc -m64 -O2 -Isrc/crypto -Isrc -o build-host/tls_resume_time tests/tls_resume_time.c $(HOST_CRYPTO_SRC)
 //   ./build-host/tls_resume_time en.wikipedia.org [n]
 #include <stdio.h>
 #include <string.h>

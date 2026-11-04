@@ -27,7 +27,7 @@ static inline void spin_unlock(spinlock_t *l) {
 // IRQ-safe: returns EFLAGS so the caller can restore (sti only if on entry).
 static inline uint32_t spin_lock_irq(spinlock_t *l) {
     uint32_t eflags;
-    __asm__ volatile("pushf; pop %0; cli" : "=r"(eflags) :: "memory");
+    __asm__ volatile("pushfq; popq %q0; cli" : "=r"(eflags) :: "memory");
     spin_lock(l);
     return eflags;
 }

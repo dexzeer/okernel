@@ -1,66 +1,64 @@
-/* Linker script for okernel DESKTOP (high-half kernel) */
+/* Linker script for the okernel kernels (64-bit, code model kernel).
+
+   LOAD MODEL: one low-phys load at 1 MB (GRUB's ELF path reads p_paddr and enters e_entry with paging off).
+   - .multiboot, .trampoline, .boottab: VMA == LMA == phys. e_entry = _start in .trampoline; GRUB requires it below 4 GB.
+   - Everything else: VMA = phys + 0xFFFFFFFF80000000, LMA = phys. */
 
 ENTRY(_start)
 
-/* LOAD MODEL: single low-phys load at 1MB (GRUB ELF path reads p_paddr).
-   - .multiboot: VMA == LMA == phys 0x100000 (GRUB finds header in 1st 8KB).
-   - _start trampoline: runs at LOW phys (e_entry = See Below).
-   - Everything else: VMA high (0xC01xxxxx), LMA phys (0x001xxxxx).
-   ENTRY RESOLUTION (2026-09-07): ENTRY(_start) with _start's VMA high sets
-   e_entry = 0xC0100030; GRUB jumps there with paging OFF -> triple fault
-   (SeaBIOS text only). The .multiboot LOW VMA does NOT fix e_entry. Two
-   candidate fixes: (a) separate low .trampoline section (VMA==LMA==phys)
-   holding _start, ENTRY stays _start; (b) ENTRY(_start_low) alias. Next:
-   implement (a) in start.asm + this script, rebuild, verify e_entry low via
-   `readelf -h | grep Entry`, then ISO boot -> 1920x1080 + serial. */
+KV = 0xFFFFFFFF80000000;
 
 SECTIONS {
     .multiboot 0x100000 : AT(0x100000) {
         *(.multiboot)
     }
 
-    /* LOW trampoline: VMA == LMA == phys (GRUB entry, paging OFF).
-       e_entry = _start here. Must stay within the first 8KB+slack of the
-       image so GRUB's load covers it (it does: right after .multiboot). */
-    .trampoline 0x100030 : AT(0x100030) {
+    /* Right after the header, so it is inside the first part of the image whatever GRUB reads first. */
+    .trampoline : {
         *(.trampoline)
     }
 
-    . = 0xC0100000 + SIZEOF(.multiboot) + SIZEOF(.trampoline);
+    /* Boot page tables: no bytes in the file, _start clears them. */
+    .boottab ALIGN(0x1000) (NOLOAD) : {
+        *(.boottab)
+    }
 
+    . = KV + ALIGN(0x1000);
     _kernel_start = .;
 
-    /* Kernel code: LMA = phys 0x100030 (VMA 0xC0100030). Linear AT form. */
-    .text : AT(0x100000 + (ADDR(.text) - 0xC0100000)) {
-        *(.text)
+    .text : AT(ADDR(.text) - KV) {
+        *(.text .text.*)
     }
 
-    /* Read-only data */
-    .rodata : AT(0x100000 + (ADDR(.rodata) - 0xC0100000)) {
+    . = ALIGN(16);
+    .rodata : AT(ADDR(.rodata) - KV) {
         _rodata_start = .;              /* the end of the code (panic.c: what a return address may point into) */
-        *(.rodata)
+        *(.rodata .rodata.*)
     }
 
-    /* Initialized data */
-    .data : AT(0x100000 + (ADDR(.data) - 0xC0100000)) {
-        *(.data)
+    . = ALIGN(16);
+    .data : AT(ADDR(.data) - KV) {
+        *(.data .data.*)
     }
 
     /* Symbol table of the panic screen (tools/ksyms.py). Last of the loaded sections before .bss: the first link
        has it empty, the second fills it in, and nothing above moves between the two. */
-    . = ALIGN(4);
-    .ksyms : AT(0x100000 + (ADDR(.ksyms) - 0xC0100000)) {
+    . = ALIGN(8);
+    .ksyms : AT(ADDR(.ksyms) - KV) {
         _ksyms_start = .;
         KEEP(*(.ksyms))
         _ksyms_end = .;
     }
 
-    /* Uninitialized data (BSS) */
     . = ALIGN(0x1000);
-    .bss : AT(0x100000 + (ADDR(.bss) - 0xC0100000)) {
+    .bss (NOLOAD) : AT(ADDR(.bss) - KV) {
         *(COMMON)
-        *(.bss)
+        *(.bss .bss.*)
     }
 
     _kernel_end = .;
+
+    /DISCARD/ : {
+        *(.eh_frame .eh_frame_hdr .comment .note .note.*)
+    }
 }

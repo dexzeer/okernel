@@ -106,7 +106,7 @@ static struct {
     uint16_t did;
     uint8_t rev;
     struct i915_gen g;
-    uint32_t bar0, bar0_size, bar2, bar2_size;
+    uint64_t bar0, bar0_size, bar2, bar2_size;
     volatile uint8_t* mmio;       // BAR0, uncached (0 if it could not be mapped)
     uint32_t mmio_len;
 } I;
@@ -137,7 +137,7 @@ const struct display_ops* i915_probe(uint32_t* backbuffer, int w, int h) {
         I.bar2_size = pcix_bar_size(loc, 2);
         serial_printf("[i915] Intel graphics %x:%x rev %x at %d:%d.%d: %s, BAR0 %x (%u KB), aperture %x (%u MB)\n",
                       0x8086, I.did, I.rev, loc.bus, loc.dev, loc.fn, I.g.name,
-                      I.bar0, I.bar0_size >> 10, I.bar2, I.bar2_size >> 20);
+                      (uint32_t)I.bar0, (uint32_t)(I.bar0_size >> 10), (uint32_t)I.bar2, (uint32_t)(I.bar2_size >> 20));
         if (I.bar0 && I.bar0_size && I.bar0_size <= 16u * 1024 * 1024) {
             I.mmio = (volatile uint8_t*)paging_map_mmio(I.bar0, I.bar0_size);
             I.mmio_len = I.bar0_size;
@@ -187,17 +187,17 @@ int i915_report(void (*out)(const char*, void*), void* ud) {
     uint8_t gen = I.g.gen;
     line(out, ud, "Intel %x:%x rev %x - %s", 0x8086, I.did, I.rev, I.g.name);
     line(out, ud, "BAR0 (regs+GTT) %x size %u KB, BAR2 (aperture) %x size %u MB, mapped %s",
-         I.bar0, I.bar0_size >> 10, I.bar2, I.bar2_size >> 20, I.mmio ? "yes" : "no");
+         (uint32_t)I.bar0, (uint32_t)(I.bar0_size >> 10), (uint32_t)I.bar2, (uint32_t)(I.bar2_size >> 20), I.mmio ? "yes" : "no");
     if (gen >= 6) {
         uint32_t gmch = pcix_read16(I.loc, 0x50);
         uint32_t bdsm = pcix_read32(I.loc, gen >= 9 ? 0xB0 : 0x5C);
         line(out, ud, "GMCH_CTL %x  BDSM (stolen memory base) %x", gmch, bdsm);
     }
     {
-        extern uint8_t* graphics_fb_base(void);
-        uint32_t fb = (uint32_t)graphics_fb_base();
+        extern uint64_t graphics_fb_phys(void);
+        uint64_t fb = graphics_fb_phys();
         const char* where = (I.bar2 && fb >= I.bar2 && fb < I.bar2 + I.bar2_size) ? "inside the aperture" : "outside the aperture";
-        line(out, ud, "GRUB framebuffer at %x (%s), aperture offset %x", fb, where, fb - I.bar2);
+        line(out, ud, "GRUB framebuffer at %x (%s), aperture offset %x", (uint32_t)fb, where, (uint32_t)(fb - I.bar2));
     }
     if (!I.mmio) { out("registers not mapped: no further data", ud); return 1; }
     uint32_t dbase = i915_display_base(I.did);

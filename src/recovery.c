@@ -447,14 +447,14 @@ static void cmd_memtest(const char* args) {
     for (int pass = 0; pass < 5; pass++) {
         for (uint32_t i = 0; i < nb; i++) {
             volatile uint32_t* w = (volatile uint32_t*)blk[i];
-            for (uint32_t k = 0; k < 262144; k++) w[k] = pass < 4 ? pat[pass] : (uint32_t)&w[k];
+            for (uint32_t k = 0; k < 262144; k++) w[k] = pass < 4 ? pat[pass] : (uint32_t)(uintptr_t)&w[k];
         }
         for (uint32_t i = 0; i < nb; i++) {
             volatile uint32_t* w = (volatile uint32_t*)blk[i];
             for (uint32_t k = 0; k < 262144; k++) {
-                uint32_t want = pass < 4 ? pat[pass] : (uint32_t)&w[k], got = w[k];
+                uint32_t want = pass < 4 ? pat[pass] : (uint32_t)(uintptr_t)&w[k], got = w[k];
                 if (got != want) {
-                    if (errors < 10) pf("%08x: wrote %08x read %08x\n", (uint32_t)&w[k], want, got);
+                    if (errors < 10) pf("%08x: wrote %08x read %08x\n", (uint32_t)(uintptr_t)&w[k], want, got);
                     errors++;
                 }
             }

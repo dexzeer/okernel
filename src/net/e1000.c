@@ -110,7 +110,7 @@ static const char hex[] = "0123456789abcdef";
 static void* dma_alloc(uint32_t size) {
     uint8_t* p = (uint8_t*)kmalloc(size + 128);
     if (!p) return 0;
-    p = (uint8_t*)(((uint32_t)p + 127) & ~127u);
+    p = (uint8_t*)(((uintptr_t)p + 127) & ~(uintptr_t)127);
     for (uint32_t i = 0; i < size; i++) p[i] = 0;
     return p;
 }
@@ -134,8 +134,7 @@ static void mmio_write(uint32_t offset, uint32_t value) {
 }
 
 static void mmio_write16(uint32_t offset, uint16_t value) {
-    uint32_t addr = (uint32_t)&mmio[offset / 4];
-    *(volatile uint16_t*)addr = value;
+    *(volatile uint16_t*)&mmio[offset / 4] = value;
 }
 
 static uint32_t mmio_read(uint32_t offset) {
@@ -199,13 +198,9 @@ void e1000_init(void) {
         serial_puts("[e1000] BAR0 is I/O, not MMIO!\n");
         return;
     }
-    mmio = (volatile uint32_t*)(bar0 & 0xFFFFFFF0);
-    serial_puts("[e1000] MMIO base OK\n");
-
     // Map MMIO region into virtual address space
     serial_puts("[e1000] mapping MMIO...\n");
-    void* mapped = paging_map(bar0 & 0xFFFFFFF0);
-    mmio = (volatile uint32_t*)mapped;
+    mmio = (volatile uint32_t*)paging_map_mmio(bar0 & 0xFFFFFFF0, 0x20000);
     serial_puts("[e1000] MMIO mapped OK\n");
 
     // Test MMIO access
@@ -380,7 +375,7 @@ void e1000_poll(void) {
             extern void rand_stir_src(const uint8_t e[32], int src) __attribute__((weak));
             if (rand_stir_src) {
                 uint64_t t = 0;
-                __asm__ volatile("rdtsc" : "=A"(t));
+                { uint32_t tsc_lo_, tsc_hi_; __asm__ volatile("rdtsc" : "=a"(tsc_lo_), "=d"(tsc_hi_)); t = ((uint64_t)tsc_hi_ << 32) | tsc_lo_; }
                 uint8_t sample[32];
                 for (int i = 0; i < 32; i++)
                     sample[i] = (uint8_t)(((t >> ((i & 7) * 8)) & 0xFF) ^ (len + rx_cur + i));

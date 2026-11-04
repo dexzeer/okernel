@@ -69,13 +69,13 @@ int ac97_init(void* ring, uint32_t ring_bytes, void* bdl) {
 
     outb(A.nabm + PO_CR, CR_RR);                                   // reset the PCM-out engine
     for (int i = 0; i < 2000 && (inb(A.nabm + PO_CR) & CR_RR); i++) pit_delay_us(1);
-    uint32_t ring_phys = V2P((uint32_t)ring);
+    uint32_t ring_phys = V2P(ring);
     for (uint32_t i = 0; i < NBUF; i++) {                          // 32 buffers; the length is counted in 16-bit samples; no interrupts
         uint32_t* e = (uint32_t*)((uint8_t*)bdl + i * 8);
         e[0] = ring_phys + i * A.buf_bytes;
         e[1] = A.buf_bytes / 2;
     }
-    outl(A.nabm + PO_BDBAR, V2P((uint32_t)bdl));
+    outl(A.nabm + PO_BDBAR, V2P(bdl));
     A.lvi = NBUF - 1;
     outb(A.nabm + PO_LVI, (uint8_t)A.lvi);
     outb(A.nabm + PO_CR, CR_RPBM);                                 // run

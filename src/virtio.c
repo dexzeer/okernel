@@ -36,10 +36,10 @@ int virtio_pci_probe(struct virtio_dev* d, struct pci_loc loc) {
         uint8_t type = pcix_read8(loc, cap + 3), bar = pcix_read8(loc, cap + 4);
         uint32_t off = pcix_read32(loc, cap + 8), len = pcix_read32(loc, cap + 12);
         if (type < 1 || type > 4 || bar > 5) continue;
-        int is_mem, above;
-        uint32_t base = pcix_bar(loc, bar, &is_mem, &above);
+        int is_mem;
+        uint64_t base = pcix_bar(loc, bar, &is_mem, 0);
         if (!base || !is_mem) {
-            serial_printf("[virtio] cap type %d: BAR%d %s\n", type, bar, above ? "is above 4GB (unsupported)" : "unassigned");
+            serial_printf("[virtio] cap type %d: BAR%d %s\n", type, bar, "unassigned");
             continue;
         }
         volatile uint8_t* m = (volatile uint8_t*)paging_map_mmio(base + off, len ? len : 4096);
@@ -118,7 +118,7 @@ int virtio_queue_setup(struct virtio_dev* d, int qidx, int max_size, struct vq* 
     q->free_head = 0; q->nfree = n;
     q->avail[0] = 1;                                 // VRING_AVAIL_F_NO_INTERRUPT: we poll
 
-    uint32_t pd = V2P((uint32_t)mem), pa = pd + avail_off, pu = pd + used_off;
+    uint32_t pd = V2P(mem), pa = pd + avail_off, pu = pd + used_off;
     wr32(c, C_QUEUE_DESC, pd);   wr32(c, C_QUEUE_DESC + 4, 0);
     wr32(c, C_QUEUE_DRIVER, pa); wr32(c, C_QUEUE_DRIVER + 4, 0);
     wr32(c, C_QUEUE_DEVICE, pu); wr32(c, C_QUEUE_DEVICE + 4, 0);

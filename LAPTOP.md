@@ -72,5 +72,5 @@ moving, using the keyboard) and of `touchpad`; if `touchpad` says "NOT WORKING",
 * Wi-Fi: the built-in chip (Realtek RTL8821CE, PCIe) has a driver since 2026-10-12 that has not run on the real hardware yet: type `wifi start` and then `wifi status` (details: `wifi log`). A Realtek USB Wi-Fi stick (8811CU / 8821CU) works too: type `wifigui`
   (or `wifi` for the text commands), turn it on, pick a network, enter the password; the browser then reaches the internet (WPA2 networks only).
 * No hard disk access and no sound codecs tested.
-* The kernel needs no SSE2 and runs on a Pentium III or later; 256 MB of RAM or more. Under UEFI the memory map
-  of the firmware is used (holes included); a framebuffer above 4 GB cannot be used by this 32-bit kernel.
+* The kernel needs an x86-64 CPU; 256 MB of RAM or more. Under UEFI the memory map of the firmware is used (holes
+  included). The text kernels only reach the first 4 GB (boot tables).

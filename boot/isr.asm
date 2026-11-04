@@ -1,314 +1,153 @@
-; ISR and IRQ stubs for the IDT
-; These are assembly trampolines that save CPU state and call C handlers
+; Segment reload, ring-3 entry for the kernel's own programs, and the kernel-thread switch. Interrupt entry is in lm.asm.
 
-%macro ISR_NOERRCODE 1
-global isr%1
-isr%1:
-    push dword 0        ; dummy error code
-    push dword %1       ; interrupt number
-    jmp isr_common_stub
-%endmacro
-
-%macro ISR_ERRCODE 1
-global isr%1
-isr%1:
-    push dword %1       ; interrupt number (error code already on stack)
-    jmp isr_common_stub
-%endmacro
-
-%macro IRQ 2
-global irq%1
-irq%1:
-    push dword 0        ; dummy error code
-    push dword %2       ; interrupt number (32 + IRQ)
-    jmp irq_common_stub
-%endmacro
-
+bits 64
 section .text
 
-; CPU exception stubs
-ISR_NOERRCODE 0
-ISR_NOERRCODE 1
-ISR_NOERRCODE 2
-ISR_NOERRCODE 3
-ISR_NOERRCODE 4
-ISR_NOERRCODE 5
-ISR_NOERRCODE 6
-ISR_NOERRCODE 7
-ISR_ERRCODE   8
-ISR_NOERRCODE 9
-ISR_ERRCODE   10
-ISR_ERRCODE   11
-ISR_ERRCODE   12
-ISR_ERRCODE   13
-ISR_ERRCODE   14
-ISR_NOERRCODE 16      ; x87 floating-point error
-ISR_ERRCODE   17      ; alignment check
-ISR_NOERRCODE 18      ; machine check
-ISR_NOERRCODE 19      ; SIMD floating-point exception
-
-; IRQ stubs (mapped to INT 32-47)
-IRQ 0, 32
-IRQ 1, 33
-IRQ 2, 34
-IRQ 3, 35
-IRQ 4, 36
-IRQ 5, 37
-IRQ 6, 38
-IRQ 7, 39
-IRQ 8, 40
-IRQ 9, 41
-IRQ 10, 42
-IRQ 11, 43
-IRQ 12, 44
-IRQ 13, 45
-IRQ 14, 46
-IRQ 15, 47
-
-; ISR 0x80 (ring-3 syscall gate): same frame as exceptions (err=0 +
-; int_num=0x80) so isr_handler's pushed[0..14] layout holds; DPL=3 gate
-; installed in idt.c (0xEE) lets ring 3 call it via int $0x80.
-global isr80
-isr80:
-    push dword 0              ; dummy error code
-    push dword 0x80           ; interrupt number
-    jmp isr_common_stub
-
-; Common ISR stub — saves registers, calls C handler, restores
-extern isr_handler
-isr_common_stub:
-    pusha               ; push edi, esi, ebp, esp, ebx, edx, ecx, eax
-
-    mov ax, ds
-    push eax            ; save data segment
-
-    mov ax, 0x10        ; load kernel data segment
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-
-    cld                 ; C code assumes DF=0 (SysV ABI); the interrupted code
-                        ; may be inside a backward rep movs (memmove: std).
-                        ; iret restores its EFLAGS, DF included.
-    push dword [esp + 36]  ; push interrupt number (4 ds + 32 pusha = 36)
-    call isr_handler
-    add esp, 4          ; clean up argument
-
-    pop eax             ; restore data segment
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-
-    popa                ; restore registers
-    add esp, 8          ; remove error code and interrupt number
-    iret
-
-; Common IRQ stub
-extern irq_handler
-irq_common_stub:
-    pusha
-
-    mov ax, ds
-    push eax
-
+; void gdt_flush(void* gdt_pointer): load the GDT and reload the segment registers.
+global gdt_flush
+gdt_flush:
+    lgdt [rdi]
     mov ax, 0x10
     mov ds, ax
     mov es, ax
-    mov fs, ax
-    mov gs, ax
-
-    cld                 ; DF=0 for C (see isr_common_stub)
-    mov eax, [esp + 44]    ; interrupted EIP / CS (4 ds + 32 pusha + 8 int no/err): the stall sampler (prof.c) reads them
-    mov [irq_last_eip], eax
-    mov eax, [esp + 48]
-    mov [irq_last_cs], eax
-    lea eax, [esp + 56]    ; the interrupted ESP (same-privilege interrupt: nothing was switched)
-    mov [irq_last_esp], eax
-    push dword [esp + 36]  ; push interrupt number (4 ds + 32 pusha = 36)
-    call irq_handler
-    add esp, 4
-
-    pop eax
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-
-    popa
-    add esp, 8
-    iret
-
-; GDT flush — reload segment registers after GDT update
-global gdt_flush
-gdt_flush:
-    mov eax, [esp + 4]  ; get pointer to GDT pointer
-    lgdt [eax]          ; load GDT
-
-    mov ax, 0x10        ; kernel data segment selector
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
     mov ss, ax
-
-    jmp 0x08:.flush     ; far jump to reload CS with kernel code segment
-.flush:
-    ret
+    xor eax, eax
+    mov fs, ax
+    mov gs, ax
+    pop rax                   ; the return address
+    push qword 0x08
+    push rax
+    retfq                     ; reloads CS and returns
 
 ; ---- enter_user_mode ----
-; void enter_user_mode(uint32_t user_eip, uint32_t user_esp)
-; NAKED LEAF, register convention: eip arrives in EAX, esp in EDX (the caller
-; does add-esp AFTER the call — push esi/push ebx + call — so ESP on entry
-; points AT the return address; save ESP+4 as the caller's frame top).
-; IRET frame needs SS:RPL=3 (0x23) and CS:RPL=3 (0x1B). User data segments
-; load BEFORE iret (ring-0 selector in DS at ring 3 = GP on first access).
-; Fork-child EAX: enter reads user_fork_child (set by enter_user_mode_fork_
-; child) and zeroes EAX when set (consumes the flag), so the child observes
-; fork() == 0. Park-resume EAX: same mechanism via user_park_ret_pending /
-; user_park_retval (set by the drain from sched_park_take before enter).
-; Plain path leaves EAX from the lea (kernel ESP — harmless: spawns ignore
-; EAX; only fork/park children depend on it and they take flagged paths).
+; void enter_user_mode(uint64_t user_rip, uint64_t user_rsp)
+; Saves the caller's callee-saved registers and stack pointer, then irets into ring 3. It "returns" when the program exits or parks: the
+; trap handler jumps to user_exit_trampoline / user_park_trampoline, which discard the trap stack and return to the caller of this function.
+; Fork-child RAX: enter reads user_fork_child (set by enter_user_mode_fork_child) and zeroes RAX when set, so the child observes fork() == 0.
+; Park-resume: RAX comes from user_park_retval (user_park_ret_pending) and every other register from user_resume_regs, as they were at the trap
+; the program parked on (syscall_load_park_regs fills them).
 global enter_user_mode
 global enter_user_mode_fork_child
+global enter_user_mode_park_ret
 global user_fork_child
 global user_park_ret_pending
 global user_park_retval
 enter_user_mode:
-    mov ebx, eax              ; ebx = user_eip (from caller: "a")
-    mov ecx, edx              ; ecx = user_esp (from caller: "d")
-    ; Save the full caller frame for the trampolines (EBP/ESI/EDI + ESP top;
-    ; EBX NOT saved — it carries user_eip; trampolines must not restore it).
-    lea eax, [esp + 4]
-    mov [user_ret_esp], eax
-    mov [user_ret_ebp], ebp
-    mov [user_ret_esi], esi
-    mov [user_ret_edi], edi
-    mov ax, 0x23
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-    push dword 0x23           ; SS (index 4 | RPL 3)
-    push ecx                  ; ESP
-    push dword 0x3202         ; EFLAGS (IF=1, IOPL=3, reserved bit1)
-    push dword 0x1B           ; CS (index 3 | RPL 3)
-    push ebx                  ; EIP
-    cmp dword [user_fork_child], 0
-    je .no_fork_eax
-    mov dword [user_fork_child], 0
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [user_ret_rsp], rsp
+    push qword 0x23           ; SS
+    push rsi                  ; RSP
+    push qword 0x3202         ; RFLAGS (IF=1, IOPL=3, reserved bit 1)
+    push qword 0x2B           ; CS (64-bit user code)
+    push rdi                  ; RIP
     xor eax, eax
-    jmp .eax_done
-.no_fork_eax:
+    cmp dword [user_fork_child], 0
+    je .no_fork
+    mov dword [user_fork_child], 0
+    jmp .rax_done
+.no_fork:
     cmp dword [user_park_ret_pending], 0
-    je .eax_done
+    je .rax_done
     mov dword [user_park_ret_pending], 0
     mov eax, [user_park_retval]
-.eax_done:
-    iret
+    mov rbx, [user_resume_regs + 0 * 8]
+    mov rbp, [user_resume_regs + 1 * 8]
+    mov r12, [user_resume_regs + 2 * 8]
+    mov r13, [user_resume_regs + 3 * 8]
+    mov r14, [user_resume_regs + 4 * 8]
+    mov r15, [user_resume_regs + 5 * 8]
+    mov rcx, [user_resume_regs + 6 * 8]
+    mov rdx, [user_resume_regs + 7 * 8]
+    mov rsi, [user_resume_regs + 8 * 8]
+    mov rdi, [user_resume_regs + 9 * 8]
+    mov r8,  [user_resume_regs + 10 * 8]
+    mov r9,  [user_resume_regs + 11 * 8]
+    mov r10, [user_resume_regs + 12 * 8]
+    mov r11, [user_resume_regs + 13 * 8]
+    iretq
+.rax_done:
+    ; nothing of the kernel's stays in the registers
+    xor ebx, ebx
+    xor ecx, ecx
+    xor edx, edx
+    xor esi, esi
+    xor edi, edi
+    xor ebp, ebp
+    xor r8d, r8d
+    xor r9d, r9d
+    xor r10d, r10d
+    xor r11d, r11d
+    xor r12d, r12d
+    xor r13d, r13d
+    xor r14d, r14d
+    xor r15d, r15d
+    iretq
 
-; Flag the NEXT enter_user_mode IRET as a fork-child entry (EAX forced 0).
-; Plain ring-0 call, runs BEFORE the enter inline asm in the main loop.
+; Flag the NEXT enter_user_mode IRET as a fork-child entry (RAX forced 0).
 enter_user_mode_fork_child:
     mov dword [user_fork_child], 1
     ret
 
-; Stage the EAX value for the NEXT enter_user_mode IRET (park-resume path).
-; Plain cdecl ring-0 call, runs BEFORE the enter inline asm.
-global enter_user_mode_park_ret
+; Stage the RAX value for the NEXT enter_user_mode IRET (park-resume path).
 enter_user_mode_park_ret:
-    mov eax, [esp + 4]
-    mov [user_park_retval], eax
+    mov [user_park_retval], edi
     mov dword [user_park_ret_pending], 1
     ret
 
-; ---- context_switch: preemptive kernel-thread switch (Phase 2) ----
-; void context_switch(uint32_t *old_esp_p, uint32_t new_esp, uint32_t new_cr3);
-; Naked asm, IRQs OFF across the call. Saves outgoing (EBX/ESI/EDI/EBP/ESP +
-; return EIP) into *old_esp_p's stack frame, loads CR3 (full TLB flush), then
-; ESP + regs, RETs into the incoming thread as if its switch call returned.
-; Stack layout on entry: [ret][old_esp_p][new_esp][new_cr3]; after 4 pushes
-; args sit at esp+20/24/28. Clobbers EAX/ECX/EDX (caller-saved).
+; ---- context_switch: preemptive kernel-thread switch ----
+; void context_switch(uintptr_t *old_rsp_p, uintptr_t new_rsp, uintptr_t new_cr3);
+; IRQs OFF across the call. Saves the outgoing callee-saved registers on its stack and the stack pointer in *old_rsp_p, loads CR3 and the
+; incoming stack, and returns into the incoming thread as if its own switch call returned.
 global context_switch
 context_switch:
-    push ebx
-    push esi
-    push edi
-    push ebp
-    mov eax, [esp + 20]       ; old_esp_p
-    mov [eax], esp            ; *old_esp_p = ESP (points at saved EBP)
-    mov eax, [esp + 28]       ; new_cr3
-    mov cr3, eax
-    mov ecx, [esp + 24]       ; new_esp
-    mov esp, ecx
-    pop ebp
-    pop edi
-    pop esi
-    pop ebx
+    push rbx
+    push rbp
+    push r12
+    push r13
+    push r14
+    push r15
+    mov [rdi], rsp
+    mov cr3, rdx
+    mov rsp, rsi
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
     ret
 
-; Resume point: idt.c JMPS here (never calls) with EAX = saved caller ESP.
-; Restores segments + EBP/ESI/EDI/ESP, jumps to [saved-4] (the CALL's return
-; address: saved = retaddr+4). Trap stack discarded (stub never resumes).
-; EBX NOT restored (see above). cli: a timer IRQ here would bury the frame.
+; Resume points of the ring-3 programs: the caller of enter_user_mode continues as if the call had returned. The trap stack is abandoned
+; (its frame never irets). cli: a timer IRQ here would bury the frame. The exit and park paths differ only in what the C side recorded.
 global user_exit_trampoline
-user_exit_trampoline:
-    cli
-    mov ecx, eax
-    mov ax, 0x10
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-    mov ebp, [user_ret_ebp]
-    mov esi, [user_ret_esi]
-    mov edi, [user_ret_edi]
-    mov esp, ecx
-    jmp [esp - 4]
-
-; Park trampoline: same resume as exit (blocking syscalls — wait/yield/read —
-; park the caller as BLOCKED and return straight to the main loop, which runs
-; queued siblings; the drain re-enters the parker with its staged EAX).
 global user_park_trampoline
+user_exit_trampoline:
 user_park_trampoline:
     cli
-    mov ecx, eax
-    mov ax, 0x10
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-    mov ebp, [user_ret_ebp]
-    mov esi, [user_ret_esi]
-    mov edi, [user_ret_edi]
-    mov esp, ecx
-    jmp [esp - 4]
+    mov rsp, [user_ret_rsp]
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbp
+    pop rbx
+    ret
 
-; Saved caller frame for the resume points. .bss: zero-init. DATA ONLY here —
-; never put CODE after a .bss/.note section (triple-fault; see AGENTS.md).
+; DATA ONLY here: never put code after a .bss/.note section.
 section .bss
-align 4
-global user_ret_esp
-user_ret_esp: resd 1
-global user_ret_ebp
-user_ret_ebp: resd 1
-global user_ret_esi
-user_ret_esi: resd 1
-global user_ret_edi
-user_ret_edi: resd 1
-global user_fork_child
+align 8
+global user_ret_rsp
+user_ret_rsp: resq 1
+global user_resume_regs
+user_resume_regs: resq 14
 user_fork_child: resd 1
-global user_park_ret_pending
 user_park_ret_pending: resd 1
-global user_park_retval
 user_park_retval: resd 1
-global irq_last_eip
-irq_last_eip: resd 1
-global irq_last_cs
-irq_last_cs: resd 1
-global irq_last_esp
-irq_last_esp: resd 1
 
-; Prevent executable stack warning (must be LAST — code after it lands non-executable; see AGENTS.md)
+; Prevent the executable-stack warning (must be LAST: code after it lands non-executable; see AGENTS.md)
 section .note.GNU-stack noalloc noexec nowrite progbits

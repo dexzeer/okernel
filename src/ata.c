@@ -101,7 +101,7 @@ int ata_read(uint32_t lba, uint8_t *buf) {
     outb(ATA_COMMAND, ATA_CMD_READ);
     if (ata_wait_drq()) return -1;
     // one string instruction per sector: a VM exit per word cost seconds per boot under WHPX
-    uint32_t n = 256;
+    uint64_t n = 256;                   // RCX: all 64 bits count
     __asm__ volatile("rep insw" : "+D"(buf), "+c"(n) : "d"((uint16_t)ATA_DATA) : "memory");
     return 0;
 }
@@ -139,7 +139,7 @@ int ata_write(uint32_t lba, const uint8_t *buf) {
     outb(ATA_COMMAND, ATA_CMD_WRITE);
     if (ata_wait_drq()) return -1;
     const uint8_t* src = buf;
-    uint32_t n = 256;
+    uint64_t n = 256;                   // RCX: all 64 bits count
     __asm__ volatile("rep outsw" : "+S"(src), "+c"(n) : "d"((uint16_t)ATA_DATA) : "memory");
     // Write cache flush is implicit on QEMU; on real hardware the device
     // completes before clearing BSY — wait for it.

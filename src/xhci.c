@@ -210,9 +210,9 @@ static void delay_ms(uint32_t ms) { while (ms--) pit_delay_us(1000); }
 static void* dma_alloc(uint32_t size, uint32_t align) {
     uint8_t* p = (uint8_t*)kcalloc(1, size + align);
     if (!p) return 0;
-    return (void*)(((uint32_t)p + align - 1) & ~(align - 1));
+    return (void*)(((uintptr_t)p + align - 1) & ~(uintptr_t)(align - 1));
 }
-static uint32_t phys_of(const void* p) { return V2P((uint32_t)p); }
+static uint32_t phys_of(const void* p) { return V2P(p); }
 
 // ---- rings --------------------------------------------------------------------------------------
 static void ring_reset(struct ring* r) {
@@ -1135,9 +1135,9 @@ static int wait_status(uint32_t mask, uint32_t want, int ms) {
 }
 
 static int cmdline_has(uint32_t mboot, const char* word) {
-    uint32_t flags = *(volatile uint32_t*)(mboot + 0);
+    uint32_t flags = *(volatile uint32_t*)(uintptr_t)(mboot + 0);
     if (!(flags & (1u << 2))) return 0;
-    const char* c = (const char*)P2V_U32(*(volatile uint32_t*)(mboot + 16));
+    const char* c = (const char*)P2V_ADDR(*(volatile uint32_t*)(uintptr_t)(mboot + 16));
     uint32_t wl = (uint32_t)strlen(word);
     for (int i = 0; c[i] && i < 512; i++)
         if (!strncmp(c + i, word, wl) && (i == 0 || c[i - 1] == ' ') && (c[i + wl] == 0 || c[i + wl] == ' ')) return 1;
@@ -1160,9 +1160,21 @@ void xhci_init(uint32_t mboot_phys) {
     if (pm) { uint16_t cs = pcix_read16(l, (uint8_t)(pm + 4)); if (cs & 3) { pcix_write16(l, (uint8_t)(pm + 4), cs & ~3u); delay_us(20000); } }
     pcix_enable(l, 1);
     int is_mem, above;
-    uint32_t bar = pcix_bar(l, 0, &is_mem, &above);
-    uint32_t size = pcix_bar_size(l, 0);
-    if (!bar || !is_mem || above || size < 0x1000) { xlog("BAR0 unusable: base %x size %x mem %d above4g %d", bar, size, is_mem, above); return; }
+#ifdef XHCI_TEST_HIGH_BAR
+    {   // test image (make kanarchy-highbar.iso): the firmware leaves small BARs low, so move this one above 4 GB, just past the big device of test_highbar.py
+        uint32_t lo = pcix_read32(l, 0x10);
+        if (((lo >> 1) & 3) == 2) {
+            uint16_t cmd = pcix_read16(l, 0x04);
+            pcix_write16(l, 0x04, cmd & ~0x0002);
+            pcix_write32(l, 0x10, 0x80000000u | (lo & 0xF));
+            pcix_write32(l, 0x14, 0xFFu);
+            pcix_write16(l, 0x04, cmd);
+        }
+    }
+#endif
+    uint64_t bar = pcix_bar(l, 0, &is_mem, &above);
+    uint64_t size = pcix_bar_size(l, 0);
+    if (!bar || !is_mem || size < 0x1000) { xlog("BAR0 unusable: base %lx size %lx mem %d above4g %d", bar, size, is_mem, above); return; }
     if (size > 0x400000) size = 0x400000;
     X.cap = (volatile uint8_t*)paging_map_mmio(bar, size);
     if (!X.cap) { xlog("cannot map the registers"); return; }

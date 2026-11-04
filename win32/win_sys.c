@@ -29,19 +29,19 @@ static void heap_count(uint32_t bytes) {
     while (u > pk && InterlockedCompareExchange(&heap_peak, u, pk) != pk) pk = heap_peak;
 }
 
-void* kmalloc(uint32_t size) {
+void* kmalloc(size_t size) {
     void* p = win_h_alloc(size ? size : 1, __builtin_return_address(0));
     if (p) heap_count(size);
     return p;
 }
 
-void* kcalloc(uint32_t n, uint32_t size) {
+void* kcalloc(size_t n, size_t size) {
     void* p = calloc(n ? n : 1, size ? size : 1);
     if (p) heap_count(n * size);
     return p;
 }
 
-void* krealloc(void* ptr, uint32_t size) {
+void* krealloc(void* ptr, size_t size) {
     return win_h_realloc(ptr, size ? size : 1, __builtin_return_address(0));
 }
 
@@ -185,7 +185,7 @@ volatile uint32_t stall_beat;
 volatile int stall_halted;
 
 void prof_report(void) { memset((void*)prof_cyc, 0, sizeof prof_cyc); memset((void*)prof_cnt, 0, sizeof prof_cnt); }
-void stall_sample(uint32_t eip, uint32_t cs, uint32_t esp) { (void)eip; (void)cs; (void)esp; }
+void stall_sample(uint64_t rip, uint32_t cs, uint64_t rsp) { (void)rip; (void)cs; (void)rsp; }
 void stall_report(void) { }
 
 // ---- CPU clock -------------------------------------------------------------

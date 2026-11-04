@@ -67,22 +67,22 @@ static void draw_cell(int idx, uint16_t cell, int cur) {
 void fbtext_init(uint32_t mboot) {
     for (int i = 0; i < COLS * ROWS; i++) { fbtext_mem[i] = 0x0F20; shadow[i] = 0; }
     mode = 0;
-    uint32_t flags = *(volatile uint32_t*)(mboot + 0);
+    uint32_t flags = *(volatile uint32_t*)(uintptr_t)(mboot + 0);
     if (flags & (1u << 12)) {
-        uint32_t lo = *(volatile uint32_t*)(mboot + 88), hi = *(volatile uint32_t*)(mboot + 92);
-        uint32_t pitch = *(volatile uint32_t*)(mboot + 96), w = *(volatile uint32_t*)(mboot + 100);
-        uint32_t h = *(volatile uint32_t*)(mboot + 104);
-        uint8_t bpp = *(volatile uint8_t*)(mboot + 108), type = *(volatile uint8_t*)(mboot + 109);
+        uint32_t lo = *(volatile uint32_t*)(uintptr_t)(mboot + 88), hi = *(volatile uint32_t*)(uintptr_t)(mboot + 92);
+        uint32_t pitch = *(volatile uint32_t*)(uintptr_t)(mboot + 96), w = *(volatile uint32_t*)(uintptr_t)(mboot + 100);
+        uint32_t h = *(volatile uint32_t*)(uintptr_t)(mboot + 104);
+        uint8_t bpp = *(volatile uint8_t*)(uintptr_t)(mboot + 108), type = *(volatile uint8_t*)(uintptr_t)(mboot + 109);
         serial_printf("[fbtext] fb=%x:%x %dx%d pitch=%d bpp=%d type=%d\n", hi, lo, (int)w, (int)h, (int)pitch, bpp, type);
         if (type == 1 && (bpp == 32 || bpp == 24) && hi == 0 && w >= 640 && h >= 200 && pitch >= w * (bpp / 8u)) {
-            rpos = *(volatile uint8_t*)(mboot + 110); rsz = *(volatile uint8_t*)(mboot + 111);
-            gpos = *(volatile uint8_t*)(mboot + 112); gsz = *(volatile uint8_t*)(mboot + 113);
-            bpos = *(volatile uint8_t*)(mboot + 114); bsz = *(volatile uint8_t*)(mboot + 115);
+            rpos = *(volatile uint8_t*)(uintptr_t)(mboot + 110); rsz = *(volatile uint8_t*)(uintptr_t)(mboot + 111);
+            gpos = *(volatile uint8_t*)(uintptr_t)(mboot + 112); gsz = *(volatile uint8_t*)(uintptr_t)(mboot + 113);
+            bpos = *(volatile uint8_t*)(uintptr_t)(mboot + 114); bsz = *(volatile uint8_t*)(uintptr_t)(mboot + 115);
             if (rsz == 0 || rsz > 8 || gsz == 0 || gsz > 8 || bsz == 0 || bsz > 8 || rpos > 24 || gpos > 24 || bpos > 24) {
                 rpos = 16; rsz = 8; gpos = 8; gsz = 8; bpos = 0; bsz = 8;
             }
             bytes_pp = bpp / 8;
-            fb = (volatile uint8_t*)lo; fb_pitch = pitch; fb_w = w; fb_h = h;
+            fb = (volatile uint8_t*)(uintptr_t)lo; fb_pitch = pitch; fb_w = w; fb_h = h;
             cw = (int)(w / COLS); if (cw > 16) cw = 16;
             ch = (int)(h / ROWS); if (ch > 32) ch = 32;
             ox = (w - (uint32_t)cw * COLS) / 2; oy = (h - (uint32_t)ch * ROWS) / 2;

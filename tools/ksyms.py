@@ -4,9 +4,11 @@
 # between the first link without it and the final one; the code addresses it lists stay the same).
 #   python3 tools/ksyms.py OUT          write the table
 #   python3 tools/ksyms.py --check OUT  the final kernel's symbols must give the same table
-# Layout (little endian): "KSYM", count, then count x (address, name offset) sorted by address, then the names (NUL
-# terminated). Only code symbols (nm types T, t, W, w) between _kernel_start and the end of the code are kept.
+# Layout (little endian): "KSYM", count, then count x (address - base of the kernel image, name offset) sorted by address, then the names
+# (NUL terminated). Only code symbols (nm types T, t, W, w) between _kernel_start and the end of the code are kept.
 import struct, sys
+
+KV = 0xFFFFFFFF80000000
 
 def table(lines):
     syms = []
@@ -18,7 +20,7 @@ def table(lines):
         addr, typ, name = int(p[0], 16), p[1], p[2]
         if name == '_kernel_start':
             start = addr
-        if typ in 'TtWw' and addr >= 0xC0000000:
+        if typ in 'TtWw' and addr >= KV:
             syms.append((addr, name))
     syms.sort()
     if start is not None:
@@ -30,7 +32,7 @@ def table(lines):
         if addr in seen:            # aliases: keep the first name
             continue
         seen.add(addr)
-        ents += struct.pack('<II', addr, len(names))
+        ents += struct.pack('<II', addr - KV, len(names))
         names += name.encode() + b'\0'
     n = len(ents) // 8
     out = b'KSYM' + struct.pack('<I', n) + bytes(ents) + bytes(names)

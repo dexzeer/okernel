@@ -200,7 +200,7 @@ void cursor_fb_repair(int y0, int y1) {
 
 static uint32_t irq_save(void) {
     uint32_t f;
-    __asm__ volatile("pushfl; popl %0; cli" : "=r"(f) :: "memory");
+    __asm__ volatile("pushfq; popq %q0; cli" : "=r"(f) :: "memory");
     return f;
 }
 static void irq_restore(uint32_t f) {

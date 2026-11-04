@@ -3,9 +3,8 @@
 //
 // Small objects (<= 4096 bytes) live in 16 KB pages of one size class
 // each; pages are carved from 1 MB chunks so they can be page aligned.
-// A bitmap over the 32-bit address space (one bit per page) says which
-// page addresses are ours, so the conservative scan can map any word to
-// "the object containing it" in O(1). Large objects are sys-malloc'd and
+// A hash set of page numbers says which page addresses are ours, so the
+// conservative scan can map any word to "the object containing it" in O(1). Large objects are sys-malloc'd and
 // kept in an address-sorted table (binary search).
 //
 // Marking: roots (intrinsics, registered slots, VM stack, jobs, modules),
@@ -21,10 +20,6 @@
 #if !defined(KERNEL) || !KERNEL
 #include <stdio.h>
 #include <stdlib.h>
-#endif
-
-#if UINTPTR_MAX != 0xFFFFFFFFu
-#error "ojs's conservative collector assumes 32-bit pointers"
 #endif
 
 #define PAGE_SHIFT 14   // 16 KB pages: a realm starts with one page per size class in use
@@ -80,7 +75,9 @@ struct marker {
 
 
 struct gc_heap {
-    uint32_t owned[(1u << (32 - PAGE_SHIFT)) / 32];   // page bitmap over 4 GB
+    uintptr_t* owned;                    // open-addressing set of owned page numbers (0 = empty, 1 = deleted)
+    uint32_t ownedsize, ownedused;       // table size (power of two); slots not empty, deleted ones included
+    uintptr_t ownedlo, ownedhi;          // address range of every page ever owned: most stack words fail this test at once
     struct page* pages[NCLASSES];        // class -> page list
     struct page* avail[NCLASSES];        // class -> stack of pages with free objects (linked by anext)
     struct chunk* chunks;
@@ -96,14 +93,60 @@ struct gc_heap {
 
 // ---------------------------------------------------------------- pages
 
+static inline uint32_t page_hash(uintptr_t pn) { return (uint32_t)(((uint64_t)pn * 0x9E3779B97F4A7C15ull) >> 32); }
+
 static inline int page_owned(struct gc_heap* H, uintptr_t addr) {
-    uint32_t pi = (uint32_t)(addr >> PAGE_SHIFT);
-    return (H->owned[pi >> 5] >> (pi & 31)) & 1;
+    if (addr < H->ownedlo || addr >= H->ownedhi) return 0;
+    uintptr_t pn = addr >> PAGE_SHIFT;
+    uint32_t mask = H->ownedsize - 1;
+    for (uint32_t i = page_hash(pn) & mask;; i = (i + 1) & mask) {
+        uintptr_t e = H->owned[i];
+        if (e == pn) return 1;
+        if (!e) return 0;
+    }
 }
-static inline void page_set_owned(struct gc_heap* H, uintptr_t addr, int on) {
-    uint32_t pi = (uint32_t)(addr >> PAGE_SHIFT);
-    if (on) H->owned[pi >> 5] |= 1u << (pi & 31);
-    else H->owned[pi >> 5] &= ~(1u << (pi & 31));
+
+static int page_table_grow(struct gc_heap* H) {
+    uint32_t nsize = H->ownedsize ? H->ownedsize * 2 : 256;
+    uintptr_t* t = (uintptr_t*)ojs_sys_malloc((size_t)nsize * sizeof(uintptr_t));
+    if (!t) return -1;
+    memset(t, 0, (size_t)nsize * sizeof(uintptr_t));
+    uint32_t used = 0;
+    for (uint32_t k = 0; k < H->ownedsize; k++) {
+        uintptr_t e = H->owned[k];
+        if (e < 2) continue;
+        uint32_t i = page_hash(e) & (nsize - 1);
+        while (t[i]) i = (i + 1) & (nsize - 1);
+        t[i] = e;
+        used++;
+    }
+    ojs_sys_free(H->owned);
+    H->owned = t;
+    H->ownedsize = nsize;
+    H->ownedused = used;
+    return 0;
+}
+
+// 0 on success. Page numbers are never 0 or 1: those would be the first 32 KB of the address space.
+static int page_set_owned(struct gc_heap* H, uintptr_t addr, int on) {
+    uintptr_t pn = addr >> PAGE_SHIFT;
+    if (on) {
+        if ((H->ownedused + 1) * 4 >= H->ownedsize * 3 && page_table_grow(H) < 0) return -1;
+        uint32_t mask = H->ownedsize - 1;
+        uint32_t i = page_hash(pn) & mask;
+        while (H->owned[i] >= 2) i = (i + 1) & mask;
+        if (!H->owned[i]) H->ownedused++;
+        H->owned[i] = pn;
+        if (!H->ownedlo || addr < H->ownedlo) H->ownedlo = addr;
+        if (addr + PAGE_SIZE > H->ownedhi) H->ownedhi = addr + PAGE_SIZE;
+        return 0;
+    }
+    if (!H->ownedsize) return 0;
+    uint32_t mask = H->ownedsize - 1;
+    for (uint32_t i = page_hash(pn) & mask;; i = (i + 1) & mask) {
+        if (H->owned[i] == pn) { H->owned[i] = 1; return 0; }
+        if (!H->owned[i]) return 0;
+    }
 }
 
 #define CHUNK_BYTES ((size_t)CHUNK_PAGES * PAGE_SIZE + PAGE_SIZE)
@@ -159,7 +202,13 @@ static struct page* page_new(ojs* J, int cls) {
     H->pages[cls] = p;
     p->anext = H->avail[cls];
     H->avail[cls] = p;
-    page_set_owned(H, (uintptr_t)p, 1);
+    if (page_set_owned(H, (uintptr_t)p, 1) < 0) {      // no room in the table: the stack scan could not find this page, so it must not be used
+        H->pages[cls] = p->next;
+        H->avail[cls] = p->anext;
+        p->next = H->spare;
+        H->spare = p;
+        return 0;
+    }
     return p;
 }
 
@@ -354,9 +403,15 @@ static void scan_conservative(ojs* J, const void* lo, const void* hi) { gc_scan_
 
 // reads raw stack words: AddressSanitizer's redzones between locals would be reported otherwise
 __attribute__((no_sanitize_address)) void gc_scan_conservative(ojs* J, const void* lo, const void* hi) {
-    uintptr_t a = ((uintptr_t)lo + 3) & ~(uintptr_t)3;
-    for (; a + 4 <= (uintptr_t)hi; a += 4) {
-        uintptr_t w = *(const uint32_t*)a;
+    // Words are pointer-sized and aligned. A word may be a NaN-boxed value: its low 48 bits sign-extended give the pointer back, and a plain
+    // pointer is unchanged by that.
+    const uintptr_t sz = sizeof(uintptr_t);
+    uintptr_t a = ((uintptr_t)lo + sz - 1) & ~(sz - 1);
+    for (; a + sz <= (uintptr_t)hi; a += sz) {
+        uintptr_t w = *(const uintptr_t*)a;
+#if UINTPTR_MAX > 0xFFFFFFFFu
+        w = (uintptr_t)((int64_t)((uint64_t)w << 16) >> 16);
+#endif
         if (w < 4096) continue;
         struct gch* g = find_object(J, w);
         if (!g && w) g = find_object(J, w - 1);     // one-past-the-end pointers
@@ -588,9 +643,15 @@ static void par_verify(ojs* J) {
 
 static void __attribute__((noinline)) mark_stack(ojs* J) {
     // spill callee-saved registers into this frame, then scan from here
+#if defined(__x86_64__)
+    volatile uint64_t regs[6];
+    __asm__ volatile("movq %%rbx, 0(%0)\n\tmovq %%rbp, 8(%0)\n\tmovq %%r12, 16(%0)\n\tmovq %%r13, 24(%0)\n\tmovq %%r14, 32(%0)\n\tmovq %%r15, 40(%0)"
+                     :: "r"(regs) : "memory");
+#else
     volatile uint32_t regs[4];
     __asm__ volatile("movl %%ebx, 0(%0)\n\tmovl %%esi, 4(%0)\n\tmovl %%edi, 8(%0)\n\tmovl %%ebp, 12(%0)"
                      :: "r"(regs) : "memory");
+#endif
     void* sp = (void*)regs;
     if (J->stack_top && (uintptr_t)sp < (uintptr_t)J->stack_top) scan_conservative(J, sp, J->stack_top);
 }
@@ -793,6 +854,7 @@ void gc_free_all(ojs* J) {
     }
     ojs_sys_free(H->large);
     ojs_sys_free(H->m0.stack);
+    ojs_sys_free(H->owned);
     ojs_sys_free(H);
     J->heap = 0;
 }
