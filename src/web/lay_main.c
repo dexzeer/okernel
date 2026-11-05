@@ -1332,6 +1332,16 @@ static void lay_box_impl(struct wlayout* L, int bi, int32_t avail, int32_t force
             int32_t mn = size_kw(L, bi, s->min_w, avail);
             if (mn >= 0 && W < mn) W = mn;
         }
+    } else {
+        // a specified (or stretched) width still obeys min/max-width
+        if (s->max_w.t == WL_LEN) {
+            int32_t mx = wl_resolve(s->max_w, avail, 0) + (bb ? 0 : extra_w);
+            if (W > mx) W = mx;
+        }
+        if (s->min_w.t == WL_LEN) {
+            int32_t mn = wl_resolve(s->min_w, avail, 0) + (bb ? 0 : extra_w);
+            if (W < mn) W = mn;
+        }
     }
     if (W < extra_w) W = extra_w;
     // auto margins (block-level in normal flow)
@@ -1417,6 +1427,10 @@ static void lay_box_impl(struct wlayout* L, int bi, int32_t avail, int32_t force
         if (s->min_h.t == WL_LEN && s->min_h.pct == 0) {
             int32_t mn = s->min_h.px + (bb ? 0 : extra_h);
             if (b->h < mn) b->h = mn;
+        }
+        if (s->max_h.t == WL_LEN && (s->max_h.pct == 0 || b->cbh >= 0)) {
+            int32_t mx = wl_resolve(s->max_h, b->cbh >= 0 ? b->cbh : 0, 0) + (bb ? 0 : extra_h);
+            if (b->h > mx) b->h = mx;
         }
     }
     if (b->baseline >= 0 && (b->flags & BF_IFC)) {} // set by lay_ifc

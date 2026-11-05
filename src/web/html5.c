@@ -873,6 +873,21 @@ static void data_state(struct hp* p) {
     }
 }
 
+// XHTML convention: <script><![CDATA[ ... ]]></script> (and the same for
+// <style>) — the markers are XML syntax, not script text. Real XML parsers
+// strip them; so do we, so wrapped scripts and stylesheets (thousands of the
+// WPT css tests) work in our lenient parser.
+static void strip_cdata(struct wbuf* b) {
+    int i = 0;
+    while (i < b->len && (b->p[i] == ' ' || b->p[i] == '\t' || b->p[i] == '\n' || b->p[i] == '\r' || b->p[i] == '\f')) i++;
+    if (b->len - i < 12 || memcmp(b->p + i, "<![CDATA[", 9)) return;
+    int j = b->len;
+    while (j > i + 12 && (b->p[j - 1] == ' ' || b->p[j - 1] == '\t' || b->p[j - 1] == '\n' || b->p[j - 1] == '\r' || b->p[j - 1] == '\f')) j--;
+    if (j - i < 12 || memcmp(b->p + j - 3, "]]>", 3)) return;
+    memmove(b->p, b->p + i + 9, j - i - 12);
+    b->len = j - i - 12;
+}
+
 // RCDATA / RAWTEXT / script data: everything up to the appropriate end tag.
 static void raw_state(struct hp* p) {
     const char* s = p->in;
@@ -901,6 +916,7 @@ static void raw_state(struct hp* p) {
         i++;
     }
     if (i > p->pos) wbuf_put(&p->chars, s + p->pos, i - p->pos);
+    if (p->raw_tag == T_script || p->raw_tag == T_style) strip_cdata(&p->chars);
     p->pos = i;
     if (i < n) {
         p->tstate = TS_DATA;

@@ -82,15 +82,16 @@ WB_DUMP=1 build-host/wbrowse <url> 800 600 out.ppm 2.5   # prints every text fra
 | 2026-11-01 | same 44 areas, `.xht` tests discovered (22742 rendered, | **12093 pass (53.1%)**          |
 |            | fresh build; Servo's css score for scale: 67.8%)       |                                 |
 | 2026-11-01 | same 44 areas, after ::first-letter + ::first-line     | **12474 pass (54.8%)**          |
+| 2026-11-04 | same 44 areas, CDATA strip + min/max clamps + bidi box | **12662 pass (55.6%)**          |
 
 The first three rows were measured before backgrounds loaded their images (see below), so some of their passes were two
 equally broken pages that happened to match.
 
-Per-area (2026-11-01, full24): CSS2 72.5%, css-align 38.7%, css-backgrounds 67.0%, css-borders 29.4%,
-css-box 87.5%, css-break 12.8%, css-cascade 40.0%, css-color 77.9%, css-conditional 56.6%, css-contain 56.9%,
-css-counter-styles 40.2%, css-display 44.0%, css-flexbox 61.2%, css-fonts 35.0%, css-grid 27.9%, css-image-animation 100%,
-css-images 59.5%, css-inline 19.9%, css-lists 69.7%, css-masking 31.8%, css-multicol 24.8%, css-overflow 49.6%,
-css-page 44.5%, css-position 48.2%, css-pseudo 42.8%, css-ruby 23.8%, css-scrollbars 100%, css-sizing 58.3%,
+Per-area (2026-11-04, full25): CSS2 75.0%, css-align 38.7%, css-backgrounds 67.0%, css-borders 29.4%,
+css-box 87.5%, css-break 12.8%, css-cascade 40.0%, css-color 78.2%, css-conditional 56.6%, css-contain 56.9%,
+css-counter-styles 40.2%, css-display 53.2%, css-flexbox 61.2%, css-fonts 35.0%, css-grid 28.1%, css-image-animation 100%,
+css-images 59.5%, css-inline 19.9%, css-lists 69.7%, css-masking 31.8%, css-multicol 24.8%, css-overflow 50.2%,
+css-page 44.5%, css-position 48.2%, css-pseudo 42.8%, css-ruby 22.4%, css-scrollbars 100%, css-sizing 58.8%,
 css-syntax 100% (1 test), css-tables 48.5%, css-text 61.2%, css-text-decor 56.3%, css-transforms 41.8%, css-ui 92.9%,
 css-values 36.9%, css-variables 53.0%, css-view-transitions 21.1%, css-writing-modes 40.5%,
 css-transitions 100%, cssom 41.7%, cssom-view 54.5%, mediaqueries 50.0%, printing 71.8%, selectors 76.7%.
@@ -98,6 +99,21 @@ css-transitions 100%, cssom 41.7%, cssom-view 54.5%, mediaqueries 50.0%, printin
 Areas probed and left out (net-negative or feature-less): css-logical (0), css-scroll-snap (1), css-anchor-position 7.4%,
 css-gaps 5.8%, css-shapes 3.9%, css-shadow 14%, css-will-change 14%, css-nesting 17.6%, css-forms 20%, css-viewport 13.9%,
 css-content 12.5%, css-highlight-api 12.6%, motion 8.2%, compositing 8.5%, css-layout-api 4.4%, css-paint-api 1.7%.
+
+## What changed on 2026-11-04 (CDATA + clamps + bidi box model)
+
+- **CDATA strip** (`html5.c`): `<script><![CDATA[ ... ]]></script>` / `<style>` in XHTML tests leaked the markers into the
+  script text (`SyntaxError: unexpected <`), killing every `dom`-flagged test that used them (~4.5k files). The parser now
+  strips the wrapper at rawtext completion. CSS2 4545 -> 4707 (table-anonymous-objects 137 -> 81 fails, css-display +19).
+- **min/max clamps on specified sizes** (`lay_main.c`): `max-height` never clamped a specified `height` (and `max-width`
+  never clamped a forced width) — the clamps only ran on the content-sized path. normal-flow 571 -> 632, css-sizing +3,
+  css-flexbox +2.
+- **Bidi box model, first half** (`lay_inline.c`): an inline box's padding+border+margin sides now consume space on bidi
+  lines (walk 1 of the bidi emitter). bidi-text +8. A fuller version (stream markers for every inline box) was tried and
+  reverted: the extra neutrals perturb UAX#9 level resolution (-22). What remains: box-model markers that participate in
+  reordering correctly, ruby on bidi lines.
+- Fixed-table-layout (67 tests) parked: needs the CSS2.1 17.5.2.1 algorithm (first-row-only widths, auto table width);
+  current misses are ~1px distribution details. `::selection` styling and first-letter background-image sizing parked too.
 
 ## What changed on 2026-11-01 (corpus + ::first-letter/::first-line)
 

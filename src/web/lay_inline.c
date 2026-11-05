@@ -645,7 +645,7 @@ static void emit_line_bidi(struct ifc* c, int n, int32_t x, int32_t base, int32_
                             : (dir ? 0x2067 : 0x2066);                  // isolate / isolate-override
                 if (nb < 8192 && nopens < 64) {
                     bcp[nb] = sc; bown[nb] = i; bctrl[nb] = 1; nb++;
-                    opensyn[nopens++] = nb - 1;
+                    opensyn[nopens++] = sc;
                 }
             }
             continue;
@@ -654,8 +654,8 @@ static void emit_line_bidi(struct ifc* c, int n, int32_t x, int32_t base, int32_
             for (int q = nspans - 1; q >= 0; q--)
                 if (spans[q].box == it->box && spans[q].b < 0) { spans[q].b = nb; break; }
             if (nopens > 0) {
-                int oi = opensyn[--nopens];
-                uint32_t cl = bcp[oi] <= 0x202E ? 0x202C : 0x2069;
+                uint32_t sc = opensyn[--nopens];
+                uint32_t cl = sc <= 0x202E ? 0x202C : 0x2069;
                 if (nb < 8192) { bcp[nb] = cl; bown[nb] = i; bctrl[nb] = 1; nb++; }
             }
             continue;
@@ -684,7 +684,21 @@ static void emit_line_bidi(struct ifc* c, int n, int32_t x, int32_t base, int32_
         int32_t wx = x;
         for (int k = 0; k < nb; k++) {
             int idx = border[k];
-            if (bctrl[idx] & 1) { bx[idx] = wx; bw[idx] = 0; continue; }
+            if (bctrl[idx] & 1) {
+                bx[idx] = wx;
+                // an inline box's open/close: the padding+border+margin sides
+                // are real space on the line (CSS2.1 box.html#bidi-box-model)
+                struct piece* sp = &PC[bown[idx]];
+                int32_t w2 = 0;
+                if (sp->item >= 0 && (sp->kind == P_OPEN || sp->kind == P_CLOSE)) {
+                    struct lbox* ib = &L->b[IT[sp->item].box];
+                    w2 = sp->kind == P_OPEN ? ib->m[3] + ib->b[3] + ib->p[3]
+                                            : ib->m[1] + ib->b[1] + ib->p[1];
+                }
+                bw[idx] = w2;
+                wx += w2;
+                continue;
+            }
             struct piece* p = &PC[bown[idx]];
             struct iitem* it = &IT[p->item];
             if (p->kind == P_ATOMIC) { bx[idx] = wx; bw[idx] = p->w; wx += p->w; continue; }
@@ -698,7 +712,9 @@ static void emit_line_bidi(struct ifc* c, int n, int32_t x, int32_t base, int32_
             int32_t xa = 0, xb = 0;
             int any = 0;
             for (int e = spans[q].a; e < spans[q].b && e < nb; e++) {
-                if (bctrl[e] & 1) continue;
+                // ctrl entries of this span's own open/close carry the box
+                // sides: include them so the fragment covers padding+border
+                if ((bctrl[e] & 1) && !(e == spans[q].a || (spans[q].b < nb && e == spans[q].b))) continue;
                 if (!any) { xa = bx[e]; xb = bx[e] + bw[e]; any = 1; }
                 else { if (bx[e] < xa) xa = bx[e]; if (bx[e] + bw[e] > xb) xb = bx[e] + bw[e]; }
             }
