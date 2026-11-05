@@ -3,8 +3,9 @@
 
 #include <stdint.h>
 #include "tls_record.h"
+#include "tls12.h"
 
-// Top-level TLS 1.3 client driver. Connects to `host:port` over TCP using
+// Top-level TLS client driver (1.3, and 1.2 when the server has nothing newer: tls12.h). Connects to `host:port` over TCP using
 // the provided send/recv callbacks, performs the 1-RTT handshake, sends
 // `request` (must already be a complete HTTP request), receives the
 // response, decrypts it, and stores plaintext into `out`.
@@ -49,9 +50,9 @@ struct tls_client_io {
 #define TLS_STEP_ERR   -1   // handshake or transport failure
 
 // Handshake reassembly cap (review #9): complete flights must fit. Real
-// flights run 1-4KB (our RSA-2048 chains ~2KB); 16KB covers RSA-4096
-// chains with headroom. Past this: reject, never truncate.
-#define TLS_HS_REASSEMBLY_MAX 16384
+// flights run 1-4KB (our RSA-2048 chains ~2KB); a full 16KB record on top of
+// a partial message still fits. Past this: reject, never truncate.
+#define TLS_HS_REASSEMBLY_MAX 32768
 
 // Why the state machine stopped. Recorded in tls_state.fail_reason so the
 // caller can distinguish "clean end" from "peer killed us" from "the
@@ -73,6 +74,8 @@ enum tls_phase {
     TLS_PH_SEND_CH = 0,  // build + send ClientHello
     TLS_PH_RECV_SH,      // read ServerHello (cleartext)
     TLS_PH_RECV_HS,      // read encrypted EE/Cert/CV/Finished
+    TLS_PH_RECV_12,      // TLS 1.2: read Certificate .. ServerHelloDone, answer
+    TLS_PH_RECV_12F,     // TLS 1.2: read the server's CCS + Finished
     TLS_PH_RECV_BODY,    // read encrypted application data
     TLS_PH_DONE
 };
@@ -178,6 +181,21 @@ struct tls_state {
     // connection then carries no HTTP/1.1 request - the caller feeds frames through tls_state_queue and reads them from out.
     int offer_h2;
     int alpn_h2;
+    // TLS 1.2 (tls12.h, step12_* in tls_client.c). Traffic keys and sequence
+    // numbers are c_ap_*/s_ap_*, the chain cert_body (rewritten to the 1.3
+    // layout), the ServerKeyExchange signature cv_body.
+    int is12;
+    int h12_next;      // first flight: 0 Certificate, 1 Status or SKE, 2 SKE, 3 CR or Done, 4 Done, 5 complete
+    int h12_status;    // the server answered status_request
+    int h12_ems;       // ... and extended_master_secret
+    int h12_cr;        // it asked for a client certificate
+    int h12_ccs;       // its ChangeCipherSpec arrived
+    uint16_t h12_sig_alg;
+    uint16_t h12_group;
+    uint8_t h12_params[TLS12_SKE_PARAMS_MAX];
+    uint32_t h12_params_len;
+    uint8_t h12_master[TLS12_MASTER_LEN];
+    tls12_hash t12;
 };
 
 void tls_state_init(struct tls_state* st, const char* host, uint16_t port,

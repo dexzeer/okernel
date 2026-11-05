@@ -3,6 +3,7 @@
 #include "sha512.h"
 #include "der.h"
 #include <string.h>
+#include "memwipe.h"
 
 // ---- curve constants (big-endian bytes; converted to limbs at init) ----
 
@@ -498,6 +499,117 @@ static int on_curve(const ec_ctx* c, const uint32_t* x, const uint32_t* y) {
     add_fe_mod(t, t, c->b, &c->fd);        // + b
     fe_mul(lhs, y, y, &c->fd);
     return cmp_fe(lhs, t, c->nl) == 0 ? 0 : -1;
+}
+
+// ---- ECDH (TLS 1.2 key exchange) ----
+
+static const ec_ctx* ctx_for_group(uint16_t group) {
+    if (group == EC_GROUP_P256) return ec_ctx_for(65);
+    if (group == EC_GROUP_P384) return ec_ctx_for(97);
+    return 0;
+}
+
+uint32_t ec_ecdh_point_len(uint16_t group) {
+    return group == EC_GROUP_P256 ? 65 : group == EC_GROUP_P384 ? 97 : 0;
+}
+
+static void limbs_to_be(const uint32_t* v, uint8_t* out, int nl) {
+    for (int i = 0; i < nl; i++) {
+        uint32_t w = v[nl - 1 - i];
+        out[4 * i] = (uint8_t)(w >> 24);
+        out[4 * i + 1] = (uint8_t)(w >> 16);
+        out[4 * i + 2] = (uint8_t)(w >> 8);
+        out[4 * i + 3] = (uint8_t)w;
+    }
+}
+
+static void pt_cswap(ec_pt* a, ec_pt* b, uint32_t bit, int nl) {
+    uint32_t mask = 0u - bit;
+    for (int i = 0; i < nl; i++) {
+        uint32_t t = (a->x[i] ^ b->x[i]) & mask; a->x[i] ^= t; b->x[i] ^= t;
+        t = (a->y[i] ^ b->y[i]) & mask; a->y[i] ^= t; b->y[i] ^= t;
+        t = (a->z[i] ^ b->z[i]) & mask; a->z[i] ^= t; b->z[i] ^= t;
+    }
+}
+
+// k*(px, py), written out as affine big-endian coordinates (y may be NULL).
+// A Montgomery ladder: the same operations for every bit. The keys are
+// ephemeral and used once, so a timing trace of one run is all anyone gets.
+// -1 when the result is the point at infinity.
+static int ecdh_mul(const ec_ctx* c, const uint32_t* k, const uint32_t* px, const uint32_t* py,
+                    uint8_t* x_out, uint8_t* y_out) {
+    const montd* fd = &c->fd;
+    int nl = c->nl;
+    ec_pt R0, R1, t;
+    pt_inf(&R0, fd);
+    for (int i = 0; i < nl; i++) { R1.x[i] = px[i]; R1.y[i] = py[i]; R1.z[i] = fd->one[i]; }
+    for (int i = c->nbits - 1; i >= 0; i--) {
+        uint32_t bit = (k[i / 32] >> (i % 32)) & 1;
+        pt_cswap(&R0, &R1, bit, nl);
+        pt_add(&t, &R0, &R1, fd);
+        R1 = t;
+        pt_dbl(&t, &R0, fd);
+        R0 = t;
+        pt_cswap(&R0, &R1, bit, nl);
+    }
+    int rc = -1;
+    if (!pt_is_inf(&R0, fd)) {
+        uint32_t zi[EC_MAX_LIMBS], z2[EC_MAX_LIMBS], v[EC_MAX_LIMBS], one_raw[EC_MAX_LIMBS];
+        for (int i = 0; i < nl; i++) one_raw[i] = 0;
+        one_raw[0] = 1;
+        fe_inv(zi, R0.z, fd);
+        fe_mul(z2, zi, zi, fd);
+        fe_mul(v, R0.x, z2, fd);
+        fe_mul(v, v, one_raw, fd);
+        limbs_to_be(v, x_out, nl);
+        if (y_out) {
+            fe_mul(v, z2, zi, fd);
+            fe_mul(v, R0.y, v, fd);
+            fe_mul(v, v, one_raw, fd);
+            limbs_to_be(v, y_out, nl);
+        }
+        secure_zero(zi, sizeof zi);
+        secure_zero(z2, sizeof z2);
+        secure_zero(v, sizeof v);
+        rc = 0;
+    }
+    secure_zero(&R0, sizeof R0);
+    secure_zero(&R1, sizeof R1);
+    secure_zero(&t, sizeof t);
+    return rc;
+}
+
+int ec_ecdh_keygen(uint16_t group, const uint8_t* rnd, uint8_t* pub) {
+    const ec_ctx* c = ctx_for_group(group);
+    if (!c) return -1;
+    uint32_t k[EC_MAX_LIMBS], acc = 0;
+    uint32_t bytes = (uint32_t)c->nl * 4;
+    be_to_limbs(rnd, bytes, k, c->nl);
+    for (int i = 0; i < c->nl; i++) acc |= k[i];
+    if (acc == 0 || cmp_fe(k, c->nd.m, c->nl) >= 0) { secure_zero(k, sizeof k); return -1; }
+    pub[0] = 0x04;
+    int rc = ecdh_mul(c, k, c->gx, c->gy, pub + 1, pub + 1 + bytes);
+    secure_zero(k, sizeof k);
+    return rc;
+}
+
+int ec_ecdh_shared(uint16_t group, const uint8_t* priv, const uint8_t* peer, uint32_t peer_len, uint8_t* out) {
+    const ec_ctx* c = ctx_for_group(group);
+    if (!c || peer_len != ec_ecdh_point_len(group) || peer[0] != 0x04) return -1;
+    uint32_t bytes = (uint32_t)c->nl * 4;
+    uint32_t px[EC_MAX_LIMBS], py[EC_MAX_LIMBS], xm[EC_MAX_LIMBS], ym[EC_MAX_LIMBS], k[EC_MAX_LIMBS];
+    be_to_limbs(peer + 1, bytes, px, c->nl);
+    be_to_limbs(peer + 1 + bytes, bytes, py, c->nl);
+    // A point off the curve would pull the private key into a small subgroup of
+    // another curve. These curves have cofactor 1: on the curve is enough.
+    if (cmp_fe(px, c->fd.m, c->nl) >= 0 || cmp_fe(py, c->fd.m, c->nl) >= 0) return -1;
+    fe_set_mont(xm, px, &c->fd);
+    fe_set_mont(ym, py, &c->fd);
+    if (on_curve(c, xm, ym) != 0) return -1;
+    be_to_limbs(priv, bytes, k, c->nl);
+    int rc = ecdh_mul(c, k, xm, ym, out, 0);
+    secure_zero(k, sizeof k);
+    return rc;
 }
 
 int ec_verify(int alg,

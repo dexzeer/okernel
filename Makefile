@@ -108,7 +108,7 @@ DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/ac97.o src/audi
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/aes.o src/crypto/chacha20.o src/crypto/poly1305.o \
              src/crypto/x25519.o src/crypto/tls_record.o src/crypto/tls_handshake.o \
-             src/crypto/tls_keysched.o src/crypto/tls_client.o src/crypto/rand.o \
+             src/crypto/tls_keysched.o src/crypto/tls_client.o src/crypto/tls12.o src/crypto/rand.o \
              src/crypto/sha512.o src/crypto/der.o src/crypto/x509.o \
              src/crypto/rsa.o src/crypto/ec.o src/crypto/roots.o \
              src/crypto/certverify.o src/rtc.o \
@@ -176,7 +176,7 @@ web-tests:
 # the ASan build is 2-3x slower — see the commented line in the recipe).
 # Informational (never gates): text_decode (charset/entity/slot coverage)
 # and the live-network tls_client_test (needs internet to example.com:443).
-HOST_CRYPTO_SRC = src/crypto/tls_client.c src/crypto/tls_record.c src/crypto/tls_handshake.c src/crypto/aes.c \
+HOST_CRYPTO_SRC = src/crypto/tls_client.c src/crypto/tls12.c src/crypto/tls_record.c src/crypto/tls_handshake.c src/crypto/aes.c \
               src/crypto/tls_keysched.c src/crypto/sha256.c src/crypto/sha1.c src/crypto/ocsp.c src/crypto/sha512.c \
               src/crypto/hmac.c src/crypto/hkdf.c src/crypto/aead.c \
               src/crypto/chacha20.c src/crypto/poly1305.c src/crypto/x25519.c \
@@ -202,6 +202,7 @@ host-tests:
 	gcc -m64 -O2 -Isrc/crypto -o build-host/t_aes tests/test_aes.c src/crypto/aes.c && (python3 tests/aes_vectors.py 300 2>/dev/null | ./build-host/t_aes - || ./build-host/t_aes) | tail -n 2
 	gcc -m64 -O2 -Isrc/crypto -Isrc -o build-host/t_pki tests/test_pki.c $(HOST_CRYPTO_SRC) && ./build-host/t_pki | tail -n 2
 	gcc -m64 -O2 -Isrc/crypto -Isrc -o build-host/t_alpn tests/test_alpn.c $(HOST_CRYPTO_SRC) && ./build-host/t_alpn | tail -n 1
+	gcc -m64 -O2 -Isrc/crypto -Isrc -o build-host/t_tls12 tests/test_tls12.c $(HOST_CRYPTO_SRC) && ./build-host/t_tls12
 	printf '#include <string.h>\n#include <stdint.h>\n#include "tls_client.h"\n' > build-host/dechunk_fn.c
 	awk '/^int http_dechunk\(char\* buf, int len\) \{/{p=1} p{print} p&&/^}/{exit}' src/net/network.c >> build-host/dechunk_fn.c
 	gcc -m64 -O1 -fsanitize=address,undefined -Isrc/crypto -Isrc -o build-host/t_dechunk tests/test_dechunk.c build-host/dechunk_fn.c $(HOST_CRYPTO_SRC) && ./build-host/t_dechunk | tail -n 1
@@ -252,6 +253,7 @@ media-tests:
 # after crypto/TLS changes, not on every edit.
 host-tests-asan:
 	mkdir -p build-host
+	gcc -m64 -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -Isrc/crypto -Isrc -o build-host/t_tls12_asan tests/test_tls12.c $(HOST_CRYPTO_SRC) && ./build-host/t_tls12_asan
 	gcc -m64 -O1 -g -fsanitize=address,undefined -Isrc/crypto -Isrc -o build-host/t_adv_asan tests/test_adversarial.c $(HOST_CRYPTO_SRC) && timeout 590 ./build-host/t_adv_asan | tail -n 3
 
 # Independent differential: okernel primitives vs Python `cryptography`
@@ -287,6 +289,8 @@ diff-test: diff-oracle
 tls-interop:
 	mkdir -p build-host
 	gcc -m64 -O2 -Isrc/crypto -Isrc -o build-host/t_tlsa tests/test_tls_attacker.c $(HOST_CRYPTO_SRC)
+	bash tests/tls12_interop.sh
+	python3 tests/tls12_evil.py
 
 all: text
 

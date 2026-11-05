@@ -61,21 +61,39 @@ void tls_transcript_update_msg(tls_transcript* t, uint8_t hs_type,
 // ---- Extension writers ----
 
 int tls_ext_append_supported_versions(uint8_t* buf, uint32_t cap, uint32_t* pos) {
-    // ext type (2) | len(2) | list_len(1) | 0x0304
+    // ext type (2) | len(2) | list_len(1) | 0x0304 | 0x0303
     uint32_t start = *pos;
-    if (!buf_has(cap, start, 6)) return -1;
+    if (!buf_has(cap, start, 9)) return -1;
     put_u16(buf + start, TLS_EXT_SUPPORTED_VERSIONS); // 0x002b
-    put_u16(buf + start + 2, 3);                        // ext body len
-    buf[start + 4] = 2;                                 // list length
+    put_u16(buf + start + 2, 5);                        // ext body len
+    buf[start + 4] = 4;                                 // list length
     put_u16(buf + start + 5, TLS_VERSION_TLS13);
-    *pos = start + 7;
+    put_u16(buf + start + 7, 0x0303);
+    *pos = start + 9;
+    return 0;
+}
+
+// What a TLS 1.2 server needs to see: extended_master_secret, renegotiation_info
+// (empty: this is the first handshake and the only one), ec_point_formats
+// (uncompressed). A 1.3 server ignores all three.
+static int tls_ext_append_tls12(uint8_t* buf, uint32_t cap, uint32_t* pos) {
+    static const uint8_t ext[] = {
+        0x00, 0x17, 0x00, 0x00,
+        0xFF, 0x01, 0x00, 0x01, 0x00,
+        0x00, 0x0B, 0x00, 0x02, 0x01, 0x00,
+    };
+    if (!buf_has(cap, *pos, sizeof ext)) return -1;
+    memcpy(buf + *pos, ext, sizeof ext);
+    *pos += sizeof ext;
     return 0;
 }
 
 int tls_ext_append_supported_groups(uint8_t* buf, uint32_t cap, uint32_t* pos) {
     // RFC 8446 §4.2.3: NamedGroupList = { uint16 length; NamedGroup groups[] }
     static const uint16_t groups[] = {
-        0x001D, // x25519
+        0x001D, // x25519 (the only key share a hello carries)
+        0x0017, // secp256r1: TLS 1.2 key exchange, and a 1.2 server will not use an
+        0x0018, // secp384r1: ECDSA certificate on a curve the client does not list
     };
     uint32_t n = sizeof(groups) / sizeof(groups[0]);
     uint32_t start = *pos;
@@ -104,6 +122,8 @@ int tls_ext_append_signature_algorithms(uint8_t* buf, uint32_t cap, uint32_t* po
         0x0804, // RSA_PSS_RSAE_SHA256
         0x0805, // RSA_PSS_RSAE_SHA384
         0x0401, // RSA_PKCS1_SHA256
+        0x0501, // RSA_PKCS1_SHA384 (these two: chains, and TLS 1.2 ServerKeyExchange)
+        0x0601, // RSA_PKCS1_SHA512
     };
     uint32_t n = sizeof(algs) / sizeof(algs[0]);
     uint32_t start = *pos;
@@ -286,6 +306,12 @@ uint32_t tls_build_client_hello(uint8_t* out, uint32_t cap,
     static const uint16_t ciphers[] = {
         0x1303, // TLS_CHACHA20_POLY1305_SHA256
         0x1301, // TLS_AES_128_GCM_SHA256
+        0xCCA9, // TLS 1.2: ECDHE_ECDSA_CHACHA20_POLY1305
+        0xCCA8, // ECDHE_RSA_CHACHA20_POLY1305
+        0xC02B, // ECDHE_ECDSA_AES128_GCM_SHA256
+        0xC02F, // ECDHE_RSA_AES128_GCM_SHA256
+        0xC02C, // ECDHE_ECDSA_AES256_GCM_SHA384
+        0xC030, // ECDHE_RSA_AES256_GCM_SHA384
         0x00ff, // TLS_EMPTY_RENEGOTIATION_INFO_SCSV
     };
     uint32_t cs_n = sizeof(ciphers) / sizeof(ciphers[0]);
@@ -312,6 +338,7 @@ uint32_t tls_build_client_hello(uint8_t* out, uint32_t cap,
     if (tls_ext_append_alpn_http11(body, sizeof(body), &pos) < 0) return 0;
     if (tls_ext_append_status_request(body, sizeof(body), &pos) < 0) return 0;
     if (tls_ext_append_psk_key_exchange_modes(body, sizeof(body), &pos) < 0) return 0;
+    if (tls_ext_append_tls12(body, sizeof(body), &pos) < 0) return 0;
     // Patch extensions length
     if (put_u16_ck(body + ext_start, pos - ext_start - 2) < 0) return 0;
 
@@ -645,6 +672,12 @@ uint32_t tls_build_client_hello_psk(uint8_t* out, uint32_t cap,
     static const uint16_t ciphers[] = {
         0x1303, // TLS_CHACHA20_POLY1305_SHA256
         0x1301, // TLS_AES_128_GCM_SHA256
+        0xCCA9, // TLS 1.2: ECDHE_ECDSA_CHACHA20_POLY1305
+        0xCCA8, // ECDHE_RSA_CHACHA20_POLY1305
+        0xC02B, // ECDHE_ECDSA_AES128_GCM_SHA256
+        0xC02F, // ECDHE_RSA_AES128_GCM_SHA256
+        0xC02C, // ECDHE_ECDSA_AES256_GCM_SHA384
+        0xC030, // ECDHE_RSA_AES256_GCM_SHA384
         0x00ff, // TLS_EMPTY_RENEGOTIATION_INFO_SCSV
     };
     uint32_t cs_n = sizeof(ciphers) / sizeof(ciphers[0]);
@@ -667,6 +700,7 @@ uint32_t tls_build_client_hello_psk(uint8_t* out, uint32_t cap,
     if (tls_ext_append_alpn_http11(body, sizeof(body), &pos) < 0) return 0;
     if (tls_ext_append_status_request(body, sizeof(body), &pos) < 0) return 0;
     if (tls_ext_append_psk_key_exchange_modes(body, sizeof(body), &pos) < 0) return 0;
+    if (tls_ext_append_tls12(body, sizeof(body), &pos) < 0) return 0;
     // pre_shared_key (last extension, RFC §4.2.11):
     //   identities: list_len(2) || ticket_len(2) || ticket || age(4)
     //   binders:    binders_len(2) || entry_len(1) || binder(32)

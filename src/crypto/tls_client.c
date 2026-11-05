@@ -2,6 +2,7 @@
 #include "tls_record.h"
 #include "tls_handshake.h"
 #include "tls_keysched.h"
+#include "tls12.h"
 #include "x25519.h"
 #include "aead.h"
 #include "aes.h"
@@ -1008,6 +1009,424 @@ void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
     st->alert_desc = -1;
 }
 
+// The server's identity, for both versions: chain -> anchor -> hostname, then the leaf.
+static int auth_chain(struct tls_state* st, x509_cert* leaf) {
+#ifdef KERNEL
+    const char* vhost = st->host;
+#else
+    // Test hook: canonicalize the override too, so the tested
+    // identity is always the canonical form (invalid → "" → the
+    // hostname check fails closed below).
+    char vhost_canon[64];
+    const char* vhost = st->host;
+    if (st->verify_host) {
+        if (tls_canon_host(vhost_canon, st->verify_host) != 0)
+            vhost_canon[0] = 0;
+        vhost = vhost_canon;
+    }
+#endif
+    int cvr = cert_verify(st->cert_body, st->cert_bl, vhost);
+    if (cvr != CV_OK) {
+        tls_dbg("[tls] cert verification failed: %s\n",
+                cert_verify_strerror(cvr));
+        st->fail_reason = TLS_FAIL_CERT;
+        st->cert_detail = cvr;
+        return -1;
+    }
+
+    // CertificateVerify: signs 64 sp || "TLS 1.3, server
+    // CertificateVerify" || 0x00, hashed per the signature algorithm,
+    // with the LEAF certificate's key. Transcript covers CH..Certificate.
+    if (cert_leaf(st->cert_body, st->cert_bl, leaf) != 0) {
+        tls_dbg("[tls] leaf certificate parse failed (len=%u)\n", st->cert_bl);
+        st->fail_reason = TLS_FAIL_CERT;
+        st->cert_detail = CV_ERR_PARSE;
+        return -1;
+    }
+    return 0;
+}
+
+// After the proof of possession: the leaf pin and the OCSP staple.
+static int auth_pin_staple(struct tls_state* st, const x509_cert* leaf) {
+    // TOFU leaf pin (see tls_client.h): first verified visit stores
+    // the leaf SPKI hash; a later DIFFERENT key fails closed here
+    // (no fallback — same gate as every CERT failure). Pin against
+    // the verified identity (host-only verify_host override in tests).
+    {
+#ifdef KERNEL
+        const char* phost = st->host;
+#else
+        const char* phost = st->verify_host ? st->verify_host : st->host;
+#endif
+        uint8_t ph[32];
+        sha256(leaf->spki.p, leaf->spki.len, ph);
+        int prc = tls_pin_check(phost, ph);
+        if (prc != 0) {
+            st->fail_reason = TLS_FAIL_CERT;
+            st->cert_detail = (prc == -2) ? CV_ERR_PRELOAD
+                                          : CV_ERR_PINCHANGED;
+            return -1;
+        }
+    }
+    // OCSP staple validation (P2): the chain verified above, so
+    // `leaf` is authentic and the flight's second cert is the
+    // direct issuer the responder must be. A present-but-invalid
+    // staple fails closed (revoked/stale/forged — indistinguishable
+    // from attack, and the warning page discloses enforcement).
+    // Must-Staple (RFC 7633, cryptoholes follow-up): a leaf
+    // asserting TLSFeature status_request(5) WITHOUT a staple
+    // fails closed too — that combination means revocation went
+    // unchecked against the issuer's explicit policy (previously
+    // soft-fail; the industry fix for silent-OCSP-stripping).
+    if (!st->got_staple && leaf->has_must_staple) {
+        tls_dbg("[tls] Must-Staple leaf without staple: refusing\n");
+        st->fail_reason = TLS_FAIL_CERT;
+        st->cert_detail = CV_ERR_OCSP;
+        return -1;
+    }
+    // Absent staple: soft-fail proceed (documented model).
+    if (st->got_staple) {
+        x509_cert issuer;
+        int ocsp_rc;
+        // The staple is checked against the flight's second cert —
+        // which must be PROVEN to be the leaf's issuer here. When
+        // the leaf anchors directly on a store root, cert_verify
+        // never looked at entry 1: an attacker holding a revoked
+        // Must-Staple leaf could append a cert of its own plus a
+        // "good" response signed by it, and the certID/signature
+        // checks would all pass against that stand-in. Unprovable
+        // issuer = unverifiable staple (soft-fail unless Must-Staple).
+        if (cert_issuer(st->cert_body, st->cert_bl, &issuer) != 0 ||
+            issuer.subject.len != leaf->issuer.len ||
+            memcmp(issuer.subject.p, leaf->issuer.p, leaf->issuer.len) != 0 ||
+            cert_sig_verify(leaf->sig_alg, &issuer, leaf->tbs.p, leaf->tbs.len,
+                            leaf->signature.p, leaf->signature.len) != 0) {
+            tls_dbg("[tls] staple: flight has no verifiable leaf issuer\n");
+            ocsp_rc = OCSP_ERR_RESPONDER;
+        } else {
+            ocsp_rc = ocsp_check_staple(st->staple, st->staple_len,
+                                       leaf, &issuer, x509_get_now());
+        }
+        tls_dbg("[tls] OCSP staple verdict: %s\n",
+                ocsp_strerror(ocsp_rc));
+        // Policy (2026-10-07): a VERIFIED revoked/unknown status
+        // always fails; a staple we cannot verify (stale, unknown
+        // responder form, bad signature) fails only for Must-Staple
+        // leaves and is otherwise treated like an absent staple.
+        // Hard-failing it bought nothing — an attacker can strip
+        // the staple instead (absent = soft-fail) — and it broke
+        // most real sites whose CAs sign through delegated
+        // responders (Firefox soft-fails the same way).
+        if (ocsp_rc == OCSP_ERR_STATUS_BAD ||
+            (ocsp_rc != OCSP_OK && leaf->has_must_staple)) {
+            st->fail_reason = TLS_FAIL_CERT;
+            st->cert_detail = CV_ERR_OCSP;
+            return -1;
+        }
+        if (ocsp_rc != OCSP_OK)
+            tls_dbg("[tls] unverifiable OCSP staple ignored (soft-fail)\n");
+    }
+    return 0;
+}
+
+// ---- TLS 1.2 handshake (a server that answered without supported_versions) ----
+//   RECV_SH -> RECV_12: Certificate, [CertificateStatus,] ServerKeyExchange,
+//     [CertificateRequest,] ServerHelloDone, in that order, each once. A hello
+//     and its flight may share records, unlike 1.3. The chain, the pin and the
+//     staple go through the same checks as 1.3, then the signature on the key.
+//   RECV_12 -> RECV_12F: [empty Certificate,] ClientKeyExchange, CCS, Finished.
+//   RECV_12F -> RECV_BODY: the server's CCS and Finished, nothing else.
+// Keys live in c_ap_*/s_ap_* from the CCS on; their sequence numbers start at 0
+// with the Finished messages.
+static int fail12(struct tls_state* st, int reason) {
+    st->fail_reason = reason;
+    return TLS_STEP_ERR;
+}
+
+static int send12(struct tls_state* st, uint8_t type, const uint8_t* pt, uint32_t n,
+                  const struct tls_client_io* io) {
+    uint32_t wl = 0;
+    if (tls12_seal(st->suite, st->c_ap_key, st->c_ap_iv, st->c_ap_seq, type, pt, n, send_ct, &wl) != 0) {
+        secure_zero(send_ct, sizeof(send_ct));
+        return -1;
+    }
+    st->c_ap_seq++;
+    uint8_t hdr[5] = { type, 0x03, 0x03, (uint8_t)(wl >> 8), (uint8_t)wl };
+    int rc = io->send(hdr, 5, io->user);
+    if (rc == 0) rc = io->send(send_ct, wl, io->user);
+    secure_zero(send_ct, sizeof(send_ct));
+    return rc;
+}
+
+// Same answers as tls_decrypt_one: the plaintext length, -1 for a bad record,
+// -2 for something that must not appear once the keys are live.
+static int decrypt12(struct tls_state* st, uint8_t* pt, uint8_t* ctype) {
+    tls_record v;
+    if (tls_record_parse_header(st->rec_buf, 5, &v) != 5) return -1;
+    *ctype = v.type;
+    if (v.type == TLS_CT_CHANGE_CIPHER_SPEC) return -2;
+    uint32_t n = 0;
+    if (tls12_open(st->suite, st->s_ap_key, st->s_ap_iv, st->s_ap_seq, v.type,
+                   st->rec_buf + 5, st->rec_pl, pt, &n) != 0)
+        return -1;
+    st->s_ap_seq++;
+    return (int)n;
+}
+
+// One complete message of the server's first flight.
+static int step12_msg(struct tls_state* st, uint8_t t, const uint8_t* body, uint32_t bl, uint32_t raw_len) {
+    if (t == TLS_HS_CERTIFICATE && st->h12_next == 0) {
+        if (tls12_cert_to_13(body, bl, st->cert_body, sizeof(st->cert_body), &st->cert_bl) != 0 ||
+            tls_parse_certificate(st->cert_body, st->cert_bl) != 0) {
+            tls_dbg("[tls] 1.2 Certificate rejected (len=%u)\n", bl);
+            return -1;
+        }
+        st->got_cert = 1;
+        st->h12_next = 1;
+    } else if (t == TLS12_HS_CERT_STATUS && st->h12_next == 1 && st->h12_status) {
+        const uint8_t* resp = 0;
+        uint32_t rl = 0;
+        if (tls12_parse_cert_status(body, bl, &resp, &rl) != 0 || rl > sizeof(st->staple)) return -1;
+        memcpy(st->staple, resp, rl);
+        st->staple_len = rl;
+        st->got_staple = 1;
+        st->h12_next = 2;
+    } else if (t == TLS12_HS_SERVER_KEY_EXCHANGE && (st->h12_next == 1 || st->h12_next == 2)) {
+        const uint8_t* sig = 0;
+        uint32_t sl = 0;
+        if (tls12_parse_ske(body, bl, &st->h12_group, &st->h12_params_len, &st->h12_sig_alg, &sig, &sl) != 0 ||
+            sl > sizeof(st->cv_body)) {
+            tls_dbg("[tls] 1.2 ServerKeyExchange rejected (len=%u)\n", bl);
+            return -1;
+        }
+        memcpy(st->h12_params, body, st->h12_params_len);
+        memcpy(st->cv_body, sig, sl);
+        st->cv_bl = sl;
+        st->got_cv = 1;
+        st->h12_next = 3;
+    } else if (t == TLS12_HS_CERT_REQUEST && st->h12_next == 3) {
+        st->h12_cr = 1;                  // answered with an empty Certificate: we have none
+        st->h12_next = 4;
+    } else if (t == TLS12_HS_SERVER_HELLO_DONE && (st->h12_next == 3 || st->h12_next == 4)) {
+        if (bl != 0) return -1;
+        st->h12_next = 5;
+    } else {
+        tls_dbg("[tls] 1.2 flight order violation: type %u at step %d\n", t, st->h12_next);
+        return -1;
+    }
+    tls12_hash_update(&st->t12, body - 4, raw_len);
+    return 0;
+}
+
+// Everything from a complete first flight to our Finished.
+static int step12_client_flight(struct tls_state* st, const struct tls_client_io* io) {
+    x509_cert leaf;
+    uint8_t hash[TLS12_MAX_HASH];
+    if (auth_chain(st, &leaf) != 0) return TLS_STEP_ERR;
+    const uint8_t* cr = st->random;
+    const uint8_t* sr = st->sh_body + 2;
+    if (tls12_verify_ske(st->suite, &leaf, st->h12_sig_alg, cr, sr, st->h12_params, st->h12_params_len,
+                         st->cv_body, st->cv_bl) != 0) {
+        tls_dbg("[tls] 1.2 ServerKeyExchange signature INVALID (alg=%04x)\n", st->h12_sig_alg);
+        st->fail_reason = TLS_FAIL_CERT;
+        st->cert_detail = CV_ERR_CHAIN;
+        return TLS_STEP_ERR;
+    }
+    tls_dbg("[tls] certificate chain verified, host matched\n");
+    if (auth_pin_staple(st, &leaf) != 0) return TLS_STEP_ERR;
+
+    // Our side of the key exchange. X25519 keys were made for the hello; the NIST
+    // curves only cost anything now that a server has actually chosen one.
+    uint8_t pms[48], cke[4 + 1 + 97];
+    uint32_t pms_len = 32, point_len = 32;
+    const uint8_t* peer = st->h12_params + 4;
+    if (st->h12_group == TLS_GROUP_X25519) {
+        memcpy(cke + 5, st->pub, 32);
+        if (!x25519_shared_secret(pms, st->priv, peer)) return fail12(st, TLS_FAIL_PROTO);
+    } else {
+        uint8_t ec_priv[48];
+        point_len = ec_ecdh_point_len(st->h12_group);
+        pms_len = (point_len - 1) / 2;
+        int got = 0;
+        for (int i = 0; i < 16 && !got; i++) {
+            if (!tls_fill_random(ec_priv, pms_len)) {
+                secure_zero(ec_priv, sizeof ec_priv);
+                return fail12(st, TLS_FAIL_RNG);
+            }
+            got = ec_ecdh_keygen(st->h12_group, ec_priv, cke + 5) == 0;
+        }
+        got = got && ec_ecdh_shared(st->h12_group, ec_priv, peer, point_len, pms) == 0;
+        secure_zero(ec_priv, sizeof ec_priv);
+        if (!got) {
+            tls_dbg("[tls] 1.2 key exchange failed (group %04x)\n", st->h12_group);
+            return fail12(st, TLS_FAIL_PROTO);
+        }
+    }
+    if (st->h12_cr) {
+        static const uint8_t none[7] = { TLS_HS_CERTIFICATE, 0, 0, 3, 0, 0, 0 };
+        tls12_hash_update(&st->t12, none, sizeof none);
+        if (send_record(TLS_CT_HANDSHAKE, none, sizeof none, io) != 0) {
+            secure_zero(pms, sizeof pms);
+            return fail12(st, TLS_FAIL_PROTO);
+        }
+    }
+    uint32_t cke_len = 4 + 1 + point_len;
+    cke[0] = TLS12_HS_CLIENT_KEY_EXCHANGE;
+    cke[1] = 0;
+    cke[2] = 0;
+    cke[3] = (uint8_t)(1 + point_len);
+    cke[4] = (uint8_t)point_len;
+    tls12_hash_update(&st->t12, cke, cke_len);
+    if (send_record(TLS_CT_HANDSHAKE, cke, cke_len, io) != 0) {
+        secure_zero(pms, sizeof pms);
+        return fail12(st, TLS_FAIL_PROTO);
+    }
+
+    int is384 = st->t12.is384;
+    uint32_t hl = tls12_hash_peek(&st->t12, hash);
+    int rc = tls12_master(is384, st->h12_ems, pms, pms_len, hash, hl, cr, sr, st->h12_master);
+    secure_zero(pms, sizeof pms);
+    secure_zero(st->priv, sizeof(st->priv));
+    if (rc != 0) return fail12(st, TLS_FAIL_PROTO);
+
+    uint32_t kl = tls12_suite_key_len(st->suite), il = tls12_suite_iv_len(st->suite);
+    uint8_t block[2 * 32 + 2 * 12], seed[64];
+    memcpy(seed, sr, 32);
+    memcpy(seed + 32, cr, 32);
+    if (tls12_prf(is384, st->h12_master, TLS12_MASTER_LEN, "key expansion", seed, 64, block, 2 * kl + 2 * il) != 0)
+        return fail12(st, TLS_FAIL_PROTO);
+    memcpy(st->c_ap_key, block, kl);
+    memcpy(st->s_ap_key, block + kl, kl);
+    memcpy(st->c_ap_iv, block + 2 * kl, il);
+    memcpy(st->s_ap_iv, block + 2 * kl + il, il);
+    secure_zero(block, sizeof block);
+    st->c_ap_seq = st->s_ap_seq = 0;
+
+    uint8_t ccs[6] = { TLS_CT_CHANGE_CIPHER_SPEC, 0x03, 0x03, 0x00, 0x01, 0x01 };
+    if (io->send(ccs, 6, io->user) != 0) return fail12(st, TLS_FAIL_PROTO);
+    uint8_t fin[4 + TLS12_VERIFY_LEN] = { TLS_HS_FINISHED, 0, 0, TLS12_VERIFY_LEN };
+    if (tls12_prf(is384, st->h12_master, TLS12_MASTER_LEN, "client finished", hash, hl, fin + 4, TLS12_VERIFY_LEN) != 0)
+        return fail12(st, TLS_FAIL_PROTO);
+    tls12_hash_update(&st->t12, fin, sizeof fin);
+    if (send12(st, TLS_CT_HANDSHAKE, fin, sizeof fin, io) != 0) return fail12(st, TLS_FAIL_PROTO);
+
+    st->phase = TLS_PH_RECV_12F;
+    st->rec_have = 0;
+    st->hs_have = 0;
+    return TLS_STEP_AGAIN;
+}
+
+static int step12_flight(struct tls_state* st, const struct tls_client_io* io) {
+    for (;;) {
+        uint32_t p = 0;
+        while (st->h12_next != 5 && p + 4 <= st->hs_have) {
+            uint8_t t = 0;
+            uint32_t bl = 0;
+            uint32_t c = parse_hs(st->hs_buf + p, st->hs_have - p, &t, &bl);
+            if (c == 0) break;           // partial message: more records
+            if (step12_msg(st, t, st->hs_buf + p + 4, bl, c) != 0) return fail12(st, TLS_FAIL_PROTO);
+            p += c;
+        }
+        if (p > 0) {
+            for (uint32_t i = p; i < st->hs_have; i++) st->hs_buf[i - p] = st->hs_buf[i];
+            st->hs_have -= p;
+        }
+        if (st->h12_next == 5) {
+            if (st->hs_have != 0) return fail12(st, TLS_FAIL_PROTO);   // bytes after ServerHelloDone
+            return step12_client_flight(st, io);
+        }
+        int r = tls_recv_record_st(st, io);
+        if (r == 0) return TLS_STEP_AGAIN;
+        if (r < 0) return fail12(st, TLS_FAIL_PROTO);
+        tls_record v;
+        if (tls_record_parse_header(st->rec_buf, 5, &v) != 5 || v.type != TLS_CT_HANDSHAKE ||
+            st->rec_pl > sizeof(st->hs_buf) - st->hs_have)
+            return fail12(st, TLS_FAIL_PROTO);
+        memcpy(st->hs_buf + st->hs_have, st->rec_buf + 5, st->rec_pl);
+        st->hs_have += st->rec_pl;
+        st->rec_have = 0;
+    }
+}
+
+// The server's CCS and Finished.
+static int step12_finish(struct tls_state* st, const struct tls_client_io* io) {
+    int r = tls_recv_record_st(st, io);
+    if (r == 0) return TLS_STEP_AGAIN;
+    if (r < 0) return fail12(st, TLS_FAIL_PROTO);
+    tls_record v;
+    if (tls_record_parse_header(st->rec_buf, 5, &v) != 5) return fail12(st, TLS_FAIL_PROTO);
+    if (!st->h12_ccs) {
+        // Everything else before the CCS is unauthenticated (or a ticket we never asked for).
+        if (v.type != TLS_CT_CHANGE_CIPHER_SPEC || st->rec_pl != 1 || st->rec_buf[5] != 0x01)
+            return fail12(st, TLS_FAIL_PROTO);
+        st->h12_ccs = 1;
+        st->rec_have = 0;
+        return TLS_STEP_AGAIN;
+    }
+    uint8_t* pt = dec_pt;
+    uint8_t ctype = 0;
+    int pl = decrypt12(st, pt, &ctype);
+    if (pl < 0) {
+        secure_zero(dec_pt, sizeof(dec_pt));
+        return fail12(st, pl == -2 ? TLS_FAIL_PROTO : TLS_FAIL_MAC);
+    }
+    if (ctype == TLS_CT_ALERT) {
+        if (pl == 2) st->alert_desc = pt[1];
+        secure_zero(dec_pt, sizeof(dec_pt));
+        return fail12(st, pl == 2 ? TLS_FAIL_ALERT : TLS_FAIL_PROTO);
+    }
+    if (ctype != TLS_CT_HANDSHAKE || pl != 4 + TLS12_VERIFY_LEN || pt[0] != TLS_HS_FINISHED ||
+        pt[1] != 0 || pt[2] != 0 || pt[3] != TLS12_VERIFY_LEN) {
+        secure_zero(dec_pt, sizeof(dec_pt));
+        return fail12(st, TLS_FAIL_PROTO);
+    }
+    uint8_t hash[TLS12_MAX_HASH], want[TLS12_VERIFY_LEN];
+    uint32_t hl = tls12_hash_peek(&st->t12, hash);
+    if (tls12_prf(st->t12.is384, st->h12_master, TLS12_MASTER_LEN, "server finished", hash, hl, want, TLS12_VERIFY_LEN) != 0) {
+        secure_zero(dec_pt, sizeof(dec_pt));
+        return fail12(st, TLS_FAIL_PROTO);
+    }
+    uint8_t diff = 0;
+    for (uint32_t i = 0; i < TLS12_VERIFY_LEN; i++) diff |= (uint8_t)(want[i] ^ pt[4 + i]);
+    secure_zero(want, sizeof want);
+    secure_zero(dec_pt, sizeof(dec_pt));
+    if (diff != 0) {
+        tls_dbg("[tls] 1.2 server Finished INVALID\n");
+        return fail12(st, TLS_FAIL_MAC);
+    }
+    secure_zero(st->h12_master, sizeof(st->h12_master));   // no resumption: nothing needs it now
+    st->rec_have = 0;
+    st->req_off = 0;
+    if (st->alpn_h2) st->request_len = 0;
+    st->phase = TLS_PH_RECV_BODY;
+    tls_dbg("[tls] TLS 1.2 up with %s, suite %04x group %04x\n", st->host, st->suite, st->h12_group);
+    return TLS_STEP_AGAIN;
+}
+
+// A ServerHello without supported_versions: leave the 1.3 path here.
+static int enter12(struct tls_state* st, const struct tls_client_io* io, uint32_t hs_bl, uint32_t consumed) {
+    struct tls12_sh sh;
+    if (hs_bl > sizeof(st->sh_body) ||
+        tls12_parse_server_hello(st->hs_buf + 4, hs_bl, st->session_id, st->offer_h2, &sh) != 0) {
+        tls_dbg("[tls] 1.2 ServerHello rejected\n");
+        return fail12(st, TLS_FAIL_PROTO);
+    }
+    memcpy(st->sh_body, st->hs_buf + 4, hs_bl);
+    st->sh_bl = hs_bl;
+    st->suite = sh.suite;
+    st->is12 = 1;
+    st->h12_ems = sh.ems;
+    st->h12_status = sh.status;
+    st->alpn_h2 = sh.alpn_h2;
+    tls12_hash_init(&st->t12, tls12_suite_is384(sh.suite));
+    tls12_hash_update(&st->t12, st->ch, st->ch_len);
+    tls12_hash_update(&st->t12, st->hs_buf, consumed);
+    for (uint32_t i = consumed; i < st->hs_have; i++) st->hs_buf[i - consumed] = st->hs_buf[i];
+    st->hs_have -= consumed;
+    st->phase = TLS_PH_RECV_12;
+    return step12_flight(st, io);
+}
+
 // Advance the client by (at most) one blocking I/O op. Returns TLS_STEP_AGAIN
 // when more I/O is required, TLS_STEP_DONE when the full response is in
 // st->out/st->out_len, or TLS_STEP_ERR on failure.
@@ -1029,6 +1448,7 @@ void tls_state_init(struct tls_state* st, const char* host, uint16_t port,
 //     clean-boundary EOF ends the STREAM (DONE) — message COMPLETENESS
 //     still needs close_notify or HTTP framing (tls_response_complete).
 //   No 0-RTT/early-data is ever sent. No client certificate exists.
+//   TLS 1.2 leaves RECV_SH through enter12 (see step12_flight above).
 int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
     switch (st->phase) {
     case TLS_PH_SEND_CH: {
@@ -1203,7 +1623,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         // already reassembles, the SH path wrongly required one record).
         // Accumulate payloads; parse when a complete message is present.
         // Cap: a storable SH (4KB body cap below + header).
-        if (st->hs_have + st->rec_pl > sizeof(st->sh_body) + 4) {
+        if (st->rec_pl > sizeof(st->hs_buf) - st->hs_have) {
             tls_dbg("[tls] ServerHello exceeds reassembly cap\n");
             st->fail_reason = TLS_FAIL_PROTO;
             return TLS_STEP_ERR;
@@ -1220,6 +1640,8 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             st->fail_reason = TLS_FAIL_PROTO;
             return TLS_STEP_ERR;
         }
+        if (tls12_sh_version(st->hs_buf + 4, hs_bl) == 12)
+            return enter12(st, io, hs_bl, consumed);
         // ServerHello fills its record(s) exactly (review 2026-09-10 #11):
         // trailing bytes would be a coalesced second message we would
         // silently drop. Real servers always send SH alone (plaintext,
@@ -1548,39 +1970,8 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         // the authentication — only the original ticket holder, verified
         // during the full handshake that issued it, can compute them.
         if (!st->psk_accepted) {
-#ifdef KERNEL
-            const char* vhost = st->host;
-#else
-            // Test hook: canonicalize the override too, so the tested
-            // identity is always the canonical form (invalid → "" → the
-            // hostname check fails closed below).
-            char vhost_canon[64];
-            const char* vhost = st->host;
-            if (st->verify_host) {
-                if (tls_canon_host(vhost_canon, st->verify_host) != 0)
-                    vhost_canon[0] = 0;
-                vhost = vhost_canon;
-            }
-#endif
-            int cvr = cert_verify(st->cert_body, st->cert_bl, vhost);
-            if (cvr != CV_OK) {
-                tls_dbg("[tls] cert verification failed: %s\n",
-                        cert_verify_strerror(cvr));
-                st->fail_reason = TLS_FAIL_CERT;
-                st->cert_detail = cvr;
-                return TLS_STEP_ERR;
-            }
-
-            // CertificateVerify: signs 64 sp || "TLS 1.3, server
-            // CertificateVerify" || 0x00, hashed per the signature algorithm,
-            // with the LEAF certificate's key. Transcript covers CH..Certificate.
             x509_cert leaf;
-            if (cert_leaf(st->cert_body, st->cert_bl, &leaf) != 0) {
-                tls_dbg("[tls] leaf certificate parse failed (len=%u)\n", st->cert_bl);
-                st->fail_reason = TLS_FAIL_CERT;
-                st->cert_detail = CV_ERR_PARSE;
-                return TLS_STEP_ERR;
-            }
+            if (auth_chain(st, &leaf) != 0) return TLS_STEP_ERR;
             uint16_t cv_alg;
             const uint8_t* cv_sig;
             uint32_t cv_sig_len;
@@ -1655,84 +2046,7 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
                 return TLS_STEP_ERR;
             }
             tls_dbg("[tls] certificate chain verified, host matched\n");
-            // TOFU leaf pin (see tls_client.h): first verified visit stores
-            // the leaf SPKI hash; a later DIFFERENT key fails closed here
-            // (no fallback — same gate as every CERT failure). Pin against
-            // the verified identity (host-only verify_host override in tests).
-            {
-#ifdef KERNEL
-                const char* phost = st->host;
-#else
-                const char* phost = st->verify_host ? st->verify_host : st->host;
-#endif
-                uint8_t ph[32];
-                sha256(leaf.spki.p, leaf.spki.len, ph);
-                int prc = tls_pin_check(phost, ph);
-                if (prc != 0) {
-                    st->fail_reason = TLS_FAIL_CERT;
-                    st->cert_detail = (prc == -2) ? CV_ERR_PRELOAD
-                                                  : CV_ERR_PINCHANGED;
-                    return TLS_STEP_ERR;
-                }
-            }
-            // OCSP staple validation (P2): the chain verified above, so
-            // `leaf` is authentic and the flight's second cert is the
-            // direct issuer the responder must be. A present-but-invalid
-            // staple fails closed (revoked/stale/forged — indistinguishable
-            // from attack, and the warning page discloses enforcement).
-            // Must-Staple (RFC 7633, cryptoholes follow-up): a leaf
-            // asserting TLSFeature status_request(5) WITHOUT a staple
-            // fails closed too — that combination means revocation went
-            // unchecked against the issuer's explicit policy (previously
-            // soft-fail; the industry fix for silent-OCSP-stripping).
-            if (!st->got_staple && leaf.has_must_staple) {
-                tls_dbg("[tls] Must-Staple leaf without staple: refusing\n");
-                st->fail_reason = TLS_FAIL_CERT;
-                st->cert_detail = CV_ERR_OCSP;
-                return TLS_STEP_ERR;
-            }
-            // Absent staple: soft-fail proceed (documented model).
-            if (st->got_staple) {
-                x509_cert issuer;
-                int ocsp_rc;
-                // The staple is checked against the flight's second cert —
-                // which must be PROVEN to be the leaf's issuer here. When
-                // the leaf anchors directly on a store root, cert_verify
-                // never looked at entry 1: an attacker holding a revoked
-                // Must-Staple leaf could append a cert of its own plus a
-                // "good" response signed by it, and the certID/signature
-                // checks would all pass against that stand-in. Unprovable
-                // issuer = unverifiable staple (soft-fail unless Must-Staple).
-                if (cert_issuer(st->cert_body, st->cert_bl, &issuer) != 0 ||
-                    issuer.subject.len != leaf.issuer.len ||
-                    memcmp(issuer.subject.p, leaf.issuer.p, leaf.issuer.len) != 0 ||
-                    cert_sig_verify(leaf.sig_alg, &issuer, leaf.tbs.p, leaf.tbs.len,
-                                    leaf.signature.p, leaf.signature.len) != 0) {
-                    tls_dbg("[tls] staple: flight has no verifiable leaf issuer\n");
-                    ocsp_rc = OCSP_ERR_RESPONDER;
-                } else {
-                    ocsp_rc = ocsp_check_staple(st->staple, st->staple_len,
-                                               &leaf, &issuer, x509_get_now());
-                }
-                tls_dbg("[tls] OCSP staple verdict: %s\n",
-                        ocsp_strerror(ocsp_rc));
-                // Policy (2026-10-07): a VERIFIED revoked/unknown status
-                // always fails; a staple we cannot verify (stale, unknown
-                // responder form, bad signature) fails only for Must-Staple
-                // leaves and is otherwise treated like an absent staple.
-                // Hard-failing it bought nothing — an attacker can strip
-                // the staple instead (absent = soft-fail) — and it broke
-                // most real sites whose CAs sign through delegated
-                // responders (Firefox soft-fails the same way).
-                if (ocsp_rc == OCSP_ERR_STATUS_BAD ||
-                    (ocsp_rc != OCSP_OK && leaf.has_must_staple)) {
-                    st->fail_reason = TLS_FAIL_CERT;
-                    st->cert_detail = CV_ERR_OCSP;
-                    return TLS_STEP_ERR;
-                }
-                if (ocsp_rc != OCSP_OK)
-                    tls_dbg("[tls] unverifiable OCSP staple ignored (soft-fail)\n");
-            }
+            if (auth_pin_staple(st, &leaf) != 0) return TLS_STEP_ERR;
         }
 
         uint8_t tx_pre_sfin[32];
@@ -1827,13 +2141,21 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
         return TLS_STEP_AGAIN;
     }
 
+    case TLS_PH_RECV_12:
+        return step12_flight(st, io);
+
+    case TLS_PH_RECV_12F:
+        return step12_finish(st, io);
+
     case TLS_PH_RECV_BODY: {
         if (st->req_off < st->request_len) {          // the request is still going out
             uint32_t n = st->request_len - st->req_off;
             if (n > TLS_REQ_CHUNK) n = TLS_REQ_CHUNK;
             if (io->send_space && io->send_space(io->user) < n + 64) return TLS_STEP_AGAIN;
-            if (send_aead(st->suite, st->c_ap_key, st->c_ap_iv, &st->c_ap_seq, TLS_CT_APPDATA,
-                          st->request + st->req_off, n, io) != 0)
+            if (st->is12) {
+                if (send12(st, TLS_CT_APPDATA, st->request + st->req_off, n, io) != 0) return TLS_STEP_ERR;
+            } else if (send_aead(st->suite, st->c_ap_key, st->c_ap_iv, &st->c_ap_seq, TLS_CT_APPDATA,
+                                 st->request + st->req_off, n, io) != 0)
                 return TLS_STEP_ERR;
             st->req_off += n;
             return TLS_STEP_AGAIN;
@@ -1864,8 +2186,9 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
 
         uint8_t* pt = dec_pt;
         uint8_t ctype;
-        int pl = tls_decrypt_one(st, st->s_ap_key, st->s_ap_iv,
-                                 &st->s_ap_seq, pt, TLS_RECORD_MAX_PAYLOAD, &ctype);
+        int pl = st->is12 ? decrypt12(st, pt, &ctype)
+                          : tls_decrypt_one(st, st->s_ap_key, st->s_ap_iv,
+                                            &st->s_ap_seq, pt, TLS_RECORD_MAX_PAYLOAD, &ctype);
         if (pl < 0) {
             // -2 = PLAINTEXT alert record (outer type ALERT, unencrypted).
             // Post-handshake everything legitimate arrives AEAD-sealed: a
@@ -1891,6 +2214,19 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             st->fail_reason = TLS_FAIL_PROTO;
             secure_zero(dec_pt, sizeof(dec_pt));
             return TLS_STEP_ERR;
+        }
+        if (ctype == TLS_CT_HANDSHAKE && st->is12) {
+            // We never renegotiate: a HelloRequest may be ignored (RFC 5246
+            // §7.4.1.1). There are no tickets either, so nothing else is legal.
+            uint32_t hp = 0;
+            while (hp + 4 <= (uint32_t)pl && pt[hp] == TLS12_HS_HELLO_REQUEST &&
+                   pt[hp + 1] == 0 && pt[hp + 2] == 0 && pt[hp + 3] == 0)
+                hp += 4;
+            int bad = hp != (uint32_t)pl;
+            secure_zero(dec_pt, sizeof(dec_pt));
+            if (bad) return fail12(st, TLS_FAIL_PROTO);
+            st->rec_have = 0;
+            return TLS_STEP_AGAIN;
         }
         if (ctype == TLS_CT_HANDSHAKE) {
             // Post-handshake handshake message: the only legal one here is
@@ -1947,6 +2283,11 @@ int tls_state_step(struct tls_state* st, const struct tls_client_io* io) {
             return TLS_STEP_AGAIN;
         }
         if (ctype == TLS_CT_ALERT) {
+            if (st->is12 && pl == 2 && pt[0] == 1 && pt[1] != 0) {   // 1.2 warnings may be ignored
+                st->rec_have = 0;
+                secure_zero(dec_pt, sizeof(dec_pt));
+                return TLS_STEP_AGAIN;
+            }
             if (pl == 2) {
                 if (pt[1] == 0) {  // close_notify
                     st->fail_reason = TLS_FAIL_ALERT_CLOSE;
@@ -2032,6 +2373,7 @@ void tls_state_wipe(struct tls_state* st) {
     secure_zero(st->master, sizeof(st->master));
     secure_zero(st->res_master, sizeof(st->res_master));
     secure_zero(st->psk_early, sizeof(st->psk_early));
+    secure_zero(st->h12_master, sizeof(st->h12_master));
     secure_zero(st->rec_buf, sizeof(st->rec_buf));
     secure_zero(st->hs_buf, sizeof(st->hs_buf));
     // Static scratch (single-connection contract): may hold plaintext,

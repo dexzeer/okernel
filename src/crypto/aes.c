@@ -114,6 +114,27 @@ void aes128_init(aes128_ctx* ctx, const uint8_t key[16]) {
         }
         for (int k = 0; k < 4; k++) rk[i + k] = (uint8_t)(rk[i - 16 + k] ^ t[k]);
     }
+    ctx->rounds = 10;
+}
+
+void aes256_init(aes128_ctx* ctx, const uint8_t key[32]) {
+    uint8_t* rk = ctx->rk;
+    memcpy(rk, key, 32);
+    uint8_t rcon = 1;
+    for (int i = 32; i < 240; i += 4) {
+        uint8_t t[4] = { rk[i - 4], rk[i - 3], rk[i - 2], rk[i - 1] };
+        if (i % 32 == 0) {
+            uint8_t r = t[0];
+            t[0] = t[1]; t[1] = t[2]; t[2] = t[3]; t[3] = r;
+            sub_bytes(t, 4);
+            t[0] ^= rcon;
+            rcon = xtime(rcon);
+        } else if (i % 32 == 16) {
+            sub_bytes(t, 4);                 // FIPS 197: Nk = 8 adds a SubWord halfway
+        }
+        for (int k = 0; k < 4; k++) rk[i + k] = (uint8_t)(rk[i - 32 + k] ^ t[k]);
+    }
+    ctx->rounds = 14;
 }
 
 void aes128_encrypt_blocks(const aes128_ctx* ctx, const uint8_t* in, uint8_t* out, int n) {
@@ -122,11 +143,11 @@ void aes128_encrypt_blocks(const aes128_ctx* ctx, const uint8_t* in, uint8_t* ou
     memcpy(s, in, len);
     for (int b = 0; b < len; b += 16)
         for (int k = 0; k < 16; k++) s[b + k] ^= ctx->rk[k];
-    for (int round = 1; round <= 10; round++) {
+    for (int round = 1; round <= ctx->rounds; round++) {
         sub_bytes(s, len);
         for (int b = 0; b < len; b += 16) {
             shift_rows(s + b);
-            if (round < 10) mix_columns(s + b);
+            if (round < ctx->rounds) mix_columns(s + b);
             for (int k = 0; k < 16; k++) s[b + k] ^= ctx->rk[16 * round + k];
         }
     }
@@ -173,10 +194,11 @@ static void inc32(uint8_t cb[16]) {
 // GCM_TAG: tag over aad + in (in = ciphertext), nothing written.
 // GCM_CTR: CTR in -> out only (tag untouched; decrypt after verifying).
 enum { GCM_SEAL, GCM_TAG, GCM_CTR };
-static void gcm(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* aad, uint32_t aad_len,
+static void gcm(const uint8_t* key, int aes256, const uint8_t nonce[12], const uint8_t* aad, uint32_t aad_len,
                 const uint8_t* in, uint32_t len, uint8_t* out, int mode, uint8_t tag[16]) {
     aes128_ctx ctx;
-    aes128_init(&ctx, key);
+    if (aes256) aes256_init(&ctx, key);
+    else aes128_init(&ctx, key);
     uint8_t hb[16] = { 0 };
     aes128_encrypt_blocks(&ctx, hb, hb, 1);
     uint32_t h[4];
@@ -221,15 +243,15 @@ done:
     secure_zero(y, sizeof y);
 }
 
-int aead_aes128gcm_encrypt(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* aad, uint32_t aad_len,
-                           const uint8_t* in, uint32_t in_len, uint8_t* out, uint8_t tag[16]) {
+static int gcm_encrypt(const uint8_t* key, int aes256, const uint8_t nonce[12], const uint8_t* aad, uint32_t aad_len,
+                       const uint8_t* in, uint32_t in_len, uint8_t* out, uint8_t tag[16]) {
     if (in_len > (1u << 24)) return -1;   // TLS records are <= 16KB
-    gcm(key, nonce, aad, aad_len, in, in_len, out, GCM_SEAL, tag);
+    gcm(key, aes256, nonce, aad, aad_len, in, in_len, out, GCM_SEAL, tag);
     return 0;
 }
 
-int aead_aes128gcm_decrypt(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* aad, uint32_t aad_len,
-                           const uint8_t* in, uint32_t in_len, const uint8_t tag[16], uint8_t* out) {
+static int gcm_decrypt(const uint8_t* key, int aes256, const uint8_t nonce[12], const uint8_t* aad, uint32_t aad_len,
+                       const uint8_t* in, uint32_t in_len, const uint8_t tag[16], uint8_t* out) {
     if (in_len > (1u << 24)) return -1;
     // Verify before releasing plaintext: the tag is a function of the
     // CIPHERTEXT, so pass 1 computes it without decrypting anything; only
@@ -237,11 +259,28 @@ int aead_aes128gcm_decrypt(const uint8_t key[16], const uint8_t nonce[12], const
     // (the old static 16KB staging area was a cross-connection hazard),
     // and `out` is never written for a forged record. Works in place.
     uint8_t want[16];
-    gcm(key, nonce, aad, aad_len, in, in_len, 0, GCM_TAG, want);
+    gcm(key, aes256, nonce, aad, aad_len, in, in_len, 0, GCM_TAG, want);
     uint8_t diff = 0;
     for (int i = 0; i < 16; i++) diff |= (uint8_t)(want[i] ^ tag[i]);
     secure_zero(want, sizeof want);
     if (diff) return -1;
-    gcm(key, nonce, aad, aad_len, in, in_len, out, GCM_CTR, 0);
+    gcm(key, aes256, nonce, aad, aad_len, in, in_len, out, GCM_CTR, 0);
     return 0;
+}
+
+int aead_aes128gcm_encrypt(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* aad, uint32_t aad_len,
+                           const uint8_t* in, uint32_t in_len, uint8_t* out, uint8_t tag[16]) {
+    return gcm_encrypt(key, 0, nonce, aad, aad_len, in, in_len, out, tag);
+}
+int aead_aes128gcm_decrypt(const uint8_t key[16], const uint8_t nonce[12], const uint8_t* aad, uint32_t aad_len,
+                           const uint8_t* in, uint32_t in_len, const uint8_t tag[16], uint8_t* out) {
+    return gcm_decrypt(key, 0, nonce, aad, aad_len, in, in_len, tag, out);
+}
+int aead_aes256gcm_encrypt(const uint8_t key[32], const uint8_t nonce[12], const uint8_t* aad, uint32_t aad_len,
+                           const uint8_t* in, uint32_t in_len, uint8_t* out, uint8_t tag[16]) {
+    return gcm_encrypt(key, 1, nonce, aad, aad_len, in, in_len, out, tag);
+}
+int aead_aes256gcm_decrypt(const uint8_t key[32], const uint8_t nonce[12], const uint8_t* aad, uint32_t aad_len,
+                           const uint8_t* in, uint32_t in_len, const uint8_t tag[16], uint8_t* out) {
+    return gcm_decrypt(key, 1, nonce, aad, aad_len, in, in_len, tag, out);
 }

@@ -53,7 +53,7 @@ CRYPTO="src/crypto/sha1.c src/crypto/sha256.c src/crypto/sha512.c src/crypto/aea
         src/crypto/aes.c src/crypto/certverify.c src/crypto/chacha20.c src/crypto/der.c \
         src/crypto/ec.c src/crypto/hkdf.c src/crypto/hmac.c src/crypto/ocsp.c \
         src/crypto/poly1305.c src/crypto/rand.c src/crypto/roots.c src/crypto/rsa.c \
-        src/crypto/tls_client.c src/crypto/tls_handshake.c src/crypto/tls_keysched.c \
+        src/crypto/tls_client.c src/crypto/tls12.c src/crypto/tls_handshake.c src/crypto/tls_keysched.c \
         src/crypto/tls_record.c src/crypto/x25519.c src/crypto/x509.c"
 
 NET="src/net/fetch.c src/net/fcache.c src/net/h2.c src/net/hpack.c src/net/hpack_tables.c"

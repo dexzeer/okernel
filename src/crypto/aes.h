@@ -10,10 +10,12 @@
 // No secret-dependent branches or memory indices anywhere.
 
 typedef struct {
-    uint8_t rk[176];   // 11 round keys
+    uint8_t rk[240];   // up to 15 round keys (AES-256)
+    int rounds;        // 10 (AES-128) or 14 (AES-256)
 } aes128_ctx;
 
 void aes128_init(aes128_ctx* ctx, const uint8_t key[16]);
+void aes256_init(aes128_ctx* ctx, const uint8_t key[32]);   // same block function, 14 rounds
 // Encrypt n (1 or 2) consecutive 16-byte blocks (two at a time is ~2x
 // cheaper: the S-box circuit runs on 32-lane bit planes).
 void aes128_encrypt_blocks(const aes128_ctx* ctx, const uint8_t* in, uint8_t* out, int n);
@@ -25,6 +27,15 @@ int aead_aes128gcm_encrypt(const uint8_t key[16], const uint8_t nonce[12],
                            const uint8_t* in, uint32_t in_len,
                            uint8_t* out, uint8_t tag[16]);
 int aead_aes128gcm_decrypt(const uint8_t key[16], const uint8_t nonce[12],
+                           const uint8_t* aad, uint32_t aad_len,
+                           const uint8_t* in, uint32_t in_len,
+                           const uint8_t tag[16], uint8_t* out);
+// AES-256-GCM (TLS 1.2 suites with SHA-384): same contract.
+int aead_aes256gcm_encrypt(const uint8_t key[32], const uint8_t nonce[12],
+                           const uint8_t* aad, uint32_t aad_len,
+                           const uint8_t* in, uint32_t in_len,
+                           uint8_t* out, uint8_t tag[16]);
+int aead_aes256gcm_decrypt(const uint8_t key[32], const uint8_t nonce[12],
                            const uint8_t* aad, uint32_t aad_len,
                            const uint8_t* in, uint32_t in_len,
                            const uint8_t tag[16], uint8_t* out);

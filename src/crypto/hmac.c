@@ -1,5 +1,6 @@
 #include "hmac.h"
 #include "memwipe.h"
+#include "sha512.h"
 
 // HMAC-SHA256, RFC 2104: H(K' ^ opad || H(K' ^ ipad || m))
 // K' is the key zero-padded (or hashed if longer) to one block.
@@ -62,4 +63,32 @@ void hmac_sha256(const uint8_t* key, uint32_t key_len,
     hmac_sha256_init(&ctx, key, key_len);
     hmac_sha256_update(&ctx, msg, msg_len);
     hmac_sha256_final(&ctx, out);
+}
+
+void hmac_sha384(const uint8_t* key, uint32_t key_len,
+                 const uint8_t* msg, uint32_t msg_len,
+                 uint8_t out[48]) {
+    uint8_t block[SHA512_BLOCK_SIZE], pad[SHA512_BLOCK_SIZE], h[SHA512_HASH_SIZE];
+    if (key_len > SHA512_BLOCK_SIZE) {
+        sha384(key, key_len, h);
+        for (uint32_t i = 0; i < SHA512_BLOCK_SIZE; i++) block[i] = i < 48 ? h[i] : 0;
+    } else {
+        for (uint32_t i = 0; i < SHA512_BLOCK_SIZE; i++) block[i] = i < key_len ? key[i] : 0;
+    }
+    sha512_ctx c;
+    xor_block(pad, block, 0x36, SHA512_BLOCK_SIZE);
+    sha384_init(&c);
+    sha512_update(&c, pad, SHA512_BLOCK_SIZE);
+    sha512_update(&c, msg, msg_len);
+    sha512_final(&c, h);
+    xor_block(pad, block, 0x5C, SHA512_BLOCK_SIZE);
+    sha384_init(&c);
+    sha512_update(&c, pad, SHA512_BLOCK_SIZE);
+    sha512_update(&c, h, 48);
+    sha512_final(&c, h);
+    for (int i = 0; i < 48; i++) out[i] = h[i];
+    secure_zero(block, sizeof block);
+    secure_zero(pad, sizeof pad);
+    secure_zero(h, sizeof h);
+    secure_zero(&c, sizeof c);
 }

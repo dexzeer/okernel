@@ -18,4 +18,9 @@ void hmac_sha256_init(hmac_sha256_ctx* ctx, const uint8_t* key, uint32_t key_len
 void hmac_sha256_update(hmac_sha256_ctx* ctx, const uint8_t* msg, uint32_t len);
 void hmac_sha256_final(hmac_sha256_ctx* ctx, uint8_t out[32]);
 
+// HMAC-SHA384 (the PRF of the TLS 1.2 SHA-384 suites). One-shot.
+void hmac_sha384(const uint8_t* key, uint32_t key_len,
+                 const uint8_t* msg, uint32_t msg_len,
+                 uint8_t out[48]);
+
 #endif

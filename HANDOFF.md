@@ -87,7 +87,7 @@ Cherry Trail Atom laptop (1.6 GHz, I2C touchpad, RTL8821CE Wi-Fi). Boots via `ma
 
 ## Known limits
 
-TLS 1.3 only (no TLS 1.2, no SHA-384 suites). HTTP/2 without push; no congestion control. No WebGL, Web Audio, WebRTC, EME, ServiceWorker, XPath, multipart uploads. CSS transforms cover translate*/scale* (with `transform-origin`) but not rotate/skew/3d. CJK glyphs beyond the bitmap table are tofu (line breaking is done). WOFF2 fonts unsupported. Wasm: no SIMD/threads/exceptions. SILK/hybrid Opus and AAC SBR missing. Page JS is slow under TCG (use WHPX/KVM). Single scheduler CPU. In-memory VFS: only PFS-synced files survive reboot.
+TLS 1.3 + TLS 1.2 (AEAD + ECDHE only; no SHA-384 suite on 1.3, no 1.2 resumption). HTTP/2 without push; no congestion control. No WebGL, Web Audio, WebRTC, EME, ServiceWorker, XPath, multipart uploads. CSS transforms cover translate*/scale* (with `transform-origin`) but not rotate/skew/3d. CJK glyphs beyond the bitmap table are tofu (line breaking is done). WOFF2 fonts unsupported. Wasm: no SIMD/threads/exceptions. SILK/hybrid Opus and AAC SBR missing. Page JS is slow under TCG (use WHPX/KVM). Single scheduler CPU. In-memory VFS: only PFS-synced files survive reboot.
 
 ## Bug classes worth remembering
 
@@ -97,7 +97,7 @@ Stale objects after a header change (keep `-MMD -MP`); 16-bit offsets in big are
 
 1. **BotGuard, if wanted**: Trusted Types (small), `Intl.DateTimeFormat`/`NumberFormat` (large), real `about:blank` iframe realms (large); re-measure each with the trace tools. Odds are low; the server never says why.
 2. **Web / WPT CSS** (harness + baseline table + per-area numbers: `tests/web/wpt/README.md`): banked **12662/22757 (55.6%)** across 44 areas. Recent sessions: the corpus fix (`WPT_XHT=2`, `.xht` tests discovered; CSS2 378 -> 6275), `::first-letter` (CSS2/selectors 174 -> 440) + `::first-line`, then the 2026-11-04 batch: CDATA strip in the parser (4.5k tests' scripts ran again), min/max clamps on specified sizes, bidi inline box-model sides. Reference bar: Servo's css score is 67.8% (scores.json 2026-10-31); their weak areas vs ours are css-break (26.7%) and css-grid (49.1%). Next levers by size: css-break 996 (box-decoration-break: clone + out-of-flow in multicol), grid 1236, writing-modes 685, CSS2 tables 198 (fixed-table-layout needs a 17.5.2.1 rewrite, ~67 tests at ~1px misses), flexbox 388, multicol 352, then `rotate()` (affine raster path), WOFF2/Brotli, bidi box-model markers done right. WebGL/Web Audio only if a real use appears.
-3. **Net/TLS**: TLS 1.2 + SHA-384 (whatwg.org, baidu.com), real congestion window for non-SLIRP networks.
+3. **Net/TLS**: real congestion window for non-SLIRP networks; HelloRetryRequest and `TLS_AES_256_GCM_SHA384` on 1.3 if a real server needs them.
 4. **JS engine**: lazy function compilation, generational GC, `using`/DisposableStack, remaining test262 edge cases.
 5. **Laptop** (only when the owner asks): verify PCIe Wi-Fi, audio, Intel scanout from our own buffer.
 6. `sysinfo`/`about` say Okapi and show CPU (brand, MHz, count, speed factor), RAM + heap use, display backend, network + IP, audio, uptime (`sysinfo_text()` in desktop.c).
