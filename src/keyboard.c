@@ -45,6 +45,7 @@ static const char scancode_shift[128] = {
 };
 
 static keyboard_callback_t callback = 0;
+static void (*ext_callback)(int code);
 static int shift_pressed = 0;
 static int ctrl_pressed = 0; // 1 = Ctrl held (0x1D)
 static int alt_pressed = 0;  // 1 = Alt held (0x38, or 0xE0 0x38 right Alt)
@@ -111,6 +112,24 @@ static void keyboard_irq(void) {
         if (scancode == 0xB8) { alt_pressed = 0; return; }  // right Alt release
         if (scancode & 0x80) return; // key release, ignore
 
+        if (ext_callback) {
+            int code = 0;
+            switch (scancode) {
+                case 0x48: code = KEY_EXT_UP; break;
+                case 0x50: code = KEY_EXT_DOWN; break;
+                case 0x4D: code = KEY_EXT_RIGHT; break;
+                case 0x4B: code = KEY_EXT_LEFT; break;
+                case 0x47: code = KEY_EXT_HOME; break;
+                case 0x4F: code = KEY_EXT_END; break;
+                case 0x52: code = KEY_EXT_INSERT; break;
+                case 0x53: code = KEY_EXT_DELETE; break;
+                case 0x49: code = KEY_EXT_PGUP; break;
+                case 0x51: code = KEY_EXT_PGDN; break;
+            }
+            if (code) ext_callback(code);
+            return;
+        }
+
         switch (scancode) {
             case 0x48: if (callback) callback('\x11'); break; // Up Arrow
             case 0x50: if (callback) callback('\x10'); break; // Down Arrow
@@ -174,6 +193,13 @@ static void keyboard_irq(void) {
     if (scancode == 0x49) { if (callback) callback('\x12'); return; } // Page Up
     if (scancode == 0x51) { if (callback) callback('\x04'); return; } // Page Down
 
+    // Esc: only for a callback that asked for keys without a character. The table has none for it, and everyone
+    // else has always ignored the key.
+    if (scancode == 0x01) {
+        if (ext_callback) ext_callback(KEY_EXT_ESC);
+        return;
+    }
+
     // Convert scancode to ASCII
     char c = 0;
     if (shift_pressed) {
@@ -198,6 +224,7 @@ static void keyboard_irq(void) {
 
 void keyboard_init(void) {
     callback = 0;
+    ext_callback = 0;
     shift_pressed = 0;
     ctrl_pressed = 0;
     alt_pressed = 0;
@@ -209,4 +236,8 @@ int keyboard_alt_held(void) { return alt_pressed; }
 
 void keyboard_set_callback(keyboard_callback_t cb) {
     callback = cb;
+}
+
+void keyboard_set_ext_callback(void (*cb)(int code)) {
+    ext_callback = cb;
 }

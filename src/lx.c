@@ -509,7 +509,7 @@ static void process_gone(struct lx_task *leader, int status) {
 
 // exit_group / the death of a whole process
 void lx_task_exit(struct lx_task *t, int status) {
-    int tgid = t->tgid;
+    int tgid = t->tgid, term_win = t->term_win;
     serial_printf("[lx] pid %d exited, status %d\n", tgid, status);
     { extern void lx_fb_owner_gone(int pid); lx_fb_owner_gone(t->pid); lx_fb_owner_gone(tgid); }
     for (int i = 0; i < LX_MAX_TASKS; i++) {                             // the other threads
@@ -524,6 +524,7 @@ void lx_task_exit(struct lx_task *t, int status) {
     struct lx_task *leader = t->pid == tgid ? t : group_leader(tgid);
     if (t != leader) slot_free(t);
     if (leader) process_gone(leader, status);
+    { extern void lx_tty_release(int win); lx_tty_release(term_win); }
 }
 
 // exit of one thread: the process lives on while another thread does
@@ -772,6 +773,29 @@ static void mk_node(const char *path, int type, int mode, uint32_t dev) {
     if (n && type == LXN_CHR) n->dev = dev;
 }
 
+// /etc/resolv.conf follows the network: DHCP may answer long after boot. Rewritten when a program starts.
+void lx_refresh_resolv(void) {
+    extern void net_dns_server(uint8_t out[4]);
+    uint8_t ip[4];
+    net_dns_server(ip);
+    char b[40], *p = b;
+    for (const char *s = "nameserver "; *s; s++) *p++ = *s;
+    for (int i = 0; i < 4; i++) {
+        int v = ip[i];
+        if (v >= 100) *p++ = (char)('0' + v / 100);
+        if (v >= 10) *p++ = (char)('0' + (v / 10) % 10);
+        *p++ = (char)('0' + v % 10);
+        *p++ = i < 3 ? '.' : '\n';
+    }
+    struct lx_node *dir; char name[LX_NAME_MAX + 1]; int err = 0;
+    if (lxfs_resolve_parent(0, "/etc/resolv.conf", &dir, name)) return;
+    struct lx_node *n = lxfs_resolve(0, "/etc/resolv.conf", 1, &err);
+    if (!n) n = lxfs_create(dir, name, LXN_REG, 0644, &err);
+    if (!n) return;
+    lxfs_truncate(n, 0);
+    lxfs_write(n, 0, b, (uint32_t)(p - b));
+}
+
 static void mk_text(const char *path, const char *text) {
     struct lx_node *dir; char name[LX_NAME_MAX + 1]; int err = 0;
     if (lxfs_resolve_parent(0, path, &dir, name)) return;
@@ -798,6 +822,8 @@ void lx_init(void) {
     mk_text("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
     mk_text("/etc/group", "root:x:0:\n");
     mk_text("/etc/hostname", "kanarchy\n");
+    mk_text("/etc/hosts", "127.0.0.1 localhost\n::1 localhost\n");
+    mk_text("/etc/nsswitch.conf", "hosts: files dns\n");
     mk_text("/etc/os-release", "NAME=KAnarchy\nID=kanarchy\nPRETTY_NAME=\"KAnarchy OS\"\n");
     // SYSCALL/SYSRET: EFER.SCE, kernel CS/SS = 0x30/0x38, user bases 0x18 (64-bit CS = 0x28, SS = 0x20)
     lx_ready = 1;

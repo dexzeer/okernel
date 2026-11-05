@@ -541,6 +541,7 @@ static void shell_execute_lx(int win_id, const char *rest) {
     if (ac == 0) { window_puts(win_id, "usage: lx <path> [args]\n"); return; }
     if (str_eq(av[0], "trace")) { extern int lx_trace; lx_trace = ac > 1 ? str_eq(av[1], "on") : !lx_trace; window_puts(win_id, lx_trace ? "trace on\n" : "trace off\n"); return; }
     static const char *const env[] = { "PATH=/bin:/usr/bin:/sbin:/usr/sbin", "HOME=/root", "TERM=xterm", "USER=root", "SHELL=/bin/sh", "LANG=C", 0 };
+    { extern void lx_refresh_resolv(void); lx_refresh_resolv(); }
     int pid = lx_spawn(av[0], av, env, win_id);
     if (pid < 0) {
         window_puts(win_id, av[0]);
@@ -1649,6 +1650,9 @@ static void on_key_irq(char c) {
     key_head++;
 }
 
+// Keys without a character share the queue, with the top bit set (the scancode tables stop at 0x7F).
+static void on_key_ext_irq(int code) { on_key_irq((char)(0x80 | code)); }
+
 static void on_keypress(char c, int alt);
 static void keys_dispatch(void) {
     while (key_tail != key_head) {
@@ -1691,6 +1695,15 @@ static void on_keypress(char c, int alt) {
         } else return;
     }
 
+    if ((unsigned char)c >= 0x80) {
+        int code = (unsigned char)c & 0x7F;
+        extern int lx_tty_ext(int win, int code);
+        if (lx_tty_ext(win_id, code)) return;                 // a Linux program owns this terminal
+        // Everyone else knows the old scroll codes, and only those.
+        if (code == KEY_EXT_UP || code == KEY_EXT_LEFT) c = 0x11;
+        else if (code == KEY_EXT_DOWN || code == KEY_EXT_RIGHT) c = 0x10;
+        else return;
+    }
     if (win_id >= 0 && win_id == wifigui_win()) { wifigui_key(c); return; }
     if (win_id >= 0 && win_id == gamewin_win()) { gamewin_key(c); return; }
     { extern int lx_okwin_char(int wid, int c); if (win_id >= 0 && lx_okwin_char(win_id, (unsigned char)c)) return; }   // a window of a Linux/Windows program
@@ -2191,6 +2204,7 @@ void kernel_main(uint32_t mboot_phys) {
     i2chid_init(mboot_phys);    // I2C-HID touchpad (only when the AML describes one); fail-safe
     keyboard_init();
     keyboard_set_callback(on_key_irq);
+    keyboard_set_ext_callback(on_key_ext_irq);
     // Capture the main-loop thread's live RSP/RBP into pid 0 BEFORE sti:
     // the preemption stub saves/restores p->rsp per thread, and process_init
     // ran one frame up (its RSP capture is stale by a frame). This is the

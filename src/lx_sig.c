@@ -198,8 +198,106 @@ int lx_sig_wake_blocked(struct lx_task *t) {
 
 // ---- timers (alarm, setitimer ITIMER_REAL) --------------------------------------------------------------------------
 
+// POSIX timers. glibc's SIGEV_THREAD timers come here as SIGEV_THREAD_ID: its helper thread sits in sigwaitinfo and
+// reads the timer back out of si_value, so the siginfo has to be right (lx_ptimer_siginfo).
+#define LX_PTIMERS 64
+#define SIGEV_NONE 1
+#define SIGEV_THREAD_ID 4
+struct ptimer {
+    int used, tgid, notify, signo, tid;
+    uint64_t value, next_ms, interval_ms;
+    uint32_t overrun;
+};
+static struct ptimer ptimers[LX_PTIMERS];
+extern int lx_task_by_pid(int pid, struct lx_task **out);
+
+static void ptimers_tick(int64_t now) {
+    for (int i = 0; i < LX_PTIMERS; i++) {
+        struct ptimer *p = &ptimers[i];
+        if (!p->used) continue;
+        struct lx_task *o = 0;
+        if (!lx_task_by_pid(p->tgid, &o) || o->state == LXT_ZOMBIE || o->state == LXT_FREE) { p->used = 0; continue; }
+        if (!p->next_ms || now < (int64_t)p->next_ms) continue;
+        if (p->interval_ms) {
+            p->next_ms += p->interval_ms;
+            if ((int64_t)p->next_ms <= now) {        // a late tick: count what was missed, and do not replay it
+                uint64_t missed = ((uint64_t)now - p->next_ms) / p->interval_ms + 1;
+                p->overrun += (uint32_t)missed;
+                p->next_ms += missed * p->interval_ms;
+            }
+        } else p->next_ms = 0;
+        if (p->notify == SIGEV_NONE) continue;
+        if (p->notify == SIGEV_THREAD_ID) {
+            struct lx_task *c = 0;
+            if (lx_task_by_pid(p->tid, &c) && c->tgid == p->tgid) lx_signal(c, p->signo);
+        } else lx_signal_group(p->tgid, p->signo);
+    }
+}
+
+void lx_ptimer_siginfo(struct lx_task *t, int sig, uint8_t *si) {
+    for (int i = 0; i < LX_PTIMERS; i++) {
+        struct ptimer *p = &ptimers[i];
+        if (!p->used || p->tgid != t->tgid || p->signo != sig) continue;
+        if (p->notify == SIGEV_THREAD_ID && p->tid != t->pid) continue;
+        int32_t code = -2, id = i;                   // SI_TIMER
+        memcpy(si + 8, &code, 4);
+        memcpy(si + 16, &id, 4);
+        memcpy(si + 20, &p->overrun, 4);
+        memcpy(si + 24, &p->value, 8);
+        p->overrun = 0;
+        return;
+    }
+}
+
+struct lx_its { int64_t isec, insec, vsec, vnsec; };
+
+int64_t lx_sys_ptimer(struct lx_task *t, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3) {
+    int64_t now = lx_now_ms();
+    if (nr == 222) {                                 // timer_create(clock, sigevent, id)
+        int i = 0;
+        while (i < LX_PTIMERS && ptimers[i].used) i++;
+        if (i == LX_PTIMERS) return -LX_EAGAIN;
+        struct ptimer *p = &ptimers[i];
+        memset(p, 0, sizeof *p);
+        p->tgid = t->tgid;
+        p->signo = SIGALRM;
+        if (a1) {
+            struct { uint64_t value; int32_t signo, notify, tid; } e;
+            if (lx_copy_in(t, &e, a1, sizeof e)) return -LX_EFAULT;
+            p->value = e.value; p->signo = e.signo; p->notify = e.notify; p->tid = e.tid;
+        }
+        int32_t id = i;
+        if (lx_copy_out(t, a2, &id, 4)) return -LX_EFAULT;
+        p->used = 1;
+        return 0;
+    }
+    if (a0 >= LX_PTIMERS || !ptimers[a0].used || ptimers[a0].tgid != t->tgid) return -LX_EINVAL;
+    struct ptimer *p = &ptimers[a0];
+    struct lx_its o = { (int64_t)(p->interval_ms / 1000), (int64_t)(p->interval_ms % 1000) * 1000000, 0, 0 };
+    if (p->next_ms > (uint64_t)now) { uint64_t rem = p->next_ms - (uint64_t)now; o.vsec = (int64_t)(rem / 1000); o.vnsec = (int64_t)(rem % 1000) * 1000000; }
+    switch (nr) {
+    case 223: {                                      // timer_settime(id, flags, new, old)
+        struct lx_its n;
+        if (lx_copy_in(t, &n, a2, sizeof n)) return -LX_EFAULT;
+        if (n.vnsec < 0 || n.vnsec >= 1000000000 || n.insec < 0 || n.insec >= 1000000000) return -LX_EINVAL;
+        if (a3 && lx_copy_out(t, a3, &o, sizeof o)) return -LX_EFAULT;
+        uint64_t val = (uint64_t)(n.vsec * 1000 + (n.vnsec + 999999) / 1000000);
+        p->interval_ms = (uint64_t)(n.isec * 1000 + (n.insec + 999999) / 1000000);
+        if (!val) p->next_ms = 0;
+        else if (a1 & 1) p->next_ms = val;           // TIMER_ABSTIME: in the monotonic clock's terms
+        else p->next_ms = (uint64_t)now + val;
+        return 0;
+    }
+    case 224: return lx_copy_out(t, a1, &o, sizeof o) ? -LX_EFAULT : 0;
+    case 225: { int64_t v = p->overrun; p->overrun = 0; return v; }
+    case 226: p->used = 0; return 0;
+    }
+    return -LX_ENOSYS;
+}
+
 void lx_sig_timers(void) {
     int64_t now = lx_now_ms();
+    ptimers_tick(now);
     for (int i = 0; i < LX_MAX_TASKS; i++) {
         struct lx_task *t = lx_task_at(i);
         if (!t || !t->pid || t->tgid != t->pid || !t->itimer_next_ms || t->state == LXT_ZOMBIE || t->state == LXT_FREE) continue;

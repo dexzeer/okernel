@@ -149,6 +149,15 @@ void window_set_text_color(int id, uint8_t fg, uint8_t bg);
 void window_set_text_color_rgb(int id, uint32_t fg, uint32_t bg);
 void window_scroll_view(int id, int notches); // wheel scrollback (terminals; positive = down/tail)
 void window_set_cursor(int id, int row, int col);
+// Terminal emulation (lx_tty.c): row and column ranges are clamped to the grid, `fg`/`bg` colour the cells that appear.
+char window_term_char(int id, int row, int col);                  // the character in a cell
+void window_term_move(int id, int row, int col);                  // the cursor, repainting both cells
+void window_term_fill(int id, int row, int c0, int c1, uint32_t fg, uint32_t bg);     // blank [c0, c1) of a row
+void window_term_shift(int id, int row, int col, int n, uint32_t fg, uint32_t bg);    // n > 0 inserts cells at col, n < 0 deletes
+// Rows top..bot move up by n (down if n < 0). archive: the rows that leave at the top go into the scrollback.
+void window_term_scroll(int id, int top, int bot, int n, uint32_t fg, uint32_t bg, int archive);
+void* window_term_save(int id);                                   // a copy of the grid (kmalloc), 0 when out of memory
+void window_term_restore(int id, void* saved);                    // puts it back and frees it
 void window_set_content_bg(int id, uint8_t bg);
 void window_set_content_bg_rgb(int id, uint32_t bg);
 int window_color_is_light(uint8_t idx);

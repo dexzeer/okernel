@@ -48,6 +48,7 @@ struct lx_sock {
     uint32_t rip; uint16_t rport;    // remote address (host order)
     uint16_t lport;                  // local port
     int udp_bound;
+    int so_error;                            // what SO_ERROR says next
 };
 
 static struct lx_sock *abstract_tab[16];
@@ -119,11 +120,16 @@ int lx_sock_readable(struct lx_sock *s) {
         extern int lx_inet_readable(struct lx_sock *s);
         return lx_inet_readable(s);
     }
+    if (s->domain == AF_INET && s->type == SOCK_DGRAM) return s->in.count > 0;   // "connected" says nothing about data
     return s->in.count > 0 || s->shut_rd || (s->state == 3 && !s->peer) || s->state == 4;
 }
 
 int lx_sock_writable(struct lx_sock *s) {
     if (s->state == 2) return 0;
+    if (s->domain == AF_INET && s->type == SOCK_STREAM) {
+        extern int lx_inet_settle(struct lx_sock *s);
+        if (lx_inet_settle(s)) return 0;     // a connect still under way: the answer to poll() is "not yet"
+    }
     if (s->peer) return s->peer->in.count < SOCK_BUF;
     return s->state == 3 || s->domain == AF_INET;
 }
@@ -526,6 +532,27 @@ int lx_inet_readable(struct lx_sock *s) {
     return tcp_rx_avail(s->tcp) > 0 || tcp_failed(s->tcp) || tcp_state(s->tcp) == TCP_STATE_CLOSED;
 }
 
+// A nonblocking connect: moves the socket on once TCP knows the outcome. 1 while it does not yet.
+int lx_inet_settle(struct lx_sock *s) {
+    if (s->state != 5 || s->tcp < 0) return 0;
+    if (tcp_state(s->tcp) == TCP_STATE_ESTABLISHED) { s->state = 3; return 0; }
+    if (tcp_failed(s->tcp) || tcp_state(s->tcp) == TCP_STATE_CLOSED) {
+        tcp_abort(s->tcp);
+        s->tcp = -1;
+        s->state = 0;
+        s->so_error = 111;                   // ECONNREFUSED: what SO_ERROR reports next
+        return 0;
+    }
+    return 1;
+}
+
+int lx_sock_take_error(struct lx_sock *s) {
+    if (s->domain == AF_INET && s->type == SOCK_STREAM) lx_inet_settle(s);
+    int e = s->so_error;
+    s->so_error = 0;
+    return e;
+}
+
 static int connect_done(struct lx_task *t) {
     struct lx_sock *s = sock_of(t, (int64_t)t->block_arg);
     if (!s || s->tcp < 0) return 1;
@@ -590,6 +617,7 @@ static int send_ready(struct lx_task *t) {
 
 int64_t lx_inet_send(struct lx_task *t, struct lx_file *f, struct lx_sock *s, uint64_t uaddr, uint64_t len, uint64_t to_addr, uint64_t to_len) {
     int fd = -1;
+    lx_inet_settle(s);
     for (int i = 0; i < LX_MAX_FDS; i++) if (t->files->fds[i] == f) { fd = i; break; }
     uint8_t buf[1500];
     if (s->type == SOCK_DGRAM) {
@@ -631,6 +659,7 @@ static int recv_ready(struct lx_task *t) {
 
 int64_t lx_inet_recv(struct lx_task *t, struct lx_file *f, struct lx_sock *s, uint64_t uaddr, uint64_t len) {
     int fd = -1;
+    lx_inet_settle(s);
     for (int i = 0; i < LX_MAX_FDS; i++) if (t->files->fds[i] == f) { fd = i; break; }
     uint8_t buf[1500];
     if (s->type == SOCK_DGRAM) {

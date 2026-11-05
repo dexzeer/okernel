@@ -268,6 +268,26 @@ int64_t lx_syscall_more(struct lx_task *t, uint64_t nr, uint64_t a0, uint64_t a1
         return r;
     }
     case 46: return do_sendmsg(t, (int)a0, a1, (int)a2);
+    case 307: { // sendmmsg: glibc's resolver sends its A and AAAA queries together
+        if (a2 > 64) a2 = 64;
+        uint64_t i = 0;
+        for (; i < a2; i++) {
+            int64_t r = do_sendmsg(t, (int)a0, a1 + i * 64, (int)a3);
+            if (t->state == LXT_BLOCK) { if (i) t->state = LXT_RUN; return (int64_t)i; }
+            if (r < 0) return i ? (int64_t)i : r;
+            uint32_t n = (uint32_t)r;
+            if (lx_copy_out(t, a1 + i * 64 + 56, &n, 4)) return -LX_EFAULT;
+        }
+        return (int64_t)i;
+    }
+    case 299: { // recvmmsg: one message at a time is a valid answer
+        if (!a2) return 0;
+        int64_t r = do_recvmsg(t, (int)a0, a1, (int)a3);
+        if (r < 0 || t->state == LXT_BLOCK) return r;
+        uint32_t n = (uint32_t)r;
+        if (lx_copy_out(t, a1 + 56, &n, 4)) return -LX_EFAULT;
+        return 1;
+    }
     case 47: return do_recvmsg(t, (int)a0, a1, (int)a2);
     case 48: return lx_sock_shutdown(t, (int)a0, (int)a1);
     case 49: return lx_sys_bind(t, (int)a0, a1, a2);
@@ -280,7 +300,8 @@ int64_t lx_syscall_more(struct lx_task *t, uint64_t nr, uint64_t a0, uint64_t a1
         struct lx_file *f = fget(t, (int64_t)a0);
         if (!f || f->kind != LXF_SOCK) return -88;
         int32_t v = 0;
-        if (a1 == 1 && a2 == 3) v = 1;                                              // SO_TYPE: stream (callers mostly test SO_ERROR)
+        if (a1 == 1 && a2 == 3) v = 1;                                              // SO_TYPE: stream
+        if (a1 == 1 && a2 == 4) { extern int lx_sock_take_error(struct lx_sock *s); v = lx_sock_take_error(f->sock); }   // SO_ERROR
         if (a3 && lx_copy_out(t, a3, &v, 4)) return -LX_EFAULT;
         if (a4) { uint32_t l = 4; lx_copy_out(t, a4, &l, 4); }
         return 0;
@@ -309,6 +330,10 @@ int64_t lx_syscall_more(struct lx_task *t, uint64_t nr, uint64_t a0, uint64_t a1
     case 157: return 0;                                                             // prctl: PR_SET_NAME and friends
     case 100: { uint64_t tms[4] = { 0, 0, 0, 0 }; if (a0 && lx_copy_out(t, a0, tms, 32)) return -LX_EFAULT; return (int64_t)(lx_now_ms() / 10); }   // times
     case 139: return -LX_ENOSYS;                                                    // sysfs
+    case 222: case 223: case 224: case 225: case 226: {                             // timer_create .. timer_delete
+        extern int64_t lx_sys_ptimer(struct lx_task *t, uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3);
+        return lx_sys_ptimer(t, nr, a0, a1, a2, a3);
+    }
     case 27: { // mincore: every mapped page counts as resident, an unmapped one is ENOMEM (libsigsegv walks the stack with this)
         if (a0 & 0xFFF) return -LX_EINVAL;
         uint64_t pages = (a1 + 0xFFF) >> 12;

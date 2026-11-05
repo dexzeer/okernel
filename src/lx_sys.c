@@ -16,6 +16,7 @@ extern int lx_has_child(struct lx_task *p, int pid);
 extern struct lx_task *lx_find_zombie_child(struct lx_task *p, int pid);
 extern uint64_t lx_now_ns(void);
 extern int lx_tty_read_ready(struct lx_task *t);
+extern int lx_tty_read_returns(struct lx_task *t);
 extern int lx_tty_read(struct lx_task *t, uint8_t *buf, uint32_t len);
 extern void lx_tty_write(struct lx_task *t, const uint8_t *buf, uint32_t len);
 extern int lx_tty_ioctl(struct lx_task *t, uint64_t req, uint64_t arg);
@@ -114,7 +115,7 @@ static int64_t file_read(struct lx_task *t, struct lx_file *f, uint64_t uaddr, u
     case LXF_TTY: {
         if ((f->flags & LX_O_ACCMODE) == LX_O_WRONLY) return -LX_EBADF;
         if (!len) return 0;
-        if (!lx_tty_read_ready(t)) {
+        if (!lx_tty_read_returns(t)) {
             if (f->flags & LX_O_NONBLOCK) return -LX_EAGAIN;
             extern int lx_tty_wake(struct lx_task*);
             lx_block(t, lx_tty_wake, 0);
@@ -191,7 +192,7 @@ static int64_t file_read(struct lx_task *t, struct lx_file *f, uint64_t uaddr, u
             }
             if (dev == LXDEV_TTY || dev == LXDEV_CONSOLE) {
                 if (!len) return 0;
-                if (!lx_tty_read_ready(t)) {
+                if (!lx_tty_read_returns(t)) {
                     if (f->flags & LX_O_NONBLOCK) return -LX_EAGAIN;
                     extern int lx_tty_wake(struct lx_task*);
                     lx_block(t, lx_tty_wake, 0);
@@ -511,6 +512,9 @@ static int futex_ready(struct lx_task *t) {
 }
 
 static int sig_wait_ready(struct lx_task *t) { return (t->sig_pending & ~t->sig_blocked) != 0; }
+static int sigwait_ready(struct lx_task *t) {
+    return (t->sig_pending & (t->block_arg | ~t->sig_blocked)) != 0 || (t->wake_ms && lx_now_ms() >= (int64_t)t->wake_ms);
+}
 
 static int vfork_ready(struct lx_task *t) {
     struct lx_task *c = 0;
@@ -906,6 +910,37 @@ int64_t lx_syscall_dispatch(struct lx_task *t) {
         lx_block(t, sig_wait_ready, 0);
         t->block_complete = 1;
         return -LX_EINTR;
+    }
+    case 128: { // rt_sigtimedwait(set, info, timeout, size): re-run after each wake-up, like every blocking call
+        uint64_t set;
+        if (lx_copy_in(t, &set, a0, 8)) return -LX_EFAULT;
+        uint64_t hit = t->sig_pending & set;
+        if (hit) {
+            int sig = 1;
+            while (!(hit & (1ull << (sig - 1)))) sig++;
+            t->sig_pending &= ~(1ull << (sig - 1));
+            t->wake_ms = 0;
+            if (a1) {
+                uint8_t si[128];
+                memset(si, 0, sizeof si);
+                memcpy(si, &sig, 4);
+                { extern void lx_ptimer_siginfo(struct lx_task *t, int sig, uint8_t *si); lx_ptimer_siginfo(t, sig, si); }
+                if (lx_copy_out(t, a1, si, sizeof si)) return -LX_EFAULT;
+            }
+            return sig;
+        }
+        if (t->sig_pending & ~t->sig_blocked) { t->wake_ms = 0; return -LX_EINTR; }
+        if (t->wake_ms == 0 && a2) {
+            struct lx_timespec ts;
+            if (lx_copy_in(t, &ts, a2, sizeof ts)) return -LX_EFAULT;
+            if (ts.sec < 0 || ts.nsec < 0 || ts.nsec >= 1000000000) return -LX_EINVAL;
+            int64_t ms = ts.sec * 1000 + (ts.nsec + 999999) / 1000000;
+            if (ms == 0) return -LX_EAGAIN;
+            t->wake_ms = (uint64_t)(lx_now_ms() + ms);
+        }
+        if (t->wake_ms && lx_now_ms() >= (int64_t)t->wake_ms) { t->wake_ms = 0; return -LX_EAGAIN; }
+        lx_block(t, sigwait_ready, set);
+        return 0;
     }
     case 130: { // rt_sigsuspend(mask, size)
         uint64_t m;

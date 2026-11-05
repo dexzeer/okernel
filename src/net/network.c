@@ -14,6 +14,7 @@
 static uint8_t our_ip[4] = {10, 0, 2, 15};    // QEMU user-mode default
 static uint8_t gateway_ip[4] = {10, 0, 2, 2};  // QEMU user-mode gateway
 static uint8_t dns_server_ip[4] = {10, 0, 2, 3}; // QEMU SLIRP DNS
+void net_dns_server(uint8_t out[4]) { for (int i = 0; i < 4; i++) out[i] = dns_server_ip[i]; }
 static uint8_t netmask[4] = {255, 255, 255, 0};
 static uint8_t broadcast_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 

@@ -1057,3 +1057,139 @@ void window_set_title(int id, const char* title) {
     window_mark_all(&windows[id]);
 }
 
+// ---- terminal emulation support (lx_tty.c) --------------------------------------------------------------------
+
+static void term_blank(struct window* w, int idx, uint32_t fg, uint32_t bg) {
+    uint8_t color = (uint8_t)(((window_rgb_is_light(bg) ? 15 : 0) << 4) | (window_rgb_is_light(fg) ? 15 : 0));
+    w->content[idx] = (uint16_t)((uint16_t)color << 8) | ' ';
+    w->cell_fg[idx] = fg;
+    w->cell_bg[idx] = bg;
+    if (w->cell_attr) w->cell_attr[idx] = 0;
+}
+
+static void term_copy_cell(struct window* w, int dst, int src) {
+    w->content[dst] = w->content[src];
+    w->cell_fg[dst] = w->cell_fg[src];
+    w->cell_bg[dst] = w->cell_bg[src];
+    if (w->cell_attr) w->cell_attr[dst] = w->cell_attr[src];
+}
+
+char window_term_char(int id, int row, int col) {
+    return (char)(windows[id].content[row * CONTENT_COLS_MAX + col] & 0xFF);
+}
+
+void window_term_move(int id, int row, int col) {
+    struct window* w = &windows[id];
+    if (row < 0) row = 0;
+    if (row >= w->content_h) row = w->content_h - 1;
+    if (col < 0) col = 0;
+    if (col >= w->content_w) col = w->content_w - 1;
+    if (w->scroll_off) { w->scroll_off = 0; w->dirty = 0; window_mark_all(w); }   // new output: follow the tail again
+    window_mark_cell(w, w->cursor_y, w->cursor_x);
+    window_mark_cell(w, row, col);
+    w->cursor_x = col;
+    w->cursor_y = row;
+    w->dirty = 1;
+}
+
+void window_term_fill(int id, int row, int c0, int c1, uint32_t fg, uint32_t bg) {
+    struct window* w = &windows[id];
+    if (row < 0 || row >= w->content_h) return;
+    if (c0 < 0) c0 = 0;
+    if (c1 > w->content_w) c1 = w->content_w;
+    if (c0 >= c1) return;
+    for (int c = c0; c < c1; c++) term_blank(w, row * CONTENT_COLS_MAX + c, fg, bg);
+    window_mark_cell(w, row, c0);
+    window_mark_cell(w, row, c1 - 1);
+    w->dirty = 1;
+}
+
+void window_term_shift(int id, int row, int col, int n, uint32_t fg, uint32_t bg) {
+    struct window* w = &windows[id];
+    if (row < 0 || row >= w->content_h || col < 0 || col >= w->content_w || n == 0) return;
+    int base = row * CONTENT_COLS_MAX, end = w->content_w;
+    if (n > 0) {
+        if (n > end - col) n = end - col;
+        for (int c = end - 1; c >= col + n; c--) term_copy_cell(w, base + c, base + c - n);
+        for (int c = col; c < col + n; c++) term_blank(w, base + c, fg, bg);
+    } else {
+        n = -n;
+        if (n > end - col) n = end - col;
+        for (int c = col; c < end - n; c++) term_copy_cell(w, base + c, base + c + n);
+        for (int c = end - n; c < end; c++) term_blank(w, base + c, fg, bg);
+    }
+    window_mark_cell(w, row, col);
+    window_mark_cell(w, row, end - 1);
+    w->dirty = 1;
+}
+
+void window_term_scroll(int id, int top, int bot, int n, uint32_t fg, uint32_t bg, int archive) {
+    struct window* w = &windows[id];
+    if (top < 0) top = 0;
+    if (bot >= w->content_h) bot = w->content_h - 1;
+    if (top > bot || n == 0) return;
+    int span = bot - top + 1, up = n > 0;
+    int k = up ? n : -n;
+    if (k > span) k = span;
+    if (archive && up) {
+        for (int r = 0; r < k; r++) {
+            for (int col = 0; col < w->content_w; col++)
+                sb_ring[id][sb_next[id]][col] = w->content[(top + r) * CONTENT_COLS_MAX + col];
+            sb_next[id] = (sb_next[id] + 1) % SB_ROWS;
+            if (sb_count[id] < SB_ROWS) sb_count[id]++;
+        }
+        w->scroll_off = 0;
+    }
+    if (up) {
+        for (int r = top; r <= bot - k; r++)
+            for (int c = 0; c < w->content_w; c++) term_copy_cell(w, r * CONTENT_COLS_MAX + c, (r + k) * CONTENT_COLS_MAX + c);
+        for (int r = bot - k + 1; r <= bot; r++)
+            for (int c = 0; c < w->content_w; c++) term_blank(w, r * CONTENT_COLS_MAX + c, fg, bg);
+    } else {
+        for (int r = bot; r >= top + k; r--)
+            for (int c = 0; c < w->content_w; c++) term_copy_cell(w, r * CONTENT_COLS_MAX + c, (r - k) * CONTENT_COLS_MAX + c);
+        for (int r = top; r < top + k; r++)
+            for (int c = 0; c < w->content_w; c++) term_blank(w, r * CONTENT_COLS_MAX + c, fg, bg);
+    }
+    w->dirty = 1;
+    window_mark_all(w);
+}
+
+struct term_saved { int w, h; uint16_t* content; uint32_t* fg; uint32_t* bg; uint8_t* attr; };
+
+void* window_term_save(int id) {
+    struct window* w = &windows[id];
+    size_t cells = (size_t)w->content_w * (size_t)w->content_h;
+    struct term_saved* s = (struct term_saved*)kmalloc(sizeof *s + cells * 11);
+    if (!s) return 0;
+    s->w = w->content_w; s->h = w->content_h;
+    s->fg = (uint32_t*)(s + 1);
+    s->bg = s->fg + cells;
+    s->content = (uint16_t*)(s->bg + cells);
+    s->attr = (uint8_t*)(s->content + cells);
+    size_t i = 0;
+    for (int r = 0; r < s->h; r++)
+        for (int c = 0; c < s->w; c++, i++) {
+            int k = r * CONTENT_COLS_MAX + c;
+            s->content[i] = w->content[k]; s->fg[i] = w->cell_fg[k]; s->bg[i] = w->cell_bg[k];
+            s->attr[i] = w->cell_attr ? w->cell_attr[k] : 0;
+        }
+    return s;
+}
+
+void window_term_restore(int id, void* saved) {
+    struct window* w = &windows[id];
+    struct term_saved* s = (struct term_saved*)saved;
+    for (int r = 0; r < w->content_h; r++)
+        for (int c = 0; c < w->content_w; c++) {
+            int k = r * CONTENT_COLS_MAX + c;
+            if (r < s->h && c < s->w) {
+                size_t i = (size_t)r * (size_t)s->w + (size_t)c;
+                w->content[k] = s->content[i]; w->cell_fg[k] = s->fg[i]; w->cell_bg[k] = s->bg[i];
+                if (w->cell_attr) w->cell_attr[k] = s->attr[i];
+            } else cell_blank(w, k);                  // the window grew while the program ran
+        }
+    kfree(s);
+    w->dirty = 1;
+    window_mark_all(w);
+}

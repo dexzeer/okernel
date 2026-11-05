@@ -298,13 +298,47 @@ EXPORT BOOL VerifyVersionInfoW(OSVERSIONINFOW *want, DWORD type, ULONGLONG mask)
     return FALSE;
 }
 
-// ---- version.dll: no program here has a version resource we would read --------------------------------------
+// ---- version.dll: every file answers with the version GetVersionEx reports ------------------------------------
+// Programs ask this about system files to learn the Windows version. Our DLLs carry no version resource, so the block
+// is made up here, with only the fixed part: asking for a string in it fails as for any file without that string.
 
-EXPORT DWORD GetFileVersionInfoSizeExW(DWORD f, LPCWSTR n, DWORD *h) { (void)f; (void)n; if (h) *h = 0; SetLastError(1813); return 0; }
+#define VS_BLOCK_SIZE 92                     // header 6 + "VS_VERSION_INFO" 32 + pad 2 + VS_FIXEDFILEINFO 52
+#define VS_FIXED_OFF 40
+EXPORT DWORD GetFileVersionInfoSizeExW(DWORD f, LPCWSTR n, DWORD *h) {
+    (void)f;
+    if (h) *h = 0;
+    if (GetFileAttributesW(n) == 0xFFFFFFFF) { SetLastError(2); return 0; }
+    return VS_BLOCK_SIZE;
+}
 EXPORT DWORD GetFileVersionInfoSizeW(LPCWSTR n, DWORD *h) { return GetFileVersionInfoSizeExW(0, n, h); }
-EXPORT BOOL GetFileVersionInfoExW(DWORD f, LPCWSTR n, DWORD h, DWORD l, void *d) { (void)f; (void)n; (void)h; (void)l; (void)d; SetLastError(1813); return FALSE; }
+EXPORT BOOL GetFileVersionInfoExW(DWORD f, LPCWSTR n, DWORD h, DWORD l, void *d) {
+    (void)f; (void)h;
+    if (l < VS_BLOCK_SIZE) { SetLastError(122); return FALSE; }      // ERROR_INSUFFICIENT_BUFFER
+    if (GetFileAttributesW(n) == 0xFFFFFFFF) { SetLastError(2); return FALSE; }
+    unsigned char *b = (unsigned char*)d;
+    for (int i = 0; i < VS_BLOCK_SIZE; i++) b[i] = 0;
+    *(WORD*)b = VS_BLOCK_SIZE; *(WORD*)(b + 2) = 52;                 // wLength, wValueLength; wType 0 = binary
+    static const char key[] = "VS_VERSION_INFO";
+    for (int i = 0; key[i]; i++) ((WCHAR*)(b + 6))[i] = (WCHAR)key[i];
+    DWORD *v = (DWORD*)(b + VS_FIXED_OFF);
+    v[0] = 0xFEEF04BD; v[1] = 0x00010000;                            // signature, struct version
+    v[2] = v[4] = 0x000A0000;                                        // file and product version 10.0.19045.0
+    v[3] = v[5] = 0x4A650000;
+    v[6] = 0x3F;                                                     // flags mask; flags 0
+    v[8] = 0x00040004;                                               // VOS_NT_WINDOWS32
+    v[9] = 1;                                                        // VFT_APP
+    return TRUE;
+}
 EXPORT BOOL GetFileVersionInfoW(LPCWSTR n, DWORD h, DWORD l, void *d) { return GetFileVersionInfoExW(0, n, h, l, d); }
-EXPORT BOOL VerQueryValueW(const void *b, LPCWSTR s, void **o, UINT *l) { (void)b; (void)s; (void)o; if (l) *l = 0; return FALSE; }
+EXPORT BOOL VerQueryValueW(const void *b, LPCWSTR s, void **o, UINT *l) {
+    if (s && s[0] == '\\' && s[1] == 0) {
+        if (o) *o = (unsigned char*)b + VS_FIXED_OFF;
+        if (l) *l = 52;
+        return TRUE;
+    }
+    if (l) *l = 0;
+    return FALSE;
+}
 
 // ---- small pieces of ntdll and shlwapi ------------------------------------------------------------------------
 
