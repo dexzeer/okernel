@@ -248,18 +248,20 @@ int tls_canon_host(char out[64], const char* in);
 // iff all entries canonicalize to themselves. Host-test entry point.
 int tls_preload_selfcheck(void);
 
-// ---- Trust-On-First-Use leaf pinning ----
-// Memory-only pin store (lost on reboot): hostname → verified leaf SPKI
-// hash. First verified visit stores; later visits with a DIFFERENT leaf key
-// fail closed (possible MITM with a rogue-but-valid cert, or a legitimate
-// rotation — indistinguishable without an override UX, which doesn't exist
-// yet; rotations are rare and the lockout ends at reboot).
+// ---- Trust-On-First-Use pinning ----
+// Pin store (kept across reboots in /.pins): hostname → SPKI hash of the CA
+// that issued the verified leaf, or of the leaf itself when the flight proves
+// no issuer. A renewal under the same CA passes, whatever its new key. A chain
+// from a DIFFERENT CA fails closed (a rogue-but-valid cert, or the site really
+// moved: indistinguishable, and there is no override UX yet, so that host stays
+// locked until 8 newer hosts evict its pin).
 // Preloaded hosts (compiled table in tls_client.c): first visit MUST match
 // (-2 below) — narrows the TOFU first-visit window for high-value hosts.
 // Returns 0 (first-seen stored, or match), -1 (changed — old pin kept, so
 // every visit warns until reboot/re-pin window), -2 (preload mismatch).
 // Test hook: tls_pin_clear() drops all pins.
-int tls_pin_check(const char* host, const uint8_t spki_hash[32]);
+int tls_pin_check_chain(const char* host, const uint8_t leaf_hash[32], const uint8_t* issuer_hash);
+int tls_pin_check(const char* host, const uint8_t spki_hash[32]);   // no issuer known
 void tls_pin_clear(void);
 // Persistence (desktop serializes to VFS `/.pins` on change, loads at
 // boot; network-attacker threat model — see tls_client.c).

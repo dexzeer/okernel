@@ -2146,10 +2146,37 @@ static void pin_section(void) {
             for (int i = 0; leg[i]; i++) raw[i] = (uint8_t)leg[i];
             for (int i = 0; i < 32; i++) raw[64 + i] = hB[i];
             blob[0]='O'; blob[1]='K'; blob[2]='P'; blob[3]='I';
-            blob[4]='N'; blob[5]='1'; blob[6]=1; blob[7]=1;
+            blob[4]='N'; blob[5]='1'; blob[6]=2; blob[7]=1;
             for (int i = 0; i < 64 + 32; i++) blob[8 + i] = raw[i];
             CHECK(tls_pin_import(blob, 8 + 64 + 32) == 0, "import normalizes legacy case");
             CHECK(tls_pin_check("d.example.com", hB) == 0, "normalized import matches canonical");
+            tls_pin_clear();
+            blob[6] = 1;
+            CHECK(tls_pin_import(blob, 8 + 64 + 32) != 0, "a version 1 store (leaf keys) is dropped");
+            tls_pin_clear();
+        }
+        // Pins follow the issuing CA: renewals pass, another CA does not.
+        {
+            uint8_t i1[32], i2[32];
+            for (int i = 0; i < 32; i++) { i1[i] = (uint8_t)(0xC0 + i); i2[i] = (uint8_t)(0x20 + i); }
+            CHECK(tls_pin_check_chain("e.example.com", hA, i1) == 0, "chain: first visit stores the issuer");
+            CHECK(tls_pin_check_chain("e.example.com", hB, i1) == 0, "chain: renewal with a new key under the same CA");
+            CHECK(tls_pin_check_chain("e.example.com", hB, i2) == -1, "chain: same key, another CA refused");
+            CHECK(tls_pin_check_chain("e.example.com", hA, i2) == -1, "chain: old key, another CA refused");
+            CHECK(tls_pin_check("e.example.com", hB) == -1, "chain: no provable issuer cannot pass as a renewal");
+            CHECK(tls_pin_check("f.example.com", hA) == 0, "chain: leaf pin without an issuer");
+            CHECK(tls_pin_check("f.example.com", hB) == -1, "chain: which then behaves like a leaf pin");
+            CHECK(tls_pin_check_chain("f.example.com", hA, i1) == 0, "chain: same leaf, issuer now provable");
+            CHECK(tls_pin_check_chain("f.example.com", hB, i1) == 0, "chain: the pin moved to the issuer");
+            tls_pin_clear();
+            // A preloaded host matches on the CA's key, not any leaf's.
+            static const uint8_t gh[32] = {
+                0x65,0x26,0xa0,0xbc,0x3c,0xe3,0x96,0xd2,0xe4,0x7b,0x05,0xc4,0x06,0xe0,0xf1,0x23,
+                0x3a,0x56,0xfd,0xda,0x55,0xc3,0x52,0x6e,0xbe,0xf9,0x9d,0xd2,0x18,0x64,0xcd,0xd6 };
+            CHECK(tls_pin_check_chain("github.com", hA, i1) == -2, "preload: another CA refused");
+            CHECK(tls_pin_check("github.com", hA) == -2, "preload: no provable issuer refused");
+            CHECK(tls_pin_check_chain("github.com", hA, gh) == 0, "preload: any leaf under the pinned CA");
+            CHECK(tls_pin_check_chain("github.com", hB, gh) == 0, "preload: its next renewal too");
             tls_pin_clear();
         }
     }

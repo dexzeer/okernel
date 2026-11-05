@@ -447,40 +447,38 @@ void tls_pin_clear(void) {
 }
 
 // ---- Preloaded first-visit pins (cryptoholes follow-up — nano-HPKP) ----
-// Curated (hostname, SPKI-hash) pairs for high-value hosts. On the FIRST
-// verified visit (no dynamic pin yet), the leaf MUST match — a mismatch
+// Curated (hostname, SPKI-hash) pairs for high-value hosts. The hash is the
+// key of the CA that issues the host's certificates, NOT the leaf's: leaf keys
+// change with every renewal (two of these three hosts were locked out that way
+// within two months of being pinned). A fixture may still pin a leaf. On the
+// FIRST verified visit (no dynamic pin yet) it MUST match — a mismatch
 // fails closed (CV_ERR_PRELOAD, returns -2 below). Later visits use the
 // normal dynamic TOFU pin (seeded by the verified first visit).
 // Contract notes (read before touching):
 // - EXACT hostname match only (no suffix/wildcard scope — surprises kill).
 // - NO expiry: expiry would silently unprotect (worse than a loud brick).
-//   Rotation bricks the host to the warning page until the pin is updated
-//   here — same UX as key-change alarms, and pins clear on reboot is NOT
-//   available for these (compiled in). Acceptable because the set is
-//   tiny, curated, and updated with the tree (same cadence as roots.c).
-// - Rotation procedure: run tools/gen_preload.py HOST (fetches the live
-//   SPKI hash AND prints the C snippet — NEVER hand-type hashes; a
+//   A host moving to another CA is bricked to the warning page until the
+//   pin is updated here. Acceptable because the set is tiny, curated, and
+//   updated with the tree (same cadence as roots.c).
+// - Update procedure: run tools/gen_preload.py HOST (fetches the live
+//   issuer's SPKI hash AND prints the C snippet — NEVER hand-type hashes; a
 //   transcription slip bricked a host in testing, bisected 2026-09-12).
 //   VERIFY with a live fetch before committing (a wrong pin bricks the
 //   host — the hash pipeline must match our SPKI view byte-exactly,
 //   validated once via test hook below).
-// - Multi-key frontends: only list hosts verified to serve ONE leaf key
-//   (or accept alarms on rotation). Never list a host you haven't checked.
+// - Only list hosts verified to serve ONE issuer. Never list a host you
+//   haven't checked.
 struct preload_pin { const char* host; uint8_t hash[32]; };
 static const struct preload_pin preload_pins[] = {
-    // github.com (Sectigo E36, 90-day certs — verify quarterly).
-    // SPKI 2026-09-12: ff088be6...
-    { "github.com", { 0xff,0x08,0x8b,0xe6,0xf8,0x0e,0x2e,0x0c,0x04,0x0f,0x8d,0x56,0x4b,0x40,0xcd,0x17,
-                      0xc4,0x22,0x4c,0x15,0x51,0xfc,0xfe,0x35,0x29,0xdd,0x7a,0xde,0xd9,0x85,0xc4,0xad } },
-    // cloudflare.com (Google WE1, 90-day certs — verify quarterly).
-    // SPKI 2026-09-12: 7708e62c...
-    { "cloudflare.com", { 0x77,0x08,0xe6,0x2c,0x2d,0x16,0x39,0x63,0x4c,0xc0,0x93,0xcc,0x1e,0x2e,0xbb,0x19,
-                      0x80,0xe7,0xad,0x00,0xeb,0x2e,0x4e,0x5c,0x15,0x59,0x66,0x7a,0xeb,0x6c,0x18,0x2b } },
-    // www.ssl.com (own CA vendor hierarchy — anchors to our embedded RSA
-    // root; doubles as the live end-to-end check of roots+preload).
-    // SPKI 2026-09-12: c36cb888...
-    { "www.ssl.com", { 0xc3,0x6c,0xb8,0x88,0x4c,0xbb,0x34,0xbb,0x6d,0x9a,0xe3,0xa4,0x24,0xec,0x1f,0x59,
-                      0xbd,0x99,0x94,0x3e,0xa8,0xa2,0x5e,0x7a,0x7a,0x7d,0x67,0x10,0x3d,0xb8,0xde,0x27 } },
+    // github.com: Sectigo Public Server Authentication CA DV E36 (2026-11-05)
+    { "github.com", { 0x65,0x26,0xa0,0xbc,0x3c,0xe3,0x96,0xd2,0xe4,0x7b,0x05,0xc4,0x06,0xe0,0xf1,0x23,
+                      0x3a,0x56,0xfd,0xda,0x55,0xc3,0x52,0x6e,0xbe,0xf9,0x9d,0xd2,0x18,0x64,0xcd,0xd6 } },
+    // cloudflare.com: Google Trust Services WE1 (2026-11-05)
+    { "cloudflare.com", { 0x90,0x87,0x69,0xe8,0xd3,0x44,0x77,0xcc,0x2c,0xba,0x06,0x32,0xc8,0x86,0x05,0xb2,
+                      0x2d,0x72,0x94,0xc0,0x84,0x0f,0x78,0x59,0x6d,0x24,0x7c,0x64,0x5b,0x1a,0xfc,0x0e } },
+    // www.ssl.com: SSL.com TLS Issuing RSA CA R1, anchors to our embedded RSA root (2026-11-05)
+    { "www.ssl.com", { 0xd0,0x52,0x81,0x57,0x19,0xf2,0x77,0x82,0x6a,0xf2,0xff,0x12,0x4f,0xed,0xec,0x8c,
+                      0xef,0x96,0xa0,0x1e,0xcf,0x2c,0x11,0x29,0x49,0xd8,0xb1,0x6c,0x71,0x35,0x2f,0x88 } },
 #ifndef KERNEL
     // Suite fixture (host tests only): at_leaf's key for a test hostname.
     // SPKI d2ce9d30... (verified byte-exact vs our parser).
@@ -503,7 +501,9 @@ int tls_preload_selfcheck(void) {
 
 // ---- Pin persistence (P2: TOFU pins survive reboot via VFS) ----
 // Wire format: "OKPIN1"(6) || version u8 (1) || count u8 (<=8) ||
-// entries of host[64] + spki_hash[32]. The desktop serializes on change
+// entries of host[64] + spki_hash[32]. Version 1 held leaf keys, which would
+// all read as "changed" at their next renewal: those files are dropped, and
+// the sites pin again. The desktop serializes on change
 // and loads at boot (see desktop.c); the threat model is network-only
 // attackers (disk-write attackers already own VFS + kernel — persistence
 // buys nothing against them, and claims nothing more).
@@ -518,7 +518,7 @@ uint32_t tls_pin_export(uint8_t* out, uint32_t cap) {
         if (pin_slots[i].used) n++;
     if (cap < 8 + n * (64 + 32)) return 0;
     out[0] = 'O'; out[1] = 'K'; out[2] = 'P'; out[3] = 'I'; out[4] = 'N';
-    out[5] = '1'; out[6] = 1; out[7] = (uint8_t)n;
+    out[5] = '1'; out[6] = 2; out[7] = (uint8_t)n;
     uint32_t p = 8;
     for (int i = 0; i < TLS_PIN_SLOTS; i++) {
         if (!pin_slots[i].used) continue;
@@ -531,7 +531,7 @@ uint32_t tls_pin_export(uint8_t* out, uint32_t cap) {
 int tls_pin_import(const uint8_t* in, uint32_t len) {
     if (!in || len < 8) return -1;
     if (in[0] != 'O' || in[1] != 'K' || in[2] != 'P' || in[3] != 'I' ||
-        in[4] != 'N' || in[5] != '1' || in[6] != 1)
+        in[4] != 'N' || in[5] != '1' || in[6] != 2)
         return -1;
     uint32_t n = in[7];
     if (n > TLS_PIN_SLOTS || 8 + n * (64 + 32) != len) return -1;
@@ -563,8 +563,14 @@ int tls_pin_import(const uint8_t* in, uint32_t len) {
     return 0;
 }
 
-int tls_pin_check(const char* host, const uint8_t spki_hash[32]) {
-    if (!host || !host[0] || !spki_hash) return -1;
+static int pin_eq(const uint8_t* a, const uint8_t* b) {
+    uint8_t diff = 0;
+    for (int j = 0; j < 32; j++) diff |= a[j] ^ b[j];
+    return diff == 0;
+}
+
+int tls_pin_check_chain(const char* host, const uint8_t leaf_hash[32], const uint8_t* issuer_hash) {
+    if (!host || !host[0] || !leaf_hash) return -1;
     // Canonicalize at the boundary: "GITHUB.COM" must hit the same slot
     // as "github.com" (cryptoholes round 4, P0). Invalid → refuse.
     char chost[64];
@@ -572,31 +578,31 @@ int tls_pin_check(const char* host, const uint8_t spki_hash[32]) {
     for (int i = 0; i < TLS_PIN_SLOTS; i++) {
         if (!pin_slots[i].used) continue;
         if (!ticket_host_eq(pin_slots[i].host, chost)) continue;
-        uint8_t diff = 0;
-        for (int j = 0; j < 32; j++) diff |= pin_slots[i].spki_hash[j] ^ spki_hash[j];
-        if (diff == 0) return 0; // match: same key as first visit
-        tls_dbg("[tls] PIN CHANGED for %s (possible MITM or rotation)\n", chost);
-        return -1; // changed: old pin kept (warns every visit till reboot)
+        int m_leaf = pin_eq(pin_slots[i].spki_hash, leaf_hash);
+        int m_issuer = issuer_hash && pin_eq(pin_slots[i].spki_hash, issuer_hash);
+        if (m_leaf || m_issuer) {
+            if (issuer_hash && !m_issuer) {   // pinned without a chain, now we have one
+                memcpy(pin_slots[i].spki_hash, issuer_hash, 32);
+                pin_dirty_flag = 1;
+            }
+            return 0;
+        }
+        tls_dbg("[tls] PIN CHANGED for %s (possible MITM, or a new CA)\n", chost);
+        return -1; // changed: old pin kept (warns every visit until it is evicted)
     }
     // No dynamic pin yet: consult the preload table (canonical hostnames —
     // self-checked by tls_preload_selfcheck in host tests).
     // A preloaded host MUST match on first visit (-2 = preload mismatch,
     // distinct from key-change so the UI can name it). Non-preloaded
     // hosts fall through to first-visit store below (plain TOFU).
-    {
-        for (unsigned i = 0;
-             i < sizeof(preload_pins) / sizeof(preload_pins[0]); i++) {
-            if (!ticket_host_eq(chost, preload_pins[i].host)) continue;
-            uint8_t diff = 0;
-            for (int j = 0; j < 32; j++)
-                diff |= preload_pins[i].hash[j] ^ spki_hash[j];
-            if (diff != 0) {
-                tls_dbg("[tls] PRELOAD pin mismatch for %s (possible MITM)\n",
-                        chost);
-                return -2;
-            }
-            break; // matched: store below like any first visit
+    for (unsigned i = 0; i < sizeof(preload_pins) / sizeof(preload_pins[0]); i++) {
+        if (!ticket_host_eq(chost, preload_pins[i].host)) continue;
+        if (!pin_eq(preload_pins[i].hash, leaf_hash) &&
+            !(issuer_hash && pin_eq(preload_pins[i].hash, issuer_hash))) {
+            tls_dbg("[tls] PRELOAD pin mismatch for %s (possible MITM)\n", chost);
+            return -2;
         }
+        break; // matched: store below like any first visit
     }
     // First verified visit: store. Past capacity, evict the OLDEST pin
     // (lowest insertion seq — review #35: the old code always overwrote
@@ -610,11 +616,15 @@ int tls_pin_check(const char* host, const uint8_t spki_hash[32]) {
             if (pin_slots[i].seq < pin_slots[slot].seq) slot = i;
     }
     ticket_host_copy(pin_slots[slot].host, chost);
-    memcpy(pin_slots[slot].spki_hash, spki_hash, 32);
+    memcpy(pin_slots[slot].spki_hash, issuer_hash ? issuer_hash : leaf_hash, 32);
     pin_slots[slot].seq = ++pin_seq;
     pin_slots[slot].used = 1;
     pin_dirty_flag = 1; // desktop persists on change
     return 0;
+}
+
+int tls_pin_check(const char* host, const uint8_t spki_hash[32]) {
+    return tls_pin_check_chain(host, spki_hash, 0);
 }
 
 // Store (or replace) `host`'s ticket. Caps lengths; oversized tickets are
@@ -1046,21 +1056,38 @@ static int auth_chain(struct tls_state* st, x509_cert* leaf) {
     return 0;
 }
 
-// After the proof of possession: the leaf pin and the OCSP staple.
+// The flight's second certificate, once PROVEN to be the leaf's issuer: its
+// name matches and its key verifies the leaf's signature. When the leaf anchors
+// directly on a store root, cert_verify never looked at entry 1, so an attacker
+// could append anything there. 0 or -1 (no proof: treat it as absent).
+static int proven_issuer(const struct tls_state* st, const x509_cert* leaf, x509_cert* issuer) {
+    if (cert_issuer(st->cert_body, st->cert_bl, issuer) != 0 ||
+        issuer->subject.len != leaf->issuer.len ||
+        memcmp(issuer->subject.p, leaf->issuer.p, leaf->issuer.len) != 0 ||
+        cert_sig_verify(leaf->sig_alg, issuer, leaf->tbs.p, leaf->tbs.len,
+                        leaf->signature.p, leaf->signature.len) != 0)
+        return -1;
+    return 0;
+}
+
+// After the proof of possession: the pin and the OCSP staple.
 static int auth_pin_staple(struct tls_state* st, const x509_cert* leaf) {
-    // TOFU leaf pin (see tls_client.h): first verified visit stores
-    // the leaf SPKI hash; a later DIFFERENT key fails closed here
-    // (no fallback — same gate as every CERT failure). Pin against
-    // the verified identity (host-only verify_host override in tests).
+    // TOFU pin (see tls_client.h): the first verified visit stores the key of
+    // the issuing CA; a later chain from a DIFFERENT CA fails closed here (no
+    // fallback — same gate as every CERT failure). Pin against the verified
+    // identity (host-only verify_host override in tests).
+    x509_cert issuer;
+    int have_issuer = proven_issuer(st, leaf, &issuer) == 0;
     {
 #ifdef KERNEL
         const char* phost = st->host;
 #else
         const char* phost = st->verify_host ? st->verify_host : st->host;
 #endif
-        uint8_t ph[32];
+        uint8_t ph[32], ih[32];
         sha256(leaf->spki.p, leaf->spki.len, ph);
-        int prc = tls_pin_check(phost, ph);
+        if (have_issuer) sha256(issuer.spki.p, issuer.spki.len, ih);
+        int prc = tls_pin_check_chain(phost, ph, have_issuer ? ih : 0);
         if (prc != 0) {
             st->fail_reason = TLS_FAIL_CERT;
             st->cert_detail = (prc == -2) ? CV_ERR_PRELOAD
@@ -1086,21 +1113,12 @@ static int auth_pin_staple(struct tls_state* st, const x509_cert* leaf) {
     }
     // Absent staple: soft-fail proceed (documented model).
     if (st->got_staple) {
-        x509_cert issuer;
         int ocsp_rc;
-        // The staple is checked against the flight's second cert —
-        // which must be PROVEN to be the leaf's issuer here. When
-        // the leaf anchors directly on a store root, cert_verify
-        // never looked at entry 1: an attacker holding a revoked
-        // Must-Staple leaf could append a cert of its own plus a
-        // "good" response signed by it, and the certID/signature
-        // checks would all pass against that stand-in. Unprovable
-        // issuer = unverifiable staple (soft-fail unless Must-Staple).
-        if (cert_issuer(st->cert_body, st->cert_bl, &issuer) != 0 ||
-            issuer.subject.len != leaf->issuer.len ||
-            memcmp(issuer.subject.p, leaf->issuer.p, leaf->issuer.len) != 0 ||
-            cert_sig_verify(leaf->sig_alg, &issuer, leaf->tbs.p, leaf->tbs.len,
-                            leaf->signature.p, leaf->signature.len) != 0) {
+        // The staple is checked against the proven issuer: without one an attacker
+        // holding a revoked Must-Staple leaf could append a cert of its own plus a
+        // "good" response signed by it. Unprovable issuer = unverifiable staple
+        // (soft-fail unless Must-Staple).
+        if (!have_issuer) {
             tls_dbg("[tls] staple: flight has no verifiable leaf issuer\n");
             ocsp_rc = OCSP_ERR_RESPONDER;
         } else {

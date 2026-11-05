@@ -1972,7 +1972,7 @@ void kernel_main(uint32_t mboot_phys) {
     else pfs_init(); // ATA disk + mount-or-format (diskless = VFS-only, safe)
     userland_seed(); // /bin/* + /sbin/init from embedded ELFs (skips present)
     lx_init();       // Linux subsystem: root file system (boot module tar), SYSCALL setup
-    // TOFU pin persistence (P2): reload last boot's verified leaf pins so
+    // TOFU pin persistence (P2): reload last boot's verified pins so
     // a reboot doesn't re-open the first-visit window to a network-only
     // attacker. Malformed files are ignored (fail-open to empty store =
     // plain TOFU, never a wedge).
