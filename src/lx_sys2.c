@@ -309,6 +309,53 @@ int64_t lx_syscall_more(struct lx_task *t, uint64_t nr, uint64_t a0, uint64_t a1
     case 157: return 0;                                                             // prctl: PR_SET_NAME and friends
     case 100: { uint64_t tms[4] = { 0, 0, 0, 0 }; if (a0 && lx_copy_out(t, a0, tms, 32)) return -LX_EFAULT; return (int64_t)(lx_now_ms() / 10); }   // times
     case 139: return -LX_ENOSYS;                                                    // sysfs
+    case 27: { // mincore: every mapped page counts as resident, an unmapped one is ENOMEM (libsigsegv walks the stack with this)
+        if (a0 & 0xFFF) return -LX_EINVAL;
+        uint64_t pages = (a1 + 0xFFF) >> 12;
+        if (pages > (1u << 20)) return -LX_ENOMEM;
+        for (uint64_t i = 0; i < pages; i++)
+            if (!lx_vma_find(t, a0 + i * 0x1000)) return -LX_ENOMEM;
+        uint8_t one[256];
+        for (unsigned i = 0; i < sizeof one; i++) one[i] = 1;
+        for (uint64_t i = 0; i < pages; i += sizeof one) {
+            uint64_t k = pages - i < sizeof one ? pages - i : sizeof one;
+            if (lx_copy_out(t, a2 + i, one, k)) return -LX_EFAULT;
+        }
+        return 0;
+    }
+    // One user, one machine: identity calls succeed, and nobody else exists to lock against.
+    case 26: case 73: case 162: case 277: case 306: return 0;                       // msync (file pages are shared), flock, sync, sync_file_range, syncfs
+    case 149: case 150: case 151: case 152: return 0;                               // mlock munlock mlockall munlockall
+    case 113: case 114: case 116: case 117: case 119: case 122: case 123: case 126: return 0; // setreuid setregid setgroups setresuid setresgid setfsuid setfsgid capset
+    case 115: return 0;                                                             // getgroups: none besides the primary one
+    case 118: case 120: {                                                           // getresuid, getresgid: all zero
+        uint32_t z = 0;
+        if (lx_copy_out(t, a0, &z, 4) || lx_copy_out(t, a1, &z, 4) || lx_copy_out(t, a2, &z, 4)) return -LX_EFAULT;
+        return 0;
+    }
+    case 124: return t->tgid;                                                       // getsid
+    case 125: {                                                                     // capget: no capabilities to report
+        uint32_t z[6] = { 0, 0, 0, 0, 0, 0 };
+        if (a1 && lx_copy_out(t, a1, z, sizeof z)) return -LX_EFAULT;
+        return 0;
+    }
+    case 135: return 0;                                                             // personality: PER_LINUX
+    case 143: {                                                                     // sched_getparam
+        uint32_t z = 0;
+        if (lx_copy_out(t, a1, &z, 4)) return -LX_EFAULT;
+        return 0;
+    }
+    case 309: {                                                                     // getcpu: tasks all run on the boot CPU
+        uint32_t z = 0;
+        if (a0 && lx_copy_out(t, a0, &z, 4)) return -LX_EFAULT;
+        if (a1 && lx_copy_out(t, a1, &z, 4)) return -LX_EFAULT;
+        return 0;
+    }
+    case 132: case 235: case 261: case 260: return 0;                               // utime utimes futimesat fchownat: like utimensat, chown
+    case 86: case 265: return -LX_EPERM;                                            // link, linkat: no hard links; git and friends fall back
+    case 188: case 189: case 190: return -95;                                       // setxattr family: EOPNOTSUPP
+    case 191: case 192: case 193: case 197: case 198: case 199: return -61;         // get/removexattr: ENODATA
+    case 194: case 195: case 196: return 0;                                         // listxattr: nothing
     case 0x1000: return lx_pe_loadlibrary(t, a0);                                   // LoadLibrary: map a DLL, return its base
     case 0x1001: return lx_pe_getproc(t, a0, a1, a2);                               // GetProcAddress(base, name, ordinal)
     case 0x1003: { // base of the mapped module that contains an address (0 = none)

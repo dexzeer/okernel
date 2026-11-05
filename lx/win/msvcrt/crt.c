@@ -376,4 +376,5 @@ EXPORT size_t strftime(char *buf, size_t max, const char *fmt, const struct tm *
     return n < max ? n : 0;
 }
 
-BOOL DllMain(HMODULE m, DWORD reason, LPVOID res) { (void)m; (void)reason; (void)res; return TRUE; }
+extern void msvcrt_wide_init(void);
+BOOL DllMain(HMODULE m, DWORD reason, LPVOID res) { (void)m; (void)res; if (reason == 1) msvcrt_wide_init(); return TRUE; }

@@ -123,7 +123,7 @@ class OkVM:
               '|': 'shift-backslash', '\\': 'backslash', ',': 'comma', '>': 'shift-dot', '<': 'shift-comma',
               '&': 'shift-7', '*': 'shift-8', '(': 'shift-9', ')': 'shift-0', '!': 'shift-1', '$': 'shift-4',
               '#': 'shift-3', '%': 'shift-5', '@': 'shift-2', '^': 'shift-6', '+': 'shift-equal',
-              '[': 'bracket_left', ']': 'bracket_right', '`': 'grave_accent', '~': 'shift-grave_accent'}
+              '{': 'shift-bracket_left', '}': 'shift-bracket_right', '[': 'bracket_left', ']': 'bracket_right', '`': 'grave_accent', '~': 'shift-grave_accent'}
         for ch in s:
             k = km.get(ch, ch.lower() if ch.isalpha() else ch)
             if ch.isupper(): k = f"shift-{ch.lower()}"

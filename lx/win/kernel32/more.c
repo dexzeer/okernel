@@ -267,3 +267,76 @@ EXPORT LONG PropVariantToStringVectorAlloc(const void *pv, LPWSTR **out, ULONG *
 EXPORT BOOL DecryptFileW(LPCWSTR f, DWORD r) { (void)f; (void)r; return 0; }
 EXPORT DWORD DuplicateEncryptionInfoFile(LPCWSTR a, LPCWSTR b, DWORD c, DWORD d, void *sa) { (void)a; (void)b; (void)c; (void)d; (void)sa; return 1; }
 EXPORT LONG __shcore_170(LPCWSTR path) { (void)path; return 0; }
+
+// ---- version checks: we answer as Windows 10.0.19045 (same numbers as GetVersionEx) ----------------------
+
+extern BOOL GetVersionExW(OSVERSIONINFOW *v);
+EXPORT ULONGLONG VerSetConditionMask(ULONGLONG mask, DWORD type, BYTE cond) {
+    for (int i = 0; i < 8; i++)                             // VER_MINORVERSION = bit 0, MAJOR = 1, BUILD = 2, ...
+        if (type & (1u << i)) mask |= (ULONGLONG)(cond & 7) << (i * 3);
+    return mask;
+}
+EXPORT LONG RtlGetVersion(OSVERSIONINFOW *v) { GetVersionExW(v); return 0; }
+// Three-way compare over the requested fields, judged by the condition of the most significant one.
+EXPORT LONG RtlVerifyVersionInfo(OSVERSIONINFOW *want, DWORD type, ULONGLONG mask) {
+    static const DWORD ours[3] = { 10, 0, 19045 };
+    const DWORD theirs[3] = { want->dwMajorVersion, want->dwMinorVersion, want->dwBuildNumber };
+    static const DWORD bit[3] = { 2, 1, 4 };                // VER_MAJORVERSION, VER_MINORVERSION, VER_BUILDNUMBER
+    static const int idx[3] = { 1, 0, 2 };
+    int c = 0, cond = 0;
+    for (int i = 0; i < 3; i++) {
+        if (!(type & bit[i])) continue;
+        if (!cond) cond = (int)((mask >> (idx[i] * 3)) & 7);
+        if (!c && ours[i] != theirs[i]) c = ours[i] > theirs[i] ? 1 : -1;
+    }
+    int ok = cond == 1 ? c == 0 : cond == 2 ? c > 0 : cond == 4 ? c < 0 : cond == 5 ? c <= 0 : c >= 0;   // 3 (>=) and unset
+    return ok ? 0 : (LONG)0xC0000059;                       // STATUS_REVISION_MISMATCH
+}
+EXPORT BOOL VerifyVersionInfoW(OSVERSIONINFOW *want, DWORD type, ULONGLONG mask) {
+    if (RtlVerifyVersionInfo(want, type, mask) == 0) return TRUE;
+    SetLastError(1150);                                     // ERROR_OLD_WIN_VERSION
+    return FALSE;
+}
+
+// ---- version.dll: no program here has a version resource we would read --------------------------------------
+
+EXPORT DWORD GetFileVersionInfoSizeExW(DWORD f, LPCWSTR n, DWORD *h) { (void)f; (void)n; if (h) *h = 0; SetLastError(1813); return 0; }
+EXPORT DWORD GetFileVersionInfoSizeW(LPCWSTR n, DWORD *h) { return GetFileVersionInfoSizeExW(0, n, h); }
+EXPORT BOOL GetFileVersionInfoExW(DWORD f, LPCWSTR n, DWORD h, DWORD l, void *d) { (void)f; (void)n; (void)h; (void)l; (void)d; SetLastError(1813); return FALSE; }
+EXPORT BOOL GetFileVersionInfoW(LPCWSTR n, DWORD h, DWORD l, void *d) { return GetFileVersionInfoExW(0, n, h, l, d); }
+EXPORT BOOL VerQueryValueW(const void *b, LPCWSTR s, void **o, UINT *l) { (void)b; (void)s; (void)o; if (l) *l = 0; return FALSE; }
+
+// ---- small pieces of ntdll and shlwapi ------------------------------------------------------------------------
+
+extern LPVOID HeapAlloc(HANDLE h, DWORD f, SIZE_T n);
+extern BOOL HeapFree(HANDLE h, DWORD f, LPVOID p);
+EXPORT LPVOID RtlAllocateHeap(HANDLE h, DWORD f, SIZE_T n) { return HeapAlloc(h, f, n); }
+EXPORT BOOL RtlFreeHeap(HANDLE h, DWORD f, LPVOID p) { return HeapFree(h, f, p); }
+
+static WCHAR fso_up(WCHAR c) { return c >= 'a' && c <= 'z' ? (WCHAR)(c - 32) : c; }
+EXPORT int FindStringOrdinal(DWORD flags, LPCWSTR src, int sl, LPCWSTR val, int vl, BOOL ic) {
+    if (sl < 0) sl = lstrlenW(src);
+    if (vl < 0) vl = lstrlenW(val);
+    if (vl > sl) return -1;
+    int from = 0, to = sl - vl, step = 1;
+    if (flags & 0x100000) to = 0;                           // FIND_STARTSWITH
+    if (flags & 0x200000) from = sl - vl;                   // FIND_ENDSWITH
+    if (flags & 0x800000) { int t = from; from = to; to = t; step = -1; }   // FIND_FROMEND
+    for (int i = from; step > 0 ? i <= to : i >= to; i += step) {
+        int k = 0;
+        while (k < vl && (ic ? fso_up(src[i + k]) == fso_up(val[k]) : src[i + k] == val[k])) k++;
+        if (k == vl) return i;
+    }
+    return -1;
+}
+EXPORT BOOL StrTrimW(LPWSTR s, LPCWSTR chars) {
+    int n = lstrlenW(s), a = 0, b = n;
+    #define IN_SET(c) ({ int f_ = 0; for (LPCWSTR q_ = chars; *q_; q_++) if (*q_ == (c)) f_ = 1; f_; })
+    while (a < b && IN_SET(s[a])) a++;
+    while (b > a && IN_SET(s[b - 1])) b--;
+    #undef IN_SET
+    if (a == 0 && b == n) return FALSE;
+    for (int i = a; i < b; i++) s[i - a] = s[i];
+    s[b - a] = 0;
+    return TRUE;
+}

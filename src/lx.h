@@ -120,7 +120,7 @@ struct lx_file {
 // ---- tasks ------------------------------------------------------------------------------------------------------
 #define LX_MAX_TASKS 64
 #define LX_MAX_FDS 128
-#define LX_MAX_VMAS 128
+#define LX_MAX_VMAS 1024                     // curl and its 30 libraries need more than 128
 #define LX_NSIG 65                           // signals 1..64
 
 #define LXT_FREE 0

@@ -700,7 +700,48 @@ int64_t lx_syscall_dispatch(struct lx_task *t) {
     uint64_t a0 = R->rdi, a1 = R->rsi, a2 = R->rdx, a3 = R->r10, a4 = R->r8, a5 = R->r9;
     struct lx_file *f;
     int err;
+    // Newer spellings of the calls below.
+    if (nr == 316) {                  // renameat2: no flag can be honoured here
+        if (a4) return -LX_EINVAL;
+        nr = 264;
+    }
+    if (nr == 439) nr = 269;          // faccessat2
     switch (nr) {
+    case 436: { // close_range
+        if (a0 > a1) return -LX_EINVAL;
+        uint64_t last = a1 < LX_MAX_FDS ? a1 : LX_MAX_FDS - 1;
+        for (uint64_t i = a0; i <= last; i++) {
+            if (!t->files->fds[i]) continue;
+            if (a2 & 4) { t->files->fdflags[i] |= 1; continue; }     // CLOSE_RANGE_CLOEXEC
+            lx_file_put(t->files->fds[i]);
+            t->files->fds[i] = 0;
+            t->files->fdflags[i] = 0;
+        }
+        return 0;
+    }
+    case 437: { // openat2: how = { flags, mode, resolve }
+        uint64_t how[3];
+        if (a3 < sizeof how) return -LX_EINVAL;
+        if (lx_copy_in(t, how, a2, sizeof how)) return -LX_EFAULT;
+        if (how[2]) return -LX_ENOSYS;                               // RESOLVE_*: callers fall back to openat
+        return do_openat(t, (int32_t)a0, a1, (uint32_t)how[0], (uint32_t)how[1]);
+    }
+    case 295: case 296: { // preadv, pwritev
+        f = fd_get(t, (int64_t)a0); if (!f) return -LX_EBADF;
+        if (f->kind != LXF_NODE) return -LX_ESPIPE;
+        if (a2 > 1024) return -LX_EINVAL;
+        int64_t total = 0;
+        for (uint64_t i = 0; i < a2; i++) {
+            uint64_t iov[2];
+            if (lx_copy_in(t, iov, a1 + i * 16, 16)) return total ? total : -LX_EFAULT;
+            if (!iov[1]) continue;
+            int64_t r = nr == 295 ? file_read(t, f, iov[0], iov[1], 1, a3 + (uint64_t)total) : file_write(t, f, iov[0], iov[1], 1, a3 + (uint64_t)total);
+            if (r < 0) return total ? total : r;
+            total += r;
+            if ((uint64_t)r < iov[1]) break;
+        }
+        return total;
+    }
     case 0:   // read
         f = fd_get(t, (int64_t)a0); if (!f) return -LX_EBADF;
         return file_read(t, f, a1, a2, 0, 0);
