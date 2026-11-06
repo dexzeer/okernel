@@ -36,14 +36,17 @@ struct okwin {
     uint64_t map_va; uint32_t map_len;
     int last_focus, last_w, last_h;
     int frameless;
+    int ptr_hidden;
 };
 
 static struct okwin wins[OKW_MAX];
 static int grab = -1;              // index of the window holding the mouse (a button is down)
+static int confine = -1;           // index of the window the pointer may not leave
 static int last_mx = -1, last_my = -1, last_mb;
 static uint8_t keyheld[256];
 static uint8_t extheld[128];
 static int inited;
+uint32_t lx_okwin_presents;        // counted for the 1 Hz [fps] line of the desktop
 
 extern void lx_mm_unmap(struct lx_mm *m, uint64_t va, uint64_t len);
 extern void lx_mm_hold(struct lx_mm *m);
@@ -75,6 +78,7 @@ void *lx_okwin_open(struct lx_task *t) {
 }
 
 static void win_free(struct okwin *w) {
+    if (confine == (int)(w - wins)) confine = -1;
     if (w->map_mm) { lx_mm_unmap(w->map_mm, w->map_va, w->map_len); lx_mm_release(w->map_mm); w->map_mm = 0; }
     if (w->wid >= 0 && window_get(w->wid)) { window_set_pixels(w->wid, 0, 0, 0, 0, 0, 0); window_destroy(w->wid); }
     if (w->raw) kfree(w->raw);
@@ -241,7 +245,7 @@ int64_t lx_okwin_ioctl(struct lx_task *t, void *conn, uint64_t req, uint64_t arg
         if (p.y < 0) { p.h += p.y; p.y = 0; }
         if (p.x + p.w > w->w) p.w = w->w - p.x;
         if (p.y + p.h > w->h) p.h = w->h - p.y;
-        if (p.w > 0 && p.h > 0) window_dirty_pixels(w->wid, p.x, p.y, p.w, p.h);
+        if (p.w > 0 && p.h > 0) { window_dirty_pixels(w->wid, p.x, p.y, p.w, p.h); lx_okwin_presents++; }
         return 0;
     }
     case OKW_SETTITLE: {
@@ -304,6 +308,26 @@ int64_t lx_okwin_ioctl(struct lx_task *t, void *conn, uint64_t req, uint64_t arg
         return lx_copy_out(t, arg, &a, sizeof a);
     }
     case OKW_TEXT: return do_text(t, arg);
+    case OKW_WARP: {
+        struct okw_warp a;
+        if (lx_copy_in(t, &a, arg, sizeof a)) return -LX_EFAULT;
+        if (a.wid < 0) { mouse_warp(a.x, a.y); return 0; }
+        struct okwin *w = by_wid(a.wid);
+        struct window *win = w ? window_get(w->wid) : 0;
+        if (!win || w->conn != c) return -LX_EINVAL;
+        mouse_warp(win->x + WIN_BORDER + a.x, win->y + (win->no_titlebar ? 0 : WIN_TITLE_H) + WIN_BORDER + a.y);
+        return 0;
+    }
+    case OKW_POINTER: {
+        struct okw_pointer a;
+        if (lx_copy_in(t, &a, arg, sizeof a)) return -LX_EFAULT;
+        struct okwin *w = by_wid(a.wid);
+        if (!w || w->conn != c) return -LX_EINVAL;
+        w->ptr_hidden = a.hidden != 0;
+        if (a.confined) confine = (int)(w - wins);
+        else if (confine == (int)(w - wins)) confine = -1;
+        return 0;
+    }
     default: return -LX_ENOTTY;
     }
 }
@@ -336,6 +360,8 @@ void lx_okwin_poll(void) {
     for (int i = 0; i < OKW_MAX; i++) if (wins[i].used) { any = 1; break; }
     if (!any) {
         pending_wheel = 0;
+        confine = -1;
+        cursor_hide(0);
         int a, b, c;
         while (keyboard_next_transition(&a, &b, &c)) {}              // nobody listens: keys typed now must not reach a window opened later
         return;
@@ -365,7 +391,18 @@ void lx_okwin_poll(void) {
     // the pointer
     int mx = mouse_get_x(), my = mouse_get_y(), mb = mouse_get_buttons();
     int target = -1;
-    if (grab >= 0 && wins[grab].used) target = grab;
+    if (confine >= 0 && wins[confine].used && wins[confine].wid == focus) {
+        struct okwin *w = &wins[confine];
+        struct window *win = window_get(w->wid);
+        if (win) {
+            int cx = win->x + WIN_BORDER, cy = win->y + (win->no_titlebar ? 0 : WIN_TITLE_H) + WIN_BORDER;
+            int nx = mx < cx ? cx : mx >= cx + w->w ? cx + w->w - 1 : mx, ny = my < cy ? cy : my >= cy + w->h ? cy + w->h - 1 : my;
+            if (nx != mx || ny != my) { mouse_warp(nx, ny); mx = nx; my = ny; }
+            target = confine;
+        }
+    }
+    if (target >= 0) {}
+    else if (grab >= 0 && wins[grab].used) target = grab;
     else {
         int wid = window_from_point(mx, my);
         struct okwin *tw = wid >= 0 ? by_wid(wid) : 0;
@@ -377,6 +414,7 @@ void lx_okwin_poll(void) {
         int cx = win ? win->x + WIN_BORDER : 0, cy = win ? win->y + (win->no_titlebar ? 0 : WIN_TITLE_H) + WIN_BORDER : 0;
         int px = mx - cx, py = my - cy;
         int inside = px >= 0 && py >= 0 && px < w->w && py < w->h;
+        cursor_hide(inside && w->ptr_hidden);
         if (inside || grab == target) {
             if (mx != last_mx || my != last_my) evq(w->conn, OKE_MOUSE_MOVE, w->wid, px, py, 0, 0);
             for (int b = 0; b < 3; b++) {
@@ -388,7 +426,7 @@ void lx_okwin_poll(void) {
             }
             if (pending_wheel) evq(w->conn, OKE_WHEEL, w->wid, px, py, -pending_wheel, 0);
         }
-    }
+    } else cursor_hide(0);
     pending_wheel = 0;
     if (!mb) grab = -1;
     last_mx = mx; last_my = my; last_mb = mb;

@@ -14,7 +14,7 @@
 #define SOCK_NONBLOCK 04000
 #define SOCK_CLOEXEC 02000000
 
-#define SOCK_BUF 65536
+#define SOCK_BUF (256 * 1024)          // a whole X request (Xlib splits images at 256 KB) fits without a round of waiting
 #define MAX_PASSED 8
 
 struct lx_msg_fds { int n; struct lx_file *f[MAX_PASSED]; };
@@ -100,14 +100,22 @@ int lx_sock_new_file(struct lx_task *t, int domain, int type, int cloexec, int n
 static uint32_t ring_write(struct ring *r, const uint8_t *p, uint32_t n) {
     uint32_t room = SOCK_BUF - r->count;
     if (n > room) n = room;
-    for (uint32_t i = 0; i < n; i++) { r->buf[r->wr] = p[i]; r->wr = (r->wr + 1) % SOCK_BUF; }
+    uint32_t a = SOCK_BUF - r->wr;
+    if (a > n) a = n;
+    memcpy(r->buf + r->wr, p, a);
+    if (n > a) memcpy(r->buf, p + a, n - a);
+    r->wr = (r->wr + n) % SOCK_BUF;
     r->count += n; r->total_in += n;
     return n;
 }
 
 static uint32_t ring_read(struct ring *r, uint8_t *p, uint32_t n) {
     if (n > r->count) n = r->count;
-    for (uint32_t i = 0; i < n; i++) { p[i] = r->buf[r->rd]; r->rd = (r->rd + 1) % SOCK_BUF; }
+    uint32_t a = SOCK_BUF - r->rd;
+    if (a > n) a = n;
+    memcpy(p, r->buf + r->rd, a);
+    if (n > a) memcpy(p + a, r->buf, n - a);
+    r->rd = (r->rd + n) % SOCK_BUF;
     r->count -= n; r->total_out += n;
     return n;
 }

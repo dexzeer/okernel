@@ -2,11 +2,13 @@
 // msvcrt/user32/gdi32 ... in /windows/system32, our own code) talk to the kernel with ordinary Linux system calls. The kernel
 // only maps the images, resolves the imports, builds the PEB/TEB and starts the program through a small generated stub.
 #include "lx.h"
+#include "memlayout.h"
 #include "memory.h"
+#include "paging.h"
 #include "serial.h"
 #include "string.h"
 
-#define WIN_META   0xAF000000u        // PEB, TEB, parameters, strings, loader tables, init stub
+#define WIN_META  0xAF000000u        // PEB, TEB, parameters, strings, loader tables, init stub
 #define WIN_META_SIZE 0x20000u
 #define MISSING_BASE 0xAE000000u      // unresolved imports point here: touching them faults and names the culprit
 #define MAX_MODS 48
@@ -330,6 +332,61 @@ static void put_u16str(uint8_t *dst, uint32_t *off, const char *s, uint32_t *len
     *off = o + 2;
 }
 
+// ---- KUSER_SHARED_DATA ---------------------------------------------------------------------------------------------
+// One read-only page at the same address in every Windows process: compiled programs read the clock and the version from it
+// directly (winver.exe reads SystemExpirationDate before anything else). One page for all of them, kept current by the kernel.
+#define KUSER_VA 0x7FFE0000u
+#define VER_MAJOR 10u
+#define VER_MINOR 0u
+#define VER_BUILD 19045u                 // what GetVersionEx reports
+static phys_t kuser_phys;
+static uint8_t *kuser;
+
+static void ksystem_time(uint32_t off, uint64_t v) {     // KSYSTEM_TIME: High2 first and High1 last, so a reader can tell it read a torn value
+    uint32_t lo = (uint32_t)v, hi = (uint32_t)(v >> 32);
+    memcpy(kuser + off + 8, &hi, 4);
+    __asm__ volatile("" ::: "memory");
+    memcpy(kuser + off, &lo, 4);
+    __asm__ volatile("" ::: "memory");
+    memcpy(kuser + off + 4, &hi, 4);
+}
+
+void lx_pe_tick(void) {
+    if (!kuser) return;
+    extern int64_t kclock_epoch_ms(void);
+    extern uint64_t lx_now_ns(void);
+    uint64_t ns = lx_now_ns(), ms = ns / 1000000ull;
+    uint32_t tick = (uint32_t)ms;
+    memcpy(kuser, &tick, 4);                             // TickCountLowDeprecated
+    ksystem_time(0x008, ns / 100);                       // InterruptTime, 100 ns units
+    ksystem_time(0x014, ((uint64_t)kclock_epoch_ms() + 11644473600000ull) * 10000ull);   // SystemTime, since 1601
+    ksystem_time(0x320, ms);                             // TickCount, in ms with the multiplier below
+}
+
+static int map_kuser(struct lx_task *t) {
+    if (!kuser) {
+        kuser_phys = pmm_alloc_page();
+        if (!kuser_phys) return -LX_ENOMEM;
+        kuser = (uint8_t*)P2V(kuser_phys);
+        memset(kuser, 0, 4096);
+        uint32_t v = 1u << 24;
+        memcpy(kuser + 0x004, &v, 4);                    // TickCountMultiplier: TickCount * this >> 24 = ms
+        static const char root[] = "C:\\Windows";
+        for (int i = 0; root[i]; i++) kuser[0x030 + 2 * i] = (uint8_t)root[i];   // NtSystemRoot
+        v = VER_BUILD; memcpy(kuser + 0x260, &v, 4);
+        v = 1;         memcpy(kuser + 0x264, &v, 4);     // ProductType: workstation
+        kuser[0x268] = 1;                                // ProductTypeIsValid
+        v = VER_MAJOR; memcpy(kuser + 0x26C, &v, 4);
+        v = VER_MINOR; memcpy(kuser + 0x270, &v, 4);
+        lx_pe_tick();
+    }
+    int r = lx_map_region(t, KUSER_VA, 0x1000, LX_PROT_READ, LX_MAP_SHARED, 0, 0);
+    if (r) return r;
+    struct lx_vma *v = lx_vma_find(t, KUSER_VA);
+    if (v) v->shared_fb = 1;                             // not this process's page: unmapping does not free it
+    return aspace_map(t->mm->cr3, KUSER_VA, kuser_phys, 0) ? -LX_ENOMEM : 0;
+}
+
 int lx_pe_load(struct lx_task *t, struct lx_node *exe, const char *path, const char *const *argv, const char *const *envp) {
     struct pe_info p;
     int r = pe_parse(exe, &p);
@@ -342,6 +399,8 @@ int lx_pe_load(struct lx_task *t, struct lx_node *exe, const char *path, const c
     r = lx_map_region(t, LX_STACK_TOP - LX_STACK_SIZE, LX_STACK_SIZE, LX_PROT_READ | LX_PROT_WRITE, LX_MAP_PRIVATE | LX_MAP_ANON | LX_MAP_GROWSDOWN, 0, 0);
     if (r) return r;
     r = lx_map_region(t, WIN_META, WIN_META_SIZE, LX_PROT_READ | LX_PROT_WRITE | LX_PROT_EXEC, LX_MAP_PRIVATE | LX_MAP_ANON, 0, 0);
+    if (r) return r;
+    r = map_kuser(t);
     if (r) return r;
     char lname[64];
     lower_name(lname, "main.exe", sizeof lname);

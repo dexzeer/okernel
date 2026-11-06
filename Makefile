@@ -46,7 +46,9 @@ boot/start_text.o: boot/start.asm
 # whenever any gen header changes (the %.o rule only tracks HEADERS, and a
 # stale seed silently ships last week's ELFs — bisected 2026-09-08 when a
 # fresh forktest never reached the ISO).
-USERLAND_GEN = $(wildcard userland/gen_*.h)
+USERLAND_GEN = $(shell sed -n 's|.*"../userland/\(gen_[a-z0-9_]*\.h\)".*|userland/\1|p' src/userland_seed.c)
+$(USERLAND_GEN):
+	$(MAKE) -C userland all gen
 
 # Web engine (src/web): HTML5 parser, CSS, layout, painter, fonts, images.
 # Desktop-only. fontdata.o incbins the TrueType faces in fonts/; callstack.o
@@ -61,8 +63,10 @@ WEB_OBJ = src/web/wdom.o src/web/html5.o src/web/charset.o src/web/wurl.o \
 WEB_HEADERS := $(wildcard src/web/*.h) $(wildcard src/ojs/*.h)
 src/wallpaper.o: src/wallpaper.asm tools/wallpaper/wallpaper.jpg
 	$(AS) $(ASFLAGS) $< -o $@
-src/rtw/rtwfw.o: src/rtw/rtwfw.asm firmware/rtw8821c_fw.bin
-	$(AS) $(ASFLAGS) $< -o $@
+# Realtek's blob is not in git (*.bin): without it the kernel builds with Wi-Fi unable to start.
+RTW_FW = $(wildcard firmware/rtw8821c_fw.bin)
+src/rtw/rtwfw.o: src/rtw/rtwfw.asm $(RTW_FW)
+	$(AS) $(ASFLAGS) $(if $(RTW_FW),-DHAVE_RTW_FW) $< -o $@
 src/web/fontdata.o: src/web/fontdata.asm $(wildcard fonts/*.ttf)
 	$(AS) $(ASFLAGS) $< -o $@
 src/web/wjs_prelude.o: src/web/wjs_prelude.asm src/web/wjs_prelude.js
@@ -103,7 +107,7 @@ src/gamewin.o: src/gamewin.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
 src/game/levels.o: src/game/levels.asm games/level1.dmccl games/level2.dmccl games/level3.dmccl games/level4.dmccl
 	$(AS) $(ASFLAGS) $< -o $@
-DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/ac97.o src/audio_rate.o src/pcix.o src/acpi_pm.o src/xhci.o src/wifigui.o src/rtw/rtw_hw.o src/rtw/rtw_pci.o src/rtw/rtw_wifi.o src/rtw/wsta.o src/rtw/wcrypto.o src/rtw/rtw_tables.o src/rtw/rtwfw.o src/hid.o src/devlog.o src/dwi2c.o src/hidi2c.o src/ptp.o src/i2caml.o src/i2chid.o src/klog.o src/virtio.o src/vgpu.o src/i915.o src/cpufreq.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/winfx.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/part.o src/pfs.o src/panic.o src/recovery.o src/textview.o src/lx.o src/lx_elf.o src/lx_sys.o src/lx_tty.o src/lx_fb.o src/lx_okwin.o src/lx_sig.o src/lx_sys2.o src/lx_net.o src/lx_ev.o src/lx_pe.o src/lxfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o src/ablock.o \
+DESKTOP_OBJ = src/mplay.o $(MEDIA_OBJ) $(GAME_OBJ) src/hda.o src/ac97.o src/audio_rate.o src/pcix.o src/acpi_pm.o src/xhci.o src/wifigui.o src/rtw/rtw_hw.o src/rtw/rtw_pci.o src/rtw/rtw_wifi.o src/rtw/wsta.o src/rtw/wcrypto.o src/rtw/rtw_tables.o src/rtw/rtwfw.o src/hid.o src/devlog.o src/dwi2c.o src/hidi2c.o src/ptp.o src/i2caml.o src/i2chid.o src/klog.o src/virtio.o src/vgpu.o src/i915.o src/cpufreq.o src/fpu.o src/simd.o src/simd_test.o src/prof.o src/acpi.o src/lapic.o src/smp.o src/graphics.o src/window.o src/winfx.o src/paging.o src/process.o src/sched.o src/sys_proc.o src/elf.o src/spinlock.o src/ata.o src/part.o src/pfs.o src/panic.o src/recovery.o src/textview.o src/lx.o src/lx_elf.o src/lx_sys.o src/lx_tty.o src/lx_fb.o src/lx_okwin.o src/lx_snd.o src/lx_sig.o src/lx_sys2.o src/lx_net.o src/lx_ev.o src/lx_pe.o src/lxfs.o src/userland_seed.o src/net/pci.o src/net/e1000.o src/net/network.o src/filesystem.o src/editor.o src/okai.o src/okai_ui.o src/taskbar.o src/cursor.o src/wallpaper.o src/textslot.o src/cjk.o src/ablock.o \
               src/font_data.o $(WEB_OBJ) $(OJS_OBJ) \
              src/crypto/sha256.o src/crypto/sha1.o src/crypto/ocsp.o src/crypto/hmac.o src/crypto/hkdf.o \
              src/crypto/aead.o src/crypto/aes.o src/crypto/chacha20.o src/crypto/poly1305.o \

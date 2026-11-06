@@ -128,7 +128,7 @@ int window_create(const char* title, int x, int y, int w, int h) {
             windows[i].dirty = 1; windows[i].pr_valid = 0; windows[i].pxd_valid = 0; windows[i].pix = 0; needs_redraw = 1; // full (slot reuse)
             sb_count[i] = 0; sb_next[i] = 0; windows[i].scroll_off = 0;
             int j = 0;
-            while (title[j] && j < 31) { windows[i].title[j] = title[j]; j++; }
+            while (title[j] && j < 63) { windows[i].title[j] = title[j]; j++; }
             windows[i].title[j] = 0;
             windows[i].content = (uint16_t*)kmalloc(CONTENT_CELLS_MAX * sizeof(uint16_t));
             windows[i].cell_fg = (uint32_t*)kmalloc(CONTENT_CELLS_MAX * sizeof(uint32_t));
@@ -254,6 +254,7 @@ void window_dirty_pixels(int id, int x, int y, int w, int h) {
     if (id < 0 || id >= MAX_WINDOWS) return;
     struct window* win = &windows[id];
     if (!win->pix || w <= 0 || h <= 0) return;
+    needs_redraw = 1;                          // the main loop composes on this, or once a second
     if (win->dirty && !win->pxd_valid) return; // full repaint already pending
     if (win->pxd_valid) {
         if (x < win->pxd_x0) win->pxd_x0 = x;
@@ -1052,7 +1053,7 @@ int window_color_is_light(uint8_t idx) {
 
 void window_set_title(int id, const char* title) {
     if (id < 0 || id >= MAX_WINDOWS) return;
-    int j = 0; while (title[j] && j < 31) { windows[id].title[j] = title[j]; j++; }
+    int j = 0; while (title[j] && j < 63) { windows[id].title[j] = title[j]; j++; }
     windows[id].title[j] = 0; windows[id].dirty = 1;
     window_mark_all(&windows[id]);
 }

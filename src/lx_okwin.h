@@ -20,6 +20,8 @@
 #define OKW_TEXT     0x4F0B     /* render text with the system font into a window buffer */
 #define OKW_CLIPBOARD 0x4F0C    /* the clipboard text (UTF-8) shared by every program: struct okw_clip */
 #define OKW_QUERY    0x4F0D     /* window position / pointer state */
+#define OKW_WARP     0x4F0E     /* move the pointer: struct okw_warp */
+#define OKW_POINTER  0x4F0F     /* the pointer over this window: struct okw_pointer */
 
 struct okw_create  { int x, y, w, h; unsigned flags; char title[64]; int out_wid; int out_stride; };
 struct okw_map     { int wid; int pad; unsigned long long out_addr; unsigned out_size; unsigned pad2; };
@@ -34,6 +36,9 @@ struct okw_text    { unsigned long long str; int len, size, flags, family; unsig
 struct okw_clip    { int op; int len; unsigned long long buf; unsigned long long seq; };   /* op 0 = set (len bytes at buf), 1 = get (up to len bytes into buf; the new len is returned in len); seq = changes so far */
 
 struct okw_query   { int wid; int x, y, w, h; int mx, my, mb, focused; };   /* in: wid (or -1);  out: outer position and client size of the window, pointer, focus */
+
+struct okw_warp    { int wid; int x, y; };   /* x,y in the window's client area, or on the screen with wid = -1 */
+struct okw_pointer { int wid; int hidden; int confined; };   /* hidden: no sprite over the window; confined: it cannot leave the client area while the window has the focus */
 
 #define OKW_F_NOFRAME 1          /* undecorated window (menus, tooltips) */
 #define OKW_F_HIDDEN 2           /* created hidden: OKW_SHOW 1 shows it (with the opening animation) */

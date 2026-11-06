@@ -3209,6 +3209,7 @@ void kernel_main(uint32_t mboot_phys) {
             unsigned busy = sp_k ? 100 - ht_k * 100 / sp_k : 100;
             serial_printf("[fps] %u loops=%u busy=%u%% awake: composed=%u cursor=%u mouse=%u fetch=%u okai=%u mplay=%u\n", fps, main_loops, busy,
                           why_composed, why_cursor, why_mouse, why_fetch, why_okai, why_mplay); // 1Hz, headless perf ground truth
+            { extern uint32_t lx_okwin_presents; if (lx_okwin_presents) { serial_printf("[okwin] presents=%u\n", lx_okwin_presents); lx_okwin_presents = 0; } }
             why_composed = why_cursor = why_mouse = why_fetch = why_okai = why_mplay = 0;
             prof_report();
             main_loops = 0; halted_cyc = 0; busy_t0 = now;
@@ -3251,10 +3252,12 @@ void kernel_main(uint32_t mboot_phys) {
         // Waiting for the network only (a fetch in flight, nothing else to run): packets are polled, so sleep in
         // half-millisecond steps (local APIC timer) instead of spinning; with nothing at all to do, sleep to the next tick.
         int net_wait = fetch_free_slots() != FETCH_MAX || ow_now == 2;
-        int timed_wait = ow_now == 3 || winfx_active();
+        int lx_soon = lapic_timer_available() && lx_timer_soon();
+        int timed_wait = ow_now == 3 || winfx_active() || lx_soon;
         if (!composed && !cursor_moved && !mb && !wheel && drag_win < 0 && resize_win < 0 &&
             ow_now != 1 && !mplay_wants_cpu() && !lx_busy() && ((!net_wait && !timed_wait) || lapic_timer_available())) {
             if (net_wait) lapic_timer_oneshot_us(500);
+            else if (lx_soon) lapic_timer_oneshot_us(1000);
             else if (timed_wait) lapic_timer_oneshot_us(3000);
             {   // idle: pay the hypervisor's first-touch cost of heap pages now instead of in the middle of a page load (memory.c)
                 uint32_t mhz = cpufreq_tsc_mhz();

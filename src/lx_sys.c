@@ -40,6 +40,7 @@ struct lx_file *lx_file_new(int kind, int flags, struct lx_node *node) {
 
 void lx_file_put(struct lx_file *f) {
     if (--f->refs > 0) return;
+    if (f->node && f->node->type == LXN_CHR && f->node->dev == LXDEV_SND_PCM) { extern void lx_snd_close_pcm(void); lx_snd_close_pcm(); }
     if (f->node) lxfs_unref(f->node);
     if (f->sock) lx_sock_close(f->sock);
     if (f->ev) lx_event_free(f->ev);
@@ -394,6 +395,11 @@ static int64_t do_openat(struct lx_task *t, int64_t dirfd, uint64_t upath, uint3
         int hr = lx_fb_open_hook(t);
         if (hr) return hr;
     }
+    if (n->type == LXN_CHR && (n->dev == LXDEV_SND_CTL || n->dev == LXDEV_SND_PCM)) {
+        extern int lx_snd_present(void); extern int lx_snd_open_pcm(void);
+        if (!lx_snd_present()) return -LX_ENODEV;
+        if (n->dev == LXDEV_SND_PCM) { int sr = lx_snd_open_pcm(); if (sr) return sr; }
+    }
     f = lx_file_new(LXF_NODE, (int)flags, n);
     if (!f) return -LX_ENOMEM;
     if (n->type == LXN_CHR && n->dev == LXDEV_OKWIN) {
@@ -657,6 +663,7 @@ static int fd_events(struct lx_task *t, struct lx_file *f, int want) {
     case LXF_NODE:
         if (f->node && f->node->type == LXN_CHR && f->node->dev == LXDEV_EVENT0) { extern int lx_input_ready(void); if (lx_input_ready()) r |= POLLIN; break; }
         if (f->node && f->node->type == LXN_CHR && f->node->dev == LXDEV_OKWIN) { extern int lx_okwin_ready(void*); if (lx_okwin_ready(f->priv)) r |= POLLIN; r |= POLLOUT; break; }
+        if (f->node && f->node->type == LXN_CHR && f->node->dev == LXDEV_SND_PCM) { extern int lx_snd_pcm_events(void); if (lx_snd_pcm_events()) r |= POLLOUT; break; }
         r |= POLLIN | POLLOUT; break;
     default: r |= POLLIN | POLLOUT; break;
     }
@@ -965,6 +972,14 @@ int64_t lx_syscall_dispatch(struct lx_task *t) {
         if (f->node && f->node->type == LXN_CHR && f->node->dev == LXDEV_OKWIN) {
             extern int64_t lx_okwin_ioctl(struct lx_task*, void*, uint64_t, uint64_t);
             return lx_okwin_ioctl(t, f->priv, a1, a2);
+        }
+        if (f->node && f->node->type == LXN_CHR && f->node->dev == LXDEV_SND_CTL) {
+            extern int64_t lx_snd_ctl_ioctl(struct lx_task*, uint64_t, uint64_t);
+            return lx_snd_ctl_ioctl(t, a1, a2);
+        }
+        if (f->node && f->node->type == LXN_CHR && f->node->dev == LXDEV_SND_PCM) {
+            extern int64_t lx_snd_pcm_ioctl(struct lx_task*, struct lx_file*, uint64_t, uint64_t);
+            return lx_snd_pcm_ioctl(t, f, a1, a2);
         }
         return -LX_ENOTTY;
     }

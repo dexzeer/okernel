@@ -3,7 +3,9 @@ section .rodata
 align 4
 global rtw_fw_start, rtw_fw_end
 rtw_fw_start:
+%ifdef HAVE_RTW_FW
 incbin "firmware/rtw8821c_fw.bin"
+%endif
 rtw_fw_end:
 align 4
 

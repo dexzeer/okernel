@@ -98,6 +98,7 @@ void okw_map_top(struct win *t) {
     t->wid = c.out_wid; t->px = (u32*)m.out_addr; t->bw = w; t->bh = h;
     t->dx0 = t->dy0 = t->dx1 = t->dy1 = 0;
     win_set_title(t);
+    input_pointer_sync(t);
 }
 
 void top_dirty(struct win *t, int x0, int y0, int x1, int y1) {
@@ -251,6 +252,7 @@ void win_map(struct win *w) {
     memset(ev, 0, 32);
     ev[0] = EV_MapNotify; p32(ev, 8, w->id); ev[12] = (u8)w->override_redirect;
     notify(w, EV_MapNotify, ev, 4);
+    if (w == t && w->wid >= 0) input_mapped(w);
     if (win_viewable(w)) {
         if (w->inputonly) return;
         win_expose_tree(w);
@@ -355,7 +357,13 @@ void win_change_attrs(struct win *w, u32 mask, const u32 *v) {
     }
     if (mask & 0x1000) w->dnp = v[i++];
     if (mask & 0x2000) w->colormap = v[i++];
-    if (mask & 0x4000) w->cursor = v[i++];
+    if ((mask & 0x4000) && w != root) {                                        // kept per top level: a child's cursor counts for the whole window
+        w->cursor = v[i++];
+        struct win *t = win_top(w);
+        u32 *c = (u32*)res_get(w->cursor, RES_CURSOR);
+        t->ptr_hidden = c && c[0];
+        input_pointer_sync(t);
+    }
 }
 
 void win_configure(struct win *w, u32 mask, const u32 *v, u32 sibling) {

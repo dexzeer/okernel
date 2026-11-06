@@ -213,6 +213,7 @@ int lx_spawn(const char *path, const char *const *argv, const char *const *envp,
 int lx_poll(void);
 int lx_alive(void);
 int lx_busy(void);                           // a task is runnable: the main loop must not sleep
+int lx_timer_soon(void);                     // a task wakes on the clock within a tick: sleep with the one-shot timer
 // Is the task `pid` still running? (the foreground wait of the shell)
 int lx_pid_alive(int pid);
 void lx_report(char *out, int cap);

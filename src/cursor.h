@@ -21,6 +21,8 @@ int  cursor_rect(int* x0, int* y0, int* x1, int* y1);
 void mouse_inject(int dx, int dy, int wheel, int buttons);
 
 void mouse_get_position(int* x, int* y);
+void mouse_warp(int x, int y);
+void cursor_hide(int hide);
 int  mouse_get_x(void);
 int  mouse_get_y(void);
 int  mouse_get_left_button(void);

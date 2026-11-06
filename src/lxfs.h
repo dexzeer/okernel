@@ -46,6 +46,8 @@ struct lx_node {
 #define LXDEV_FB0     LXDEV(29, 0)
 #define LXDEV_EVENT0  LXDEV(13, 64)
 #define LXDEV_OKWIN   LXDEV(10, 200)
+#define LXDEV_SND_CTL LXDEV(116, 0)
+#define LXDEV_SND_PCM LXDEV(116, 16)
 
 void lxfs_init(void);
 struct lx_node *lxfs_root(void);

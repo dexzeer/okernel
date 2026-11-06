@@ -288,8 +288,32 @@ void input_poll(void) {
 
 int input_query_pointer(void) { return ptr_root_x; }
 
+// A new window gets the desktop's focus without any change the desktop would report: the client must hear it from us.
+void input_mapped(struct win *t) {
+    struct okw_query q;
+    memset(&q, 0, sizeof q);
+    q.wid = t->wid;
+    if (okw_ioctl(OKW_QUERY, &q) == 0 && q.focused) on_focus(t, 1);
+}
+
+static struct win *conf_top;
+
+void input_pointer_sync(struct win *t) {
+    if (!t || t->wid < 0) return;
+    struct okw_pointer a = { t->wid, t->ptr_hidden, conf_top == t };
+    okw_ioctl(OKW_POINTER, &a);
+}
+
+void input_confine(struct win *w) {
+    struct win *t = w ? win_top(w) : 0, *old = conf_top;
+    conf_top = t;
+    if (old && old != t) input_pointer_sync(old);
+    if (t) input_pointer_sync(t);
+}
+
 void input_win_gone(struct win *w) {
     if (!w) return;
+    if (conf_top == w) conf_top = 0;
     if (grab_ptr_win == w) { grab_ptr_win = 0; grab_ptr_client = 0; grab_ptr_implicit = 0; }
     if (grab_kb_win == w) { grab_kb_win = 0; grab_kb_client = 0; }
     if (focus_win == w) focus_win = 0;

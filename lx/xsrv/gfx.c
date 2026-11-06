@@ -485,6 +485,21 @@ void draw_put_image(struct dstate *d, int format, int depth, int w, int h, int d
     int x0 = d->ox + dx, y0 = d->oy + dy;
     if (format == 2 && (depth == 24 || depth == 32)) {
         if ((u64)w * (u64)h * 4 > len) return;
+        struct gc *gc = d->gc;
+        if (d->depth != 1 && (!gc || (gc->function == 3 && (gc->plane_mask & 0xFFFFFFu) == 0xFFFFFFu))) {   // the common case: whole rows
+            for (int k = 0; k < d->clip.n; k++) {
+                Rect *r = &d->clip.r[k];
+                int xa = imax(x0, r->x), xb = imin(x0 + w, r->x + r->w), ya = imax(y0, r->y), yb = imin(y0 + h, r->y + r->h);
+                if (xa >= xb || ya >= yb) continue;
+                for (int y = ya; y < yb; y++) {
+                    u32 *o = &d->px[y * d->sw + xa];
+                    const u8 *s = data + ((u64)(y - y0) * (u64)w + (u64)(xa - x0)) * 4;
+                    for (int x = xa; x < xb; x++, s += 4) *o++ = g32(s, 0) & 0xFFFFFF;
+                }
+                touch(d, xa, ya, xb, yb);
+            }
+            return;
+        }
         for (int j = 0; j < h; j++)
             for (int i = 0; i < w; i++) put_col(d, x0 + i, y0 + j, g32(data, (j * w + i) * 4) & 0xFFFFFF);
         return;

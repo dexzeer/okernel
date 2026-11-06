@@ -113,6 +113,7 @@ struct win {
     int rx0, ry0;                                          // client origin in screen coordinates (learned from pointer events)
     int wm_delete;
     u32 focus_child;                                       // not used by the desktop; kept for SetInputFocus on this top level
+    int ptr_hidden;                                        // top level: the client defined an empty cursor
 };
 
 struct pix { u32 id; int w, h, depth; u32 *px; struct client *owner; };
@@ -246,7 +247,10 @@ void input_poll(void);
 void input_init(void);
 extern int grab_ptr_implicit, grab_ptr_owner_events; extern u32 grab_ptr_mask;
 u32 keysym_for(int code, int idx);
-extern struct win *focus_win;                              // SetInputFocus target (0 = follow the pointer, 1 = pointer root)
+void input_mapped(struct win *t);                          // a top level was just shown
+void input_confine(struct win *w);                       // the pointer stays inside w's top level (0 = free again)
+void input_pointer_sync(struct win *t);                    // tells the desktop what the pointer does over this top level
+extern struct win *focus_win;                             // SetInputFocus target (0 = follow the pointer, 1 = pointer root)
 extern struct win *ptr_win;
 extern struct win *grab_ptr_win, *grab_kb_win;
 extern struct client *grab_ptr_client, *grab_kb_client;

@@ -393,8 +393,22 @@ int lx_alive(void) {
 }
 
 int lx_busy(void) {
-    for (int i = 0; i < LX_MAX_TASKS; i++)
-        if (tasks[i] && tasks[i]->pid && tasks[i]->state == LXT_RUN) return 1;
+    for (int i = 0; i < LX_MAX_TASKS; i++) {
+        struct lx_task *t = tasks[i];
+        if (!t || !t->pid) continue;
+        if (t->state == LXT_RUN) return 1;
+        if (t->state == LXT_BLOCK && t->block_fn && t->block_fn(t)) return 1;      // another task just gave it what it waits for: no halt until the next tick
+    }
+    return 0;
+}
+
+// A blocked task wakes on the clock within the next tick: the main loop must not sleep a whole tick.
+int lx_timer_soon(void) {
+    int64_t now = lx_now_ms();
+    for (int i = 0; i < LX_MAX_TASKS; i++) {
+        struct lx_task *t = tasks[i];
+        if (t && t->pid && t->state == LXT_BLOCK && t->wake_ms && (int64_t)t->wake_ms - now < 10) return 1;
+    }
     return 0;
 }
 
@@ -747,6 +761,7 @@ int lx_poll(void) {
     if (!lx_ready) return 0;
     int any = 0;
     lx_sig_timers();
+    { extern void lx_pe_tick(void); lx_pe_tick(); }
     for (int n = 0; n < LX_MAX_TASKS; n++) {
         int i = (rr_next + n) % LX_MAX_TASKS;
         struct lx_task *t = tasks[i];
@@ -807,7 +822,7 @@ void lx_init(void) {
     lxfs_init();
     const uint8_t *mod; uint32_t mlen;
     if ((mod = memory_boot_module(0, &mlen, 0)) != 0) lxfs_load_tar(mod, mlen);
-    static const char *const dirs[] = { "/bin", "/sbin", "/usr", "/usr/bin", "/usr/sbin", "/usr/lib", "/lib", "/lib64", "/etc", "/dev", "/dev/input", "/tmp", "/proc", "/sys", "/home", "/root", "/var", "/var/tmp", "/run", "/mnt", 0 };
+    static const char *const dirs[] = { "/bin", "/sbin", "/usr", "/usr/bin", "/usr/sbin", "/usr/lib", "/lib", "/lib64", "/etc", "/dev", "/dev/input", "/dev/snd", "/tmp", "/proc", "/sys", "/home", "/root", "/var", "/var/tmp", "/run", "/mnt", 0 };
     for (int i = 0; dirs[i]; i++) mk_node(dirs[i], LXN_DIR, 0755, 0);
     mk_node("/dev/null", LXN_CHR, 0666, LXDEV_NULL);
     mk_node("/dev/zero", LXN_CHR, 0666, LXDEV_ZERO);
@@ -819,6 +834,8 @@ void lx_init(void) {
     mk_node("/dev/fb0", LXN_CHR, 0666, LXDEV_FB0);
     mk_node("/dev/input/event0", LXN_CHR, 0666, LXDEV_EVENT0);
     mk_node("/dev/okwin", LXN_CHR, 0666, LXDEV_OKWIN);
+    mk_node("/dev/snd/controlC0", LXN_CHR, 0666, LXDEV_SND_CTL);
+    mk_node("/dev/snd/pcmC0D0p", LXN_CHR, 0666, LXDEV_SND_PCM);
     mk_text("/etc/passwd", "root:x:0:0:root:/root:/bin/sh\n");
     mk_text("/etc/group", "root:x:0:\n");
     mk_text("/etc/hostname", "kanarchy\n");

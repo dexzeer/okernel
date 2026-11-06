@@ -48,7 +48,7 @@ struct window {
                        // its own chrome at the top (used by the browser window)
     int dirty;
     int last_cursor_visible;
-    char title[32];
+    char title[64];
     uint16_t* content;
     // Exact-color planes parallel to `content` (one 0xRRGGBB value per cell).
     // RGB is the paint-time source of truth; the VGA attr byte in `content`

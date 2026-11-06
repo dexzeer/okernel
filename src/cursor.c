@@ -321,6 +321,31 @@ static void mouse_irq_handler(void) {
     }
 }
 
+// Puts the pointer somewhere else (X's WarpPointer: a game keeping it in the middle of its window).
+void mouse_warp(int x, int y) {
+    uint32_t f = irq_save();
+    if (x < 0) x = 0;
+    if (x >= SCREEN_W) x = SCREEN_W - 1;
+    if (y < 0) y = 0;
+    if (y >= SCREEN_H) y = SCREEN_H - 1;
+    mouse_x = x; mouse_y = y;
+    if (cur_on) move_sprite(mouse_x, mouse_y);
+    irq_restore(f);
+}
+
+// Takes the sprite off the screen while a program asks for no pointer over its window.
+void cursor_hide(int hide) {
+    static int hidden;
+    uint32_t f = irq_save();
+    if (hide != hidden) {
+        hidden = hide;
+        if (hw_cursor) hw->cursor_show(!hide);
+        else if (hide && cur_on) { fb_restore(cur_x + spr_x0, cur_y + spr_y0, spr_x1 - spr_x0, spr_y1 - spr_y0); cur_on = 0; }
+        else if (!hide && !cur_on) { cur_on = 1; cur_x = mouse_x - HOT_X; cur_y = mouse_y - HOT_Y; fb_draw(cur_x, cur_y, 0, SCREEN_H); }
+    }
+    irq_restore(f);
+}
+
 void mouse_get_position(int* x, int* y) {
     uint32_t f = irq_save();
     *x = mouse_x; *y = mouse_y;

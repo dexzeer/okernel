@@ -507,9 +507,10 @@ void req_dispatch(struct client *c, u8 *r, u32 len) {
         if (grab_ptr_win && !grab_ptr_implicit && grab_ptr_client != c) { o[1] = 1; return; }
         if (!win_viewable(w)) { o[1] = 3; return; }
         grab_ptr_win = w; grab_ptr_client = c; grab_ptr_implicit = 0; grab_ptr_owner_events = r[1]; grab_ptr_mask = g16(r, 8);
+        input_confine(g32(r, 12) ? win_of(g32(r, 12)) : 0);
         return;
     }
-    case 27: if (grab_ptr_client == c) { grab_ptr_win = 0; grab_ptr_client = 0; grab_ptr_implicit = 0; } return;
+    case 27: if (grab_ptr_client == c) { grab_ptr_win = 0; grab_ptr_client = 0; grab_ptr_implicit = 0; input_confine(0); } return;
     case 28: case 29: case 30: return;                                             // passive button grabs: not supported
     case 31: {                                                                     // GrabKeyboard
         NEED(16);
@@ -548,7 +549,26 @@ void req_dispatch(struct client *c, u8 *r, u32 len) {
         p16(o, 12, (u32)(sx + gi16(r, 12) - dx)); p16(o, 14, (u32)(sy + gi16(r, 14) - dy));
         return;
     }
-    case 41: return;
+    case 41: {                                                                     // WarpPointer: the motion event follows from the new position
+        NEED(24);
+        u32 dst = g32(r, 8);
+        struct okw_warp a;
+        a.wid = -1; a.x = ptr_root_x + gi16(r, 20); a.y = ptr_root_y + gi16(r, 22);
+        if (dst) {
+            struct win *w = win_of(dst);
+            if (!w) BADWIN(dst);
+            a.x = gi16(r, 20); a.y = gi16(r, 22);
+            if (w != root) {
+                struct win *t = win_top(w);
+                int ax, ay;
+                if (t->wid < 0) return;
+                win_abs(w, &ax, &ay);
+                a.wid = t->wid; a.x += ax; a.y += ay;
+            }
+        }
+        okw_ioctl(OKW_WARP, &a);
+        return;
+    }
     case 42: {                                                                     // SetInputFocus
         NEED(12);
         u32 f = g32(r, 4);
@@ -866,7 +886,15 @@ void req_dispatch(struct client *c, u8 *r, u32 len) {
         NEED(8);
         u32 id = g32(r, 4);
         if (!id_ok(c, id)) { send_error(c, ER_IDChoice, id, op, 0); return; }
-        res_put(id, RES_CURSOR, xcalloc(8));
+        u32 *cur = (u32*)xcalloc(8);                                               // cur[0] = 1: nothing to show (how clients hide the pointer)
+        if (op == 93 && len >= 16) {
+            struct pix *m = (struct pix*)res_get(g32(r, 12), RES_PIXMAP);
+            if (m) {
+                cur[0] = 1;
+                for (u64 i = 0; i < (u64)m->w * (u64)m->h; i++) if (m->px[i] & 1) { cur[0] = 0; break; }
+            }
+        }
+        res_put(id, RES_CURSOR, cur);
         return;
     }
     case 95: { NEED(8); void *p = res_get(g32(r, 4), RES_CURSOR); if (p) { res_del(g32(r, 4)); xfree(p); } return; }

@@ -220,7 +220,9 @@ void lx_fb_poll(void) {
     if (any) evq(0, 0, 0);                                       // EV_SYN
     // the picture: at most ~30 times a second
     if (tick_count - F.last_tick >= 3 && w->visible) {
+        extern int needs_redraw;
         F.last_tick = tick_count;
         window_set_pixels(F.win, F.pix, 0, 0, (int)F.w, (int)F.h, (int)F.w);
+        needs_redraw = 1;
     }
 }
