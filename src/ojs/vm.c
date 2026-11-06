@@ -135,13 +135,22 @@ void ftempl_trace(ojs* J, struct gch* g) {
     gc_mark_ptr(J, t->source);
     gc_mark_bytes(J, t->param_map);
     gc_mark_bytes(J, t->srct);
-    J->ic_stat[6] += t->nic * IC_WAYS;
+    if (t->flags & TF_LAZY) {   // the stub's free-name map keeps what it names alive
+        gc_mark_bytes(J, t->upv_names);
+        gc_mark_bytes(J, t->upv_flags);
+        gc_mark_bytes(J, t->glob_names);
+        for (uint16_t i = 0; i < t->nupvals; i++)
+            if (t->upv_names && t->upv_names[i]) gc_mark_ptr(J, t->upv_names[i]);
+        for (uint16_t i = 0; i < t->nglob; i++)
+            if (t->glob_names && t->glob_names[i]) gc_mark_ptr(J, t->glob_names[i]);
+    }
+    J->ic_stat[0] += t->nic * IC_WAYS;
     if (t->ic) {   // the caches keep what they name alive (so they survive collections)
         gc_mark_bytes(J, t->ic);
         struct ic* e = t->ic;
         for (uint32_t i = 0; i < t->nic * IC_WAYS; i++, e++) {
             if (!e->shape) continue;                       // an empty way: nothing to keep
-            J->ic_stat[7]++;
+            J->ic_stat[1]++;
             if ((uintptr_t)e->shape > 4096) gc_mark_ptr(J, e->shape);
             gc_mark_ptr(J, e->holder);
             gc_mark_ptr(J, e->hshape);
@@ -464,6 +473,7 @@ jv default_ctor_call(ojs* J, struct func* fn, int argc, jv* argv, jv new_target)
 
 static jv call_closure(ojs* J, struct func* fn, jv this_v, int argc, jv* argv, jv new_target) {
     struct ftempl* t = fn->t;
+    if (t->flags & TF_LAZY && !lazy_compile_body(J, t)) return JV_EXC;
     if ((t->flags & TF_CLASS_CTOR) && jv_is_undef(new_target))
         return throw_type(J, "Class constructor %S cannot be invoked without 'new'", t->name);
     if (t->flags & TF_DEFAULT_CTOR) return default_ctor_call(J, fn, argc, argv, new_target);
@@ -505,6 +515,7 @@ static jv call_closure(ojs* J, struct func* fn, jv this_v, int argc, jv* argv, j
 // run a prepared top-level closure (eval code with environment upvalues)
 jv vm_run_func(ojs* J, struct func* fn, jv this_v, jv new_target) {
     struct ftempl* t = fn->t;
+    if (t->flags & TF_LAZY && !lazy_compile_body(J, t)) return JV_EXC;
     uint32_t n = (uint32_t)t->nlocals + t->stack_size;
     jv* block = vstack_alloc(J, n);
     if (!block) return JV_EXC;
@@ -537,6 +548,7 @@ static jv jit_run_frame(ojs* J, struct ojs_frame* f);
 #define TF_NOT_PLAIN (TF_CLASS_CTOR | TF_DEFAULT_CTOR | TF_GENERATOR | TF_ASYNC)
 static inline jv call_plain(ojs* J, struct func* fn, jv this_v, int argc, jv* argv) {
     struct ftempl* t = fn->t;
+    if (t->flags & TF_LAZY && !lazy_compile_body(J, t)) return JV_EXC;
     if (++J->call_depth > 4000 ||
         (J->stack_top && (uintptr_t)J->stack_top - (uintptr_t)__builtin_frame_address(0) > J->stack_limit)) {
         J->call_depth--;

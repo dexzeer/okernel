@@ -819,6 +819,7 @@ static struct funcinfo* new_funcinfo(struct parser* P, uint32_t flags, uint32_t 
         fi->depth = P->F->depth + 1;
         if (P->F->flags & FI_STRICT) fi->flags |= FI_STRICT;
         if (P->F->flags & (FI_FIELD_INIT | FI_STATIC_BLOCK | FI_IN_FIELD_INIT)) fi->flags |= FI_IN_FIELD_INIT;
+        if (P->F->flags & FI_TRACK) fi->flags |= FI_TRACK;   // lazy free-name recording covers the whole subtree
         // link as a child (compile order)
         if (P->F->last_child) P->F->last_child->next_sibling = fi;
         else P->F->children = fi;
@@ -937,6 +938,8 @@ static struct node* parse_arrow_body(struct parser* P, struct funcinfo* fi) {
     fi->body_scope = push_scope(P, SC_FUNC_BODY);
     if (!fi->body_scope) return 0;
     fi->body_scope->fn = fi;
+    struct arena_chunk* lazy_arena = 0;
+    if (fi->flags & FI_LAZY) { lazy_arena = P->arena; P->arena = 0; }   // the body's AST is thrown away
     if (TOK == T_LBRACE) {
         if (!parse_function_body(P, fi)) return 0;
     } else {
@@ -951,6 +954,7 @@ static struct node* parse_arrow_body(struct parser* P, struct funcinfo* fi) {
     }
     finish_function_checks(P, fi, fi->src_start);
     P->in_static_block = saved_sb;
+    lazy_after_body(P, fi, lazy_arena);
     fn->end = fi->src_end;
     return fn;
 }
@@ -973,7 +977,7 @@ static struct node* parse_function(struct parser* P, uint32_t pos, uint32_t flag
         if (!is_decl) {
             ojs* J = P->J;
             if (name == J->A->yield && ((flags & FI_GENERATOR) || strict(P))) { perr(P, TPOS, "Unexpected identifier 'yield'"); return 0; }
-            if (name == J->A->await && ((flags & FI_ASYNC) || P->is_module)) { perr(P, TPOS, "Unexpected reserved word 'await'"); return 0; }
+            if (name == J->A->await && ((flags & FI_ASYNC) || P->is_module || P->ctx_module)) { perr(P, TPOS, "Unexpected reserved word 'await'"); return 0; }
             if (strict(P) && is_strict_reserved(P, name)) { perr(P, TPOS, "Unexpected strict mode reserved word"); return 0; }
         } else if (!ident_ok(P, name, TPOS, 1)) return 0;
         next(P);
@@ -983,6 +987,16 @@ static struct node* parse_function(struct parser* P, uint32_t pos, uint32_t flag
     struct funcinfo* fi = new_funcinfo(P, flags | (is_decl ? FI_DECL : (is_method ? 0 : FI_EXPR)), pos);
     if (!fi) return 0;
     fi->name = name;
+    // lazy candidate: the body parses into a throwaway sub-arena and compiles on first call
+    struct arena_chunk* lazy_arena = 0;
+    {
+        uint8_t lctx = 0;
+        if (lazy_eligible(P, fi, &lctx)) {
+            fi->flags |= FI_LAZY | FI_TRACK;
+            fi->def_scope = P->S;
+            fi->ctx = lctx;
+        }
+    }
     struct node* fn = mk(P, N_FUNC, pos);
     if (!fn) return 0;
     fn->u.fn = fi;
@@ -1023,6 +1037,7 @@ static struct node* parse_function(struct parser* P, uint32_t pos, uint32_t flag
     P->in_static_block = 0;
     P->allow_in = 1;
     P->cover_init = 0;
+    if (fi->flags & FI_LAZY) { lazy_arena = P->arena; P->arena = 0; }   // the body's AST is thrown away
     enter_function(P, fi, &saved_f, &saved_s);
     // named function expressions see their own name (immutable binding)
     if (!is_decl && name && !is_method) {
@@ -1081,6 +1096,7 @@ static struct node* parse_function(struct parser* P, uint32_t pos, uint32_t flag
     P->in_static_block = saved_sb;
     P->allow_in = saved_in;
     P->cover_init = saved_cover;
+    lazy_after_body(P, fi, lazy_arena);
     fn->end = fi->src_end;
     return fn;
 }
@@ -1677,9 +1693,24 @@ int parse_program(ojs* J, struct str* src, const struct parse_opts* o, struct pa
     P->is_module = o->kind == PARSE_MODULE;
     P->eval_env = o->eval_env;
     lex_init(&P->L, J, src, P->is_module);
+    if (o->start) P->L.pos = o->start;   // lazy first-call re-parse: the function's own source range
+    if (o->end) P->L.len = o->end;       // and nothing beyond it (the call parens after `}` must not parse)
+    P->stop_pos = o->end;
+    P->ctx_module = (o->ctx & LC_MODULE) != 0;
     uint32_t fl = o->kind == PARSE_MODULE ? (FI_MODULE | FI_STRICT | FI_ASYNC) :
                   o->kind == PARSE_EVAL ? FI_EVAL : FI_SCRIPT;
     if (o->strict) fl |= FI_STRICT;
+    if (o->dyn_fn) fl |= FI_NEW_FUNCTION;   // nothing inside a dynamic function compiles lazily
+    if (o->ctx & LC_FILL) {
+        // the synthetic top of a lazy re-parse: super / new.target legality comes from the definition context;
+        // FI_TRACK so the compiled-now function's nested lazy stubs still record their free names
+        fl = FI_EVAL | FI_CTX_TOP | FI_TRACK | (o->strict ? FI_STRICT : 0);
+        if (o->ctx & LC_GEN) fl |= FI_GENERATOR;
+        if (o->ctx & LC_ASYNC) fl |= FI_ASYNC;
+        if (o->ctx & LC_SUPER_PROP) fl |= FI_USES_SUPER_PROP;
+        if (o->ctx & LC_SUPER_CALL) fl |= FI_USES_SUPER_CALL;
+        if (o->ctx & LC_NEW_TARGET) fl |= FI_USES_NEW_TARGET;
+    }
     if (o->kind == PARSE_EVAL) {
         if (o->allow_new_target) fl |= FI_USES_NEW_TARGET;
         if (o->allow_super_prop) fl |= FI_USES_SUPER_PROP;
@@ -1706,7 +1737,7 @@ int parse_program(ojs* J, struct str* src, const struct parse_opts* o, struct pa
     prog->u.fn = top;
     struct node** tail = &prog->a;
     int in_prologue = 1;
-    while (TOK != T_EOF && !FAILED) {
+    while (TOK != T_EOF && !FAILED && (!P->stop_pos || TPOS < P->stop_pos)) {
         if (in_prologue && TOK == T_STRING) {
             uint32_t sp = TPOS, se = P->L.t.end;
             struct str* val = P->L.t.str;
@@ -1717,7 +1748,14 @@ int parse_program(ojs* J, struct str* src, const struct parse_opts* o, struct pa
             } else in_prologue = 0;
         } else in_prologue = 0;
         struct node* s;
-        if (P->is_module && TOK == T_IMPORT) {
+        if (o->ctx & LC_EXPR) {
+            // lazy re-parse of a function expression / arrow: bind its name like the original did
+            s = mk(P, N_EXPR_STMT, TPOS);
+            if (!s) break;
+            s->a = parse_assign(P);
+            if (!s->a) break;
+        }
+        else if (P->is_module && TOK == T_IMPORT) {
             struct token t;
             int nt = peek(P, &t);
             s = (nt == T_LPAREN || nt == T_DOT) ? parse_statement_list_item(P) : parse_import(P);

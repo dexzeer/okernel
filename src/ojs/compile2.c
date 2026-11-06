@@ -965,11 +965,148 @@ static void comp_stmt(struct cfunc* c, struct node* n) {
 
 // ---------------------------------------------------------------- function templates
 
-static struct ftempl* compile_func(ojs* J, struct parser* P, struct funcinfo* fi, struct cfunc* parent);
+static struct ftempl* compile_func(ojs* J, struct parser* P, struct funcinfo* fi, struct cfunc* parent, struct ftempl* lm);
+
+// funcinfo flags -> template flags (also used for lazy stubs, which must look
+// like the finished function to closure_new before the body compiles)
+static uint32_t fi_tf(uint32_t ff) {
+    uint32_t fl = 0;
+    if (ff & FI_STRICT) fl |= TF_STRICT;
+    if (ff & FI_ARROW) fl |= TF_ARROW;
+    if (ff & FI_GENERATOR) fl |= TF_GENERATOR;
+    if (ff & FI_ASYNC) fl |= TF_ASYNC;
+    if (ff & FI_METHOD) fl |= TF_METHOD;
+    if (ff & FI_CLASS_CTOR) fl |= TF_CLASS_CTOR;
+    if (ff & FI_DERIVED) fl |= TF_DERIVED;
+    if (ff & FI_GETTER) fl |= TF_GETTER;
+    if (ff & FI_SETTER) fl |= TF_SETTER;
+    if (ff & FI_SCRIPT) fl |= TF_SCRIPT;
+    if (ff & FI_MODULE) fl |= TF_MODULE;
+    if (ff & FI_EVAL) fl |= TF_EVAL;
+    if (ff & FI_SIMPLE_PARAMS) fl |= TF_SIMPLE_PARAMS;
+    if (ff & FI_FIELD_INIT) fl |= TF_FIELD_INIT;
+    if (ff & FI_STATIC_BLOCK) fl |= TF_STATIC_INIT;
+    if (ff & FI_IN_FIELD_INIT) fl |= TF_IN_FIELD_INIT;
+    if (ff & FI_EXPR) fl |= TF_EXPR_NAME;
+    // constructors: ordinary functions (not methods / arrows / generators / async) and classes
+    if (((ff & (FI_ARROW | FI_METHOD | FI_GENERATOR | FI_ASYNC | FI_GETTER | FI_SETTER | FI_FIELD_INIT | FI_STATIC_BLOCK)) == 0 &&
+         !(ff & (FI_SCRIPT | FI_MODULE | FI_EVAL))) || (ff & FI_CLASS_CTOR))
+        fl |= TF_CONSTRUCTOR;
+    return fl;
+}
+
+// a lazy function: a stub template that fills on first call (vm.c). The free
+// names recorded by the parser resolve against the enclosing scopes here and
+// become the stub's upvalues; closures created from the stub hold those cells,
+// so the first-call compile must reference them by the same index (c->lm).
+static void comp_lazy_stub(struct cfunc* c, struct funcinfo* fi) {
+    ojs* J = c->J;
+    struct ftempl* t = (struct ftempl*)gc_alloc(J, GT_FTEMPL, sizeof(struct ftempl));
+    if (!t) { c->failed = 1; return; }
+    t->code = (uint8_t*)bytes_new(J, 1);
+    t->consts = valarr_new(J, 1);
+    if (!t->code || !t->consts) { c->failed = 1; return; }
+    t->code[0] = OP_RETURN_UNDEF;
+    t->code_len = 1;
+    t->flags = fi_tf(fi->flags) | TF_LAZY;
+    t->name = fi->name ? fi->name : J->A->empty;
+    t->filename = c->P->filename ? atom_cstr(J, c->P->filename) : J->A->empty;
+    t->source = c->P->L.src;
+    t->src_start = fi->src_start;
+    t->src_end = fi->src_end;
+    t->nparams = (uint16_t)fi->nparams;
+    t->length = (uint16_t)fi->nparams_len;
+    t->this_slot = t->newtarget_slot = t->home_slot = t->callee_slot = t->args_slot = -1;
+    t->stack_size = 4;
+    t->ctx_flags = fi->ctx | LC_FILL;   // the fill parse must always build the synthetic top
+    if (!fi->nfree) {
+        op32(c, OP_CLOSURE, add_const(c, jv_from_ptr(t)), 1);
+        return;
+    }
+    // resolve every recorded free name; upvalue entries in the order resolve() assigns them
+    struct upval_desc* descs = (struct upval_desc*)ojs_sys_malloc((size_t)fi->nfree * sizeof(struct upval_desc));
+    struct str** names = (struct str**)ojs_sys_malloc((size_t)fi->nfree * sizeof(struct str*));
+    uint8_t* uflags = (uint8_t*)ojs_sys_malloc((size_t)fi->nfree);
+    struct str** globs = (struct str**)ojs_sys_malloc((size_t)fi->nfree * sizeof(struct str*));
+    if (!descs || !names || !uflags || !globs) {
+        ojs_sys_free(descs); ojs_sys_free(names); ojs_sys_free(uflags); ojs_sys_free(globs);
+        c->failed = 1;
+        throw_oom(J);
+        return;
+    }
+    memset(descs, 0, (size_t)fi->nfree * sizeof(struct upval_desc));   // holes must be {0,0}, not malloc garbage
+    memset(names, 0, (size_t)fi->nfree * sizeof(struct str*));
+    memset(uflags, 0, (size_t)fi->nfree);
+    memset(globs, 0, (size_t)fi->nfree * sizeof(struct str*));
+    struct cfunc fake;
+    memset(&fake, 0, sizeof fake);
+    fake.J = J;
+    fake.P = c->P;
+    fake.parent = c;
+    fake.fi = fi;
+    fake.stub_create = 1;
+    fake.lm = c->lm;   // names above this compile's parse resolve through its map
+    fake.this_slot = fake.newtarget_slot = fake.home_slot = fake.callee_slot = fake.args_slot = fake.completion_slot = -1;
+    uint16_t nupv = 0, nglob = 0;
+    for (uint16_t i = 0; i < fi->nfree; i++) {
+        struct str* nm = fi->free_names[i];
+        struct ref r;
+        resolve(&fake, nm, fi->def_scope, &r);
+        if (c->failed) break;
+        if (r.kind == R_GLOBAL && !r.with_count) { globs[nglob++] = nm; continue; }
+        if (r.kind != R_UPVAL || r.index >= 16384) { cerr(c, fi->src_start, "internal: lazy free name"); break; }
+        // module cells and eval-environment bindings keep their own index (no fake.upv entry:
+        // upval_index only appends for ordinary captured decls); a name captured through the
+        // enclosing compile's map is a (0, map index) desc — "the parent's upval #index"
+        if (r.lazy_upv || (r.d && (r.d->scope->kind == SC_MODULE || (r.d->flags & 0x40)))) {
+            descs[r.index].from_local = 0;
+            descs[r.index].index = r.index;
+        } else {
+            if (r.index >= fake.nupv) { cerr(c, fi->src_start, "internal: lazy free name"); break; }
+            descs[r.index].from_local = fake.upv[r.index].from_local;
+            descs[r.index].index = fake.upv[r.index].index;
+        }
+        names[r.index] = nm;
+        uflags[r.index] = (uint8_t)((r.tdz ? 1 : 0) | (r.is_const ? 2 : 0) |
+                                    (r.d && r.d->kind == D_FUNCNAME ? 4 : 0));
+        if ((uint16_t)(r.index + 1) > nupv) nupv = (uint16_t)(r.index + 1);
+    }
+    if (!c->failed) {
+        t->nupvals = nupv;
+        if (nupv) {
+            t->upvals = (struct upval_desc*)bytes_new(J, sizeof(struct upval_desc) * (size_t)nupv);
+            t->upv_names = (struct str**)bytes_new(J, sizeof(struct str*) * (size_t)nupv);
+            t->upv_flags = (uint8_t*)bytes_new(J, nupv);
+            if (!t->upvals || !t->upv_names || !t->upv_flags) c->failed = 1;
+        }
+        if (nglob) {
+            t->glob_names = (struct str**)bytes_new(J, sizeof(struct str*) * (size_t)nglob);
+            if (!t->glob_names) c->failed = 1;
+        }
+        if (!c->failed) {
+            for (uint16_t i = 0; i < nupv; i++) {
+                t->upvals[i] = descs[i];
+                t->upv_names[i] = names[i];
+                t->upv_flags[i] = uflags[i];
+            }
+            for (uint16_t i = 0; i < nglob; i++) t->glob_names[i] = globs[i];
+            t->nglob = nglob;
+        }
+    }
+    ojs_sys_free(descs);
+    ojs_sys_free(names);
+    ojs_sys_free(uflags);
+    ojs_sys_free(globs);
+    if (c->failed) return;
+    op32(c, OP_CLOSURE, add_const(c, jv_from_ptr(t)), 1);
+}
 
 static void comp_function_node(struct cfunc* c, struct node* fn) {
     struct funcinfo* fi = fn->u.fn;
-    struct ftempl* t = compile_func(c->J, c->P, fi, c);
+    if (fi->flags & FI_LAZY) { comp_lazy_stub(c, fi); return; }
+    // lm propagates: an eagerly compiled function inside a lazy first-call
+    // compile resolves the stub's free names through the same map
+    struct ftempl* t = compile_func(c->J, c->P, fi, c, c->lm);
     if (!t) { c->failed = 1; return; }
     op32(c, OP_CLOSURE, add_const(c, jv_from_ptr(t)), 1);
 }
@@ -1090,7 +1227,7 @@ static int needs_this_slot(struct funcinfo* fi) {
 static struct ftempl* finish_template(struct cfunc* c);
 static void comp_body_and_finish(struct cfunc* c);
 
-static struct ftempl* compile_func(ojs* J, struct parser* P, struct funcinfo* fi, struct cfunc* parent) {
+static struct ftempl* compile_func(ojs* J, struct parser* P, struct funcinfo* fi, struct cfunc* parent, struct ftempl* lm) {
     struct cfunc C;
     struct cfunc* c = &C;
     memset(c, 0, sizeof C);
@@ -1098,6 +1235,7 @@ static struct ftempl* compile_func(ojs* J, struct parser* P, struct funcinfo* fi
     c->P = P;
     c->parent = parent;
     c->fi = fi;
+    c->lm = lm;
     c->this_slot = c->newtarget_slot = c->home_slot = c->callee_slot = c->args_slot = c->completion_slot = -1;
     c->is_global_code = (fi->flags & FI_SCRIPT) != 0;
     c->is_module = (fi->flags & FI_MODULE) != 0;
@@ -1301,29 +1439,7 @@ static struct ftempl* finish_template(struct cfunc* c) {
     t->home_slot = (int16_t)c->home_slot;
     t->callee_slot = (int16_t)c->callee_slot;
     t->args_slot = (int16_t)c->args_slot;
-    uint32_t fl = 0;
-    if (fi->flags & FI_STRICT) fl |= TF_STRICT;
-    if (fi->flags & FI_ARROW) fl |= TF_ARROW;
-    if (fi->flags & FI_GENERATOR) fl |= TF_GENERATOR;
-    if (fi->flags & FI_ASYNC) fl |= TF_ASYNC;
-    if (fi->flags & FI_METHOD) fl |= TF_METHOD;
-    if (fi->flags & FI_CLASS_CTOR) fl |= TF_CLASS_CTOR;
-    if (fi->flags & FI_DERIVED) fl |= TF_DERIVED;
-    if (fi->flags & FI_GETTER) fl |= TF_GETTER;
-    if (fi->flags & FI_SETTER) fl |= TF_SETTER;
-    if (fi->flags & FI_SCRIPT) fl |= TF_SCRIPT;
-    if (fi->flags & FI_MODULE) fl |= TF_MODULE;
-    if (fi->flags & FI_EVAL) fl |= TF_EVAL;
-    if (fi->flags & FI_SIMPLE_PARAMS) fl |= TF_SIMPLE_PARAMS;
-    if (fi->flags & FI_FIELD_INIT) fl |= TF_FIELD_INIT;
-    if (fi->flags & FI_STATIC_BLOCK) fl |= TF_STATIC_INIT;
-    if (fi->flags & FI_IN_FIELD_INIT) fl |= TF_IN_FIELD_INIT;
-    if (fi->flags & FI_EXPR) fl |= TF_EXPR_NAME;
-    // constructors: ordinary functions (not methods / arrows / generators / async) and classes
-    if (((fi->flags & (FI_ARROW | FI_METHOD | FI_GENERATOR | FI_ASYNC | FI_GETTER | FI_SETTER | FI_FIELD_INIT | FI_STATIC_BLOCK)) == 0 &&
-         !(fi->flags & (FI_SCRIPT | FI_MODULE | FI_EVAL))) || (fi->flags & FI_CLASS_CTOR))
-        fl |= TF_CONSTRUCTOR;
-    t->flags = fl;
+    t->flags = fi_tf(fi->flags);
     t->nupvals = (uint16_t)c->nupv;
     t->nic = c->nic;
     if (c->nupv) {

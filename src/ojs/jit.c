@@ -1217,6 +1217,7 @@ int jit_compile(ojs* J, struct ftempl* t) {
 }
 static int jit_compile_(ojs* J, struct ftempl* t) {
     if (t->jit) return 0;
+    if (t->flags & TF_LAZY) return -1;   // stubs fill on first call before any code runs
     if (t->flags & (TF_GENERATOR | TF_ASYNC | TF_SCRIPT | TF_MODULE | TF_EVAL | TF_DEFAULT_CTOR)) return -1;
     struct cg c;
     memset(&c, 0, sizeof c);

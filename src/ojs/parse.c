@@ -40,6 +40,19 @@ void* arena_alloc(struct parser* P, size_t n) {
     return p;
 }
 
+// ---------------------------------------------------------------- lazy compilation
+//
+// A candidate function (FI_LAZY) has its body parsed for early errors inside a
+// throwaway sub-arena, which is then freed: only the function's range, flags,
+// name and free identifiers survive. The body compiles on first call (vm.c
+// lazy_fill -> compile3.c lazy_compile_body). Over-recording a free name is
+// safe (the first-call compile resolves the function's own scopes first); a
+// missed one fails loudly there.
+
+int ojs_lazy = 0;   // opt-in: OJS_LAZY=1 compiles function bodies on first call (default: eager)
+
+struct lazy_block { struct lazy_block* next; void* p; };
+
 void parse_free(struct parser* P) {
     if (P->gc_held && P->J) { P->J->gc_disabled--; P->gc_held = 0; }
     for (struct arena_chunk* c = P->arena; c;) {
@@ -48,7 +61,165 @@ void parse_free(struct parser* P) {
         c = n;
     }
     P->arena = 0;
+    for (struct lazy_block* b = (struct lazy_block*)P->lazy_blocks; b;) {
+        struct lazy_block* n = b->next;
+        ojs_sys_free(b->p);
+        ojs_sys_free(b);
+        b = n;
+    }
+    P->lazy_blocks = 0;
     lex_free(&P->L);
+}
+
+// ---------------------------------------------------------------- lazy functions (helpers)
+
+static void lazy_block_add(struct parser* P, void* p) {
+    struct lazy_block* b = (struct lazy_block*)ojs_sys_malloc(sizeof *b);
+    if (!b) { ojs_sys_free(p); return; }
+    b->p = p;
+    b->next = (struct lazy_block*)P->lazy_blocks;
+    P->lazy_blocks = b;
+}
+
+static void registry_retarget(struct parser* P, void* oldp, void* newp) {
+    for (struct lazy_block* b = (struct lazy_block*)P->lazy_blocks; b; b = b->next)
+        if (b->p == oldp) { b->p = newp; return; }
+}
+
+static void fn_add_free(struct parser* P, struct funcinfo* f, struct str* name) {
+    for (uint16_t i = 0; i < f->nfree; i++) if (f->free_names[i] == name) return;
+    if (f->nfree >= 16384) return;   // absurd; a missed name fails loudly at first call
+    if (f->nfree >= f->capfree) {
+        uint16_t nc = (uint16_t)(f->capfree ? f->capfree * 2 : 8);
+        struct str** t = (struct str**)ojs_sys_malloc((size_t)nc * sizeof(struct str*));
+        if (!t) return;
+        if (f->free_names) {
+            memcpy(t, f->free_names, (size_t)f->nfree * sizeof(struct str*));
+            registry_retarget(P, f->free_names, t);
+            ojs_sys_free(f->free_names);
+        } else lazy_block_add(P, t);
+        f->free_names = t;
+        f->capfree = nc;
+    }
+    f->free_names[f->nfree++] = name;
+}
+
+// `name` is used here: record it as free for every tracked function whose own
+// scopes it escapes (with scopes are dynamic: they never resolve).
+static void record_free(struct parser* P, struct str* name) {
+    struct funcinfo* cur = P->F;
+    if (!cur || P->failed || !(cur->flags & FI_TRACK)) return;
+    struct scope* s = P->S;
+    for (; s; s = s->parent) {
+        if (s->kind != SC_WITH && scope_find(s, name)) return;
+        if (s == cur->param_scope) {
+            fn_add_free(P, cur, name);
+            cur = cur->parent;
+            if (!cur || !(cur->flags & FI_TRACK)) return;
+        }
+    }
+}
+
+// this / super / new.target are not identifiers: record them for the tracked
+// functions strictly inside `owner` (the function that owns the binding).
+static void record_pseudo(struct parser* P, const char* nm, struct funcinfo* owner) {
+    struct str* a = atom_cstr(P->J, nm);
+    if (!a) return;
+    for (struct funcinfo* g = P->F; g && g != owner; g = g->parent)
+        if (g->flags & FI_TRACK) fn_add_free(P, g, a);
+}
+
+// the cover grammar parses an arrow's parameter list as an expression of the
+// ENCLOSING function: free identifiers inside it were recorded for the wrong
+// function. Re-record them for the arrow (rescope has moved the nodes' scopes
+// into its parameter scope, so resolution against it is exact).
+static void lazy_rerecord_ident(struct parser* P, struct funcinfo* fi, struct node* n, int depth) {
+    if (!n || depth > 100) return;
+    for (; n; n = n->next) {
+        switch (n->type) {
+        case N_FUNC: case N_CLASS: break;   // their own parse recorded their own names
+        case N_IDENT: {
+            struct scope* s = n->scope;
+            int found = 0;
+            for (; s; s = s->parent) {
+                if (scope_find(s, n->u.str)) { found = 1; break; }
+                if (s == fi->param_scope) break;
+            }
+            if (!found) fn_add_free(P, fi, n->u.str);
+            break;
+        }
+        case N_THIS: fn_add_free(P, fi, atom_cstr(P->J, "this")); break;
+        case N_NEW_TARGET: fn_add_free(P, fi, atom_cstr(P->J, "new.target")); break;
+        case N_SUPER:
+            fn_add_free(P, fi, atom_cstr(P->J, n->b ? "*home*" : "*func*"));
+            if (!n->b) fn_add_free(P, fi, atom_cstr(P->J, "new.target"));
+            break;
+        default:
+            lazy_rerecord_ident(P, fi, n->a, depth + 1);
+            lazy_rerecord_ident(P, fi, n->b, depth + 1);
+            lazy_rerecord_ident(P, fi, n->c, depth + 1);
+            lazy_rerecord_ident(P, fi, n->d, depth + 1);
+            break;
+        }
+        if (P->failed) return;
+    }
+}
+
+// can this function's body be thrown away and compiled on first call?
+static int lazy_eligible(struct parser* P, struct funcinfo* fi, uint8_t* ctx_out) {
+    *ctx_out = 0;
+    if (!ojs_lazy || P->failed) return 0;
+    if (fi->flags & (FI_METHOD | FI_GETTER | FI_SETTER | FI_CLASS_CTOR | FI_FIELD_INIT | FI_STATIC_BLOCK |
+                     FI_IN_FIELD_INIT | FI_NEW_FUNCTION | FI_EVAL | FI_SCRIPT | FI_MODULE |
+                     FI_GENERATOR | FI_ASYNC)) return 0;   // async/generator bodies: the fill's context is not worth it yet
+    if (P->cls) return 0;   // class bodies: private names would not resolve in the re-parse
+    if (P->F && (P->F->flags & FI_CTX_TOP)) return 0;   // the re-parsed function compiles right now
+    for (struct funcinfo* g = P->F; g; g = g->parent) {
+        if (g->flags & FI_OWN_EVAL) return 0;   // its scopes become evalvar-dynamic at its compile
+        if ((g->flags & FI_EVAL) && !(g->flags & FI_CTX_TOP)) return 0;   // eval env descriptors need the real chain
+        if (g->flags & FI_NEW_FUNCTION) return 0;
+    }
+    for (struct scope* s = P->S; s; s = s->parent) if (s->kind == SC_WITH) return 0;
+    uint8_t ctx = 0;
+    if (!(fi->flags & FI_DECL) || !fi->name) ctx |= LC_EXPR;   // the re-parse must bind the name like the original did
+                                                               // (anonymous functions cannot re-parse as statements)
+    struct funcinfo* nonarrow = P->F;
+    while (nonarrow && (nonarrow->flags & FI_ARROW)) nonarrow = nonarrow->parent;
+    if (nonarrow) {
+        if (nonarrow->flags & FI_GENERATOR) ctx |= LC_GEN;
+        if (nonarrow->flags & FI_ASYNC) ctx |= LC_ASYNC;
+        if (nonarrow->flags & (FI_METHOD | FI_FIELD_INIT | FI_STATIC_BLOCK)) ctx |= LC_SUPER_PROP;
+        if ((nonarrow->flags & FI_DERIVED) && (nonarrow->flags & FI_CLASS_CTOR)) ctx |= LC_SUPER_CALL;
+        if (!(nonarrow->flags & (FI_SCRIPT | FI_MODULE))) ctx |= LC_NEW_TARGET;
+    }
+    if (P->is_module) ctx |= LC_MODULE;
+    *ctx_out = ctx;
+    return 1;
+}
+
+// the body is parsed: keep the AST only if a direct eval inside forces the
+// eager compiler to see it (eval env descriptors), else free the sub-arena
+static void lazy_after_body(struct parser* P, struct funcinfo* fi, struct arena_chunk* saved_arena) {
+    if (!saved_arena) return;
+    if (fi->flags & FI_DIRECT_EVAL) {
+        struct arena_chunk* c = P->arena;
+        if (c) { while (c->next) c = c->next; c->next = saved_arena; }
+        else P->arena = saved_arena;
+        fi->flags &= ~FI_LAZY;   // compile eagerly; its nested lazy functions keep their stubs
+        return;
+    }
+    for (struct arena_chunk* c = P->arena; c;) {
+        struct arena_chunk* n = c->next;
+        ojs_sys_free(c);
+        c = n;
+    }
+    P->arena = saved_arena;
+    fi->body = 0;
+    fi->params = 0;
+    fi->param_scope = 0;
+    fi->body_scope = 0;
+    fi->children = 0;
+    fi->last_child = 0;
 }
 
 // ---------------------------------------------------------------- errors
@@ -460,6 +631,7 @@ static struct node* parse_object_literal(struct parser* P) {
                 struct node* id = mk(P, N_IDENT, pos);
                 if (!id) return 0;
                 id->u.str = key_name;
+                record_free(P, key_name);   // shorthand { a }: the value is a reference
                 p->flags |= NF_SHORTHAND;
                 if (TOK == T_ASSIGN) {
                     next(P);
@@ -580,6 +752,7 @@ static struct node* parse_template(struct parser* P, struct node* tag) {
 static struct node* parse_paren_or_arrow(struct parser* P, int is_async, uint32_t async_pos);
 
 static struct node* make_ident(struct parser* P, struct str* s, uint32_t pos) {
+    record_free(P, s);   // lazy compilation: a free identifier of a tracked function
     struct node* n = mk(P, N_IDENT, pos);
     if (n) n->u.str = s;
     return n;
@@ -595,9 +768,13 @@ static struct node* parse_primary(struct parser* P) {
     case T_THIS:
         n = mk(P, N_THIS, pos);
         // an arrow's this is its enclosing function's: that one needs the binding
-        for (struct funcinfo* f = P->F; f; f = f->parent) {
-            f->flags |= FI_USES_THIS;
-            if (!(f->flags & FI_ARROW)) break;
+        {
+            struct funcinfo* f;
+            for (f = P->F; f; f = f->parent) {
+                f->flags |= FI_USES_THIS;
+                if (!(f->flags & FI_ARROW)) break;
+            }
+            record_pseudo(P, "this", f);
         }
         next(P);
         return n;
@@ -647,9 +824,13 @@ static struct node* parse_primary(struct parser* P) {
             }
             if (!ok) { perr(P, pos, "new.target expression is not allowed here"); return 0; }
             // an arrow's new.target is its enclosing function's: that one needs the binding as well
-            for (struct funcinfo* f = P->F; f; f = f->parent) {
-                f->flags |= FI_USES_THIS | FI_USES_NEW_TARGET;
-                if (!(f->flags & FI_ARROW)) break;
+            {
+                struct funcinfo* f;
+                for (f = P->F; f; f = f->parent) {
+                    f->flags |= FI_USES_THIS | FI_USES_NEW_TARGET;
+                    if (!(f->flags & FI_ARROW)) break;
+                }
+                record_pseudo(P, "new.target", f);
             }
             next(P);
             return mk(P, N_NEW_TARGET, pos);
@@ -698,6 +879,8 @@ static struct node* parse_primary(struct parser* P) {
             for (struct funcinfo* g = P->F; g && (g->flags & FI_ARROW); g = g->parent) g->flags |= FI_USES_THIS;
             P->F->flags |= FI_USES_THIS;
             if (f) f->flags |= FI_USES_SUPER_CALL;
+            record_pseudo(P, "*func*", f);
+            record_pseudo(P, "new.target", f);
             return n;
         }
         if (TOK == T_DOT || TOK == T_LBRACK) {
@@ -709,6 +892,7 @@ static struct node* parse_primary(struct parser* P) {
             for (struct funcinfo* g = P->F; g && (g->flags & FI_ARROW); g = g->parent) g->flags |= FI_USES_THIS;
             P->F->flags |= FI_USES_THIS;
             if (f) f->flags |= FI_USES_SUPER_PROP;
+            record_pseudo(P, "*home*", f);
             return n;
         }
         perr(P, pos, "'super' keyword unexpected here");
@@ -719,7 +903,7 @@ static struct node* parse_primary(struct parser* P) {
         if (TOK == T_DOT) {
             next(P);
             if (!(IS_CTX(meta) && !P->L.t.escaped)) { perr(P, TPOS, "unexpected %s after import.", tok_name(TOK)); return 0; }
-            if (!P->is_module) { perr(P, pos, "Cannot use 'import.meta' outside a module"); return 0; }
+            if (!P->is_module && !P->ctx_module) { perr(P, pos, "Cannot use 'import.meta' outside a module"); return 0; }
             next(P);
             return mk(P, N_IMPORT_META, pos);
         }
@@ -890,7 +1074,7 @@ static void rescope(struct node* n, struct scope* olds, struct scope* news,
             continue;   // its body has its own scopes
         }
         if (n->type == N_CLASS) {
-            if (n->scope && n->scope->parent == olds) n->scope->parent = news;
+            if (n->scope && n->scope->parent == olds) { n->scope->parent = news; n->scope->fn = newf; }
             // methods / field initializers of the class
             if (n->b) rescope(n->b, olds, news, oldf, newf);
             for (struct node* m = n->c; m; m = m->next) {
@@ -914,6 +1098,14 @@ static struct node* arrow_from_params(struct parser* P, struct node* params, uin
     struct funcinfo* fi = new_funcinfo(P, FI_ARROW | (is_async ? FI_ASYNC : 0), pos);
     if (!fi) return 0;
     fi->params = params;
+    {
+        uint8_t lctx = 0;
+        if (lazy_eligible(P, fi, &lctx)) {
+            fi->flags |= FI_LAZY | FI_TRACK;
+            fi->def_scope = outer_scope;
+            fi->ctx = lctx;
+        }
+    }
     struct funcinfo* saved_f;
     struct scope* saved_s;
     enter_function(P, fi, &saved_f, &saved_s);
@@ -923,6 +1115,7 @@ static struct node* arrow_from_params(struct parser* P, struct node* params, uin
         fi->nparams++;
     }
     declare_params(P, fi);
+    if (fi->flags & FI_TRACK) lazy_rerecord_ident(P, fi, fi->params, 0);
     struct node* fn = parse_arrow_body(P, fi);
     leave_function(P, saved_f, saved_s);
     if (fn) fn->pos = pos;

@@ -33,8 +33,13 @@ Things to know
   registered (ojs_add_root / ojs_add_root_range).
 * SSE2 doubles on x86-64 (thread context only in the kernel: interrupt handlers do not save XMM). double -> int conversions
   still go through the IEEE bits (d2i64, dtoi32, jv_number), which is also what the 32-bit x87 Windows port needs.
-* Inline caches (struct ic, per property/global site) are made on first use
-  and dropped by every collection, so they never point at freed objects.
+* Inline caches (struct ic, IC_WAYS entries per property/global site) are
+  made on first use and survive collections: ftempl_trace marks what their
+  entries name (shape, holder, proto, key), so entries never point at freed
+  objects and hot sites stay warm across the 20-30 collections of a big
+  page load. Entries holding a shape die with their template; a proto-chain
+  entry re-checks the realm's proto epoch, so a prototype change invalidates
+  it without a collection.
 * The realm memory limit (ojs_set_memory_limit) counts memory taken from the
   system, ArrayBuffer storage included (gc_ext_alloc); an allocation that
   would pass it collects first. ojs_set_memory_guard lets the embedder veto

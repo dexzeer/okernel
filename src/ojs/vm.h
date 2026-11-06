@@ -101,6 +101,8 @@ struct upval_desc { uint16_t from_local; uint16_t index; };
 #define TF_STATIC_INIT   0x40000
 #define TF_IN_FIELD_INIT 0x100000  // lexically inside a class field initializer or static block
 #define TF_DEFAULT_CTOR  0x80000    // class without an explicit constructor (VM does it)
+#define TF_LAZY          0x200000   // stub: the body compiles on the function's first call
+#define TF_HIDDEN        0x400000   // hide_source ran on the compile: toString fakes a built-in
 
 // an inline cache entry: where a property was found for objects of one shape.
 // holder 0: own data slot of the receiver; else a data slot of holder (the
@@ -142,12 +144,18 @@ struct ftempl {
     struct str* source;         // the whole source text (Function.prototype.toString)
     uint32_t src_start, src_end;
     struct ic* ic;              // inline caches: IC_WAYS entries per property/global site (gc bytes; made on first use;
-    uint32_t nic;               //   traced by the collector, so what they name stays alive) 
+    uint32_t nic;               //   traced by the collector, so what they name stays alive)
     uint8_t* param_map;         // mapped arguments: 1 if parameter i is its name's binding (gc bytes)
     struct srctext* srct;       // compact copy of the source (then source is NULL; srctext.c)
     struct jitcode* jit;        // compiled code (jit.c), freed by the finalizer
     uint32_t hot;               // calls and loop iterations counted towards compiling it
     uint8_t jit_bad;            // compiling failed: do not try again
+    // lazy stub (TF_LAZY): what the first-call compile needs to reproduce the function
+    struct str** upv_names;     // per upvalue: the free identifier it captures (gc bytes)
+    uint8_t* upv_flags;         // per upvalue: bit0 TDZ check, bit1 const (gc bytes)
+    struct str** glob_names;    // free names that resolve to the global object (gc bytes)
+    uint16_t nglob;
+    uint16_t ctx_flags;         // LC_* re-parse context (parse.h)
 };
 
 // srctext.c: a script's source kept as UTF-8 for its compiled templates
@@ -241,6 +249,8 @@ void ftempl_dump(ojs* J, struct ftempl* t);
 jv   vm_call(ojs* J, jv fn, jv this_v, int argc, jv* argv, jv new_target);
 jv   vm_run(ojs* J, struct ojs_frame* f);
 struct func* closure_new(ojs* J, struct ftempl* t, struct ojs_frame* parent, struct obj* proto);
+// fill a lazy stub in place: parse+compile its body from its own source range (compile3.c)
+struct ftempl* lazy_compile_body(ojs* J, struct ftempl* t);
 void close_upvals(ojs* J, struct ojs_frame* f, jv* from);
 jv   vm_run_script(ojs* J, struct ftempl* t, jv this_v);
 jv   vm_run_func(ojs* J, struct func* fn, jv this_v, jv new_target);

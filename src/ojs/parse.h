@@ -120,7 +120,21 @@ struct funcinfo {
     struct ftempl* tmpl;        // compiler output
     struct node* class_node;    // the class whose constructor / field initializer this is
     int depth;
+    // lazy compilation (FI_LAZY): the body was parsed for early errors and discarded
+    struct scope* def_scope;    // scope the function is defined in (free names resolve from here)
+    struct str** free_names;    // identifiers used inside that resolve outside (sys-alloc'd; parse_free frees)
+    uint16_t nfree, capfree;
+    uint8_t ctx;                // LC_* context for the first-call re-parse
 };
+// lazy re-parse context bits (funcinfo.ctx / parse_opts.ctx / ftempl ctx_flags)
+#define LC_GEN        0x01     // `yield` is a keyword (enclosing generator)
+#define LC_ASYNC      0x02     // `await` is a keyword (enclosing async / module top level)
+#define LC_SUPER_PROP 0x04     // super.x legal (enclosing method / field init)
+#define LC_SUPER_CALL 0x08     // super() legal (enclosing derived constructor)
+#define LC_NEW_TARGET 0x10     // new.target legal via an eval-like context
+#define LC_MODULE     0x20     // defined in a module (await reserved for names too)
+#define LC_EXPR       0x40     // the re-parsed source is an expression (function expression / arrow)
+#define LC_FILL       0x80     // this parse is a lazy first-call fill (the top is synthetic)
 #define FI_ARROW        0x00001
 #define FI_ASYNC        0x00002
 #define FI_GENERATOR    0x00004
@@ -150,6 +164,9 @@ struct funcinfo {
 #define FI_NEW_FUNCTION 0x2000000  // body of new Function(...)
 #define FI_USES_NEW_TARGET 0x4000000
 #define FI_OWN_EVAL     0x8000000   // a direct eval call directly in this function (sloppy vars land here)
+#define FI_TRACK        0x10000000  // lazy: free identifiers of this subtree are recorded
+#define FI_LAZY         0x20000000  // lazy: body parsed for early errors, AST discarded, compiled on first call
+#define FI_CTX_TOP      0x40000000  // synthetic top of a lazy first-call re-parse (pseudo names go through the stub's map)
 
 struct node {
     uint8_t type;
@@ -191,6 +208,8 @@ struct parser {
     int allow_in;               // `in` allowed in relational expressions
     int in_class_field;         // arguments forbidden
     int in_static_block;
+    int ctx_module;             // lazy re-parse of a function defined in a module (await / import.meta rules)
+    uint32_t stop_pos;          // lazy re-parse: stop the statement loop at this offset (0: no limit)
     int label_depth;
     struct label* labels;
     int iteration_depth;
@@ -209,6 +228,7 @@ struct parser {
     int eval_kind;              // 0 none, 1 indirect/global eval, 2 direct eval
     int gc_held;                // the collector is paused until parse_free (the AST and the
                                 // compiler's constant lists hold strings it cannot see)
+    void* lazy_blocks;          // sys-malloc'd free-name lists of lazy functions (parse_free frees)
     struct ojs_eval_env* eval_env;
 };
 
@@ -225,6 +245,12 @@ struct parse_opts {
     struct ojs_eval_env* eval_env;
     // new Function(): parameter text and body text are parsed separately
     int function_kind;          // 0 normal, 1 generator, 2 async, 3 async generator
+    int dyn_fn;                 // this parse builds a new Function body: nothing in it may go lazy
+    // lazy first-call re-parse of one function (PARSE_SCRIPT): the context the
+    // function was defined in; see the LC_* bits. [start, end) is the function's
+    // own range in src (0/0: parse everything).
+    int ctx;
+    uint32_t start, end;
 };
 int  parse_program(ojs* J, struct str* src, const struct parse_opts* o, struct parser* P);
 // direct eval inside a class body may reference the class's private names
@@ -232,5 +258,7 @@ int  ojs_eval_env_has_private(struct ojs_eval_env* e, struct str* name);
 void parse_free(struct parser* P);
 struct decl* scope_find(struct scope* s, struct str* name);
 void* arena_alloc(struct parser* P, size_t n);
+// lazy compilation (ojs.c): functions whose body was pre-parsed only compile on first call
+extern int ojs_lazy;
 
 #endif

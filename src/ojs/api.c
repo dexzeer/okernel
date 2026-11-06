@@ -39,7 +39,8 @@ void api_classes(void) { }
 ojs* ojs_new(void) {
     classes_init();
 #if !(defined(KERNEL) && KERNEL)
-    { const char* je = getenv("OJS_JIT"); if (je) ojs_jit_mode = atoi(je); const char* jt = getenv("OJS_JIT_THRESHOLD"); if (jt) ojs_jit_threshold = (uint32_t)atoi(jt); }
+    { const char* je = getenv("OJS_JIT"); if (je) ojs_jit_mode = atoi(je); const char* jt = getenv("OJS_JIT_THRESHOLD"); if (jt) ojs_jit_threshold = (uint32_t)atoi(jt);
+      const char* lz = getenv("OJS_LAZY"); if (lz) ojs_lazy = atoi(lz); }
 #endif
     ojs* J = (ojs*)ojs_sys_malloc(sizeof(ojs));
     if (!J) return 0;
@@ -133,7 +134,7 @@ void ojs_get_stats(ojs* J, struct ojs_stats* st) {
     st->gc_count = J->gc_count;
     st->gc_ms = J->gc_ms;
     st->gc_mark_ms = J->gc_mark_ms;
-    for (int i = 0; i < 8; i++) st->ic_stat[i] = J->ic_stat[i];
+    for (int i = 0; i < 2; i++) st->ic_stat[i] = J->ic_stat[i];
     st->total_alloc = J->total_alloc;
     for (int i = 0; i < 16; i++) st->live_by_type[i] = J->heap ? gc_live_of_type(J, i + 1) : 0;
 }
@@ -419,6 +420,11 @@ uint8_t* ojs_bytes(ojs* J, ojsv v, size_t* len) { (void)J; size_t l = 0; uint8_t
 // Function.prototype.toString answers "function name() { [native code] }" like a built-in
 static void hide_source(struct ftempl* t, int depth) {
     if (!t || depth > 200) return;
+    if (t->flags & TF_LAZY) {
+        // the stub keeps its source (it compiles on first call); toString fakes a built-in
+        t->flags |= TF_HIDDEN;
+        return;
+    }
     t->source = 0;
     t->srct = 0;
     t->src_end = t->src_start;

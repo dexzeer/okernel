@@ -468,7 +468,7 @@ struct ojs {
     struct obj* fin_regs;           // FinalizationRegistry objects
     struct marker* mk;              // the mark stack gc_mark_* push on (the collector's own, or a parallel worker's)
     uint32_t proto_epoch;           // bumped whenever an OF_PROTO object's properties or prototype change: proto-chain inline caches check it
-    uint32_t ic_stat[8];            // inline cache statistics (OJS_ICSTATS): hits, own hits, proto hits, polymorphic hits, fills, slow gets
+    uint32_t ic_stat[2];            // inline cache statistics (OJS_ICSTATS): [0] sites at last collection, [1] filled ways at last collection
     int gc_count;
     double gc_ms;                // time spent collecting (wall clock)
     double gc_mark_ms;           // of which marking (roots + drain + weak structures)

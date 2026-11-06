@@ -85,6 +85,7 @@ struct cfunc {
     int this_slot, newtarget_slot, home_slot, callee_slot, args_slot, completion_slot;
     struct decl* this_decl, *newtarget_decl, *home_decl, *callee_decl;
     int failed;
+    uint8_t stub_create;        // this cfunc builds a lazy stub: free names resolve through the enclosing map
     int is_global_code;         // script top level: var/function go to the global object
     int is_eval;
     int eval_dyn_vars;          // sloppy direct eval in a function: var names live in the caller's eval var object
@@ -92,6 +93,7 @@ struct cfunc {
     int is_module;
     int nparam_slots;
     struct scope* cur_scope;
+    struct ftempl* lm;          // lazy first-call compile: the stub whose upvalue map free names resolve through
 };
 
 static void cerr(struct cfunc* c, uint32_t pos, const char* msg) {
@@ -336,7 +338,42 @@ struct ref {
     int tdz;                // needs a TDZ check
     int is_const;           // assignment throws TypeError (const) / silently fails (function name)
     int with_count;         // R_WITH: number of with scopes between
+    uint16_t lazy_upv;      // no decl: index is the lazy stub's upvalue (load_ref/store_ref emit it directly)
+    uint16_t fnname;        // lazy_upv + is_const: the capture is a named function expression's own name
 };
+
+// append one upvalue descriptor to c's table (grows the array); -1 on failure
+static int upval_push(struct cfunc* c, struct decl* d, uint16_t from_local, uint16_t index) {
+    if (c->nupv >= 65000) { cerr(c, 0, "too many captured variables"); return -1; }
+    if (c->nupv >= c->capupv) {
+        int nc = c->capupv ? c->capupv * 2 : 8;
+        struct cupv* t = (struct cupv*)ojs_sys_realloc(c->upv, (size_t)nc * sizeof(struct cupv));
+        if (!t) { c->failed = 1; throw_oom(c->J); return -1; }
+        c->upv = t;
+        c->capupv = nc;
+    }
+    c->upv[c->nupv].d = d;
+    c->upv[c->nupv].from_local = from_local;
+    c->upv[c->nupv].index = index;
+    return c->nupv++;
+}
+
+// the position of the filled function's cell #lm_idx in c's own upvals table:
+// the top of the fill owns the stub's cells directly (its position IS the
+// stub index); a function compiled inside the fill captures the cell through
+// its parent's table
+static int lm_upval_pos(struct cfunc* c, uint16_t lm_idx) {
+    for (int k = 0; k < c->nupv; k++)
+        if (!c->upv[k].d && !c->upv[k].from_local && c->upv[k].index == lm_idx) return k;
+    if (!c->parent) return lm_idx;   // the fill's top: its upvals are the stub's cells
+    uint16_t index = lm_idx;
+    if (c->parent->lm) {
+        int pp = lm_upval_pos(c->parent, lm_idx);
+        if (pp < 0) return -1;
+        index = (uint16_t)pp;
+    }
+    return upval_push(c, 0, 0, index);
+}
 
 static int upval_index(struct cfunc* c, struct decl* d) {
     if ((d->flags & 0x40) && !c->parent) return d->slot;   // eval environment cell
@@ -354,21 +391,23 @@ static int upval_index(struct cfunc* c, struct decl* d) {
         if (d->slot < 0) { cerr(c, d->node ? d->node->pos : 0, "internal: captured binding has no slot"); return 0; }
     } else {
         from_local = 0;
-        index = (uint16_t)upval_index(p, d);
+        if (!p->parent && p->lm) {
+            // the parent compiles the fill of a lazy stub: its closures hold the
+            // stub's cells, so the index is the stub map's index for this name
+            // (not the compile-time table, whose order means nothing here)
+            struct ftempl* tp = p->lm;
+            int found = -1;
+            for (uint16_t i = 0; i < tp->nupvals; i++)
+                if (tp->upv_names[i] == d->name) { found = i; break; }
+            if (found < 0) { cerr(c, 0, "internal: lazy cell capture"); return 0; }
+            index = (uint16_t)found;
+        } else {
+            index = (uint16_t)upval_index(p, d);
+        }
     }
     d->flags |= DF_CAPTURED;
-    if (c->nupv >= 65000) { cerr(c, 0, "too many captured variables"); return 0; }
-    if (c->nupv >= c->capupv) {
-        int nc = c->capupv ? c->capupv * 2 : 8;
-        struct cupv* t = (struct cupv*)ojs_sys_realloc(c->upv, (size_t)nc * sizeof(struct cupv));
-        if (!t) { c->failed = 1; throw_oom(c->J); return 0; }
-        c->upv = t;
-        c->capupv = nc;
-    }
-    c->upv[c->nupv].d = d;
-    c->upv[c->nupv].from_local = from_local;
-    c->upv[c->nupv].index = index;
-    return c->nupv++;
+    int ix = upval_push(c, d, from_local, index);
+    return ix < 0 ? 0 : ix;
 }
 
 static int is_tdz_kind(int k) { return k == D_LET || k == D_CONST || k == D_CLASS || k == D_CLASSNAME; }
@@ -378,11 +417,67 @@ static int is_tdz_kind(int k) { return k == D_LET || k == D_CONST || k == D_CLAS
 static int is_evalvar_scope(struct scope* s) { return s->has_eval == 2; }   // holds the *evalvars* binding
 
 // resolve `name` as seen from scope `s` in function c
+static void resolve(struct cfunc* c, struct str* name, struct scope* s, struct ref* r);
+
+// resolve a free name through the stub being filled (lazy first-call compile):
+// its upvalue table was computed when the enclosing function compiled; the
+// body being compiled must reference those same cells by index. An eagerly
+// compiled function inside the fill captures the cell through its OWN upvals
+// table: desc (0, stub index) = "the filled function's upval #index" — the
+// stub's cells are already wired into its closures.
+static int lazy_lookup(struct cfunc* c, struct str* name, struct ref* r, int withs) {
+    struct ftempl* t = c->lm;
+    for (uint16_t i = 0; i < t->nupvals; i++) {
+        if (t->upv_names[i] == name) {
+            r->kind = R_UPVAL;
+            r->index = i;
+            r->d = 0;
+            r->name = name;
+            r->tdz = (t->upv_flags[i] & 1) != 0;
+            r->is_const = (t->upv_flags[i] & 2) != 0;
+            r->fnname = (t->upv_flags[i] & 4) != 0;
+            r->lazy_upv = 1;
+            if (withs) { r->kind = R_WITH; r->with_count = withs; }
+            if (c->stub_create) {
+                // a stub built inside this fill: its desc (0, i) means "the
+                // enclosing compiled function's upval #i" (its closures hold
+                // the map's cells)
+            } else if (c->parent) {   // not the fill's top: reference the cell through this function's own table
+                int pos = lm_upval_pos(c, i);
+                if (pos < 0) { cerr(c, 0, "internal: lazy cell capture"); return 0; }
+                r->index = pos;
+            }
+            return 1;
+        }
+    }
+    if (t->glob_names) {
+        for (uint16_t i = 0; i < t->nglob; i++) {
+            if (t->glob_names[i] == name) {
+                r->kind = withs ? R_WITH : R_GLOBAL;
+                r->with_count = withs;
+                r->d = 0;
+                r->name = name;
+                return 1;
+            }
+        }
+    }
+    if (!withs) {
+        cerr(c, 0, "internal: lazy free name unresolved");
+        return 0;
+    }
+    // with scopes may hold it dynamically: fall through to a plain global probe
+    r->kind = R_GLOBAL;
+    r->with_count = withs;
+    r->name = name;
+    return 1;
+}
+
 static void resolve(struct cfunc* c, struct str* name, struct scope* s, struct ref* r) {
     memset(r, 0, sizeof *r);
     r->name = name;
     int withs = 0;
     for (; s; s = s->parent) {
+        if (s->fn && (s->fn->flags & FI_CTX_TOP)) continue;   // the synthetic top of a lazy re-parse owns nothing
         if (s->kind == SC_WITH) { withs++; continue; }
         struct decl* d = scope_find(s, name);
         if (!d && is_evalvar_scope(s)) { withs++; continue; }
@@ -411,6 +506,7 @@ static void resolve(struct cfunc* c, struct str* name, struct scope* s, struct r
         if (withs) r->kind = R_WITH;
         return;
     }
+    if (c->lm && lazy_lookup(c, name, r, withs)) return;
     r->kind = withs ? R_WITH : R_GLOBAL;
     r->with_count = withs;
 }
@@ -454,8 +550,8 @@ static void load_ref_static(struct cfunc* c, struct ref* r, uint32_t pos, int fo
                                r->d->scope->kind != SC_MODULE && !(r->d->flags & 0x40))) {
         if (r->tdz) op16_32(c, OP_GET_LOC_CHK, (uint32_t)r->d->slot, atom_const(c, r->name), 1);
         else op16(c, OP_GET_LOC, (uint32_t)r->d->slot, 1);
-    } else if (r->d && r->kind != R_GLOBAL) {
-        int ix = r->kind == R_UPVAL ? r->index : upval_index(c, r->d);
+    } else if ((r->d && r->kind != R_GLOBAL) || (!r->d && r->lazy_upv)) {
+        int ix = r->lazy_upv || r->kind == R_UPVAL ? r->index : upval_index(c, r->d);
         if (r->tdz) op16_32(c, OP_GET_UPV_CHK, (uint32_t)ix, atom_const(c, r->name), 1);
         else op16(c, OP_GET_UPV, (uint32_t)ix, 1);
     } else {
@@ -468,15 +564,16 @@ static void load_ref_static(struct cfunc* c, struct ref* r, uint32_t pos, int fo
 static void store_ref_static(struct cfunc* c, struct ref* r, uint32_t pos, int keep, int init) {
     // value on top of the stack; keep = leave it there
     ref_kind(c, r);
-    if (r->d && r->is_const && !init) {
-        if (r->d->kind == D_FUNCNAME) {
+    if ((r->d || r->lazy_upv) && r->is_const && !init) {
+        if (r->d ? r->d->kind == D_FUNCNAME : r->fnname) {
             // assignment to a named function expression's own name: ignored (strict: TypeError)
             if (c->fi->flags & FI_STRICT) op32(c, OP_CONST_ERROR, atom_const(c, r->name), 0);
             if (!keep) op(c, OP_POP, -1);
             return;
         }
         // const: TDZ check first (a ReferenceError beats the TypeError), then TypeError
-        if (r->d->scope->fn == c->fi && r->d->slot >= 0) op16_32(c, OP_GET_LOC_CHK, (uint32_t)r->d->slot, atom_const(c, r->name), 1);
+        if (r->lazy_upv) op16_32(c, OP_GET_UPV_CHK, (uint32_t)r->index, atom_const(c, r->name), 1);
+        else if (r->d->scope->fn == c->fi && r->d->slot >= 0) op16_32(c, OP_GET_LOC_CHK, (uint32_t)r->d->slot, atom_const(c, r->name), 1);
         else op16_32(c, OP_GET_UPV_CHK, (uint32_t)upval_index(c, r->d), atom_const(c, r->name), 1);
         op(c, OP_POP, -1);
         op32(c, OP_CONST_ERROR, atom_const(c, r->name), 0);
@@ -491,8 +588,8 @@ static void store_ref_static(struct cfunc* c, struct ref* r, uint32_t pos, int k
         if (keep) op16(c, OP_SET_LOC, s, 0); else op16(c, OP_PUT_LOC, s, -1);
         return;
     }
-    if (r->d && r->kind != R_GLOBAL) {
-        uint32_t ix = r->kind == R_UPVAL ? (uint32_t)r->index : (uint32_t)upval_index(c, r->d);
+    if ((r->d && r->kind != R_GLOBAL) || (!r->d && r->lazy_upv)) {
+        uint32_t ix = (uint32_t)(r->lazy_upv || r->kind == R_UPVAL ? r->index : upval_index(c, r->d));
         if (init) { op16(c, OP_INIT_UPV, ix, 0); if (!keep) op(c, OP_POP, -1); return; }
         if (r->tdz) { op16_32(c, OP_PUT_UPV_CHK, ix, atom_const(c, r->name), 0); if (!keep) op(c, OP_POP, -1); return; }
         if (keep) op16(c, OP_SET_UPV, ix, 0); else op16(c, OP_PUT_UPV, ix, -1);
@@ -601,6 +698,24 @@ static void load_pseudo(struct cfunc* c, const char* which, uint32_t pos) {
     struct decl* d = tf ? scope_find(tf->param_scope, nm) : 0;
     if (!d && tf && (tf->flags & FI_EVAL)) {
         for (struct scope* s = c->cur_scope ? c->cur_scope : tf->param_scope; s && !d; s = s->parent) d = scope_find(s, nm);
+    }
+    if (!d && c->lm) {
+        // lazy first-call compile: the real owner is outside this parse; the stub's map holds the capture
+        struct ftempl* st = c->lm;
+        for (uint16_t i = 0; i < st->nupvals; i++) {
+            if (st->upv_names[i] == nm) {
+                struct ref r2;
+                memset(&r2, 0, sizeof r2);
+                r2.kind = R_UPVAL;
+                r2.index = i;
+                r2.name = nm;
+                r2.lazy_upv = 1;
+                r2.tdz = (st->upv_flags[i] & 1) != 0;
+                load_ref_static(c, &r2, pos, 0);
+                return;
+            }
+        }
+        // not captured: the owner is the script / module top (the frame-level ops below)
     }
     if (!d) {
         // global / module / eval code

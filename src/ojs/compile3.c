@@ -1,5 +1,6 @@
 // compile3.c — classes and the program entry points (included by compile2.c)
 
+
 jv bigint_from_literal(ojs* J, struct str* text);   // bigint.c
 
 static jv bigint_literal(ojs* J, struct str* text) { return bigint_from_literal(J, text); }
@@ -77,7 +78,7 @@ static void comp_class(struct cfunc* c, struct node* cls, struct str* inferred) 
     struct ftempl* ct;
     if (holder->c) {
         holder->c->u.fn->name = name ? name : J->A->empty;
-        ct = compile_func(J, c->P, holder->c->u.fn, c);
+        ct = compile_func(J, c->P, holder->c->u.fn, c, c->lm);
     } else ct = default_ctor_template(c, has_heritage, name, cls);
     if (!ct) { c->failed = 1; return; }
     ct->name = name ? name : J->A->empty;
@@ -370,5 +371,84 @@ struct ftempl* compile_module(ojs* J, struct parser* P, struct ftempl** init_out
 
 // a single function from source (new Function): P->top's only statement
 struct ftempl* compile_function_source(ojs* J, struct parser* P, struct funcinfo* fi) {
-    return compile_func(J, P, fi, 0);
+    return compile_func(J, P, fi, 0, 0);
+}
+
+// ---------------------------------------------------------------- lazy first-call fill
+
+// point the freshly compiled templates at the canonical source text (their own
+// parse ran on a slice/reconstruction of it; the offsets are absolute already)
+static void lazy_fix_source(struct ftempl* x, struct ftempl* stub, int depth) {
+    if (!x || depth > 200) return;
+    x->source = stub->source;
+    x->srct = stub->srct;
+    x->filename = stub->filename;
+    for (uint32_t i = 0; i < x->nconsts; i++) {
+        jv v = x->consts[i];
+        if (JV_TAG(v) == TAG_PTR && ((struct gch*)JV_PTR(v))->type == GT_FTEMPL)
+            lazy_fix_source((struct ftempl*)JV_PTR(v), stub, depth + 1);
+    }
+}
+
+// fill a lazy stub (called at the function's first call, vm.c): parse its body
+// from the function's own source range with the recorded context, compile it
+// against the stub's upvalue map, and move the result into the stub in place.
+// The stub's upvalue table must not change: closures created before the fill
+// hold cells built from it.
+struct ftempl* lazy_compile_body(ojs* J, struct ftempl* t) {
+    jv srcv = JV_UNDEFINED;
+    if (t->srct) srcv = srctext_slice(J, t->srct, 0, srctext_len(t->srct));
+    else if (t->source) srcv = jv_from_str(t->source);
+    if (!jv_is_str(srcv)) {
+        if (!jv_is_exc(srcv)) throw_syntax(J, "internal: lazy function has no source");
+        return 0;
+    }
+    struct parse_opts o;
+    memset(&o, 0, sizeof o);
+    o.kind = PARSE_SCRIPT;
+    o.strict = (t->flags & TF_STRICT) != 0;
+    o.ctx = t->ctx_flags;
+    o.start = t->src_start;
+    o.end = t->src_end;
+    struct parser P2;
+    if (parse_program(J, jv_str(srcv), &o, &P2) < 0) {
+        parse_free(&P2);
+        return 0;   // SyntaxError pending (the recorded context must reproduce the original parse)
+    }
+    struct node* s = P2.program->a;
+    if (s && s->type == N_EXPR_STMT) s = s->a;
+    if (!s || s->type != N_FUNC || s->next || P2.failed) {
+        parse_free(&P2);
+        throw_syntax(J, "internal: lazy re-parse did not yield one function");
+        return 0;
+    }
+    struct funcinfo* fi2 = s->u.fn;
+    struct ftempl* t2 = compile_func(J, &P2, fi2, 0, t);
+    if (!t2) {
+        parse_free(&P2);
+        if (!jv_is_exc(J->exc)) throw_syntax(J, "internal: lazy compile failed");
+        return 0;
+    }
+    lazy_fix_source(t2, t, 0);
+    // move the body into the stub while the collector is still paused (parse_free releases it)
+    t->code = t2->code;
+    t->code_len = t2->code_len;
+    t->consts = t2->consts;
+    t->nconsts = t2->nconsts;
+    t->nlocals = t2->nlocals;
+    t->stack_size = t2->stack_size;
+    t->this_slot = t2->this_slot;
+    t->newtarget_slot = t2->newtarget_slot;
+    t->home_slot = t2->home_slot;
+    t->callee_slot = t2->callee_slot;
+    t->args_slot = t2->args_slot;
+    t->exc = t2->exc;
+    t->nexc = t2->nexc;
+    t->lines = t2->lines;
+    t->nlines = t2->nlines;
+    t->param_map = t2->param_map;
+    t->nic = t2->nic;
+    t->flags = t2->flags | (t->flags & TF_HIDDEN);   // TF_LAZY gone; keep hide_source
+    parse_free(&P2);
+    return t;
 }

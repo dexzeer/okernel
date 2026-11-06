@@ -178,6 +178,7 @@ static jv fn_to_string(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     struct obj* o = jv_obj(this_v);
     if (obj_class(o) == OC_FUNCTION) {
         struct ftempl* t = ((struct func*)o)->t;
+        if (t->flags & TF_HIDDEN) return native_source(J, o);
         if (t->source && t->src_end > t->src_start && t->src_end <= str_len(t->source))
             return jstr_sub(J, jv_from_str(t->source), t->src_start, t->src_end);
         if (t->srct && t->src_end > t->src_start && t->src_end <= srctext_len(t->srct))
@@ -261,6 +262,7 @@ jv create_dynamic_function(ojs* J, int kind, int argc, jv* argv, jv new_target) 
         memset(&o, 0, sizeof o);
         o.kind = PARSE_SCRIPT;
         o.filename = "anonymous";
+        o.dyn_fn = 1;
         if (parse_program(J, src, &o, &P) < 0) { parse_free(&P); return JV_EXC; }
         struct node* s = P.program->a;
         if (!s || s->next || s->type != N_FUNC || s->u.fn->src_end != str_len(src)) {

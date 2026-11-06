@@ -1989,10 +1989,10 @@ void wjs_stats(struct wjs* js, char* out, int cap) {
         }
         if (n < cap - 4) out[n++] = ']';
     }
-    if (st.ic_stat[6] && n < cap - 40) {   // inline cache entries traced per collection (all ways, non-empty)
+    if (st.ic_stat[0] && n < cap - 40) {   // inline cache entries traced per collection (all ways, non-empty)
         const char* p = " ics=";
         while (*p) out[n++] = *p++;
-        unsigned vs[2] = { st.ic_stat[6] / (st.gc_count ? (unsigned)st.gc_count : 1u), st.ic_stat[7] / (st.gc_count ? (unsigned)st.gc_count : 1u) };
+        unsigned vs[2] = { st.ic_stat[0] / (st.gc_count ? (unsigned)st.gc_count : 1u), st.ic_stat[1] / (st.gc_count ? (unsigned)st.gc_count : 1u) };
         for (int k = 0; k < 2; k++) {
             unsigned v = vs[k]; char d[12]; int dl = 0;
             do { d[dl++] = (char)('0' + v % 10); v /= 10; } while (v);
