@@ -7,3 +7,7 @@ Moved from AGENTS.md to keep that file short.
 ## The terminal
 
 Programs in a terminal window write through an xterm-style parser in `src/lx_tty.c` (TERM=xterm: cursor movement, erase, insert and delete, scroll regions, SGR colours including 256 and RGB, the alternate screen, DECCKM). The cursor is the window's own, so the shell carries on where a program stopped; `lx_tty_release` resets the terminal when the window's last program exits. The cell font is single-byte: UTF-8 is decoded, line drawing becomes ASCII, anything else `?`. Keys without a character come through `keyboard_set_ext_callback`; arrows, Home/End, PgUp/PgDn, Insert/Delete and Esc reach a program only when it reads raw, other windows keep the old scroll codes. OSC 7777 prints the cell grid on serial for tests. Test: `tests/headless/test_lx_term.py` (`lx/src/vtcheck.c`, plus real nano, vim and curl from `tools/lx/real_progs.sh`).
+
+## DOSBox
+
+Ubuntu's prebuilt DOSBox 0.74 (SDL 1.2 compat on SDL2 on Xlib, dynamic CPU core) runs against `xokai`: `tools/lx/dosbox_root.sh` adds it to a test root, `tests/headless/test_lx_dosbox.py` runs it. It needs more than the default 512 MB of guest memory (`OKVM_MEM=2048`). Silent: there is no Linux sound device yet. Frame rate and a real graphics program are not measured yet.

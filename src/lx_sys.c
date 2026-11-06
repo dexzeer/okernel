@@ -389,7 +389,7 @@ static int64_t do_openat(struct lx_task *t, int64_t dirfd, uint64_t upath, uint3
     if (n->type == LXN_DIR && (flags & LX_O_ACCMODE) != LX_O_RDONLY) return -LX_EISDIR;
     if ((flags & LX_O_TRUNC) && n->type == LXN_REG && (flags & LX_O_ACCMODE) != LX_O_RDONLY) lxfs_truncate(n, 0);
     struct lx_file *f;
-    if (n->type == LXN_CHR && (n->dev == LXDEV_FB0 || n->dev == LXDEV_EVENT0)) {
+    if (n->type == LXN_CHR && n->dev == LXDEV_FB0) {           // not the event device: libraries open it just to look for joysticks
         extern int lx_fb_open_hook(struct lx_task*);
         int hr = lx_fb_open_hook(t);
         if (hr) return hr;

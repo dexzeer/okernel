@@ -550,7 +550,7 @@ void req_dispatch(struct client *c, u8 *r, u32 len) {
     }
     case 41: return;
     case 42: {                                                                     // SetInputFocus
-        NEED(16);
+        NEED(12);
         u32 f = g32(r, 4);
         focus_win = f > 1 ? win_of(f) : 0;
         return;
