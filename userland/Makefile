@@ -23,7 +23,8 @@ $(PROGS): %: %.c $(USYS_OBJ)
 	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $< $(USYS_OBJ)
 
 # Emit bindata C include for one program: xxd -i <prog> > gen_<prog>.h
-gen:
+# (it needs the programs: under make -j "all gen" ran these two side by side)
+gen: $(PROGS)
 	for p in $(PROGS); do xxd -i $$p > gen_$$p.h; done
 
 clean:
