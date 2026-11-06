@@ -22,6 +22,14 @@
 #include <stdlib.h>
 #endif
 
+// the debug/opt-in knobs are env vars on the host; in the kernel they are off
+// (the embedder flips the engine-level switches instead)
+#if defined(KERNEL) && KERNEL
+static inline int gc_env_on(const char* name) { (void)name; return 0; }
+#else
+static inline int gc_env_on(const char* name) { const char* g = getenv(name); return g && *g == '1'; }
+#endif
+
 #define PAGE_SHIFT 14   // 16 KB pages: a realm starts with one page per size class in use
 #define PAGE_SIZE  (1u << PAGE_SHIFT)
 #define CHUNK_PAGES 64   // 1 MB chunks
@@ -342,7 +350,7 @@ void* gc_alloc(ojs* J, int type, size_t size) {
             J->gc_stress_n = 0;
             // stress alternates: three minor collections, then a major one
             static int gen_on = -1;
-            if (gen_on < 0) { const char* g = getenv("OJS_GC_GEN"); gen_on = g && *g == '1'; }
+            if (gen_on < 0) gen_on = gc_env_on("OJS_GC_GEN");
             if (++J->gc_stress_rounds % 4 == 0 || !gen_on) gc_collect(J);
             else gc_collect_minor(J);
         } else if (J->force_major || J->bytes_since_gc + size > J->gc_threshold) {
@@ -353,7 +361,7 @@ void* gc_alloc(ojs* J, int type, size_t size) {
             // The generational path is opt-in (OJS_GC_GEN=1) until its remaining
             // interaction bug is found: minors alone corrupt plain churn workloads.
             static int gen_on = -1;
-            if (gen_on < 0) { const char* g = getenv("OJS_GC_GEN"); gen_on = g && *g == '1'; }
+            if (gen_on < 0) gen_on = gc_env_on("OJS_GC_GEN");
             if (gen_on) {
                 size_t minor_budget = J->gc_threshold / 4;
                 if (minor_budget < (1u << 20)) minor_budget = 1u << 20;
@@ -923,7 +931,7 @@ void gc_free_all(ojs* J) {
 // record an old object whose fields were written (it may now point at young
 // objects); the next minor GC traces it. GCF_REM deduplicates.
 void gc_remember(ojs* J, void* holder) {
-    if (getenv("OJS_GC_NOBARRIER")) return;   // B5
+    if (gc_env_on("OJS_GC_NOBARRIER")) return;
     struct gc_heap* H = J->heap;
     if (!H) return;
     if (H->nrem >= REMSET_MAX) { J->force_major = 1; return; }
@@ -942,7 +950,7 @@ void gc_remember(ojs* J, void* holder) {
 // collections. A promoted object joins the remembered set once: its young
 // children (written while it was young, when no barrier fired) must be found.
 static void minor_survive(ojs* J, struct gch* g) {
-    if (getenv("OJS_GC_NOAGE")) { return; }   // B4: aging off
+    if (gc_env_on("OJS_GC_NOAGE")) return;
     uint32_t age = (g->gcflags & GCF_AGE) >> 5;
     if (g->gcflags & GCF_PINNED || age >= GCF_AGE_MAX) {
         g->gcflags &= (uint8_t)~GCF_AGE;
@@ -991,7 +999,7 @@ void gc_collect_minor(ojs* J) {
     // OJS_GC_VERIFY: re-trace everything marked, ignoring generations; any young
     // object that becomes marked now would have been swept while still reachable
     // (a missing write barrier). Names the holder chain by type counts.
-    if (getenv("OJS_GC_VERIFY")) {
+    if (gc_env_on("OJS_GC_VERIFY")) {
         int fixed = 0;
         for (;;) {
             int before = 0;
@@ -1057,7 +1065,7 @@ void gc_collect_minor(ojs* J) {
                     if (g->type == GT_STR && (((struct str*)g)->h.aux & SF_ATOM)) { has_young = 1; continue; }
 #if !defined(KERNEL) || !KERNEL
                     // verify: no marked object may still point at a young object we are about to free
-                    if (getenv("OJS_GC_VERIFY")) {
+                    if (gc_env_on("OJS_GC_VERIFY")) {
                         int refd = 0;
                         for (int c2 = 0; c2 < NCLASSES && !refd; c2++)
                             for (struct page* p2 = H->pages[c2]; p2 && !refd; p2 = p2->next)
@@ -1089,7 +1097,7 @@ void gc_collect_minor(ojs* J) {
 #endif
                     if (g->gcflags & GCF_FINAL) gc_finalize(J, g);
 #if !defined(KERNEL) || !KERNEL
-                    if (getenv("OJS_GC_POISON") && p->objsize <= 64) memset((uint8_t*)g + 2, 0xCC, p->objsize - 2 > 40 ? 40 : p->objsize - 2);
+                    if (gc_env_on("OJS_GC_POISON") && p->objsize <= 64) memset((uint8_t*)g + 2, 0xCC, p->objsize - 2 > 40 ? 40 : p->objsize - 2);
 #endif
                     g->type = GT_FREE;
                     g->gcflags = 0;
