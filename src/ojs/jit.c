@@ -606,6 +606,11 @@ static void mov64_rm(struct cg* c, int r, int base, int32_t d) { rex(c, 1, r, 0,
 static void mov64_mr(struct cg* c, int base, int32_t d, int r) { rex(c, 1, r, 0, base); em8(c, 0x89); mrm(c, r, base, d); }
 static void mov64_ri(struct cg* c, int r, uint64_t imm) { rex(c, 1, 0, 0, r); em8(c, 0xB8 + (uint32_t)(r & 7)); em64(c, imm); }
 static void mov64_rr(struct cg* c, int dst, int src) { rex(c, 1, src, 0, dst); em8(c, 0x89); em8(c, (uint32_t)(0xC0 | ((src & 7) << 3) | (dst & 7))); }
+static void sub64_ri(struct cg* c, int r, int32_t imm) {
+    rex(c, 1, 0, 0, r);
+    if (imm >= -128 && imm <= 127) { em8(c, 0x83); em8(c, (uint32_t)(0xE8 | (r & 7))); em8(c, (uint32_t)imm); }
+    else { em8(c, 0x81); em8(c, (uint32_t)(0xE8 | (r & 7))); em32(c, (uint32_t)imm); }
+}
 static void cmp64_rm(struct cg* c, int r, int base, int32_t d) { rex(c, 1, r, 0, base); em8(c, 0x3B); mrm(c, r, base, d); }
 static void cmp64_rr(struct cg* c, int a, int b) { rex(c, 1, b, 0, a); em8(c, 0x39); em8(c, (uint32_t)(0xC0 | ((b & 7) << 3) | (a & 7))); }
 static void or64_rr(struct cg* c, int a, int b) { rex(c, 1, b, 0, a); em8(c, 0x09); em8(c, (uint32_t)(0xC0 | ((b & 7) << 3) | (a & 7))); }
@@ -669,6 +674,22 @@ static void set_frame_sp(struct cg* c, int d) {                     // clobbers 
     mov64_mr(c, RF, F_OFF(sp), RAX);
 }
 
+
+// the generational write barrier for compiled stores: RAX holds the GC container
+// written into (a valarr's data or the container itself — adjusted by the caller),
+// the stored value is frame slot V. Falls through when no record is needed.
+static void wb_emit(struct cg* c, int V) {
+    uint32_t done = new_label(c);
+    movzx16_rm(c, RCX, SLOT_TAG(V));
+    alu_ri(c, 7, RCX, (int32_t)TAG_OBJ); jcc(c, CC_B, done);          // not a pointer value
+    test_mi(c, RAX, (int32_t)offsetof(struct gch, gcflags), GCF_OLD); jcc(c, CC_E, done);   // young container
+    load_ptr(c, RCX, V);
+    test_mi(c, RCX, (int32_t)offsetof(struct gch, gcflags), GCF_OLD | GCF_REM); jcc(c, CC_NE, done);   // old target or already recorded
+    mov64_rr(c, RDI, RJ);
+    mov64_rr(c, RSI, RAX);
+    // BISECT: the call is skipped; the checks alone must be harmless
+    bind(c, done);
+}
 // ---- the step call: run the instruction at `ord` in the interpreter and continue wherever it says
 static void gen_step(struct cg* c, uint32_t ord, int d) {
     struct ftempl* t = c->t;
@@ -1090,6 +1111,8 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         ic_lookup(c, &t->ic[(size_t)ici * IC_WAYS], miss);
         mov64_rm(c, RAX, RAX, (int32_t)offsetof(struct obj, slots));
         mov64_rm(c, RDX, SLOT_LO(V)); mov64_xr(c, RAX, RCX, 0, RDX);
+        sub64_ri(c, RAX, (int32_t)offsetof(struct valarr, v));     // o->slots (data) -> the valarr header
+        wb_emit(c, V);                       // generational barrier
         CPY(ST(O), ST(V));
         break;
     }
@@ -1132,6 +1155,9 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
         mov64_ri(c, RDX, JV_HOLE);
         cmp64_rm(c, RDX, RAX, 0); jcc(c, CC_E, SLOW());                  // a hole
         mov64_rm(c, RCX, SLOT_LO(V)); mov64_mr(c, RAX, 0, RCX);
+        // bisect: PUT_ELEM barrier off
+        // sub64_ri(c, RAX, (int32_t)offsetof(struct valarr, v));
+        // wb_emit(c, V);
         CPY(ST(O), ST(V));
         jmp(c, NEXT_L);
         bind(c, hl);
@@ -1198,7 +1224,7 @@ static void gen_ins(struct cg* c, uint32_t ord, int d) {
 #undef NEXT_L
 }
 
-// ---- the whole function
+
 static int jit_compile_(ojs* J, struct ftempl* t);
 int jit_compile(ojs* J, struct ftempl* t) {
 #if !defined(__x86_64__)

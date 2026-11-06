@@ -179,6 +179,7 @@ struct str* str_flat(ojs* J, jv v) {
     uint32_t at = 0;
     copy_units(J, v, s, &at);
     r->flat = s;
+    gc_wb_p(J, r, s);
     // drop the halves: the rope is now an indirection to the flat string
     r->left = r->right = jv_from_str(s);
     r->depth = 0;

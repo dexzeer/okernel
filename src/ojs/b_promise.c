@@ -135,6 +135,7 @@ static void fulfill(ojs* J, struct promise* p, jv v) {
     if (p->state != PS_PENDING) return;
     jv list = p->reactions;
     p->result = v;
+    gc_wb(J, p, v);
     p->reactions = JV_UNDEFINED;
     p->state = PS_FULFILLED;
     trigger_reactions(J, list, 0, v);
@@ -144,6 +145,7 @@ static void reject(ojs* J, struct promise* p, jv reason) {
     if (p->state != PS_PENDING) return;
     jv list = p->reactions;
     p->result = reason;
+    gc_wb(J, p, reason);
     p->reactions = JV_UNDEFINED;
     p->state = PS_REJECTED;
     if (!p->handled) track_rejection(J, p, 0);

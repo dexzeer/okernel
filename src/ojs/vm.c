@@ -236,6 +236,7 @@ void close_upvals(ojs* J, struct ojs_frame* f, jv* from) {
         struct upval* u = f->open;
         if (f->uidx) { size_t i = (size_t)(u->loc - f->locals); if (i < f->uidx_n) f->uidx[i] = 0; }
         u->closed = *u->loc;
+        gc_wb(J, u, u->closed);
         u->loc = &u->closed;
         f->open = u->next_open;
         u->next_open = 0;

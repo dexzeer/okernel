@@ -600,6 +600,7 @@ static int link_module(ojs* J, struct module_rec* m) {
             jv ns = get_namespace(J, d);
             if (ns == JV_EXC) { m->status = MS_NEW; return -1; }
             m->cells[cell]->closed = ns;
+            gc_wb(J, m->cells[cell], ns);
             continue;
         }
         struct rset set;
@@ -616,7 +617,7 @@ static int link_module(ojs* J, struct module_rec* m) {
             jv ns = get_namespace(J, r.m);
             if (ns == JV_EXC) { m->status = MS_NEW; return -1; }
             m->cells[cell]->closed = ns;
-        } else m->cells[cell] = r.m->cells[r.cell];
+        } else { m->cells[cell] = r.m->cells[r.cell]; gc_wb_p(J, m, m->cells[cell]); }
     }
     if (run_init(J, m) == JV_EXC) { m->status = MS_NEW; return -1; }
     m->status = MS_LINKED;

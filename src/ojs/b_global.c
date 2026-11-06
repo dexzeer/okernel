@@ -66,6 +66,7 @@ int global_put(ojs* J, struct str* name, jv v, int strict) {
         if (L->slots[i] == JV_HOLE) { tdz(J, name); return -1; }
         if (!(L->shape->props[i].attrs & PA_WRITABLE)) { throw_type(J, "Assignment to constant variable."); return -1; }
         L->slots[i] = v;
+        gc_wb(J, valarr_of(L->slots), v);
         return 0;
     }
     struct obj* g = J->I.global;
@@ -73,6 +74,7 @@ int global_put(ojs* J, struct str* name, jv v, int strict) {
         int j = shape_find(g->shape, k);
         if (j >= 0 && (g->shape->props[j].attrs & (PA_ACCESSOR | PA_WRITABLE)) == PA_WRITABLE) {
             g->slots[j] = v;
+            gc_wb(J, valarr_of(g->slots), v);
             return 0;
         }
     }
@@ -178,6 +180,7 @@ int global_init_lex(ojs* J, struct str* name, jv v) {
         return obj_define_value(J, L, k, v, PA_WRITABLE);
     }
     L->slots[i] = v;
+    gc_wb(J, valarr_of(L->slots), v);
     return 0;
 }
 

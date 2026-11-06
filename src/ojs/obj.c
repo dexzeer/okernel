@@ -179,6 +179,7 @@ static int shape_append(ojs* J, struct obj* o, pkey k, uint32_t attrs) {
         jv* ns = valarr_grow(J, o->slots, cap, nc, JV_UNDEFINED);
         if (!ns) return -1;
         o->slots = ns;
+        gc_wb_p(J, o, valarr_of(ns));
     }
     return (int)idx;
 }
@@ -296,6 +297,7 @@ static int elems_reserve(ojs* J, struct obj* o, uint32_t n) {
     jv* e = valarr_grow(J, o->elems, cap, nc, JV_HOLE);
     if (!e) return -1;
     o->elems = e;
+    gc_wb_p(J, o, valarr_of(e));
     o->ecap = nc;
     return 0;
 }
@@ -317,6 +319,7 @@ int elems_to_slow(ojs* J, struct obj* o) {
         int idx = shape_append(J, o, k, attrs);
         if (idx < 0) return -1;
         o->slots[idx] = e[i];
+        gc_wb(J, valarr_of(o->slots), e[i]);
     }
     return 0;
 }
@@ -444,6 +447,7 @@ static int put_prop(ojs* J, struct obj* o, pkey k, uint32_t attrs, jv value, jv 
     if (L->kind == 2) {
         if (!accessor && attrs == PA_DEFAULT && !(o->flags & (OF_FROZEN_ELEMS | OF_SEALED_ELEMS))) {
             o->elems[L->idx] = value;
+            gc_wb(J, valarr_of(o->elems), value);
             return 0;
         }
         if (elems_to_slow(J, o) < 0) return -1;
@@ -454,6 +458,7 @@ static int put_prop(ojs* J, struct obj* o, pkey k, uint32_t attrs, jv value, jv 
         uint32_t i = PK_INDEX(k);
         if (elems_reserve(J, o, i + 1) < 0) return -1;
         o->elems[i] = value;
+        gc_wb(J, valarr_of(o->elems), value);
         if (i >= o->elen) o->elen = i + 1;
         return 0;
     }
@@ -467,11 +472,13 @@ static int put_prop(ojs* J, struct obj* o, pkey k, uint32_t attrs, jv value, jv 
     if (L->kind == 1) {
         if (shape_set_attrs(J, o, L->idx, attrs) < 0) return -1;
         o->slots[L->idx] = slotv;
+        gc_wb(J, valarr_of(o->slots), slotv);
         return 0;
     }
     int idx = shape_append(J, o, k, attrs);
     if (idx < 0) return -1;
     o->slots[idx] = slotv;
+    gc_wb(J, valarr_of(o->slots), slotv);
     return 0;
 }
 
@@ -535,6 +542,7 @@ int validate_and_apply(ojs* J, struct obj* o, pkey k, int extensible, const stru
             struct accessor* b = accessor_new(J, n.get, n.set);
             if (!b) return -1;
             o->slots[L.idx] = jv_from_obj(&b->base);
+            gc_wb(J, valarr_of(o->slots), jv_from_obj(&b->base));
         }
         return shape_set_attrs(J, o, L.idx, attrs) < 0 ? -1 : 1;
     }
@@ -808,8 +816,8 @@ int ord_set(ojs* J, struct obj* o, pkey k, jv v, jv receiver) {
             if (found) {
                 // fast path: writable own data property of the receiver itself
                 if (!(L.attrs & PA_ACCESSOR) && (L.attrs & PA_WRITABLE) && receiver == jv_from_obj(cur) && L.kind != 3) {
-                    if (L.kind == 1) cur->slots[L.idx] = v;
-                    else cur->elems[L.idx] = v;
+                    if (L.kind == 1) { cur->slots[L.idx] = v; gc_wb(J, valarr_of(cur->slots), v); }
+                    else { cur->elems[L.idx] = v; gc_wb(J, valarr_of(cur->elems), v); }
                     return 1;
                 }
                 ord_get_own(J, cur, k, &d);
@@ -1014,6 +1022,7 @@ int obj_set_proto(ojs* J, struct obj* o, struct obj* proto) {
     proto_touch(J, o);                       // everything below o now resolves differently
     if (proto) proto->flags |= OF_PROTO;
     o->proto = proto;
+    gc_wb_p(J, o, proto);
     return 1;
 }
 
@@ -1192,6 +1201,7 @@ int obj_append_raw(ojs* J, struct obj* o, pkey k, uint32_t attrs, jv v) {
     int idx = shape_append(J, o, k, attrs);
     if (idx < 0) return -1;
     o->slots[idx] = v;
+    gc_wb(J, valarr_of(o->slots), v);
     return 0;
 }
 

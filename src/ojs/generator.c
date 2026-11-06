@@ -69,7 +69,7 @@ static struct heapframe* heap_frame(ojs* J, struct func* fn, jv this_v, int argc
     f->flags = FRF_HEAP;
     for (uint32_t i = 0; i < t->nlocals; i++) h->v[i] = JV_UNDEFINED;
     int np = t->nparams < argc ? t->nparams : argc;
-    for (int i = 0; i < np; i++) h->v[i] = argv[i];
+    for (int i = 0; i < np; i++) { h->v[i] = argv[i]; gc_wb(J, h, argv[i]); }
     if (t->this_slot >= 0) h->v[t->this_slot] = this_v;
     if (t->newtarget_slot >= 0) h->v[t->newtarget_slot] = new_target;
     if (t->home_slot >= 0) h->v[t->home_slot] = fn->home;

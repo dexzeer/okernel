@@ -43,6 +43,7 @@ static int has_i(ojs* J, struct obj* o, double i) {
 static int set_i(ojs* J, struct obj* o, double i, jv v) {
     if (is_fast(o) && !(o->flags & (OF_FROZEN_ELEMS | OF_SEALED_ELEMS)) && i < o->elen && o->elems[d2u32(i)] != JV_HOLE) {
         o->elems[d2u32(i)] = v;
+        gc_wb(J, valarr_of(o->elems), v);
         return 0;
     }
     pkey k = idx_key(J, i);
@@ -149,7 +150,7 @@ static jv array_ctor(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     }
     struct obj* a = array_create(J, 0, proto);
     if (!a || obj_elems_reserve(J, a, (uint32_t)argc) < 0) return JV_EXC;
-    for (int i = 0; i < argc; i++) a->elems[i] = argv[i];
+    for (int i = 0; i < argc; i++) { a->elems[i] = argv[i]; gc_wb(J, valarr_of(a->elems), argv[i]); }
     a->elen = a->alen = (uint32_t)argc;
     return jv_from_obj(a);
 }
@@ -254,7 +255,7 @@ static jv ap_push(ojs* J, jv this_v, int argc, jv* argv, int magic) {
         (o->flags & OF_EXTENSIBLE) && (uint64_t)o->alen + (uint64_t)argc <= 0x7FFFFFFFu && !J->I.aproto_indexed) {
         uint32_t n = o->alen;
         if (obj_elems_reserve(J, o, n + (uint32_t)argc) < 0) return JV_EXC;
-        for (int i = 0; i < argc; i++) o->elems[n + (uint32_t)i] = argv[i];
+        for (int i = 0; i < argc; i++) { o->elems[n + (uint32_t)i] = argv[i]; gc_wb(J, valarr_of(o->elems), argv[i]); }
         o->elen = o->alen = n + (uint32_t)argc;
         return jv_number((double)o->alen);
     }

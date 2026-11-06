@@ -91,6 +91,14 @@ static inline int ic_get_str(ojs* J, struct ftempl* t, uint32_t i, jv* out) {
 }
 
 // the way to write into: the one already holding shape s, else a free one, else the older one (the newest entry lives in way 0)
+// the IC entries name young objects (shapes, holders, prototypes) that can die
+// in a minor collection before this template is traced again: an old template
+// is marked but not traced by a minor GC, so record it — the drain re-runs
+// ftempl_trace, which marks everything the entries hold
+static void ic_barrier(ojs* J, struct ftempl* t) {
+    if (((struct gch*)t)->gcflags & GCF_OLD && !(((struct gch*)t)->gcflags & GCF_REM)) gc_remember(J, t);
+}
+
 static struct ic* ic_way(struct ic* e, struct shape* s) {
     for (int w = 0; w < IC_WAYS; w++) if (e[w].shape == s) { e[w].fshape = 0; return &e[w]; }       // (the filler sets fshape again if the entry qualifies)
     for (int w = 0; w < IC_WAYS; w++) if (!e[w].shape) { memmove(e + 1, e, (size_t)w * sizeof *e); e->fshape = 0; return e; }
@@ -113,10 +121,10 @@ static void ic_fill_get_str(ojs* J, struct ftempl* t, uint32_t i, pkey k) {
     e->hshape = h->shape;
     e->proto = 0;
     e->aux = 0;
-    e->aux = 0;
     e->key = k;
     e->slot = (uint32_t)j;
     e->epoch = J->proto_epoch;
+    ic_barrier(J, t);
 }
 
 // the first prototype of o's chain that has k (a data property), or 0; *slot its slot. Fails (returns -1) when something on the way makes the
@@ -164,6 +172,7 @@ static void ic_fill_get(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, pke
     e->aux = acc ? 2 : 0;
     e->epoch = J->proto_epoch;
     if (!h && !acc && !s->dict) { e->fshape = s; e->fslot = slot; }      // compiled code: an own data property of a shared shape
+    ic_barrier(J, t);
 }
 
 // cached [[Set]]: an own writable data property, the addition of a property (the shape after it is cached), or a setter. Returns 1 when done,
@@ -235,6 +244,7 @@ static void ic_fill_put(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, pke
         e->aux = acc ? 3 : 0;
         e->key = k; e->slot = slot; e->epoch = J->proto_epoch;
         if (!h && !acc && !s->dict) { e->fshape = s; e->fslot = slot; }      // compiled code: an own writable data property of a shared shape
+        ic_barrier(J, t);
         return;
     }
     // the shape moved: if exactly one property was appended to a shared shape, remember the transition. It stays valid while the prototype
@@ -253,6 +263,7 @@ static void ic_fill_put(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, pke
     e->shape = before; e->holder = 0; e->proto = o->proto;
     e->hshape = s; e->aux = 1;                         // aux 1: this entry adds a property, hshape is the shape after
     e->key = k; e->slot = idx; e->epoch = J->proto_epoch;
+    ic_barrier(J, t);
 }
 
 
@@ -290,6 +301,7 @@ static void ic_fill_define(ojs* J, struct ftempl* t, uint32_t i, struct obj* o, 
     e = ic_way(e, before);
     e->shape = before; e->holder = 0; e->proto = 0; e->hshape = s; e->aux = 1;
     e->key = k; e->slot = idx; e->epoch = 0;
+    ic_barrier(J, t);
 }
 
 // globals: a binding of the global lexical environment, or a data property of the
@@ -353,6 +365,7 @@ static void ic_fill_global(ojs* J, struct ftempl* t, uint32_t i, pkey k, int for
     e->key = k;
     e->slot = (uint32_t)j;
     e->aux = L->shape->nprops;
+    ic_barrier(J, t);
 }
 
 // [[Get]] with a fast path for ordinary own data properties
@@ -446,6 +459,7 @@ static int put_elem(ojs* J, jv base, jv key, jv v, int strict) {
         if ((fl & ~(OF_EXTENSIBLE | OF_LEN_RO)) == OF_ARRAY_FAST) {
             if (i < o->elen && o->elems[i] != JV_HOLE) {
                 o->elems[i] = v;
+                gc_wb(J, valarr_of(o->elems), v);
                 return 0;
             }
             // appending to a dense array: a[a.length] = v
@@ -453,6 +467,7 @@ static int put_elem(ojs* J, jv base, jv key, jv v, int strict) {
                 fl == (OF_ARRAY_FAST | OF_EXTENSIBLE) && protos_index_free(o->proto)) {
                 if (obj_elems_reserve(J, o, i + 1) < 0) return -1;
                 o->elems[i] = v;
+                gc_wb(J, valarr_of(o->elems), v);
                 o->elen = o->alen = i + 1;
                 return 0;
             }
@@ -725,6 +740,7 @@ static int array_push_fast(ojs* J, struct obj* a, jv v) {
     if ((a->flags & OF_ARRAY_FAST) && a->elen == n) {
         if (obj_elems_reserve(J, a, n + 1) < 0) return -1;
         a->elems[n] = v;
+        gc_wb(J, valarr_of(a->elems), v);
         a->elen = n + 1;
         a->alen = n + 1;
         return 0;

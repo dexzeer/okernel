@@ -236,8 +236,8 @@ jv vm_run(ojs* J, struct ojs_frame* f) {
             break;
         }
         case OP_GET_UPV: L_OP_GET_UPV: PUSH(*upv[rd16(pc)]->loc); pc += 2; break;
-        case OP_SET_UPV: L_OP_SET_UPV: *upv[rd16(pc)]->loc = TOP; pc += 2; break;
-        case OP_PUT_UPV: L_OP_PUT_UPV: *upv[rd16(pc)]->loc = POP(); pc += 2; break;
+        case OP_SET_UPV: L_OP_SET_UPV: { struct upval* uv = upv[rd16(pc)]; *uv->loc = TOP; if (uv->loc == &uv->closed) gc_wb(J, uv, TOP); pc += 2; break; }
+        case OP_PUT_UPV: L_OP_PUT_UPV: { struct upval* uv = upv[rd16(pc)]; jv vv = POP(); *uv->loc = vv; if (uv->loc == &uv->closed) gc_wb(J, uv, vv); pc += 2; break; }
         case OP_INIT_UPV: L_OP_INIT_UPV: *upv[rd16(pc)]->loc = TOP; pc += 2; break;
         case OP_GET_UPV_CHK: L_OP_GET_UPV_CHK: {
             uint16_t s = rd16(pc);

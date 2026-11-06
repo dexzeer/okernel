@@ -137,6 +137,10 @@ enum gc_type {
 #define GCF_MARK   0x01
 #define GCF_PINNED 0x02     // never collected (intrinsic tables)
 #define GCF_FINAL  0x04     // has a finalizer (sweep calls obj_finalize)
+#define GCF_OLD    0x08     // generational: promoted; minor GCs mark but do not trace it (young children come via the remembered set)
+#define GCF_REM    0x10     // in the remembered set (an old object written since the last minor GC)
+#define GCF_AGE    0x60     // minor-GC survival count (2 bits); GCF_AGE_MAX promotions happen at the next minor GC
+#define GCF_AGE_MAX 3
 
 struct gch {
     uint8_t type;
@@ -158,7 +162,25 @@ void  gc_mark_value(ojs* J, jv v);
 void  gc_mark_ptr(ojs* J, void* p);
 void  gc_init(ojs* J);
 void  gc_free_all(ojs* J);
-void  gc_write_barrier(ojs* J, void* holder);            // (non-incremental: no-op)
+void  gc_remember(ojs* J, void* holder);                 // put an old object into the remembered set (generational GC)
+
+// generational write barriers: after storing `v`/`p` into a field of `holder`,
+// record the holder if an old object may now point at a young one. Cheap when
+// either side is young (the common case: new objects are young).
+static inline void gc_wb(ojs* J, void* holder, jv v) {
+    if (!(((struct gch*)holder)->gcflags & GCF_OLD)) return;
+    if (JV_TAG(v) < TAG_OBJ) return;
+    struct gch* g = (struct gch*)JV_PTR(v);
+    if (g->gcflags & (GCF_OLD | GCF_REM)) return;
+    gc_remember(J, holder);
+}
+static inline void gc_wb_p(ojs* J, void* holder, void* p) {
+    if (!p) return;
+    if (!(((struct gch*)holder)->gcflags & GCF_OLD)) return;
+    struct gch* g = (struct gch*)p;
+    if (g->gcflags & (GCF_OLD | GCF_REM)) return;
+    gc_remember(J, holder);
+}
 
 // arrays of values owned by an object (realloc-able, gc-managed)
 struct valarr { struct gch h; uint32_t cap; uint32_t pad; jv v[]; };
@@ -414,6 +436,11 @@ struct ojs {
     void* mem_guard_ud;
     int gc_disabled;            // during init / sensitive sections
     uint32_t gc_stress, gc_stress_n;   // testing: collect every gc_stress allocations
+    uint32_t gc_stress_rounds;  // testing: stress collections so far (alternates minor / major)
+    size_t bytes_since_minor;   // allocation since the last minor collection (generational nursery budget)
+    int force_major;            // the next collection must be a full one (remembered-set overflow)
+    uint32_t minor_count;       // statistics: minor collections so far
+    uint64_t minor_freed;       // statistics: bytes the minor collections reclaimed
     int in_gc;
     // conservative stack scan bounds
     void* stack_top;            // highest address of the C stack region in use (set on entry)
@@ -639,6 +666,7 @@ static inline void set_proto_raw(ojs* J, struct obj* o, struct obj* p) {
     if (o->flags & OF_PROTO) J->proto_epoch++;
     if (p) p->flags |= OF_PROTO;
     o->proto = p;
+    gc_wb_p(J, o, p);
 }
 
 #endif

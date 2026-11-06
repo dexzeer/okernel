@@ -39,7 +39,26 @@ Things to know
   objects and hot sites stay warm across the 20-30 collections of a big
   page load. Entries holding a shape die with their template; a proto-chain
   entry re-checks the realm's proto epoch, so a prototype change invalidates
-  it without a collection.
+  it without a collection. Because a minor collection does not trace old
+  templates, every IC fill on an old template records the template
+  (ic_barrier), so the next minor's remembered-set drain re-runs
+  ftempl_trace over what the entries name.
+* The collector has a generational path (gc_collect_minor): per-object
+  generations (GCF_OLD/GCF_AGE), write barriers at every mutation funnel
+  (gc_wb / gc_wb_p in ojs_int.h; the JIT emits its own after PUT_FIELD and
+  PUT_ELEM), a remembered set (gc_remember), promotion with a scan, and a
+  young-only sweep that leaves the allocator's avail lists alone. A full
+  collection demotes every survivor, so the old-generation invariant ("old
+  objects with young children are recorded") holds vacuously after it.
+  It is OPT-IN (OJS_GC_GEN=1): a plain churn workload still corrupts with
+  minors on (mini2.js in build-host/night reproduces: 400x2000 object
+  pushes, unmarked-reachable checks pass, so the bug is a write, not a
+  free). Debug knobs: OJS_GC_VERIFY re-traces everything marked ignoring
+  generations before the sweep, OJS_GC_VERIFY with the sweep's own check
+  aborts on a free of a referenced object, OJS_GC_POISON poisons freed
+  slots, OJS_GC_NOAGE/OJS_GC_NOBARRIER bisect aging and the barriers.
+  The full collector is unaffected: test262, corpus and smoke are
+  byte-identical with minors off.
 * The realm memory limit (ojs_set_memory_limit) counts memory taken from the
   system, ArrayBuffer storage included (gc_ext_alloc); an allocation that
   would pass it collects first. ojs_set_memory_guard lets the embedder veto

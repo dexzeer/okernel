@@ -193,7 +193,7 @@ static int mt_set(ojs* J, struct mtab* t, jv k, jv v) {
         k = jv_from_str(s);
     }
     int32_t i = mt_find(J, t, k);
-    if (i >= 0) { t->e[2 * i + 1] = v; return 0; }
+    if (i >= 0) { t->e[2 * i + 1] = v; gc_wb(J, bytes_of(t->e), v); return 0; }
     if (t->n >= t->cap) {
         if (t->live < t->n / 2 && t->n >= 8) {
             if (mt_compact(J, t) < 0) return -1;
@@ -205,6 +205,7 @@ static int mt_set(ojs* J, struct mtab* t, jv k, jv v) {
             if (t->n) memcpy(e, t->e, (size_t)t->n * 2 * sizeof(jv));
             for (uint32_t x = t->n * 2; x < nc * 2; x++) e[x] = JV_HOLE;
             t->e = e;
+            gc_wb_p(J, t, bytes_of(e));
             t->cap = nc;
         }
     }
@@ -217,6 +218,8 @@ static int mt_set(ojs* J, struct mtab* t, jv k, jv v) {
     uint32_t n = t->n++;
     t->e[2 * n] = k;
     t->e[2 * n + 1] = v;
+    gc_wb(J, bytes_of(t->e), k);
+    gc_wb(J, bytes_of(t->e), v);
     t->live++;
     uint32_t m = t->hsize - 1, j = key_hash(J, k) & m;
     while (t->idx[j] >= 0) j = (j + 1) & m;
@@ -772,6 +775,7 @@ static jv weakref_ctor(ojs* J, jv this_v, int argc, jv* argv, int magic) {
     if (ov == JV_EXC) return JV_EXC;
     struct weakref* r = (struct weakref*)jv_obj(ov);
     r->target = argv[0];
+    gc_wb(J, r, r->target);
     r->next = J->weak_refs;
     J->weak_refs = &r->base;
     return ov;
@@ -817,6 +821,9 @@ static int cells_push(ojs* J, struct finreg* f, jv a, jv b, jv d) {
     f->cells[f->ncells++] = a;
     f->cells[f->ncells++] = b;
     f->cells[f->ncells++] = d;
+    gc_wb(J, bytes_of(f->cells), a);
+    gc_wb(J, bytes_of(f->cells), b);
+    gc_wb(J, bytes_of(f->cells), d);
     return 0;
 }
 

@@ -14,6 +14,7 @@ int  gc_is_marked(const void* p);
 size_t gc_live_bytes(ojs* J);
 void gc_scan_conservative(ojs* J, const void* lo, const void* hi);   // mark whatever the words point into
 size_t gc_live_of_type(ojs* J, int type);
+void gc_collect_minor(ojs* J);   // generational: mark young + remembered set only
 
 static inline struct gbytes* bytes_of(void* d) { return (struct gbytes*)((char*)d - offsetof(struct gbytes, d)); }
 static inline void gc_mark_bytes(ojs* J, void* d) { if (d) gc_mark_ptr(J, bytes_of(d)); }

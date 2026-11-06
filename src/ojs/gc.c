@@ -38,9 +38,10 @@ struct page {
     uint32_t nobj;
     uint32_t nfree;
     uint16_t cls;
-    uint16_t swept;
+    uint16_t in_young;          // the page is in the heap's young list (holds at least one young object)
     struct page* next;          // all pages of this class
     struct page* anext;         // pages of this class with free objects (the allocation stack)
+    struct page* ynext;         // pages of this class holding young objects (the minor GC walks these)
     struct gch* free;           // free list (linked through the object body)
     uint8_t* data;              // first object
 };
@@ -80,16 +81,22 @@ struct gc_heap {
     uintptr_t ownedlo, ownedhi;          // address range of every page ever owned: most stack words fail this test at once
     struct page* pages[NCLASSES];        // class -> page list
     struct page* avail[NCLASSES];        // class -> stack of pages with free objects (linked by anext)
+    struct page* young[NCLASSES];        // class -> pages holding young objects (linked by ynext)
     struct chunk* chunks;
     struct page* spare;                  // carved, unused pages
     struct large* large;
     int nlarge, caplarge;
+    struct gch** remset;                 // remembered old objects (generational: written since the last minor GC)
+    int nrem, caprem;
+    uint32_t minor_count;                // statistics
     struct marker m0;                    // the calling thread's mark stack
     int mark_overflow;
     size_t live_after_gc;
     size_t live_by_type[GT_COUNT];
     uint8_t size_to_class[(4096 / 8) + 1];
 };
+
+#define REMSET_MAX 65536   // beyond this a minor GC costs more than a major one: force the major instead
 
 // ---------------------------------------------------------------- pages
 
@@ -151,6 +158,9 @@ static int page_set_owned(struct gc_heap* H, uintptr_t addr, int on) {
 
 #define CHUNK_BYTES ((size_t)CHUNK_PAGES * PAGE_SIZE + PAGE_SIZE)
 
+void gc_collect(ojs* J);
+void gc_collect_minor(ojs* J);
+
 // the realm's memory limit applies to what is taken from the system: free slots
 // and spare pages are always reusable
 static int over_limit(ojs* J, size_t bytes) {
@@ -188,7 +198,7 @@ static struct page* page_new(ojs* J, int cls) {
     p->nobj = (uint32_t)(((uintptr_t)p + PAGE_SIZE - data) / os);
     p->nfree = p->nobj;
     p->cls = (uint16_t)cls;
-    p->swept = 1;
+    p->in_young = 0;
     p->free = 0;
     // free list in address order (low addresses first: better locality)
     for (int i = (int)p->nobj - 1; i >= 0; i--) {
@@ -225,6 +235,11 @@ static void* alloc_small(ojs* J, int cls) {
     p->free = *(struct gch**)(g + 1);
     p->nfree--;
     if (!p->free) H->avail[cls] = p->anext;      // exhausted: pop
+    if (!p->in_young) {                          // the page now holds a young object: the minor GC must see it
+        p->in_young = 1;
+        p->ynext = H->young[cls];
+        H->young[cls] = p;
+    }
     return g;
 }
 
@@ -322,11 +337,29 @@ void gc_ext_free(ojs* J, void* p, size_t n) {
 void* gc_alloc(ojs* J, int type, size_t size) {
     struct gc_heap* H = J->heap;
     if (size < sizeof(struct gch) + sizeof(void*)) size = sizeof(struct gch) + sizeof(void*);
-    if (J->bytes_since_gc + size > J->gc_threshold && !J->gc_disabled && !J->in_gc && J->stack_top)
-        gc_collect(J);
-    else if (J->gc_stress && ++J->gc_stress_n >= J->gc_stress && !J->gc_disabled && !J->in_gc && J->stack_top) {
-        J->gc_stress_n = 0;
-        gc_collect(J);
+    if (!J->gc_disabled && !J->in_gc && J->stack_top) {
+        if (J->gc_stress && ++J->gc_stress_n >= J->gc_stress) {
+            J->gc_stress_n = 0;
+            // stress alternates: three minor collections, then a major one
+            static int gen_on = -1;
+            if (gen_on < 0) { const char* g = getenv("OJS_GC_GEN"); gen_on = g && *g == '1'; }
+            if (++J->gc_stress_rounds % 4 == 0 || !gen_on) gc_collect(J);
+            else gc_collect_minor(J);
+        } else if (J->force_major || J->bytes_since_gc + size > J->gc_threshold) {
+            gc_collect(J);
+        } else {
+            // the nursery: a quarter of the major threshold (floor 1 MB); the
+            // minor collection reclaims it so a full mark does not run on every burst.
+            // The generational path is opt-in (OJS_GC_GEN=1) until its remaining
+            // interaction bug is found: minors alone corrupt plain churn workloads.
+            static int gen_on = -1;
+            if (gen_on < 0) { const char* g = getenv("OJS_GC_GEN"); gen_on = g && *g == '1'; }
+            if (gen_on) {
+                size_t minor_budget = J->gc_threshold / 4;
+                if (minor_budget < (1u << 20)) minor_budget = 1u << 20;
+                if (J->bytes_since_minor + size > minor_budget) gc_collect_minor(J);
+            }
+        }
     }
     void* p;
     for (int tries = 0;; tries++) {
@@ -341,6 +374,7 @@ void* gc_alloc(ojs* J, int type, size_t size) {
     memset(p, 0, real);
     ((struct gch*)p)->type = (uint8_t)type;
     J->bytes_since_gc += real;
+    J->bytes_since_minor += real;
     J->total_alloc += real;
     return p;
 }
@@ -419,7 +453,10 @@ __attribute__((no_sanitize_address)) void gc_scan_conservative(ojs* J, const voi
     }
 }
 
-static void trace(ojs* J, struct gch* g) {
+// trace one object. thru_old: the caller is the minor GC's remembered-set drain
+// (old objects are normally skipped: their young children come from the remset).
+static void trace1(ojs* J, struct gch* g, int thru_old) {
+    if (!thru_old && (g->gcflags & GCF_OLD)) return;   // minor marking: old objects are only marked, not traced
     switch (g->type) {
     case GT_STR: case GT_BIGINT: case GT_BYTES: break;
     case GT_ROPE: {
@@ -450,6 +487,8 @@ static void trace(ojs* J, struct gch* g) {
     default: break;
     }
 }
+
+static void trace(ojs* J, struct gch* g) { trace1(J, g, 0); }
 
 static void drain(ojs* J) {
     struct gc_heap* H = J->heap;
@@ -690,13 +729,18 @@ static size_t sweep(ojs* J) {
             struct page* p = *pp;
             p->free = 0;
             p->nfree = 0;
+            int has_young = 0;
             for (int i = (int)p->nobj - 1; i >= 0; i--) {
                 struct gch* g = (struct gch*)(p->data + (size_t)i * p->objsize);
                 if (g->type != GT_FREE) {
                     if (g->gcflags & (GCF_MARK | GCF_PINNED)) {
-                        g->gcflags &= (uint8_t)~GCF_MARK;
+                        // a full collection demotes every survivor: the young/old
+                        // split rebuilds from here, so the remembered-set invariant
+                        // ("old objects with young refs are recorded") holds vacuously
+                        g->gcflags &= (uint8_t)~(GCF_MARK | GCF_OLD | GCF_AGE | GCF_REM);
                         live += p->objsize;
                         if (g->type < GT_COUNT) H->live_by_type[g->type] += p->objsize;
+                        has_young = 1;
                         continue;
                     }
                     if (g->gcflags & GCF_FINAL) gc_finalize(J, g);
@@ -715,6 +759,17 @@ static size_t sweep(ojs* J) {
                 H->spare = p;
                 continue;
             }
+            if (has_young && !p->in_young) {
+                p->in_young = 1;
+                p->ynext = H->young[c];
+                H->young[c] = p;
+            } else if (!has_young && p->in_young) {
+                p->in_young = 0;
+                // remove from the young list: walk it (the full sweep is rare)
+                struct page** yp = &H->young[c];
+                while (*yp && *yp != p) yp = &(*yp)->ynext;
+                if (*yp) *yp = p->ynext;
+            }
             if (p->free) { *atail = p; atail = &p->anext; p->anext = 0; }
             pp = &p->next;
         }
@@ -724,7 +779,7 @@ static size_t sweep(ojs* J) {
         struct large* L = &H->large[i];
         struct gch* g = (struct gch*)L->p;
         if (g->gcflags & (GCF_MARK | GCF_PINNED)) {
-            g->gcflags &= (uint8_t)~GCF_MARK;
+            g->gcflags &= (uint8_t)~(GCF_MARK | GCF_OLD | GCF_AGE | GCF_REM);
             live += L->size;
             if (g->type < GT_COUNT) H->live_by_type[g->type] += L->size;
             H->large[w++] = *L;
@@ -735,6 +790,7 @@ static size_t sweep(ojs* J) {
         ojs_sys_free(L->raw);
     }
     H->nlarge = w;
+    H->nrem = 0;   // the survivors are all young again
     return live;
 }
 
@@ -780,6 +836,8 @@ void gc_collect(ojs* J) {
     struct gc_heap* H = J->heap;
     if (J->in_gc || !H) return;
     J->in_gc = 1;
+    J->force_major = 0;
+    J->bytes_since_minor = 0;
     double t0 = ojs_sys_time_ms();
     H->m0.sp = 0;
     H->m0.overflow = 0;
@@ -855,11 +913,245 @@ void gc_free_all(ojs* J) {
     ojs_sys_free(H->large);
     ojs_sys_free(H->m0.stack);
     ojs_sys_free(H->owned);
+    ojs_sys_free(H->remset);
     ojs_sys_free(H);
     J->heap = 0;
 }
 
-void gc_write_barrier(ojs* J, void* holder) { (void)J; (void)holder; }
+// ---------------------------------------------------------------- generational
+
+// record an old object whose fields were written (it may now point at young
+// objects); the next minor GC traces it. GCF_REM deduplicates.
+void gc_remember(ojs* J, void* holder) {
+    if (getenv("OJS_GC_NOBARRIER")) return;   // B5
+    struct gc_heap* H = J->heap;
+    if (!H) return;
+    if (H->nrem >= REMSET_MAX) { J->force_major = 1; return; }
+    if (H->nrem >= H->caprem) {
+        int nc = H->caprem ? H->caprem * 2 : 256;
+        struct gch** t = (struct gch**)ojs_sys_realloc(H->remset, (size_t)nc * sizeof(struct gch*));
+        if (!t) { J->force_major = 1; return; }
+        H->remset = t;
+        H->caprem = nc;
+    }
+    ((struct gch*)holder)->gcflags |= GCF_REM;
+    H->remset[H->nrem++] = (struct gch*)holder;
+}
+
+// age a surviving young object; promote it once it has seen GCF_AGE_MAX minor
+// collections. A promoted object joins the remembered set once: its young
+// children (written while it was young, when no barrier fired) must be found.
+static void minor_survive(ojs* J, struct gch* g) {
+    if (getenv("OJS_GC_NOAGE")) { return; }   // B4: aging off
+    uint32_t age = (g->gcflags & GCF_AGE) >> 5;
+    if (g->gcflags & GCF_PINNED || age >= GCF_AGE_MAX) {
+        g->gcflags &= (uint8_t)~GCF_AGE;
+        g->gcflags |= GCF_OLD;
+        gc_remember(J, g);
+        return;
+    }
+    g->gcflags = (uint8_t)((g->gcflags & ~GCF_AGE) | ((age + 1) << 5));
+}
+
+// a minor collection: mark from the roots but trace only young objects, drain
+// the remembered set, sweep young objects only. Old objects keep their mark
+// bits (the next full sweep clears them) and are never freed here.
+void gc_collect_minor(ojs* J) {
+    struct gc_heap* H = J->heap;
+    if (J->in_gc || !H) return;
+    if (J->force_major) { gc_collect(J); return; }
+    J->in_gc = 1;
+    double t0 = ojs_sys_time_ms();
+    H->m0.sp = 0;
+    H->m0.overflow = 0;
+    H->m0.par = 0;
+    H->mark_overflow = 0;
+    J->mk = &H->m0;
+    mark_roots(J);
+    drain(J);
+    // the remembered set: old objects written since the last minor GC (their
+    // young children are reachable only through them)
+    for (int i = 0; i < H->nrem; i++) {
+        struct gch* g = H->remset[i];
+        g->gcflags &= (uint8_t)~GCF_REM;
+        trace1(J, g, 1);
+    }
+    H->nrem = 0;
+    drain(J);
+    // weak structures (a young WeakMap key may die here; targets are cleared)
+    for (;;) {
+        int more = weak_process_ephemerons(J);
+        drain(J);
+        if (!more) break;
+    }
+    finreg_process(J);
+    drain(J);
+    weak_clear_dead(J);
+#if !defined(KERNEL) || !KERNEL
+    // OJS_GC_VERIFY: re-trace everything marked, ignoring generations; any young
+    // object that becomes marked now would have been swept while still reachable
+    // (a missing write barrier). Names the holder chain by type counts.
+    if (getenv("OJS_GC_VERIFY")) {
+        int fixed = 0;
+        for (;;) {
+            int before = 0;
+            struct marker* mk = J->mk;
+            for (int c = 0; c < NCLASSES; c++)
+                for (struct page* p = H->pages[c]; p; p = p->next)
+                    for (uint32_t i = 0; i < p->nobj; i++) {
+                        struct gch* g = (struct gch*)(p->data + (size_t)i * p->objsize);
+                        if (g->type != GT_FREE && (g->gcflags & GCF_MARK)) { before += mk->sp; trace1(J, g, 1); fixed += mk->sp; while (mk->sp > 0) mk->sp--; }
+                    }
+            for (int i = 0; i < H->nlarge; i++) {
+                struct gch* g = (struct gch*)H->large[i].p;
+                if (g->gcflags & GCF_MARK) { trace1(J, g, 1); fixed += mk->sp; while (mk->sp > 0) mk->sp--; }
+            }
+            if (!fixed) break;   // stable: nothing new became marked
+            fprintf(stderr, "[gc] VERIFY: minor marking missed objects (traced %d more this round)\n", fixed);
+            (void)before;
+            fixed = 0;
+            // keep going: the loop ends when a full pass marks nothing new
+        }
+        fprintf(stderr, "[gc] VERIFY: stable\n");
+    }
+#endif
+    J->gc_mark_ms += ojs_sys_time_ms() - t0;
+    // sweep of the young generation. Pages already in avail[cls] are left
+    // untouched (their free lists keep working exactly as the allocator left
+    // them); slots freed here on other pages are collected onto those pages
+    // own free lists and the pages re-enter allocation if they had been
+    // exhausted. Nothing is returned to the spare pool and no avail entry is
+    // removed: a fully dead page simply waits for the full sweep, which owns
+    // every one of those lists. This keeps the allocators invariants trivially
+    // true while the minor GC still reclaims the common case (fresh pages of
+    // short-lived objects).
+    size_t live = 0;
+    for (int c = 0; c < NCLASSES; c++) {
+        struct page** yp = &H->young[c];
+        while (*yp) {
+            struct page* p = *yp;
+            int had_free = p->nfree > 0;   // in avail[c] (the alloc invariant)
+            int has_young = 0;
+            if (!had_free) {
+                // an exhausted page: reclaim its dead young objects
+                p->free = 0;
+                p->nfree = 0;
+                for (int i = (int)p->nobj - 1; i >= 0; i--) {
+                    struct gch* g = (struct gch*)(p->data + (size_t)i * p->objsize);
+                    if (g->type == GT_FREE) {
+                        *(struct gch**)(g + 1) = p->free;
+                        p->free = g;
+                        p->nfree++;
+                        continue;
+                    }
+                    if (g->gcflags & GCF_OLD) continue;
+                    if (g->gcflags & (GCF_MARK | GCF_PINNED)) {
+                        g->gcflags &= (uint8_t)~GCF_MARK;
+                        live += p->objsize;
+                        minor_survive(J, g);
+                        if (!(g->gcflags & GCF_OLD)) has_young = 1;
+                        continue;
+                    }
+                    // young atom strings stay until the full sweep: the atom table
+                    // (swept only by full collections) would hold dangling pointers
+                    if (g->type == GT_STR && (((struct str*)g)->h.aux & SF_ATOM)) { has_young = 1; continue; }
+#if !defined(KERNEL) || !KERNEL
+                    // verify: no marked object may still point at a young object we are about to free
+                    if (getenv("OJS_GC_VERIFY")) {
+                        int refd = 0;
+                        for (int c2 = 0; c2 < NCLASSES && !refd; c2++)
+                            for (struct page* p2 = H->pages[c2]; p2 && !refd; p2 = p2->next)
+                                for (uint32_t i2 = 0; i2 < p2->nobj && !refd; i2++) {
+                                    struct gch* g2 = (struct gch*)(p2->data + (size_t)i2 * p2->objsize);
+                                    if (g2 == g || g2->type == GT_FREE || !(g2->gcflags & (GCF_MARK | GCF_PINNED))) continue;
+                                    // crude: scan the raw body for the pointer (catches every container kind)
+                                    uint64_t* w = (uint64_t*)((struct gch*)g2 + 1);
+                                    size_t nw = (p2->objsize - sizeof(struct gch)) / 8;
+                                    for (size_t k2 = 0; k2 < nw; k2++) {
+                                        uintptr_t word = w[k2];
+                                        uintptr_t ptr = (uintptr_t)((int64_t)(word << 16) >> 16);   // jv pointer or raw pointer
+                                        if (ptr == (uintptr_t)g) { refd = 1; fprintf(stderr, "[gc] FREE of referenced object (type %d) from marked (type %d)\n", g->type, g2->type); break; }
+                                    }
+                                }
+                        for (int i2 = 0; i2 < H->nlarge && !refd; i2++) {
+                            struct gch* g2 = (struct gch*)H->large[i2].p;
+                            if (g2 == g || !(g2->gcflags & (GCF_MARK | GCF_PINNED))) continue;
+                            uint64_t* w = (uint64_t*)((struct gch*)g2 + 1);
+                            size_t nw = (H->large[i2].size - sizeof(struct gch)) / 8;
+                            for (size_t k2 = 0; k2 < nw; k2++) {
+                                uintptr_t word = w[k2];
+                                uintptr_t ptr = (uintptr_t)((int64_t)(word << 16) >> 16);
+                                if (ptr == (uintptr_t)g) { refd = 1; fprintf(stderr, "[gc] FREE of referenced object from marked large\n"); break; }
+                            }
+                        }
+                        if (refd) { fprintf(stderr, "[gc] ABORT: freeing a referenced young object\n"); abort(); }
+                    }
+#endif
+                    if (g->gcflags & GCF_FINAL) gc_finalize(J, g);
+#if !defined(KERNEL) || !KERNEL
+                    if (getenv("OJS_GC_POISON") && p->objsize <= 64) memset((uint8_t*)g + 2, 0xCC, p->objsize - 2 > 40 ? 40 : p->objsize - 2);
+#endif
+                    g->type = GT_FREE;
+                    g->gcflags = 0;
+                    J->minor_freed += p->objsize;
+                    *(struct gch**)(g + 1) = p->free;
+                    p->free = g;
+                    p->nfree++;
+                }
+                if (p->nfree > 0) {              // back into allocation
+                    p->anext = H->avail[c];
+                    H->avail[c] = p;
+                }
+            } else {
+                // in avail: survivors age, garbage waits for the full sweep
+                for (int i = 0; i < (int)p->nobj; i++) {
+                    struct gch* g = (struct gch*)(p->data + (size_t)i * p->objsize);
+                    if (g->type == GT_FREE || (g->gcflags & GCF_OLD)) continue;
+                    if (g->gcflags & (GCF_MARK | GCF_PINNED)) {
+                        g->gcflags &= (uint8_t)~GCF_MARK;
+                        live += p->objsize;
+                        minor_survive(J, g);
+                        if (!(g->gcflags & GCF_OLD)) has_young = 1;
+                    } else if (g->type == GT_STR && (((struct str*)g)->h.aux & SF_ATOM)) {
+                        has_young = 1;           // the atom table (major-only sweep) still points here
+                    } else {
+                        has_young = 1;           // dead but not reclaimable here: keep the page young-listed
+                        if (g->gcflags & GCF_FINAL) gc_finalize(J, g);   // hmm: it dies at the full sweep instead
+                    }
+                }
+                // (dead objects of in-avail pages are finalized by the full sweep)
+            }
+            if (has_young) yp = &p->ynext;         // kept in the young list (*yp is already p)
+            else {
+                struct page* done = *yp;
+                *yp = done->ynext;
+                done->in_young = 0;
+                done->ynext = 0;
+            }
+        }
+    }
+    int w = 0;
+    for (int i = 0; i < H->nlarge; i++) {
+        struct gch* g = (struct gch*)H->large[i].p;
+        if (g->gcflags & GCF_OLD) { H->large[w++] = H->large[i]; continue; }
+        if (g->gcflags & (GCF_MARK | GCF_PINNED)) {
+            g->gcflags &= (uint8_t)~GCF_MARK;
+            live += H->large[i].size;
+            minor_survive(J, g);
+            H->large[w++] = H->large[i];     // keep the table address-sorted
+            continue;
+        }
+        if (g->gcflags & GCF_FINAL) gc_finalize(J, g);
+        J->heap_bytes -= H->large[i].size + 16;
+        ojs_sys_free(H->large[i].raw);
+        // dropped: the table stays sorted
+    }
+    H->nlarge = w;
+    J->bytes_since_minor = 0;
+    J->minor_count++;   // statistics (ojs.h)
+    J->gc_ms += ojs_sys_time_ms() - t0;
+    J->in_gc = 0;
+}
 
 // ---------------------------------------------------------------- value arrays
 

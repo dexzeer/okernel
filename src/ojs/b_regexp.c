@@ -88,6 +88,7 @@ static struct re_prog* compile_cached(ojs* J, struct str* src, struct str* fl, i
     t->flags = jv_from_str(fl);
     t->prog = p;
     e[0] = jv_from_str(src);
+    gc_wb(J, valarr_of(e), e[0]);
     e[1] = jv_from_str(fl);
     e[2] = jv_from_obj(&t->base);
     return p;
