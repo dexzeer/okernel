@@ -13,6 +13,7 @@ isodir/
 /userland/sh
 /userland/init
 /userland/gen_*.h
+/userland/.gen
 
 # Editor
 *.swp

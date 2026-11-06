@@ -46,9 +46,11 @@ boot/start_text.o: boot/start.asm
 # whenever any gen header changes (the %.o rule only tracks HEADERS, and a
 # stale seed silently ships last week's ELFs — bisected 2026-09-08 when a
 # fresh forktest never reached the ISO).
-USERLAND_GEN = $(shell sed -n 's|.*"../userland/\(gen_[a-z0-9_]*\.h\)".*|userland/\1|p' src/userland_seed.c)
-$(USERLAND_GEN):
+USERLAND_GEN = $(wildcard userland/gen_*.h)
+# a fresh clone has none yet (one rule for all of them: make -j must not run it once per header)
+userland/.gen:
 	$(MAKE) -C userland all gen
+	touch $@
 
 # Web engine (src/web): HTML5 parser, CSS, layout, painter, fonts, images.
 # Desktop-only. fontdata.o incbins the TrueType faces in fonts/; callstack.o
@@ -95,7 +97,7 @@ MEDIA_SRC = ec opus_packet celt celt_tables opus_dec webm vp9 vp9_recon vp9_simd
 MEDIA_OBJ = $(patsubst %,src/media/%.o,$(MEDIA_SRC))
 src/media/%.o: src/media/%.c
 	$(CC) $(OJS_CFLAGS) -c $< -o $@
-src/userland_seed.o: $(USERLAND_GEN)
+src/userland_seed.o: $(USERLAND_GEN) | $(if $(USERLAND_GEN),,userland/.gen)
 # The dmccl language (src/dmccl) and the game engine on top of it (src/game, src/gamewin.c): SSE2 floating point like ojs.
 GAME_SRC = dmccl/dm_lex dmccl/dm_compile dmccl/dm_vm dmccl/dm_lib game/phys game/game game/game_chars game/game_gfx
 GAME_OBJ = $(patsubst %,src/%.o,$(GAME_SRC)) src/gamewin.o src/game/levels.o
