@@ -340,10 +340,11 @@ build-host/lxsys.tar: $(LX_SRC)
 # The adblock filter lists (filters/): shipped as a second GRUB module with
 # the cmdline tag "ablock" (src/ablock.c finds it via memory_boot_module).
 # ABLOCK_EXTRA=<file> appends a test list (make desktop ABLOCK_EXTRA=...).
-ABLOCK_DEPS = filters/easylist.txt filters/easyprivacy.txt $(if $(ABLOCK_EXTRA),$(ABLOCK_EXTRA))
+# The lists are not in git (third-party data, see filters/LICENSE-NOTE.md): without them the adblocker is empty.
+ABLOCK_DEPS = $(wildcard filters/easylist.txt filters/easyprivacy.txt) $(if $(ABLOCK_EXTRA),$(ABLOCK_EXTRA))
 build-host/ablists.txt: $(ABLOCK_DEPS)
 	mkdir -p build-host
-	cat filters/easylist.txt filters/easyprivacy.txt $(if $(ABLOCK_EXTRA),$(ABLOCK_EXTRA)) > $@
+	cat /dev/null $(ABLOCK_DEPS) > $@
 
 kanarchy-desktop.iso: kanarchy-desktop.bin build-host/lxsys.tar build-host/ablists.txt
 	rm -rf isodir
