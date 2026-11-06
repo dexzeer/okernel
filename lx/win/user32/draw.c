@@ -384,9 +384,10 @@ extern HRSRC FindResourceExW(HMODULE m, LPCWSTR type, LPCWSTR name, WORD lang);
 extern HGLOBAL LoadResource(HMODULE m, HRSRC r);
 static const WCHAR *find_string(HINSTANCE h, UINT id, int *len) {
     HRSRC r = FindResourceExW(h, (LPCWSTR)(ULONG_PTR)6, (LPCWSTR)(ULONG_PTR)((id >> 4) + 1), 0);          // RT_STRING: blocks of 16
-    if (!r) return 0;
+    if (!r) { set_error(1814); return 0; }                                                                  // ERROR_RESOURCE_NAME_NOT_FOUND: programs try FormatMessage on this
     const WCHAR *p = LoadResource(h, r);
     for (UINT i = 0; i < (id & 15); i++) p += 1 + p[0];
+    if (!p[0]) { set_error(1814); return 0; }
     *len = p[0];
     return p + 1;
 }

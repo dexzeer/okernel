@@ -60,8 +60,27 @@ EXPORT BOOL SetWindowPlacement(HWND h, const WINDOWPLACEMENT *p) {
 }
 
 EXPORT HANDLE MonitorFromWindow(HWND h, DWORD flags) { (void)h; (void)flags; return (HANDLE)(ULONG_PTR)1; }
-EXPORT HANDLE SetWinEventHook(DWORD lo, DWORD hi, HANDLE mod, void *proc, DWORD pid, DWORD tid, DWORD flags) { (void)lo; (void)hi; (void)mod; (void)proc; (void)pid; (void)tid; (void)flags; return (HANDLE)(ULONG_PTR)1; }
-EXPORT BOOL UnhookWinEvent(HANDLE h) { (void)h; return 1; }
-EXPORT void NotifyWinEvent(DWORD ev, HWND h, LONG obj, LONG child) { (void)ev; (void)h; (void)obj; (void)child; }
+// WinEvent hooks, for this process only: a hook runs at once, on the thread that raised the event.
+typedef void (*WINEVENTPROC)(HANDLE, DWORD, HWND, LONG, LONG, DWORD, DWORD);
+static struct { DWORD lo, hi; WINEVENTPROC proc; } weh[16];
+EXPORT HANDLE SetWinEventHook(DWORD lo, DWORD hi, HANDLE mod, void *proc, DWORD pid, DWORD tid, DWORD flags) {
+    (void)mod; (void)pid; (void)tid; (void)flags;
+    for (int i = 0; i < 16; i++) if (!weh[i].proc) { weh[i].lo = lo; weh[i].hi = hi; weh[i].proc = (WINEVENTPROC)proc; return (HANDLE)(ULONG_PTR)(i + 1); }
+    return 0;
+}
+EXPORT BOOL UnhookWinEvent(HANDLE h) {
+    ULONG_PTR i = (ULONG_PTR)h;
+    if (i < 1 || i > 16 || !weh[i - 1].proc) return 0;
+    weh[i - 1].proc = 0;
+    return 1;
+}
+EXPORT void NotifyWinEvent(DWORD ev, HWND h, LONG obj, LONG child) {
+    static int depth;
+    if (depth > 2) return;
+    depth++;
+    for (int i = 0; i < 16; i++)
+        if (weh[i].proc && ev >= weh[i].lo && ev <= weh[i].hi) weh[i].proc((HANDLE)(ULONG_PTR)(i + 1), ev, h, obj, child, 0, 0);
+    depth--;
+}
 EXPORT HANDLE SetThreadDpiAwarenessContext(HANDLE c) { return c; }
 EXPORT BOOL SystemParametersInfoForDpi(UINT a, UINT b, void *c, UINT d, UINT dpi) { (void)dpi; extern BOOL SystemParametersInfoW(UINT, UINT, void*, UINT); return SystemParametersInfoW(a, b, c, d); }

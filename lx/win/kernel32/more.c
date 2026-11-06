@@ -298,23 +298,31 @@ EXPORT BOOL VerifyVersionInfoW(OSVERSIONINFOW *want, DWORD type, ULONGLONG mask)
     return FALSE;
 }
 
-// ---- version.dll: every file answers with the version GetVersionEx reports ------------------------------------
-// Programs ask this about system files to learn the Windows version. Our DLLs carry no version resource, so the block
-// is made up here, with only the fixed part: asking for a string in it fails as for any file without that string.
+// ---- version.dll ---------------------------------------------------------------------------------------------
+// A file with a version resource answers with it (Microsoft's console tools read their own InternalName). Programs also ask
+// about system files to learn the Windows version, and our DLLs carry no resource: those answer with a made-up block holding
+// only the fixed part and the version GetVersionEx reports, so asking for a string in it fails as for any file without one.
 
+extern DWORD k32_read_version(LPCWSTR path, void *out, DWORD cap);   // rsrc.c: the file's RT_VERSION resource; its size, 0 = none
 #define VS_BLOCK_SIZE 92                     // header 6 + "VS_VERSION_INFO" 32 + pad 2 + VS_FIXEDFILEINFO 52
 #define VS_FIXED_OFF 40
 EXPORT DWORD GetFileVersionInfoSizeExW(DWORD f, LPCWSTR n, DWORD *h) {
     (void)f;
     if (h) *h = 0;
     if (GetFileAttributesW(n) == 0xFFFFFFFF) { SetLastError(2); return 0; }
-    return VS_BLOCK_SIZE;
+    DWORD real = k32_read_version(n, 0, 0);
+    return real ? real : VS_BLOCK_SIZE;
 }
 EXPORT DWORD GetFileVersionInfoSizeW(LPCWSTR n, DWORD *h) { return GetFileVersionInfoSizeExW(0, n, h); }
 EXPORT BOOL GetFileVersionInfoExW(DWORD f, LPCWSTR n, DWORD h, DWORD l, void *d) {
     (void)f; (void)h;
-    if (l < VS_BLOCK_SIZE) { SetLastError(122); return FALSE; }      // ERROR_INSUFFICIENT_BUFFER
     if (GetFileAttributesW(n) == 0xFFFFFFFF) { SetLastError(2); return FALSE; }
+    DWORD real = k32_read_version(n, 0, 0);
+    if (real) {
+        if (l < real) { SetLastError(122); return FALSE; }
+        return k32_read_version(n, d, l) != 0;
+    }
+    if (l < VS_BLOCK_SIZE) { SetLastError(122); return FALSE; }      // ERROR_INSUFFICIENT_BUFFER
     unsigned char *b = (unsigned char*)d;
     for (int i = 0; i < VS_BLOCK_SIZE; i++) b[i] = 0;
     *(WORD*)b = VS_BLOCK_SIZE; *(WORD*)(b + 2) = 52;                 // wLength, wValueLength; wType 0 = binary
@@ -330,14 +338,44 @@ EXPORT BOOL GetFileVersionInfoExW(DWORD f, LPCWSTR n, DWORD h, DWORD l, void *d)
     return TRUE;
 }
 EXPORT BOOL GetFileVersionInfoW(LPCWSTR n, DWORD h, DWORD l, void *d) { return GetFileVersionInfoExW(0, n, h, l, d); }
+// One node of the tree: wLength, wValueLength, wType (1 = text, the length counts characters), key, value, children, all 4-aligned.
+static const BYTE *ver_value(const BYTE *blk, UINT *bytes) {
+    const WCHAR *k = (const WCHAR*)(blk + 6);
+    int n = 0;
+    while (k[n]) n++;
+    const BYTE *v = (const BYTE*)(((ULONG_PTR)(blk + 6 + 2 * (n + 1)) + 3) & ~(ULONG_PTR)3);
+    *bytes = ((const WORD*)blk)[1] * (((const WORD*)blk)[2] ? 2u : 1u);
+    return v;
+}
 EXPORT BOOL VerQueryValueW(const void *b, LPCWSTR s, void **o, UINT *l) {
-    if (s && s[0] == '\\' && s[1] == 0) {
-        if (o) *o = (unsigned char*)b + VS_FIXED_OFF;
-        if (l) *l = 52;
-        return TRUE;
-    }
+    const BYTE *blk = (const BYTE*)b;
     if (l) *l = 0;
-    return FALSE;
+    if (!b || !s) return FALSE;
+    for (;;) {
+        while (*s == '\\') s++;
+        if (!*s) break;
+        int cn = 0;
+        while (s[cn] && s[cn] != '\\') cn++;
+        UINT vb;
+        const BYTE *v = ver_value(blk, &vb);
+        const BYTE *c = (const BYTE*)(((ULONG_PTR)(v + vb) + 3) & ~(ULONG_PTR)3), *end = blk + *(const WORD*)blk, *hit = 0;
+        while (c + 6 <= end && *(const WORD*)c) {
+            const WCHAR *k = (const WCHAR*)(c + 6);
+            int i = 0;
+            for (; i < cn; i++) { WCHAR x = k[i], y = s[i]; if (x >= 'a' && x <= 'z') x -= 32; if (y >= 'a' && y <= 'z') y -= 32; if (x != y) break; }
+            if (i == cn && !k[cn]) { hit = c; break; }
+            c = (const BYTE*)(((ULONG_PTR)(c + *(const WORD*)c) + 3) & ~(ULONG_PTR)3);
+        }
+        if (!hit) return FALSE;
+        blk = hit;
+        s += cn;
+    }
+    UINT vb;
+    const BYTE *v = ver_value(blk, &vb);
+    if (!vb) return FALSE;
+    if (o) *o = (void*)v;
+    if (l) *l = ((const WORD*)blk)[1];
+    return TRUE;
 }
 
 // ---- small pieces of ntdll and shlwapi ------------------------------------------------------------------------

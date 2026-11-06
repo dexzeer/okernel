@@ -133,6 +133,50 @@ EXPORT LPVOID LockResource(HGLOBAL h) { return h; }
 EXPORT DWORD SizeofResource(HMODULE m, HRSRC r) { (void)m; return r ? ((const struct rdata*)r)->size : 0; }
 EXPORT BOOL FreeResource(HGLOBAL h) { (void)h; return TRUE; }
 
+// ---- the version resource of a file on disk (nothing is mapped as an image: version.dll asks about any file) -------------------------------
+
+// Copies the RT_VERSION resource of the file to `out` when it fits in cap. Returns its size, 0 = the file has none.
+DWORD k32_read_version(LPCWSTR path, void *out, DWORD cap) {
+    char u[MAX_PATH * 4], lin[4200];
+    k32_wide_to_utf8(path, -1, u, sizeof u);
+    k32_to_linux_path(u, lin, sizeof lin);
+    long fd = SC3(LX_open, lin, O_RDONLY, 0);
+    if (fd < 0) return 0;
+    long end = SC3(LX_lseek, fd, 0, 2);
+    long r = end >= 0x200 ? SC6(LX_mmap, 0, end, 1, 2, fd, 0) : -1;
+    SC1(LX_close, fd);
+    if (r < 0 && r > -4096) return 0;
+    if (r == -1) return 0;
+    const BYTE *b = (const BYTE*)r;
+    DWORD got = 0;
+    if (b[0] == 'M' && b[1] == 'Z' && *(const DWORD*)(b + 0x3C) + 0x100 < (unsigned long)end) {
+        struct mui m;
+        const BYTE *nt = b + *(const DWORD*)(b + 0x3C);
+        int nsec = *(const WORD*)(nt + 6), optsz = *(const WORD*)(nt + 20);
+        const BYTE *opt = nt + 24, *sec = opt + optsz;
+        if (nsec > 16) nsec = 16;
+        m.nsec = nsec;
+        for (int i = 0; i < nsec; i++) { const DWORD *sh = (const DWORD*)(sec + i * 40); m.vsize[i] = sh[2] > sh[4] ? sh[2] : sh[4]; m.va[i] = sh[3]; m.raw[i] = sh[5]; }
+        DWORD rva = *(const DWORD*)(opt + (*(const WORD*)opt == 0x20b ? 112 : 96) + 16);
+        DWORD off = rva ? mui_off(&m, rva) : 0;
+        if (off) {
+            DWORD last = *teb_lasterror();
+            HRSRC e = lookup(b + off, (LPCWSTR)(ULONG_PTR)16, (LPCWSTR)(ULONG_PTR)1, 0);
+            *teb_lasterror() = last;
+            if (e) {
+                const struct rdata *d = (const struct rdata*)e;
+                DWORD at = mui_off(&m, d->rva);
+                if (at && at + d->size <= (unsigned long)end) {
+                    got = d->size;
+                    if (out && cap >= got) { for (DWORD i = 0; i < got; i++) ((BYTE*)out)[i] = b[at + i]; }
+                }
+            }
+        }
+    }
+    SC2(LX_munmap, r, end);
+    return got;
+}
+
 // ---- message tables ----------------------------------------------------------------------------------------------------------------------
 
 // finds message `id` in the RT_MESSAGETABLE (type 11) of the module; returns the entry text and sets *unicode

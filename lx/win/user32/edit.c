@@ -638,7 +638,7 @@ static void free_edit(struct edit *e) {
 static const wc empty_w[1] = { 0 };
 static int line_len_at(struct edit *e, int line) { return e->le[line] - e->ls[line]; }
 
-LRESULT U_edit_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+static LRESULT edit_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     struct wnd *w = h;
     struct edit *e = (struct edit*)w->ctl;
     switch (m) {
@@ -849,6 +849,33 @@ LRESULT U_edit_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
         if (r < cap) ((char*)lp)[r] = 0;
         return r;
     }
+    // The caret and "file lines" of the common controls v6 messages: lines end at line breaks only, word wrap does not count.
+    case 0x150C: return TRUE;                                          // EM_SETENDOFLINE
+    case 0x150D: return 1;                                             // EM_GETENDOFLINE: EC_ENDOFLINE_CRLF
+    case 0x1511: {                                                     // EM_SETCARETINDEX
+        int i = (int)wp;
+        e->a = e->b = i < 0 ? 0 : i > e->len ? e->len : i;
+        scroll_to_caret(w, e); update_bars(w, e); invalidate(w, e);
+        return 0;
+    }
+    case 0x1512: return e->b;                                          // EM_GETCARETINDEX
+    case 0x1513: case 0x1517: {                                        // EM_GETFILELINEFROMCHAR, EM_GETFILELINECOUNT
+        int i = m == 0x1517 || (int)wp == -1 ? (m == 0x1517 ? e->len : e->b) : (int)wp;
+        if (i > e->len) i = e->len;
+        int ln = 0;
+        for (int k = 0; k < i; k++) if (e->buf[k] == 10) ln++;
+        return m == 0x1517 ? ln + 1 : ln;
+    }
+    case 0x1514: case 0x1515: {                                        // EM_FILELINEINDEX, EM_FILELINELENGTH: wp is a line, or -1 for the caret's
+        int ln = (int)wp, start = 0;
+        if (ln == -1) { ln = 0; for (int k = 0; k < e->b; k++) if (e->buf[k] == 10) ln++; }
+        for (int k = 0; k < e->len && ln > 0; k++) if (e->buf[k] == 10) { ln--; start = k + 1; }
+        if (ln > 0) return -1;
+        if (m == 0x1514) return start;
+        int end = start;
+        while (end < e->len && e->buf[end] != 10 && e->buf[end] != 13) end++;
+        return end - start;
+    }
     case EM_GETFIRSTVISIBLELINE: return e->sy;
     case EM_LINESCROLL: layout(w, e); e->sx += (int)wp * 8; e->sy += (int)lp; clamp_scroll(w, e); update_bars(w, e); invalidate(w, e); return TRUE;
     case EM_SCROLL: {
@@ -910,4 +937,16 @@ LRESULT U_edit_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
     case EM_SETIMESTATUS: return 0;
     default: return U_def_proc(w, m, wp, lp, w->unicode);
     }
+}
+
+// Whatever moved the caret, the programs watching it hear about it (Notepad's line and column in the status bar).
+LRESULT U_edit_proc(HWND h, UINT m, WPARAM wp, LPARAM lp) {
+    extern void NotifyWinEvent(DWORD ev, HWND h, LONG obj, LONG child);
+    struct wnd *w = h;
+    struct edit *e0 = (struct edit*)w->ctl;
+    int a = e0 ? e0->a : 0, b = e0 ? e0->b : 0;
+    LRESULT r = edit_proc(h, m, wp, lp);
+    if (m == 2 || m == 0x82) return r;                                 // WM_DESTROY, WM_NCDESTROY: the state may be gone
+    if (e0 && (struct edit*)w->ctl == e0 && (e0->a != a || e0->b != b)) NotifyWinEvent(0x800B, h, -8, 0);   // EVENT_OBJECT_LOCATIONCHANGE, OBJID_CARET
+    return r;
 }

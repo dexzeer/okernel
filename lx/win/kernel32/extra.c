@@ -157,12 +157,12 @@ static DWORD format_message(DWORD flags, LPCVOID src, DWORD id, int wide, void *
             }
         }
         if (!msg && ((flags & 0x1000) || !(flags & 0x800))) msg = sys_message(id);
-        if (!msg) {
+        if (!msg && (flags & 0x1000)) {                          // the system table of ours is short: an error number is still better than nothing
             const char *p = "Unknown error (0x"; int k = 0; while (*p) numbuf[k++] = *p++;
             for (int s = 28; s >= 0; s -= 4) { int d = (int)((id >> s) & 15); numbuf[k++] = (char)(d < 10 ? '0' + d : 'a' + d - 10); }
             numbuf[k++] = ')'; numbuf[k] = 0; msg = numbuf;
-            set_error(317);                                      // ERROR_MR_MID_NOT_FOUND
         }
+        if (!msg) { set_error(317); return 0; }                  // ERROR_MR_MID_NOT_FOUND: programs read the id as "no such message" (where.exe's blank help lines)
     }
     char res[16384];
     int rcap = 16000;
