@@ -3375,34 +3375,64 @@ function parseHeaders(raw) {
 // the strings their rules return in opaque typed objects. There is no CSP enforcement
 // (we serve no require-trusted-types-for directive), so DOM sinks keep taking plain
 // strings and coerce these through toString.
-class TrustedHTML {
-    constructor(s) { hidden(this, '_s', String(s)); }
-    toString() { return this._s; }
-    toJSON() { return this._s; }
+const TT_HTML_PROTO = {
+    toString() { return this._s; },
+    toJSON() { return this._s; },
+};
+TT_HTML_PROTO.constructor = TrustedHTML;
+const TT_SCRIPT_PROTO = Object.create(TT_HTML_PROTO);
+TT_SCRIPT_PROTO.constructor = TrustedScript;
+const TT_URL_PROTO = Object.create(TT_HTML_PROTO);
+TT_URL_PROTO.constructor = TrustedScriptURL;
+function ttMake(proto, s) {
+    const o = Object.create(proto);
+    hidden(o, '_s', String(s));
+    return o;
 }
-class TrustedScript extends TrustedHTML {}
-class TrustedScriptURL extends TrustedHTML {}
+// the types are not constructible from script ("Illegal constructor")
+function TrustedHTML() { throw new TypeError("Failed to construct 'TrustedHTML': Illegal constructor"); }
+function TrustedScript() { throw new TypeError("Failed to construct 'TrustedScript': Illegal constructor"); }
+function TrustedScriptURL() { throw new TypeError("Failed to construct 'TrustedScriptURL': Illegal constructor"); }
+TrustedHTML.prototype = TT_HTML_PROTO;
+TrustedScript.prototype = TT_SCRIPT_PROTO;
+TrustedScriptURL.prototype = TT_URL_PROTO;
 const TT_POLICIES = new Map();
 class TrustedTypePolicy {
     constructor(name, rules) {
         // Chromium allows recreating a policy name (BotGuard creates 'ad' several
         // times); the newest policy wins
         hidden(this, '_name', name);
-        for (const [prop, Cls] of [['createHTML', TrustedHTML], ['createScript', TrustedScript], ['createScriptURL', TrustedScriptURL]]) {
+        for (const [prop, proto] of [['createHTML', TT_HTML_PROTO], ['createScript', TT_SCRIPT_PROTO], ['createScriptURL', TT_URL_PROTO]]) {
             const rule = rules && rules[prop];
             this[prop] = typeof rule === 'function'
-                ? function (input) {
+                ? function (input, ...args) {
                     const s = input === undefined || input === null ? '' : typeof input === 'string' ? input : String(input.valueOf());
-                    const out = rule(s);
+                    const out = rule(s, ...args);
                     if (out === undefined || out === null) throw new TypeError("The " + prop + " policy's callback returned a falsy value.");
-                    return new Cls(out);
+                    return ttMake(proto, out);
                 }
                 : function () { throw new TypeError("Failed to execute '" + prop + "' on 'TrustedTypePolicy': Policy '" + name + "' does not support " + prop + "."); };
         }
         TT_POLICIES.set(name, this);
+        if (name === 'default') TT_DEFAULT = this;
     }
     get name() { return this._name; }
 }
+let TT_DEFAULT = null;
+// the spec's injection-sink tables (getAttributeType / getPropertyType)
+const TT_ATTR_SINKS = {
+    SCRIPT: { src: 'TrustedScriptURL' },
+    IFRAME: { srcdoc: 'TrustedHTML' },
+};
+const TT_PROP_SINKS = {
+    SCRIPT: { src: 'TrustedScriptURL', text: 'TrustedScript', innerText: 'TrustedScript', textContent: 'TrustedScript' },
+    IFRAME: { srcdoc: 'TrustedHTML' },
+};
+const TT_GLOBAL_SINKS = {
+    eval: 'TrustedScript', setTimeout: 'TrustedScript', setInterval: 'TrustedScript',
+    Function: 'TrustedScript', execScript: 'TrustedScript',
+    documentwrite: 'TrustedHTML', open: 'TrustedScriptURL',
+};
 class TrustedTypePolicyFactory {
     createPolicy(name, rules) {
         if (arguments.length === 0) throw new TypeError("Failed to execute 'createPolicy' on 'TrustedTypePolicyFactory': 1 argument required, but only 0 present.");
@@ -3411,9 +3441,27 @@ class TrustedTypePolicyFactory {
     isHTML(v) { return v instanceof TrustedHTML; }
     isScript(v) { return v instanceof TrustedScript; }
     isScriptURL(v) { return v instanceof TrustedScriptURL; }
-    get defaultPolicy() { return null; }
-    getAttributeType(tag, attr) { return null; }
-    getPropertyType(tag, prop) { return null; }
+    get defaultPolicy() { return TT_DEFAULT; }
+    get emptyHTML() { return ttMake(TT_HTML_PROTO, ''); }
+    get emptyScript() { return ttMake(TT_SCRIPT_PROTO, ''); }
+    getAttributeType(tag, attr) {
+        if (tag === undefined || tag === null || attr === undefined || attr === null) return null;
+        const t = String(tag).toUpperCase();
+        const a = String(attr).toLowerCase();
+        const tab = TT_ATTR_SINKS[t];
+        return (tab && tab[a]) || null;
+    }
+    getPropertyType(tag, prop) {
+        if (tag === undefined || tag === null || prop === undefined || prop === null) return null;
+        const t = String(tag).toUpperCase();
+        const a = String(prop).toLowerCase();
+        if (t === '(GLOBAL)') return TT_GLOBAL_SINKS[a] || null;
+        if (t === 'DOCUMENT' && a === 'write') return 'TrustedHTML';
+        const tab = TT_PROP_SINKS[t];
+        if (tab && tab[a]) return tab[a];
+        if (a === 'innerhtml' || a === 'outerhtml') return 'TrustedHTML';
+        return null;
+    }
 }
 const trustedTypes = new TrustedTypePolicyFactory();
 
