@@ -55,6 +55,14 @@ int memcmp(const void* a, const void* b, size_t n) {
     return 0;
 }
 
+void* memchr(const void* s, int c, size_t n) {
+    const unsigned char* p = (const unsigned char*)s;
+    for (size_t i = 0; i < n; i++) {
+        if (p[i] == (unsigned char)c) return (void*)(p + i);
+    }
+    return 0;
+}
+
 size_t strlen(const char* s) {
     size_t n = 0;
     while (s[n]) n++;
@@ -84,10 +92,52 @@ char* strchr(const char* s, int c) {
     return 0;
 }
 
+char* strrchr(const char* s, int c) {
+    const char* found = 0;
+    while (*s) {
+        if (*s == (char)c) found = s;
+        s++;
+    }
+    return (char*)found;
+}
+
+char* strstr(const char* h, const char* n) {
+    if (!*n) return (char*)h;
+    for (; *h; h++) {
+        const char* a = h;
+        const char* b = n;
+        while (*a && *b && *a == *b) { a++; b++; }
+        if (!*b) return (char*)h;
+    }
+    return 0;
+}
+
+char* strcpy(char* dst, const char* src) {
+    char* d = dst;
+    while ((*d++ = *src++)) {}
+    return dst;
+}
+
+char* strcat(char* dst, const char* src) {
+    char* d = dst;
+    while (*d) d++;
+    while ((*d++ = *src++)) {}
+    return dst;
+}
+
 char* strncpy(char* dst, const char* src, size_t n) {
     unsigned int i = 0;
     for (; i < n && src[i]; i++) dst[i] = src[i];
     for (; i < n; i++) dst[i] = 0;
+    return dst;
+}
+
+char* strncat(char* dst, const char* src, size_t n) {
+    char* d = dst;
+    while (*d) d++;
+    size_t i = 0;
+    for (; i < n && src[i]; i++) d[i] = src[i];
+    d[i] = 0;
     return dst;
 }
 
