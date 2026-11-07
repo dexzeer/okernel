@@ -135,7 +135,9 @@ int  b_map_init(ojs* J);
 int  b_proxy_init(ojs* J);
 int  b_typed_init(ojs* J);
 int  b_bigint_init(ojs* J);
+int  b_intl_init(ojs* J);
 void classes_init(void);
+void intl_classes(void);
 int  realm_init(ojs* J);
 
 #endif

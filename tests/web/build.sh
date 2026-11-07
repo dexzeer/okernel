@@ -22,7 +22,7 @@ nasm -f elf64 src/web/wjs_prelude.asm -o build-host/wjs_prelude.o
 QD=build-host/ojs-web64-nopie$(printf '%s' "$SAN$OPT" | tr -c 'a-zA-Z0-9' '_')
 mkdir -p $QD
 QOBJ=""
-for f in gc str obj util conv num unicode unicode_data lex parse compile ops vm realm b_object b_function          b_error b_iter b_array b_string b_number b_global b_promise generator b_map b_proxy b_typed bigint          b_json b_date re b_regexp module api srctext; do
+for f in gc str obj util conv num unicode unicode_data lex parse compile ops vm realm b_object b_function          b_error b_iter b_array b_string b_number b_global b_promise generator b_map b_proxy b_typed bigint          b_json b_date re b_regexp module api srctext intl intl_data b_intl; do
     if [ ! -f $QD/$f.o ] || [ -n "$(find src/ojs -newer $QD/$f.o -name '*.[ch]' | head -1)" ]; then
         X=""; [ $f = vm ] && X="--param max-goto-duplication-insns=64"   # interpreter dispatch
         gcc -m64 -fno-pie -fno-pic $OPT -g $SAN -fno-strict-aliasing -w $X -c src/ojs/$f.c -o $QD/$f.o

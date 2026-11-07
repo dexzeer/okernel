@@ -527,6 +527,8 @@ jv num_to_string(ojs* J, double x, int radix) {
 // ---------------------------------------------------------------- exact decimal expansion
 
 // x > 0 finite: all digits of x (exact), value = 0.digits * 10^point
+// (the Intl builtins walk the expansion through the num_exact_digits wrapper)
+int num_exact_digits(double x, char* out, int cap, int* point);
 static int exact_digits(double x, char* out, int cap, int* point) {
     uint64_t f; int e;
     dparts(x, &f, &e);
@@ -539,6 +541,11 @@ static int exact_digits(double x, char* out, int cap, int* point) {
     *point = n - frac;
     while (n > 1 && out[n - 1] == '0') n--;
     return n;
+}
+
+// public wrapper for the Intl builtins (intl.c)
+int num_exact_digits(double x, char* out, int cap, int* point) {
+    return exact_digits(x, out, cap, point);
 }
 
 // first `keep` digits of d[0..n) rounded half-up (zeros past n), into

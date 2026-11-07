@@ -39,7 +39,7 @@ if args.from_fails:
 SKIP_FEATURES = {
     "Temporal", "ShadowRealm", "decorators", "source-phase-imports", "source-phase-imports-module-source",
     "import-defer", "explicit-resource-management", "json-modules", "import-text", "import-bytes",
-    "IsHTMLDDA", "cross-realm", "Atomics.waitAsync", "canonical-tz", "Intl", "intl-normative-optional",
+    "IsHTMLDDA", "cross-realm", "Atomics.waitAsync", "canonical-tz", "intl-normative-optional",
     "regexp-v-flag-properties-of-strings", "tail-call-optimization", "host-gc-required",
     "legacy-regexp", "Math.sumPrecise", "upsert", "iterator-sequencing", "joint-iteration", "await-dictionary",
     "Array.fromAsync", "uint8array-base64", "immutable-arraybuffer", "nonextensible-applies-to-private",

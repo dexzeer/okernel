@@ -95,6 +95,7 @@ void b_generator_classes(void);
 void b_map_classes(void);
 void b_proxy_classes(void);
 void b_typed_classes(void);
+void intl_classes(void);
 void b_regexp_classes(void);
 void module_classes(void);
 void api_classes(void);
@@ -114,6 +115,7 @@ void classes_init(void) {
     b_typed_classes();
     b_regexp_classes();
     module_classes();
+    intl_classes();
     api_classes();
 }
 
@@ -167,7 +169,7 @@ int realm_init(ojs* J) {
         b_array_init(J) < 0 || b_string_init(J) < 0 || b_number_init(J) < 0 || b_symbol_init(J) < 0 ||
         b_math_init(J) < 0 || b_promise_init(J) < 0 || b_generator_init(J) < 0 || b_json_init(J) < 0 ||
         b_date_init(J) < 0 || b_regexp_init(J) < 0 || b_map_init(J) < 0 || b_proxy_init(J) < 0 ||
-        b_typed_init(J) < 0 || b_bigint_init(J) < 0 || b_global_init(J) < 0)
+        b_typed_init(J) < 0 || b_bigint_init(J) < 0 || b_global_init(J) < 0 || b_intl_init(J) < 0)
         goto fail;
     J->gc_disabled = saved;
     return 0;

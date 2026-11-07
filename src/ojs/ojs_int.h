@@ -337,6 +337,7 @@ enum {
     OC_FOR_IN,          // internal: for-in enumerator state
     OC_ARRAY_ITER, OC_STRING_ITER, OC_MAP_ITER, OC_SET_ITER, OC_REGEXP_STR_ITER, OC_ITER_HELPER,
     OC_WRAP_ITER, OC_PROMISE_FN, OC_DISPOSABLE_STACK, OC_INTERNAL, OC_ASYNC_FN, OC_RAW_JSON,
+    OC_INTL,            // Intl service objects (NumberFormat, DateTimeFormat, Locale, ...)
     OC_COUNT
 };
 
@@ -554,6 +555,8 @@ int  is_regexp(ojs* J, jv v);                          // IsRegExp: 0/1/-1
 double num_from_str(const struct str* s, int* ok);     // StringToNumber
 jv   num_to_string(ojs* J, double d, int radix);
 int  num_to_cstr(double d, char* buf);                 // shortest round-trip form (ECMAScript)
+int  num_exact_digits(double x, char* out, int cap, int* point);  // exact expansion: 0.digits * 10^point (x > 0, intl.c)
+double num_from_decimal(const char* digits, int nd, int exp10);        // digits * 10^exp10 (exact rounding)
 
 // ---------------------------------------------------------------- objects (obj.c)
 

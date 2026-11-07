@@ -8,7 +8,7 @@ cd "$(dirname "$0")/../.."
 OUT=${OUTDIR:-build-host/ojs64}
 mkdir -p $OUT
 CFLAGS="-m64 -msse2 -mfpmath=sse -fno-pie -fno-pic -std=gnu11 -O2 -g -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -fno-strict-aliasing $*"
-SRCS="gc str obj util conv num unicode unicode_data lex parse compile ops vm realm b_object b_function b_error b_iter b_array b_string b_number b_global b_promise generator b_map b_proxy b_typed bigint b_json b_date re b_regexp module api srctext"
+SRCS="gc str obj util conv num unicode unicode_data lex parse compile ops vm realm b_object b_function b_error b_iter b_array b_string b_number b_global b_promise generator b_map b_proxy b_typed bigint b_json b_date re b_regexp module api srctext intl intl_data b_intl"
 
 stale() {   # stale <obj> <dep file>
     [ -n "$FORCE" ] && return 0

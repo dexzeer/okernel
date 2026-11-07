@@ -83,7 +83,7 @@ OJS_CFLAGS = -m64 -mcmodel=kernel -ffreestanding -fno-pic -fno-pie -mno-red-zone
              -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare
 OJS_SRC = gc str obj util conv num unicode unicode_data lex parse compile ops vm realm b_object b_function \
           b_error b_iter b_array b_string b_number b_global b_promise generator b_map b_proxy b_typed bigint \
-          b_json b_date re b_regexp module api srctext
+          b_json b_date re b_regexp module api srctext intl intl_data b_intl
 OJS_OBJ = $(patsubst %,src/ojs/%.o,$(OJS_SRC)) src/kmath.o src/kclock.o
 src/ojs/vm.o: src/ojs/vm.c
 	$(CC) $(OJS_CFLAGS) --param max-goto-duplication-insns=64 -c $< -o $@
