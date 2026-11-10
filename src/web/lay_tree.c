@@ -253,8 +253,76 @@ static int roman(int n, char* out, int upper) {
     return o;
 }
 
+// ---- dynamic @counter-style markers ------------------------------------------------
+
+static void dyn_resolve_cb(void* rctx, const char* s, int len, const struct cstyle_dyn** dyn_out, int* idx_out) {
+    const struct wstyleset* ss = rctx;
+    *dyn_out = 0;
+    *idx_out = -1;
+    int n = css_set_sheet_count(ss);
+    for (int i = 0; i < n; i++) {
+        struct wsheet* sh = css_set_sheet_at((struct wstyleset*)ss, i);
+        if (!sh) continue;
+        struct cstyle_dyn* d = cstyle_dyn_find(sh->dyns, sh->ndyn, s, len, 0);
+        if (d) { *dyn_out = d; return; }
+    }
+    int ci = cstyle_find(s, len);
+    if (ci >= 0) *idx_out = ci;
+}
+
+// Format a counter value in the named style (document @counter-style rules
+// first, then the predefined table, then each style's fallback chain).
+// *pre/*suf receive the marker prefix/suffix (0 = unset; the caller defaults
+// the suffix to ". "). Returns the core length, 0 = cannot format.
+static int dyn_render_name(const struct wstyleset* ss, const char* nm, int nl, int value,
+                           char* out, int cap, const char** pre, const char** suf, int depth) {
+    *pre = 0;
+    *suf = 0;
+    if (depth > 4) return 0;
+    int n = css_set_sheet_count(ss);
+    for (int i = 0; i < n; i++) {
+        struct wsheet* sh = css_set_sheet_at((struct wstyleset*)ss, i);
+        if (!sh) continue;
+        struct cstyle_dyn* d = cstyle_dyn_find(sh->dyns, sh->ndyn, nm, nl, 0);
+        if (!d) continue;
+        int r = cstyle_dyn_format(d, value, out, cap, (void*)ss, dyn_resolve_cb, 0);
+        if (d->prefix_off != 0xFFFF) *pre = d->pool + d->prefix_off;
+        if (d->suffix_off != 0xFFFF) *suf = d->pool + d->suffix_off;
+        if (r > 0) return r;
+        if (d->fallback) return dyn_render_name(ss, d->fallback, (int)strlen(d->fallback), value, out, cap, pre, suf, depth + 1);
+        *pre = 0;
+        *suf = 0;
+        return 0;
+    }
+    int ci = cstyle_find(nm, nl);
+    if (ci >= 0) return cstyle_format(ci, value, out);
+    return 0;
+}
+
+static int marker_dyn(const struct wstyle* st, int ord, char* out, const struct wstyleset* ss) {
+    const char* nm = css_str(ss, st->list_marker, 0);
+    if (!nm || !nm[0]) return 0;
+    char core[64];
+    const char* pre = 0;
+    const char* suf = 0;
+    int n = dyn_render_name(ss, nm, (int)strlen(nm), ord, core, (int)sizeof core, &pre, &suf, 0);
+    if (n <= 0) return 0;
+    int o = 0;
+    int cap = 78;
+    for (const char* p = pre; p && *p && o < cap; p++) out[o++] = *p;
+    for (int k = 0; k < n && o < cap; k++) out[o++] = core[k];
+    if (suf) { for (const char* p = suf; *p && o < cap; p++) out[o++] = *p; }
+    else { out[o++] = '.'; out[o++] = ' '; }
+    return o;
+}
+
 static int marker_text(const struct wstyle* st, int ord, char* out, const struct wstyleset* ss) {
     int o = 0;
+    if (st->list_style_type == LS_CUSTOM) {
+        o = marker_dyn(st, ord, out, ss);
+        if (o > 0) return o;
+        goto dec;
+    }
     if (st->list_style_type >= LS_CSTYLE0 && st->cstyle_idx >= 0) {
         o = cstyle_format(st->cstyle_idx, ord, out);
         if (o > 0) { out[o++] = '.'; out[o++] = ' '; return o; }

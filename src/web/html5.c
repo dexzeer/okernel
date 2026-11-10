@@ -38,6 +38,7 @@ struct tok {
     int tag;                 // atom (start/end)
     char name[64];           // lowercase tag name (start/end)
     int nlen;
+    int ns_hint;             // 0 or NS_SVG/NS_MATH: XHTML-style <svg:x> prefix
     int self_closing;
     struct tattr* attrs;     // -> hp.attr_store (kept off the stack)
     int nattr;
@@ -285,6 +286,7 @@ static int create_for_token(struct hp* p, struct tok* t, int ns) {
 }
 
 static int insert_element(struct hp* p, struct tok* t, int ns) {
+    if (t->ns_hint) ns = t->ns_hint;
     int parent, before;
     place(p, &parent, &before);
     int el = create_for_token(p, t, ns);
@@ -296,7 +298,7 @@ static int insert_element(struct hp* p, struct tok* t, int ns) {
 
 static int insert_html(struct hp* p, int tag) {
     struct tok t;
-    t.tag = tag; t.nattr = 0;
+    t.tag = tag; t.nattr = 0; t.ns_hint = 0;
     return insert_element(p, &t, NS_HTML);
 }
 
@@ -713,6 +715,21 @@ static int read_tag(struct hp* p) {
         }
     }
     p->pos = i;
+    // XHTML-style namespace prefixes (<svg:rect>, <math:mi>): split the
+    // prefix off and hint the element namespace
+    t.ns_hint = 0;
+    for (int k = 0; k < t.nlen; k++) {
+        if (t.name[k] == ':') {
+            if (k == 3 && !memcmp(t.name, "svg", 3)) t.ns_hint = NS_SVG;
+            else if (k == 4 && !memcmp(t.name, "math", 4)) t.ns_hint = NS_MATH;
+            if (t.ns_hint) {
+                t.nlen -= k + 1;
+                memmove(t.name, t.name + k + 1, (size_t)t.nlen);
+                t.name[t.nlen] = 0;
+            }
+            break;
+        }
+    }
     t.tag = watom_intern(&D->atoms, t.name, t.nlen);
     if (t.type == TK_START)
         for (int a = 0; a < t.nattr; a++)

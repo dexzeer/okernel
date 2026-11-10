@@ -20,10 +20,12 @@ isodir/
 *~
 .vscode/
 
-# MiMoCode
+# ai shit
 .mimocode/
 desktop.png
 terminal.png
+.zcode
+.commandcode
 # Host test binaries / caches
 okai-preview-binary
 tests/okai_preview
@@ -56,3 +58,5 @@ build-ksyms/
 build-recovery/
 build-disk/
 kanarchy-disk.img
+
+YOUTUBE_ATTEMPT_NOTES.md

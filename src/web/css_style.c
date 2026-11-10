@@ -2,6 +2,7 @@
 #include "css_int.h"
 #include "wurl.h"
 #include "font.h"
+#include "colortab.h"
 
 // ---- UA stylesheet ------------------------------------------------------------
 
@@ -921,6 +922,8 @@ static void initial_init(void) {
     s->translate_x = s->translate_y = wl_px(0);
     s->scale_x = s->scale_y = 65536;
     s->tfo_x = s->tfo_y = wl_px(0); s->tfo_x.pct = s->tfo_y.pct = 5000;
+    s->tf_a = s->tf_d = 65536; s->tf_b = s->tf_c = s->tf_e = s->tf_f = 0;
+    s->tf_gen = s->tf_decl = s->tfo_decl = s->tbox = 0;
     s->cstyle_idx = -1;
     s->vertical_align = VA_BASELINE;
     initial_ready = 1;
@@ -1510,9 +1513,37 @@ static void box_shadow(struct cctx* c, const char* s, int len) {
     }
 }
 
+// compose affine b (16.16, b applies first) into a
+static void tf_mul(struct wstyle* st, int32_t ba, int32_t bb, int32_t bc, int32_t bd, int32_t be, int32_t bf) {
+    int64_t a2 = ((int64_t)st->tf_a * ba + (int64_t)st->tf_b * bc) >> 16;
+    int64_t b2 = ((int64_t)st->tf_a * bb + (int64_t)st->tf_b * bd) >> 16;
+    int64_t c2 = ((int64_t)st->tf_c * ba + (int64_t)st->tf_d * bc) >> 16;
+    int64_t d2 = ((int64_t)st->tf_c * bb + (int64_t)st->tf_d * bd) >> 16;
+    int64_t e2 = (((int64_t)st->tf_e * ba + (int64_t)st->tf_f * bc) >> 16) + be;
+    int64_t f2 = (((int64_t)st->tf_e * bb + (int64_t)st->tf_f * bd) >> 16) + bf;
+    st->tf_a = (int32_t)a2; st->tf_b = (int32_t)b2; st->tf_c = (int32_t)c2;
+    st->tf_d = (int32_t)d2; st->tf_e = (int32_t)e2; st->tf_f = (int32_t)f2;
+    st->tf_gen = 1;
+}
+
+// an angle token in milli-degrees (deg/rad/grad/turn; bare numbers = deg)
+static int angle_of(const char* t, int tl, int32_t* out) {
+    int32_t m; int u;
+    if (!cv_number(t, tl, &m, &u)) return 0;
+    if (u >= tl) { *out = m; return 1; }                       // bare: degrees
+    if (tl - u == 3 && t[u] == 'd' && t[u+1] == 'e' && t[u+2] == 'g') { *out = m; return 1; }
+    if (tl - u == 3 && t[u] == 'r' && t[u+1] == 'a' && t[u+2] == 'd') { *out = (int32_t)w_div64((int64_t)m * 57296, 1000); return 1; }
+    if (tl - u == 4 && t[u] == 'g' && t[u+1] == 'r' && t[u+2] == 'a' && t[u+3] == 'd') { *out = (int32_t)w_div64((int64_t)m * 9, 10); return 1; }
+    if (tl - u == 4 && t[u] == 't' && t[u+1] == 'u' && t[u+2] == 'r' && t[u+3] == 'n') { *out = (int32_t)w_div64((int64_t)m * 36, 100); return 1; }
+    return 0;
+}
+
 static void transform(struct cctx* c, const char* s, int len) {
     struct wstyle* st = c->s;
     st->translate_x = st->translate_y = wl_px(0);
+    st->tf_a = st->tf_d = 65536; st->tf_b = st->tf_c = st->tf_e = st->tf_f = 0;
+    st->tf_gen = 0;
+    st->tf_decl = 1;
     cv_trim(&s, &len);
     if (w_ieq(s, len, "none")) return;
     // "translate" property form: "x [y]"
@@ -1532,6 +1563,7 @@ static void transform(struct cctx* c, const char* s, int len) {
         return;
     }
     int pos = 0; const char* fn; int fl;
+    int32_t rot_sum = 0;   // composed rotation, for the html paint fold below
     while (cv_next(s, len, &pos, &fn, &fl)) {
         int p = 0;
         while (p < fl && fn[p] != '(') p++;
@@ -1590,13 +1622,63 @@ static void transform(struct cctx* c, const char* s, int len) {
                 mv[nm++] = m;
             }
             if (nm == 6) {
-                if (mv[1] != 0 || mv[2] != 0 || mv[0] <= 0 || mv[3] <= 0) return;
-                st->translate_x.px += w_muldiv(mv[4], 65536, 1000);
-                st->translate_y.px += w_muldiv(mv[5], 65536, 1000);
-                st->scale_x = w_muldiv(st->scale_x, mv[0], 1000);
-                st->scale_y = w_muldiv(st->scale_y, mv[3], 1000);
+                if (mv[1] != 0 || mv[2] != 0) {
+                    // general matrix (rotation/skew): kept for svg painting
+                    int32_t m6[6];
+                    for (int k = 0; k < 6; k++) m6[k] = (int32_t)w_div64((int64_t)mv[k] * 65536, 1000);
+                    tf_mul(st, m6[0], m6[1], m6[2], m6[3], m6[4], m6[5]);
+                } else {
+                    // axis-aligned (negative a/d are 180-degree mirrors)
+                    st->translate_x.px += w_muldiv(mv[4], 65536, 1000);
+                    st->translate_y.px += w_muldiv(mv[5], 65536, 1000);
+                    st->scale_x = w_muldiv(st->scale_x, mv[0], 1000);
+                    st->scale_y = w_muldiv(st->scale_y, mv[3], 1000);
+                }
             }
+        } else if (w_ieq(name, nl, "rotate")) {
+            // rotate(a) or rotate(a, cx, cy) (the svg-compatible 3-arg form)
+            int32_t ang = 0;
+            int q2 = 0; const char* t2; int tl2;
+            if (!cv_next_comma(args, al, &q2, &t2, &tl2) || !angle_of(t2, tl2, &ang)) return;
+            int32_t sn = sin_deg[(ang / 1000 % 360 + 360) % 360];
+            int32_t cs = sin_deg[((ang / 1000 + 90) % 360 + 360) % 360];
+            int32_t ra = cs, rb = sn, rc = -sn, rd = cs, re = 0, rf = 0;
+            int32_t cx = 0, cy = 0, have_c = 0;
+            if (cv_next_comma(args, al, &q2, &t2, &tl2)) {
+                int32_t m3; int u3;
+                if (!cv_number(t2, tl2, &m3, &u3)) return;
+                cx = w_div64((int64_t)m3 * 65536, 1000);
+                if (!cv_next_comma(args, al, &q2, &t2, &tl2)) return;
+                if (!cv_number(t2, tl2, &m3, &u3)) return;
+                cy = w_div64((int64_t)m3 * 65536, 1000);
+                have_c = 1;
+            }
+            if (have_c) tf_mul(st, 65536, 0, 0, 65536, -cx, -cy);
+            tf_mul(st, ra, rb, rc, rd, re, rf);
+            if (have_c) tf_mul(st, 65536, 0, 0, 65536, cx, cy);
+            rot_sum += ang;
+        } else if (w_ieq(name, nl, "skewx")) {
+            int32_t ang = 0;
+            int q2 = 0; const char* t2; int tl2;
+            if (!cv_next_comma(args, al, &q2, &t2, &tl2) || !angle_of(t2, tl2, &ang)) return;
+            int32_t sn = sin_deg[(ang / 1000 % 360 + 360) % 360];
+            int32_t cs = sin_deg[((ang / 1000 + 90) % 360 + 360) % 360];
+            tf_mul(st, 65536, 0, cs ? (int32_t)w_div64((int64_t)sn * 65536, cs) : 0, 65536, 0, 0);
+        } else if (w_ieq(name, nl, "skewy")) {
+            int32_t ang = 0;
+            int q2 = 0; const char* t2; int tl2;
+            if (!cv_next_comma(args, al, &q2, &t2, &tl2) || !angle_of(t2, tl2, &ang)) return;
+            int32_t sn = sin_deg[(ang / 1000 % 360 + 360) % 360];
+            int32_t cs = sin_deg[((ang / 1000 + 90) % 360 + 360) % 360];
+            tf_mul(st, 65536, cs ? (int32_t)w_div64((int64_t)sn * 65536, cs) : 0, 0, 65536, 0, 0);
         }
+    }
+    // axis-aligned total rotation folds into the html paint scale stack
+    // (180 degrees +- the rounding of a radian-pi input)
+    int32_t norm = ((rot_sum % 360000) + 360000) % 360000;
+    if (norm >= 180000 - 100 && norm <= 180000 + 100) {
+        st->scale_x = -st->scale_x;
+        st->scale_y = -st->scale_y;
     }
 }
 
@@ -2264,8 +2346,11 @@ static void copy_prop(struct wstyle* dst, const struct wstyle* src, int p) {
         dst->has_shadow = src->has_shadow; dst->shadow_x = src->shadow_x; dst->shadow_y = src->shadow_y;
         dst->shadow_blur = src->shadow_blur; dst->shadow_spread = src->shadow_spread;
         dst->shadow_color = src->shadow_color; dst->shadow_inset = src->shadow_inset; break;
-    case P_TRANSFORM: dst->translate_x = src->translate_x; dst->translate_y = src->translate_y; dst->scale_x = src->scale_x; dst->scale_y = src->scale_y; break;
-    case P_TFO: dst->tfo_x = src->tfo_x; dst->tfo_y = src->tfo_y; break;
+    case P_TRANSFORM: dst->translate_x = src->translate_x; dst->translate_y = src->translate_y; dst->scale_x = src->scale_x; dst->scale_y = src->scale_y;
+        dst->tf_a = src->tf_a; dst->tf_b = src->tf_b; dst->tf_c = src->tf_c; dst->tf_d = src->tf_d; dst->tf_e = src->tf_e; dst->tf_f = src->tf_f;
+        dst->tf_gen = src->tf_gen; dst->tf_decl = src->tf_decl; break;
+    case P_TFO: dst->tfo_x = src->tfo_x; dst->tfo_y = src->tfo_y; dst->tfo_decl = src->tfo_decl; break;
+    case P_TBOX: dst->tbox = src->tbox; break;
     case P_SCALE: dst->scale_x = src->scale_x; dst->scale_y = src->scale_y; break;
     case P_ASPECT_RATIO: dst->aspect_ratio = src->aspect_ratio; break;
     case P_OBJECT_FIT: dst->object_fit = src->object_fit; break;
@@ -2574,6 +2659,20 @@ static void apply_decl(struct cctx* c, int p, const struct cdecl* d) {
             if (len >= 2 && (raw[0] == '"' || raw[0] == '\'')) {
                 s->list_style_type = LS_STRING;
                 s->list_marker = str_intern(c->ss, raw + 1, len - 2);
+            } else {
+                cv_trim(&raw, &len);
+                // <custom-ident>: a @counter-style name (case-sensitive)
+                int ok = len > 0 && len <= 120;
+                for (int k = 0; ok && k < len; k++) {
+                    unsigned char ch = (unsigned char)raw[k];
+                    if (k == 0) ok = ((ch | 32) >= 'a' && (ch | 32) <= 'z') || ch == '_' || ch >= 0x80;
+                    else ok = ((ch | 32) >= 'a' && (ch | 32) <= 'z') || ch == '_' || ch == '-' || (ch >= '0' && ch <= '9') || ch >= 0x80;
+                }
+                if (ok) {
+                    s->list_style_type = LS_CUSTOM;
+                    s->list_marker = str_intern(c->ss, raw, len);
+                    s->cstyle_idx = -1;
+                }
             }
         }
         break;
@@ -2684,7 +2783,18 @@ static void apply_decl(struct cctx* c, int p, const struct cdecl* d) {
             s->tfo_x = v[0];
             if (nv >= 2) s->tfo_y = v[1];
             else { s->tfo_y = wl_px(0); s->tfo_y.pct = 500; }
+            s->tfo_decl = 1;
         }
+        break;
+    }
+    case P_TBOX: {
+        raw = draw_of(c, d, &len);
+        // 0 view-box (svg default) 1 fill-box 2 stroke-box 3 content-box 4 border-box
+        if (w_ieq(raw, len, "fill-box")) s->tbox = 1;
+        else if (w_ieq(raw, len, "stroke-box")) s->tbox = 2;
+        else if (w_ieq(raw, len, "content-box")) s->tbox = 3;
+        else if (w_ieq(raw, len, "border-box")) s->tbox = 4;
+        else s->tbox = 0;
         break;
     }
     case P_ASPECT_RATIO: raw = draw_of(c, d, &len); aspect_ratio(c, raw, len); break;

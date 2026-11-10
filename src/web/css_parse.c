@@ -1,5 +1,6 @@
 // Stylesheet parser: rule structure, at-rules, selectors, declarations.
 #include "css_int.h"
+#include "cstyles.h"
 
 // ---- storage helpers ------------------------------------------------------------
 
@@ -90,6 +91,8 @@ void csheet_free(struct wsheet* sh) {
     wbuf_free(&sh->pool);
     wbuf_free(&sh->imports);
     wbuf_free(&sh->fontfaces);
+    for (int i = 0; i < sh->ndyn; i++) cstyle_dyn_free(sh->dyns[i]);
+    w_free(sh->dyns);
     w_free(sh->decls); w_free(sh->rules); w_free(sh->sels); w_free(sh->parts);
     w_free(sh->calcs); w_free(sh->mqs); w_free(sh->kfs);
     memset(sh, 0, sizeof(*sh));
@@ -1822,6 +1825,7 @@ static const struct propdef PROPS[] = {
     {"translate", H_RAW, P_TRANSFORM, 0, 0, 0},
     {"scale", H_RAW, P_SCALE, 0, 0, 0},
     {"transform-origin", H_RAW, P_TFO, 0, 0, 0},
+    {"transform-box", H_RAW, P_TBOX, 0, 0, 0},
     {"aspect-ratio", H_RAW, P_ASPECT_RATIO, 0, 0, 0},
     {"object-fit", H_KW, P_OBJECT_FIT, 0, 0, KW_OFIT},
     {"object-position", H_RAW, P_OBJECT_POS, 0, 0, 0},
@@ -1875,9 +1879,42 @@ static const struct propdef* prop_find(const char* name, int len) {
     return 0;
 }
 
+// does the range contain a character (none of our libc variants export memchr)
+static int has_char(const char* s, int n, char ch) {
+    for (int i = 0; i < n; i++) if (s[i] == ch) return 1;
+    return 0;
+}
+static int has_backslash(const char* s, int n) { return has_char(s, n, '\\'); }
+
 // Dispatch one property value. `val` may live in the pool.
 static int apply_prop(struct dctx* c, const struct propdef* pd, const char* v, int vl) {
     int before = c->sh->ndecl;
+    // escaped identifiers in the value (\67\72... = green): unescape the whole
+    // value when it has no strings (strings carry their own escapes)
+    char vbuf[1024];
+    if (vl > 0 && vl < 1000 && has_backslash(v, vl) && !has_char(v, vl, 0x22) && !has_char(v, vl, 0x27)) {
+        int u = 0;
+        for (int k = 0; k < vl && u < 1000; k++) {
+            char ch = v[k];
+            if (ch == '\\' && k + 1 < vl) {
+                k++;
+                if (w_ishex((unsigned char)v[k])) {
+                    uint32_t cp = 0;
+                    int q = 0;
+                    while (q < 6 && k < vl && w_ishex((unsigned char)v[k])) { cp = cp * 16 + w_hexval((unsigned char)v[k]); k++; q++; }
+                    k--;
+                    if (k + 1 < vl && w_isspace((unsigned char)v[k + 1])) k++;
+                    char uu[4];
+                    int ul = w_utf8_enc(cp ? cp : 0xFFFD, uu);
+                    for (int t = 0; t < ul && u < 1000; t++) vbuf[u++] = uu[t];
+                } else vbuf[u++] = v[k];
+            } else vbuf[u++] = ch;
+        }
+        vbuf[u] = 0;
+        v = vbuf;
+        vl = u;
+        cv_trim(&v, &vl);
+    }
     switch (pd->h) {
     case H_KW: {
         if (pd->prop == P_VERTICAL_ALIGN) break;
@@ -1996,8 +2033,17 @@ static int apply_prop(struct dctx* c, const struct propdef* pd, const char* v, i
     case H_LIST: list_style_sh(c, v, vl); break;
     case H_LSTYPE: {
         const char* s = v; int l = vl; cv_trim(&s, &l);
-        if (l && (s[0] == '"' || s[0] == '\'')) emit_raw(c, P_LIST_STYLE_TYPE, s, l);
-        else emit_kwt(c, P_LIST_STYLE_TYPE, KW_LSTYPE, s, l);
+        if (l && (s[0] == '"' || s[0] == '\'')) { emit_raw(c, P_LIST_STYLE_TYPE, s, l); break; }
+        int kv = kw_lookup(KW_LSTYPE, s, l);
+        if (kv >= 0) { emit_kw(c, P_LIST_STYLE_TYPE, kv); break; }
+        // <custom-ident>: a @counter-style name (case-sensitive)
+        int ok = l > 0 && l <= 120;
+        for (int k = 0; ok && k < l; k++) {
+            unsigned char ch = (unsigned char)s[k];
+            if (k == 0) ok = ((ch | 32) >= 'a' && (ch | 32) <= 'z') || ch == '_' || ch >= 0x80;
+            else ok = ((ch | 32) >= 'a' && (ch | 32) <= 'z') || ch == '_' || ch == '-' || (ch >= '0' && ch <= '9') || ch >= 0x80;
+        }
+        if (ok) emit_raw(c, P_LIST_STYLE_TYPE, s, l);
         break;
     }
     case H_GAP: gap_sh(c, v, vl); break;
@@ -2102,6 +2148,30 @@ static void parse_decl(struct wsheet* sh, const char* s, int len) {
         d.name = ref_of(sh, name, nl); d.namelen = (uint32_t)nl;
         add_decl(sh, &d);
         return;
+    }
+    char namebuf[64];
+    if (nl > 0 && nl < 63 && has_backslash(name, nl)) {
+        // escaped identifiers as property names: \63... = color
+        int u = 0;
+        for (int k = 0; k < nl && u < 62; k++) {
+            char ch = name[k];
+            if (ch == '\\' && k + 1 < nl) {
+                k++;
+                if (w_ishex((unsigned char)name[k])) {
+                    uint32_t cp = 0;
+                    int q = 0;
+                    while (q < 6 && k < nl && w_ishex((unsigned char)name[k])) { cp = cp * 16 + w_hexval((unsigned char)name[k]); k++; q++; }
+                    k--;
+                    if (k + 1 < nl && w_isspace((unsigned char)name[k + 1])) k++;
+                    char uu[4];
+                    int ul = w_utf8_enc(cp ? cp : 0xFFFD, uu);
+                    for (int t = 0; t < ul && u < 62; t++) namebuf[u++] = uu[t];
+                } else namebuf[u++] = name[k];
+            } else namebuf[u++] = ch;
+        }
+        namebuf[u] = 0;
+        name = namebuf;
+        nl = u;
     }
     const struct propdef* pd = prop_find(name, nl);
     if (!pd) return;
@@ -2271,6 +2341,298 @@ static int supports_cond(struct pctx* pc, const char* s, int len) {
 // @font-face { font-family: X; src: url(...) }: record the family and the
 // absolute first url() src for the document to fetch and register
 // (local() and format() hints are ignored).
+// ---- @counter-style ----------------------------------------------------------------
+
+// One component of a descriptor value: a quoted string (unescaped, flag 1) or
+// an unquoted ident run (flag 0). Returns 0 at end of value.
+static int cs_component(const char* s, int len, int* pos, char* out, int cap) {
+    while (*pos < len && w_isspace((unsigned char)s[*pos])) (*pos)++;
+    if (*pos >= len) return 0;
+    int o = 0;
+    if (s[*pos] == '"' || s[*pos] == '\'') {
+        char q = s[(*pos)++];
+        while (*pos < len && s[*pos] != q && o < cap - 1) {
+            unsigned char c = (unsigned char)s[*pos];
+            if (c == '\\' && *pos + 1 < len) {
+                int j = *pos + 1;
+                if (w_ishex((unsigned char)s[j])) {
+                    uint32_t cp = 0;
+                    int k = 0;
+                    while (k < 6 && j < len && w_ishex((unsigned char)s[j])) { cp = cp * 16 + w_hexval((unsigned char)s[j]); j++; k++; }
+                    if (j < len && w_isspace((unsigned char)s[j])) j++;
+                    char u[4];
+                    int ul = w_utf8_enc(cp ? cp : 0xFFFD, u);
+                    for (int t = 0; t < ul && o < cap - 1; t++) out[o++] = u[t];
+                    *pos = j;
+                    continue;
+                }
+                (*pos)++;
+                if (*pos < len && s[*pos] == '\n') { (*pos)++; continue; }
+                if (*pos < len && o < cap - 1) out[o++] = s[(*pos)++];
+                continue;
+            }
+            out[o++] = (char)c;
+            (*pos)++;
+        }
+        if (*pos < len) (*pos)++;   // closing quote
+        out[o] = 0;
+        return 1;
+    }
+    // ident run up to whitespace/comma (escapes resolved)
+    while (*pos < len && !w_isspace((unsigned char)s[*pos]) && s[*pos] != ',' && o < cap - 1) {
+        unsigned char c = (unsigned char)s[*pos];
+        if (c == '\\' && *pos + 1 < len) {
+            int j = *pos + 1;
+            if (w_ishex((unsigned char)s[j])) {
+                uint32_t cp = 0;
+                int k = 0;
+                while (k < 6 && j < len && w_ishex((unsigned char)s[j])) { cp = cp * 16 + w_hexval((unsigned char)s[j]); j++; k++; }
+                if (j < len && w_isspace((unsigned char)s[j])) j++;
+                char u[4];
+                int ul = w_utf8_enc(cp ? cp : 0xFFFD, u);
+                for (int t = 0; t < ul && o < cap - 1; t++) out[o++] = u[t];
+                *pos = j;
+                continue;
+            }
+            (*pos)++;
+            if (*pos < len && o < cap - 1) out[o++] = s[(*pos)++];
+            continue;
+        }
+        out[o++] = (char)c;
+        (*pos)++;
+    }
+    out[o] = 0;
+    return o > 0;
+}
+
+static void parse_counter_style(struct pctx* pc, const char* pre, int pl, const char* s, int len) {
+    cv_trim(&pre, &pl);
+    if (pl <= 0 || pl > 100) return;
+    int npos = 0;
+    char nm[128];
+    if (!cs_component(pre, pl, &npos, nm, (int)sizeof nm)) return;
+    while (npos < pl && w_isspace((unsigned char)pre[npos])) npos++;
+    if (npos < pl) return;   // the prelude is a single custom ident
+    struct cstyle_dyn* d = cstyle_dyn_new(nm, (int)strlen(nm));
+    if (!d) return;
+    d->system = -1;          // no valid system descriptor seen yet
+    int i = 0;
+    while (i < len) {
+        // one declaration: split at ';' at paren/string depth 0
+        int depth = 0, st = i;
+        char q = 0;
+        while (i < len) {
+            char ch = s[i];
+            if (q) { if (ch == q) q = 0; }
+            else if (ch == '"' || ch == '\'') q = ch;
+            else if (ch == '(') depth++;
+            else if (ch == ')') { if (depth) depth--; }
+            else if (ch == ';' && depth == 0) break;
+            i++;
+        }
+        const char* item = s + st; int il = i - st;
+        i++;
+        int d2 = 0, colon = -1;
+        char q2 = 0;
+        for (int k = 0; k < il; k++) {
+            char ch = item[k];
+            if (q2) { if (ch == q2) q2 = 0; }
+            else if (ch == '"' || ch == '\'') q2 = ch;
+            else if (ch == '(') d2++;
+            else if (ch == ')') { if (d2) d2--; }
+            else if (ch == ':' && d2 == 0) { colon = k; break; }
+        }
+        if (colon < 0) continue;
+        const char* nm2 = item; int nl = colon;
+        const char* val = item + colon + 1; int vl = il - colon - 1;
+        cv_trim(&nm2, &nl); cv_trim(&val, &vl);
+        if (nl <= 0 || vl <= 0) continue;
+        char lown[24];
+        int nn = 0;
+        for (int k = 0; k < nl && nn < 23; k++) lown[nn++] = (char)w_lower((unsigned char)nm2[k]);
+        lown[nn] = 0;
+        if (!strcmp(lown, "system")) {
+            int pos = 0;
+            char a1[64];
+            if (!cs_component(val, vl, &pos, a1, (int)sizeof a1)) continue;
+            for (char* p = a1; *p; p++) *p = (char)w_lower((unsigned char)*p);
+            if (!strcmp(a1, "decimal")) { d->system = CS_NUMERIC; d->alias_decimal = 1; }
+            else if (!strcmp(a1, "numeric")) d->system = CS_NUMERIC;
+            else if (!strcmp(a1, "alphabetic")) d->system = CS_ALPHABETIC;
+            else if (!strcmp(a1, "symbolic")) d->system = CS_SYMBOLIC;
+            else if (!strcmp(a1, "cyclic")) d->system = CS_CYCLIC;
+            else if (!strcmp(a1, "additive")) d->system = CS_ADDITIVE;
+            else if (!strcmp(a1, "fixed")) {
+                int32_t m;
+                int u = 0;
+                d->system = CS_FIXED;
+                d->fixed_start = 1;
+                // optional first-symbol value
+                int p2 = pos;
+                char a2[32];
+                while (p2 < vl && w_isspace((unsigned char)val[p2])) p2++;
+                if (p2 < vl && cv_number(val + p2, vl - p2, &m, &u) && u > 0 && m >= 0 && m % 1000 == 0) d->fixed_start = (int)m / 1000;
+            } else if (!strcmp(a1, "extends")) {
+                char a2[128];
+                while (pos < vl && w_isspace((unsigned char)val[pos])) pos++;
+                if (!cs_component(val, vl, &pos, a2, (int)sizeof a2)) continue;
+                for (char* p = a2; *p; p++) *p = (char)w_lower((unsigned char)*p);
+                w_free(d->extends_nm);
+                int l2 = (int)strlen(a2);
+                d->extends_nm = (char*)w_malloc((size_t)l2 + 1);
+                if (d->extends_nm) { memcpy(d->extends_nm, a2, (size_t)l2 + 1); d->system = CS_DYN_EXTENDS; }
+            }
+        } else if (!strcmp(lown, "symbols")) {
+            int pos = 0;
+            char c1[256];
+            d->nsym = 0;
+            while (d->nsym < 8 && cs_component(val, vl, &pos, c1, (int)sizeof c1)) {
+                uint16_t off = cstyle_dyn_put(d, c1, (int)strlen(c1));
+                if (off == 0xFFFF) { d->nsym = 0; break; }
+                d->sym_off[d->nsym++] = off;
+                while (pos < vl && (w_isspace((unsigned char)val[pos]) || val[pos] == ',')) pos++;
+            }
+        } else if (!strcmp(lown, "additive-symbols")) {
+            int pos = 0;
+            d->nadd = 0;
+            int ok = 1;
+            int32_t last = 1 << 30;
+            while (ok && d->nadd < 24) {
+                while (pos < vl && (w_isspace((unsigned char)val[pos]) || val[pos] == ',')) pos++;
+                if (pos >= vl) break;
+                int32_t m;
+                int u = 0;
+                if (!cv_number(val + pos, vl - pos, &m, &u) || u <= 0 || m < 0 || m % 1000 != 0) { ok = 0; break; }
+                m /= 1000;
+                if (m >= last) { ok = 0; break; }
+                last = m;
+                pos += u;
+                char c1[256];
+                if (!cs_component(val, vl, &pos, c1, (int)sizeof c1)) { ok = 0; break; }
+                uint16_t off = cstyle_dyn_put(d, c1, (int)strlen(c1));
+                if (off == 0xFFFF) { ok = 0; break; }
+                d->add[d->nadd].v = m;
+                d->add[d->nadd].off = off;
+                d->nadd++;
+            }
+            if (!ok) d->nadd = 0;
+        } else if (!strcmp(lown, "prefix") || !strcmp(lown, "suffix")) {
+            int pos = 0;
+            char c1[256];
+            if (cs_component(val, vl, &pos, c1, (int)sizeof c1)) {
+                uint16_t off = cstyle_dyn_put(d, c1, (int)strlen(c1));
+                if (off != 0xFFFF) {
+                    if (lown[0] == 'p') d->prefix_off = off;
+                    else d->suffix_off = off;
+                }
+            }
+        } else if (!strcmp(lown, "pad")) {
+            int pos = 0;
+            int32_t m;
+            int u = 0;
+            char c1[256];
+            int seen_n = 0, seen_s = 0;
+            int pn = 0;
+            uint16_t poff = 0xFFFF;
+            for (int k = 0; k < 2; k++) {
+                int save = pos;
+                while (pos < vl && w_isspace((unsigned char)val[pos])) pos++;
+                if (!seen_n && cv_number(val + pos, vl - pos, &m, &u) && u > 0 && m >= 0 && m <= 100 * 1000 && m % 1000 == 0) {
+                    seen_n = 1;
+                    pn = (int)m / 1000;
+                    pos += u;
+                } else if (!seen_s && cs_component(val, vl, &pos, c1, (int)sizeof c1)) {
+                    seen_s = 1;
+                    poff = cstyle_dyn_put(d, c1, (int)strlen(c1));
+                } else { pos = save; break; }
+            }
+            if (seen_n && seen_s && poff != 0xFFFF) { d->pad_n = pn; d->pad_off = poff; d->has_pad = 1; }
+        } else if (!strcmp(lown, "negative")) {
+            int pos = 0;
+            char c1[128], c2[128];
+            if (cs_component(val, vl, &pos, c1, (int)sizeof c1)) {
+                int l1 = (int)strlen(c1);
+                int l2 = 0;
+                if (cs_component(val, vl, &pos, c2, (int)sizeof c2)) l2 = (int)strlen(c2);
+                uint16_t off = cstyle_dyn_put(d, c1, l1);
+                if (off != 0xFFFF) {
+                    if (l2) {
+                        uint16_t off2 = cstyle_dyn_put(d, c2, l2);
+                        if (off2 != 0xFFFF && off2 == off + l1 + 1) {
+                            d->neg_off = off;
+                            d->neg_pre_len = l1;
+                            d->neg_suf_len = l2;
+                        }
+                    } else {
+                        d->neg_off = off;
+                        d->neg_pre_len = l1;
+                        d->neg_suf_len = 0;
+                    }
+                }
+            }
+        } else if (!strcmp(lown, "range")) {
+            int pos = 0;
+            int32_t a2 = 0, b2 = 0;
+            int got = 0;
+            int seen = 0;
+            while (pos < vl && got < 2) {
+                char c1[32];
+                while (pos < vl && w_isspace((unsigned char)val[pos])) pos++;
+                if (pos >= vl) break;
+                if (w_ieq_prefix(val + pos, vl - pos, "infinite")) {
+                    if (got == 0) a2 = -(1 << 30);
+                    else b2 = 1 << 30;
+                    pos += 8;
+                } else {
+                    int u = 0;
+                    int32_t m2 = 0;
+                    if (!cv_number(val + pos, vl - pos, &m2, &u) || u <= 0 || m2 % 1000 != 0) break;
+                    if (got == 0) a2 = m2 / 1000; else b2 = m2 / 1000;
+                    pos += u;
+                }
+                got++;
+                seen = 1;
+                while (pos < vl && w_isspace((unsigned char)val[pos])) pos++;
+                if (pos < vl && val[pos] == ',') pos++;
+            }
+            if (seen && got == 2 && a2 <= b2) { d->rmin = a2; d->rmax = b2; d->has_range = 1; }
+        } else if (!strcmp(lown, "fallback")) {
+            int pos = 0;
+            char c1[128];
+            if (cs_component(val, vl, &pos, c1, (int)sizeof c1)) {
+                while (pos < vl && w_isspace((unsigned char)val[pos])) pos++;
+                if (pos >= vl) {
+                    w_free(d->fallback);
+                    int l2 = (int)strlen(c1);
+                    d->fallback = (char*)w_malloc((size_t)l2 + 1);
+                    if (d->fallback) memcpy(d->fallback, c1, (size_t)l2 + 1);
+                }
+            }
+        }
+        // speak-as and unknown descriptors: ignored (they cannot invalidate
+        // the rule unless duplicated; we keep the first of everything)
+    }
+    // required descriptors per system
+    int keep = 0;
+    if (d->system == CS_NUMERIC || d->system == CS_ALPHABETIC || d->system == CS_SYMBOLIC ||
+        d->system == CS_CYCLIC || d->system == CS_FIXED) {
+        keep = d->alias_decimal || d->nsym >= (d->system == CS_NUMERIC || d->system == CS_ALPHABETIC ? 2 : 1);
+    } else if (d->system == CS_ADDITIVE) {
+        keep = d->nadd >= 1;
+    } else if (d->system == CS_DYN_EXTENDS) {
+        keep = d->extends_nm != 0;
+    }
+    if (pc->sh->ndyn == pc->sh->capdyn) {
+        int nc = pc->sh->capdyn ? pc->sh->capdyn * 2 : 4;
+        struct cstyle_dyn** nd = (struct cstyle_dyn**)w_malloc(sizeof(void*) * (size_t)nc);
+        if (!nd) { cstyle_dyn_free(d); return; }
+        if (pc->sh->dyns) { memcpy(nd, pc->sh->dyns, sizeof(void*) * (size_t)pc->sh->ndyn); w_free(pc->sh->dyns); }
+        pc->sh->dyns = nd;
+        pc->sh->capdyn = nc;
+    }
+    pc->sh->dyns[pc->sh->ndyn++] = d;
+}
+
 static void parse_font_face(struct pctx* pc, const char* s, int len) {
     const char* fam = 0; int fl = 0;
     const char* url = 0; int ul = 0;
@@ -2425,8 +2787,10 @@ static void parse_rules(struct pctx* pc, const char* s, int len, int mq) {
                 parse_rules(pc, body, bl, mq);
             } else if (w_ieq(name, nl, "font-face")) {
                 parse_font_face(pc, body, bl);
+            } else if (w_ieq(name, nl, "counter-style")) {
+                parse_counter_style(pc, pre, pl, body, bl);
             }
-            // @keyframes, @page, @font-feature-values, @counter-style,
+            // @keyframes, @page, @font-feature-values,
             // @property, @starting-style...: skipped
             i = be < len ? be + 1 : len;
             continue;

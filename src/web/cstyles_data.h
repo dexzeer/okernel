@@ -3,7 +3,7 @@
 #ifndef CSTYLES_DATA_H
 #define CSTYLES_DATA_H
 
-enum { CS_NUMERIC, CS_ALPHABETIC, CS_SYMBOLIC, CS_ADDITIVE, CS_FIXED, CS_HEBREW, CS_ETHIOPIC, CS_CJK };
+#include "cstyles.h"
 
 static const char cs_pool[] = {
 48,0,49,0,50,0,51,0,52,0,53,0,54,0,55,0,56,0,57,0,

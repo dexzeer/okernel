@@ -83,22 +83,60 @@ WB_DUMP=1 build-host/wbrowse <url> 800 600 out.ppm 2.5   # prints every text fra
 |            | fresh build; Servo's css score for scale: 67.8%)       |                                 |
 | 2026-11-01 | same 44 areas, after ::first-letter + ::first-line     | **12474 pass (54.8%)**          |
 | 2026-11-04 | same 44 areas, CDATA strip + min/max clamps + bidi box | **12662 pass (55.6%)**          |
+| 2026-11-05 | same 44 areas, svg css transforms + gradient fills     | **12721 pass (55.9%)**          |
+| 2026-11-06 | same 44 areas, @counter-style at-rules                 | **12725 pass (55.9%)**          |
+| 2026-11-06 | same 44 areas, abspos 10.3.7 + svg: prefixes + escapes | **12796 pass (56.2%)**          |
+|            | + grid 8.5 placement + rotate(180) painting            |                                 |
 
 The first three rows were measured before backgrounds loaded their images (see below), so some of their passes were two
 equally broken pages that happened to match.
 
-Per-area (2026-11-04, full25): CSS2 75.0%, css-align 38.7%, css-backgrounds 67.0%, css-borders 29.4%,
+Per-area (2026-11-06, full28): CSS2 76.1%, css-align 38.7%, css-backgrounds 67.0%, css-borders 29.4%,
 css-box 87.5%, css-break 12.8%, css-cascade 40.0%, css-color 78.2%, css-conditional 56.6%, css-contain 56.9%,
-css-counter-styles 40.2%, css-display 53.2%, css-flexbox 61.2%, css-fonts 35.0%, css-grid 28.1%, css-image-animation 100%,
-css-images 59.5%, css-inline 19.9%, css-lists 69.7%, css-masking 31.8%, css-multicol 24.8%, css-overflow 50.2%,
-css-page 44.5%, css-position 48.2%, css-pseudo 42.8%, css-ruby 22.4%, css-scrollbars 100%, css-sizing 58.8%,
-css-syntax 100% (1 test), css-tables 48.5%, css-text 61.2%, css-text-decor 56.3%, css-transforms 41.8%, css-ui 92.9%,
+css-counter-styles 41.4%, css-display 53.2%, css-flexbox 61.2%, css-fonts 35.0%, css-grid 28.3%, css-image-animation 100%,
+css-images 59.5%, css-inline 19.9%, css-lists 70.2%, css-masking 31.8%, css-multicol 24.8%, css-overflow 50.2%,
+css-page 44.5%, css-position 48.6%, css-pseudo 42.8%, css-ruby 22.4%, css-scrollbars 100%, css-sizing 58.8%,
+css-syntax 100% (1 test), css-tables 48.5%, css-text 61.2%, css-text-decor 56.3%, css-transforms 49.2%, css-ui 93.1%,
 css-values 36.9%, css-variables 53.0%, css-view-transitions 21.1%, css-writing-modes 40.5%,
 css-transitions 100%, cssom 41.7%, cssom-view 54.5%, mediaqueries 50.0%, printing 71.8%, selectors 76.7%.
 
 Areas probed and left out (net-negative or feature-less): css-logical (0), css-scroll-snap (1), css-anchor-position 7.4%,
 css-gaps 5.8%, css-shapes 3.9%, css-shadow 14%, css-will-change 14%, css-nesting 17.6%, css-forms 20%, css-viewport 13.9%,
 css-content 12.5%, css-highlight-api 12.6%, motion 8.2%, compositing 8.5%, css-layout-api 4.4%, css-paint-api 1.7%.
+
+## What changed on 2026-11-06 (overnight batch: @counter-style, abspos 10.3.7, grid placement, svg: prefixes, escapes)
+
+- **@counter-style at-rules** (`css_parse.c` + `cstyles.c/h` + `lay_tree.c` + `css_style.c`): custom counter styles now
+  parse (system: cyclic/fixed/numeric/alphabetic/symbolic/additive/extends, symbols, additive-symbols, prefix, suffix,
+  pad, negative, range, fallback; speak-as ignored) into the sheet (`wsheet->dyns`) and format markers through the
+  document's sheets first, then the predefined table, then the fallback chain. `list-style-type: <custom-ident>` keeps
+  the name (LS_CUSTOM) instead of dropping the declaration. Extends of "decimal" synthesizes the digits (the predefined
+  table has no plain decimal row). Pad counts characters on the final string (sign included), matching Chrome.
+  Caveats: combining-diacritic symbols render tofu (no mark shaping), `extends hiragana`-style bases missing from the
+  predefined table fall back, shadow-DOM access tests unsupported.
+- **abspos §10.3.7/§10.6.4** (`lay_main.c`): auto width/height solved from left+right (top+bottom) now participates in
+  auto-margin centering (the old code only centered a specified size), a single auto margin takes the leftover, and
+  forced heights now obey min/max-height. The 34px-box-over-red class of css-position tests.
+- **XHTML namespace prefixes** (`html5.c`): `<svg:rect>`/`<math:mi>` split the prefix and switch the element namespace —
+  the CSS2 suite uses `<svg:svg>` images in sizing tests, which parsed as unknown elements before.
+- **CSS escapes in declarations** (`css_parse.c`): escaped identifiers as property names (`\63\6F...` = color) and in
+  unescaped-string values (`\67\72\65\65\6E` = green) unescape before matching (selectors already did).
+- **Grid item placement per css-grid-1 8.5** (`lay_grid.c`): the placement is now three phases (definite, one-axis-locked,
+  cursor walk) instead of a single row-flow pass; grid-auto-flow: column and dense parse through; abspos children with
+  definite grid lines get their grid area as the containing block and static position.
+- Diagnosed and parked: transform painting for HTML boxes needs a raster transform stack (283 2D-only css-transforms
+  fails); multicol pagination into column rows; inline-block replaced img intrinsic width.
+
+## What changed on 2026-11-05 (svg transforms + gradients)
+
+- **CSS transforms on svg elements** (`svg.c` + `css_style.c`): the transform property now parses rotate()/skewx()/skewy()/
+  general matrix() into a 16.16 matrix on wstyle (html painting still skips those; svg composes them), transform-box
+  (view-box default, fill-box = the element's own geometry) and transform-origin (css property or presentation attribute,
+  0 0 svg default) resolve and wrap the transform; the css transform overrides the transform attribute (cascade).
+- **linearGradient fills**: `fill="url(#g)"` renders real gradients (stop offsets/colors/opacity, objectBoundingBox or
+  userSpaceOnUse units, gradient line mapped through the element transform, per-pixel evaluation in the span callback).
+  First-stop approximation remains the fallback for <pattern>/radialGradient (the svg-matrix family waits on patterns).
+  css-transforms 333 -> 392 (49.2%).
 
 ## What changed on 2026-11-04 (CDATA + clamps + bidi box model)
 

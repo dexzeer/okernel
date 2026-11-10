@@ -596,6 +596,11 @@ void lay_abs_register(struct wlayout* L, int bi) {
         for (int p = b->parent; p >= 0; p = L->b[p].parent)
             if ((L->b[p].flags & BF_POSITIONED) && (L->b[p].kind == LB_BLOCK || L->b[p].kind == LB_REPLACED || L->b[p].kind == LB_INLINE)) { cb = p; break; }
     }
+    // the same box can register again on a later layout pass of its parent
+    // (intrinsic, then real): skip if it is already queued, or the list goes
+    // circular and the abs walk spins
+    for (int a = L->b[cb].abs_head, guard = 0; a >= 0 && guard < 4096; a = L->b[a].abs_next, guard++)
+        if (a == bi) return;
     b->abs_next = L->b[cb].abs_head;
     L->b[cb].abs_head = bi;
 }
@@ -607,7 +612,10 @@ static void lay_one_abs(struct wlayout* L, int ai, int cbi) {
     int fixed = L->b[ai].st->position == POS_FIXED;
     // containing block = padding box of cb (viewport for fixed / the ICB)
     int32_t cx, cy, cw, ch;
-    if (fixed || cbi == L->root) { cx = 0; cy = 0; cw = PX(L->vw); ch = PX(L->vh); }
+    if (!fixed && cbi != L->root && L->b[ai].gax_set) {
+        // an abspos child of a grid with a definite grid area: that area
+        cx = L->b[ai].gax; cy = L->b[ai].gay; cw = L->b[ai].gaw; ch = L->b[ai].gah;
+    } else if (fixed || cbi == L->root) { cx = 0; cy = 0; cw = PX(L->vw); ch = PX(L->vh); }
     else {
         cx = cb->b[3]; cy = cb->b[0];
         cw = cb->w - cb->b[1] - cb->b[3];
@@ -649,6 +657,16 @@ static void lay_one_abs(struct wlayout* L, int ai, int cbi) {
     if (s->height.t != WL_LEN && has[0] && has[2] && b->kind != LB_REPLACED) {
         forced_h = ch - ins[0] - ins[2] - b->m[0] - b->m[2];
         if (forced_h < 0) forced_h = 0;
+        // min/max-height clamp (mirrors the width clamp above)
+        int32_t extrah = b->p[0] + b->p[2] + b->b[0] + b->b[2];
+        if (s->max_h.t == WL_LEN) {
+            int32_t m = wl_resolve(s->max_h, ch, 0) + (s->box_sizing == BX_BORDER ? 0 : extrah);
+            if (forced_h > m) forced_h = m;
+        }
+        if (s->min_h.t == WL_LEN) {
+            int32_t m = wl_resolve(s->min_h, ch, 0) + (s->box_sizing == BX_BORDER ? 0 : extrah);
+            if (forced_h < m) forced_h = m;
+        }
     }
     b->cbh = ch;
     b->pax = cb->pax + cx;
@@ -669,11 +687,16 @@ static void lay_one_abs(struct wlayout* L, int ai, int cbi) {
         fx_al = row ? jc : ca;
         fy_al = row ? ca : jc;
     }
-    // horizontal position
+    // horizontal position (CSS2 10.3.7: the width may have been solved from
+    // left+right, so the guard on a specified width must not exclude it)
     int32_t x;
-    if (has[3] && has[1] && s->width.t != WL_AUTO && auto_ml && auto_mr) {
+    if (has[3] && has[1] && auto_ml && auto_mr) {
         int32_t free = cw - ins[3] - ins[1] - b->w;
         x = ins[3] + (free > 0 ? free / 2 : 0);
+    } else if (has[3] && has[1] && (auto_ml || auto_mr)) {
+        int32_t free = cw - ins[3] - ins[1] - b->w - b->m[1] - b->m[3];
+        if (free > 0) { if (auto_ml) b->m[3] += free; else b->m[1] += free; }
+        x = ins[3] + b->m[3];
     } else if (has[3]) x = ins[3] + b->m[3];
     else if (has[1]) x = cw - ins[1] - b->m[1] - b->w;
     else if (b->_pad & 2) x = b->sx - (cb->pax + cx) - b->w - b->m[1];       // the static position is a right edge (rtl)
@@ -686,9 +709,13 @@ static void lay_one_abs(struct wlayout* L, int ai, int cbi) {
         }
     }
     int32_t y;
-    if (has[0] && has[2] && s->height.t != WL_AUTO && auto_mt && auto_mb) {
+    if (has[0] && has[2] && auto_mt && auto_mb) {
         int32_t free = ch - ins[0] - ins[2] - b->h;
         y = ins[0] + (free > 0 ? free / 2 : 0);
+    } else if (has[0] && has[2] && (auto_mt || auto_mb)) {
+        int32_t free = ch - ins[0] - ins[2] - b->h - b->m[0] - b->m[2];
+        if (free > 0) { if (auto_mt) b->m[0] += free; else b->m[2] += free; }
+        y = ins[0] + b->m[0];
     } else if (has[0]) y = ins[0] + b->m[0];
     else if (has[2]) y = ch - ins[2] - b->m[2] - b->h;
     else {

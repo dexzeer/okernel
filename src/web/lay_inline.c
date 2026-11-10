@@ -606,10 +606,11 @@ static void emit_line_bidi(struct ifc* c, int n, int32_t x, int32_t base, int32_
     int nb = 0;
     int opensyn[64]; int nopens = 0;
     // span (inline box) ranges in stream indexes, for background fragments;
-    // boxes still open from the previous line cover the whole line
-    struct { int box, a, b; } spans[64];
+    // boxes still open from the previous line cover the whole line (op = -1:
+    // no open piece on this line, its start side was consumed earlier)
+    struct { int box, a, b, op; } spans[64];
     int nspans = 0;
-    for (int k = 0; k < c->nopen && nspans < 64; k++) { spans[nspans].box = c->open[k]; spans[nspans].a = 0; spans[nspans].b = -1; nspans++; }
+    for (int k = 0; k < c->nopen && nspans < 64; k++) { spans[nspans].box = c->open[k]; spans[nspans].a = 0; spans[nspans].b = -1; spans[nspans].op = -1; nspans++; }
 
     // paragraph direction (P3; unicode-bidi: plaintext resolves first-strong)
     int bbase = c->rst->direction_rtl ? 1 : 0;
@@ -635,9 +636,10 @@ static void emit_line_bidi(struct ifc* c, int n, int32_t x, int32_t base, int32_
         struct piece* p = &PC[i];
         struct iitem* it = &IT[p->item];
         if (p->kind == P_OPEN) {
-            if (nspans < 64) { spans[nspans].box = it->box; spans[nspans].a = nb; spans[nspans].b = -1; nspans++; }
             const struct wstyle* s = it->st;
-            if (s && s->ubidi) {
+            int ub = s && s->ubidi;
+            if (nspans < 64) { spans[nspans].box = it->box; spans[nspans].a = nb; spans[nspans].b = -1; spans[nspans].op = ub ? nb : -1; nspans++; }
+            if (ub) {
                 int dir = s->direction_rtl;
                 uint32_t sc = s->ubidi == 1 ? (dir ? 0x202B : 0x202A)   // embed
                             : s->ubidi == 3 ? (dir ? 0x202E : 0x202D)   // bidi-override

@@ -42,7 +42,7 @@ enum {
     P_CTR_RESET, P_CTR_INC, P_CTR_SET, P_BG_ORIGIN, P_BG_CLIP, P_LINE_BREAK, P_LINE_CLAMP, P_WEBKIT_ORIENT, P_HYPHENS, P_OBJECT_POS, P_TEXT_ALIGN_LAST, P_CONTAIN, P_CIS_W, P_CIS_H, P_TAB_SIZE, P_MULTICOL, P_OCM, P_WST,
     P_BG_ATTACH, P_TW, P_TWM, P_TWS,                       // text-wrap, text-wrap-mode, text-wrap-style
     P_EMPH_STYLE, P_EMPH_POS, P_EMPH, P_RUBY_POS,          // text-emphasis-*; ruby-position
-    P_TFO, P_SCALE,                                        // transform-origin; standalone scale property
+    P_TFO, P_SCALE, P_TBOX,                                // transform-origin; scale; transform-box
     P_UBIDI,                                               // unicode-bidi
 
     P_BI_SRC, P_BI_SLICE, P_BI_WIDTH, P_BI_OUTSET, P_BI_REPEAT,      // border-image longhands (raw text)
@@ -145,6 +145,8 @@ struct ckf {
     int32_t decl, ndecl; // range in decls[]
 };
 
+struct cstyle_dyn;       // @counter-style rules (cstyles.h)
+
 struct wsheet {
     struct wbuf pool;        // copies of value/selector text
     struct cdecl* decls; int ndecl, capdecl;
@@ -162,6 +164,9 @@ struct wsheet {
     // @font-face entries, "family\0url\0" (absolute), NUL separated
     struct wbuf fontfaces;
     int nfontfaces;
+    // @counter-style rules (cstyles.h), later rules override earlier
+    struct cstyle_dyn** dyns;
+    int ndyn, capdyn;
     // transient parse source: text being parsed (never the pool itself)
     // and the pool offset holding an identical copy of it
     const char* src;

@@ -81,6 +81,52 @@ static int32_t attr_num(struct wdom* d, int el, int atom, int32_t dflt, int32_t 
     return r;
 }
 
+// transform-origin resolved in 16.16 user units: offset + percentage of the
+// reference box + lengths (LU -> 16.16)
+static int32_t tfo16(struct wlen w, int32_t size16, int32_t off16) {
+    int32_t v = off16;
+    if (w.pct) v += (int32_t)((int64_t)size16 / 10000 * w.pct);
+    if (w.px) v += (int32_t)((int64_t)w.px * 1024);
+    return v;
+}
+
+// the fill-box reference box: the element's own geometry in user units
+static void local_bbox(struct wdom* d, int el, int32_t* x, int32_t* y, int32_t* w, int32_t* h) {
+    int t = d->n[el].tag;
+    int32_t bx = 0, by = 0;   // percentages of the geometry itself: use 0 basis
+    switch (t) {
+    case T_rect: {
+        *x = attr_num(d, el, A_x, 0, 0); *y = attr_num(d, el, A_y, 0, 0);
+        *w = attr_num(d, el, A_width, 0, 0); *h = attr_num(d, el, A_height, 0, 0);
+        return;
+    }
+    case T_circle: {
+        int32_t r = attr_num(d, el, A_r, 0, 0);
+        *x = attr_num(d, el, A_cx, 0, 0) - r; *y = attr_num(d, el, A_cy, 0, 0) - r;
+        *w = 2 * r; *h = 2 * r;
+        return;
+    }
+    case T_ellipse: {
+        int32_t rx = attr_num(d, el, A_rx, 0, 0), ry = attr_num(d, el, A_ry, 0, 0);
+        *x = attr_num(d, el, A_cx, 0, 0) - rx; *y = attr_num(d, el, A_cy, 0, 0) - ry;
+        *w = 2 * rx; *h = 2 * ry;
+        return;
+    }
+    case T_line: {
+        int32_t x1 = attr_num(d, el, A_x1, 0, 0), y1 = attr_num(d, el, A_y1, 0, 0);
+        int32_t x2 = attr_num(d, el, A_x2, 0, 0), y2 = attr_num(d, el, A_y2, 0, 0);
+        *x = x1 < x2 ? x1 : x2; *y = y1 < y2 ? y1 : y2;
+        *w = (x1 ^ x2) < 0 ? 0 : (x1 > x2 ? x1 - x2 : x2 - x1);
+        *h = (y1 ^ y2) < 0 ? 0 : (y1 > y2 ? y1 - y2 : y2 - y1);
+        return;
+    }
+    default:
+        (void)bx; (void)by;
+        *x = 0; *y = 0; *w = 0; *h = 0;   // caller falls back to the viewBox basis
+        return;
+    }
+}
+
 static struct mat parse_transform(const char* s, int len) {
     struct mat m = mat_id();
     int i = 0;
@@ -412,7 +458,7 @@ static void build_points(struct pbuf* p, const char* s, int len, int close) {
 
 // ---- fill / stroke -------------------------------------------------------------
 
-struct sfill { struct wsurf* s; uint32_t color; };
+struct sfill { struct wsurf* s; uint32_t color; const void* grad; };
 static void span_blend(void* ctx, int y, int x, int len, const uint8_t* cov) {
     struct sfill* f = (struct sfill*)ctx;
     struct wsurf* s = f->s;
@@ -429,15 +475,68 @@ static void span_blend(void* ctx, int y, int x, int len, const uint8_t* cov) {
 static struct wraster SR;
 static int sr_ready;
 
-static void fill_pbuf(struct wsurf* s, const struct pbuf* p, uint32_t color, int evenodd) {
+// linear gradient paint (linearGradient defs): the gradient line in device
+// pixels; stops with offsets; t evaluated per pixel in the span callback
+struct svggrad {
+    int32_t p1x, p1y, p2x, p2y;     // device pixels, 24.8 subpixel
+    int nst;
+    uint32_t sc[8];                 // ARGB
+    int32_t sp[8];                  // stop offsets, 16.16
+};
+
+static uint32_t grad_stop_color(const struct svggrad* g, int32_t t) {
+    if (t <= 0) return g->sc[0];
+    if (t >= 65536) return g->sc[g->nst - 1];
+    for (int i = 1; i < g->nst; i++) {
+        if (t > g->sp[i]) continue;
+        int32_t t0 = g->sp[i - 1], t1 = g->sp[i];
+        int32_t f = t1 > t0 ? w_div64((int64_t)(t - t0) << 16, t1 - t0) : 0;
+        uint32_t a = g->sc[i - 1], b = g->sc[i];
+        uint32_t r = ((a >> 16 & 255) * (65536 - f) + (b >> 16 & 255) * f) >> 16;
+        uint32_t gr = ((a >> 8 & 255) * (65536 - f) + (b >> 8 & 255) * f) >> 16;
+        uint32_t bl = ((a & 255) * (65536 - f) + (b & 255) * f) >> 16;
+        uint32_t al = ((a >> 24) * (65536 - f) + (b >> 24) * f) >> 16;
+        return (al << 24) | (r << 16) | (gr << 8) | bl;
+    }
+    return g->sc[g->nst - 1];
+}
+
+static void span_grad(void* ctx, int y, int x, int len, const uint8_t* cov) {
+    struct sfill* f = (struct sfill*)ctx;
+    struct wsurf* s = f->s;
+    if (y < s->cy0 || y >= s->cy1) return;
+    const struct svggrad* g = (const struct svggrad*)f->grad;
+    int32_t dx = g->p2x - g->p1x, dy = g->p2y - g->p1y;
+    int64_t len2 = (int64_t)dx * dx + (int64_t)dy * dy;
+    unsigned ca = f->color >> 24;
+    uint32_t* row = s->px + y * s->stride;
+    int64_t ry = (int64_t)(y << 8) + 128 - g->p1y;
+    for (int i = 0; i < len; i++) {
+        int xx = x + i;
+        if (xx < s->cx0 || xx >= s->cx1 || !cov[i]) continue;
+        int64_t rx = (int64_t)((xx << 8) + 128) - g->p1x;
+        int32_t t;
+        if (len2 == 0) t = 0;
+        else t = (int32_t)w_div64((rx * dx + ry * dy) * 65536, (int32_t)len2);
+        uint32_t col = grad_stop_color(g, W_CLAMP(t, 0, 65536));
+        unsigned ga = col >> 24;
+        row[xx] = ws_blend(row[xx], col | (f->color & 0xFF000000), (cov[i] * ga * ca + 127) / 255 / 255);
+    }
+}
+
+static void fill_pbuf_g(struct wsurf* s, const struct pbuf* p, uint32_t color, int evenodd, const struct svggrad* g) {
     if (!sr_ready) { wr_init(&SR); sr_ready = 1; }
     wr_reset(&SR);
     for (int i = 0; i < p->n; i++) {
         if (p->start[i]) wr_move(&SR, p->x[i], p->y[i]);
         else wr_line(&SR, p->x[i], p->y[i]);
     }
-    struct sfill f = { s, color };
-    wr_fill(&SR, s->cx0, s->cy0, s->cx1, s->cy1, evenodd, span_blend, &f);
+    struct sfill f = { s, color, (void*)g };
+    wr_fill(&SR, s->cx0, s->cy0, s->cx1, s->cy1, evenodd, g ? span_grad : span_blend, &f);
+}
+
+static void fill_pbuf(struct wsurf* s, const struct pbuf* p, uint32_t color, int evenodd) {
+    fill_pbuf_g(s, p, color, evenodd, 0);
 }
 
 static void quad_seg(int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t hw) {
@@ -472,6 +571,7 @@ static void stroke_pbuf(struct wsurf* s, const struct pbuf* p, uint32_t color, i
     wr_fill(&SR, s->cx0, s->cy0, s->cx1, s->cy1, 0, span_blend, &f);
 }
 
+// build a device-space linear gradient from a <linearGradient> def
 static uint32_t paint_of(const struct wstyle* st, int stroke, struct wdom* d, int el, int* none) {
     uint32_t c = stroke ? st->stroke : st->fill;
     *none = stroke ? st->stroke_none : st->fill_none;
@@ -533,6 +633,73 @@ struct sctx {
 };
 
 static void render_el(struct sctx* c, int el, struct mat m, int in_use);
+static int grad_of(struct sctx* c, struct wdom* d, int gdef, int el, struct mat m, struct svggrad* out) {
+    if (d->n[gdef].tag != T_lineargradient) return 0;
+    int32_t bbx = 0, bby = 0, bbw = 0, bbh = 0;
+    int ul;
+    const char* uu = wdom_attr(d, gdef, watom_intern(&d->atoms, "gradientUnits", 13), &ul);
+    int obj = !(uu && w_ieq(uu, ul, "userSpaceOnUse"));
+    if (obj) {
+        local_bbox(d, el, &bbx, &bby, &bbw, &bbh);
+        if (bbw <= 0 || bbh <= 0) { bbw = c->bx; bbh = c->by; }   // unsupported shape: viewBox basis
+    }
+    // one coordinate: fraction of the bbox (objectBoundingBox) or user units
+    #define GCOORD(atom, dflt_frac) (obj ? (int32_t)((int64_t)(atom == A_x || atom == A_x1 || atom == A_x2 ? bbx : bby) +         (int64_t)w_muldiv(attr_num(d, gdef, atom, dflt_frac * 65536, 65536), (atom == A_x || atom == A_x1 || atom == A_x2 ? bbw : bbh), 65536))         : attr_num(d, gdef, atom, dflt_frac * 65536, 0))
+    int32_t x1 = GCOORD(A_x1, 0), y1 = GCOORD(A_y1, 0);
+    int32_t x2 = GCOORD(A_x2, 1), y2 = GCOORD(A_y2, 0);
+    #undef GCOORD
+    out->nst = 0;
+    for (int c2 = d->n[gdef].first; c2 >= 0 && out->nst < 8; c2 = d->n[c2].next) {
+        if (d->n[c2].type != WN_ELEM || d->n[c2].tag != T_stop) continue;
+        int32_t off = attr_num(d, c2, watom_intern(&d->atoms, "offset", 6), -1, 65536);
+        if (off < 0) {
+            int sl;
+            const char* sv = wdom_attr(d, c2, watom_intern(&d->atoms, "style", 5), &sl);
+            off = 0;
+            if (sv) {
+                for (int k = 0; k + 7 < sl; k++)
+                    if (w_ieq_prefix(sv + k, sl - k, "offset:")) {
+                        int i2 = 0;
+                        int32_t r;
+                        if (num(sv + k + 7, sl - k - 7, &i2, &r)) {
+                            while (k + 7 + i2 < sl && w_isspace((unsigned char)sv[k + 7 + i2])) i2++;
+                            off = (k + 7 + i2 < sl && sv[k + 7 + i2] == '%') ? r / 100 : r;
+                        }
+                    }
+            }
+        }
+        uint32_t cc = 0xFF000000;
+        int have = 0;
+        char col[64];
+        if (wdom_attr_copy(d, c2, watom_intern(&d->atoms, "stop-color", 10), col, sizeof col) > 0)
+            have = css_parse_color(col, (int)strlen(col), &cc);
+        int sl2;
+        const char* sv2 = wdom_attr(d, c2, watom_intern(&d->atoms, "style", 5), &sl2);
+        if (!have && sv2) {
+            for (int k = 0; k + 11 < sl2; k++)
+                if (w_ieq_prefix(sv2 + k, sl2 - k, "stop-color:")) {
+                    int e = k + 11;
+                    while (e < sl2 && sv2[e] != ';') e++;
+                    if (css_parse_color(sv2 + k + 11, e - k - 11, &cc)) have = 1;
+                }
+        }
+        int32_t sop = 65536;
+        int ol;
+        const char* ov = wdom_attr(d, c2, watom_intern(&d->atoms, "stop-opacity", 12), &ol);
+        if (ov) { int i3 = 0; int32_t r3; if (num(ov, ol, &i3, &r3)) sop = r3; }
+        out->sc[out->nst] = ((uint32_t)((sop * 255) >> 16) << 24) | (cc & 0xFFFFFF);
+        out->sp[out->nst] = W_CLAMP(off, 0, 65536);
+        out->nst++;
+    }
+    if (out->nst < 2) return 0;
+    // user space -> device pixels (24.8), as pb_point does
+    out->p1x = (int32_t)(((int64_t)m.a * x1 + (int64_t)m.c * y1) >> 24) + (m.e >> 8);
+    out->p1y = (int32_t)(((int64_t)m.b * x1 + (int64_t)m.d * y1) >> 24) + (m.f >> 8);
+    out->p2x = (int32_t)(((int64_t)m.a * x2 + (int64_t)m.c * y2) >> 24) + (m.e >> 8);
+    out->p2y = (int32_t)(((int64_t)m.b * x2 + (int64_t)m.d * y2) >> 24) + (m.f >> 8);
+    return 1;
+}
+
 
 static void render_children(struct sctx* c, int el, struct mat m) {
     for (int k = c->d->n[el].first; k >= 0; k = c->d->n[k].next)
@@ -553,7 +720,71 @@ static void render_el(struct sctx* c, int el, struct mat m, int in_use) {
     }
     int tl;
     const char* tv = wdom_attr(d, el, A_transform, &tl);
-    if (tv) m = mat_mul(m, parse_transform(tv, tl));
+    // transform-origin (css property or svg presentation attribute) resolves
+    // against the transform-box: fill-box = the element's own geometry,
+    // otherwise the viewBox/viewport basis; 0 0 when undeclared (svg default)
+    int32_t bbw = c->bx, bbh = c->by, bbx = 0, bby = 0;
+    int fill = st && (st->tbox == 1 || st->tbox == 2 || st->tbox == 3);
+    if (fill) local_bbox(d, el, &bbx, &bby, &bbw, &bbh);
+    if (bbw <= 0) bbw = c->bx;
+    if (bbh <= 0) bbh = c->by;
+    int32_t ox = 0, oy = 0;
+    if (st && st->tfo_decl) {
+        ox = tfo16(st->tfo_x, bbw, fill ? bbx : 0);
+        oy = tfo16(st->tfo_y, bbh, fill ? bby : 0);
+    } else {
+        int ol;
+        const char* ov = wdom_attr_s(d, el, "transform-origin", &ol);
+        if (ov) {
+            int i2 = 0;
+            int32_t v1, v2;
+            if (num(ov, ol, &i2, &v1)) {
+                while (i2 < ol && w_isspace((unsigned char)ov[i2])) i2++;
+                int pct1 = 0;
+                if (i2 < ol && ov[i2] == '%') { pct1 = 1; i2++; }
+                int32_t a1 = pct1 ? (int32_t)((int64_t)bbw / 10000 * (v1 / 65536 * 100)) : v1;
+                while (i2 < ol && (w_isspace((unsigned char)ov[i2]) || ov[i2] == ',')) i2++;
+                int32_t a2;
+                if (i2 < ol && num(ov, ol, &i2, &v2)) {
+                    while (i2 < ol && w_isspace((unsigned char)ov[i2])) i2++;
+                    int pct2 = 0;
+                    if (i2 < ol && ov[i2] == '%') { pct2 = 1; i2++; }
+                    a2 = pct2 ? (int32_t)((int64_t)bbh / 10000 * (v2 / 65536 * 100)) : v2;
+                } else a2 = bbh / 2;
+                ox = (fill ? bbx : 0) + a1;
+                oy = (fill ? bby : 0) + a2;
+            }
+        }
+    }
+    if (st && st->tf_decl) {
+        // the css transform property (overrides the presentation attribute)
+        struct mat cm = mat_id();
+        if (st->tf_gen) {
+            struct mat tm = { st->tf_a, st->tf_b, st->tf_c, st->tf_d, st->tf_e, st->tf_f };
+            struct mat o1 = mat_id(); o1.e = ox; o1.f = oy;
+            struct mat o2 = mat_id(); o2.e = -ox; o2.f = -oy;
+            cm = mat_mul(o1, mat_mul(tm, o2));
+        }
+        if (st->scale_x != 65536 || st->scale_y != 65536) {
+            struct mat sm = mat_id(); sm.a = st->scale_x; sm.d = st->scale_y;
+            cm = mat_mul(sm, cm);
+        }
+        struct mat tm2 = mat_id();
+        if (st->translate_x.px) tm2.e += (int32_t)((int64_t)st->translate_x.px * 1024);
+        if (st->translate_x.pct) tm2.e += (int32_t)((int64_t)bbw / 10000 * st->translate_x.pct);
+        if (st->translate_y.px) tm2.f += (int32_t)((int64_t)st->translate_y.px * 1024);
+        if (st->translate_y.pct) tm2.f += (int32_t)((int64_t)bbh / 10000 * st->translate_y.pct);
+        cm = mat_mul(tm2, cm);
+        m = mat_mul(m, cm);
+    } else if (tv) {
+        struct mat am = parse_transform(tv, tl);
+        if (ox || oy) {
+            struct mat o1 = mat_id(); o1.e = ox; o1.f = oy;
+            struct mat o2 = mat_id(); o2.e = -ox; o2.f = -oy;
+            am = mat_mul(o1, mat_mul(am, o2));
+        }
+        m = mat_mul(m, am);
+    }
     int32_t op = opacity_attr(d, el, A_opacity);
     if (st && st->opacity < 255) op = op * st->opacity / 255;
     uint8_t saved = c->alpha;
@@ -659,16 +890,30 @@ static void render_el(struct sctx* c, int el, struct mat m, int in_use) {
     if (p.n > 0 && st) {
         int none;
         uint32_t fc = paint_of(st, 0, d, el, &none);
+        struct svggrad gr;
+        int hasg = 0;
+        {
+            int vl2;
+            const char* v2 = wdom_attr(d, el, A_fill, &vl2);
+            if (v2 && vl2 > 5 && w_ieq_prefix(v2, vl2, "url(#")) {
+                char id2[64];
+                int n2 = 0;
+                for (int i2 = 5; i2 < vl2 && v2[i2] != ')' && n2 < 63; i2++) id2[n2++] = v2[i2];
+                id2[n2] = 0;
+                int g2 = wdom_find_id(d, id2);
+                if (g2 >= 0) hasg = grad_of(c, d, g2, el, m, &gr);
+            }
+        }
         int evenodd = 0;
         int fl;
         const char* fr = wdom_attr(d, el, A_fill_rule, &fl);
         if (fr && w_ieq(fr, fl, "evenodd")) evenodd = 1;
         if (!none && t != T_line && t != T_polyline) {
             uint32_t a = (fc >> 24) * c->alpha / 255 * opacity_attr(d, el, A_fill_opacity) / 255;
-            if (a) fill_pbuf(c->s, &p, (a << 24) | (fc & 0xFFFFFF), evenodd);
+            if (a) fill_pbuf_g(c->s, &p, (a << 24) | (fc & 0xFFFFFF), evenodd, hasg ? &gr : 0);
         } else if (!none && t == T_polyline) {
             uint32_t a = (fc >> 24) * c->alpha / 255;
-            if (a) fill_pbuf(c->s, &p, (a << 24) | (fc & 0xFFFFFF), evenodd);
+            if (a) fill_pbuf_g(c->s, &p, (a << 24) | (fc & 0xFFFFFF), evenodd, hasg ? &gr : 0);
         }
         uint32_t sc = paint_of(st, 1, d, el, &none);
         if (!none) {

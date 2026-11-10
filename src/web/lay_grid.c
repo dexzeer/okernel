@@ -235,30 +235,62 @@ static int grid_place(struct wlayout* L, int bi, struct gstate* g, int32_t conte
     g->nitems = 0;
     int cur_r = 0, cur_c = 0;
     int used_rows = explicit_rows;
-    for (int c = gb->first; c >= 0 && g->nitems < MAXGI; c = L->b[c].next) {
-        struct lbox* cb = &L->b[c];
-        if (cb->flags & BF_ABS) {
-            cb->sx = gb->pax + gb->b[3] + gb->p[3];
-            cb->sy = gb->pay + gb->b[0] + gb->p[0];
-            lay_abs_register(L, c);
-            continue;
-        }
-        const struct wstyle* is = cb->st;
-        int c0, c1, r0, r1, cauto, rauto;
-        int named = 0;
-        if (is->grid_area_name && na) {
-            const char* nm = css_str(L->ss, is->grid_area_name, is->grid_area_name_len);
-            for (int k = 0; k < na; k++)
-                if ((int)strlen(areas[k].name) == is->grid_area_name_len &&
-                    !memcmp(areas[k].name, nm, is->grid_area_name_len)) {
-                    c0 = areas[k].c0; c1 = areas[k].c1; r0 = areas[k].r0; r1 = areas[k].r1;
-                    named = 1;
-                    break;
+    int flow_col = s->grid_auto_flow_col, dense = s->grid_auto_flow_dense;
+    // item placement (css-grid-1 8.5): fully definite items first, then items
+    // locked to one axis, then the cursor walk for the rest
+    for (int phase = 0; phase < 3; phase++) {
+        for (int c = gb->first; c >= 0 && g->nitems < MAXGI; c = L->b[c].next) {
+            struct lbox* cb = &L->b[c];
+            if (cb->flags & BF_ABS) {
+                if (phase == 0) {
+                    cb->sx = gb->pax + gb->b[3] + gb->p[3];
+                    cb->sy = gb->pay + gb->b[0] + gb->p[0];
+                    // the hypothetical grid area (css-grid-1 9.2): definite
+                    // placement lines only; resolved to px once tracks are sized
+                    cb->gax_set = 0;
+                    const struct wstyle* as = cb->st;
+                    int ac0, ac1, ar0, ar1, aca, ara;
+                    resolve_lines(as->gc_start, as->gc_end, explicit_cols, &ac0, &ac1, &aca);
+                    resolve_lines(as->gr_start, as->gr_end, explicit_rows, &ar0, &ar1, &ara);
+                    if (!aca && !ara) {
+                        if (ac1 > explicit_cols) ac1 = explicit_cols;
+                        if (ar1 > explicit_rows) ar1 = explicit_rows;
+                        if (ac0 < 0) ac0 = 0;
+                        if (ar0 < 0) ar0 = 0;
+                        if (ac1 <= ac0) ac1 = ac0 + 1;
+                        if (ar1 <= ar0) ar1 = ar0 + 1;
+                        cb->gax = ac0; cb->gaw = ac1; cb->gay = ar0; cb->gah = ar1;
+                        cb->gax_set = 1;
+                    }
+                    lay_abs_register(L, c);
                 }
-        }
-        if (!named) {
-            resolve_lines(is->gc_start, is->gc_end, explicit_cols, &c0, &c1, &cauto);
-            resolve_lines(is->gr_start, is->gr_end, explicit_rows, &r0, &r1, &rauto);
+                continue;
+            }
+            const struct wstyle* is = cb->st;
+            int c0, c1, r0, r1, cauto, rauto;
+            int named = 0;
+            if (is->grid_area_name && na) {
+                const char* nm = css_str(L->ss, is->grid_area_name, is->grid_area_name_len);
+                for (int k = 0; k < na; k++)
+                    if ((int)strlen(areas[k].name) == is->grid_area_name_len &&
+                        !memcmp(areas[k].name, nm, is->grid_area_name_len)) {
+                        c0 = areas[k].c0; c1 = areas[k].c1; r0 = areas[k].r0; r1 = areas[k].r1;
+                        named = 1;
+                        break;
+                    }
+            }
+            if (!named) {
+                resolve_lines(is->gc_start, is->gc_end, explicit_cols, &c0, &c1, &cauto);
+                resolve_lines(is->gr_start, is->gr_end, explicit_rows, &r0, &r1, &rauto);
+            }
+            int cdef = named || !cauto, rdef = named || !rauto;
+            if (phase == 0 && !(cdef && rdef)) continue;
+            if (phase == 1) {
+                if (cdef && rdef) continue;        // both definite: phase 0
+                if (!flow_col && !rdef) continue;  // row flow: locked to a row
+                if (flow_col && !cdef) continue;   // column flow: locked to a column
+            }
+            if (phase == 2 && cdef && rdef) continue;
             if (c1 > ncols) {
                 // implicit columns
                 while (g->ncols < c1 && g->ncols < MAXTRACK) g->cols[g->ncols++] = autoc;
@@ -267,45 +299,90 @@ static int grid_place(struct wlayout* L, int bi, struct gstate* g, int32_t conte
                 if (maxrows > MAXTRACK) maxrows = MAXTRACK;
             }
             if (c1 > ncols) { c1 = ncols; if (c0 >= c1) c0 = c1 - 1; }
-            if (cauto || rauto) {
+            if (!cdef || !rdef) {
                 int cspan = c1 - c0, rspan = r1 - r0;
                 if (cspan > ncols) cspan = ncols;
                 int found = 0;
-                if (!rauto) {
-                    // fixed row, find a column
-                    for (int cc = 0; cc + cspan <= ncols && !found; cc++) {
+                if (cdef) {
+                    // definite columns, find the topmost row that fits
+                    for (int rr = 0; rr + rspan <= maxrows && !found; rr++) {
+                        int ok = 1;
+                        for (int r2 = rr; r2 < rr + rspan && ok; r2++)
+                            for (int k = c0; k < c1 && ok; k++)
+                                if (r2 >= maxrows || g->occ[r2 * ncols + k]) ok = 0;
+                        if (ok) { r0 = rr; r1 = rr + rspan; found = 1; }
+                    }
+                } else if (rdef) {
+                    // definite row, find a column run from the cursor
+                    if (dense) cur_c = 0;
+                    for (int cc = cur_c; cc + cspan <= ncols && !found; cc++) {
                         int ok = 1;
                         for (int rr = r0; rr < r1 && ok; rr++)
                             for (int k = cc; k < cc + cspan; k++) if (rr < maxrows && g->occ[rr * ncols + k]) ok = 0;
                         if (ok) { c0 = cc; c1 = cc + cspan; found = 1; }
                     }
-                } else {
-                    int rr = cauto ? cur_r : 0;
-                    int cc0 = cauto ? cur_c : c0;
+                    if (found) cur_c = c1;
+                } else if (!flow_col) {
+                    // row flow: walk the cursor over rows/columns
+                    if (dense) { cur_r = 0; cur_c = 0; }
+                    int rr = cur_r;
                     for (; rr < maxrows && !found; rr++) {
-                        for (int cc = (cauto ? cc0 : c0); cc + cspan <= ncols; cc++) {
+                        for (int cc = (rr == cur_r ? cur_c : 0); cc + cspan <= ncols; cc++) {
                             int ok = 1;
                             for (int r2 = rr; r2 < rr + rspan && ok; r2++)
                                 for (int k = cc; k < cc + cspan; k++)
                                     if (r2 >= maxrows || g->occ[r2 * ncols + k]) { ok = 0; break; }
                             if (ok) { c0 = cc; c1 = cc + cspan; r0 = rr; r1 = rr + rspan; found = 1; break; }
-                            if (!cauto) break;
                         }
-                        cc0 = 0;
                     }
-                    if (found && cauto) { cur_r = r0; cur_c = c1; if (cur_c >= ncols) { cur_c = 0; cur_r++; } }
+                    if (found) { cur_r = r0; cur_c = c1; if (cur_c >= ncols) { cur_c = 0; cur_r++; } }
+                } else {
+                    // column flow: walk the cursor down columns
+                    if (dense) { cur_r = 0; cur_c = 0; }
+                    int cc = cur_c;
+                    for (; cc < ncols && !found; cc++) {
+                        for (int rr = (cc == cur_c ? cur_r : 0); rr + rspan <= maxrows; rr++) {
+                            int ok = 1;
+                            for (int r2 = rr; r2 < rr + rspan && ok; r2++)
+                                for (int k = cc; k < cc + cspan; k++)
+                                    if (r2 >= maxrows || g->occ[r2 * ncols + k]) { ok = 0; break; }
+                            if (ok) { c0 = cc; c1 = cc + cspan; r0 = rr; r1 = rr + rspan; found = 1; break; }
+                        }
+                    }
+                    if (found) { cur_c = c0; cur_r = r1; if (cur_r >= maxrows) { cur_r = 0; cur_c++; } }
                 }
-                if (!found) { r0 = used_rows; r1 = r0 + rspan; }
+                if (!found) {
+                    // implicit track growth: a locked row item opens a column,
+                    // the cursor walks open a row (row flow) or a column
+                    if (rdef && !flow_col) {
+                        c0 = ncols;
+                        while (g->ncols < c0 + cspan && g->ncols < MAXTRACK) g->cols[g->ncols++] = autoc;
+                        ncols = g->ncols;
+                        maxrows = (int)(sizeof g->occ / ncols);
+                        if (maxrows > MAXTRACK) maxrows = MAXTRACK;
+                        c1 = c0 + cspan;
+                    } else if (!flow_col) {
+                        c0 = 0; c1 = cspan;
+                        r0 = used_rows; r1 = r0 + rspan;
+                    } else {
+                        c0 = ncols; c1 = c0 + cspan;
+                        while (g->ncols < c1 && g->ncols < MAXTRACK) g->cols[g->ncols++] = autoc;
+                        ncols = g->ncols;
+                        maxrows = (int)(sizeof g->occ / ncols);
+                        if (maxrows > MAXTRACK) maxrows = MAXTRACK;
+                        r0 = 0; r1 = rspan;
+                    }
+                }
             }
+            if (r1 > maxrows) r1 = maxrows;
+            if (r0 >= r1) r0 = r1 - 1;
+            if (r0 < 0) { r0 = 0; r1 = 1; }
+            for (int rr = r0; rr < r1; rr++)
+                for (int k = c0; k < c1 && k < ncols; k++) g->occ[rr * ncols + k] = 1;
+            if (r1 > used_rows) used_rows = r1;
+            struct gitem* gi = &g->items[g->nitems++];
+            gi->box = c; gi->c0 = c0; gi->c1 = c1; gi->r0 = r0; gi->r1 = r1;
         }
-        if (r1 > maxrows) r1 = maxrows;
-        if (r0 >= r1) r0 = r1 - 1;
-        if (r0 < 0) { r0 = 0; r1 = 1; }
-        for (int rr = r0; rr < r1; rr++)
-            for (int k = c0; k < c1 && k < ncols; k++) g->occ[rr * ncols + k] = 1;
-        if (r1 > used_rows) used_rows = r1;
-        struct gitem* gi = &g->items[g->nitems++];
-        gi->box = c; gi->c0 = c0; gi->c1 = c1; gi->r0 = r0; gi->r1 = r1;
     }
     while (g->nrows < used_rows && g->nrows < MAXTRACK) g->rows[g->nrows++] = autor;
     return g->ncols;
@@ -545,6 +622,27 @@ void lay_grid(struct wlayout* L, int bi, int32_t content_w, int32_t* content_h) 
     // place + align
     gb = &L->b[bi];
     int32_t cleft = gb->b[3] + gb->p[3], ctop = gb->b[0] + gb->p[0];
+    // abspos children with a definite grid area: the area is their containing
+    // block (and the static position, when insets are auto)
+    for (int ai = gb->abs_head; ai >= 0; ai = L->b[ai].abs_next) {
+        struct lbox* ab = &L->b[ai];
+        if (!ab->gax_set) continue;
+        int c0 = ab->gax, c1 = ab->gaw, r0 = ab->gay, r1 = ab->gah;
+        if (c0 < 0 || r0 < 0 || c0 > nc || r0 > nr) continue;
+        if (c1 > nc) c1 = nc;
+        if (r1 > nr) r1 = nr;
+        if (c1 <= c0) c1 = c0 + 1;
+        if (r1 <= r0) r1 = r0 + 1;
+        int32_t ax = cleft + colx[c0];
+        int32_t ay = ctop + rowy[r0];
+        int32_t aw = ((c1 >= nc ? colx[nc] : colx[c1] - gapc) - colx[c0]);
+        int32_t ah = ((r1 >= nr ? rowy[nr] : rowy[r1] - gapr) - rowy[r0]);
+        if (aw < 0) aw = 0;
+        if (ah < 0) ah = 0;
+        ab->gax = ax; ab->gay = ay; ab->gaw = aw; ab->gah = ah;
+        ab->sx = gb->pax + ax;
+        ab->sy = gb->pay + ay;
+    }
     for (int k = 0; k < g->nitems; k++) {
         struct gitem* gi = &g->items[k];
         struct lbox* cb = &L->b[gi->box];

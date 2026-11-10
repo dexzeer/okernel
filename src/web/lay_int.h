@@ -77,6 +77,9 @@ struct lbox {
     // scrolling: ux/uy = absolute origin before scroll offsets (and sticky shifts of ancestors included), sw/sh = scrollable overflow extent
     // of a scroll container relative to its padding box, sox/soy = its scroll offset
     int32_t ux, uy, sw, sh, sox, soy;
+    // grid: the hypothetical grid area of an abspos child (containing block)
+    int32_t gax, gay, gaw, gah;
+    uint8_t gax_set;
 };
 
 // IFC fragment

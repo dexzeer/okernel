@@ -77,7 +77,7 @@ enum { VA_BASELINE, VA_TOP, VA_MIDDLE, VA_BOTTOM, VA_SUB, VA_SUPER, VA_TEXT_TOP,
        VA_TEXT_BOTTOM, VA_LEN };
 enum { LS_DISC, LS_CIRCLE, LS_SQUARE, LS_DECIMAL, LS_DECIMAL_LZ, LS_LOWER_ALPHA,
        LS_UPPER_ALPHA, LS_LOWER_ROMAN, LS_UPPER_ROMAN, LS_LOWER_GREEK, LS_NONE,
-       LS_DISCLOSURE_OPEN, LS_DISCLOSURE_CLOSED, LS_STRING };
+       LS_DISCLOSURE_OPEN, LS_DISCLOSURE_CLOSED, LS_STRING, LS_CUSTOM };
 #define LS_CSTYLE0 0x40     // values >= this index the predefined counter-style table
 enum { FD_ROW, FD_ROW_REV, FD_COL, FD_COL_REV };
 enum { FW_NOWRAP, FW_WRAP, FW_WRAP_REV };
@@ -159,7 +159,7 @@ struct wstyle {
     uint32_t deco_color;       // 0 = currentColor
     struct wlen text_indent;
     int32_t letter_spacing, word_spacing; // LU
-    int32_t list_marker;       // LS_STRING: string pool offset (+1)
+    int32_t list_marker;       // LS_STRING/LS_CUSTOM: string pool offset (+1)
     // flex / grid
     uint8_t flex_direction, flex_wrap, justify_content, align_items, align_self, align_content;
     uint8_t justify_items, justify_self, grid_auto_flow_col, grid_auto_flow_dense;
@@ -185,6 +185,8 @@ struct wstyle {
     uint32_t shadow_color; uint8_t shadow_inset, has_shadow;
     struct wlen translate_x, translate_y;
     int32_t scale_x, scale_y;  // transform scale, fixed point 65536 = 1.0
+    int32_t tf_a, tf_b, tf_c, tf_d, tf_e, tf_f;  // general 2d transform (rotate/skew/matrix), 16.16
+    uint8_t tf_gen, tf_decl, tfo_decl, tbox;  // tf used, transform declared, origin declared, transform-box
     struct wlen tfo_x, tfo_y;  // transform-origin from the border box top-left
     int32_t aspect_ratio;      // w/h * 1000, 0 none
     uint8_t object_fit, pointer_events_none, cursor_pointer, outline_style;
